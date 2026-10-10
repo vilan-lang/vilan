@@ -1,0 +1,79 @@
+// F122 (array-lengths.md Q12): a fixed array past 1 KiB keeps its `[T; N]`
+// type and lives on the heap natively — `[0; 4000000]` (16 MB) overflowed the
+// main stack where JS printed the element. Both sides of the threshold:
+// `[i32; 256]` and `[str; 64]` (1024 bytes) stay inline, `[i32; 257]`,
+// `[u8; 1025]` and `[str; 300]` go to the heap; each is built, written,
+// copied by value (the copy independent), passed, returned, iterated,
+// counted, held in a struct and printed.
+import std::io::print;
+
+struct Table {
+	cells: [i32; 257],
+	label: str,
+}
+
+fun total(values: [i32; 257]): i32 {
+	mut sum = 0;
+	for value in values {
+		sum = sum + value;
+	}
+	sum
+}
+
+fun bumped(values: [i32; 257]): [i32; 257] {
+	mut copy = values;
+	copy[0] = copy[0] + 100;
+	copy
+}
+
+fun first_of(values: &[str; 300]): str {
+	values[0]
+}
+
+fun first_of_inline(values: &[str; 64]): str {
+	values[0]
+}
+
+fun main() {
+	mut big = [0; 4000000];
+	big[3999999] = 7;
+	print(big[3999999]);
+	print(big.len());
+
+	mut inline = [1; 256];
+	inline[255] = 5;
+	let inline_copy = inline;
+	inline[0] = 9;
+	print(i"{inline[0]} {inline_copy[0]} {inline_copy[255]}");
+
+	mut heap = [1; 257];
+	heap[256] = 5;
+	let heap_copy = heap;
+	heap[0] = 9;
+	print(i"{heap[0]} {heap_copy[0]} {heap_copy[256]} {heap.len()}");
+	print(total(heap));
+	let moved = bumped(heap);
+	print(i"{moved[0]} {heap[0]}");
+
+	mut bytes = [0u8; 1025];
+	bytes[1024] = 255u8;
+	print(bytes[1024]);
+
+	mut table = Table { cells = [2; 257], label = "t" };
+	table.cells[3] = 4;
+	print(i"{table.label} {table.cells[3]} {total(table.cells)}");
+
+	let words = ["w"; 300];
+	print(first_of(&words));
+
+	let names = ["n"; 64];
+	print(first_of_inline(&names));
+	let small: [i32; 3] = [1, 2, 3];
+	print(small);
+	let tail = [7; 1100];
+	mut count = 0;
+	for value in tail {
+		count = count + value;
+	}
+	print(count);
+}

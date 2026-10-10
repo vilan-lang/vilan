@@ -314,6 +314,95 @@ impl<T: Js, const N: usize> Js for [T; N] {
     }
 }
 
+// ------------------------------------------------------------ heap arrays ---
+
+/// F122 (array-lengths.md Q12): a fixed array (`[T; N]`) past the emitter's
+/// size threshold, its STORAGE on the heap. The type stays `[T; N]` in
+/// vilan; natively an inline `[T; N]` lives in its frame, and a debug build
+/// keeps several copies of it there while it is built and moved, so
+/// `[0; 4000000]` (16 MB) overflowed the 8 MB main stack where JS printed the
+/// element. This is a pointer that derefs to the array, so a subscript, `len`,
+/// `iter` and a printer's `&value[..]` read it as they read the inline one.
+///
+/// It is not a bare `Box<[T; N]>` because of the copy: value semantics clone
+/// an array on every binding and argument, and `Box`'s `clone` of a non-`Copy`
+/// element type builds the array on the stack before it moves it into the
+/// box. [`Clone`] here clones element-wise straight into a new allocation.
+#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct HeapArray<T, const N: usize>(pub Box<[T; N]>);
+
+impl<T, const N: usize> HeapArray<T, N> {
+    /// The array of `items`, which hold exactly `N` elements (the emitter's
+    /// list literal under a fixed-array type), moved into its allocation.
+    pub fn from_vec(items: Vec<T>) -> Self {
+        match items.into_boxed_slice().try_into() {
+            Ok(boxed) => HeapArray(boxed),
+            Err(_) => panic_with("a fixed array literal of the wrong length"),
+        }
+    }
+}
+
+/// `[value; N]` past the threshold: the value evaluated once and cloned into
+/// each slot (the JS backend's `__repeat`), built on the heap.
+pub fn heap_repeat<T: Clone, const N: usize>(value: T) -> HeapArray<T, N> {
+    HeapArray::from_vec(vec![value; N])
+}
+
+impl<T: Clone, const N: usize> Clone for HeapArray<T, N> {
+    fn clone(&self) -> Self {
+        HeapArray::from_vec(self.0.to_vec())
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for HeapArray<T, N> {
+    type Target = [T; N];
+    fn deref(&self) -> &[T; N] {
+        &self.0
+    }
+}
+
+impl<T, const N: usize> std::ops::DerefMut for HeapArray<T, N> {
+    fn deref_mut(&mut self) -> &mut [T; N] {
+        &mut self.0
+    }
+}
+
+impl<T, const N: usize> IntoIterator for HeapArray<T, N> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        (self.0 as Box<[T]>).into_vec().into_iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a HeapArray<T, N> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a mut HeapArray<T, N> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
+impl<T: Js, const N: usize> Js for HeapArray<T, N> {
+    fn js(&self) -> String {
+        (*self.0).js()
+    }
+    fn js_nested(&self) -> String {
+        (*self.0).js_nested()
+    }
+    fn js_hosted(&self) -> String {
+        (*self.0).js_hosted()
+    }
+}
+
 impl<T: Js> Js for Option<T> {
     /// An `Option` is a vilan ENUM, and an enum's runtime value on the JS
     /// backend is `[index, ...data]` — so `Some(5)` prints `[ 0, 5 ]` and `None`
@@ -1980,6 +2069,12 @@ impl<T: Json, const N: usize> Json for [T; N] {
 /// An `Option` is a vilan ENUM, whose JS value is `[index, ...data]` (the same
 /// reason [`Js for Option`] prints `[ 0, 5 ]`) — so it is an OBJECT there and it
 /// keys as the JSON text of that array, not as its payload.
+impl<T: Json, const N: usize> Json for HeapArray<T, N> {
+    fn json(&self) -> String {
+        (*self.0).json()
+    }
+}
+
 impl<T: Json> Json for Option<T> {
     fn json(&self) -> String {
         match self {

@@ -12742,3 +12742,33 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
         "only the user key's lookup copies its set out of the cell:\n{main}"
     );
 }
+
+/// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
+/// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
+/// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
+/// stack" where JS printed the element. Both sides of the threshold are
+/// pinned (`[i32; 256]` and `[str; 64]` inline, `[i32; 257]`, `[u8; 1025]`
+/// and `[str; 300]` on the heap), each built, written, copied by value, passed, returned, iterated,
+/// held in a struct and printed; the emission pin reads the rendering on
+/// each side.
+#[test]
+fn f122_a_fixed_array_past_one_kib_lives_on_the_heap_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f122_heap_arrays.vl";
+    std::fs::write(staged.join(file), include_str!("native/heap_arrays.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a large fixed array must not overflow the native stack"
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        main.contains("vilan_rt::heap_repeat::<_, 4000000>(")
+            && main.contains("vilan_rt::heap_repeat::<_, 257>(")
+            && main.contains("vilan_rt::heap_repeat::<_, 300>(")
+            && main.contains("std::array::from_fn::<_, 256, _>(")
+            && main.contains("std::array::from_fn::<_, 64, _>("),
+        "1024 bytes stays inline and 1028 goes to the heap:\n{main}"
+    );
+}

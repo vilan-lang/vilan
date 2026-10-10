@@ -75,6 +75,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**F122: a fixed array past 1 KiB lives on the heap natively — `mut big = [0; 4000000]; big[3999999] = 7; print(big[3999999]);` printed `7` on JS and aborted "thread 'main' has overflowed its stack" natively, because `[T; N]` rendered as an inline Rust array built by `std::array::from_fn` in the frame.** array-lengths.md Q12, as ruled (R-e): the vilan type stays `[T; N]`; natively an array whose estimated size (element × length, from the element's vilan type) passes 1024 bytes renders as the new `vilan_rt::HeapArray<T, N>`, a pointer that derefs to the array, so a subscript, `len`, `iter`, a `for` and the printers read it as they read the inline one. `[value; N]` fills it on the heap (`heap_repeat`: the value evaluated once and cloned per slot), a literal or a `const` moves into it, and its copy clones element-wise into a new allocation (a `Box<[T; N]>`'s `clone` of a non-`Copy` element builds the array on the stack first). The threshold was measured on a debug build's 8 MB main stack: an inline array costs four to five copies of itself in the frame that builds it (`[0; 400000]` ran, `[0; 500000]` overflowed), and a recursion pays that per frame — a function holding a local `[i32; 256]` (1 KiB) recursed past 7000 frames natively, beyond node's own limit for it, while `[i32; 512]` overflowed at 5000 frames where JS answered. So `[i32; 256]`, `[u8; 1024]` and `[str; 64]` stay inline and `[i32; 257]` does not. A slot-by-slot pattern over an array past the threshold is refused by name. Pin: `f122_a_fixed_array_past_one_kib_lives_on_the_heap_on_both_backends` (`native/heap_arrays.vl`: both sides of the threshold built, written, copied by value, passed, returned, iterated, held in a struct and printed, plus the emission on each side).
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->

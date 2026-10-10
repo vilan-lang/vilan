@@ -177,6 +177,22 @@ pub fn emit(program: &Program<'_>, options: &BuildOptions) -> Result<Emitted, Er
 /// and the executor has to be entered from a synchronous frame.
 const ASYNC_MAIN_BODY: &str = "vilan_async_main";
 
+/// F122 (array-lengths.md Q12): a fixed array whose estimated size passes
+/// this many BYTES keeps its `[T; N]` type and lives on the heap natively
+/// (`vilan_rt::HeapArray`), where the JS backend's array lives at any length.
+///
+/// Measured on a debug build (the one `vilan run` makes), 8 MB main stack:
+/// an inline array costs four to five copies of itself in the frame that
+/// builds it (`[0; 400000]`, 1.6 MB, runs; `[0; 500000]`, 2 MB, overflows),
+/// and a RECURSION pays that per frame. A function holding a local
+/// `[i32; 256]` (1 KiB) recursed past 7000 frames natively, beyond node's own
+/// limit for it (5000 ran, 7000 overflowed on JS); at `[i32; 512]` (2 KiB)
+/// the native build overflowed at 5000 frames while JS answered. So 1 KiB is
+/// where an inline array stops costing a program depth it has on JS: a pixel,
+/// a matrix, a 256-entry table stay inline, and past it the copy a value pays
+/// is a memcpy of over a kilobyte, beside which one allocation is small.
+const HEAP_ARRAY_BYTES: usize = 1024;
+
 /// The prelude every emitted program carries.
 const PRELUDE: &str = "\
 #![allow(unused_imports, unused_parens, unused_variables, unused_mut, unused_braces)]
@@ -2448,7 +2464,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Ok(format!("({})", parts.join(", ")))
             }
             Type::Array(element, length) => {
+                let on_the_heap = self.array_lives_on_the_heap(element, length);
                 let element = self.rust_type(element, span)?;
+                if on_the_heap {
+                    return Ok(format!("vilan_rt::HeapArray<{element}, {length}>"));
+                }
                 Ok(format!("[{element}; {length}]"))
             }
             Type::Closure(parameters, return_type, contexts, modes) => {
@@ -5137,10 +5157,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         _ => None,
                     });
                 let value = self.consumed_value_of_expecting(value, element, depth)?;
-                format!(
-                    "{{ let __repeated = {value}; \
-                     std::array::from_fn::<_, {length}, _>(|_| __repeated.clone()) }}"
-                )
+                // F122: past the threshold the slots are filled on the heap.
+                if element.is_some_and(|element| self.array_lives_on_the_heap(element, length)) {
+                    format!("vilan_rt::heap_repeat::<_, {length}>({value})")
+                } else {
+                    format!(
+                        "{{ let __repeated = {value}; \
+                         std::array::from_fn::<_, {length}, _>(|_| __repeated.clone()) }}"
+                    )
+                }
             }
             // B462: a tuple variant standing for a closure is its
             // eta-expansion, one per instantiation (the closure type the
@@ -5296,9 +5321,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .type_of(id)
                     .or(self.expected_type)
                     .and_then(|type_id| self.resolve(type_id))
-                    .is_some_and(|resolved| matches!(resolved, Type::Array(..)));
-                if fixed {
-                    format!("[{}]", parts.join(", "))
+                    .and_then(|resolved| match resolved {
+                        Type::Array(element, length) => Some((*element, *length)),
+                        _ => None,
+                    });
+                if let Some((element, length)) = fixed {
+                    // F122: a literal past the threshold is built on the heap.
+                    if self.array_lives_on_the_heap(element, length) {
+                        format!(
+                            "vilan_rt::HeapArray::<_, {length}>::from_vec(vec![{}])",
+                            parts.join(", ")
+                        )
+                    } else {
+                        format!("[{}]", parts.join(", "))
+                    }
                 } else {
                     format!("vec![{}]", parts.join(", "))
                 }
@@ -7529,10 +7565,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let rendered = self.const_tuple(items, &mut cursor, &elements, span)?;
                 Ok(rendered)
             }
-            (ConstValue::Array(items), Some(Type::Array(element, _))) => {
+            (ConstValue::Array(items), Some(Type::Array(element, length))) => {
                 let mut parts = Vec::new();
                 for item in items {
                     parts.push(self.const_value(item, Some(element), span)?);
+                }
+                if self.array_lives_on_the_heap(element, length) {
+                    return Ok(format!(
+                        "vilan_rt::HeapArray::<_, {length}>::from_vec(vec![{}])",
+                        parts.join(", ")
+                    ));
                 }
                 Ok(format!("[{}]", parts.join(", ")))
             }
@@ -7754,6 +7796,107 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id == Some(*enum_id),
             _ => false,
         }
+    }
+
+    /// F122: whether a `[element; length]` lives on the heap natively — its
+    /// estimated size past [`HEAP_ARRAY_BYTES`]. Read under the substitution
+    /// in force, so an instance and its call site, which see the same
+    /// concrete element, always agree on the rendering.
+    fn array_lives_on_the_heap(&mut self, element: TypeId, length: usize) -> bool {
+        let element = self.estimated_size(element, &mut Vec::new());
+        element.saturating_mul(length) > HEAP_ARRAY_BYTES
+    }
+
+    /// F122: the bytes a value of `type_id` takes inline natively, ESTIMATED
+    /// from its vilan type (rustc's layout is not known here): a scalar its
+    /// width, a `str` or a `BigInt` 16, a `List` 24, a counted handle or a
+    /// closure a pointer or two, a struct or tuple the sum of its parts, an
+    /// enum its largest variant plus a tag, an inline array its element times
+    /// its length (a heap one a pointer). Deterministic per type, which is all
+    /// the threshold needs; a type met again inside itself counts a pointer.
+    fn estimated_size(&mut self, type_id: TypeId, visiting: &mut Vec<TypeId>) -> usize {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return 8;
+        };
+        let type_id = self.concrete(type_id);
+        if visiting.contains(&type_id) {
+            return 8;
+        }
+        let Some(resolved) = self.resolve(type_id).cloned() else {
+            return 8;
+        };
+        visiting.push(type_id);
+        let size = match resolved {
+            Type::Void | Type::Never => 0,
+            Type::Struct(struct_id, arguments) => {
+                let Some(declaration) = self.program.structs.get(&struct_id).cloned() else {
+                    visiting.pop();
+                    return 8;
+                };
+                if declaration.external {
+                    match declaration.name {
+                        "i8" | "u8" => 1,
+                        "i16" | "u16" => 2,
+                        "i32" | "u32" | "f32" => 4,
+                        "i53" | "u53" | "f64" | "usize" => 8,
+                        "str" | "BigInt" => 16,
+                        "List" => 24,
+                        _ => 16,
+                    }
+                } else {
+                    let entries = self.nominal_entries(
+                        &declaration.generic_parameter_constraint_ids,
+                        &arguments,
+                    );
+                    let mut total = 0usize;
+                    for field in &declaration.fields {
+                        let field_type = self.substituted(field.type_id, &entries);
+                        total = total.saturating_add(self.estimated_size(field_type, visiting));
+                    }
+                    total
+                }
+            }
+            Type::Enum(enum_id, arguments) => {
+                if self.program.bool_enum_id == Some(enum_id) {
+                    1
+                } else if let Some(declaration) = self.program.enums.get(&enum_id).cloned() {
+                    let entries = self.nominal_entries(
+                        &declaration.generic_parameter_constraint_ids,
+                        &arguments,
+                    );
+                    let mut largest = 0usize;
+                    for variant in &declaration.variants {
+                        let mut payload = 0usize;
+                        for data in &variant.data_type_ids {
+                            let data = self.substituted(*data, &entries);
+                            payload = payload.saturating_add(self.estimated_size(data, visiting));
+                        }
+                        largest = largest.max(payload);
+                    }
+                    largest.saturating_add(8)
+                } else {
+                    8
+                }
+            }
+            Type::Tuple(elements, _) => {
+                let mut total = 0usize;
+                for element in elements {
+                    total = total.saturating_add(self.estimated_size(element, visiting));
+                }
+                total
+            }
+            Type::Array(element, length) => {
+                if self.array_lives_on_the_heap(element, length) {
+                    8
+                } else {
+                    self.estimated_size(element, visiting).saturating_mul(length)
+                }
+            }
+            Type::Closure(..) | Type::Function(_) | Type::Dyn(..) => 16,
+            _ => 8,
+        };
+        visiting.pop();
+        size
     }
 
     /// F125: whether `id`'s value is a `BigInt` — by its settled or recorded
@@ -8261,10 +8404,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // irrefutable (the count is the type's length), and Rust's array
             // pattern is the same text.
             ExprPattern::Array(elements) => {
-                let element_type = match subject_type.and_then(|type_id| self.resolve(type_id)) {
-                    Some(Type::Array(element, _)) => Some(*element),
-                    _ => None,
-                };
+                let (element_type, length) =
+                    match subject_type.and_then(|type_id| self.resolve(type_id)) {
+                        Some(Type::Array(element, length)) => (Some(*element), *length),
+                        _ => (None, 0),
+                    };
+                // F122: an array past the threshold is a pointer natively,
+                // and a slot-by-slot pattern over one that large is not a
+                // shape a program writes; named rather than mis-emitted.
+                if let Some(element) = element_type
+                    && self.array_lives_on_the_heap(element, length)
+                {
+                    return Err(unsupported(
+                        "a pattern over a fixed array past 1 KiB (which lives on the heap \
+                         natively, F122)",
+                        span,
+                    ));
+                }
                 let mut parts = Vec::new();
                 for element in elements {
                     self.pattern_nesting += 1;
