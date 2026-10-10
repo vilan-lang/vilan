@@ -249,9 +249,34 @@ pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>
             .filter(|parameter_id| Some(**parameter_id) != hidden)
             .filter_map(|parameter_id| program.parameters.get(parameter_id))
             .filter(|parameter| parameter.name != "self")
-            .map(|parameter| parameter.name.to_string())
+            .flat_map(|parameter| match spread_labels(program, parameter) {
+                Some(labels) => labels,
+                None => vec![parameter.name.to_string()],
+            })
             .collect(),
     )
+}
+
+/// B569 S4: a spread parameter over a LABELLED tuple is called with one
+/// argument per label (`draw(x = 1, y = 2)` against `...at: (x: f64, y:
+/// f64)`), so its tab stops are the labels rather than the pack's name.
+fn spread_labels(
+    program: &Program,
+    parameter: &vilan_core::analyzer::Parameter,
+) -> Option<Vec<String>> {
+    if !parameter.spread {
+        return None;
+    }
+    match program.type_id_to_type_map.get(&parameter.type_id)? {
+        vilan_core::type_::Type::Tuple(_, labels) => Some(
+            labels
+                .labels()?
+                .iter()
+                .map(|label| label.to_string())
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// The start of the line containing `at` — `0`, or one past the nearest

@@ -356,10 +356,17 @@ impl<'src> Analyzer<'src> {
                 let name = self.traits.get(id).map_or("?", |trait_| trait_.name);
                 format!("dyn {name}{}", arguments(type_arguments, introduced))
             }
-            Type::Tuple(items) => {
+            Type::Tuple(items, labels) => {
                 let rendered: Vec<String> = items
                     .iter()
-                    .map(|item| self.binder_type_label(*item, introduced, depth + 1))
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let rendered = self.binder_type_label(*item, introduced, depth + 1);
+                        match labels.get(index) {
+                            Some(label) => format!("{label}: {rendered}"),
+                            None => rendered,
+                        }
+                    })
                     .collect();
                 format!("({})", rendered.join(", "))
             }
@@ -506,7 +513,7 @@ impl<'src> Analyzer<'src> {
                     self.collect_head_generics(argument.borrow_type(self), depth + 1, out);
                 }
             }
-            Type::Tuple(items) => {
+            Type::Tuple(items, _) => {
                 for item in items {
                     self.collect_head_generics(item.borrow_type(self), depth + 1, out);
                 }

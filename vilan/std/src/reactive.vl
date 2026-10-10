@@ -4094,3 +4094,14 @@ export impl Optimistic<type T, type S: Signal<T>> {
 		outcome
 	}
 }
+
+// E283 — at the end of the file, so no std location a golden quotes moves.
+import pkg::debug::Debug;
+
+/// `SignalCell(3)`: the current value, read WITHOUT subscribing, as `dbg` prints it
+/// on one line (E283).
+export impl SignalCell<type T: Debug> with Debug {
+	fun debug(self): str {
+		"SignalCell(" + self.get().debug() + ")"
+	}
+}

@@ -916,6 +916,9 @@ struct Interpreter<'a> {
     /// "no cell identity" sentinel and nothing should be able to collide with
     /// it. A float because every interpreter number is one.
     next_shared_identity: f64,
+    /// The `Shared` cells a `__dbg_shared` is inside, by address (debugging.md
+    /// S1b's cycle cut, mirrored).
+    dbg_inside: Vec<usize>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -932,6 +935,7 @@ impl<'a> Interpreter<'a> {
             scheduled: Vec::new(),
             scopes: Vec::new(),
             next_shared_identity: 1.0,
+            dbg_inside: Vec::new(),
         }
     }
 
@@ -1578,6 +1582,179 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The `dbg` printer's document helpers (debugging.md S1, S3), mirroring
+    /// `helper_source`'s `__dbg` block: a document is a string, or a group
+    /// object `{ o, c, p, e, f }`. `print` writes an aggregate through them
+    /// (`__dbg_flat`), so the equivalence suite meets them in ordinary programs.
+    /// The writers (`__dbg`, `__dbg_value`, ..) print to stderr, which the
+    /// macro engine has no stream for, and stay unavailable.
+    fn call_dbg_helper(
+        &mut self,
+        name: &str,
+        arguments: Vec<Value<'a>>,
+    ) -> Result<Value<'a>, Failure> {
+        let take = |index: usize| -> Value<'a> {
+            arguments.get(index).cloned().unwrap_or(Value::Undefined)
+        };
+        match name {
+            "__dbg_group" => Ok(dbg_group(take(0), take(1), take(2), take(3), take(4))),
+            "__dbg_list" => {
+                let items = array_items(&take(0))?;
+                let show = take(1);
+                let mut entries = Vec::new();
+                let shown = items.len().min(100);
+                for item in &items[..shown] {
+                    let document = self.call_value(&show, vec![item.clone()])?;
+                    entries.push(array(vec![Value::Str(Rc::from("")), document]));
+                }
+                if items.len() > shown {
+                    entries.push(array(vec![
+                        Value::Str(Rc::from("")),
+                        Value::Str(Rc::from(format!("\u{2026} {} more", items.len() - shown))),
+                    ]));
+                }
+                Ok(dbg_group(
+                    Value::Str(Rc::from("[")),
+                    Value::Str(Rc::from("]")),
+                    Value::Bool(false),
+                    array(entries),
+                    take(2),
+                ))
+            }
+            "__dbg_members" => {
+                let open = take(0);
+                let items = array_items(&take(1))?;
+                let show = take(2);
+                self.dbg_members(
+                    open,
+                    items,
+                    |interpreter, item| interpreter.call_value(&show, vec![item]),
+                    take(3),
+                )
+            }
+            "__dbg_set" => {
+                let open = take(0);
+                let items = map_or_set_values(&take(1))?;
+                let show = take(2);
+                self.dbg_members(
+                    open,
+                    items,
+                    |interpreter, item| {
+                        let document = interpreter.call_value(&show, vec![item])?;
+                        Ok(array(vec![Value::Str(Rc::from("")), document]))
+                    },
+                    take(3),
+                )
+            }
+            "__dbg_map" => {
+                let open = take(0);
+                let items = map_or_set_values(&take(1))?;
+                let (show_key, show_value) = (take(2), take(3));
+                let key_width = expect_number(&take(4))? as usize;
+                let value_width = expect_number(&take(5))? as usize;
+                self.dbg_members(
+                    open,
+                    items,
+                    |interpreter, pair| {
+                        let slots = array_items(&pair)?;
+                        let slice = |from: usize, width: usize| -> Value<'a> {
+                            if width == 1 {
+                                slots.get(from).cloned().unwrap_or(Value::Undefined)
+                            } else {
+                                array(slots.iter().skip(from).take(width).cloned().collect())
+                            }
+                        };
+                        let key = slice(0, key_width);
+                        let value = slice(key_width, value_width);
+                        let key_document = interpreter.call_value(&show_key, vec![key])?;
+                        let label = format!("{} => ", dbg_flat(&key_document)?);
+                        let value_document = interpreter.call_value(&show_value, vec![value])?;
+                        Ok(array(vec![Value::Str(Rc::from(label)), value_document]))
+                    },
+                    Value::Bool(false),
+                )
+            }
+            "__dbg_shared" => {
+                let Value::Object(cell) = take(0) else {
+                    return Err(Failure::internal("__dbg_shared over a non-cell"));
+                };
+                let address = Rc::as_ptr(&cell) as usize;
+                if self.dbg_inside.contains(&address) {
+                    return Ok(Value::Str(Rc::from("<cycle>")));
+                }
+                self.dbg_inside.push(address);
+                let inner = cell.borrow().get("v").cloned().unwrap_or(Value::Undefined);
+                let shown = self.call_value(&take(1), vec![inner]);
+                self.dbg_inside.pop();
+                Ok(dbg_group(
+                    Value::Str(Rc::from("Shared(")),
+                    Value::Str(Rc::from(")")),
+                    Value::Bool(false),
+                    array(vec![array(vec![Value::Str(Rc::from("")), shown?])]),
+                    Value::Bool(false),
+                ))
+            }
+            "__dbg_str" => {
+                let text = self.to_js_string(&take(0))?;
+                let mut out = String::from("\"");
+                for character in text.chars() {
+                    match character {
+                        '\\' => out.push_str("\\\\"),
+                        '"' => out.push_str("\\\""),
+                        '\n' => out.push_str("\\n"),
+                        '\t' => out.push_str("\\t"),
+                        '\r' => out.push_str("\\r"),
+                        '\0' => out.push_str("\\0"),
+                        other => out.push(other),
+                    }
+                }
+                out.push('"');
+                Ok(Value::Str(Rc::from(out)))
+            }
+            "__dbg_float" => {
+                let value = expect_number(&take(0))?;
+                if value == 0.0 && value.is_sign_negative() {
+                    return Ok(Value::Str(Rc::from("-0.0")));
+                }
+                let text = js_number_to_string(value);
+                if value.is_finite() && value.fract() == 0.0 && !text.contains('e') {
+                    Ok(Value::Str(Rc::from(format!("{text}.0"))))
+                } else {
+                    Ok(Value::Str(Rc::from(text)))
+                }
+            }
+            "__dbg_flat" => Ok(Value::Str(Rc::from(dbg_flat(&take(0))?))),
+            _ => Err(Failure::unsupported(format!("`{name}`"))),
+        }
+    }
+
+    /// `__dbg_members`: a padded group of at most 100 members, then `… N more`.
+    fn dbg_members(
+        &mut self,
+        open: Value<'a>,
+        items: Vec<Value<'a>>,
+        mut show: impl FnMut(&mut Self, Value<'a>) -> Result<Value<'a>, Failure>,
+        fill: Value<'a>,
+    ) -> Result<Value<'a>, Failure> {
+        let mut entries = Vec::new();
+        for item in items.iter().take(100) {
+            entries.push(show(self, item.clone())?);
+        }
+        if items.len() > 100 {
+            entries.push(array(vec![
+                Value::Str(Rc::from("")),
+                Value::Str(Rc::from(format!("\u{2026} {} more", items.len() - 100))),
+            ]));
+        }
+        Ok(dbg_group(
+            open,
+            Value::Str(Rc::from("}")),
+            Value::Bool(true),
+            array(entries),
+            fill,
+        ))
+    }
+
     /// Free-name host calls: the `__` runtime helpers (implemented natively,
     /// mirroring their JS sources in `helper_source`) and the dotted host
     /// globals the backend emits.
@@ -1589,6 +1766,9 @@ impl<'a> Interpreter<'a> {
                 Value::Undefined
             }
         };
+        if name.starts_with("__dbg_") {
+            return self.call_dbg_helper(name, arguments);
+        }
         match name {
             // `print` reaches here as the extern binding `[extern("console.log")]`
             // — a dotted free name, unlike the Property-shaped emission.
@@ -3838,6 +4018,100 @@ fn json_parse_string(text: &str, bytes: &[u8], position: &mut usize) -> Result<S
         }
     }
     Err("Unterminated JSON string".to_string())
+}
+
+/// A JS array value.
+fn array<'a>(items: Vec<Value<'a>>) -> Value<'a> {
+    Value::Array(Rc::new(RefCell::new(items)))
+}
+
+fn array_items<'a>(value: &Value<'a>) -> Result<Vec<Value<'a>>, Failure> {
+    match value {
+        Value::Array(items) => Ok(items.borrow().clone()),
+        other => Err(Failure::internal(format!(
+            "expected an array, got {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// `Array.from(table.values())` over a `Map` or a `Set`.
+fn map_or_set_values<'a>(value: &Value<'a>) -> Result<Vec<Value<'a>>, Failure> {
+    match value {
+        Value::Map(map) => Ok(map
+            .borrow()
+            .values()
+            .map(|(_, value)| value.clone())
+            .collect()),
+        Value::Set(set) => Ok(set.borrow().values().cloned().collect()),
+        other => Err(Failure::internal(format!(
+            "expected a Map or a Set, got {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// `__dbg_group(open, close, padded, entries, fill)`: `{ o, c, p, e, f }`.
+fn dbg_group<'a>(
+    open: Value<'a>,
+    close: Value<'a>,
+    padded: Value<'a>,
+    entries: Value<'a>,
+    fill: Value<'a>,
+) -> Value<'a> {
+    let mut object = IndexMap::new();
+    object.insert(Rc::from("o"), open);
+    object.insert(Rc::from("c"), close);
+    object.insert(Rc::from("p"), padded);
+    object.insert(Rc::from("e"), entries);
+    object.insert(
+        Rc::from("f"),
+        Value::Bool(matches!(fill, Value::Bool(true))),
+    );
+    Value::Object(Rc::new(RefCell::new(object)))
+}
+
+/// `__dbg_flat(document)`: the document on one line.
+fn dbg_flat(document: &Value) -> Result<String, Failure> {
+    match document {
+        Value::Str(text) => Ok(text.to_string()),
+        Value::Object(group) => {
+            let group = group.borrow();
+            let text = |key: &str| -> String {
+                match group.get(key) {
+                    Some(Value::Str(text)) => text.to_string(),
+                    _ => String::new(),
+                }
+            };
+            let entries = match group.get("e") {
+                Some(Value::Array(entries)) => entries.borrow().clone(),
+                _ => Vec::new(),
+            };
+            if entries.is_empty() {
+                return Ok(format!("{}{}", text("o"), text("c")));
+            }
+            let mut inner = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let pair = array_items(entry)?;
+                let label = match pair.first() {
+                    Some(Value::Str(label)) => label.to_string(),
+                    _ => String::new(),
+                };
+                let nested = pair.get(1).cloned().unwrap_or(Value::Undefined);
+                inner.push(format!("{label}{}", dbg_flat(&nested)?));
+            }
+            let padded = matches!(group.get("p"), Some(Value::Bool(true)));
+            Ok(if padded {
+                format!("{} {} {}", text("o"), inner.join(", "), text("c"))
+            } else {
+                format!("{}{}{}", text("o"), inner.join(", "), text("c"))
+            })
+        }
+        other => Err(Failure::internal(format!(
+            "a dbg document cannot be {}",
+            type_name(other)
+        ))),
+    }
 }
 
 #[cfg(test)]

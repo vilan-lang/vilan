@@ -598,6 +598,65 @@ async fn m104_a_module_both_entries_reach_reports_both_legs() {
     );
 }
 
+/// E280: the same module, opened the OTHER way round. `m104_a_module_both_
+/// entries_reach_reports_both_legs` opens the module first and the browser entry
+/// second, so the module's own analysis and the entry's open sweep both run. Here
+/// the browser entry is open and settled FIRST, and the module's open is served
+/// from its held world with no analysis at all - which used to return before the
+/// sweep that analyzes the node entry's further world, so the module showed only
+/// the browser leg's verdict until its next edit. The served open must owe the
+/// node leg the same answer, and must not re-analyze the world it was served
+/// from to deliver it.
+#[tokio::test]
+async fn e280_a_module_served_from_a_held_world_still_gets_its_further_world() {
+    const WIDGET: &str = "import std::web::ui::{ View, view };\n\n\
+         export fun attach(): View {\n\tlet root = view(\"div\");\n\t\
+         root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
+    const REACHES: &str = "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\n";
+    let package = Package::new("legs-held");
+    for (name, text) in [
+        ("widget.vl", WIDGET),
+        ("client.vl", REACHES),
+        ("server.vl", REACHES),
+    ] {
+        std::fs::write(package.directory.join("src").join(name), text).expect("a source");
+    }
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(server, &package, &[("client.vl", REACHES)]).await;
+    assert!(
+        !server.worlds.contains_key(&package.canonical("server.vl")),
+        "nothing has asked for the node entry's world yet"
+    );
+    let before = server.analyses.counts().started;
+    open_all(server, &package, &[("widget.vl", WIDGET)]).await;
+    let document = server
+        .documents
+        .get(&package.uri("widget.vl"))
+        .expect("open");
+    assert_eq!(
+        document.world_root(),
+        Some(package.canonical("client.vl").as_path()),
+        "the browser leg serves it, from the held world",
+    );
+    assert_eq!(document.further_worlds(), &[package.canonical("server.vl")]);
+    drop(document);
+    assert_eq!(
+        server.analyses.counts().started - before,
+        1,
+        "exactly one analysis: the node entry's world, and not the held client world again",
+    );
+    assert!(
+        server.worlds.contains_key(&package.canonical("server.vl")),
+        "the node entry's world is analyzed and kept while the module is open",
+    );
+    let shown = errors(&shown(server, &package.uri("widget.vl")));
+    assert!(
+        shown.iter().any(|message| message.contains("element")),
+        "the node leg's error reaches the module: {shown:?}",
+    );
+}
+
 /// E247: the status bar's menu asks `vilan/analysisPlatform`, and the answer
 /// names the entry whose world the file is analyzed in — `null` for a file
 /// that is its own entry — and the analysis's size in COUNTS. A released
@@ -1002,4 +1061,48 @@ async fn e254_a_twin_no_entry_admits_keeps_the_files_own_analysis() {
         .get(&package.uri("place.vl"))
         .expect("open");
     assert_eq!(document.world_root(), None, "its own analysis");
+}
+
+/// E278 under reuse: a per-stage hint is still served for a module the
+/// session REUSES rather than re-walks — an edit in another file, then the
+/// hint request on the untouched module. `stage_hints` is built for every id
+/// on every analysis (it takes no part in a per-module label record), and
+/// the shape the C3 merge gate caught for hovers is held here for stages.
+#[tokio::test]
+async fn e278_a_stage_hint_is_served_on_a_module_reused_after_an_edit_elsewhere() {
+    const STAGED: &str = "import pkg::model::{ Model, total };\n\n\
+         export fun page(): i32 {\n\tlet words = [\"a\", \"bb\"];\n\tlet count = words\n\
+         \t\t.map(|word| word.len())\n\t\t.len();\n\ttotal(Model { count = count.as_i32() })\n}\n";
+    let package = Package::new("stage-reused");
+    std::fs::write(package.directory.join("src/views.vl"), STAGED).expect("a source");
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(
+        server,
+        &package,
+        &[
+            ("client.vl", CLIENT),
+            ("views.vl", STAGED),
+            ("channel.vl", CHANNEL),
+        ],
+    )
+    .await;
+    let edited = CHANNEL.replace("count = 3", "count = 4");
+    edit(server, &package.uri("channel.vl"), 2, &edited).await;
+    at_rest(server).await;
+    let document = server
+        .documents
+        .get(&package.uri("views.vl"))
+        .expect("open");
+    let stages: Vec<String> = document
+        .keystroke_hints_served(false, true)
+        .into_iter()
+        .map(|hint| hint.label)
+        .filter(|label| label.starts_with(" as "))
+        .collect();
+    assert_eq!(
+        stages,
+        vec![" as List<str>", " as List<usize>", " as usize"],
+        "the reused module's head and both stages still hint",
+    );
 }

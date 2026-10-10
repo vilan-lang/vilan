@@ -19,11 +19,13 @@ use crate::support::*;
 fn b76_a_string_backed_enum_lowers_to_its_bare_string() {
     // §3.5, the whole thesis: `Align::Start` IS `"flex-start"` at runtime,
     // exactly as `Ordering::Greater` IS `1` (P1). No array, no wrapper.
+    // `.value()` folds to its receiver, so the print shows the value itself
+    // (a bare `print(Align::Start)` prints the NAME since debugging.md S3).
     let javascript = compile(
         r#"
         import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
-        fun main() { print(Align::Start); }
+        fun main() { print(Align::Start.value()); }
         "#,
     )
     .expect("a clean compile");
@@ -1051,7 +1053,7 @@ fn b76_a_backing_string_keeps_its_escapes() {
         enum Quoted { Tab = "a\tb", Quote = "say \"hi\"" }
         fun main() {
             print(match Quoted::Quote { Quoted::Tab => "tab", Quoted::Quote => "quote" });
-            print(Quoted::Tab);
+            print(Quoted::Tab.value());
         }
         "#,
         "quote\na\tb\n",
@@ -2420,7 +2422,7 @@ fn a_compound_assignment_evaluates_an_impure_index_once() {
         r#"
         import std::io::print;
         mut calls = 0;
-        fun bump(): i32 {
+        fun bump(): usize {
             calls = calls + 1;
             0
         }
@@ -2443,7 +2445,7 @@ fn a_compound_assignment_evaluates_the_index_before_the_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun index(): i32 { print("index"); 0 }
+        fun index(): usize { print("index"); 0 }
         fun amount(): i32 { print("amount"); 5 }
         fun main() {
             mut ys = [10, 20];
@@ -2493,7 +2495,7 @@ fn a_compound_assignment_hoists_an_index_in_the_targets_subject() {
         import std::io::print;
         struct Cell { n: i32 }
         mut calls = 0;
-        fun bump(): i32 {
+        fun bump(): usize {
             calls = calls + 1;
             0
         }
@@ -2515,8 +2517,8 @@ fn a_compound_assignment_hoists_every_index_of_a_nested_target() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun row(): i32 { print("row"); 0 }
-        fun column(): i32 { print("column"); 1 }
+        fun row(): usize { print("row"); 0 }
+        fun column(): usize { print("column"); 1 }
         fun main() {
             mut grid = [[1, 2], [3, 4]];
             grid[row()][column()] += 100;
@@ -2535,7 +2537,7 @@ fn a_compound_assignment_through_a_view_hoists_its_index() {
         r#"
         import std::io::print;
         mut calls = 0;
-        fun bump(): i32 {
+        fun bump(): usize {
             calls = calls + 1;
             0
         }
@@ -2561,7 +2563,7 @@ fn a_plain_indexed_assignment_still_evaluates_its_index_once() {
         r#"
         import std::io::print;
         mut calls = 0;
-        fun bump(): i32 {
+        fun bump(): usize {
             calls = calls + 1;
             0
         }
@@ -2585,8 +2587,8 @@ fn two_hand_written_subscripts_are_not_collapsed_into_one() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun first(): i32 { print("first"); 0 }
-        fun second(): i32 { print("second"); 1 }
+        fun first(): usize { print("first"); 0 }
+        fun second(): usize { print("second"); 1 }
         fun main() {
             mut ys = [10, 20];
             ys[first()] = ys[second()] + 1;

@@ -178,7 +178,7 @@ fun main() {
 	print(some_id);
 }
 "#,
-        "[ 0 ]\n",
+        "Id { n = 0 }\n",
     );
 }
 

@@ -63,6 +63,65 @@ fun main() {
 A function of your own named `dbg` takes precedence, as it would over any
 prelude name.
 
+## Everything in scope: `dbg_stack`
+
+`dbg_stack()` prints every binding in scope where you call it — a snapshot of
+the stack frame, without naming anything:
+
+```vilan
+[resource]
+struct Guard { id: i32 }
+
+fun consume(own guard: Guard) {
+	print(guard.id);
+}
+
+fun main() {
+	let guard = Guard { id = 7 };
+	consume(guard);
+	let x = 1;
+	mut rows = [Some(1), Some(2)];
+	match &rows[0] {
+		Some(let first) => {
+			print(*first);
+			rows.push(None);
+			let x = "shadow";
+			dbg_stack();
+		},
+		None => {},
+	}
+}
+```
+
+```text
+[src/main.vl:18:4] dbg_stack() in main
+  x: str = "shadow"
+  x (shadowed at 17:8): i32 = 1
+  first: view i32 = <view, invalidated by push at 16:4>  (a view into rows)
+  guard: Guard = <moved at 10:10>
+  rows: List<Option<i32>> = [Some(1), Some(2), None]
+```
+
+- **Which bindings.** The function's parameters and every local visible at the
+  call, innermost scope first. A binding another one hides is listed under it,
+  marked with where it was shadowed. Inside a closure: its own parameters and
+  locals, then the bindings it captures, marked `(captured)`. Module-level
+  bindings are not the stack and are not listed.
+- **It reads nothing it must not.** A resource that was moved prints `<moved
+  at L:C>` (or `<moved on some paths>`); a view that a later `push` invalidated
+  prints `<view, invalidated by push at L:C>`; a pipe prints `<pipe, not
+  sampled>` and a `lazy` parameter `<lazy, not forced>`, since looking would run
+  them. A cell prints its current value without subscribing, so a `dbg_stack()`
+  inside an effect does not make it re-run.
+- **Values print as `dbg` prints them**, laid out from where they start, on the
+  same stream, the same bytes on both backends. A view is marked `view` and
+  says what it views.
+- **Each listed binding counts as used at the call.** That can keep a value
+  alive to the `dbg_stack()` line; on the native backend the worst case is a
+  copy where a move used to be.
+- **Release builds refuse it**, as they refuse `dbg`, and `[build] dbg` decides
+  for both.
+
 ## Where: panics name their line
 
 An uncaught panic prints the file, the line and the column that raised it, on

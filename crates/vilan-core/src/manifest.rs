@@ -41,6 +41,9 @@ pub struct Manifest {
     /// `[lints]` — the opt-in warnings (E221): each key a lint, each value
     /// `"allow"` (the default) or `"warn"`.
     pub lints: Option<LintsSection>,
+    /// `[check]` — what `vilan check` asks of the package beyond correctness
+    /// (B570 S4): `auto = "off" | "exported" | "all"`.
+    pub check: Option<CheckSection>,
     /// `[entry.<name>]` — the package's build entries, each with its own
     /// platform. Empty for the classic single-entry form.
     #[serde(rename = "entry", default)]
@@ -58,7 +61,8 @@ pub struct Manifest {
 /// pinned against. `server` / `client` are here only so [`Manifest::validate`]
 /// can point their users at the replacement; they are not valid content.
 pub const KNOWN_SECTIONS: &[&str] = &[
-    "package", "library", "project", "build", "fmt", "macro", "lints", "entry", "server", "client",
+    "package", "library", "project", "build", "fmt", "macro", "lints", "check", "entry", "server",
+    "client",
 ];
 
 /// The `[lints]` section as written (E221): the warnings a package asks for
@@ -100,6 +104,47 @@ impl Lints {
             internal_use: section
                 .and_then(|section| section.internal_use)
                 .unwrap_or_default(),
+        }
+    }
+}
+
+/// The `[check]` section as written (B570 S4, `auto-annotations.md` §8).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckSection {
+    /// `auto` — which inferred types `vilan check` asks to be written as
+    /// `auto` annotations (a warning each, the annotation its fix).
+    pub auto: Option<AutoOptIn>,
+}
+
+/// B570 S4: which items' inferred types a package asks to see written as
+/// `auto` (Q6 RULED for "exported").
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoOptIn {
+    /// Nothing — the default.
+    #[default]
+    Off,
+    /// The returns and module bindings reachable from outside their module:
+    /// `export`-marked, everything in an `export *;` (or unmarked) file, and
+    /// the inherent methods of an exported type. Void returns are skipped.
+    Exported,
+    /// Every return and module binding.
+    All,
+}
+
+/// The resolved `[check]` of the ENTRY package (B570 S4), every key
+/// defaulted — carried on [`crate::analyzer::Workspace`] like `[lints]`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CheckOptions {
+    pub auto: AutoOptIn,
+}
+
+impl CheckOptions {
+    /// The section as written, every absent key at its default.
+    pub fn from_section(section: Option<&CheckSection>) -> CheckOptions {
+        CheckOptions {
+            auto: section.and_then(|section| section.auto).unwrap_or_default(),
         }
     }
 }
@@ -1804,6 +1849,7 @@ pub fn resolve_workspace_with_hook_report(
 ) -> Result<(Workspace, Vec<DependencyHooks>), WorkspaceError> {
     let manifest = load_manifest(package_dir)?;
     let lints = Lints::from_section(manifest.lints.as_ref());
+    let check = CheckOptions::from_section(manifest.check.as_ref());
     let defaults = crate::macros::MacroLimits::default();
     let macro_limits = manifest
         .macro_
@@ -1830,6 +1876,7 @@ pub fn resolve_workspace_with_hook_report(
                     macro_limits,
                     entry_prelude,
                     lints,
+                    check,
                     ..Workspace::default()
                 },
                 Vec::new(),
@@ -1871,6 +1918,7 @@ pub fn resolve_workspace_with_hook_report(
             macro_limits,
             entry_prelude,
             lints,
+            check,
             // The front end fills the rest in: resolving the dependency graph
             // says nothing about which entry coloured the file (E119), nor
             // about which control can change the ambient scope (E120) — and
@@ -4915,6 +4963,41 @@ mod tests {
             "a `..` dependency path is the normal spelling, not an error: {:?}",
             manifest.validate()
         );
+    }
+
+    // --- B570 S4: the `[check]` section ----------------------------------------
+
+    #[test]
+    fn a_check_section_parses_its_auto_opt_in_and_refuses_another_value() {
+        for (written, expected) in [
+            ("off", AutoOptIn::Off),
+            ("exported", AutoOptIn::Exported),
+            ("all", AutoOptIn::All),
+        ] {
+            let (manifest, warnings) = Manifest::parse(&format!(
+                "[package]\nname = \"app\"\n\n[check]\nauto = \"{written}\"\n"
+            ))
+            .expect("parses");
+            assert!(
+                warnings.is_empty(),
+                "`[check]` is a known section: {warnings:?}"
+            );
+            assert_eq!(
+                CheckOptions::from_section(manifest.check.as_ref()).auto,
+                expected
+            );
+        }
+        let (manifest, _) = Manifest::parse("[package]\nname = \"app\"\n").expect("parses");
+        assert_eq!(
+            CheckOptions::from_section(manifest.check.as_ref()).auto,
+            AutoOptIn::Off,
+            "off by default"
+        );
+        assert!(
+            Manifest::parse("[package]\nname = \"app\"\n\n[check]\nauto = \"sometimes\"\n")
+                .is_err()
+        );
+        assert!(Manifest::parse("[package]\nname = \"app\"\n\n[check]\nstrict = true\n").is_err());
     }
 
     // --- E221: the `[lints]` section ----------------------------------------

@@ -1,0 +1,11 @@
+[native_probe_b569_dbg_labels.vl:10:2] p = (x = 5.0, y = 7.0)
+[native_probe_b569_dbg_labels.vl:11:2] q = (1.0, 2.0)
+[native_probe_b569_dbg_labels.vl:12:2] [(a = 1, b = "one")] = [
+  (a = 1, b = "one"),
+]
+[native_probe_b569_dbg_labels.vl:13:2] (outer = (left = 1, right = 2), tag = "t") = (
+  outer = (left = 1, right = 2),
+  tag = "t",
+)
+[native_probe_b569_dbg_labels.vl:4:2] value = (5.0, 7.0)
+[native_probe_b569_dbg_labels.vl:4:2] value = (1.0, 2.0)

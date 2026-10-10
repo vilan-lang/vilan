@@ -13,15 +13,15 @@ fun assert(condition: bool, message: str)   // panic when false
 ```
 
 `print` writes a number by the language's own conversion, the one an
-i-string uses, so `print(0.0 * -1.0)` prints `0` on both backends. It lays
-any other value out as node's `console.log` does, under either
-backend: a string at the top level is written bare and quoted inside a
-container, a struct or a tuple prints as the array it is at run time
-(`[ 1, 'two' ]`), a list of more than six entries is grouped into
-aligned columns, a container wider than 80 columns takes one entry per
-line, and a fourth level of nesting prints `[Array]`. A trait object
-prints as its value — on its own or in a `List` — and as its stored
-`[ value, {} ]` pair inside any other container.
+i-string uses, so `print(3.0)` prints `3` and `print(0.0 * -1.0)` prints `0`
+on both backends; a string prints bare, and a bool as `true`/`false`. Any
+other value prints in vilan's own literal syntax — `dbg`'s printer, on ONE
+line, the same bytes on both backends: `Point { x = 1, y = 2.0 }`,
+`Shape::Circle(1.5)`, `Some(5)`, `(1, "two")`, `[1, 2, 3]`,
+`HashMap { "ada" => 36 }`, `dyn Area(Square { side = 2 })`. Inside a value a
+float keeps its `.0` and a string is quoted; a backed enum prints its name
+(`Color::Red`), not the value it is backed by. A host value the printer could
+only name (a `Location`, a DOM node) is handed to the host's console as it is.
 
 `panic` is for unreachable states (expected failures are `Result`). A
 `panic` arm in a `match` diverges: the other arms decide the match's

@@ -849,8 +849,9 @@ export impl Region {
 /// type-directed half of `child`: the value's type carries the static-vs-tracked
 /// distinction, and ordinary trait dispatch decides what lands in the DOM.
 ///
-/// THE CHILD CONTRACT (B268), six arms in three pairs — a `str`, a `View`, a
-/// `List<View>`, and a `Source` of each. The static arm places once; the reactive
+/// THE CHILD CONTRACT (B268), arms in pairs — a `str`, a `View`, a `List<View>`,
+/// and a `Source` of each; and an `Option` of any child, with a
+/// `Source<Option<View>>` beside it (A165). The static arm places once; the reactive
 /// arm places and REPLACES, owning its own re-render under the nearest boundary.
 /// That pairing is the whole rule: whatever may be a child statically may be a
 /// child reactively, and `{expr}` in element syntax means the same thing either
@@ -998,6 +999,54 @@ fun place_views_flow<F: Flow<List<View>>>(own flow: F, parent: View) {
 		}
 		region.hold(next);
 		live.write() = next;
+	});
+}
+
+/// An OPTIONAL child (A165): `Some(child)` places the child, `None` places nothing
+/// — the static twin of `when`, which an `Option<View>` in a hole reads as
+/// (`<p>"item"{badge}</p>`). Any `Slot` may be the payload, so an `Option<str>` or
+/// an `Option<List<View>>` reads the same way.
+export impl Option<type V: Slot> with Slot {
+	fun place(own self, parent: View) {
+		match self {
+			Some(let child) => child.place(parent),
+			None => {},
+		}
+	}
+}
+
+/// A reactive OPTIONAL element child — the `Option<View>` arm's reactive twin
+/// (A165, B268's pairing): the view the source holds while it holds one, nothing
+/// while it holds `None`, replaced on every change. The single-view arm's ownership
+/// and position story, exactly: the source's views arrive built, and a `Region`
+/// keeps the hole's place (A71).
+export impl type S: Flow<Option<View>> with Slot {
+	fun place(own self, parent: View) {
+		place_optional_view_flow(self, parent);
+	}
+}
+
+fun place_optional_view_flow<F: Flow<Option<View>>>(own flow: F, parent: View) {
+	let region = Region::open(parent);
+	// A binding the closure captures is its storage (spec §6.9, M93's rule): no
+	// cell for the view on screen.
+	mut live: Option<View> = None;
+	// A88, as for the single-view arm: the view and its anchor leave with the
+	// boundary.
+	get_owner().defer(|| region.close());
+	follow(flow, |next: Option<View>| {
+		match live {
+			Some(let previous) => previous.element.remove(),
+			None => {},
+		}
+		match next {
+			Some(let view) => {
+				region.insert(view);
+				region.hold([view]);
+			},
+			None => region.hold([]),
+		}
+		live = next;
 	});
 }
 // === The positional value forms (A85) ======================================

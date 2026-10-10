@@ -178,7 +178,16 @@ const KEYWORD_CLASSES: &[(&str, Class, &str)] = &[
         Class::Construct,
         "brings a type's namespace (variants) into scope",
     ),
-    ("as", Class::Clause, "the alias on an import leaf"),
+    (
+        "as",
+        Class::Clause,
+        "the alias on an import leaf; the type ascription (B571)",
+    ),
+    (
+        "auto",
+        Class::Typing,
+        "a type the toolchain writes and keeps current (B570): part of the signature",
+    ),
     (
         "borrows",
         Class::Typing,

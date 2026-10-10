@@ -59,9 +59,22 @@ jobs:
       # letting the other leg finish buys is the complete failure list on the
       # day it matters most.
       fail-fast: false
+      # SHARDED like ci.yml's `test` (L17): at v0.45.0 the two unsharded gate
+      # legs ran 55 and 110 minutes and every build and publish job waited on
+      # them. Same `count:N/M` shards as ci.yml, so each OS's shards are the
+      # whole suite once. The ubuntu shards run on the owner's self-hosted
+      # runner (`vilan-linux`): only a tag push or a dispatch by someone with
+      # write access can start this workflow, so there is no fork to keep off
+      # it. The windows shards move to `vilan-windows` once that runner exists.
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - { os: ubuntu-latest, partition: 1, shards: 2 }
+          - { os: ubuntu-latest, partition: 2, shards: 2 }
+          - { os: windows-latest, partition: 1, shards: 4 }
+          - { os: windows-latest, partition: 2, shards: 4 }
+          - { os: windows-latest, partition: 3, shards: 4 }
+          - { os: windows-latest, partition: 4, shards: 4 }
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'vilan-linux' || matrix.os }}
     # The suite runs against current stable, exactly as ci.yml's `test` job
     # declares it: rust-toolchain.toml is the formatter's pin (N21), and it
     # would otherwise outrank the toolchain dtolnay/rust-toolchain sets.
@@ -131,12 +144,21 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
+      # The SCRIPT, exactly as ci.yml's `test` leg runs it (`release_gate.rs`
+      # holds the two to the same commands): `VILAN_CI_PARTITION` is nextest's
+      # `count:N/M` shard.
       - name: The suite is green
-        run: cargo nextest run --workspace
+        shell: bash
+        env:
+          VILAN_CI_PARTITION: ${{ matrix.partition }}/${{ matrix.shards }}
+        run: scripts/ci-local.sh test
       # nextest does not run doc-tests. Every doc-test set is empty today;
       # this leg exists so a future doc-test cannot silently stop running.
+      # ONCE per OS, as ci.yml does it: the shards split the suite, not this.
       - name: The doc-tests are green
-        run: cargo test --workspace --doc
+        if: matrix.partition == 1
+        shell: bash
+        run: scripts/ci-local.sh doctest
 
   # ── ci.yml's other three legs, on the release side ──────────────────────────
   #

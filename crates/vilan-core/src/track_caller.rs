@@ -298,6 +298,7 @@ fn own_body_children(program: &Program, id: Id, out: &mut Vec<Id>) {
         Expr::Assignment(target, value) => out.extend([*target, *value]),
         Expr::Await(inner)
         | Expr::TryAssert(inner)
+        | Expr::Ascribe(inner)
         | Expr::Unary(_, inner)
         | Expr::Reference(inner, _)
         | Expr::Dereference(inner)

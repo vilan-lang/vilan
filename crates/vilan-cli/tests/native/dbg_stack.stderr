@@ -1,0 +1,70 @@
+[native_probe_dbg_stack.vl:75:3] dbg_stack() in main
+  x: str = "shadow"
+  x (shadowed at 73:7): i32 = 1
+  wide: List<Point> = [
+    Point { x = 1, y = 2 },
+    Point { x = 1, y = 2 },
+    Point { x = 1, y = 2 },
+    Point { x = 1, y = 2 },
+    Point { x = 1, y = 2 },
+  ]
+  point: Point = Point { x = 1, y = 2 }
+  moved: Guard = <moved at 71:10>
+  kept: Guard = Guard { id = 2 }
+[native_probe_dbg_stack.vl:27:3] dbg_stack() in shifted
+  self: Point = Point { x = 1, y = 2 }
+  by: i32 = 3
+[native_probe_dbg_stack.vl:48:2] dbg_stack() in pass
+  value: i32 = <moved at 47:13>
+  kept: i32 = 5
+[native_probe_dbg_stack.vl:48:2] dbg_stack() in pass
+  value: Guard = <moved at 47:13>
+  kept: Guard = Guard { id = 3 }
+[native_probe_dbg_stack.vl:53:2] dbg_stack() in forces
+  message: str = <lazy, not forced>
+  read: bool = false
+[native_probe_dbg_stack.vl:63:2] dbg_stack() in bump
+  list: view List<i32> = [1, 9]
+[native_probe_dbg_stack.vl:87:4] first = 1
+[native_probe_dbg_stack.vl:90:4] dbg_stack() in main
+  first: view i32 = <view, invalidated by push at 89:4>  (a view into rows)
+  x: i32 = 1
+  point: Point = Point { x = 1, y = 2 }
+  moved: Guard = <moved at 71:10>
+  kept: Guard = Guard { id = 2 }
+  shifted: Point = Point { x = 4, y = 2 }
+  shape: dyn Area = dyn Area(Point { x = 4, y = 2 })
+  held: Guard = Guard { id = 3 }
+  numbers: List<i32> = [1, 9]
+  rows: List<Option<i32>> = [Some(1), Some(2), None]
+[native_probe_dbg_stack.vl:103:4] dbg_stack() in a closure in main
+  value: i32 = 3
+  other: SignalCell<i32> = SignalCell(5)  (captured, read without tracking)
+[native_probe_dbg_stack.vl:103:4] dbg_stack() in a closure in main
+  value: i32 = 4
+  other: SignalCell<i32> = SignalCell(6)  (captured, read without tracking)
+[native_probe_dbg_stack.vl:109:2] dbg_stack() in main
+  x: i32 = 1
+  point: Point = Point { x = 1, y = 2 }
+  moved: Guard = <moved at 71:10>
+  kept: Guard = Guard { id = 2 }
+  shifted: Point = Point { x = 4, y = 2 }
+  shape: dyn Area = dyn Area(Point { x = 4, y = 2 })
+  held: Guard = Guard { id = 3 }
+  numbers: List<i32> = [1, 9]
+  rows: List<Option<i32>> = [Some(1), Some(2), None]
+  count: SignalCell<i32> = SignalCell(4)  (read without tracking)
+  other: SignalCell<i32> = SignalCell(6)  (read without tracking)
+  doubled: Derive<SignalCell<i32>, i32, i32> = <pipe, not sampled>
+  owner: Owner = Owner {
+    cell = Shared(
+      OwnerCell {
+        epoch = 0,
+        cleanups = Shared([<closure || void>]),
+        listed = true,
+        nursery = None,
+      },
+    ),
+    epoch = 0,
+  }
+  copied: List<i32> = [1, 9]

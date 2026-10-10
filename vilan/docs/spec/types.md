@@ -13,7 +13,10 @@ The type forms (grammar §3.9) denote:
   distinct (no implicit numeric conversions, §5.8).
 - **Tuples**: `(T, U, …)`; structural: equal iff element-wise equal.
   `()` and one-element tuples do not exist as distinct types (`(T)` is
-  `T`; the unit is `void`).
+  `T`; the unit is `void`) — save the one-slot LABELLED tuple `(x: T)`,
+  whose label makes it one. A tuple's slots may carry labels, `(x: f64, y:
+  f64)`; labels name positions and are never part of the type's identity
+  (§5.9, labelled tuples).
 - **Closure types**: `|T, U| R`, `|| R`, `|| void`; structural in their
   parameter and return types. An `async` closure type (§7.4) is distinct
   from its plain counterpart. A `context` clause (§8.5) is carried by the
@@ -976,6 +979,7 @@ fun check<T: PartialEq>(x: T, y: T) { if x == y { … } }  // the test produces 
 "p=" + point.to_string()     // the fix the error names
 count + "n="                 // error: only a `str` LEFT operand concatenates
 1.5 + count                  // error: f64 and i32; no implicit conversions
+index - count                // error: usize and i32 — `-`, `*`, `/`, `%` as `+`
 count * true                 // error: `*` computes on two numbers, and `bool` is not one
 count * "2"                  // error: the same, for `str`
 ```
@@ -1194,6 +1198,70 @@ already a value and never coerces.
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
 
+### Ascription: `EXP as T`
+
+`EXP as T` names the type a value has, in place, where no `let` is at
+hand. It is typed exactly as the initializer of `let tmp: T = EXP` is:
+the type flows into `EXP` (an unsuffixed literal, an empty list, a bare
+`None` and a generic call's result take it), every coercion an annotated
+binding performs is performed (a value erased to `dyn T`, §5.12; a named
+function or a tuple variant re-typed as a closure, above; a closure
+literal's parameters adopting the type's modes; `Never` yielding), a bare
+trait is checked and the value keeps its concrete type (§5.5, as at a
+binding), and a mismatch is refused. The result has type `T` — or the
+concrete type, under a bare trait.
+
+```vilan,fragment
+SignalCell::new([1, 2, 3] as List<usize>)
+make() as List<str>
+match pick { true => Source::constant(1), false => cell.derive(f) } as dyn Flow<i32>
+```
+
+It is **not a binding**: nothing is copied that the unascribed value
+would not copy (`f(xs as List<i32>)` passes `xs` exactly as `f(xs)`
+does, and `let ys = xs as List<i32>` copies as `let ys = xs` does), it
+has no drop point and no name, and a resource moves exactly when the
+unascribed expression would. It is a **value, never a place**: an
+assignment through one, a `&mut` view of one and a mutating method called
+on one are refused (`(p as Point).x = 1` — write `p.x = 1`).
+
+**The method converts, the keyword constrains.** `n.as_f64()` makes an
+`f64`; `n as f64` says `n` already is one, and with `n: i32` it is
+refused with the conversion that exists. vilan has no cast: a `dyn`
+value never narrows back (§5.12), so `as` cannot downcast either.
+
+### `auto`: types the toolchain keeps
+
+`auto T` on a function's return, a `let`/`mut` binding (a module's or a
+local), or an ascription (`as auto T`) is a type the toolchain writes and
+keeps current. It is a **signature, not a constraint**: the body — a
+function's, a binding's initializer, an ascription's value — is inferred
+exactly as if nothing were written, so `T` never directs it (`fun f():
+auto f64 { 5 }` infers `i32`); everything outside reads `T` — a
+function's callers, a binding's uses, hover; and `vilan check` (and
+`build`, `run`, `test`) compares the two and refuses a difference as
+**stale**, naming how many callers were checked against the written type
+in the meantime. `vilan check --fix` rewrites it, and a bare `auto`,
+which promised nothing yet, is a warning the same command fills. In a
+program that checks, deleting every `auto` changes nothing it does.
+
+```vilan,fragment
+fun load(): auto List<str> { … }         // callers read List<str>
+mut names: auto List<str> = [];           // a use elsewhere cannot widen it
+fun doubled(cell): auto Pipe<i32> { … }   // a stage type, by its trait
+```
+
+Two types agree when their resolved forms are equal, except that a bare
+trait anywhere in the written type is met by any type that implements it
+(§5.5, as at a binding) — which is how a long pipe-stage type is written:
+as the inlay hint shows it, `~Pipe<T>` written as the bare trait
+`Pipe<T>`. Such an item is no firewall: its callers still hold the
+concrete type. A labelled tuple is written with its labels, and labels
+agree as §5.9 reconciles them — except one label at two different
+slots, which callers would read from the wrong slot. `fmt` prints an `auto` canonically and never fills one;
+`auto` stands nowhere a type is not inferred — a parameter, a field, a
+generic argument, a trait member's return is refused.
+
 ## 5.9 Variadic tuples
 
 A generic parameter with a **tuple bound** ranges over tuples:
@@ -1246,12 +1314,23 @@ position satisfies it only through its own declared tuple bound: a
 contained arity range whose element bound names the same trait or a
 subtrait.
 
+A tuple bound also **declares** the trait of a blanket written over a
+tuple bound that contains it — by the same containment, a range inside
+the blanket's and an element bound naming its trait or a subtrait. Over
+std's `impl type T: (2..: PartialEq) with PartialEq`, a parameter `T:
+(2..: PartialEq)` is `PartialEq`: two `T`s compare with `==`, and a
+callee bounded `U: PartialEq` takes one. The containment is a proof about
+every instantiation, not an impl search, so an abstract value's declared
+bounds stay its only answer (§5.4); and the dispatch stays per instance —
+at `T = (i32, i32)` a program's own `impl (i32, i32) with PartialEq`
+outranks the blanket (B588).
+
 A **spread parameter** `...items: T` is a *call convention* over an
 ordinary tuple parameter — the call site writes the pack's elements out
 flat, and they are collected into that one tuple argument:
 
 ```vilan,fragment
-fun log<T: (..: Display)>(...items: T)      //  log(1, "hi")  ==  log((1, "hi"))
+fun log<T: (..: Display)>(...items: T)      //  log(1, "hi") collects the pack (1, "hi")
 fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T>
 ```
 
@@ -1265,6 +1344,13 @@ what makes 0- and 1-arity tuple *values* reachable; tuple types already
 admit them. Since the convention lives on the declaration, a spread
 function used as a **value** has its tuple type, and is called with a
 tuple.
+
+A direct call by name always **collects**, whatever its arguments' types:
+`log((1, "hi"))` passes ONE argument, so its pack is the one-slot
+`((1, "hi"))`, and against `fun draw(...at: (f64, f64))` the call
+`draw((3, 4))` is refused. A tuple already built is passed AS the pack
+with a tuple-value spread (below): `draw(..pair)`, `log(..(1, "hi"))`
+(B581).
 
 Grammar and the positions where `...` is rejected: §3.3.
 
@@ -1331,6 +1417,67 @@ yields its region as a value (destructuring reads the same layout).
 Positional access and destructuring are the element-wise spellings a
 tuple has: a tuple is **not iterable**, and `for x in t` is refused
 because the binder would have no single type to take (§3.5).
+
+
+### Labelled tuples
+
+A tuple's positions may carry **labels** (B569, `named-tuple-fields.md`):
+`let p: (x: f64, y: f64) = (x = 5, y = 7);` — every slot labelled, or
+none. A label is a name for a POSITION, read as `p.x` (the slot `p.0` is,
+and `p.0` keeps working) and written through a `mut` binding as `p.x = 3;`.
+Labels are carried by the type and never compared: two tuple types are
+compatible when their elements are, whatever their labels, with ONE
+exception below. So:
+
+- a **labelled literal** against a labelled type of its arity matches BY
+  NAME — `let q: (x: f64, y: f64) = (y = 7, x = 5);` is `(5, 7)` — and must
+  name exactly that type's labels; its entries are evaluated as WRITTEN,
+  then stored in the type's order. Against an unlabelled type, or with no
+  expected type, it is positional (`(y = 7, x = 5)` alone is `(y: i32, x:
+  i32)`).
+- an **unlabelled** value into a labelled position takes the position's
+  labels; a labelled one into an unlabelled position drops them; two
+  DIFFERENTLY named label sets reconcile by position — `(w: f64, h: f64)`
+  into `(x: f64, y: f64)` — and a binding, parameter, field or return takes
+  the labels of its declared type.
+- **The contradiction is refused**: two tuple types where some label sits at
+  DIFFERENT positions — `(x: f64, y: f64)` into `(y: f64, x: f64)`, and the
+  one-rename twin `(x: f64, y: f64)` into `(y: f64, z: f64)`. The two
+  readings (by name, by position) give different values, so neither is
+  picked; the refusal spells both rewrites for a value that is a place:
+  `(y = p.y, x = p.x)` by name, `(p.0, p.1)` by position.
+- a **join** types a later arm against a labelled first arm, so labelled
+  literal arms and list elements match it by name.
+
+A tuple PATTERN may name its elements too — `let (y = top, x = left) =
+p;`, `match q { (x = 0, y = let v) => … }` — and is placed by the labels
+of the value it matches, which it names exactly; a positional pattern
+ignores them. `dbg` prints a labelled tuple as its literal, `p = (x = 5.0,
+y = 7.0)`; a tuple a generic body prints through its parameter prints
+positionally, since labels erase at the instance (below). `Debug`'s
+`debug()` is positional.
+
+A **spread parameter over a labelled tuple** takes NAMED arguments: the
+call collects its arguments into one tuple literal (§5.9's desugar), so
+`draw(x = 1, y = 2)` and `draw(y = 2, x = 1)` against `fun draw(...at: (x:
+f64, y: f64))` both collect a literal that matches the pack by name, and
+`draw(1, 2)` still collects one positionally. A fixed parameter before the
+pack is passed by position; the collected arguments are all named or none;
+a name nothing collects is refused; and a slot cannot be left out — there
+are no defaults (a struct with field defaults is the shape for those).
+
+Labels flow through generics as part of the type a parameter binds
+(`id(p).x`), and a **mapped tuple** keeps its source's labels position by
+position — `combine((x = a, y = b))` derives over `(x: i32, y: i32)`. They
+are **erased** at monomorphization (`f<(x: i32, y: i32)>` and `f<(i32,
+i32)>` are one instance), in both emitters (a label is the slot offset), and
+in a service's contract hash. A tuple's future `Wire` or `Json` encoding is
+positional. `keys()` is unchanged: a key is a position. An `impl` cannot
+name a labelled tuple — labels are not an identity, so it would answer for
+every tuple of its slot types — and a shape with methods, derives, an
+identity across signatures or a wire format is a struct. `(x = 5)` is a
+one-slot labelled tuple (`(x: i32)`, arity 1, so it does not meet `T:
+(2..)`); `(5)` stays a group.
 
 ## 5.10 `!`, `?.` and `?`
 
@@ -1411,7 +1558,13 @@ Normative rejection cases (each is a compile error):
   just with its neighbour. Diverging legs and arms (`ret`, `panic`,
   `jump`) are `Never` and don't participate (§5.1).
 - An `i53`/`i32` operand mix (no implicit widening; suffix the
-  literal).
+  literal) — two different integer types as the operands of `+`, `-`,
+  `*`, `/`, `%`, a comparison or `==` (B579).
+- A binding whose type still holds a part nothing determines once
+  inference is done — `let xs = []` read only through `len()`, `let o =
+  None` — is refused at its initializer, naming where to write the type
+  (`xs: List<…>`); a later use that states it (`xs.push(1)`) is what
+  inference reads, and only an annotation can stand in for one (B580).
 - A value written into a struct field it does not match, through either
   door: the literal `S { field = v }` and the assignment `s.field = v`
   are governed by ONE rule, and a place chain of any depth (`a.b.c = v`,

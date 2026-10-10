@@ -61,6 +61,13 @@ impl bool with Debug {
 	external fun debug(self): str;
 }
 
+/// Its digits, as `dbg` prints a `BigInt` (`10`, not `10n`) (E283).
+impl BigInt with Debug {
+	fun debug(self): str {
+		i"{self}"
+	}
+}
+
 // Every container the `dbg` printer prints is `Debug` when its elements are
 // (debugging.md S4, E260), so a struct with a `List` or `Option` field derives it
 // and `T: Debug` takes a list, an option, a result or a tuple. The rendering is the
@@ -135,7 +142,9 @@ macro fun Debug(item: Item): Source {
 		} else {
 			mut parts: List<str> = [];
 			for field in target.fields {
-				parts.push(quote(i"{field.name} = ") + i" + self.{field.name}.debug()");
+				parts.push(quote(i"{field.name} = ")
+					+ " + "
+					+ debug_member(i"self.{field.name}", field.type_.render()));
 			}
 			body = quote(i"{target.name} \{ ")
 				+ " + "
@@ -164,7 +173,7 @@ macro fun Debug(item: Item): Source {
 				mut index = 0;
 				for index < arity {
 					binds.push(i"let p{index}");
-					parts.push(i"p{index}.debug()");
+					parts.push(debug_member(i"p{index}", variant.payload[index].render()));
 					index = index + 1;
 				}
 				let bind_pattern = join(binds, ", ");
@@ -184,6 +193,48 @@ macro fun Debug(item: Item): Source {
 			.render());
 	}
 	source("")
+}
+
+/// The `Debug` derive's rendering of one member at `place`, an expression of
+/// type `str`. A closure has no `Debug` to call, so it prints its written type
+/// as `dbg` does (`<closure |i32| i32>`); a fixed array of a LITERAL length
+/// prints element by element (`[1, 2]`) until arrays of every length take an
+/// impl (array-lengths.md S2); anything else calls its `debug` (E283).
+macro fun debug_member(place: str, written: str): str {
+	import macro_std::option::Option::{ self, Some, None };
+	import macro_std::build::{ quote, join };
+
+	if written.starts_with("|") {
+		ret quote("<closure " + written + ">");
+	}
+	if written.starts_with("[") && written.ends_with("]") && written.contains(";") {
+		let inner = written.substring(1, written.len() - 1);
+		let parts = inner.split(";");
+		let length = parts[parts.len() - 1].trim().parse_i32();
+		if length is Some(let count) {
+			mut element = "";
+			mut index: usize = 0;
+			for index + 1 < parts.len() {
+				if index > 0 {
+					element = element + ";";
+				}
+				element = element + parts[index];
+				index = index + 1;
+			}
+			element = element.trim();
+			if count == 0 {
+				ret quote("[]");
+			}
+			mut items: List<str> = [];
+			mut at = 0;
+			for at < count {
+				items.push(debug_member(i"{place}[{at}]", element));
+				at = at + 1;
+			}
+			ret quote("[") + " + " + join(items, " + " + quote(", ") + " + ") + " + " + quote("]");
+		}
+	}
+	place + ".debug()"
 }
 
 // --- Locations (debugging.md S0) ---
@@ -245,6 +296,21 @@ external fun caller(): Location;
 /// named, imported and documented. A release build refuses it unless
 /// `vilan.toml` sets `[build] dbg = "strip"` or `"keep"`.
 external fun dbg(): void;
+
+// --- `dbg_stack` (debugging.md S2) ---
+
+/// `dbg_stack()` prints every binding in scope at the call to stderr (`console.log`
+/// in the browser): a `[src/main.vl:12:5] dbg_stack() in main` line, then one
+/// `name: Type = value` line per parameter and local, innermost scope first, a
+/// shadowed binding under the one that hides it. The compiler expands the call from
+/// the scope it sits in, so it prints without looking anything up at run time and
+/// the same bytes on both backends. It reads nothing it must not: a resource
+/// already moved prints `<moved at L:C>` (or `<moved on some paths>`), a view a
+/// later push invalidated prints `<view, invalidated by push at L:C>`, a pipe and a
+/// `lazy` parameter print without running, and a cell prints its current value
+/// without subscribing. Inside a closure it lists the closure's own bindings and
+/// then the ones it captures. A release build refuses it, as it refuses `dbg`.
+external fun dbg_stack(): void;
 
 // --- Json / Wire (shared JSON impls via in-world helpers) ---
 

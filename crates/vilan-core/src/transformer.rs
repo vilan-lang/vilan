@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch, ExprPattern, Function,
-    GenericDispatch, Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
+    BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
+    Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::{Error, Note};
@@ -11,6 +11,7 @@ use crate::interpreter::ConstValue;
 use crate::node::{BinaryOp, Convention, ExternBinding};
 use crate::options::BuildOptions;
 use crate::span::Span;
+use crate::teardown;
 use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
 use indexmap::IndexMap;
 use std::borrow::Cow;
@@ -1134,6 +1135,11 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__panic");
         added = true;
     }
+    // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
+    if helpers.contains(&"__dbg_stack") && !helpers.contains(&"__dbg") {
+        helpers.push("__dbg");
+        added = true;
+    }
     if added {
         helpers.sort();
     }
@@ -2008,6 +2014,20 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              \tfor (const entry of document.e) out += pad + entry[0] + __dbg_layout(entry[1], __dbg_width(pad + entry[0]), indent + 2) + \",\\n\";\n\
              \treturn out + \" \".repeat(indent) + document.c;\n\
+             }"
+        }
+        // `dbg_stack()`'s runtime (debugging.md S2): the header line, then one
+        // `  name: Type = value` line per binding, the value laid out from
+        // where it starts with its broken entries two spaces under the
+        // binding, and the binding's note after it — `vilan_rt::show::
+        // dbg_stack`'s twin. Each entry is `[head, document, note]`.
+        "__dbg_stack" => {
+            "function __dbg_stack(write, location, title, entries) {\n\
+             \twrite(\"[\" + location + \"] \" + title);\n\
+             \tfor (const entry of entries) {\n\
+             \t\tconst head = \"  \" + entry[0] + \" = \";\n\
+             \t\twrite(head + __dbg_layout(entry[1], __dbg_width(head), 2) + entry[2]);\n\
+             \t}\n\
              }"
         }
         // `panic(message)` (debugging.md S0): an `Error`, so a stack exists, whose
@@ -3965,7 +3985,7 @@ impl<'src> Transformer<'src> {
         node: js::Node<'src>,
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
-        if !self.type_drops_nontrivially(type_id) {
+        if !teardown::drops_nontrivially(self.program, type_id) {
             return node;
         }
         let name = self.ng.next_name();
@@ -4066,6 +4086,14 @@ impl<'src> Transformer<'src> {
     /// that would otherwise alias its source. `__clone` (not `structuredClone`)
     /// so a value holding closures can be copied.
     fn maybe_clone(&mut self, value_id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        // B571: an ascription's copy is decided at its VALUE (the analyzer's
+        // `peel_ascriptions`), where its coercion is keyed too.
+        let mut value_id = value_id;
+        while self.program.has_ascriptions
+            && let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&value_id)
+        {
+            value_id = *inner;
+        }
         // M90: a read-only `let` of a stable place shares it — nothing can
         // write either side while the binding lives, and it never leaves the
         // frame (`Analyzer::compute_shared_place_lets`).
@@ -4376,6 +4404,7 @@ impl<'src> Transformer<'src> {
             Expr::Unary(_, operand)
             | Expr::Reference(operand, _)
             | Expr::Dereference(operand)
+            | Expr::Ascribe(operand)
             | Expr::Is(operand, _)
             | Expr::Destructure(operand, _) => self.expr_has_side_effects(*operand),
             Expr::Field(subject, _, _)
@@ -5534,6 +5563,10 @@ impl<'src> Transformer<'src> {
             // A macro-name marker: never a value (the analyzer rejects value
             // uses); reached only as an inert statement — emit nothing.
             Expr::Macro => js::Node::Void,
+            // An ascription (B571) evaluates exactly its value: the type it
+            // names was checked, and any coercion it asked for is recorded at
+            // the value's own id, which `walk_entity` applies.
+            Expr::Ascribe(inner) => return self.walk_entity(*inner, block),
             Expr::TupleComprehension(bindings, body_id) => {
                 // A flat tuple is a JS array, so the comprehension lowers to a
                 // runtime `source.map((x) => body)` — arity-independent, no
@@ -6004,13 +6037,28 @@ impl<'src> Transformer<'src> {
                             .get(&target_id)
                             .and_then(|external| external.extern_binding.clone())
                         {
-                            let args =
-                                self.host_arguments(target_id, &function_call.argument_ids, args);
-                            let args = self.number_print_arguments(
+                            // debugging.md S3: a `print` of an aggregate writes the
+                            // printer's text, from the value as vilan holds it;
+                            // anything else reaches the host as before.
+                            let (args, printed) = self.printed_aggregates(
                                 target_id,
                                 &function_call.argument_ids,
                                 args,
                             );
+                            let args = if printed {
+                                args
+                            } else {
+                                let args = self.host_arguments(
+                                    target_id,
+                                    &function_call.argument_ids,
+                                    args,
+                                );
+                                self.number_print_arguments(
+                                    target_id,
+                                    &function_call.argument_ids,
+                                    args,
+                                )
+                            };
                             let call = self.emit_extern(target_id, binding, args);
                             return Some(self.maybe_await(target_id, call));
                         }
@@ -6024,6 +6072,13 @@ impl<'src> Transformer<'src> {
                         }
                         if Some(target_id) == self.program.dbg_fn_id {
                             return Some(self.dbg_call(*id, &function_call.argument_ids, args));
+                        }
+                        if Some(target_id) == self.program.dbg_stack_fn_id {
+                            return Some(self.dbg_stack_call(
+                                *id,
+                                &function_call.argument_ids,
+                                args,
+                            ));
                         }
                         if target_id == self.print_fn_id {
                             return Some(js::Node::Call(
@@ -7923,11 +7978,37 @@ impl<'src> Transformer<'src> {
                 // expression caches no type of its own (a call, an `if`).
                 // The splice is applied AFTER the ordered walk, so a spilled
                 // element is the value and never the `...` around it (B452).
-                let items = self
-                    .walk_siblings_in_order(ids, block, |this, id, block| {
-                        let walked = this.walk_entity(id, block)?;
-                        Some(this.maybe_clone(id, walked))
-                    })
+                let mut walked = self.walk_siblings_in_order(ids, block, |this, id, block| {
+                    let walked = this.walk_entity(id, block)?;
+                    Some(this.maybe_clone(id, walked))
+                });
+                // B569 §4.1: a literal matched by name stores its entries in
+                // its type's order, and still evaluates them as WRITTEN — so
+                // every entry whose value a later one could change is bound
+                // to a `const` first, in written order, and the array reads
+                // the bindings in storage order.
+                if let Some(layout) = self.program.tuple_literal_layouts.get(&id).cloned()
+                    && layout.len() == walked.len()
+                {
+                    for (entry_id, value) in walked.iter_mut() {
+                        if self.sibling_value_is_settled(*entry_id, value) {
+                            continue;
+                        }
+                        let temp = self.ng.next_name();
+                        let evaluated = std::mem::replace(value, js::Node::Local(temp.clone()));
+                        block.push(js::Node::ConstVariable(js::Variable {
+                            name: temp,
+                            value: Box::new(evaluated),
+                        }));
+                    }
+                    let mut written: Vec<Option<(Id, js::Node<'src>)>> =
+                        walked.into_iter().map(Some).collect();
+                    walked = layout
+                        .iter()
+                        .filter_map(|written_index| written[*written_index].take())
+                        .collect();
+                }
+                let items = walked
                     .into_iter()
                     .map(|(id, value)| {
                         let splices =
@@ -8782,7 +8863,7 @@ impl<'src> Transformer<'src> {
         else {
             return None;
         };
-        let Some(Type::Tuple(elements)) = self
+        let Some(Type::Tuple(elements, _)) = self
             .program
             .type_id_to_type_map
             .get(&self.resolve_type_id(source_tuple))
@@ -8800,13 +8881,13 @@ impl<'src> Transformer<'src> {
                 self.program
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(template)),
-                Some(Type::Tuple(_))
+                Some(Type::Tuple(_, _))
             );
             let result_is_tuple = matches!(
                 self.program
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(body_template)),
-                Some(Type::Tuple(_))
+                Some(Type::Tuple(_, _))
             );
             self.current_substitution = outer;
             if source_is_tuple && source_width == 1 {
@@ -9132,7 +9213,7 @@ impl<'src> Transformer<'src> {
                     self.program
                         .type_id_to_type_map
                         .get(&self.resolve_type_id(template)),
-                    Some(Type::Tuple(_))
+                    Some(Type::Tuple(_, _))
                 )
             });
             let mut body = Vec::new();
@@ -9291,7 +9372,7 @@ impl<'src> Transformer<'src> {
             .type_id_to_type_map
             .get(&self.resolve_type_id(type_id))
         {
-            Some(Type::Tuple(elements)) => {
+            Some(Type::Tuple(elements, _)) => {
                 elements.clone().iter().map(|id| self.flat_width(*id)).sum()
             }
             _ => 1,
@@ -9315,7 +9396,8 @@ impl<'src> Transformer<'src> {
         let mut type_id = self.resolve_type_id(*root_type_id);
         let mut offset = 0;
         for index in path {
-            let Some(Type::Tuple(elements)) = self.program.type_id_to_type_map.get(&type_id) else {
+            let Some(Type::Tuple(elements, _)) = self.program.type_id_to_type_map.get(&type_id)
+            else {
                 return baked;
             };
             let elements = elements.clone();
@@ -10124,7 +10206,7 @@ impl<'src> Transformer<'src> {
                     self.program
                         .type_id_to_type_map
                         .get(&self.resolve_type_id(result_template)),
-                    Some(Type::Tuple(_))
+                    Some(Type::Tuple(_, _))
                 );
                 self.current_substitution = outer;
                 is_tuple
@@ -10222,7 +10304,7 @@ impl<'src> Transformer<'src> {
                 self.program
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(element)),
-                Some(Type::Tuple(_))
+                Some(Type::Tuple(_, _))
             );
             self.current_substitution = outer;
             positions.push((offset, width, is_tuple));
@@ -10245,7 +10327,7 @@ impl<'src> Transformer<'src> {
             .type_id_to_type_map
             .get(&self.resolve_type_id(type_id))?
         {
-            Type::Tuple(elements) => Some(
+            Type::Tuple(elements, _) => Some(
                 elements
                     .iter()
                     .map(|element| (*element, Vec::new()))
@@ -10541,13 +10623,12 @@ impl<'src> Transformer<'src> {
             return None;
         }
         let statements = &function.body.0;
-        let teardown = ScopeTeardown::Captures(parameters.iter().map(|(id, _)| *id).collect());
+        let bindings: Vec<Id> = parameters.iter().map(|(id, _)| *id).collect();
         // The parameters' region starts at the body's entry rather than after a
         // declaration statement, and — like any region — must cover every
         // teardown declared inside it.
         let end = statements.len();
-        let own = self.own_teardown_extent(&teardown, statements, 0, end);
-        let extent = self.widen_over_declarations(own, statements, 0, end);
+        let extent = teardown::region_end(self.program, &bindings, statements, 0, end);
         (extent < end).then_some(extent)
     }
 
@@ -10560,7 +10641,7 @@ impl<'src> Transformer<'src> {
             .filter(|parameter_id| self.program.dropped_bindings.contains(parameter_id))
             .filter_map(|parameter_id| {
                 let type_id = self.program.parameters.get(parameter_id)?.type_id;
-                self.type_drops_nontrivially(type_id)
+                teardown::drops_nontrivially(self.program, type_id)
                     .then_some((*parameter_id, type_id))
             })
             .collect()
@@ -11619,18 +11700,17 @@ impl<'src> Transformer<'src> {
     /// `let`'s teardown, or — B62 — the resource payloads a `let`-pattern
     /// captured out of a consumed subject. Nothing for every other statement.
     fn statement_teardown(&self, statement: Id) -> ScopeTeardown {
+        // N154: what a statement owes is `teardown::statement_teardown`'s
+        // answer, which the native emitter reads too; the shape (one `let`, or
+        // a destructure's captures) is this emitter's, since it decides how
+        // the drop is written.
+        let bindings = teardown::statement_teardown(self.program, statement);
+        if bindings.is_empty() {
+            return ScopeTeardown::None;
+        }
         match self.program.entity_map.get(&statement) {
-            Some(Expr::Variable(variable_id))
-                if self.program.dropped_bindings.contains(variable_id)
-                    && self.binding_drops_nontrivially(*variable_id) =>
-            {
-                ScopeTeardown::Binding(*variable_id)
-            }
-            Some(Expr::Destructure(_, pattern)) => match self.droppable_pattern_captures(pattern) {
-                captures if captures.is_empty() => ScopeTeardown::None,
-                captures => ScopeTeardown::Captures(captures),
-            },
-            _ => ScopeTeardown::None,
+            Some(Expr::Variable(variable_id)) => ScopeTeardown::Binding(*variable_id),
+            _ => ScopeTeardown::Captures(bindings),
         }
     }
 
@@ -11642,7 +11722,7 @@ impl<'src> Transformer<'src> {
             .into_iter()
             .filter(|capture_id| {
                 self.program.dropped_bindings.contains(capture_id)
-                    && self.binding_drops_nontrivially(*capture_id)
+                    && teardown::binding_drops_nontrivially(self.program, *capture_id)
             })
             .collect()
     }
@@ -11673,23 +11753,6 @@ impl<'src> Transformer<'src> {
             }
         }
         drops
-    }
-
-    /// Whether a dropped binding's type actually destroys something (a `Drop` impl
-    /// or a resource member) — as opposed to a bare `resource external` leaf with
-    /// no destructor, whose scope-end drop is a no-op.
-    fn binding_drops_nontrivially(&self, variable_id: Id) -> bool {
-        self.program
-            .variables
-            .get(&variable_id)
-            .is_some_and(|variable| self.type_drops_nontrivially(variable.type_id))
-    }
-
-    fn type_drops_nontrivially(&self, type_id: TypeId) -> bool {
-        self.program
-            .drop_glue
-            .get(&type_id)
-            .is_some_and(|glue| glue.drop_method.is_some() || !glue.members.is_empty())
     }
 
     /// Emit a scope body (statements + tail) with per-resource `try`/`finally`
@@ -11770,7 +11833,8 @@ impl<'src> Transformer<'src> {
     /// Where a declaration's teardown region ends — an EXCLUSIVE index into
     /// `statements`, never past `end` and never before `declaration + 1`.
     ///
-    /// The analyzer answers per BINDING ([`DropExtent`], `lifetimes.md` §6) with
+    /// The analyzer answers per BINDING ([`crate::analyzer::DropExtent`],
+    /// `lifetimes.md` §6) with
     /// the chain of statements enclosing the last read, outermost first; this
     /// picks the chain element that is a direct statement of the range being
     /// emitted. Three refusals all fall back to `end`, which is the scope-end
@@ -11804,98 +11868,12 @@ impl<'src> Transformer<'src> {
         declaration: usize,
         end: usize,
     ) -> usize {
-        let own = self.own_teardown_extent(teardown, statements, declaration + 1, end);
-        self.widen_over_declarations(own, statements, declaration + 1, end)
-    }
-
-    /// Grow `extent` until every name declared in `statements[start..extent]`
-    /// has its last read inside it. Monotone and bounded by `end`.
-    ///
-    /// `statements[index]` is a DIRECT statement of the region being emitted,
-    /// which is exactly how `liveness::LastUse::declared_binding_extents` keys
-    /// its map: the innermost statement enclosing each declaration. The two
-    /// sides must agree, and `statements` is whatever range this call owns — an
-    /// `if` arm's, a `match` leg's, a loop body's — so a key measured from the
-    /// enclosing function instead would match only at a body's top level and
-    /// silently skip every nested region (B159).
-    fn widen_over_declarations(
-        &self,
-        mut extent: usize,
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
-        loop {
-            let mut widened = extent;
-            for index in start..extent {
-                let Some(declared) = self
-                    .program
-                    .declared_binding_extents
-                    .get(&statements[index])
-                else {
-                    continue;
-                };
-                for binding_extent in declared {
-                    // Measured from the declaring statement itself, not after
-                    // it: a `for` item or an `is` capture has its last read
-                    // INSIDE the statement that declares it, and resolving from
-                    // the next one would find no chain element and refuse.
-                    widened =
-                        widened.max(Self::resolve_extent(binding_extent, statements, index, end));
-                }
-            }
-            if widened == extent {
-                return extent;
-            }
-            extent = widened;
-        }
-    }
-
-    /// One [`DropExtent`] resolved against a statement range: the exclusive
-    /// index its last read sits at, `start` when nothing reads it, and `end`
-    /// for every refusal (an explicit scope end, or a chain naming no statement
-    /// of this range — the read is in the scope's tail).
-    fn resolve_extent(extent: &DropExtent, statements: &[Id], start: usize, end: usize) -> usize {
-        let start = start.min(end);
-        match extent {
-            DropExtent::ScopeEnd => end,
-            DropExtent::Declaration => start,
-            DropExtent::Statement(chain) => {
-                let region = &statements[start..end];
-                match chain
-                    .iter()
-                    .find_map(|holder| region.iter().position(|s| s == holder))
-                {
-                    Some(offset) => start + offset + 1,
-                    None => end,
-                }
-            }
-        }
-    }
-
-    /// One teardown's own extent, before nesting is taken into account: the
-    /// exclusive statement index its last use sits at, `start` when nothing
-    /// reads it, and `end` for every refusal.
-    fn own_teardown_extent(
-        &self,
-        teardown: &ScopeTeardown,
-        statements: &[Id],
-        start: usize,
-        end: usize,
-    ) -> usize {
         let bindings: &[Id] = match teardown {
             ScopeTeardown::None => return end,
             ScopeTeardown::Binding(binding) => std::slice::from_ref(binding),
             ScopeTeardown::Captures(captures) => captures.as_slice(),
         };
-        let mut extent = start.min(end);
-        for binding in bindings {
-            let Some(binding_extent) = self.program.drop_extents.get(binding) else {
-                return end;
-            };
-            extent = extent.max(Self::resolve_extent(binding_extent, statements, start, end));
-        }
-        extent.min(end)
+        teardown::region_end(self.program, bindings, statements, declaration + 1, end)
     }
 
     /// Emit a loop body's nodes (statements + discarded tail), with per-resource
@@ -12579,7 +12557,7 @@ impl<'src> Transformer<'src> {
                 .program
                 .type_id_to_type_map
                 .get(&self.resolve_type_id(type_id))
-                .is_some_and(|type_| matches!(type_, Type::Tuple(_)));
+                .is_some_and(|type_| matches!(type_, Type::Tuple(_, _)));
         }
         self.program
             .tuple_element_types
@@ -12589,7 +12567,7 @@ impl<'src> Transformer<'src> {
                     .type_id_to_type_map
                     .get(&self.resolve_type_id(*type_id))
             })
-            .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
+            .is_some_and(|type_| matches!(type_, Type::Tuple(_, _)))
     }
 
     /// Whether a `for x in ...` loop's iterable is the built-in `HashSet` — a vilan
@@ -12849,7 +12827,7 @@ impl<'src> Transformer<'src> {
                 let _ = write!(out, "D{}", id.0);
                 self.write_type_key_arguments(arguments, out);
             }
-            Type::Tuple(elements) => {
+            Type::Tuple(elements, _) => {
                 out.push_str("Tup");
                 self.write_type_key_arguments(elements, out);
             }
@@ -14249,6 +14227,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__dbg_members",
     "__dbg_map",
     "__dbg_set",
+    "__dbg_stack",
     "__scan",
     "__parse_i32",
     "__parse_f64",

@@ -19,7 +19,7 @@
 //! are the runtimes' (`__dbg_*` on JS, `vilan_rt::show` natively), written
 //! twice and pinned against each other by the native differential.
 
-use crate::analyzer::{BackingValue, Program};
+use crate::analyzer::{BackingValue, DbgStackBinding, DbgStackSite, DbgStackValue, Program};
 use crate::id::Id;
 use crate::impl_select;
 use crate::type_::{Type, TypeId};
@@ -57,8 +57,10 @@ pub enum Shape {
     Backed {
         variants: Vec<(String, BackingValue)>,
     },
-    /// A tuple: its element types, in order.
-    Tuple(Vec<TypeId>),
+    /// A tuple: its element types, in order, each with the text its entry
+    /// opens with — `x = ` for a labelled slot (B569 S3: `dbg` prints the
+    /// literal, `(x = 5.0, y = 7.0)`), empty for a positional one.
+    Tuple(Vec<(String, TypeId)>),
     /// `List<T>` and `[T; n]`.
     List(TypeId),
     /// A value that prints as fixed text: a closure by its type, a pipe by
@@ -131,7 +133,180 @@ fn is_integer_name(name: &str) -> bool {
 /// The slot is one function reference per (trait, type) table, so a program
 /// that never calls `dbg` pays nothing (§2.3).
 pub fn tables_carry_show(program: &Program, policy: crate::options::DbgPolicy) -> bool {
-    policy != crate::options::DbgPolicy::Strip && !program.dbg_calls.is_empty()
+    (policy != crate::options::DbgPolicy::Strip
+        && (!program.dbg_calls.is_empty() || !program.dbg_stack_sites.is_empty()))
+        || program
+            .print_argument_types
+            .values()
+            .any(|type_id| may_hold_an_object(program, *type_id, &mut Vec::new()))
+}
+
+/// S3: whether a value of `type_id` may hold a trait object a `print` reaches —
+/// the type names a `dyn`, or a generic an instance could bind to one.
+fn may_hold_an_object(program: &Program, type_id: TypeId, seen: &mut Vec<TypeId>) -> bool {
+    if seen.contains(&type_id) {
+        return false;
+    }
+    seen.push(type_id);
+    match program.type_id_to_type_map.get(&type_id) {
+        Some(Type::Dyn(..) | Type::Generic(_)) => true,
+        Some(Type::Tuple(elements, _)) => elements
+            .iter()
+            .any(|element| may_hold_an_object(program, *element, seen)),
+        Some(Type::Array(element, _)) => may_hold_an_object(program, *element, seen),
+        Some(Type::Struct(struct_id, arguments)) => {
+            arguments
+                .iter()
+                .any(|argument| may_hold_an_object(program, *argument, seen))
+                || program.structs.get(struct_id).is_some_and(|declaration| {
+                    declaration
+                        .fields
+                        .iter()
+                        .any(|field| may_hold_an_object(program, field.type_id, seen))
+                })
+        }
+        Some(Type::Enum(enum_id, arguments)) => {
+            arguments
+                .iter()
+                .any(|argument| may_hold_an_object(program, *argument, seen))
+                || program.enums.get(enum_id).is_some_and(|declaration| {
+                    declaration.variants.iter().any(|variant| {
+                        variant
+                            .data_type_ids
+                            .iter()
+                            .any(|payload| may_hold_an_object(program, *payload, seen))
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
+/// debugging.md S3 (P2, the 2026-10-09 ruling): whether `print` writes a value
+/// of this shape through the printer — on one line (`print` never breaks
+/// lines), a float inside it keeping its `.0`, a backed enum by its NAME. A
+/// number, a bool, a string and `()` keep `print`'s own rendering (`console.log`
+/// on JS: `3.0` prints `3`, a string raw), and so does a host or opaque value
+/// the printer could only name (`<Location>`), which `console.log` shows — a
+/// bare closure among them, which the native backend refuses to print (F25).
+/// A closure INSIDE an aggregate prints its type, as `dbg` prints it.
+pub fn print_uses_the_printer(shape: &Shape) -> bool {
+    match shape {
+        Shape::Integer | Shape::Float | Shape::BigInt | Shape::Bool | Shape::Str | Shape::Void => {
+            false
+        }
+        Shape::Text(text) => text.starts_with("<pipe "),
+        Shape::Struct { .. }
+        | Shape::Enum { .. }
+        | Shape::Backed { .. }
+        | Shape::Tuple(_)
+        | Shape::List(_)
+        | Shape::Shared(_)
+        | Shape::Cell { .. }
+        | Shape::Map { .. }
+        | Shape::Set { .. }
+        | Shape::Object { .. } => true,
+    }
+}
+
+// --- `dbg_stack()` (debugging.md S2) ---
+//
+// A site prints a header line, then one line per listed binding:
+//
+//     [src/main.vl:12:5] dbg_stack() in main
+//       rows: List<i32> = [1, 2]
+//       first: view i32 = 1  (a view into rows)
+//       guard: Guard = <moved at 9:10>
+//       x (shadowed at 7:6): i32 = 1
+//
+// A value lays out from where it starts, its broken entries two spaces under
+// the binding. The text around the values is spelled here, once, so the two
+// emitters write the same bytes; each emitter only reads the value.
+
+/// The header line's text after the location: `dbg_stack() in main`.
+pub fn dbg_stack_title(site: &DbgStackSite) -> String {
+    match &site.owner {
+        Some(owner) => format!("dbg_stack() in {owner}"),
+        None => "dbg_stack()".to_string(),
+    }
+}
+
+/// A binding line's head, before ` = `: `x (shadowed at 7:6): view i32`. The
+/// type is resolved under the emitter's active substitution.
+pub fn dbg_stack_head(
+    program: &Program,
+    binding: &DbgStackBinding,
+    resolve: &dyn Fn(TypeId) -> TypeId,
+) -> String {
+    let shadowed = binding
+        .shadowed_at
+        .as_ref()
+        .map(|at| format!(" (shadowed at {at})"))
+        .unwrap_or_default();
+    let view = if binding.view { "view " } else { "" };
+    format!(
+        "{}{shadowed}: {view}{}",
+        binding.name,
+        type_text(program, binding.type_id, resolve)
+    )
+}
+
+/// What a binding prints INSTEAD of its value, when it prints one: a moved
+/// resource, an invalidated view, a pipe (sampling it would run it) and a
+/// `lazy` parameter (reading it would force it) are never read.
+pub fn dbg_stack_unread_value(
+    program: &Program,
+    binding: &DbgStackBinding,
+    resolve: &dyn Fn(TypeId) -> TypeId,
+) -> Option<String> {
+    match &binding.value {
+        DbgStackValue::Read(_) => is_pipe_type(program, binding.type_id, resolve)
+            .then(|| "<pipe, not sampled>".to_string()),
+        DbgStackValue::Moved(at) => Some(format!("<moved at {at}>")),
+        DbgStackValue::MovedOnSomePaths => Some("<moved on some paths>".to_string()),
+        DbgStackValue::Invalidated { by, at } => {
+            Some(format!("<view, invalidated by {by} at {at}>"))
+        }
+        DbgStackValue::Pipe => Some("<pipe, not sampled>".to_string()),
+        DbgStackValue::Lazy => Some("<lazy, not forced>".to_string()),
+    }
+}
+
+/// What follows a binding's value: `  (a view into rows)`, `  (captured)`, a
+/// cell's `  (read without tracking)` — or nothing.
+pub fn dbg_stack_note(
+    program: &Program,
+    binding: &DbgStackBinding,
+    resolve: &dyn Fn(TypeId) -> TypeId,
+) -> String {
+    let mut notes: Vec<String> = Vec::new();
+    if !binding.view_into.is_empty() {
+        notes.push(format!("a view into {}", binding.view_into.join(", ")));
+    }
+    if binding.captured {
+        notes.push("captured".to_string());
+    }
+    if matches!(binding.value, DbgStackValue::Read(_))
+        && matches!(
+            shape_of(program, binding.type_id, resolve),
+            Shape::Cell { .. }
+        )
+    {
+        notes.push("read without tracking".to_string());
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", notes.join(", "))
+    }
+}
+
+/// Whether `type_id` (under `resolve`) is a std pipe, which prints by its type.
+fn is_pipe_type(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> bool {
+    matches!(
+        program.type_id_to_type_map.get(&resolve(type_id)),
+        Some(Type::Struct(struct_id, _)) if is_a_pipe(program, *struct_id)
+    )
 }
 
 /// E275: the trait a WRITTEN `Debug` impl for `type_id` is reached through —
@@ -198,19 +373,86 @@ fn is_std(program: &Program, id: Id) -> bool {
         .is_some_and(|source| program.std_sources.contains(&source))
 }
 
+/// The LABELS a printer for `type_id` writes (B569 S3), spelled for a
+/// printer cache's key: every tuple label the type reaches, in walk order,
+/// and the empty string for a type that reaches none. The emitters key their
+/// printers by the type's identity, which a label is no part of (labels
+/// erase at mono), so a key that is only the identity would hand
+/// `(x: i32, y: i32)` the printer `(i32, i32)` built first, or the reverse.
+pub fn label_key(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> String {
+    fn walk(
+        program: &Program,
+        type_id: TypeId,
+        resolve: &dyn Fn(TypeId) -> TypeId,
+        out: &mut String,
+    ) {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return;
+        };
+        let written = type_id;
+        let type_id = resolve(type_id);
+        let Some(resolved) = program.type_id_to_type_map.get(&type_id) else {
+            return;
+        };
+        match resolved {
+            Type::Tuple(elements, labels) => {
+                // Erased through a substitution, as `shape_of` reads it.
+                if written == type_id
+                    && let Some(labels) = labels.labels()
+                {
+                    out.push('(');
+                    out.push_str(&labels.join(","));
+                    out.push(')');
+                }
+                for element in elements {
+                    walk(program, *element, resolve, out);
+                }
+            }
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => {
+                for argument in arguments {
+                    walk(program, *argument, resolve, out);
+                }
+            }
+            Type::Array(element, _) => walk(program, *element, resolve, out),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    walk(program, type_id, resolve, &mut out);
+    out
+}
+
 /// The printing shape of `type_id`. `resolve` grounds a generic under the
 /// asking emitter's active substitution (and returns any other id as is);
 /// the shape's own type ids are NOT resolved — an emitter recursing into a
 /// field resolves it under the shape's `bindings`.
 pub fn shape_of(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> Shape {
+    let written = type_id;
     let type_id = resolve(type_id);
+    // B569 §5: labels print where the type was WRITTEN with them. A type that
+    // reaches the printer through a generic's substitution reaches it erased:
+    // label sets share one instance (§6.3), so the labels there are whichever
+    // instantiation was emitted first, and printing them would be a guess.
+    let erased = written != type_id;
     let Some(resolved) = program.type_id_to_type_map.get(&type_id) else {
         return Shape::Text("<unknown>".to_string());
     };
     match resolved {
         Type::Void => Shape::Void,
-        Type::Tuple(elements) if elements.is_empty() => Shape::Void,
-        Type::Tuple(elements) => Shape::Tuple(elements.clone()),
+        Type::Tuple(elements, _) if elements.is_empty() => Shape::Void,
+        Type::Tuple(elements, labels) => Shape::Tuple(
+            elements
+                .iter()
+                .enumerate()
+                .map(|(slot, element)| {
+                    let opens = labels
+                        .get(slot)
+                        .filter(|_| !erased)
+                        .map_or_else(String::new, |label| format!("{label} = "));
+                    (opens, *element)
+                })
+                .collect(),
+        ),
         Type::Array(element, _) => Shape::List(*element),
         Type::Closure(..) | Type::Function(_) => Shape::Text(format!(
             "<closure {}>",
@@ -445,7 +687,7 @@ pub fn type_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) ->
                 .unwrap_or("?"),
             arguments_text(arguments)
         ),
-        Some(Type::Tuple(elements)) => {
+        Some(Type::Tuple(elements, _)) => {
             let parts: Vec<String> = elements
                 .iter()
                 .map(|element| type_text(program, *element, resolve))

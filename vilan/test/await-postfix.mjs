@@ -53,18 +53,27 @@ function __task(run, origin, nursery) {
 	return new __Task(run, origin, nursery);
 }
 async function sleep(ms, $b) {
-	await (__sleep(ms, ambient_signal($b)));
+	await (__sleep(clamp_delay(ms), ambient_signal($b)));
 }
-function ambient_signal($c) {
-	const $d = $c;
-	let $e = null;
-	if ($d[0] === 0) {
-		const n = $d[1];
-		$e = [ 0, n.signal_of() ];
+function clamp_delay(ms) {
+	let $c = null;
+	if (ms < 0) {
+		$c = 0;
 	} else {
-		$e = [ 1 ];
+		$c = ms;
 	}
-	return $e;
+	return $c;
+}
+function ambient_signal($d) {
+	const $e = $d;
+	let $f = null;
+	if ($e[0] === 0) {
+		const n = $e[1];
+		$f = [ 0, n.signal_of() ];
+	} else {
+		$f = [ 1 ];
+	}
+	return $f;
 }
 function doubled(self) {
 	return self[0] * 2;
@@ -73,16 +82,16 @@ async function fetch_row($a) {
 	await (sleep(0, $a));
 	return [ 7, "seven" ];
 }
-async function fetch_list($f) {
-	await (sleep(0, $f));
+async function fetch_list($g) {
+	await (sleep(0, $g));
 	return [ 10, 20, 30 ];
 }
-async function fetch_num($h) {
-	await (sleep(0, $h));
+async function fetch_num($i) {
+	await (sleep(0, $i));
 	return 5;
 }
-async function fetch_maker($g) {
-	await (sleep(0, $g));
+async function fetch_maker($h) {
+	await (sleep(0, $h));
 	return () => {
 		return 99;
 	};
@@ -101,7 +110,7 @@ async function fetch_maker($g) {
 	console.log(String(await (fetch_num([ 1 ])) + 1));
 	const row = await (fetch_row([ 1 ]));
 	console.log(String(row[0]));
-})().catch(($i) => {
-	console.error(String($i));
+})().catch(($j) => {
+	console.error(String($j));
 	process.exit(1);
 });

@@ -40,183 +40,11 @@ mod scratch;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use replay_harness::std_spec;
-use vilan_core::incremental::{
-    Census, Plant, clean_analysis, clean_analysis_keeping_hot_shape, render_observation, set_plant,
-};
-use vilan_core::{BuildOptions, Platform, Workspace, analyze_source, transform};
+use replay_harness::packages::*;
+use vilan_core::Platform;
+use vilan_core::incremental::{Census, Plant, set_plant};
 
 static SWITCH_LOCK: Mutex<()> = Mutex::new(());
-
-/// One package on disk, its open buffers in the document overlay.
-struct Package {
-    directory: PathBuf,
-    entry: PathBuf,
-    platform: Platform,
-    /// The text each file holds NOW (the overlay's, once edited).
-    texts: Vec<(String, String)>,
-}
-
-impl Package {
-    fn write(name: &str, platform: Platform, files: &[(&str, &str)]) -> Package {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory =
-            scratch::root().join(format!("vilan_m110_{name}_{}_{unique}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create the package directory");
-        for (file, text) in files {
-            std::fs::write(directory.join(file), text).expect("write a package file");
-        }
-        Package {
-            entry: directory.join("main.vl"),
-            directory,
-            platform,
-            texts: files
-                .iter()
-                .map(|(file, text)| (file.to_string(), text.to_string()))
-                .collect(),
-        }
-    }
-
-    fn path(&self, file: &str) -> PathBuf {
-        self.directory.join(file)
-    }
-
-    fn text(&self, file: &str) -> &str {
-        &self
-            .texts
-            .iter()
-            .find(|(name, _)| name == file)
-            .unwrap_or_else(|| panic!("no file {file} in the package"))
-            .1
-    }
-
-    /// The editor's keystroke: the buffer moves, through the overlay every
-    /// load and every base-cache validation reads.
-    fn set(&mut self, file: &str, text: String) {
-        vilan_core::analyzer::set_document_overlay(&self.path(file), Some(text.clone()));
-        for (name, current) in &mut self.texts {
-            if name == file {
-                *current = text;
-                return;
-            }
-        }
-        panic!("no file {file} in the package");
-    }
-
-    fn remove(self) {
-        for (file, _) in &self.texts {
-            vilan_core::analyzer::set_document_overlay(&self.path(file), None);
-        }
-        let _ = std::fs::remove_dir_all(&self.directory);
-    }
-}
-
-/// What one analysis showed, and what it did to get there.
-struct Observation {
-    rendering: String,
-    javascript: Option<String>,
-    census: Census,
-}
-
-/// Which analysis [`observe`] runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Leg {
-    /// The incremental one, every reuse on, the seeds as the edited files.
-    Incremental,
-    /// The canonical clean one: nothing reused, no hot set — what everything
-    /// an editor reads is compared against.
-    Clean,
-    /// Clean, but built in the hot-set shape the seeds ask for — what the
-    /// emitted JS is compared against (a hot-set world numbers its hot
-    /// modules' declarations after the prefix's, so its JS orders them
-    /// differently from the canonical world's; a hot-set program is never
-    /// emitted, and its JS is still the sharpest check that nothing reused was
-    /// stale).
-    CleanSameShape,
-}
-
-/// One analysis of `package`'s entry, on a big-stack worker like every real
-/// pipeline.
-fn observe(package: &Package, seeds: Vec<PathBuf>, leg: Leg) -> Observation {
-    let entry_text = package.text("main.vl").to_string();
-    let pkg_root = package.directory.clone();
-    let entry = package.entry.clone();
-    let platform = package.platform;
-    std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
-        .spawn(move || {
-            let leaked: &'static str = Box::leak(entry_text.into_boxed_str());
-            let workspace = Workspace {
-                hot_seeds: seeds,
-                ..Workspace::default()
-            };
-            let analyze = || {
-                analyze_source(
-                    leaked,
-                    &std_spec(),
-                    &pkg_root,
-                    &entry,
-                    Some(platform),
-                    &workspace,
-                )
-            };
-            let (program, errors) = match leg {
-                Leg::Incremental => analyze(),
-                Leg::Clean => clean_analysis(analyze),
-                Leg::CleanSameShape => clean_analysis_keeping_hot_shape(analyze),
-            };
-            let census = vilan_core::incremental::census();
-            let rendering = program
-                .as_ref()
-                .map(|program| render_observation(program, &errors))
-                .unwrap_or_else(|| format!("no program: {errors:?}"));
-            let javascript = match program {
-                Some(program) if errors.is_empty() => {
-                    transform(&program, &BuildOptions::default()).ok()
-                }
-                _ => None,
-            };
-            Observation {
-                rendering,
-                javascript,
-                census,
-            }
-        })
-        .expect("spawn worker")
-        .join()
-        .expect("worker panicked")
-}
-
-/// The first row where two renderings part, for the failure message.
-fn first_difference(incremental: &str, clean: &str) -> String {
-    let left: Vec<&str> = incremental.lines().collect();
-    let right: Vec<&str> = clean.lines().collect();
-    let at = left
-        .iter()
-        .zip(&right)
-        .position(|(a, b)| a != b)
-        .unwrap_or(left.len().min(right.len()));
-    format!(
-        "row {at}:\n    incremental: {:?}\n    clean:       {:?}\n    ({} rows against {})",
-        left.get(at),
-        right.get(at),
-        left.len(),
-        right.len()
-    )
-}
-
-/// One edit: replacements in one file (applied in order), the file the editor
-/// is typing into (usually that file — `seed` overrides it for the step where
-/// a PREFIX module moves under a seed elsewhere), and a name for the report.
-struct Edit {
-    label: &'static str,
-    file: &'static str,
-    seed: Option<&'static str>,
-    replacements: &'static [(&'static str, &'static str)],
-}
 
 /// Applies `edit`, observes incrementally and cleanly, compares; then undoes it
 /// and does the same. Answers every divergence found and the incremental
@@ -269,269 +97,6 @@ fn replay(package: &mut Package, edit: &Edit, divergences: &mut Vec<String>) -> 
     censuses
 }
 
-// --- the §6 edit classes ------------------------------------------------------
-
-const CLASSES_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::impls;\nimport pkg::user::use_it;\nimport pkg::side::side_value;\nimport pkg::ext;\nimport pkg::reader::shouted;\nimport pkg::runner::run_read;\nimport pkg::bag::fill;\nimport pkg::a_spoil::spoil;\nimport pkg::painter::painted;\nimport pkg::shiner::shone;\nimport pkg::bar_eq;\nimport pkg::bar_user::bars_match;\nimport pkg::data_user::{ banner, smaller };\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(use_it());\n\tprint(side_value());\n\tprint(shouted());\n\tprint(run_read());\n\tfill();\n\tspoil();\n\tprint(painted());\n\tprint(shone());\n\tprint(bars_match());\n\tprint(banner());\n\tprint(smaller());\n}\n";
-
-// S1's hazards, each a module the PREFIX holds and a module the hot set holds:
-// an inherent impl on a prefix type, written in a module the caller never
-// imports (`ext` / `reader`, the impl guard's case); a context whose value type
-// only a hot module's `run` grounds (`ctx` / `runner`, the early-commitment
-// guard's case); and a module binding two modules push into, the hot one
-// first in load order (`bag` / `a_spoil`, which side of a conflict is blamed).
-const CLASSES_EXT: &str =
-    "import pkg::shapes::Foo;\n\nimpl Foo {\n\tfun shout(self): str {\n\t\t\"HI\"\n\t}\n}\n";
-
-const CLASSES_READER: &str = "import pkg::shapes::Foo;\n\nexport fun shouted(): str {\n\tlet foo = Foo { n = 2 };\n\tfoo.shout()\n}\n";
-
-const CLASSES_CTX: &str = "import std::context::Context;\n\nexport let mood = Context::new();\n\nexport fun read_mood(): i32 {\n\tmood.get() + 1\n}\n";
-
-const CLASSES_RUNNER: &str = "import pkg::ctx::{ mood, read_mood };\n\nexport fun run_read(): i32 {\n\tmut seen = 0;\n\tmood.run(5, || {\n\t\tseen = read_mood();\n\t});\n\tseen\n}\n";
-
-const CLASSES_BAG: &str = "export mut bag = [];\n\nexport fun fill() {\n\tbag.push(1);\n}\n";
-
-const CLASSES_SPOIL: &str = "import pkg::bag::bag;\n\nexport fun spoil() {\n\tbag.push(2);\n}\n";
-
-const CLASSES_MODEL: &str = "import std::context::Context;\n\nexport struct Item {\n\tname: str,\n\tcount: i32,\n}\n\nexport let flavor: Context<i32> = Context::new();\n\nmut items = [];\n\nexport fun add() {\n\titems.push(1);\n}\n\nexport fun show(): i32 {\n\titems[0] + 1\n}\n\nexport fun make() {\n\t1\n}\n\nexport fun leaf(): i32 {\n\t1\n}\n\nexport fun size(): i32 {\n\t4\n}\n\nexport fun first_item(): Item {\n\tItem { name = \"a\", count = 1 }\n}\n";
-
-const CLASSES_VIEWS: &str = "import pkg::model::{ add, first_item, leaf, make, show, size };\n\nexport fun render(): i32 {\n\tadd();\n\tlet made: i32 = make();\n\tlet item = first_item();\n\tlet table = const size() * 2;\n\tmade + show() + leaf() + item.count + table\n}\n";
-
-const CLASSES_CYCLE_A: &str = "import pkg::cycle_b::bounce;\nimport pkg::model::leaf;\n\nexport fun ring(n: i32): i32 {\n\tif n > 3 {\n\t\tn\n\t} else {\n\t\tbounce(n + 1) + leaf()\n\t}\n}\n";
-
-const CLASSES_CYCLE_B: &str =
-    "import pkg::cycle_a::ring;\n\nexport fun bounce(n: i32): i32 {\n\tring(n + 1)\n}\n";
-
-const CLASSES_SHAPES: &str = "export struct Foo {\n\tn: i32,\n}\n\nexport trait Greet {\n\tfun greet(self): str;\n}\n\nexport struct Bar {\n\tn: i32,\n}\n\nexport trait Shine {\n\tfun shine(self): i32;\n}\n";
-
-// M121's hot impls on PREFIX types, as kolt writes them: an inherent impl
-// whose members' returns are inferred (`styles.vl`'s `impl style::Style`), and
-// a trait impl on a type another module declares (`prefs.vl`'s `impl HashMap
-// with Json`) — each called only from a module that imports it, so no
-// question the stored prefix asked reaches them and the hot-set world serves
-// them. And one the prefix DOES reach, through an operator: `bar_user` (a
-// prefix module) compares two `Bar`s, and `bar_eq` (hot) is their `PartialEq`.
-const CLASSES_PAINT: &str =
-    "import pkg::shapes::Foo;\n\nimpl Foo {\n\tfun paint(self) {\n\t\t\"p\"\n\t}\n}\n";
-
-const CLASSES_PAINTER: &str = "import pkg::paint;\nimport pkg::shapes::Foo;\n\nexport fun painted(): str {\n\tlet foo = Foo { n = 4 };\n\tfoo.paint()\n}\n";
-
-const CLASSES_SHINE: &str = "import pkg::shapes::{ Foo, Shine };\n\nimpl Foo with Shine {\n\tfun shine(self): i32 {\n\t\tself.n\n\t}\n}\n";
-
-const CLASSES_SHINER: &str = "import pkg::shine;\nimport pkg::shapes::{ Foo, Shine };\n\nexport fun shone(): i32 {\n\tlet foo = Foo { n = 5 };\n\tfoo.shine()\n}\n";
-
-const CLASSES_BAR_EQ: &str = "import std::compare::PartialEq;\nimport pkg::shapes::Bar;\n\nimpl Bar with PartialEq {\n\tfun eq(self, other: Self): bool {\n\t\tself.n == other.n\n\t}\n}\n";
-
-// M110 S4's const sites over the project and std: one reads an input file the
-// edit script moves, one calls a std function the script edits in std itself.
-const CLASSES_DATA_USER: &str = "import std::math;\nimport std::web::asset;\n\nexport fun banner(): str {\n\tconst asset::read(\"banner.txt\")\n}\n\nexport fun smaller(): i32 {\n\tconst math::minmax(2, 1).0\n}\n";
-
-const CLASSES_BANNER: &str = "hello\n";
-
-const CLASSES_BAR_USER: &str = "import pkg::shapes::Bar;\n\nexport fun bars_match(): bool {\n\tBar { n = 1 } == Bar { n = 1 }\n}\n";
-
-const CLASSES_IMPLS: &str = "import pkg::shapes::{ Foo, Greet };\n\nexport impl Foo with Greet {\n\tfun greet(self): str {\n\t\t\"hi\"\n\t}\n}\n";
-
-const CLASSES_USER: &str = "import pkg::shapes::{ Foo, Greet };\n\nexport fun use_it(): str {\n\tlet foo = Foo { n = 1 };\n\tfoo.greet()\n}\n";
-
-const CLASSES_SIDE: &str = "export fun side_value(): i32 {\n\t2\n}\n";
-
-fn classes_package() -> Package {
-    Package::write(
-        "classes",
-        Platform::default(),
-        &[
-            ("main.vl", CLASSES_MAIN),
-            ("model.vl", CLASSES_MODEL),
-            ("views.vl", CLASSES_VIEWS),
-            ("cycle_a.vl", CLASSES_CYCLE_A),
-            ("cycle_b.vl", CLASSES_CYCLE_B),
-            ("shapes.vl", CLASSES_SHAPES),
-            ("impls.vl", CLASSES_IMPLS),
-            ("user.vl", CLASSES_USER),
-            ("side.vl", CLASSES_SIDE),
-            ("ext.vl", CLASSES_EXT),
-            ("reader.vl", CLASSES_READER),
-            ("ctx.vl", CLASSES_CTX),
-            ("runner.vl", CLASSES_RUNNER),
-            ("bag.vl", CLASSES_BAG),
-            ("a_spoil.vl", CLASSES_SPOIL),
-            ("paint.vl", CLASSES_PAINT),
-            ("painter.vl", CLASSES_PAINTER),
-            ("shine.vl", CLASSES_SHINE),
-            ("shiner.vl", CLASSES_SHINER),
-            ("bar_eq.vl", CLASSES_BAR_EQ),
-            ("bar_user.vl", CLASSES_BAR_USER),
-            ("data_user.vl", CLASSES_DATA_USER),
-            ("banner.txt", CLASSES_BANNER),
-        ],
-    )
-}
-
-/// §6's list, one edit per class, each applied and undone.
-const CLASS_EDITS: &[Edit] = &[
-    Edit {
-        label: "a body literal's type flips an inferred return (i1)",
-        file: "model.vl",
-        seed: None,
-        replacements: &[(
-            "export fun make() {\n\t1\n}",
-            "export fun make() {\n\t\"one\"\n}",
-        )],
-    },
-    Edit {
-        label: "a context read added to a leaf (i2)",
-        file: "model.vl",
-        seed: None,
-        replacements: &[(
-            "export fun leaf(): i32 {\n\t1\n}",
-            "export fun leaf(): i32 {\n\tflavor.get()\n}",
-        )],
-    },
-    Edit {
-        label: "a sleep makes a leaf and its callers async (i6), with its import",
-        file: "model.vl",
-        seed: None,
-        replacements: &[
-            (
-                "import std::context::Context;\n",
-                "import std::context::Context;\nimport std::time;\n",
-            ),
-            (
-                "export fun leaf(): i32 {\n\t1\n}",
-                "export fun leaf(): i32 {\n\ttime::sleep(1);\n\t1\n}",
-            ),
-        ],
-    },
-    Edit {
-        label: "a different type pushed into a module binding (i7)",
-        file: "model.vl",
-        seed: None,
-        replacements: &[("items.push(1);", "items.push(\"one\");")],
-    },
-    Edit {
-        label: "a written return type changed",
-        file: "model.vl",
-        seed: None,
-        replacements: &[("export fun leaf(): i32 {", "export fun leaf(): i53 {")],
-    },
-    Edit {
-        label: "a field renamed",
-        file: "model.vl",
-        seed: None,
-        replacements: &[("\tcount: i32,", "\ttotal: i32,")],
-    },
-    Edit {
-        label: "an impl in a module the caller never imports, removed (i3)",
-        file: "impls.vl",
-        seed: None,
-        replacements: &[(
-            "export impl Foo with Greet {\n\tfun greet(self): str {\n\t\t\"hi\"\n\t}\n}\n",
-            "",
-        )],
-    },
-    Edit {
-        label: "a derive flipped on",
-        file: "shapes.vl",
-        seed: None,
-        replacements: &[(
-            "export struct Foo {",
-            "[derive(PartialEq)]\nexport struct Foo {",
-        )],
-    },
-    Edit {
-        label: "an import added",
-        file: "views.vl",
-        seed: None,
-        replacements: &[(
-            "import pkg::model::{",
-            "import pkg::side::side_value;\nimport pkg::model::{",
-        )],
-    },
-    Edit {
-        label: "a const callee's body edited (i4)",
-        file: "model.vl",
-        seed: None,
-        replacements: &[(
-            "export fun size(): i32 {\n\t4\n}",
-            "export fun size(): i32 {\n\tlet list: List<i32> = [];\n\tlist[3]\n}",
-        )],
-    },
-    Edit {
-        label: "a const callee's value edited, the site's own text unchanged (S4)",
-        file: "model.vl",
-        seed: None,
-        replacements: &[(
-            "export fun size(): i32 {\n\t4\n}",
-            "export fun size(): i32 {\n\t5\n}",
-        )],
-    },
-    Edit {
-        label: "a body edit inside an import cycle",
-        file: "cycle_b.vl",
-        seed: None,
-        replacements: &[("\tring(n + 1)", "\tring(n + 2)")],
-    },
-    Edit {
-        label: "an inherent impl the prefix calls, edited in a module it never imports",
-        file: "ext.vl",
-        seed: None,
-        replacements: &[("\t\t\"HI\"", "\t\t\"HEY\"")],
-    },
-    Edit {
-        label: "the hot module that grounds a prefix context's value type",
-        file: "runner.vl",
-        seed: None,
-        replacements: &[("\tseen\n}", "\tseen + 0\n}")],
-    },
-    Edit {
-        label: "a push into another module's binding, from the module loaded first",
-        file: "a_spoil.vl",
-        seed: None,
-        replacements: &[("bag.push(2);", "bag.push(\"two\");")],
-    },
-    Edit {
-        label: "a statement typed into a leaf importer's body",
-        file: "views.vl",
-        seed: None,
-        replacements: &[("\tadd();\n", "\tadd();\n\tlet extra = 1;\n")],
-    },
-    Edit {
-        label: "a PREFIX module changes while the seed stays on another file",
-        file: "side.vl",
-        seed: Some("views.vl"),
-        replacements: &[("\t2\n", "\t3\n")],
-    },
-    Edit {
-        label: "a hot trait impl a prefix module's operator dispatches through",
-        file: "bar_eq.vl",
-        seed: None,
-        replacements: &[("\t\tself.n == other.n", "\t\tself.n + 0 == other.n")],
-    },
-    Edit {
-        label: "an input file a const site reads, edited (S4)",
-        file: "banner.txt",
-        seed: Some("data_user.vl"),
-        replacements: &[("hello", "HELLO")],
-    },
-    Edit {
-        label: "a module binding's push typed in the entry's hot set's neighbour",
-        file: "model.vl",
-        seed: None,
-        replacements: &[("\titems.push(1);\n", "\titems.push(1);\n\titems.push(2);\n")],
-    },
-];
-
-/// S4's std bump: std's own `math::minmax` edited under the analysis (an
-/// edited std buffer, through the overlay every load reads), with the
-/// classes package's const site that calls it. A const result remembered from
-/// before the edit is the stale answer the const cache must not serve.
-const STD_EDIT_FILE: &str = "src/math.vl";
-const STD_EDIT_LABEL: &str = "a std function a const site calls, edited (S4's std bump)";
-const STD_EDIT: (&str, &str) = (
-    "\tif a <= b {\n\t\t(a, b)\n\t} else {\n\t\t(b, a)\n\t}",
-    "\tif a <= b {\n\t\t(b, a)\n\t} else {\n\t\t(a, b)\n\t}",
-);
-
 /// [`replay`] for [`STD_EDIT`]: std's file moves (and moves back), the seed
 /// stays on the module whose const site calls it.
 fn replay_std_edit(package: &Package, divergences: &mut Vec<String>) -> Vec<Census> {
@@ -567,146 +132,6 @@ fn replay_std_edit(package: &Package, divergences: &mut Vec<String>) -> Vec<Cens
     }
     censuses
 }
-
-/// M121's acceptance shape, over the classes package: a keystroke in a module
-/// whose hot set writes impls on PREFIX types that nothing in the prefix asks
-/// about. S1's spelling guard refused these (kolt's `theme.vl`, `model.vl`
-/// and `styles.vl` every keystroke); the reach probe serves them, and each
-/// must be a hot-set world as well as agree with a clean analysis.
-const SERVED_IMPL_EDITS: &[Edit] = &[
-    Edit {
-        label: "a hot inherent impl on a prefix type, its return inferred, that no prefix module calls",
-        file: "paint.vl",
-        seed: None,
-        replacements: &[("\t\t\"p\"", "\t\t\"pp\"")],
-    },
-    Edit {
-        label: "a hot trait impl on a prefix type that no prefix module asks for",
-        file: "shine.vl",
-        seed: None,
-        replacements: &[("\t\tself.n\n", "\t\tself.n + 1\n")],
-    },
-    Edit {
-        label: "a statement typed into the module that calls a hot impl",
-        file: "painter.vl",
-        seed: None,
-        replacements: &[("\tfoo.paint()\n", "\tlet extra = 1;\n\tfoo.paint()\n")],
-    },
-];
-
-/// B553's package: the ENTRY writes the impl a module calls. Every analysis of
-/// it — the entry's keystroke and the module's — resolves the world once,
-/// after the entry walks, and has to agree with a clean analysis doing the
-/// same.
-const ENTRY_IMPL_SHAPES: &str = "export struct Foo {\n\tn: i32,\n}\n";
-
-const ENTRY_IMPL_WAVER: &str = "import pkg::shapes::Foo;\n\nexport fun waved(): str {\n\tlet foo = Foo { n = 3 };\n\tfoo.wave()\n}\n";
-
-const ENTRY_IMPL_MAIN: &str = "import pkg::shapes::Foo;\nimport pkg::waver::waved;\n\nimpl Foo {\n\tfun wave(self) {\n\t\t\"wave\"\n\t}\n}\n\nfun main() {\n\tprint(waved());\n}\n";
-
-const ENTRY_IMPL_EDITS: &[Edit] = &[
-    Edit {
-        label: "the entry's impl a module calls, its body edited (B553)",
-        file: "main.vl",
-        seed: None,
-        replacements: &[("\t\t\"wave\"", "\t\t\"WAVE\"")],
-    },
-    Edit {
-        label: "the module that calls the entry's impl, edited (B553)",
-        file: "waver.vl",
-        seed: None,
-        replacements: &[("Foo { n = 3 }", "Foo { n = 4 }")],
-    },
-];
-
-const PLATFORM_MAIN: &str = "import pkg::shared::label;\nimport pkg::twin::place;\n\nfun main() {\n\tprint(label());\n\tprint(place());\n}\n";
-
-// B573: a module with `[platform(..)]` twins, in the browser package — the twin
-// a hot-set walk over the stored world selects is the build platform's.
-const PLATFORM_TWIN: &str = "[platform(\"browser\")]\nexport fun place(): str {\n\t\"browser twin\"\n}\n\n[platform(\"@process\")]\nexport fun place(): str {\n\t\"process twin\"\n}\n";
-
-const PLATFORM_SHARED: &str = "export fun label(): str {\n\t\"x\"\n}\n";
-
-const PLATFORM_EDITS: &[Edit] = &[
-    Edit {
-        label: "a twinned module edited in a browser world (B573)",
-        file: "twin.vl",
-        seed: None,
-        replacements: &[("\t\"browser twin\"", "\t\"browser twin!\"")],
-    },
-    Edit {
-        label: "a browser entry reaches a node-only call (i5)",
-        file: "shared.vl",
-        seed: None,
-        replacements: &[(
-            "export fun label(): str {\n\t\"x\"\n}\n",
-            "import std::process;\n\nexport fun label(): str {\n\ti\"x{process::args().len()}\"\n}\n",
-        )],
-    },
-];
-
-fn platform_package() -> Package {
-    Package::write(
-        "platform",
-        Platform::Browser,
-        &[
-            ("main.vl", PLATFORM_MAIN),
-            ("shared.vl", PLATFORM_SHARED),
-            ("twin.vl", PLATFORM_TWIN),
-        ],
-    )
-}
-
-/// The package the re-walk pins measure, with nothing a guard refuses: the
-/// hot-set world is built for every module of it, so the edits below run
-/// through S1's reuse and nothing else.
-fn leaf_package() -> Package {
-    Package::write(
-        "leaf",
-        Platform::default(),
-        &[
-            ("main.vl", PINS_MAIN),
-            ("views.vl", PINS_VIEWS),
-            ("cycle_a.vl", PINS_CYCLE_A),
-            ("cycle_b.vl", PINS_CYCLE_B),
-            ("hub.vl", PINS_HUB),
-        ],
-    )
-}
-
-/// Edits over [`leaf_package`], each served from a hot-set world: a Class A
-/// refusal typed into the hot leaf (whose remembered checks must never be
-/// replayed), and the PREFIX moving under the leaf's seed (which must never be
-/// served unvalidated).
-const LEAF_EDITS: &[Edit] = &[
-    Edit {
-        label: "a statement typed into the hot leaf",
-        file: "views.vl",
-        seed: None,
-        replacements: &[("\tbase() + 1\n", "\tlet extra = 1;\n\tbase() + extra\n")],
-    },
-    Edit {
-        label: "a Class A refusal typed into the hot leaf",
-        file: "views.vl",
-        seed: None,
-        replacements: &[(
-            "\tbase() + 1\n",
-            "\tlet frozen = 1;\n\tfrozen = 2;\n\tbase() + frozen\n",
-        )],
-    },
-    Edit {
-        label: "the PREFIX module the leaf imports changes under the leaf's seed",
-        file: "hub.vl",
-        seed: Some("views.vl"),
-        replacements: &[("\t2\n", "\t3\n")],
-    },
-    Edit {
-        label: "a body edit inside the hot cycle",
-        file: "cycle_b.vl",
-        seed: None,
-        replacements: &[("\tring(n + 1)", "\tring(n + 2)")],
-    },
-];
 
 /// What [`replay_the_classes`] observed: every divergence, every incremental
 /// census, and the censuses of the edits whose SHAPE is asserted besides
@@ -770,6 +195,16 @@ fn replay_the_classes() -> Replayed {
         censuses.extend(replay(&mut package, edit, &mut divergences));
     }
     package.remove();
+    // M110 S2a: the bound audit's verdicts at PREFIX sites are recorded and
+    // replayed; the plants that serve a stale record (the audit skipped
+    // without recording, the impl guard off) must turn this package red.
+    for fixture in BOUND_FIXTURES {
+        let mut package = fixture.write();
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
     vilan_core::analyzer::base_cache_clear();
     Replayed {
         divergences,
@@ -794,6 +229,20 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
         served,
         entry_impl,
     } = replay_the_classes();
+    let mut divergences = divergences;
+    let mut censuses = censuses;
+    // The post-pass class (pass map §6 "does not prove" 2; B575): a prefix
+    // module's verdict a POST pass decides, under keystrokes elsewhere. In
+    // the gate only: no plant targets a post pass, and each replay of them
+    // is 48 analyses.
+    for fixture in POST_PASS_FIXTURES {
+        let mut package = fixture.write();
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
     assert!(
         divergences.is_empty(),
         "{} step(s) of the edit script observe incremental analysis:\n{}",
@@ -842,6 +291,23 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
             .all(|census| census.base_hits > 0),
         "the warm keystrokes reuse the stored prefix: {served:#?}"
     );
+    // M110 S2a: the bound audit served PREFIX sites from the record on the
+    // warm keystrokes (the undo of every edit is one) — or the comparison
+    // above said nothing about the record.
+    let bound_served: u64 = censuses
+        .iter()
+        .map(|census| census.bound_sites_served)
+        .sum();
+    let bound_checked: u64 = censuses
+        .iter()
+        .map(|census| census.bound_sites_checked)
+        .sum();
+    eprintln!("bound audit: {bound_served} sites served from records, {bound_checked} checked");
+    assert!(
+        bound_served > 0 && bound_checked > 0,
+        "the classes leg must serve bound-audit sites from a reused module's record \
+         (served {bound_served}, checked {bound_checked})"
+    );
     // M110 S4: the const cache served sites — or every comparison above said
     // nothing about it.
     let const_hits: u64 = censuses.iter().map(|census| census.const_cache_hits).sum();
@@ -868,37 +334,38 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
     );
 }
 
+/// Non-vacuity of the post-pass class: each of its packages carries, in its
+/// PREFIX module, a diagnostic a post pass decides — or the class says nothing
+/// about what a reusing analysis drops.
+#[test]
+fn each_post_pass_package_carries_a_prefix_verdict() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    for fixture in POST_PASS_FIXTURES {
+        let package = fixture.write();
+        let clean = observe(&package, Vec::new(), Leg::Clean);
+        let module = package.path("m.vl").display().to_string();
+        package.remove();
+        let diagnostics = clean
+            .rendering
+            .split("# warnings")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .filter(|row| row.starts_with(&module))
+            .count();
+        assert!(
+            diagnostics >= 1,
+            "{}: the prefix module carries a post-pass verdict:\n{}",
+            fixture.name,
+            clean.rendering
+        );
+    }
+}
+
 // --- the corpus ----------------------------------------------------------------
-
-/// The Class A refusal every corpus module gets, so each has a diagnostic of
-/// its own to remember (M57's lesson: sixty clean modules agree under any
-/// reuse at all).
-const PROBE_REFUSAL: &str =
-    "\nfun m110_probe_refusal(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal\n}\n";
-
-const CORPUS_MAIN: &str = "import pkg::module;\nimport pkg::user;\nimport pkg::side;\n\nfun main() {\n\tprint(user::user_value());\n\tprint(side::side_value());\n}\n";
-
-const CORPUS_USER: &str = "import pkg::module;\n\nexport fun user_value(): i32 {\n\t1\n}\n";
-
-const CORPUS_SIDE: &str = "export fun side_value(): i32 {\n\t2\n}\n";
-
-const CORPUS_EDITS: &[Edit] = &[
-    Edit {
-        label: "a function typed into the module",
-        file: "module.vl",
-        seed: None,
-        replacements: &[(
-            "\nfun m110_probe_refusal(): i32 {",
-            "\nfun m110_probe_added(): i32 {\n\tlet total = 1;\n\ttotal = 3;\n\ttotal\n}\n\nfun m110_probe_refusal(): i32 {",
-        )],
-    },
-    Edit {
-        label: "the bystander changes under the module's seed",
-        file: "side.vl",
-        seed: Some("module.vl"),
-        replacements: &[("\t2\n", "\t3\n")],
-    },
-];
 
 /// **The corpus leg.** Every corpus program, re-hosted as the module of a
 /// package with an importer (`user.vl`, in the module's hot set) and a
@@ -1063,9 +530,13 @@ fn the_differential_sees_a_hot_impl_the_prefix_needed() {
 }
 
 /// S1's plant: the use-inferred-binding guard dropped. A hot module that
-/// decides a prefix binding's type by its first use — a context's `run`, a
-/// push into a module's empty list — is then walked after the prefix decided
-/// it, where the canonical world walks it first.
+/// decides a prefix binding's type by its first use — a push into a module's
+/// empty list — is then walked after the prefix decided it, where the
+/// canonical world walks it first. (A context's `run` no longer is such a
+/// hazard: since B584 a call on a context's open value slot binds to the slot
+/// itself, so the prefix's calls take whatever `run` fills it, in either walk
+/// order — the context edit agrees under the plant, and the guard's context
+/// arm is incr's to retire.)
 #[test]
 fn the_differential_sees_a_binding_the_hot_set_should_have_decided() {
     let _switch = SWITCH_LOCK
@@ -1073,10 +544,10 @@ fn the_differential_sees_a_binding_the_hot_set_should_have_decided() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let divergences = replay_with_plant(Plant::UseInferredGuardOff);
     assert!(
-        divergences
+        !divergences
             .iter()
             .any(|divergence| divergence.contains("grounds a prefix context")),
-        "the use-inferred plant must turn the context edit red; it found: {divergences:#?}"
+        "B584: the context edit is order-free, even with the guard off: {divergences:#?}"
     );
     assert!(
         divergences
@@ -1158,6 +629,152 @@ fn the_differential_sees_a_const_key_without_its_callees() {
     );
 }
 
+/// S2a's plant: the bound audit skips a reused module's sites and records
+/// nothing for them. A prefix module's bound refusal is then dropped on the
+/// hit — the gate must see it.
+#[test]
+fn the_differential_sees_a_bound_audit_served_without_its_record() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::BoundAuditUnrecorded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("bound refusal")),
+        "the unrecorded-audit plant must turn the bound package red; it found: {divergences:#?}"
+    );
+}
+
+/// S2a's second plant: a module's recorded audit replayed without asking
+/// whether a LATE impl answers one of its questions. The impl a prefix
+/// module's bound is satisfied through is moved to another type in a hot
+/// module, and the record keeps the answer the world no longer gives. (S1's
+/// impl guard is not what protects the record — the audit's questions are
+/// asked after the store, so the record carries its own test — which is why
+/// `ImplGuardOff` leaves this package green.)
+#[test]
+fn the_differential_sees_a_bound_record_kept_over_a_moved_impl() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::BoundRecordUnguarded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("bound is satisfied through, moved")),
+        "the unguarded-record plant must turn the moved-impl edit red; it found: {divergences:#?}"
+    );
+}
+
+/// S2b's plant: the tail skips a reused module's label rendering and drops
+/// the restored rows — the prefix's hover types and declaration labels are
+/// then missing on the hit; the gate must see it.
+#[test]
+fn the_differential_sees_label_tables_served_without_their_rows() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::LabelTablesUnrecorded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("type ") || divergence.contains("declaration ")),
+        "the unrecorded-labels plant must turn a hover label red; it found: {divergences:#?}"
+    );
+}
+
+/// S2b's other seam: an analysis NO front end seeded (a plain base-cache hit
+/// — the CLI's watch, an editor leg served without a seed) reuses modules
+/// whose record was filed by an unseeded analysis and so carries no label
+/// rows; the tail must render their labels, not skip them. The hit's
+/// rendering is compared with the clean one in full (the hover types and
+/// declaration labels included), where the fixup that filed rows only for a
+/// seeded analysis left four of vilan-lsp's hovers empty.
+#[test]
+fn a_reused_module_keeps_its_labels_without_a_seed() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let package = leaf_package();
+    let cold = observe(&package, Vec::new(), Leg::Incremental);
+    let warm = observe(&package, Vec::new(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        cold.census.base_misses == 1 && warm.census.base_hits == 1,
+        "the second unseeded analysis is served the stored world: {:?} / {:?}",
+        cold.census,
+        warm.census
+    );
+    assert!(
+        warm.census.records_replayed > 0,
+        "the hit replays module records: {:?}",
+        warm.census
+    );
+    assert!(
+        warm.rendering == clean.rendering,
+        "an unseeded hit renders every label a clean analysis renders: {}",
+        first_difference(&warm.rendering, &clean.rendering)
+    );
+}
+
+/// B569 (lang-a-49, at C3's request): a reused PREFIX module's labelled
+/// tuples — the labels its hover rows and declaration labels print, which S2b
+/// records per module and restores on reuse, and the label refusal the tuple
+/// rule records during inference — render on every keystroke elsewhere, and
+/// on an unseeded hit, exactly as a clean analysis renders them.
+#[test]
+fn b569_a_reused_modules_tuple_labels_render_as_a_clean_analysis_renders() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let mut divergences = Vec::new();
+    let mut censuses = Vec::new();
+    let mut package = LABELS_FIXTURE.write();
+    for edit in LABELS_FIXTURE.edits {
+        censuses.extend(replay(&mut package, edit, &mut divergences));
+    }
+    vilan_core::analyzer::base_cache_clear();
+    let cold = observe(&package, Vec::new(), Leg::Incremental);
+    let warm = observe(&package, Vec::new(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(divergences.is_empty(), "{divergences:#?}");
+    assert!(
+        censuses.iter().any(|census| census.records_replayed > 0),
+        "the keystrokes reuse the prefix module's records: {censuses:#?}"
+    );
+    assert!(
+        cold.census.base_misses == 1 && warm.census.base_hits == 1,
+        "the second unseeded analysis is served the stored world: {:?} / {:?}",
+        cold.census,
+        warm.census
+    );
+    assert!(
+        warm.rendering == clean.rendering,
+        "an unseeded hit renders every label a clean analysis renders: {}",
+        first_difference(&warm.rendering, &clean.rendering)
+    );
+    for printed in [
+        "(min: i32, max: i32)",
+        "(x: f64, y: f64)",
+        "`z` is not a label of `(x: i32, y: i32)`",
+    ] {
+        assert!(
+            clean.rendering.contains(printed),
+            "the fixture renders {printed:?} (or it says nothing about labels):\n{}",
+            clean.rendering
+        );
+    }
+}
+
 /// M121 / B553's cost: a check whose late files write no impl on a type they
 /// do not declare RECORDS NOTHING — the pre-entry resolve asks the impl table
 /// thousands of questions and none of them is kept (`reach_questions` 0), which
@@ -1198,17 +815,6 @@ fn a_check_whose_late_files_write_no_foreign_impl_records_nothing() {
 }
 
 // --- the re-walk counter pins (Q9) ------------------------------------------------
-
-const PINS_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::hub::base;\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(base());\n}\n";
-
-const PINS_VIEWS: &str = "import pkg::hub::base;\n\nexport fun render(): i32 {\n\tbase() + 1\n}\n";
-
-const PINS_CYCLE_A: &str = "import pkg::cycle_b::bounce;\n\nexport fun ring(n: i32): i32 {\n\tif n > 3 {\n\t\tn\n\t} else {\n\t\tbounce(n + 1)\n\t}\n}\n";
-
-const PINS_CYCLE_B: &str =
-    "import pkg::cycle_a::ring;\n\nexport fun bounce(n: i32): i32 {\n\tring(n + 1)\n}\n";
-
-const PINS_HUB: &str = "export fun base(): i32 {\n\t2\n}\n";
 
 /// What a keystroke in `file` re-walks once the hot-set world is warm: the
 /// census of the SECOND of two analyses seeded there (the first stores the

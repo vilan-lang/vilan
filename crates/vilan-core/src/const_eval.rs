@@ -1484,7 +1484,7 @@ impl<'p, 'src> TypeParameterScan<'p, 'src> {
             Some(Type::Enum(_, arguments))
             | Some(Type::Struct(_, arguments))
             | Some(Type::Trait(_, arguments))
-            | Some(Type::Tuple(arguments)) => arguments
+            | Some(Type::Tuple(arguments, _)) => arguments
                 .clone()
                 .into_iter()
                 .any(|inner| self.walk(inner, visiting)),

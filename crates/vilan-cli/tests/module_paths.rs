@@ -688,3 +688,82 @@ fn a65_a_directory_carries_no_platform_coloring_of_its_own() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- B586: a `[library]` file in file mode roots `pkg::` at its layer ----------
+
+/// A library whose nested module imports a sibling by `pkg::` path - the shape
+/// std's own `web/dom.vl` has (`pkg::reactive`).
+fn write_library(dir: &Path, manifest: &str, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("vilan.toml"), manifest).unwrap();
+    for (name, contents) in files {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+}
+
+#[test]
+fn b586_a_nested_library_file_resolves_pkg_from_the_library_base_root() {
+    // `vilan check src/deep/pair.vl` rooted `pkg::` at `src/deep/` - the file's
+    // own directory, as for a file no manifest owns - so `pkg::util` was "cannot
+    // find 'util' in the imported path". The language server roots the same file
+    // at the library's base root, and the terminal must answer as the editor does.
+    let root = temp_root("b586-base");
+    write_library(
+        &root,
+        "[library]\nname = \"shapes\"\n",
+        &[
+            ("src/lib.vl", "export fun noop() {}\n"),
+            ("src/util.vl", "export fun unit(): i32 {\n\t1\n}\n"),
+            (
+                "src/deep/pair.vl",
+                "import pkg::util::unit;\n\nexport fun two(): i32 {\n\tunit() + unit()\n}\n",
+            ),
+        ],
+    );
+    let output = vilan(&root, &["check", "src/deep/pair.vl"]);
+    assert!(
+        output.status.success(),
+        "a nested library module checks on its own: {}",
+        combined(&output)
+    );
+    // And the file's own directory is still no root: a module that is only
+    // reachable from `src/deep/` is not `pkg::`'s to find.
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn b586_a_library_file_in_a_layer_resolves_pkg_from_that_layer() {
+    // The deepest layer root containing the file is its `pkg::` root; a file in
+    // the base root keeps the base root. Both are what the editor does (a layer
+    // file does not reach the base layer's modules: the deferral the editor's
+    // `a_layered_library_module_is_rooted_at_its_own_layer` records).
+    let root = temp_root("b586-layer");
+    write_library(
+        &root,
+        "[library]\nname = \"widgets\"\n[library.layer.browser]\nplatform = [\"browser\"]\n",
+        &[
+            ("src/lib.vl", "export fun noop() {}\n"),
+            ("src/base_only.vl", "export fun base(): i32 {\n\t1\n}\n"),
+            ("src/browser/paint.vl", "export fun tint(): i32 {\n\t2\n}\n"),
+            (
+                "src/browser/deep/user.vl",
+                "import pkg::paint::tint;\n\nexport fun use_it(): i32 {\n\ttint()\n}\n",
+            ),
+            (
+                "src/deep/base_user.vl",
+                "import pkg::base_only::base;\n\nexport fun use_base(): i32 {\n\tbase()\n}\n",
+            ),
+        ],
+    );
+    for file in ["src/browser/deep/user.vl", "src/deep/base_user.vl"] {
+        let output = vilan(&root, &["check", file]);
+        assert!(
+            output.status.success(),
+            "{file} resolves `pkg::` at its own layer: {}",
+            combined(&output)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

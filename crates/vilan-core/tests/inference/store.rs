@@ -1971,3 +1971,317 @@ fn a149_a_closure_payload_is_a_leaf_with_no_equality() {
         "run woke\nrun woke\nkeyed woke\nkeyed woke\nkeyed woke\nidle=true\n",
     );
 }
+
+// --- A153 S1: the wire walkers (`mirrored-store.md` §3–§4) ------------------
+
+/// A mirrored root's shapes, `[derive(Storable, Wire)]`, and the three ways a
+/// pin drives a walker: describe what a path reaches, read a subscription path
+/// off a frame, and apply a frame at a path.
+const WIRE_WALKERS: &str = r#"
+import std::binary::binary_codec;
+import std::display::Display;
+import std::hash::Hashable;
+import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ Storable, Store, StoreStep, StoreWire };
+import std::wire::{ Codec, Deserialize, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+    id: u53,
+    author: str,
+    content: str,
+}
+
+[derive(Storable, Wire)]
+enum Presence {
+    Offline,
+    Online(str),
+    Away(str, i32),
+}
+
+[derive(Storable, Wire)]
+struct Global {
+    title: str,
+    messages: HashMap<u53, Message>,
+    presence: Presence,
+    log: List<str>,
+    nick: Option<str>,
+}
+
+fun text(frame: Frame): str {
+    match frame {
+        Frame::Text(let value) => value,
+        Frame::Binary(let bytes) => i"<{bytes.len()} bytes>",
+    }
+}
+
+fun global(): Global {
+    mut messages: HashMap<u53, Message> = HashMap::new();
+    messages.insert(7, Message { id = 7, author = "bob", content = "hello" });
+    Global { title = "general", messages, presence = Presence::Away("lunch", 30), log = ["a", "b"], nick = None }
+}
+
+fun key(id: u53): StoreStep {
+    StoreStep::Key(id.hash())
+}
+
+fun field(index: usize): StoreStep {
+    StoreStep::Field(index)
+}
+
+fun described<T: StoreWire>(value: T, path: List<StoreStep>): str {
+    let codec = json_codec();
+    let (record, finish) = (codec.writer)();
+    mut serializer = record;
+    let reach = value.store_describe_at(&path, 0, &mut serializer, true);
+    i"{reach.debug()} {text(finish())}"
+}
+
+fun wire<T: Wire>(value: T): str {
+    let codec = json_codec();
+    let (record, finish) = (codec.writer)();
+    mut serializer = record;
+    value.describe(&mut serializer);
+    text(finish())
+}
+
+fun read_path(frame: str): str {
+    let codec = json_codec();
+    mut deserializer = (codec.reader)(Frame::Text(frame));
+    let count = deserializer.begin_list();
+    mut into: List<StoreStep> = [];
+    let walked = Global::store_read_path(&mut deserializer, count, &mut into);
+    let failed = match deserializer.failed() {
+        Some(let _reason) => " (malformed)",
+        None => "",
+    };
+    mut steps: List<str> = [];
+    for step in into {
+        steps.push(match step {
+            StoreStep::Field(let index) => i"{index}",
+            StoreStep::Key(let _hash) => "key",
+        });
+    }
+    i"{walked} [{steps.join(", ")}]{failed}"
+}
+
+fun applied<T: StoreWire>(target: T, path: List<StoreStep>, frame: str): T {
+    let codec = json_codec();
+    mut deserializer = (codec.reader)(Frame::Text(frame));
+    mut landed = target;
+    let reach = landed.store_apply_at(&path, 0, &mut deserializer);
+    print(i"applied {reach.debug()}");
+    landed
+}
+
+/// Describe `value` whole through `codec`, read it back FRESH, and describe that.
+fun round_trip(codec: Codec, value: Global): str {
+    let here: List<StoreStep> = [];
+    let (record, finish) = (codec.writer)();
+    mut serializer = record;
+    let _described = value.store_describe_at(&here, 0, &mut serializer, true);
+    mut deserializer = (codec.reader)(finish());
+    let fresh = Global::store_fresh(&mut deserializer);
+    let failed = match deserializer.failed() {
+        Some(let reason) => reason,
+        None => "clean",
+    };
+    i"{failed} {described(fresh, [])}"
+}
+"#;
+
+fn wire_walkers_program(body: &str) -> String {
+    format!("{WIRE_WALKERS}\nfun main() {{\n{body}\n}}\n\nmain();\n")
+}
+
+#[test]
+fn a153_s1_a_value_describes_as_its_wire_impl_with_its_keyed_collections_empty() {
+    // §3.4/§2.2: what a boundary's seed carries is `Wire`'s own format, call for
+    // call — a struct by its fields' names, an enum tagged, an `Option` bare or
+    // `null`, a list element by element — except that a KEYED collection inside
+    // it is described empty: its keys cross as boundaries of their own, so a
+    // root holding a database never ships it on connect (§2.3). A path describes
+    // the value it reaches, and says when it reaches a keyed collection or
+    // nothing at all. Red on the base: `StoreWire` does not exist.
+    assert_compiles_and_runs(
+        &wire_walkers_program(
+            r#"
+            let g = global();
+            print(described(g, []));
+            mut held = global();
+            held.messages = HashMap::new();
+            print(i"Wire     {wire(held)}");
+            print(described(g, [field(0)]));
+            print(described(g, [field(1)]));
+            print(described(g, [field(1), key(7)]));
+            print(described(g, [field(1), key(7), field(1), field(2)]));
+            print(described(g, [field(1), key(8)]));
+            print(described(g, [field(1), key(8), field(1)]));
+            print(described(g, [field(2), field(3)]));
+            print(described(g, [field(2), field(3), field(1)]));
+            print(described(g, [field(2), field(2)]));
+            print(described(g, [field(2), field(0)]));
+            print(described(g, [field(3)]));
+            print(described(g, [field(3), field(0)]));
+            print(described(g, [field(9)]));
+            "#,
+        ),
+        "StoreReach::Described {\"title\":\"general\",\"messages\":[],\"presence\":{\"Away\":[\"lunch\",30]},\"log\":[\"a\",\"b\"],\"nick\":null}\n\
+         Wire     {\"title\":\"general\",\"messages\":[],\"presence\":{\"Away\":[\"lunch\",30]},\"log\":[\"a\",\"b\"],\"nick\":null}\n\
+         StoreReach::Described \"general\"\n\
+         StoreReach::Keyed []\n\
+         StoreReach::Described {\"id\":7,\"author\":\"bob\",\"content\":\"hello\"}\n\
+         StoreReach::Described \"hello\"\n\
+         StoreReach::Described null\n\
+         StoreReach::Absent \n\
+         StoreReach::Described [\"lunch\",30]\n\
+         StoreReach::Described 30\n\
+         StoreReach::Absent \n\
+         StoreReach::Absent \n\
+         StoreReach::Described [\"a\",\"b\"]\n\
+         StoreReach::Absent \n\
+         StoreReach::Absent \n",
+    );
+}
+
+#[test]
+fn a153_s1_a_subscription_path_is_read_at_the_types_it_walks() {
+    // §3.3: a field's step is its child index, a key's step is the key at its own
+    // type (read here, kept as its hash, never sent back), a variant's payload is
+    // `1 + i` and several payloads are walked by position. A step that names no
+    // child a subscription can stand at — a variant's flag, an index past the
+    // fields, a position in a list (Q11) — fails the walk; a key that does not
+    // decode at its type poisons the frame.
+    assert_compiles_and_runs(
+        &wire_walkers_program(
+            r#"
+            print(read_path("[]"));
+            print(read_path("[1, 7]"));
+            print(read_path("[1, 7, 1, 2]"));
+            print(read_path("[2, 3, 1]"));
+            print(read_path("[2, 2]"));
+            print(read_path("[4, 1]"));
+            print(read_path("[2, 0]"));
+            print(read_path("[5]"));
+            print(read_path("[3, 0]"));
+            print(read_path("[1, \"seven\"]"));
+            "#,
+        ),
+        "true []\n\
+         true [1, key]\n\
+         true [1, key, 1, 2]\n\
+         true [2, 3, 1]\n\
+         true [2, 2]\n\
+         true [4, 1]\n\
+         false [2]\n\
+         false []\n\
+         false [3]\n\
+         true [1, key] (malformed)\n",
+    );
+}
+
+#[test]
+fn a153_s1_a_frame_applied_at_a_path_merges_and_keeps_the_keys_a_replica_holds() {
+    // The client's twin (§6): a value lands at its path IN PLACE. At a struct its
+    // fields merge one by one, and a keyed collection arrives empty and is KEPT —
+    // its keys are seeded through their own boundaries — so a write to a parent
+    // never throws away the keys a replica holds. The live variant's payload
+    // merges, another variant is built fresh, a payload is reached by position,
+    // and `null` clears an `Option`. A value described whole and read back fresh
+    // is the same value, on the JSON codec and the binary one (positional — the
+    // shape, not the names, carries it).
+    assert_compiles_and_runs(
+        &wire_walkers_program(
+            r#"
+            let renamed = applied(global(), [], "{\"title\":\"renamed\",\"messages\":[],\"presence\":{\"Online\":\"desk\"},\"log\":[\"c\"],\"nick\":\"rb\"}");
+            print(described(renamed, []));
+            print(i"keys kept: {renamed.messages.len()}");
+            let phone = applied(renamed, [field(2), field(2)], "\"phone\"");
+            print(described(phone, [field(2)]));
+            let away = applied(phone, [field(2)], "{\"Away\":[\"tea\",5]}");
+            print(described(away, [field(2)]));
+            let nine = applied(away, [field(2), field(3), field(1)], "9");
+            print(described(nine, [field(2)]));
+            let cleared = applied(nine, [field(4)], "null");
+            print(described(cleared, [field(4)]));
+            let elsewhere = applied(cleared, [field(2), field(2)], "\"desk\"");
+            print(described(elsewhere, [field(2)]));
+            let _carried = applied(elsewhere, [field(1)], "[{\"key\":1,\"value\":{}}]");
+            print(round_trip(json_codec(), global()));
+            print(round_trip(binary_codec(), global()));
+            "#,
+        ),
+        "applied StoreReach::Described\n\
+         StoreReach::Described {\"title\":\"renamed\",\"messages\":[],\"presence\":{\"Online\":\"desk\"},\"log\":[\"c\"],\"nick\":\"rb\"}\n\
+         keys kept: 1\n\
+         applied StoreReach::Described\n\
+         StoreReach::Described {\"Online\":\"phone\"}\n\
+         applied StoreReach::Described\n\
+         StoreReach::Described {\"Away\":[\"tea\",5]}\n\
+         applied StoreReach::Described\n\
+         StoreReach::Described {\"Away\":[\"tea\",9]}\n\
+         applied StoreReach::Described\n\
+         StoreReach::Described null\n\
+         applied StoreReach::Absent\n\
+         StoreReach::Described {\"Away\":[\"tea\",9]}\n\
+         applied StoreReach::Keyed\n\
+         clean StoreReach::Described {\"title\":\"general\",\"messages\":[],\"presence\":{\"Away\":[\"lunch\",30]},\"log\":[\"a\",\"b\"],\"nick\":null}\n\
+         clean StoreReach::Described {\"title\":\"general\",\"messages\":[],\"presence\":{\"Away\":[\"lunch\",30]},\"log\":[\"a\",\"b\"],\"nick\":null}\n",
+    );
+}
+
+#[test]
+fn a153_s1_a_struct_with_a_closure_field_still_derives_its_walkers() {
+    // A closure never crosses the wire (the `[rpc]` element rule refuses the type
+    // before a frame is written), but `[derive(Storable)]` writes the walkers for
+    // every type it derives — so a closure field, or a closure payload among
+    // others, must leave the generated impl whole. Its walk ends there.
+    assert_compiles_and_runs(
+        r#"
+import std::display::Display;
+import std::io::print;
+import std::json::json_codec;
+import std::reactive::store::{ Storable, Store, StoreStep, StoreWire };
+import std::wire::Frame;
+
+[derive(Storable)]
+struct Button {
+    label: str,
+    on_press: || void,
+}
+
+[derive(Storable)]
+enum Action {
+    Idle,
+    Run(|| void, str),
+}
+
+fun main() {
+    let codec = json_codec();
+    let (record, finish) = (codec.writer)();
+    mut serializer = record;
+    let button = Button { label = "go", on_press = || {} };
+    let path: List<StoreStep> = [StoreStep::Field(0)];
+    print(button.store_describe_at(&path, 0, &mut serializer, true).debug());
+    let flag: List<StoreStep> = [StoreStep::Field(1)];
+    print(button.store_describe_at(&flag, 0, &mut serializer, false).debug());
+    let action = Action::Run(|| {}, "now");
+    let payload: List<StoreStep> = [StoreStep::Field(2), StoreStep::Field(1)];
+    print(action.store_describe_at(&payload, 0, &mut serializer, true).debug());
+    match finish() {
+        Frame::Text(let written) => print(written),
+        Frame::Binary(let _bytes) => print("binary"),
+    }
+}
+
+main();
+"#,
+        "StoreReach::Described\n\
+         StoreReach::Absent\n\
+         StoreReach::Described\n\
+         \"go\",\"now\"\n",
+    );
+}

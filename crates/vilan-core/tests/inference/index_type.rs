@@ -977,3 +977,110 @@ fn b426_a_non_negative_constant_and_a_runtime_difference_compile() {
         "}\n",
     ));
 }
+
+// --- B579: `-`, `*`, `/`, `%` over two integer widths -----------------------
+
+/// B579 (R-d, v0.47.0): the four operators over two DIFFERENT integer types
+/// are refused as `+`, `<` and `==` over the pair already were — `usize - i32`
+/// checked, ran on JS (`3 18 2 0`) and was refused by rustc, which has no
+/// spelling for it.
+#[test]
+fn b579_arithmetic_over_two_integer_widths_is_refused() {
+    for symbol in ["-", "*", "/", "%"] {
+        let source = format!(
+            r#"
+            fun main() {{
+                let a: usize = 6;
+                let b: i32 = 3;
+                let _c = a {symbol} b;
+            }}
+            "#
+        );
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`{symbol}` computes on two values of the same type, but the operands are \
+                 `usize` and `i32`: there are no implicit conversions"
+            ),
+        );
+    }
+    // Two non-index widths too: no rule makes either side the target.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let a: u8 = 6;
+            let b: i32 = 3;
+            let _c = a * b;
+        }
+        "#,
+        "but the operands are `u8` and `i32`",
+    );
+}
+
+/// B579's boundary: one width on both sides computes, a literal takes the
+/// left operand's width, a converted operand computes, and a float with an
+/// integer stays the deliberate carve-out it was (not R-d's question).
+#[test]
+fn b579_one_width_a_literal_and_a_conversion_still_compute() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let a: usize = 6;
+            let b: i32 = 4;
+            print(a - 1);
+            print(a * b.as_usize());
+            print(b % 3);
+            print(a / 2);
+            let x: f64 = 1.5;
+            print(x * b);
+        }
+        "#,
+        "5\n24\n1\n3\n6\n",
+    );
+}
+
+// --- B591: a subscript's index typed after the subscript resolves -----------
+
+/// B591: the `usize` check passed an index whose type was not known when the
+/// subscript resolved — a call's (`xs[minus_one()]`, `xs[n.max(0)]`) — and
+/// nothing asked again, so an `i32` index checked clean and a negative one
+/// panicked "the index is -1" on JS and "18446744073709551615" natively. The
+/// subscript waits for its index's type, then checks it.
+#[test]
+fn b591_a_late_typed_index_is_checked() {
+    for index in ["minus_one()", "n.max(0)", "pick(1)"] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            fun minus_one(): i32 {{
+                0 - 1
+            }}
+            fun pick<T>(value: T): T {{
+                value
+            }}
+            fun main() {{
+                let xs = [1, 2, 3];
+                let n: i32 = 1;
+                print(xs[{index}]);
+            }}
+            "#
+        );
+        assert_fails_once_with(&source, "an index must be a `usize`, and this one is `i32`");
+    }
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun one(): usize {
+            1
+        }
+        fun main() {
+            let xs = [1, 2, 3];
+            let n: i32 = 2;
+            print(xs[one()]);
+            print(xs[n.as_usize()]);
+        }
+        "#,
+        "2\n3\n",
+    );
+}

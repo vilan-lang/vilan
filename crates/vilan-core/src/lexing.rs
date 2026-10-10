@@ -120,7 +120,11 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
 pub const CONTEXTUAL_KEYWORDS: &[(&str, &str)] = &[
     (
         "as",
-        "the alias on an import path leaf: `import a::b as c;`",
+        "the alias on an import path leaf, `import a::b as c;`, and the type ascription after a complete operand: `[] as List<str>`",
+    ),
+    (
+        "auto",
+        "the toolchain-kept type at an annotation's head: `fun f(): auto i32`, `let x: auto = ..`, `as auto T` (`auto::` is a path)",
     ),
     (
         "borrows",

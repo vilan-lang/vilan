@@ -19,6 +19,31 @@
 //! safe direction: a stretched sleep only ever waits longer. The one phase that
 //! measures a gap uses a 2 s window and a 100 ms gap, so it would take a 20x
 //! overshoot of that sleep to split the window.
+//!
+//! **The margins, audited (N139).** There are exactly two kinds of claim in
+//! this file, and the 50 ms windows are only ever the first:
+//!
+//! 1. *"It fired before the marker"* - a window (50 ms) against the fixed
+//!    `sleep(1000)` that follows. The window's timer is registered BEFORE the
+//!    sleep's and expires 950 ms sooner, and a host that stalls runs expired
+//!    timers in expiry order when it wakes, so the stall cannot reorder them:
+//!    the fire lands first however long the box stalls. What a stall used to do
+//!    to this phase was not reorder it but hand `setTimeout` a negative
+//!    remaining delay and make node print to stderr (N155: the window had
+//!    already run out before the loop's first `now()`); the clamp in
+//!    `std::time` is the fix, and `n155_*` below is its pin. Widening these
+//!    windows would NOT help and would cost: the wait that proves the fire
+//!    happened is the same `sleep(1000)`, so a 500 ms window leaves half the
+//!    proof.
+//! 2. *"It had not fired yet"* - a call, cancel or flush made some time after
+//!    `run`, which the window must outlast. These are the only margin-bound
+//!    claims, and each is wide: the pushed deadline's second `run` comes 100 ms
+//!    into a 2 s window (20x); the nursery cancel comes 10 ms into a 1 s window
+//!    (100x, widened from 50 ms by the order-45 `windows-latest` find); the
+//!    flush exhibit's `flush` and the cancel/run races are dispatched in the
+//!    SAME tick as the `run`, so no stall can come between them at all; and the
+//!    window `renewing` re-arms from inside a flushed callback (200 ms) is
+//!    followed by a 2 s sleep (10x).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -343,6 +368,65 @@ fn b277_a_debounce_survives_a_callback_that_throws_and_the_failure_is_reported()
         stderr.matches("unhandled task error").count(),
         1,
         "one failure, one report; stderr was:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- N155: a deadline already past reaches the host timer as 0 ---------------
+
+/// A host that stalls past a deadline between `run` and the loop's first
+/// `now()` (a loaded Windows runner, a preempted process) used to hand
+/// `setTimeout` a NEGATIVE delay, and node answered on stderr with
+/// `TimeoutNegativeWarning: -1 is a negative number` - which the exhibit's
+/// empty-stderr assertion (right, and kept) reported as red. A stall cannot be
+/// scheduled, so the pin makes the deadline already past on purpose: a negative
+/// `Duration` is a deadline before `run` was even called, a negative `Timer::after`
+/// and `sleep` are the same number arriving by the other two doors. Every one
+/// must fire, in order, with nothing on stderr.
+const DEBOUNCE_DEADLINE_ALREADY_PAST: &str = r#"import std::io::print;
+import std::time::{ Debounce, Duration, Timer, sleep };
+
+async fun main() {
+	// 1. A timer whose delay is already past fires, and says so.
+	let late = Timer::after(-5);
+	print(late.wait());
+	print("mark-a");
+
+	// 2. A sleep whose delay is already past ends.
+	sleep(-5);
+	print("mark-b");
+
+	// 3. A debounce whose deadline is before the call fires, once, with the
+	//    last callback: the driving loop computes a negative time left.
+	let past = Debounce::new(Duration::millis(-5));
+	past.run(|| print("past-first"));
+	past.run(|| print("past-last"));
+	sleep(500);
+	print("mark-c");
+}
+"#;
+
+#[test]
+fn n155_a_deadline_already_past_fires_and_writes_nothing_to_stderr() {
+    let dir = temp_project("deadline_past");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", DEBOUNCE_DEADLINE_ALREADY_PAST);
+    // `run_project` asserts stderr is empty: node's TimeoutNegativeWarning
+    // is exactly what this pin exists to keep out of it.
+    let stdout = run_project(&dir);
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        ["true", "mark-a", "mark-b", "past-last", "mark-c"],
+        "the past-deadline exhibit printed the wrong sequence; got:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

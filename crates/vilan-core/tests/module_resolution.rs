@@ -7103,7 +7103,7 @@ fn analyze_inherited_default_package(p1_import: &str) -> InheritedDefaultProgram
         .find(|declared| declared.name == "Box")
         .expect("`Box`")
         .id;
-    let box_type = *program
+    let box_type = program
         .type_id_to_type_map
         .iter()
         .find(|(_, type_)| {
@@ -9052,6 +9052,132 @@ fn f28_a_file_importing_only_a_single_platform_module_is_analyzed_as_before() {
     }
 }
 
+/// E286 (E266's other half): the platform a file with no project is analyzed
+/// under, when its only browser evidence is a `pkg::` or `<dependency>::` module
+/// whose FILE declares `[platform("browser")] mod self;` - `infer_platform` read
+/// `std::` imports only, so a `[library]` file importing its own browser-declared
+/// module read "analyzed as: node - default". Returns (platform, kind, reason).
+fn e286_inferred(
+    files: &[(&str, &str)],
+    entry: &str,
+    dependencies: &[(&str, &[(&str, &str)])],
+) -> (Platform, Option<&'static str>, String) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = scratch::root().join(format!("vilan_e286_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    for (relative, contents) in files {
+        let path = app.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let mut packages = Vec::new();
+    let mut entry_dependencies = Vec::new();
+    for (index, (name, dependency_files)) in dependencies.iter().enumerate() {
+        let dependency_root = root.join(name);
+        for (relative, contents) in *dependency_files {
+            let path = dependency_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+        }
+        packages.push(PackageSpec {
+            base_root: dependency_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        });
+        entry_dependencies.push((name.to_string(), index));
+    }
+    let workspace = Workspace {
+        packages,
+        entry_dependencies,
+        ..Workspace::default()
+    };
+    let entry_path = app.join(entry);
+    let source: &'static str = Box::leak(
+        std::fs::read_to_string(&entry_path)
+            .unwrap()
+            .into_boxed_str(),
+    );
+    let (program, _errors) =
+        analyze_source(source, &std_spec(), &app, &entry_path, None, &workspace);
+    let program = program.expect("a program");
+    let answer = (
+        program.platform,
+        program.platform_kind,
+        program.platform_reason.clone().unwrap_or_default(),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    answer
+}
+
+const E286_BROWSER_MODULE: &str = "[platform(\"browser\")] mod self;\n\n\
+     export fun anchor_of(n: i32): i32 {\n\tn\n}\n";
+const E286_PLAIN_MODULE: &str = "export fun anchor_of(n: i32): i32 {\n\tn\n}\n";
+
+#[test]
+fn e286_a_pkg_module_declaring_the_browser_platform_is_browser_evidence() {
+    let entry = "import pkg::paint::anchor_of;\n\nexport fun measure(): i32 {\n\tanchor_of(1)\n}\n";
+    let (platform, kind, reason) = e286_inferred(
+        &[("measure.vl", entry), ("paint.vl", E286_BROWSER_MODULE)],
+        "measure.vl",
+        &[],
+    );
+    assert_eq!(platform, Platform::Browser, "{reason}");
+    assert_eq!(kind, Some("inferred"), "{reason}");
+    assert!(
+        reason.contains("`pkg::paint`") && reason.contains("declares the `browser` platform"),
+        "the reason names the module: {reason}"
+    );
+    // The control: the same file over a module that declares nothing is the default.
+    let (platform, kind, reason) = e286_inferred(
+        &[("measure.vl", entry), ("paint.vl", E286_PLAIN_MODULE)],
+        "measure.vl",
+        &[],
+    );
+    assert_eq!(platform, Platform::default(), "{reason}");
+    assert_eq!(kind, Some("default"), "{reason}");
+}
+
+#[test]
+fn e286_a_dependency_module_declaring_the_browser_platform_is_browser_evidence() {
+    let entry =
+        "import widgets::paint::anchor_of;\n\nexport fun measure(): i32 {\n\tanchor_of(1)\n}\n";
+    let (platform, kind, reason) = e286_inferred(
+        &[("measure.vl", entry)],
+        "measure.vl",
+        &[(
+            "widgets",
+            &[
+                ("lib.vl", "export fun noop() {}\n"),
+                ("paint.vl", E286_BROWSER_MODULE),
+            ],
+        )],
+    );
+    assert_eq!(platform, Platform::Browser, "{reason}");
+    assert_eq!(kind, Some("inferred"), "{reason}");
+    assert!(
+        reason.contains("`widgets::paint`"),
+        "the reason names the dependency's module: {reason}"
+    );
+    // The control: a dependency whose module declares nothing is no evidence.
+    let (platform, ..) = e286_inferred(
+        &[("measure.vl", entry)],
+        "measure.vl",
+        &[(
+            "widgets",
+            &[
+                ("lib.vl", "export fun noop() {}\n"),
+                ("paint.vl", E286_PLAIN_MODULE),
+            ],
+        )],
+    );
+    assert_eq!(platform, Platform::default());
+}
+
 #[test]
 fn b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive() {
     // B547: `std::reactive::store` RE-EXPORTS the `Storable` trait from
@@ -9518,6 +9644,236 @@ fn b576_a_modules_twin_note_names_the_builds_platform() {
     );
 }
 
+/// Analyzes `entry` twice against the same package directory — the second
+/// time under `second`, with the first analysis's world in the base cache —
+/// and answers both diagnostic lists and the second analysis's census (B576:
+/// a stored world may not render a fact that is the serving call's).
+fn analyze_twice_under(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+    first: Workspace,
+    second: Workspace,
+) -> (Vec<Error>, Vec<Error>, vilan_core::incremental::Census) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!(
+        "vilan_modres_twice_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    vilan_core::analyzer::base_cache_clear();
+    let (_, first_errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &first,
+    );
+    let (_, second_errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &second,
+    );
+    let census = vilan_core::incremental::census();
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&dir);
+    (first_errors, second_errors, census)
+}
+
+/// B576: the twin note's REASON clause is the serving call's. A module's note
+/// is produced by the pre-entry resolve, which a stored world carries; the
+/// call served that world renders its own `platform_reason` — never the one
+/// the storing call had, and never none.
+#[test]
+fn b576_a_stored_worlds_twin_note_renders_the_serving_calls_reason() {
+    let files = [
+        (
+            "m.vl",
+            "import std::web::ui::{ View, view };\n\nexport fun show(): str {\n\tlet v: View = view(\"div\");\n\tv.render()\n}\n",
+        ),
+        (
+            "main.vl",
+            "import std::io::print;\nimport pkg::m::show;\n\nfun main() {\n\tprint(show());\n}\n",
+        ),
+    ];
+    let reasoned = |reason: &str| Workspace {
+        platform_reason: Some(reason.to_string()),
+        ..Workspace::default()
+    };
+    let (first, second, census) = analyze_twice_under(
+        &files,
+        "main.vl",
+        Platform::Browser,
+        reasoned("the first call's reason"),
+        reasoned("the second call's reason"),
+    );
+    assert!(
+        census.base_hits == 1,
+        "the second analysis is served the stored world: {census:?}"
+    );
+    let twin_note = |errors: &[Error]| -> String {
+        errors
+            .iter()
+            .filter_map(|error| error.note.as_ref().map(|note| note.msg.clone()))
+            .find(|note| note.contains("this file is analyzed under"))
+            .unwrap_or_else(|| panic!("no twin note: {errors:#?}"))
+    };
+    let (first, second) = (twin_note(&first), twin_note(&second));
+    assert!(
+        first.contains("analyzed under browser: the first call's reason"),
+        "the storing call renders its reason: {first}"
+    );
+    assert!(
+        second.contains("analyzed under browser: the second call's reason")
+            && !second.contains("first call"),
+        "the served call renders ITS reason, not the stored world's: {second}"
+    );
+    assert!(
+        !first.contains('\u{1}') && !second.contains('\u{1}'),
+        "no publish mark leaks: {first} / {second}"
+    );
+}
+
+/// B576's other unkeyed fact: the web-set steer names the REPAIR the serving
+/// front end can take. A module's steer is the pre-entry resolve's; served
+/// from a stored world to a toggle front end, it asks for the toggle.
+#[test]
+fn b576_a_stored_worlds_web_set_steer_names_the_serving_calls_repair() {
+    let files = [
+        (
+            "m.vl",
+            "export fun probe(): i32 {\n\tlet s = Signal::new(0);\n\t1\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::m::probe;\n\nfun main() {\n\tprint(probe());\n}\n",
+        ),
+    ];
+    let repaired = |repair: PreludeRepair| Workspace {
+        entry_prelude: base_prelude(),
+        prelude_repair: repair,
+        ..Workspace::default()
+    };
+    let (first, second, census) = analyze_twice_under(
+        &files,
+        "main.vl",
+        Platform::Browser,
+        repaired(PreludeRepair::Manifest),
+        repaired(PreludeRepair::Toggle),
+    );
+    assert!(
+        census.base_hits == 1,
+        "the second analysis is served the stored world: {census:?}"
+    );
+    let steer = |errors: &[Error]| -> String {
+        errors
+            .iter()
+            .map(|error| error.msg.clone())
+            .find(|msg| msg.contains("in the prelude of the web set"))
+            .unwrap_or_else(|| panic!("no web-set steer: {errors:#?}"))
+    };
+    let (first, second) = (steer(&first), steer(&second));
+    assert!(
+        first.contains("set `prelude = \"std::web::prelude\"` in vilan.toml"),
+        "the manifest front end is told the manifest line: {first}"
+    );
+    assert!(
+        second.contains("switch the playground's prelude to the web set")
+            && !second.contains("vilan.toml"),
+        "the toggle front end is told the toggle, from the same stored world: {second}"
+    );
+}
+
+/// The sources an analysis of `entry` loaded, as the paths' strings — for
+/// the pins about WHAT a program's seeds pull in.
+fn loaded_sources(files: &[(&str, &str)], entry: &str, platform: Platform) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!(
+        "vilan_modres_loaded_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, _) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    program
+        .expect("the analysis produces a program")
+        .sources
+        .iter()
+        .map(|path| path.display().to_string().replace('\\', "/"))
+        .collect()
+}
+
+/// kolt's shape: the service file IMPORTS the store and holds a `Store<T>`
+/// field, and no member returns a handle — the import rule seeded mirror for
+/// it, the surface rule does not.
+const A167_SERVICE_WITHOUT_STORE: &str = "import std::io::print;\nimport std::reactive::store::{ Storable, Store };\nimport std::shared::Shared;\n\n[derive(Storable)]\nstruct Global {\n\tcount: i32,\n}\n\n[service(PingClient)]\nstruct Ping {\n\tcalls: Shared<i32>,\n\tglobal: Store<Global>,\n}\n\nimpl Ping {\n\t[rpc]\n\tfun ping(self): i32 {\n\t\t1\n\t}\n}\n\nfun main() {\n\tprint(\"up\");\n}\n";
+
+const A167_SERVICE_WITH_STORE: &str = "import std::io::print;\nimport std::reactive::store::{ Storable, Store };\nimport std::shared::Shared;\n\n[derive(Storable)]\nstruct Global {\n\tcount: i32,\n}\n\n[service(GlobalClient)]\nstruct Api {\n\tglobal: Store<Global>,\n}\n\nimpl Api {\n\t[rpc]\n\tfun global(self): Store<Global> {\n\t\tself.global\n\t}\n}\n\nfun main() {\n\tprint(\"up\");\n}\n";
+
+/// A167 / C3b: a `[service]` whose surface returns no store handle loads
+/// `std::rpc` and NOT `std::rpc::mirror` — the seed is keyed on the surface,
+/// not on the file importing the store (kolt's service file imports it for a
+/// field and paid mirror's 1,409 lines on every keystroke).
+#[test]
+fn a167_a_service_without_a_store_return_does_not_load_rpc_mirror() {
+    let sources = loaded_sources(
+        &[("main.vl", A167_SERVICE_WITHOUT_STORE)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        sources.iter().any(|path| path.ends_with("/std/src/rpc.vl")),
+        "the service seeds std::rpc: {sources:#?}"
+    );
+    assert!(
+        !sources.iter().any(|path| path.ends_with("/rpc/mirror.vl")),
+        "a service returning no store handle must not load std::rpc::mirror: {sources:#?}"
+    );
+}
+
+/// The control: a surface returning `Store<T>` seeds `std::rpc::mirror`.
+#[test]
+fn a167_a_service_returning_a_store_loads_rpc_mirror() {
+    let sources = loaded_sources(
+        &[("main.vl", A167_SERVICE_WITH_STORE)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        sources.iter().any(|path| path.ends_with("/rpc/mirror.vl")),
+        "a service returning a store handle seeds std::rpc::mirror: {sources:#?}"
+    );
+}
+
 /// B572: a std name a facade re-exports is steered to the facade, not to the
 /// internal module that declares it — `Store` and `StoreSome` are declared in
 /// `std::reactive::store_core` and re-exported by `std::reactive::store`, the
@@ -9597,5 +9953,77 @@ fn b561_a_nested_package_traits_import_is_spelled_at_its_full_path() {
     assert!(
         errors.is_empty(),
         "the refusal's import compiles: {errors:#?}"
+    );
+}
+
+// --- B585: `resolve_world`'s static-path refusals in a module are anchored -----
+
+/// B585: the static-member arms of `resolve_world` pushed with no attribution,
+/// so a refusal raised inside a MODULE rendered against whichever file was
+/// walked last (std's `lib.vl`, with std's comment text under the label).
+/// Each arm now anchors at its own expression; one helper, one pin per arm.
+fn b585_refusal_is_anchored_in_the_module(user: &str, message_part: &str) {
+    let entry = "import pkg::user::call;\n\nfun main() {\n\tlet _ = call(1);\n}\n";
+    let errors = analyze_package_spanned(
+        &[("main.vl", entry), ("user.vl", user)],
+        "main.vl",
+        Platform::default(),
+    );
+    let refusal = errors
+        .iter()
+        .find(|(message, ..)| message.contains(message_part))
+        .unwrap_or_else(|| panic!("no `{message_part}` refusal: {errors:#?}"));
+    assert_eq!(refusal.1, "user.vl", "{errors:#?}");
+    assert!(
+        refusal.2.end <= user.len() && !user[refusal.2.clone()].trim().is_empty(),
+        "the span indexes user.vl's own text: {errors:#?}"
+    );
+}
+
+#[test]
+fn b585_an_unconstrained_parameters_static_miss_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "export fun call<T>(value: T): i32 {\n\tlet _ = T::missing();\n\t1\n}\n",
+        "cannot access 'missing' on an unconstrained type parameter",
+    );
+}
+
+#[test]
+fn b585_a_types_static_miss_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "import std::option::Option;\n\nexport fun call(value: i32): i32 {\n\tlet _ = Option::nothing_here();\n\tvalue\n}\n",
+        "cannot find 'nothing_here' in Option",
+    );
+}
+
+#[test]
+fn b585_a_bounded_parameters_static_miss_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "import std::display::Display;\n\nexport fun call<T: Display>(value: T): i32 {\n\tlet _ = T::missing();\n\t1\n}\n",
+        "no bound of this type parameter (Display) has a member 'missing'",
+    );
+}
+
+#[test]
+fn b585_a_bodyless_associated_function_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "trait Make {\n\tfun make(): i32;\n}\n\nexport fun call(value: i32): i32 {\n\tMake::make() + value\n}\n",
+        "'Make::make' has no default body",
+    );
+}
+
+#[test]
+fn b585_an_ambiguous_static_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "trait A {\n\tfun make(): i32;\n}\n\ntrait B {\n\tfun make(): i32;\n}\n\nstruct Thing {}\n\nimpl Thing with A {\n\tfun make(): i32 {\n\t\t1\n\t}\n}\n\nimpl Thing with B {\n\tfun make(): i32 {\n\t\t2\n\t}\n}\n\nexport fun call(value: i32): i32 {\n\tThing::make() + value\n}\n",
+        "'make' is ambiguous on 'Thing'",
+    );
+}
+
+#[test]
+fn b585_a_trait_member_on_the_types_path_is_anchored_in_its_module() {
+    b585_refusal_is_anchored_in_the_module(
+        "trait Greet {\n\tfun hello(self): str;\n}\n\nstruct Thing {}\n\nimpl Thing with Greet {\n\tfun hello(self): str {\n\t\t\"hi\"\n\t}\n}\n\nexport fun call(value: i32): i32 {\n\tlet _ = Thing::hello(Thing {});\n\tvalue\n}\n",
+        "'hello' is not an inherent member of 'Thing'",
     );
 }

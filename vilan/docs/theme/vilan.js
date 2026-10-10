@@ -94,12 +94,13 @@
 			begin: "(?<=\\()sync\\b",
 		};
 		// `as` is CONTEXTUAL the same way (E142/E145): it names an import
-		// alias — `import a::b as c;` — and a value may still be NAMED `as`.
-		// Guarded on BOTH sides, since between two identifiers is the only
-		// place the alias sits.
+		// alias — `import a::b as c;` — and the type ascription after a
+		// complete operand (`[] as List<str>`, `f() as A`, B571), and a value
+		// may still be NAMED `as`. Guarded on BOTH sides: something an operand
+		// ends with before it, something a type begins with after it.
 		const IMPORT_ALIAS = {
 			className: "keyword",
-			begin: "(?<=[A-Za-z0-9_]\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_])",
+			begin: "(?<=[A-Za-z0-9_\\)\\]\\}\"']\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_(&|])",
 		};
 		// `only` is CONTEXTUAL too (B318's trailing import modifier, K26):
 		// `import a::{ b } only;`. It sits between a path's end — a name or a
@@ -129,6 +130,10 @@
 		const CONTEXTUAL_LAZY = { className: "keyword", begin: "\\blazy\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
 		const CONTEXTUAL_DYN = { className: "keyword", begin: "\\bdyn\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
 		const CONTEXTUAL_JUMP = { className: "keyword", begin: "\\bjump\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		// B570: `auto`, the toolchain-kept type, at an annotation's head —
+		// after a `:` (never `::`, so `Length::auto()` stays plain) or `as`,
+		// and never before `::`.
+		const CONTEXTUAL_AUTO = { className: "keyword", begin: "(?<=(?:[^:]:|\\b[a][s])\\s{0,8})auto\\b(?!\\s{0,8}::)" };
 		// B414 S4, the member tier: every word — a reserved one included —
 		// names a member, so `event.type`, `bag.if()` and a field `type: str`
 		// are NAMES. R-k writes a member's name against its dot, which makes
@@ -217,6 +222,7 @@
 				CONTEXTUAL_OWN,
 				CONTEXTUAL_LAZY,
 				CONTEXTUAL_DYN,
+				CONTEXTUAL_AUTO,
 				CONTEXTUAL_JUMP,
 				CONTEXTUAL_THEN,
 				ELEMENT_TAG,

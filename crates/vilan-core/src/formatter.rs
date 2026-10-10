@@ -119,11 +119,76 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
                 collapse_field_shorthands(canonicalize_marker_heads(drop_redundant_view_prefixes(
-                    drop_trailing_commas(tokens),
+                    drop_ascribed_closure_parens(drop_trailing_commas(tokens)),
                 ))),
             )),
         ))),
     ))))
+}
+
+/// Drops the parentheses around a closure type right after `as` — `x as
+/// (|i32| i32)` is `x as |i32| i32` — so the safety net accepts the printer
+/// parenthesizing every ascribed closure type (B571 §10, Q9 RULED). The
+/// pair is found by depth from the `(` that follows `as` and opens with a
+/// closure type's first token (`|`, `||`, `async`, `sync`); both streams are
+/// folded alike, so a CALL of a function named `as` with a closure argument
+/// (`as(|x| x)`) folds identically on both sides and still compares.
+fn drop_ascribed_closure_parens(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut dropped: Vec<bool> = vec![false; tokens.len()];
+    for index in 0..tokens.len() {
+        if tokens[index] != Token::Ident("as") || tokens.get(index + 1) != Some(&Token::Ctrl('(')) {
+            continue;
+        }
+        let closure = matches!(
+            tokens.get(index + 2),
+            Some(Token::Op("|" | "||") | Token::Async | Token::Ident("sync"))
+        );
+        // `as (x: T)` is a one-slot LABELLED tuple (B569), no group: its
+        // parentheses are its syntax, as a tuple's comma is.
+        if matches!(tokens.get(index + 2), Some(Token::Ident(_)))
+            && tokens.get(index + 3) == Some(&Token::Op(":"))
+        {
+            continue;
+        }
+        // The matching `)`, and whether the group holds a comma of its own
+        // (a tuple type, `as (A, B)`, whose parentheses are its syntax) —
+        // commas inside a nested group or a generic list are the inner
+        // type's.
+        let mut depth = 0usize;
+        let mut angles = 0usize;
+        let mut comma = false;
+        let mut close = None;
+        for (at, token) in tokens.iter().enumerate().skip(index + 1) {
+            match token {
+                Token::Ctrl('(') => depth += 1,
+                Token::Ctrl('<') => angles += 1,
+                Token::Ctrl('>') => angles = angles.saturating_sub(1),
+                Token::Ctrl(',') if depth == 1 && angles == 0 => comma = true,
+                Token::Ctrl(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(at);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A closure type's parentheses (§10's printing), or a ONE-type group
+        // `as (T)` (§10: printed `as T` unless it is the `<` escape) — both
+        // streams fold alike, so either spelling compares to the other.
+        if let Some(close) = close
+            && (closure || !comma)
+        {
+            dropped[index + 1] = true;
+            dropped[close] = true;
+        }
+    }
+    tokens
+        .into_iter()
+        .zip(dropped)
+        .filter_map(|(token, drop)| (!drop).then_some(token))
+        .collect()
 }
 
 /// Drops a parameter's view prefix that its type already states — `&x: &i32`
@@ -3419,6 +3484,9 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
                 error.reason,
                 crate::parsing::ParseErrorReason::MarkerOrder { .. }
                     | crate::parsing::ParseErrorReason::AttributeOrder { .. }
+                    // B571 §5.1: a spaced generic list after `as` is read as
+                    // the tight one, and the reprint is the fix.
+                    | crate::parsing::ParseErrorReason::SpacedAscribedGenerics { .. }
             )
         })
     })
@@ -5641,6 +5709,14 @@ impl<'src> Printer<'src> {
                 }
                 self.print_type(&inner.0);
             }
+            // `auto T` / `auto` (B570): one space after the marker.
+            Node::AutoType(written) => {
+                self.out.push_str("auto");
+                if let Some(written) = written.as_deref() {
+                    self.out.push(' ');
+                    self.print_type(&written.0);
+                }
+            }
             // `async |A| B` / `sync |A| B` — closure-type contract markers.
             Node::AsyncType(inner) => {
                 self.out.push_str("async ");
@@ -5698,6 +5774,13 @@ impl<'src> Printer<'src> {
                 if let Some(tuple_bound) = tuple_bound {
                     self.print_tuple_bound(tuple_bound);
                 }
+            }
+            // B569: `x: f64` — a labelled slot of a tuple type, one space after
+            // the `:` as a field's.
+            Node::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(": ");
+                self.print_type(&inner.0);
             }
             // `(A, B)` — a tuple type.
             Node::Tuple(elements) => {
@@ -6596,13 +6679,62 @@ impl<'src> Printer<'src> {
         while let Node::MemberAccessor(inner, _)
         | Node::Index(inner, _)
         | Node::TryAssert(inner)
-        | Node::Lifted(inner) = &subject.0
+        | Node::Lifted(inner)
+        | Node::Ascribe(inner, _) = &subject.0
         {
             spine.push(subject);
             subject = inner;
         }
         spine.reverse();
         (subject, spine)
+    }
+
+    /// ` as T` — an ascription's word and type (B571, type-ascription.md §10):
+    /// one space each side, the type canonical (generic lists tight), and a
+    /// closure type parenthesized, `as (|i32| i32)`, so a reader never has to
+    /// find where a greedy return type ends.
+    fn print_ascription(&mut self, type_: &Spanned<Node<'src>>) {
+        self.out.push_str(" as ");
+        // `as (T)` is the ESCAPE where a `<` follows (`n as (usize) < limit`,
+        // §5.1) and kept there; with nothing after it the parentheses are
+        // redundant and the canonical form is `as T` (§10). A labelled slot,
+        // `as (x: T)`, is a one-slot tuple (B569) and keeps them.
+        if let Node::Tuple(elements) = &type_.0
+            && let [only] = elements.as_slice()
+            && !matches!(only.0, Node::Labelled(..))
+            && !self.source[type_.1.end..].trim_start().starts_with('<')
+        {
+            self.print_ascribed_type(only);
+            return;
+        }
+        self.print_ascribed_type(type_);
+    }
+
+    /// [`Self::print_ascription`]'s type, a closure type parenthesized.
+    fn print_ascribed_type(&mut self, type_: &Spanned<Node<'src>>) {
+        let closure = match &type_.0 {
+            Node::ClosureType(..) | Node::AsyncType(_) | Node::SyncType(_) => true,
+            Node::TypeWithContexts(inner, _) => matches!(inner.0, Node::ClosureType(..)),
+            _ => false,
+        };
+        if closure {
+            self.out.push('(');
+            self.print_type(&type_.0);
+            self.out.push(')');
+        } else {
+            self.print_type(&type_.0);
+        }
+    }
+
+    /// How many ascriptions `expr`'s postfix spine carries — a chain with one
+    /// on more than one stage breaks one stage per line, each ascription at
+    /// the end of its stage's line (B571 §10).
+    fn chain_ascriptions(expr: &Spanned<Node<'src>>) -> usize {
+        let (_, spine) = Self::postfix_spine(expr);
+        spine
+            .iter()
+            .filter(|node| matches!(node.0, Node::Ascribe(..)))
+            .count()
     }
 
     /// Whether a ONE-link chain may break on width at all: its single link's
@@ -6839,6 +6971,10 @@ impl<'src> Printer<'src> {
         // a `?`/`!` subject through the plain operand rule.
         match &spine[0].0 {
             Node::MemberAccessor(_, _) | Node::Index(_, _) => self.print_postfix_subject(subject),
+            // A block-like form ascribed after its brace (B571 Q4) prints bare.
+            Node::Ascribe(..) if crate::parsing::is_block_like(&subject.0) => {
+                self.print_expr(subject);
+            }
             _ => self.print_operand(subject, 100),
         }
         for step in spine {
@@ -7768,7 +7904,8 @@ impl<'src> Printer<'src> {
             }
             Node::TryAssert(_) => self.out.push('!'),
             Node::Lifted(_) => self.out.push('?'),
-            // `postfix_spine` yields only the four forms above.
+            Node::Ascribe(_, type_) => self.print_ascription(type_),
+            // `postfix_spine` yields only the five forms above.
             _ => self.decline(Some(step.1)),
         }
     }
@@ -8135,6 +8272,12 @@ impl<'src> Printer<'src> {
             self.print_split_chain(expr);
             return;
         }
+        // A third door (B571 §10): ascriptions on more than one stage put each
+        // stage on its own line, the ascription closing it.
+        if call_links >= 1 && Self::chain_ascriptions(expr) >= 2 {
+            self.print_split_chain(expr);
+            return;
+        }
         // A `style()` builder chain that the canonical order PERMUTES cannot go
         // through the recursive `MemberAccessor` arm below, which prints the
         // spine in its written order. It gets the same inline rendering, link by
@@ -8356,6 +8499,17 @@ impl<'src> Printer<'src> {
             Node::TryAssert(subject) => {
                 self.print_operand(subject, 100);
                 self.out.push('!');
+            }
+            // `value as T` (B571): a chain-tier postfix. A block-like value
+            // (`match .. { .. } as T`, Q4) prints bare — the ascription after
+            // its brace is the form's own continuation, on the brace's line.
+            Node::Ascribe(value, type_) => {
+                if crate::parsing::is_block_like(&value.0) {
+                    self.print_expr(value);
+                } else {
+                    self.print_operand(value, 100);
+                }
+                self.print_ascription(type_);
             }
             Node::Lift(subject, continuation) => {
                 // `a?.b.c`: the subject, `?`, then the continuation — whose
@@ -8672,6 +8826,13 @@ impl<'src> Printer<'src> {
                 self.out.push('(');
                 self.print_expression_list(elements);
                 self.out.push(')');
+            }
+            // B569: `x = 5` — a labelled tuple entry, spaced as a struct
+            // literal's field.
+            Node::Labelled((label, _), value) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_expr(value);
             }
             Node::Closure(closure) => {
                 self.print_closure_parameters(&closure.parameters.0);
@@ -8999,6 +9160,12 @@ impl<'src> Printer<'src> {
                 }
                 self.out.push(']');
             }
+            // B569 S3: a by-name element, `y = top`.
+            Pattern::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_binder(&inner.0);
+            }
             // A binder is only ever a name, a tuple, or an array of binders;
             // other pattern shapes can't reach here from the parser.
             other => self.print_pattern(other),
@@ -9080,6 +9247,12 @@ impl<'src> Printer<'src> {
                 self.out.push(']');
             }
             Pattern::Literal(literal) => self.print_expr(literal),
+            // B569 S3: a by-name element, `x = let v`.
+            Pattern::Labelled((label, _), inner) => {
+                self.out.push_str(label);
+                self.out.push_str(" = ");
+                self.print_match_pattern(inner);
+            }
         }
     }
 }
@@ -9160,6 +9333,82 @@ mod reformats {
     fn an_identity_pin_over_a_declined_source_fails() {
         let source = "fun main() {\n\tlet x = (;\n}\n";
         assert_formats(source, source);
+    }
+
+    // B571 §10: `as` with one space each side, the type canonical, a closure
+    // type parenthesized, a spaced generic list after `as` written tight, a
+    // block-like form ascribed after its brace, and a single ascription on
+    // the ordinary chain rule.
+    #[test]
+    fn b571_an_ascription_prints_canonically() {
+        assert_formats(
+            "fun main() {\n\tlet a = 5  as   f64;\n\tlet xs = [] as List <i32>;\n\tlet m = x as HashMap< str ,List <i32> >;\n}\n",
+            "fun main() {\n\tlet a = 5 as f64;\n\tlet xs = [] as List<i32>;\n\tlet m = x as HashMap<str, List<i32>>;\n}\n",
+        );
+        assert_formats(
+            "fun main() {\n\tlet f = measure as |str| i32;\n\tlet g = f as async || i32;\n}\n",
+            "fun main() {\n\tlet f = measure as (|str| i32);\n\tlet g = f as (async || i32);\n}\n",
+        );
+        let kept = concat!(
+            "fun main() {\n",
+            "\tlet f = measure as (|str| i32);\n",
+            "\tlet n = count as (usize) < limit;\n",
+            "\tlet picked = match flag {\n\t\ttrue => 1,\n\t\tfalse => 2,\n\t} as f64;\n",
+            "\tlet one = words.map(f) as List<usize>;\n",
+            "\tlet total = a + b as f64;\n",
+            "\tlet value = (await promise) as i32;\n",
+            "\tlet as = 5;\n",
+            "}\n",
+        );
+        assert_formats(kept, kept);
+    }
+
+    /// B570: `auto` prints canonically — one space after the marker — and the
+    /// formatter never fills or rewrites one (that is `check --fix`'s).
+    #[test]
+    fn b570_an_auto_annotation_prints_canonically_and_is_never_filled() {
+        assert_formats(
+            "fun f():  auto   i32 {\n\t5\n}\n\nfun g(): auto {\n\t5\n}\n\nmut xs: auto  List< str > = [];\n",
+            "fun f(): auto i32 {\n\t5\n}\n\nfun g(): auto {\n\t5\n}\n\nmut xs: auto List<str> = [];\n",
+        );
+        let kept = "fun h(): auto i32 context settings {\n\t5\n}\n";
+        assert_formats(kept, kept);
+    }
+
+    /// B571 §10: a redundant `as (T)` prints as `as T`; the escape before a
+    /// `<` keeps its parentheses, and so does a tuple type — a one-slot
+    /// labelled one included (B569).
+    #[test]
+    fn b571_a_redundant_parenthesized_ascription_prints_bare() {
+        assert_formats(
+            "fun main() {\n\tlet n = count as (usize);\n\tlet m = count as ( List<i32> ).len();\n}\n",
+            "fun main() {\n\tlet n = count as usize;\n\tlet m = count as List<i32>.len();\n}\n",
+        );
+        let kept = "fun main() {\n\tlet a = n as (usize) < limit;\n\tlet b = pair as (i32, str);\n\tlet d = f as (|i32| i32);\n\tlet e = point as (x: i32);\n}\n";
+        assert_formats(kept, kept);
+    }
+
+    /// B571 §10: ascriptions on more than one stage put each stage on its own
+    /// line, the ascription closing it — the owner's layout — whatever the
+    /// width; written on one line, the chain is broken into it.
+    #[test]
+    fn b571_a_chain_ascribed_on_several_stages_breaks_one_stage_per_line() {
+        let broken = concat!(
+            "fun main() {\n",
+            "\tlet y = a() as A\n",
+            "\t\t.b() as B\n",
+            "\t\t.c() as C;\n",
+            "}\n",
+        );
+        assert_formats(broken, broken);
+        assert_formats(
+            "fun main() {\n\tlet y = a() as A.b() as B.c() as C;\n}\n",
+            broken,
+        );
+        assert_formats(
+            "fun main() {\n\tlet n = words as List<str>.len() as usize;\n}\n",
+            "fun main() {\n\tlet n = words as List<str>\n\t\t.len() as usize;\n}\n",
+        );
     }
 
     // B414: the six demoted keywords reprint as NAMES where they are names and

@@ -44,180 +44,180 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 256_501_430
-measured_at = "v0.46.0's seal"
+ceiling = 250_556_961
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 323_198_913
-measured_at = "v0.46.0's seal"
+ceiling = 316_493_354
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_450_646_599
-measured_at = "v0.46.0's seal"
+ceiling = 1_401_397_525
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_070_421_860
-measured_at = "v0.46.0's seal"
+ceiling = 2_921_719_082
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_694_294_616
-measured_at = "v0.46.0's seal"
+ceiling = 1_618_079_748
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_846_849_513
-measured_at = "v0.46.0's seal"
+ceiling = 1_754_915_302
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_829_587_271
-measured_at = "v0.46.0's seal"
+ceiling = 3_624_023_661
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_455_262_510
-measured_at = "v0.46.0's seal"
+ceiling = 1_409_226_385
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_018_583_086
-measured_at = "v0.46.0's seal"
+ceiling = 1_838_173_993
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 5_015_326_748
-measured_at = "v0.46.0's seal"
+ceiling = 4_623_601_746
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 5_086_895_866
-measured_at = "v0.46.0's seal"
+ceiling = 4_724_277_314
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 8_757_545_783
-measured_at = "v0.46.0's seal"
+ceiling = 8_301_520_925
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 268_246_549
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 263_350_377
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 336_618_515
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 331_341_576
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_509_563_038
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_462_043_834
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_187_134_322
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 3_042_396_360
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_760_796_838
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_689_683_219
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_917_566_257
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_828_817_217
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_972_928_013
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 3_777_130_688
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_515_211_742
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_472_645_016
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_091_098_856
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_911_572_862
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 5_196_874_356
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 4_804_246_863
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 5_274_963_649
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 4_906_794_890
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 9_055_409_317
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 8_604_423_549
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[growth]]
@@ -229,8 +229,8 @@ max_ratio = 2.3
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
+green_seals = 0
+blocking = false
 
 [[e121]]
 scenario = "shared.vl keystroke"
@@ -243,26 +243,26 @@ blocking = false
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
+green_seals = 1
+blocking = false
 
 [[e121]]
 scenario = "model.vl keystroke, importers open"
 metric = "cpu_ms"
 target_ms = 500
-green_seals = 1
+green_seals = 0
 blocking = false
 
 [[e121]]
 scenario = "css keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
+green_seals = 0
+blocking = false
 
 [[e121]]
 scenario = "parse break"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
+green_seals = 0
+blocking = false

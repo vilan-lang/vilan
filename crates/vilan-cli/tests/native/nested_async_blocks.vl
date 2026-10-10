@@ -1,0 +1,58 @@
+// F120: an `async` block whose value is itself a handle — `async { async {
+// "s" } }`, three deep, or a call answering a `Task` — is assimilated: the
+// analyzer types it by the payload, as JS's promise adoption answers, and
+// natively each layer is one more `.await` inside the block (rustc refused
+// the emitted Rust, E0308). B559's written `Task<Task<str>>` reaches it too.
+import std::io::print;
+import std::task::Task;
+
+fun deeper(): Task<str> {
+	async {
+		async {
+			"s"
+		}
+	}
+}
+
+fun deepest(): Task<i32> {
+	async {
+		let inner = 4;
+		async {
+			async {
+				inner * 10
+			}
+		}
+	}
+}
+
+fun handed(): Task<str> {
+	async {
+		"h"
+	}
+}
+
+fun relay(): Task<str> {
+	async {
+		handed()
+	}
+}
+
+async fun twice(): Task<Task<str>> {
+	async {
+		async {
+			"t"
+		}
+	}
+}
+
+async fun main() {
+	let s: str = await deeper();
+	print(s);
+	print(await deepest());
+	print(await relay());
+	print(await twice());
+	let plain = await async {
+		5
+	};
+	print(plain);
+}

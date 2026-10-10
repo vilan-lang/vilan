@@ -1,0 +1,66 @@
+// debugging.md S3: `print` writes an aggregate in vilan's literal syntax — the
+// `dbg` printer, on one line — a float inside it keeping its `.0`, a backed
+// enum by its name; a number, a string and a bool print as they always have.
+// The same bytes on both backends.
+import std::hash_map::HashMap;
+
+struct Point {
+	x: i32,
+	y: f64,
+}
+
+enum Shape {
+	Circle(f64),
+	Empty,
+}
+
+enum Color {
+	Red = "red",
+	Green = "green",
+}
+
+trait Area {
+	fun area(self): i32;
+}
+
+impl Point with Area {
+	fun area(self): i32 {
+		self.x
+	}
+}
+
+fun show<T>(value: T) {
+	print(value);
+}
+
+fun main() {
+	print(3.0);
+	print("raw");
+	print(true);
+	print(Point { x = 1, y = 3.0 });
+	print(Shape::Circle(1.5));
+	print(Shape::Empty);
+	print(Color::Red);
+	print([1, 2, 3]);
+	print(["a", "b"]);
+	print([[1.0, 2.5], []]);
+	print((1, "two", 3.0));
+	print(Some(5));
+	let none: Option<str> = None;
+	print(none);
+	mut ages: HashMap<str, i32> = HashMap::new();
+	ages.insert("ada", 36);
+	print(ages);
+	let shape: dyn Area = Point { x = 4, y = 0.5 };
+	print(shape);
+	let long = [
+		Point { x = 1, y = 1.0 },
+		Point { x = 2, y = 2.0 },
+		Point { x = 3, y = 3.0 },
+		Point { x = 4, y = 4.0 },
+	];
+	print(long);
+	show(Point { x = 7, y = 8.0 });
+	show(2.5);
+	show("generic");
+}

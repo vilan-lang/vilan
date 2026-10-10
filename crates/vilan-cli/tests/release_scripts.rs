@@ -2024,3 +2024,238 @@ fn e229_an_unknown_installer_option_is_refused() {
     assert!(report.contains("unknown option: --no-vs-code"), "{report}");
     assert!(!installer.installed().exists());
 }
+
+// ---------------------------------------------------------------------------
+// N161: `perf_gate.py ratchet --release` resets only the bumps of the classes it
+// MEASURED. The seal's verdict measures the `reference` class; the `ci` class is
+// measured by CI's own `perf` job, so a `ci` bump reset with nothing absorbed
+// turned the v0.46.0 release commit's own CI red (math x1.019, watch x1.019, todo
+// x1.005). Two paths absorb it - the green CI run's `perf-measured` artifact,
+// given (`--ci-from`) or fetched with `gh` (`--ci-run-of`, which the cut passes) -
+// and without either the bump stays in budgets.toml and the ratchet says so.
+// ---------------------------------------------------------------------------
+
+/// A reference row and a `ci` row for one subject, each with its own bump.
+const N161_BUDGETS: &str = r#"# fixture budgets
+tolerance = 0.01
+
+[[row]]
+subject = "example:math"
+counter = "instructions:u"
+class = "reference"
+ceiling = 1_000_000
+measured_at = "old"
+
+[[row]]
+subject = "example:math"
+counter = "callgrind"
+class = "ci"
+ceiling = 500_000
+measured_at = "old"
+tolerance = 0.005
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.02
+reason = "x"
+item = "M1"
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.02
+reason = "y"
+item = "M2"
+"#;
+
+/// The seal's verdict: the `reference` class only.
+const N161_VERDICT: &str = r#"{"sha": "0123456789", "verdict": "green", "counter": "instructions:u",
+    "class": "reference", "t2": {"results": {"example:math": {"instructions": 1010000, "exit": 0}}}}"#;
+
+/// CI's `perf-measured/measured.json`: the `ci` class, callgrind.
+const N161_CI_MEASURED: &str = r#"{"counter": "callgrind", "class": "ci",
+    "results": {"example:math": {"instructions": 505000, "exit": 0}}}"#;
+
+/// `perf_gate.py ratchet --release` over the fixture budgets, `PATH` as given.
+/// Returns (the report, the budgets as written).
+fn n161_release_ratchet(name: &str, path: &str, extra: &[&str], ci_json: bool) -> (String, String) {
+    let scratch = support::scratch_root().join(format!("vilan-n161-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).expect("create the scratch directory");
+    let budgets = scratch.join("budgets.toml");
+    fs::write(&budgets, N161_BUDGETS).expect("write the fixture budgets");
+    let verdict = scratch.join("perf-0123.json");
+    fs::write(&verdict, N161_VERDICT).expect("write the fixture verdict");
+    let ci = scratch.join("ci-measured.json");
+    fs::write(&ci, N161_CI_MEASURED).expect("write CI's measurement");
+    let mut command = Command::new("python3");
+    command
+        .env("PATH", path)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(repository_root().join("scripts/perf_gate.py"))
+        .arg("--budgets")
+        .arg(&budgets)
+        .arg("--work")
+        .arg(&scratch)
+        .args(["ratchet", "--release", "--from"])
+        .arg(&verdict)
+        .args(extra);
+    if ci_json {
+        command.arg("--ci-from").arg(&ci);
+    }
+    let output = command.output().expect("run scripts/perf_gate.py");
+    let mut report = String::from_utf8_lossy(&output.stdout).into_owned();
+    report.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "the ratchet failed:\n{report}");
+    let written = fs::read_to_string(&budgets).expect("read the ratcheted budgets");
+    let _ = fs::remove_dir_all(&scratch);
+    (report, written)
+}
+
+/// A PATH holding python3 and, when `gh` is `Some`, that shim as `gh` - and
+/// nothing else, so the machine's own gh (authenticated, networked) can never
+/// answer for the fixture.
+fn n161_path(name: &str, gh: Option<&str>) -> String {
+    let bin = support::scratch_root().join(format!("vilan-n161-bin-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&bin);
+    fs::create_dir_all(&bin).expect("create the PATH directory");
+    let python = locate("python3").expect("python3 on PATH");
+    std::os::unix::fs::symlink(&python, bin.join("python3")).expect("link python3");
+    if let Some(body) = gh {
+        write_shim(&bin.join("gh"), body);
+    }
+    bin.to_string_lossy().into_owned()
+}
+
+#[test]
+fn n161_a_release_ratchet_keeps_the_ci_bump_a_reference_verdict_never_measured() {
+    // No second measurement, and nothing to fetch it with: the reference bump
+    // is absorbed and reset, the ci bump and its ceiling are LEFT, and the
+    // ratchet says so.
+    let path = n161_path("kept", None);
+    let (report, written) = n161_release_ratchet("kept", &path, &[], false);
+    assert!(
+        written.contains("ceiling = 1_010_000"),
+        "the reference bump is absorbed:\n{written}"
+    );
+    assert_eq!(
+        written.matches("[[bump]]").count(),
+        1,
+        "exactly the ci bump survives:\n{written}"
+    );
+    assert!(
+        written.contains("class = \"ci\"\nratio = 1.02"),
+        "the surviving bump is the ci one:\n{written}"
+    );
+    assert!(
+        written.contains("ceiling = 500_000"),
+        "the ci row is untouched:\n{written}"
+    );
+    assert!(
+        report.contains("KEPT the bump on example:math x1.02 (class ci)"),
+        "the ratchet says what it left:\n{report}"
+    );
+    // And with --ci-run-of but no gh on PATH: kept, with the reason.
+    let (report, written) = n161_release_ratchet(
+        "kept-no-gh",
+        &path,
+        &["--ci-run-of", "0123456789abcdef"],
+        false,
+    );
+    assert_eq!(written.matches("[[bump]]").count(), 1, "{written}");
+    assert!(report.contains("gh is not installed"), "{report}");
+}
+
+#[test]
+fn n161_a_release_ratchet_absorbs_the_ci_bump_from_a_given_measurement() {
+    let path = n161_path("given", None);
+    let (report, written) = n161_release_ratchet("given", &path, &[], true);
+    assert!(
+        written.contains("ceiling = 1_010_000") && written.contains("ceiling = 505_000"),
+        "both classes' bumped rows take their measured count:\n{written}"
+    );
+    assert!(
+        !written.contains("[[bump]]"),
+        "both bumps are settled and reset:\n{written}"
+    );
+    assert!(
+        written.contains("tolerance = 0.005"),
+        "the ci row keeps its own tolerance:\n{written}"
+    );
+    assert!(!report.contains("KEPT"), "{report}");
+}
+
+/// A `gh` that answers `run list` with a run id and `run download` with CI's
+/// measurement, the way the real one prints the cooked `--jq` result and writes
+/// the artifact's files under `-D`.
+const N161_GH: &str = r#"#!/bin/sh
+case "$1 $2" in
+    "run list")
+        if [ "${VILAN_FIXTURE_RUNS:-1}" = 0 ]; then exit 0; fi
+        echo 424242
+        ;;
+    "run download")
+        while [ $# -gt 0 ]; do [ "$1" = -D ] && dir="$2"; shift; done
+        # printf is a builtin: the fixture PATH holds python3 and this shim only.
+        printf '%s\n' '{"counter": "callgrind", "class": "ci",' \
+            ' "results": {"example:math": {"instructions": 505000, "exit": 0}}}' \
+            > "$dir/measured.json"
+        ;;
+    *) exit 1 ;;
+esac
+"#;
+
+#[test]
+fn n161_the_cut_fetches_the_ci_measurement_with_gh_when_a_ci_bump_is_waiting() {
+    let path = n161_path("fetched", Some(N161_GH));
+    let (report, written) = n161_release_ratchet(
+        "fetched",
+        &path,
+        &["--ci-run-of", "0123456789abcdef", "--ci-repo", "owner/repo"],
+        false,
+    );
+    assert!(
+        written.contains("ceiling = 505_000") && !written.contains("[[bump]]"),
+        "the ci bump is absorbed from the fetched run:\n{written}"
+    );
+    assert!(
+        written.contains("ci rows from CI's perf job at 0123456789"),
+        "the row's stamp says where its count came from:\n{written}"
+    );
+    assert!(!report.contains("KEPT"), "{report}");
+}
+
+#[test]
+fn n161_a_run_with_no_green_ci_at_the_commit_leaves_the_bump_and_says_why() {
+    let path = n161_path(
+        "norun",
+        Some(&N161_GH.replace("${VILAN_FIXTURE_RUNS:-1}", "0")),
+    );
+    let (report, written) =
+        n161_release_ratchet("norun", &path, &["--ci-run-of", "0123456789abcdef"], false);
+    assert_eq!(written.matches("[[bump]]").count(), 1, "{written}");
+    assert!(
+        report.contains("ci.yml has no green run at 0123456789"),
+        "{report}"
+    );
+}
+
+#[test]
+fn n161_the_cut_passes_the_ratchet_the_commit_it_tags_from() {
+    // The apply step cannot be run in a fixture (it bumps real manifests), so
+    // the wiring is held as text: the ratchet call carries `--ci-run-of` with
+    // the TARGET sha, and the repo when the CI check found one.
+    let script = fs::read_to_string(repository_root().join("scripts/cut-release.sh"))
+        .expect("read cut-release.sh");
+    let call = script
+        .lines()
+        .skip_while(|line| !line.contains("perf_gate.py ratchet --from"))
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        call.contains("--release") && call.contains("--ci-run-of \"$TARGET\""),
+        "the cut's ratchet call must name the commit whose green CI run holds the ci counts:\n{call}"
+    );
+}

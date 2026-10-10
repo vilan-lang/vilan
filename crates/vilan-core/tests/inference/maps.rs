@@ -104,7 +104,7 @@ fn a138_s1_every_write_records_its_op() {
             main();
             "#
         ),
-        "7\n7\nput(a,None,1) put(a,Some(1),2) put(b,None,3) delete(a,2) put(b,Some(3),30) put(c,None,7) \n6\nreset(0) \n7\nput(x,None,1) put(y,None,2) delete(x,1) \n8\n[ 0, 2 ]\nfalse\n",
+        "7\n7\nput(a,None,1) put(a,Some(1),2) put(b,None,3) delete(a,2) put(b,Some(3),30) put(c,None,7) \n6\nreset(0) \n7\nput(x,None,1) put(y,None,2) delete(x,1) \n8\nSome(2)\nfalse\n",
     );
 }
 
@@ -265,7 +265,7 @@ fn a138_s1_reset_wakes_every_live_slot_and_reconcile_only_what_changed() {
             main();
             "#
         ),
-        "a=1 b=0 c=1 whole=1\ndelete(c,3) put(a,Some(1),10) put(d,None,4) \na=1 b=0 c=1 whole=1\n[ 'a', 'b', 'd' ]\na=2 b=1 c=2 whole=2\na=3 b=2 c=3 whole=3\nreset(2) reset(0) \n",
+        "a=1 b=0 c=1 whole=1\ndelete(c,3) put(a,Some(1),10) put(d,None,4) \na=1 b=0 c=1 whole=1\n[\"a\", \"b\", \"d\"]\na=2 b=1 c=2 whole=2\na=3 b=2 c=3 whole=3\nreset(2) reset(0) \n",
     );
 }
 
@@ -297,7 +297,7 @@ fn a138_s1_a_map_entry_writes_its_key() {
             main();
             "#
         ),
-        "[ 'None', 'Some(1)', 'Some(2)', 'None', 'None' ]\nput(k,None,1) put(k,Some(1),2) delete(k,2) \nk\n",
+        "[\"None\", \"Some(1)\", \"Some(2)\", \"None\", \"None\"]\nput(k,None,1) put(k,Some(1),2) delete(k,2) \nk\n",
     );
 }
 
@@ -345,7 +345,7 @@ fn a138_s1_at_feeds_an_effect_a_tracked_read_and_a_switch() {
             main();
             "#
         ),
-        "3 Some(1)\n21 Some(1)\n21 Some(20)\n120 Some(20)\n[ 'Some(2)', 'Some(20)' ]\n3\n3\n0\n",
+        "3 Some(1)\n21 Some(1)\n21 Some(20)\n120 Some(20)\n[\"Some(2)\", \"Some(20)\"]\n3\n3\n0\n",
     );
 }
 
@@ -359,7 +359,7 @@ fn a138_s1_at_feeds_an_effect_a_tracked_read_and_a_switch() {
 fn a138_s1_the_map_cell_agrees_with_a_hash_map_under_a_random_walk() {
     assert_compiles_and_runs(
         &format!("{MAP_WALK}\nmain();\n"),
-        "failures 0\nwatched 4\nwatched 0\n[ 62, 76, 86, 80 ]\n",
+        "failures 0\nwatched 4\nwatched 0\n[62, 76, 86, 80]\n",
     );
 }
 
@@ -414,7 +414,7 @@ fn a138_s1_a_set_cell_answers_records_and_wakes_per_member() {
         }
         main();
         "#,
-        "true\nfalse\ntrue\nfalse\nadd(c) remove(a) remove(b) add(a) add(d) \n[ true, false, true ]\nc=1 watched=2\nreset(0) \n[ true, false, true, false ]\nc=2\n0\n",
+        "true\nfalse\ntrue\nfalse\nadd(c) remove(a) remove(b) add(a) add(d) \n[true, false, true]\nc=1 watched=2\nreset(0) \n[true, false, true, false]\nc=2\n0\n",
     );
 }
 
@@ -424,7 +424,7 @@ fn a138_s1_a_set_cell_answers_records_and_wakes_per_member() {
 fn a138_s1_the_set_cell_agrees_with_a_hash_set_under_a_random_walk() {
     assert_compiles_and_runs(
         &format!("{SET_WALK}\nmain();\n"),
-        "failures 0\nwatched 4\nwatched 0\n[ 70, 57, 62, 64 ]\n",
+        "failures 0\nwatched 4\nwatched 0\n[70, 57, 62, 64]\n",
     );
 }
 
@@ -520,7 +520,7 @@ fn a138_s2_values_ranks_its_ops_and_keys_changes_only_on_arrival_and_removal() {
 
         main();
         "#,
-        "set(1,2,20) splice(3,[ ],[ 4 ]) splice(0,[ 1 ],[ ]) splice(3,[ ],[ 5 ]) \nadd(d) remove(a) add(a) \n[ 20, 3, 4, 5 ]\n1\nset(2,4,40) splice(4,[ ],[ 1 ]) splice(2,[ 40 ],[ ]) reset([ 1 ]) \nadd(e) remove(d) reset(1) \n",
+        "set(1,2,20) splice(3,[ ],[ 4 ]) splice(0,[ 1 ],[ ]) splice(3,[ ],[ 5 ]) \nadd(d) remove(a) add(a) \n[20, 3, 4, 5]\n1\nset(2,4,40) splice(4,[ ],[ 1 ]) splice(2,[ 40 ],[ ]) reset([ 1 ]) \nadd(e) remove(d) reset(1) \n",
     );
 }
 

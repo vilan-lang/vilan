@@ -111,7 +111,12 @@ pub enum Type {
     // §0 of trait-objects.md says the one representation was missing. Every
     // reader that asks "is this a value" answers yes here and no there.
     Dyn(Id, Vec<TypeId>),
-    Tuple(Vec<TypeId>),
+    // A tuple: its element types, and the LABELS its positions carry (B569,
+    // `named-tuple-fields.md`) — `(x: f64, y: f64)`. The labels are names for
+    // positions, never part of the type's identity: equality and hashing
+    // ignore them ([`TupleLabels`]), unification carries them, mono and the
+    // emitters erase them.
+    Tuple(Vec<TypeId>, TupleLabels),
     // A fixed-length array `[T; n]` — the element type and a compile-time-known
     // length (`[i32; 4]` -> `Array(i32, 4)`). Unlike `List<T>` (a growable
     // `Struct(list_id, [T])`), the length is part of the type, so `[i32; 3]` and
@@ -184,8 +189,178 @@ pub enum ParameterMode {
     Open(Id),
 }
 
+/// The labels of a tuple type's positions (B569, `named-tuple-fields.md`
+/// §10): `None` for an unlabelled tuple, one label per slot otherwise — a
+/// tuple labels every slot or none.
+///
+/// **Carried, never compared.** `PartialEq` holds for any two values and
+/// `Hash` writes nothing, so `(x: f64, y: f64)` and `(f64, f64)` are one
+/// [`Type`] to every map, memo and comparison that keys on it — the
+/// instantiation keys mono builds, the selection memos, the conformance
+/// tables. That is what erases labels at monomorphization: two label sets
+/// can never split an instance. Code that must SEE the labels — the
+/// printer, member access, the literal's by-name match, the contradiction
+/// refusal — reads them through the accessors here; [`TupleLabels::spelled_alike`]
+/// is the comparison that does look, for the one place that interns a type
+/// by its printed form.
+#[derive(Clone, Debug, Default)]
+pub struct TupleLabels(Option<std::sync::Arc<[Box<str>]>>);
+
+impl TupleLabels {
+    /// An unlabelled tuple's labels.
+    pub const NONE: TupleLabels = TupleLabels(None);
+
+    /// One label per slot, in slot order.
+    pub fn new<S: Into<Box<str>>>(labels: impl IntoIterator<Item = S>) -> TupleLabels {
+        TupleLabels(Some(labels.into_iter().map(Into::into).collect()))
+    }
+
+    /// The labels, when the tuple has them.
+    pub fn labels(&self) -> Option<&[Box<str>]> {
+        self.0.as_deref()
+    }
+
+    pub fn is_labelled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The label of slot `index`.
+    pub fn get(&self, index: usize) -> Option<&str> {
+        self.0.as_deref()?.get(index).map(|label| &**label)
+    }
+
+    /// The slot `label` names.
+    pub fn position(&self, label: &str) -> Option<usize> {
+        self.0.as_deref()?.iter().position(|each| &**each == label)
+    }
+
+    /// These labels for a tuple of `arity` slots: kept when they label
+    /// exactly that many, dropped otherwise (a label set describes ONE
+    /// arity, and a slot list rebuilt at another has nothing to name).
+    pub fn for_arity(&self, arity: usize) -> TupleLabels {
+        match self.labels() {
+            Some(labels) if labels.len() == arity => self.clone(),
+            _ => TupleLabels::NONE,
+        }
+    }
+
+    /// The first label both carry at DIFFERENT positions (B569 §4.3): the
+    /// one pair of label sets that does not reconcile. The same set
+    /// reordered is the common case (`(x, y)` into `(y, x)`), and one
+    /// renamed slot is the same mistake (`(x, y)` into `(y, z)` moves `y`).
+    /// Disjoint sets reconcile by position, and shared labels at the same
+    /// positions agree.
+    pub fn contradiction<'a>(&'a self, other: &TupleLabels) -> Option<&'a str> {
+        let (mine, theirs) = (self.labels()?, other.labels()?);
+        mine.iter().enumerate().find_map(|(index, label)| {
+            let position = theirs.iter().position(|each| each == label)?;
+            (position != index).then_some(&**label)
+        })
+    }
+
+    /// The labels a reconcile keeps: `self`'s when it has them, else
+    /// `other`'s.
+    pub fn or(&self, other: &TupleLabels) -> TupleLabels {
+        if self.is_labelled() {
+            self.clone()
+        } else {
+            other.clone()
+        }
+    }
+
+    /// Whether the two print alike — the comparison [`PartialEq`] declines.
+    pub fn spelled_alike(&self, other: &TupleLabels) -> bool {
+        self.labels() == other.labels()
+    }
+}
+
+impl PartialEq for TupleLabels {
+    fn eq(&self, _: &TupleLabels) -> bool {
+        true
+    }
+}
+
+impl Eq for TupleLabels {}
+
+impl std::hash::Hash for TupleLabels {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(pub u32);
+
+/// The program's type slots, indexed by [`TypeId`].
+///
+/// Ids are minted densely and in order (`Analyzer::new_type_id` is a counter,
+/// and `type_id_sources` is already indexed by it), so the table is a `Vec`
+/// and a read is an index. It was a hash map keyed by that same counter: a
+/// hash per read, a control byte and a 7/8 load factor per slot, and a
+/// doubling at a power-of-two threshold — which is where kolt's cold check
+/// found 20 MB of its peak RSS when Order 49's std growth took its server
+/// leg's slot count from 221k to 230k, across 7/8 of 2^18 (the map rehashed
+/// into 2^19 buckets of 88 bytes, 46 MB, with the old table live beside the
+/// new one while it did). The `Vec` holds the same slots in 23 MB, and its
+/// own doubling waits for 2^18 slots.
+///
+/// The API is the subset of the map's the compiler used — `get`, `insert`,
+/// `len`, `keys`, `iter` — with the same semantics (`insert` past the end
+/// fills the gap, so an id minted before its slot is written reads `None`
+/// until it is), so that a reader keeps its shape; `keys` and `iter` hand
+/// the id by value, since no id is stored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TypeTable {
+    slots: Vec<Option<Type>>,
+    filled: usize,
+}
+
+impl TypeTable {
+    /// The type in slot `type_id`, if one was written.
+    #[inline]
+    pub fn get(&self, type_id: &TypeId) -> Option<&Type> {
+        self.slots.get(type_id.0 as usize).and_then(Option::as_ref)
+    }
+
+    /// Whether slot `type_id` holds a type.
+    pub fn contains_key(&self, type_id: &TypeId) -> bool {
+        self.get(type_id).is_some()
+    }
+
+    /// Writes slot `type_id`, handing back what it held.
+    pub fn insert(&mut self, type_id: TypeId, type_: Type) -> Option<Type> {
+        let index = type_id.0 as usize;
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+        let previous = self.slots[index].replace(type_);
+        if previous.is_none() {
+            self.filled += 1;
+        }
+        previous
+    }
+
+    /// How many slots hold a type.
+    pub fn len(&self) -> usize {
+        self.filled
+    }
+
+    /// Whether no slot holds a type.
+    pub fn is_empty(&self) -> bool {
+        self.filled == 0
+    }
+
+    /// The ids of the slots that hold a type, in id order.
+    pub fn keys(&self) -> impl Iterator<Item = TypeId> + '_ {
+        self.iter().map(|(type_id, _)| type_id)
+    }
+
+    /// Every written slot with its id, in id order.
+    pub fn iter(&self) -> impl Iterator<Item = (TypeId, &Type)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|type_| (TypeId(index as u32), type_)))
+    }
+}
 
 impl std::fmt::Debug for TypeId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -194,3 +369,53 @@ impl std::fmt::Debug for TypeId {
 }
 
 pub type SubstitutionContext = HashMap<TypeId, TypeId>;
+
+#[cfg(test)]
+mod type_table_tests {
+    use super::{Type, TypeId, TypeTable};
+    use crate::id::Id;
+
+    #[test]
+    fn a_slot_reads_back_what_was_written_and_nothing_before_it_is_written() {
+        let mut table = TypeTable::default();
+        assert!(table.is_empty());
+        assert_eq!(table.get(&TypeId(0)), None);
+        assert_eq!(table.insert(TypeId(0), Type::Any), None);
+        assert_eq!(table.insert(TypeId(1), Type::Never), None);
+        assert_eq!(table.get(&TypeId(0)), Some(&Type::Any));
+        assert_eq!(table.get(&TypeId(1)), Some(&Type::Never));
+        assert_eq!(table.get(&TypeId(2)), None);
+        assert!(!table.contains_key(&TypeId(2)));
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_rewrite_hands_back_the_previous_type_and_keeps_the_count() {
+        let mut table = TypeTable::default();
+        table.insert(TypeId(0), Type::Unknown);
+        assert_eq!(
+            table.insert(TypeId(0), Type::Struct(Id(7), vec![])),
+            Some(Type::Unknown)
+        );
+        assert_eq!(table.get(&TypeId(0)), Some(&Type::Struct(Id(7), vec![])));
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn a_write_past_the_end_fills_the_gap_with_empty_slots() {
+        let mut table = TypeTable::default();
+        table.insert(TypeId(3), Type::Void);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(&TypeId(0)), None);
+        assert_eq!(table.get(&TypeId(2)), None);
+        assert_eq!(table.get(&TypeId(3)), Some(&Type::Void));
+        assert_eq!(table.keys().collect::<Vec<_>>(), vec![TypeId(3)]);
+        // The gap is written later, out of id order: `iter` still walks by id.
+        table.insert(TypeId(1), Type::Any);
+        assert_eq!(
+            table.iter().collect::<Vec<_>>(),
+            vec![(TypeId(1), &Type::Any), (TypeId(3), &Type::Void)]
+        );
+        assert_eq!(table.len(), 2);
+    }
+}

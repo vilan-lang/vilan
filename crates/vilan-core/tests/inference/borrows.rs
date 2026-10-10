@@ -12729,7 +12729,7 @@ fn m90_a_read_only_let_of_a_stable_place_copies_nothing() {
                 n += 1;
             }
             let found = [config, Config { layout = Layout { table = [0] } }];
-            let order = [0, 1].sort_by(|a, b| {
+            let order = [0usize, 1usize].sort_by(|a, b| {
                 let x = found[a];
                 let y = found[b];
                 if x.layout.table[0] < y.layout.table[0] { Ordering::Less } else { Ordering::Greater }
@@ -13382,5 +13382,94 @@ fn b562_a_scalar_view_at_a_later_by_value_parameter_still_wants_its_star() {
         fun main() {}
         "#,
         "a view can't be read as a value here; write `*`",
+    );
+}
+
+// --- B587: a TOP-LEVEL tuple pattern under a view subject binds views --------
+
+/// B587: under `match &mut pair` with a TUPLE subject, a `let` capture was a
+/// copy — a write to it was refused with the old "declare it `mut`" steer, and
+/// `(mut a, let b) => a += 10` compiled on JS without the write landing (and
+/// natively rustc refused the emitted match). payload-views.md's door A, one
+/// level up: a one-slot leaf is a view into its slot of the tuple, on a
+/// binding, a struct-holding tuple, under `is`, and readonly under `&place`.
+#[test]
+fn b587_a_top_level_tuple_pattern_under_a_view_subject_binds_views() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Point {
+            x: i32,
+        }
+        fun main() {
+            mut pair = (1, 2);
+            match &mut pair {
+                (let a, let b) => {
+                    a += 10;
+                    b = *b * 3;
+                },
+            }
+            print(pair.0);
+            print(pair.1);
+            mut nested = (1, Point { x = 5 }, "s");
+            match &mut nested {
+                (let n, let p, _) => {
+                    n += 1;
+                    p.x = 50;
+                },
+            }
+            print(nested.0);
+            print(nested.1.x);
+            let shown = (7, 8);
+            match &shown {
+                (let a, _) => print(*a),
+            }
+            if &mut pair is (let first, _) {
+                first = 100;
+            }
+            print(pair.0);
+        }
+        "#,
+        "11\n6\n2\n50\n7\n100\n",
+    );
+}
+
+/// B587's refusals follow the payload rules: `mut` on a leaf is B509 Q4's
+/// refusal, a write under `&place` is a readonly view's, and a sub-tuple leaf
+/// keeps the whole-tuple steer (it spans several slots).
+#[test]
+fn b587_a_top_level_tuple_leaf_follows_the_payload_view_rules() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut pair = (1, 2);
+            match &mut pair {
+                (mut a, let b) => { a += 10; },
+            }
+        }
+        "#,
+        "`mut a` would bind a COPY of the payload, but this matches a view (`&mut pair`)",
+    );
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let pair = (1, 2);
+            match &pair {
+                (let a, _) => { a += 1; },
+            }
+        }
+        "#,
+        "cannot write through 'a': this matches `&pair`, a readonly view",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut deep = ((1, 2), 3);
+            match &mut deep {
+                (let inner, _) => { inner = (5, 6); },
+            }
+        }
+        "#,
+        "a capture of a sub-tuple",
     );
 }

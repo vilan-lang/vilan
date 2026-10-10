@@ -7550,13 +7550,14 @@ fn b553_an_entry_operator_impl_serves_a_module() {
     assert_eq!(stdout, "true\n");
 }
 
-/// B553's second shape: a module's `Context::new()` whose only `run` is in the
-/// entry takes its value type from that run. Not an order question: the world
-/// resolved ONCE, after the entry walked (the deferred order the impl half
-/// takes), still reports `T` unbounded, while a `run` in any module — loaded
-/// before or after `c.vl` — grounds it.
+/// B553's second shape, B584: a module's `Context::new()` whose only `run` is
+/// in the entry takes its value type from that run. Not an order question: a
+/// call on the context while its value slot was open (`flavor.get()`, with no
+/// `run` pending in the modules' fixpoint) bound nothing and typed as the
+/// impl's abstract `T`, so `get() + 1` was refused "`T` is unbounded"; the
+/// call now binds the impl's parameter to the open slot itself, which the
+/// entry's `run` fills.
 #[test]
-#[ignore = "B553: an entry `run` does not ground a module's `Context::new()` even when the world resolves after the entry walks; the context half is the solver's (incr-48)"]
 fn b553_a_module_context_grounded_only_by_an_entry_run() {
     let (_, stdout) = compile_and_run_package(
         &[
@@ -7605,5 +7606,265 @@ fn b573_a_modules_platform_twins_are_chosen_for_the_builds_platform() {
             javascript.contains(kept) && !javascript.contains(dropped),
             "the {platform:?} bundle holds the {kept} and not the {dropped}:\n{javascript}"
         );
+    }
+}
+
+// --- B583: a module's traits never compete at std's own call sites ----------
+
+const B583_MAIN: &str = "import std::io::print;\nimport pkg::describe::Describe;\n\nfun main() {\n\tprint(Describe::describe(4));\n}\n";
+
+/// B583: a MODULE's exported blanket over every type declaring `describe`
+/// made std's own `items.describe(serializer)` and `index.describe(..)`
+/// (`wire.vl`) ambiguous between `Wire` and the package's `Describe` — two
+/// errors inside std for a program that never touched `Wire` — while the same
+/// blanket in the ENTRY compiled (std resolves before the entry walks). The
+/// rule: std's files reach std's traits and no package's, so a package trait
+/// is no candidate at a std call; the program runs either way round.
+#[test]
+fn b583_a_modules_blanket_does_not_make_stds_own_calls_ambiguous() {
+    let describe = "export trait Describe {\n\tfun describe(self): str;\n}\n\nexport impl type T with Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n";
+    let (_, stdout) = compile_and_run_package(
+        &[("describe.vl", describe), ("main.vl", B583_MAIN)],
+        "main.vl",
+    )
+    .expect("a module's blanket leaves std's own calls alone");
+    assert_eq!(stdout, "mine\n");
+}
+
+/// B583's other heads: an impl headed by std's own `List` (it competes at
+/// `items.describe(..)` exactly), and a blanket that provides the name as its
+/// trait's DEFAULT (the inherited-default lookup narrows by the same rule).
+#[test]
+fn b583_a_modules_list_headed_impl_and_default_leave_stds_calls_alone() {
+    let list_headed = "export trait Describe {\n\tfun describe(self): str;\n}\n\nexport impl List<type T> with Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n\nexport impl usize with Describe {\n\tfun describe(self): str {\n\t\t\"index\"\n\t}\n}\n\nexport impl i32 with Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n";
+    let by_default = "export trait Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n\nexport impl type T with Describe {}\n";
+    for describe in [list_headed, by_default] {
+        let (_, stdout) = compile_and_run_package(
+            &[("describe.vl", describe), ("main.vl", B583_MAIN)],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("std's calls stay std's: {errors:?}\n{describe}"));
+        assert_eq!(stdout, "mine\n");
+    }
+}
+
+// --- B554: a module binding's cross-file element conflict blames the declaration
+
+/// B554: two modules push `1` and `"two"` into one `export mut bag = []`, and
+/// the slot took the FIRST push in walk order — the modules' name order — so
+/// "Expected str, but got i32" landed in `bag.vl` or "Expected i32, but got
+/// str" in `spoil.vl` by what the files were called. The binding is what has
+/// no single type: the conflict is reported at its declaration, in its file,
+/// naming both types sorted, whichever module loads first.
+#[test]
+fn b554_a_cross_file_element_conflict_blames_the_declaration_in_every_load_order() {
+    let bag = "export mut bag = [];\n\nexport fun fill() {\n\tbag.push(1);\n}\n";
+    for spoil in ["a_spoil", "z_spoil"] {
+        let spoiler = "import pkg::bag::bag;\n\nexport fun spoil() {\n\tbag.push(\"two\");\n}\n";
+        let main = format!(
+            "import pkg::bag::fill;\nimport pkg::{spoil}::spoil;\n\nfun main() {{\n\tfill();\n\tspoil();\n}}\n"
+        );
+        let spoil_file = format!("{spoil}.vl");
+        let outcome = analyze_package(
+            &[("main.vl", &main), ("bag.vl", bag), (&spoil_file, spoiler)],
+            "main.vl",
+        );
+        let [(message, span, file)] = outcome.diagnostics.as_slice() else {
+            panic!("one diagnostic under {spoil}: {:?}", outcome.diagnostics);
+        };
+        assert_eq!(file.as_deref(), Some("bag.vl"), "{spoil}: {message}");
+        assert_eq!(&bag[span.clone()], "bag", "{spoil}: the binding's name");
+        assert!(
+            message.starts_with(
+                "`bag`'s element type is decided by its uses, and uses in two files disagree: \
+                 one gives it `i32`, another `str`."
+            ),
+            "{spoil}: {message}"
+        );
+    }
+}
+
+/// B554's boundary: two disagreeing uses in ONE file keep the ordinary
+/// mismatch at the later use — within a file the walk follows the text.
+#[test]
+fn b554_a_same_file_element_conflict_stays_at_the_later_use() {
+    let bag = "export mut bag = [];\n\nexport fun fill() {\n\tbag.push(1);\n}\n\nexport fun spoil() {\n\tbag.push(\"two\");\n}\n";
+    let main = "import pkg::bag::{ fill, spoil };\n\nfun main() {\n\tfill();\n\tspoil();\n}\n";
+    let outcome = analyze_package(&[("main.vl", main), ("bag.vl", bag)], "main.vl");
+    let [(message, span, file)] = outcome.diagnostics.as_slice() else {
+        panic!("one diagnostic: {:?}", outcome.diagnostics);
+    };
+    assert_eq!(file.as_deref(), Some("bag.vl"));
+    assert_eq!(&bag[span.clone()], "\"two\"");
+    assert_eq!(message, "Expected i32, but got str instead.");
+}
+
+// --- M130: two admitted homes of one trait default ---------------------------
+
+const M130_TRAIT: &str = "import std::option::Option::{ self, None, Some };\n\nexport trait Counting<T> {\n\tfun next(mut self): Option<T> {\n\t\tNone\n\t}\n}\n";
+const M130_BOX: &str = "export struct Box {\n\tn: i32,\n}\n";
+const M130_I32: &str =
+    "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting<i32> {}\n";
+const M130_STR: &str =
+    "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting<str> {}\n";
+
+/// M130: `impl Box with Counting<i32> {}` beside `impl Box with Counting<str>
+/// {}` were ONE candidate for the trait's default `next` — deduplicated by
+/// member — so `for item in box` typed `item` by whichever block's module
+/// loaded first (clean one way, refused the other). Two homes are two
+/// candidates, reported ambiguous at the loop and at a call, the same
+/// sentence (providers sorted) in either load order.
+#[test]
+fn m130_two_homes_of_one_default_are_ambiguous_in_every_load_order() {
+    for (first, second) in [("p1.vl", "p9.vl"), ("p9.vl", "p1.vl")] {
+        for (body, expected) in [
+            (
+                "\tmut box = Box { n = 1 };\n\tfor item in box {\n\t\tlet copy: i32 = item;\n\t}\n",
+                "`next` is ambiguous on `Box`: both 'Counting<i32>' and 'Counting<str>' provide it \
+                 as an inherited default",
+            ),
+            (
+                "\tmut box = Box { n = 1 };\n\tlet _next = box.next();\n",
+                "'next' is ambiguous on 'Box': both 'Counting<i32>' and 'Counting<str>' provide it \
+                 as their trait's default",
+            ),
+        ] {
+            let main = format!(
+                "import pkg::b::Box;\nimport pkg::t::Counting;\nimport pkg::p1;\nimport pkg::p9;\n\nfun main() {{\n{body}}}\n"
+            );
+            let outcome = analyze_package(
+                &[
+                    ("main.vl", &main),
+                    ("b.vl", M130_BOX),
+                    ("t.vl", M130_TRAIT),
+                    (first, M130_I32),
+                    (second, M130_STR),
+                ],
+                "main.vl",
+            );
+            let [(message, _, _)] = outcome.diagnostics.as_slice() else {
+                panic!("one diagnostic ({first} first): {:?}", outcome.diagnostics);
+            };
+            assert!(message.starts_with(expected), "({first} first) {message}");
+        }
+    }
+}
+
+/// M130's boundary: one home is one candidate — a blanket and a concrete block
+/// that instantiate the trait at the SAME arguments rank inside the home, the
+/// concrete one answering, whichever registered first.
+#[test]
+fn m130_one_home_stays_one_candidate() {
+    let blanket = "import pkg::t::Counting;\n\nexport impl type T with Counting<i32> {}\n";
+    let main = "import std::io::print;\nimport pkg::b::Box;\nimport pkg::t::Counting;\nimport pkg::p1;\nimport pkg::p9;\n\nfun main() {\n\tmut box = Box { n = 1 };\n\tfor item in box {\n\t\tlet copy: i32 = item;\n\t\tprint(copy);\n\t}\n\tprint(\"done\");\n}\n";
+    for (first, second) in [("p1.vl", "p9.vl"), ("p9.vl", "p1.vl")] {
+        let (_, stdout) = compile_and_run_package(
+            &[
+                ("main.vl", main),
+                ("b.vl", M130_BOX),
+                ("t.vl", M130_TRAIT),
+                (first, M130_I32),
+                (second, blanket),
+            ],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("one home ({first} first): {errors:?}"));
+        assert_eq!(stdout, "done\n");
+    }
+}
+
+// --- B574: a std trait whose derive macro shares its name -------------------
+
+/// B574: a miss of `Storable` got no import steer in ANY type position — a
+/// bound, an annotation — because std's import index read the derive MACRO
+/// `Storable` (`std::reactive::store`) and the TRAIT `Storable`
+/// (`store_core`) as two homes and dropped the name. A macro is its own
+/// namespace; the trait's home is the facade that re-exports it beside its
+/// derive.
+#[test]
+fn b574_a_trait_sharing_its_derives_name_gets_the_import_steer() {
+    let outcome = analyze_package(
+        &[(
+            "main.vl",
+            "fun keep<T: Storable>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _kept = keep(1);\n}\n",
+        )],
+        "main.vl",
+    );
+    assert!(
+        outcome.diagnostics.iter().any(|(message, _, _)| message
+            == "cannot find type 'Storable'; import it first (`import std::reactive::store::Storable;`)"),
+        "{:?}",
+        outcome.diagnostics
+    );
+}
+
+// --- E285: a fragment straight inside a fragment ------------------------------
+
+/// E285: `<><i>"a"</i><><b>"b"</b></></>` reached the list literal's own
+/// element check, whose sentence said nothing of fragments — E272's marker
+/// (a list literal written as markup) now carries its steer there, and a
+/// written list keeps the plain sentence.
+#[test]
+fn e285_a_fragment_inside_a_fragment_is_named_with_the_fix() {
+    let source = "import std::web::ui::{ View, render, view };\n\nfun main() {\n\tlet _group: List<View> = <><i>\"a\"</i><><b>\"b\"</b></></>;\n}\n";
+    assert_fails_spanning(
+        source,
+        "<><b>\"b\"</b></>",
+        "Expected View (this literal's element type), but got List<View> instead. A fragment \
+         does not flatten into a fragment: put the inner one in a child position \
+         (`<span>…</span>`), or write its children into the outer one",
+    );
+    let written = "import std::web::ui::{ View, view };\n\nfun main() {\n\tlet _group: List<View> = [view(\"i\"), [view(\"b\")]];\n}\n";
+    assert_fails_with(
+        written,
+        "Expected View (this literal's element type), but got List<View> instead.",
+    );
+    assert_fails_without(written, "fragment");
+}
+
+// --- A164 (R-g): `null`'s type stays unwritable ------------------------------
+
+/// A164 (RULED: unwritable): a mismatch names the `null` VALUE, never a type
+/// the author cannot spell — "Expected i32, but got null instead" named one.
+#[test]
+fn a164_a_mismatch_names_the_null_value() {
+    assert_fails_once_with(
+        "fun main() {\n\tlet _wrong: i32 = null;\n}\n",
+        "Expected i32, but got the `null` value instead.",
+    );
+}
+
+/// B584's other faces: the slot the entry's `run` fills is the type the
+/// module's calls see — a `str` use of an `i32` context is refused at the
+/// module's operator — and a `run` in a module loaded before or after the
+/// context's still grounds it.
+#[test]
+fn b584_an_entry_run_types_a_modules_context_calls() {
+    let module = "import std::context::Context;\n\nexport let flavor = Context::new();\n\nexport fun read_it(): str {\n\tflavor.get() + \"!\"\n}\n";
+    let main = "import std::io::print;\nimport pkg::c::{ flavor, read_it };\n\nfun main() {\n\tflavor.run(5, || {\n\t\tprint(read_it());\n\t});\n}\n";
+    let outcome = analyze_package(&[("c.vl", module), ("main.vl", main)], "main.vl");
+    let [(message, _, file)] = outcome.diagnostics.as_slice() else {
+        panic!("one refusal: {:?}", outcome.diagnostics);
+    };
+    assert_eq!(file.as_deref(), Some("c.vl"));
+    assert!(
+        message.starts_with("`+` on `i32` adds, and `str` is not a number"),
+        "{message}"
+    );
+    let context = "import std::context::Context;\n\nexport let flavor = Context::new();\n\nexport fun read_it(): i32 {\n\tflavor.get() + 1\n}\n";
+    for runner in ["a.vl", "r.vl"] {
+        let runner_module = "import std::io::print;\nimport pkg::c::{ flavor, read_it };\n\nexport fun go() {\n\tflavor.run(5, || {\n\t\tprint(read_it());\n\t});\n}\n";
+        let name = runner.trim_end_matches(".vl");
+        let entry = format!("import pkg::{name}::go;\n\nfun main() {{\n\tgo();\n}}\n");
+        let (_, stdout) = compile_and_run_package(
+            &[
+                ("c.vl", context),
+                (runner, runner_module),
+                ("main.vl", &entry),
+            ],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("a run in {runner} grounds it: {errors:?}"));
+        assert_eq!(stdout, "6\n");
     }
 }

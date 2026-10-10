@@ -848,6 +848,26 @@ async function organizeImportsEdits(document: TextDocument): Promise<TextEdit[]>
     return organize?.edit?.get(document.uri) ?? [];
 }
 
+/// The `auto` rewrites the server offers for `document`, or `[]` (B570 S3).
+/// Backs `vilan.autoTypes.onSave` by requesting the server's OWN
+/// `source.fixAll.vilan.auto` action — the same edits `vilan check --fix`
+/// makes, and none while the file has any other error.
+async function autoTypeEdits(document: TextDocument): Promise<TextEdit[]> {
+    if (!client) {
+        return [];
+    }
+    const kind = CodeActionKind.SourceFixAll.append('vilan').append('auto');
+    const wholeFile = new Range(0, 0, document.lineCount, 0);
+    const actions = await commands.executeCommand<CodeAction[]>(
+        'vscode.executeCodeActionProvider',
+        document.uri,
+        wholeFile,
+        kind.value,
+    );
+    const fix = actions?.find((action) => action.kind?.contains(kind));
+    return fix?.edit?.get(document.uri) ?? [];
+}
+
 export function activate(context: ExtensionContext): void {
     outputChannel = window.createOutputChannel('Vilan Language Server', { log: true });
     context.subscriptions.push(outputChannel);
@@ -967,12 +987,21 @@ export function activate(context: ExtensionContext): void {
             if (event.document.languageId !== 'vilan' || !client) {
                 return;
             }
-            const enabled = workspace
-                .getConfiguration('vilan', event.document)
-                .get<boolean>('organizeImports.onSave', false);
-            if (enabled) {
-                event.waitUntil(organizeImportsEdits(event.document));
+            const settings = workspace.getConfiguration('vilan', event.document);
+            const organize = settings.get<boolean>('organizeImports.onSave', false);
+            // B570 S3: its own setting and its own action kind (Q5 RULED).
+            const autoTypes = settings.get<boolean>('autoTypes.onSave', false);
+            if (!organize && !autoTypes) {
+                return;
             }
+            // Both answer the same text and touch disjoint regions (the
+            // import list, the annotations), so one batch carries both.
+            event.waitUntil(
+                Promise.all([
+                    organize ? organizeImportsEdits(event.document) : Promise.resolve([]),
+                    autoTypes ? autoTypeEdits(event.document) : Promise.resolve([]),
+                ]).then(([imports, autos]) => [...imports, ...autos]),
+            );
         }),
     );
 }

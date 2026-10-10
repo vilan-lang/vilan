@@ -17,6 +17,8 @@
 
 mod support;
 
+mod ascription;
+mod auto_annotations;
 mod backed_enums;
 mod borrows;
 mod bounds;
@@ -37,6 +39,7 @@ mod macros;
 mod maps;
 mod markdown;
 mod modules;
+mod named_tuples;
 mod platform;
 mod resources;
 mod returns;

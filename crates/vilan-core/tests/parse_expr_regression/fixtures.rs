@@ -302,23 +302,15 @@ const EXPRESSION_FIXTURES: &[&str] = &[
     "for x in xs { f(x) }",
     "for a { b }",
     "for { jump break }",
-    // --- jump / return / assignment as expressions ------------------------
+    // --- jump / return as expressions ------------------------------------
+    // (Assignment left value position with B569 S1: the `let __probe = …`
+    // wrapper USES its value, so the forms are a DECLINER below and a
+    // statement in the whole-file list.)
     "jump break",
     "jump continue",
     "ret",
     "ret x",
     "ret a + b",
-    "x = 5",
-    "x += 1",
-    "x -= 1",
-    "x *= 2",
-    "x /= 2",
-    "x %= 2",
-    "a.b = c",
-    "list[i] = v",
-    "*p = 5",
-    "a.b.c = d",
-    "*node.slot() = 10",
     // --- Types (embedded in generic-argument position) --------------------
     "g<i32>()",
     "g<str>()",
@@ -485,6 +477,18 @@ const WHOLE_FILE_FIXTURES: &[&str] = &[
     "let x = 5;",
     "let x = 5;\nlet y = 10;\nx + y;",
     "x = 1;\ny = 2;",
+    // B569 S1: every assignment form, standing where its value is discarded.
+    "x = 5;",
+    "x += 1;",
+    "x -= 1;",
+    "x *= 2;",
+    "x /= 2;",
+    "x %= 2;",
+    "a.b = c;",
+    "list[i] = v;",
+    "*p = 5;",
+    "a.b.c = d;",
+    "*node.slot() = 10;",
     "f();\ng();\nh();",
     "if ready { start(); }",
     "if a { x } else { y }",
@@ -506,6 +510,19 @@ const WHOLE_FILE_FIXTURES: &[&str] = &[
 /// oracle (accepting something the grammar rejects). Each must decline through BOTH
 /// frontends when wrapped as `let __probe = <fixture>;`.
 const DECLINER_FIXTURES: &[&str] = &[
+    // B569 S1: an assignment where its value is used — the `let __probe = …`
+    // wrapper's initializer — is refused, every form of it.
+    "x = 5",
+    "x += 1",
+    "x -= 1",
+    "x *= 2",
+    "x /= 2",
+    "x %= 2",
+    "a.b = c",
+    "list[i] = v",
+    "*p = 5",
+    "a.b.c = d",
+    "*node.slot() = 10",
     "(a, b,)",   // the tuple atom has no `allow_trailing` (unlike a list)
     "(a,)",      // one element + trailing comma is neither tuple nor group
     "a < < b",   // a non-adjacent `< <` is not a shift (and not a valid comparison)

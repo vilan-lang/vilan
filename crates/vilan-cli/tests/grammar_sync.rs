@@ -590,6 +590,82 @@ fn the_import_alias_as_is_coloured_by_position_in_both_grammars() {
     }
 }
 
+/// B571: the same rule colours `as` as the type ASCRIPTION after a complete
+/// operand — a name, a call's or an index's closer, a block-like brace, a
+/// string — before a type, and still leaves a value NAMED `as` plain.
+#[test]
+fn b571_the_ascription_as_is_coloured_by_position_in_both_grammars() {
+    const ASCRIPTIONS: &[&str] = &[
+        "let a = 5 as f64;",
+        "let xs = [] as List<str>;",
+        "make() as List<str>",
+        "xs[0] as i32",
+        "match k { _ => 1 } as dyn Flow<i32>",
+        "\"text\" as str",
+        "f as (|i32| i32)",
+        "n as (usize) < limit",
+        "x as &T",
+    ];
+    const NAMES: &[&str] = &["let as = 1;", "f(as)", "as + 1", "x = as;", "value.as()"];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "as");
+        assert_eq!(
+            regex_matches(&rule.regex, ASCRIPTIONS),
+            vec![true; ASCRIPTIONS.len()],
+            "{file}: {:?} misses an ascription among {ASCRIPTIONS:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, NAMES),
+            vec![false; NAMES.len()],
+            "{file}: {:?} colours `as` where it is an ordinary name ({NAMES:?})",
+            rule.regex,
+        );
+    }
+}
+
+/// B570: `auto` colours as a keyword in BOTH grammars at an annotation's
+/// head — after a `:` or `as` — and stays a name everywhere else: a path
+/// segment (`Length::auto()`), `auto::`, a binding, a field.
+#[test]
+fn b570_auto_is_coloured_at_an_annotations_head_in_both_grammars() {
+    const MARKERS: &[&str] = &[
+        "fun f(): auto i32 {",
+        "fun g(): auto {",
+        "let x: auto = 1;",
+        "mut items: auto List<str> = [];",
+        "let y = make() as auto List<str>;",
+    ];
+    const NAMES: &[&str] = &[
+        "let auto = 1;",
+        "Length::auto()",
+        "let a: auto::Thing = t;",
+        "f(auto)",
+        "auto: i32,",
+    ];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "auto");
+        assert_eq!(
+            regex_matches(&rule.regex, MARKERS),
+            vec![true; MARKERS.len()],
+            "{file}: {:?} misses an `auto` annotation among {MARKERS:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, NAMES),
+            vec![false; NAMES.len()],
+            "{file}: {:?} colours `auto` where it is a name ({NAMES:?})",
+            rule.regex,
+        );
+    }
+}
+
 /// K26 — `only`, B318's trailing import modifier, colours as a keyword in
 /// BOTH grammars after a path's end and before the statement's `;`, and not
 /// where a VALUE named `only` sits before a `;` — after `ret`, `else`, `then`,

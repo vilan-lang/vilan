@@ -646,6 +646,14 @@ pub enum Node<'src> {
     // `await <expr>` — suspends until the promise resolves, yielding `T`. Forces
     // its enclosing function to be async.
     Await(Box<Spanned<Self>>),
+    // `EXP as T` — a type ASCRIPTION (B571, `proposal/type-ascription.md`):
+    // the value and the written type. A constraint, never a cast: `EXP` is
+    // typed exactly as `let tmp: T = EXP`'s initializer is (the expected type
+    // flows in, every coercion an annotated binding performs is performed, a
+    // mismatch is refused), but no binding is made — no copy, no drop point,
+    // no name — and the result is a value, never a place. A postfix of the
+    // chain tier, so `a() as A .b()` continues after the type.
+    Ascribe(Box<Spanned<Self>>, Box<Spanned<Self>>),
     // A `type X` generic binder appearing inside a type — the impl subject
     // pattern (`impl Option<(type T, type U)>`), including a bare blanket
     // (`impl type T`). The optional bounds are `T: A + B`. The ANONYMOUS
@@ -704,6 +712,16 @@ pub enum Node<'src> {
     // an object changes which member runs where an inherent one outranks the
     // trait's, so the change of surface must be written, not inferred.
     DynType(Box<Spanned<Node<'src>>>),
+    // `auto T` / `auto` — a type the TOOLCHAIN writes and keeps current (B570,
+    // `proposal/auto-annotations.md`): at a return, a `let`'s annotation, or
+    // an ascription (`as auto T`). A SIGNATURE, not a constraint: the body (or
+    // initializer, or value) is inferred as if the annotation were absent,
+    // everything outside reads the written `T`, and `check` refuses a `T` the
+    // inference no longer agrees with (stale), with the rewrite as its fix.
+    // `None` is the bare `auto`, which promised nothing yet (a warning, with
+    // the fill as its fix). `auto` is contextual at a type's head, except
+    // `auto::`, a path into a module named `auto`.
+    AutoType(Option<Box<Spanned<Node<'src>>>>),
     // `(|| void) context owner_scope` / `context (a, b)` — a closure type
     // carrying a context requirement (proposal/ambient-owner.md §5): the
     // closure defers those contexts' bindings to its CALL sites instead of
@@ -1030,6 +1048,12 @@ pub enum Node<'src> {
         ItemLabels<'src>,
     ),
     Tuple(NodeList<'src>),
+    // B569 (`named-tuple-fields.md` §2): one LABELLED slot of a tuple — a
+    // tuple type's `x: f64`, a tuple literal's `x = 5`. The label is a MEMBER
+    // (any word, B414 S4) with its own span; the inner node is the slot's
+    // type or value. Only ever an entry of a `Tuple`, and a tuple labels every
+    // slot or none — the parser refuses a mix.
+    Labelled(Spanned<&'src str>, Box<Spanned<Self>>),
     // `..e` — a tuple-value SPREAD element (proposal/variadic-generics.md §T):
     // inside a tuple construction it contributes the ELEMENTS of `e`'s tuple
     // type rather than `e` itself, so the construction's type is the
@@ -1120,6 +1144,7 @@ impl<'src> Node<'src> {
                     }
                 }
                 Pattern::Literal(literal) => visit(literal),
+                Pattern::Labelled(_, inner) => visit_pattern(&inner.0, visit),
             }
         }
         fn visit_parameters<'a, 'src>(
@@ -1201,6 +1226,10 @@ impl<'src> Node<'src> {
                 }
             }
             Node::Export(_, inner, _) => visit(inner),
+            Node::Ascribe(value, type_) => {
+                visit(value);
+                visit(type_);
+            }
             Node::Async(inner)
             | Node::Await(inner)
             | Node::Dereference(inner)
@@ -1273,6 +1302,11 @@ impl<'src> Node<'src> {
             Node::AsyncType(inner) => visit(inner),
             Node::SyncType(inner) => visit(inner),
             Node::DynType(inner) => visit(inner),
+            Node::AutoType(written) => {
+                if let Some(written) = written.as_deref() {
+                    visit(written);
+                }
+            }
             Node::Const(inner) => visit(inner),
             Node::MappedType {
                 source, template, ..
@@ -1361,6 +1395,7 @@ impl<'src> Node<'src> {
                     visit(item);
                 }
             }
+            Node::Labelled(_, inner) => visit(inner),
             Node::Repeat(value, length) | Node::ArrayType(value, length) => {
                 visit(value);
                 visit(length);
@@ -1707,6 +1742,12 @@ pub enum Pattern<'src> {
     // A literal value pattern (`"quit"`, `42`, `true`): matches by equality,
     // binding nothing. Holds the literal as its node.
     Literal(Box<Spanned<Node<'src>>>),
+    // B569 S3: one BY-NAME element of a tuple pattern — `let (y = top, x =
+    // left) = p;`, `(x = 0, y = let v)` — the label (with its own span) and
+    // the sub-pattern its slot meets. Only ever an element of a `Tuple`, which
+    // labels every element or none; the analyzer places each at its label's
+    // slot once the matched type is known.
+    Labelled(Spanned<&'src str>, Box<Spanned<Pattern<'src>>>),
 }
 
 // One match leg: the patterns it matches (more than one is an or-pattern,

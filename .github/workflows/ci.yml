@@ -211,10 +211,20 @@ jobs:
       # GitHub-hosted only: the self-hosted runner's `_work` persists between
       # jobs, so its `target/` is already warm and a cache restore would only
       # overwrite it with an older one.
+      #
+      # N156: the suite builds under Cargo.toml's `ci-test` profile (vilan-core
+      # at opt-level 1; `scripts/ci-local.sh` selects it), so its artifacts are
+      # `target/ci-test/`, not `target/debug/`. The key says so: the entry an
+      # older run saved under `suite-<os>` holds a `target/debug/` this job no
+      # longer reads, and restoring it would only carry dead weight into the new
+      # profile's first cache. The action caches every profile directory it finds
+      # under `target/`, so nothing else needs to learn the name. Expect ONE cold
+      # run (a clean opt-level-1 vilan-core, ~+1.5 min on the shared runners) and
+      # warm ones after it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: runner.environment == 'github-hosted'
         with:
-          shared-key: suite-${{ matrix.os }}
+          shared-key: suite-ci-test-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
       # THE gate command, and it is not written here: `scripts/ci-local.sh`
       # holds it, this job calls the script, and `ci_local_script.rs` holds the

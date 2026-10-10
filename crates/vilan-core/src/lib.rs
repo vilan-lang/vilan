@@ -49,6 +49,7 @@ pub mod printer;
 pub mod span;
 pub mod stack_guard;
 pub mod target;
+pub mod teardown;
 pub mod token;
 pub mod track_caller;
 pub mod transformer;
@@ -121,11 +122,25 @@ struct InferredPlatform {
 ///   `impl` methods, trait members), counting only a name one twin declares and
 ///   the other does not. A name both declare, or neither, says nothing.
 ///
+/// - E286: the same file-declared evidence reaches past `std`. A `pkg::`
+///   import is read against the entry package's root (`pkg_root`), and an
+///   import through a declared dependency (`<dependency>::`) against that
+///   dependency's roots: a module whose file declares the browser platform
+///   alone, or one only the dependency's browser layer serves, is browser
+///   evidence exactly as the `std` module is. Only `std` has TWINS, so the
+///   names-and-members rules above stay `std`'s; a dependency's surface
+///   (`lib.vl`) is not followed through a re-export.
+///
 /// Any browser evidence wins (the old bias, kept for a file whose imports
 /// contradict each other); otherwise Node, whose layer set serves the process
 /// twins. Layer directories are read from `std`'s manifest, not a hardcoded
 /// list.
-fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
+fn infer_platform(
+    root: &NodeList,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    workspace: &Workspace,
+) -> InferredPlatform {
     let defaulted = |reason: &str| InferredPlatform {
         platform: Platform::default(),
         reason: reason.to_string(),
@@ -214,25 +229,39 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     // admitting the browser and nothing else (E266). Read through the parse
     // cache as `declares` is, and as forgiving: a file that fails to read or
     // parse declares nothing.
-    fn declares_only_browser(path: &Path) -> bool {
+    //
+    // `cached` is for `std`'s files only: they never change, so the clean-parse
+    // cache holds each once. A `pkg::` or dependency module is a file the user
+    // is EDITING (E286), and the cache leaks one tree per distinct content for
+    // the life of the process - the editor's per-keystroke leak
+    // (`overlay_module_reclaim`'s `ParseCleanCacheText` pin) - so those parse
+    // into a tree this function owns and drops, and read the leading
+    // declaration off whatever tree recovery gave even when the file below it
+    // does not parse yet (a half-typed module keeps its platform).
+    fn declares_only_browser(path: &Path, cached: bool) -> bool {
         let Ok(source) = util::read_source(path) else {
             return false;
         };
-        let Some((tree, _)) = parse_clean_cached(&source) else {
-            return false;
-        };
-        let Some((Node::ModulePlatform(patterns), _)) = tree.0.first() else {
-            return false;
-        };
-        let parsed: Vec<Pattern> = patterns
-            .iter()
-            .filter_map(|(text, _)| Pattern::parse(text))
-            .flatten()
-            .collect();
-        !parsed.is_empty()
-            && parsed
+        fn leading_is_browser_only(nodes: &NodeList) -> bool {
+            let Some((Node::ModulePlatform(patterns), _)) = nodes.first() else {
+                return false;
+            };
+            let parsed: Vec<Pattern> = patterns
                 .iter()
-                .all(|pattern| matches!(pattern, Pattern::Browser))
+                .filter_map(|(text, _)| Pattern::parse(text))
+                .flatten()
+                .collect();
+            !parsed.is_empty()
+                && parsed
+                    .iter()
+                    .all(|pattern| matches!(pattern, Pattern::Browser))
+        }
+        if cached {
+            parse_clean_cached(&source).is_some_and(|(tree, _)| leading_is_browser_only(&tree.0))
+        } else {
+            let (tree, _errors, _warnings) = parsing::parse_with_warnings(&source);
+            tree.is_some_and(|tree| leading_is_browser_only(&tree.0))
+        }
     }
     /// The MEMBER names the module at `path` declares (F27 R2): a struct's
     /// fields, an `impl` block's functions, a trait's members — the names that
@@ -308,13 +337,16 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     fn child_is_browser_evidence(
         branch: &ImportBranch,
         prefix: &str,
-        browser_root: &Path,
+        owner: &str,
+        browser_root: Option<&Path>,
         other_roots: &[&Path],
     ) -> Option<String> {
         match branch {
             ImportBranch::Path(segment, _, sub) => {
                 let module = &joined(prefix, segment);
-                let Some(browser_file) = module_file(browser_root, module) else {
+                let Some(browser_file) =
+                    browser_root.and_then(|browser_root| module_file(browser_root, module))
+                else {
                     // E266 (F28): a module whose FILE declares the browser
                     // platform alone (`[platform("browser")] mod self;`) is the
                     // evidence a browser-layer-only module is — one promise,
@@ -322,10 +354,10 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                     if other_roots
                         .iter()
                         .filter_map(|root| module_file(root, module))
-                        .any(|file| declares_only_browser(&file))
+                        .any(|file| declares_only_browser(&file, owner == "std"))
                     {
                         return Some(format!(
-                            "it imports `std::{module}`, whose file declares the `browser` \
+                            "it imports `{owner}::{module}`, whose file declares the `browser` \
                              platform"
                         ));
                     }
@@ -334,7 +366,13 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                     if let ImportTail::Continue(sub) = sub
                         && !is_module_in(other_roots, module)
                     {
-                        return child_is_browser_evidence(sub, module, browser_root, other_roots);
+                        return child_is_browser_evidence(
+                            sub,
+                            module,
+                            owner,
+                            browser_root,
+                            other_roots,
+                        );
                     }
                     return None;
                 };
@@ -345,7 +383,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                 if twin_files.is_empty() {
                     // Browser-exclusive — the module itself is the evidence.
                     return Some(format!(
-                        "it imports `std::{module}`, which only the browser layer serves"
+                        "it imports `{owner}::{module}`, which only the browser layer serves"
                     ));
                 }
                 // A twin: only a name the browser side alone declares says
@@ -365,17 +403,17 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                     })
                     .map(|name| {
                         format!(
-                            "it imports `{name}` from `std::{module}`, which only the browser \
-                             twin declares"
+                            "it imports `{name}` from `{owner}::{module}`, which only the \
+                             browser twin declares"
                         )
                     })
             }
             ImportBranch::Reach(_, inner) => {
-                child_is_browser_evidence(inner, prefix, browser_root, other_roots)
+                child_is_browser_evidence(inner, prefix, owner, browser_root, other_roots)
             }
             ImportBranch::Selector(_) => None,
             ImportBranch::Set(branches) => branches.iter().find_map(|branch| {
-                child_is_browser_evidence(branch, prefix, browser_root, other_roots)
+                child_is_browser_evidence(branch, prefix, owner, browser_root, other_roots)
             }),
         }
     }
@@ -435,16 +473,44 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         }
         nodes.iter().any(|node| walk(node, matches))
     }
+    // E286: the roots a dependency's modules resolve under - its browser layer
+    // (when it has one) and everything else - for the imports that name it.
+    let dependency_roots = |name: &str| -> Option<(Option<&Path>, Vec<&Path>)> {
+        let (_, index) = workspace
+            .entry_dependencies
+            .iter()
+            .find(|(import, _)| import == name)?;
+        let spec = workspace.packages.get(*index)?;
+        let browser = spec
+            .layers
+            .iter()
+            .find(|layer| layer.patterns.iter().any(|p| matches!(p, Pattern::Browser)))
+            .map(|layer| layer.root.as_path());
+        let others = spec
+            .layers
+            .iter()
+            .filter(|layer| !layer.patterns.iter().any(|p| matches!(p, Pattern::Browser)))
+            .map(|layer| layer.root.as_path())
+            .chain(std::iter::once(spec.base_root.as_path()))
+            .collect();
+        Some((browser, others))
+    };
     let mut import_reason: Option<String> = None;
     any_node(root, &mut |node| {
         let branch = match node {
             Node::Import(branch, ..) | Node::Use(branch) => branch,
             _ => return false,
         };
-        let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch else {
+        let ImportBranch::Path(head, _, ImportTail::Continue(child)) = branch else {
             return false;
         };
-        import_reason = child_is_browser_evidence(child, "", browser_root, &other_roots);
+        import_reason = match *head {
+            "std" => child_is_browser_evidence(child, "", "std", Some(browser_root), &other_roots),
+            "pkg" => child_is_browser_evidence(child, "", "pkg", None, &[pkg_root]),
+            name => dependency_roots(name).and_then(|(browser, others)| {
+                child_is_browser_evidence(child, "", name, browser, &others)
+            }),
+        };
         import_reason.is_some()
     });
     if let Some(reason) = import_reason {
@@ -1044,7 +1110,7 @@ fn analyze_source_unfenced(
                     reason: platform_color::PlatformReason::Declared(declared.written).clause(),
                     kind: "declared",
                 },
-                None => infer_platform(&root.0, std),
+                None => infer_platform(&root.0, std, pkg_root, workspace),
             });
     let platform = platform.unwrap_or_else(|| {
         inferred

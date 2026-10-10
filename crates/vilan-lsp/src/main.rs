@@ -33,6 +33,8 @@ mod member_admission_tests;
 #[cfg(test)]
 mod moved_std_path_tests;
 #[cfg(test)]
+mod named_tuple_tests;
+#[cfg(test)]
 mod organize_duplicate_tests;
 #[cfg(test)]
 mod sticky_span_tests;
@@ -2740,6 +2742,37 @@ async fn publish_closed_world(context: &AnalysisContext, root_path: &Path) {
     }
 }
 
+/// E280: whether the open document at `uri` needs a further world (the other
+/// platform's entry, for a module both reach) that no kept world and no open
+/// entry document holds - the worlds [`reanalyze_dependents`]'s sweep would
+/// create, and the only ones an open that analyzed nothing owes.
+fn lacks_a_further_world(context: &AnalysisContext, uri: &Url) -> bool {
+    let Some(document) = context.documents.get(uri) else {
+        return false;
+    };
+    document.further_worlds().iter().any(|root| {
+        !context.worlds.contains_key(root) && open_document_uri(&context.documents, root).is_none()
+    })
+}
+
+/// E280: the open document and kept world [`reanalyze_dependents`] is to leave
+/// ALONE - all of them. Handed as the sweep's `already` answered set, it
+/// narrows the sweep to the worlds that should exist and do not: an open
+/// changed no file's content, so nothing already analyzed is stale.
+fn everything_but_missing_worlds(context: &AnalysisContext) -> Answered {
+    let mut worlds: Vec<PathBuf> = context
+        .worlds
+        .iter()
+        .map(|world| world.key().clone())
+        .collect();
+    let mut documents = Vec::new();
+    for document in context.documents.iter() {
+        documents.push(document.key().clone());
+        worlds.extend(document.world_root().map(Path::to_path_buf));
+    }
+    Answered { documents, worlds }
+}
+
 /// M104: the worlds still in use — each open document's own (when it is
 /// served from one) and the further worlds that report its diagnostics under
 /// another platform.
@@ -4048,6 +4081,7 @@ fn server_capabilities() -> ServerCapabilities {
                 CodeActionKind::QUICKFIX,
                 CodeActionKind::REFACTOR_REWRITE,
                 fix_all_imports_kind(),
+                fix_all_auto_kind(),
             ]),
             ..Default::default()
         })),
@@ -4490,6 +4524,20 @@ impl LanguageServer for Backend {
             // served from that world — no analysis — when the world read every
             // open buffer as it stands, this one included.
             if serve_from_held_world(&context, &uri, &text).await {
+                // E280: served is not swept. The held world is one platform's;
+                // a module both platforms reach has FURTHER worlds (the node
+                // entry's, when the browser entry's serves it), and none of
+                // them was analyzed by an open that analyzed nothing. Open in
+                // the other order, the analysis path below runs this sweep.
+                if lacks_a_further_world(&context, &uri) {
+                    reanalyze_dependents(
+                        &context,
+                        &uri,
+                        None,
+                        everything_but_missing_worlds(&context),
+                    )
+                    .await;
+                }
                 schedule_package_union(&context, &uri);
                 send_refreshes(&context.client, refresh_plan(true)).await;
                 return;
@@ -4961,7 +5009,9 @@ impl LanguageServer for Backend {
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
                         tooltip: hint.full.map(|full| {
-                            InlayHintTooltip::String(full.trim_start_matches(": ").to_string())
+                            // `: T` for a binding, ` as T` for a stage (E278).
+                            let full = full.trim_start_matches(": ").trim_start_matches(" as ");
+                            InlayHintTooltip::String(full.to_string())
                         }),
                         padding_left: Some(false),
                         padding_right: Some(false),
@@ -5592,9 +5642,15 @@ impl LanguageServer for Backend {
                 action_kind_requested(&params.context.only, &fix_all_imports_kind());
             let wants_refactor =
                 action_kind_requested(&params.context.only, &CodeActionKind::REFACTOR_REWRITE);
+            let wants_auto = action_kind_requested(&params.context.only, &fix_all_auto_kind());
             // Skip the work entirely when the client asked for a kind none of
-            // these four answer.
-            if !wants_organize && !wants_quickfix && !wants_fix_all_imports && !wants_refactor {
+            // these five answer.
+            if !wants_organize
+                && !wants_quickfix
+                && !wants_fix_all_imports
+                && !wants_refactor
+                && !wants_auto
+            {
                 return Ok(None);
             }
             let uri = params.text_document.uri;
@@ -5721,6 +5777,57 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }));
             }
+            // B570 S3: every stale or unfilled `auto` in the file rewritten —
+            // nothing while the file has any other error, or while the buffer
+            // is ahead of the analysis.
+            if wants_auto {
+                let edits = document.auto_fix_all();
+                if !edits.is_empty() {
+                    let text_edits: Vec<TextEdit> = edits
+                        .into_iter()
+                        .map(|(span, new_text)| TextEdit {
+                            range: document.line_index.range(&span),
+                            new_text,
+                        })
+                        .collect();
+                    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                    changes.insert(uri.clone(), text_edits);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Keep `auto` types current".to_string(),
+                        kind: Some(fix_all_auto_kind()),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
+            // E278: "Ascribe this stage" and "Ascribe every stage of this
+            // chain", the per-stage hints written into the file.
+            if wants_refactor {
+                for (title, edits) in document.stage_ascriptions(live_span(&document, params.range))
+                {
+                    let text_edits: Vec<TextEdit> = edits
+                        .into_iter()
+                        .map(|(span, new_text)| TextEdit {
+                            range: document.line_index.range(&span),
+                            new_text,
+                        })
+                        .collect();
+                    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                    changes.insert(uri.clone(), text_edits);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title,
+                        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
             if let Some(program) = document.program.as_ref() {
                 if wants_quickfix {
                     let range = live_span(&document, params.range);
@@ -5816,6 +5923,12 @@ fn live_span(document: &Document, range: Range) -> Span {
 /// kind is what avoids ever needing one.
 fn fix_all_imports_kind() -> CodeActionKind {
     CodeActionKind::new("source.fixAll.imports")
+}
+
+/// B570 S3 (Q5 RULED): the `auto` rewrites' own source action — what
+/// `vilan.autoTypes.onSave` asks for, separate from every other fix.
+fn fix_all_auto_kind() -> CodeActionKind {
+    CodeActionKind::new("source.fixAll.vilan.auto")
 }
 
 /// Whether a code-action request wants `kind` — an unfiltered request (no

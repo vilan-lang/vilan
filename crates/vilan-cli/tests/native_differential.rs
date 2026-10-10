@@ -1357,13 +1357,100 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 fn vilan(staged: &Path) -> Command {
+    vilan_in(staged, &shared_target())
+}
+
+/// [`vilan`] building into `target` — a WORKER's own cargo target directory
+/// ([`worker_target`]) where legs run concurrently.
+fn vilan_in(staged: &Path, target: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command
         .current_dir(staged)
         .env("VILAN_STD", std_dir())
         .env("VILAN_RT", runtime_dir())
-        .env("CARGO_TARGET_DIR", shared_target());
+        .env("CARGO_TARGET_DIR", target);
     command
+}
+
+/// N158: one worker's own cargo target directory, beside [`shared_target`],
+/// keyed by the TEST (`tag`) as well as the worker. Cargo LOCKS a target
+/// directory for a whole build, so legs sharing one would build one at a
+/// time however many threads ran them — and the binary lands at
+/// `<target>/debug/<program>`, so two tests building one corpus program into
+/// one directory could run each other's binary mid-write (the reason every
+/// native test builds its own program name). `vilan-rt` is built once per
+/// directory (about 3 s cold), and the directories persist under
+/// `CARGO_TARGET_TMPDIR` like the shared one.
+fn worker_target(tag: &str, worker: usize) -> PathBuf {
+    let target =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("native-differential-{tag}-w{worker}"));
+    std::fs::create_dir_all(&target).expect("create a worker's cargo target directory");
+    target
+}
+
+/// N158: how many legs of one test run at once — four, or fewer on a
+/// smaller machine. A leg is a vilan compile, a cargo build, two runs: half
+/// the cores keeps a test from starving the suite's others.
+fn leg_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| (cores.get() / 2).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+/// N158: `leg` over every item, at most [`leg_workers`] at once
+/// (`std::thread::scope`), each worker with its own cargo target directory
+/// ([`worker_target`], under the test's `tag`);
+/// the answers come back in the ITEMS' order, so a test's report reads as
+/// the serial loop's did. A leg that panics (an assertion inside it) is
+/// resumed on the test's own thread once every worker has stopped, so the
+/// test fails with the leg's own message.
+fn legs_in_parallel<T, R, F>(tag: &str, items: Vec<T>, leg: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T, &Path) -> R + Sync,
+{
+    let count = items.len();
+    let queue = std::sync::Mutex::new(items.into_iter().enumerate());
+    let answers: std::sync::Mutex<Vec<Option<R>>> =
+        std::sync::Mutex::new((0..count).map(|_| None).collect());
+    let workers = leg_workers().min(count.max(1));
+    let panics: Vec<Box<dyn std::any::Any + Send>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let (queue, answers, leg) = (&queue, &answers, &leg);
+                scope.spawn(move || {
+                    let target = worker_target(tag, worker);
+                    loop {
+                        let next = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .next();
+                        let Some((index, item)) = next else {
+                            break;
+                        };
+                        let answer = leg(item, &target);
+                        answers
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(answer);
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().err())
+            .collect()
+    });
+    if let Some(panic) = panics.into_iter().next() {
+        std::panic::resume_unwind(panic);
+    }
+    answers
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .into_iter()
+        .map(|answer| answer.expect("every leg answered"))
+        .collect()
 }
 
 /// What one program did.
@@ -1378,6 +1465,12 @@ enum Verdict {
 }
 
 fn compare(staged: &Path, program: &str) -> Verdict {
+    compare_in(staged, program, &shared_target())
+}
+
+/// [`compare`] building into `target` ([`legs_in_parallel`]).
+fn compare_in(staged: &Path, program: &str, target: &Path) -> Verdict {
+    let vilan = |staged: &Path| vilan_in(staged, target);
     let native = vilan(staged)
         .args(["run", "--backend", "rust", program])
         .output()
@@ -1444,8 +1537,11 @@ fn compare(staged: &Path, program: &str) -> Verdict {
 fn the_default_suite_is_byte_identical_on_both_backends() {
     let staged = stage();
     let mut broken = Vec::new();
-    for program in DEFAULT_SUITE {
-        match compare(&staged, program) {
+    let verdicts = legs_in_parallel("suite", DEFAULT_SUITE.to_vec(), |program, target| {
+        compare_in(&staged, program, target)
+    });
+    for (program, verdict) in DEFAULT_SUITE.iter().zip(verdicts) {
+        match verdict {
             Verdict::Identical => {}
             Verdict::Refused(reason) => broken.push(format!(
                 "{program}: the default suite must be programs the backend ACCEPTS, and this one \
@@ -2230,6 +2326,359 @@ const DESTRUCTURE_PROBE: &str = concat!(
     "\t\tlet (index, name) = row;\n",
     "\t\tprint(i\"{index}={name}\");\n",
     "\t}\n",
+    "}\n",
+);
+
+/// B569 S1: assignment keeps every position whose value is discarded — a
+/// statement, a block's tail, a `match` arm, a closure's expression body and
+/// a `then`/`else` branch of a statement — and those positions mean the same
+/// thing on both backends.
+#[test]
+fn b569_assignment_in_a_discarded_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_discarded_assignment.vl"),
+        B569_DISCARDED_ASSIGNMENT_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b569_discarded_assignment.vl"),
+        Verdict::Identical,
+        "an assignment where its value is discarded must run the same on both backends"
+    );
+}
+
+const B569_DISCARDED_ASSIGNMENT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut x = 0;\n",
+    "\tx = 1;\n",
+    "\tx += 1;\n",
+    "\tlet unit = { x = x * 10 };\n",
+    "\tprint(x);\n",
+    "\tmatch x {\n",
+    "\t\t20 => x = 3,\n",
+    "\t\t_ => x = 4,\n",
+    "\t}\n",
+    "\tprint(x);\n",
+    "\tmut total = 0;\n",
+    "\tfor v in [5, 6] {\n",
+    "\t\t[v].for_each(|w| total += w);\n",
+    "\t}\n",
+    "\tprint(total);\n",
+    "\tx > 2 then x = 7 else x = 8;\n",
+    "\tprint(x);\n",
+    "\tx == 0 else x = 9;\n",
+    "\tprint(x);\n",
+    "}\n",
+);
+
+/// B569 S2: labelled tuples mean the same on both backends — a literal
+/// matched BY NAME stores in its type's order and evaluates as written (the
+/// two calls print in written order), a label reads and writes its slot, the
+/// one-slot tuple, a spread that concatenates labels, a join matched by name,
+/// a mapped tuple's labels and a reconcile that drops them.
+#[test]
+fn b569_labelled_tuples_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_labels.vl"),
+        B569_LABELS_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b569_labels.vl"),
+        Verdict::Identical,
+        "a labelled tuple must mean the same thing on both backends"
+    );
+}
+
+const B569_LABELS_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun say(label: str, value: f64): f64 {\n",
+    "\tprint(label);\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun pick(first: bool): (x: i32, y: i32) {\n",
+    "\tfirst then (x = 1, y = 2) else (y = 3, x = 4)\n",
+    "}\n",
+    "\n",
+    "fun plain(pair: (f64, f64)): f64 {\n",
+    "\tpair.0 - pair.1\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet point: (x: f64, y: f64) = (y = say(\"y\", 7), x = say(\"x\", 5));\n",
+    "\tprint(i\"{point.x} {point.y} {point.0}\");\n",
+    "\tmut m: (a: i32, b: i32) = (1, 2);\n",
+    "\tm.b = 10;\n",
+    "\tm.a += 1;\n",
+    "\tprint(m.a + m.b);\n",
+    "\tlet one = (x = 5);\n",
+    "\tprint(one.x);\n",
+    "\tlet s = (..m, c = 3);\n",
+    "\tprint(s.c + s.b);\n",
+    "\tprint(pick(false).x);\n",
+    "\tprint(plain(point));\n",
+    "\tlet rows = [(x = 1, y = 2), (y = 3, x = 4)];\n",
+    "\tprint(rows[1].x);\n",
+    "\tlet nested: (outer: (left: i32, right: i32), tag: str) = (tag = \"t\", outer = (right = 4, left = 3));\n",
+    "\tprint(i\"{nested.outer.left} {nested.outer.right} {nested.tag}\");\n",
+    "}\n",
+);
+
+/// B569 §6.3: labels are erased at monomorphization — one generic function
+/// called with a labelled and an unlabelled tuple of the same slot types is
+/// ONE native instance.
+#[test]
+fn b569_labels_never_split_a_native_instance() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_mono.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun first<T, U>(pair: (T, U)): T {\n",
+            "\tpair.0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet labelled: (x: i32, y: i32) = (x = 1, y = 2);\n",
+            "\tlet plain: (i32, i32) = (3, 4);\n",
+            "\tprint(first(labelled));\n",
+            "\tprint(first(plain));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    let built = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_b569_mono.vl"])
+        .output()
+        .expect("build natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let emitted =
+        std::fs::read_to_string(staged.join("dist/native/native_probe_b569_mono/src/main.rs"))
+            .expect("the emitted crate's main.rs");
+    let instances = emitted.matches("fn first_").count();
+    assert_eq!(
+        instances, 1,
+        "a labelled and an unlabelled `(i32, i32)` are one instance of `first`:\n{emitted}"
+    );
+}
+
+/// B569 S4: named arguments through a spread parameter — collected into the
+/// labelled literal and matched by name, evaluated as written — mean the
+/// same on both backends, beside a fixed parameter, a one-slot pack, a
+/// positional call and a spread of a labelled binding.
+#[test]
+fn b569_named_arguments_are_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b569_named_arguments.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun say(label: str, value: f64): f64 {\n",
+            "\tprint(label);\n",
+            "\tvalue\n",
+            "}\n",
+            "\n",
+            "fun draw(...at: (x: f64, y: f64)): f64 {\n",
+            "\tat.x * 10 + at.y\n",
+            "}\n",
+            "\n",
+            "fun tagged(tag: str, ...at: (x: i32, y: i32)): str {\n",
+            "\ti\"{tag}: {at.x},{at.y}\"\n",
+            "}\n",
+            "\n",
+            "fun one(...only: (x: i32)): i32 {\n",
+            "\tonly.x\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(draw(1, 2));\n",
+            "\tprint(draw(x = 1, y = 2));\n",
+            "\tprint(draw(y = say(\"y\", 2), x = say(\"x\", 1)));\n",
+            "\tlet q: (x: f64, y: f64) = (x = 3, y = 4);\n",
+            "\tprint(draw(..q));\n",
+            "\tprint(tagged(\"p\", y = 6, x = 5));\n",
+            "\tprint(one(x = 7));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b569_named_arguments.vl"),
+        Verdict::Identical,
+        "named arguments must mean the same thing on both backends"
+    );
+}
+
+/// B571: every row of type-ascription.md §2.3 — a literal, an empty list, a
+/// `None` and a generic result taking the ascribed type; an erasure to `dyn`
+/// (a value, a `match` of two types, a place still read after); a bare trait
+/// checked with the concrete type kept; a named function and a tuple variant
+/// re-typed as closures; a closure literal adopting the ascribed modes;
+/// `Never` yielding — plus the copies rule 1 owes through an ascription, the
+/// precedence rows, a chain ascribed per stage and an ascription after a
+/// block-like brace, and a labelled tuple (B569) matched by name, labelled
+/// in one slot, or labelled from positions. Natively an open value (an empty list, a bare `None`) is
+/// written through a typed block, and the copy and the erasure both land on
+/// the value, as at an annotated binding.
+#[test]
+fn b571_every_ascription_row_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b571.vl"), B571_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b571.vl"),
+        Verdict::Identical,
+        "an ascription must mean the same thing on both backends"
+    );
+}
+
+const B571_PROBE: &str = concat!(
+    "import std::io::{print, panic};\n",
+    "import std::reactive::{SignalCell, Pipe, Source, Flow};\n",
+    "\n",
+    "trait Shape {\n",
+    "\tfun area(self): i32;\n",
+    "}\n",
+    "\n",
+    "struct Square {\n",
+    "\tside: i32,\n",
+    "}\n",
+    "\n",
+    "struct Strip {\n",
+    "\tlength: i32,\n",
+    "}\n",
+    "\n",
+    "impl Square with Shape {\n",
+    "\tfun area(self): i32 {\n",
+    "\t\tself.side * self.side\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Strip with Shape {\n",
+    "\tfun area(self): i32 {\n",
+    "\t\tself.length\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Point {\n",
+    "\tx: i32,\n",
+    "\ty: i32,\n",
+    "}\n",
+    "\n",
+    "fun make<T>(): List<T> {\n",
+    "\t[]\n",
+    "}\n",
+    "\n",
+    "fun measure(text: str): i32 {\n",
+    "\ttext.len().as_i32()\n",
+    "}\n",
+    "\n",
+    "fun apply(f: |i32| Option<i32>, value: i32): Option<i32> {\n",
+    "\tf(value)\n",
+    "}\n",
+    "\n",
+    "fun keep(own items: List<i32>): List<i32> {\n",
+    "\tmut kept = items;\n",
+    "\tkept.push(99);\n",
+    "\tkept\n",
+    "}\n",
+    "\n",
+    "fun echo(items: List<i32>): List<i32> {\n",
+    "\titems as List<i32>\n",
+    "}\n",
+    "\n",
+    "fun show(shape: dyn Shape): i32 {\n",
+    "\tshape.area()\n",
+    "}\n",
+    "\n",
+    "fun each(f: |&str| void) {\n",
+    "\tlet word = \"abc\";\n",
+    "\tf(&word);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(5 as f64 / 2.0);\n",
+    "\tlet words = [] as List<str>;\n",
+    "\tprint(words.len());\n",
+    "\tlet nothing = None as Option<i32>;\n",
+    "\tprint(nothing.is_none());\n",
+    "\tlet made = make() as List<str>;\n",
+    "\tprint(made.len());\n",
+    "\tlet cell = SignalCell::new([1, 2, 3] as List<usize>);\n",
+    "\tprint(cell.get().len());\n",
+    "\tlet one = Square { side = 3 } as dyn Shape;\n",
+    "\tprint(one.area());\n",
+    "\tlet wide = true;\n",
+    "\tlet picked = match wide {\n",
+    "\t\ttrue => Square { side = 2 },\n",
+    "\t\tfalse => Strip { length = 5 },\n",
+    "\t} as dyn Shape;\n",
+    "\tprint(picked.area());\n",
+    "\tlet square = Square { side = 4 };\n",
+    "\tlet erased = square as dyn Shape;\n",
+    "\tprint(erased.area());\n",
+    "\tprint(square.side);\n",
+    "\tlet counter = SignalCell::new(3);\n",
+    "\tlet doubled = counter.derive(|value| value * 2) as Pipe<i32>;\n",
+    "\tprint(doubled.sample());\n",
+    "\tlet state = match wide {\n",
+    "\t\ttrue => Source::constant(1),\n",
+    "\t\tfalse => counter.derive(|value| value + 1),\n",
+    "\t} as dyn Flow<i32>;\n",
+    "\tlet _ = state;\n",
+    "\tlet typed = measure as |str| i32;\n",
+    "\tprint(typed(\"hello\"));\n",
+    "\tlet wrap = Some as |i32| Option<i32>;\n",
+    "\tprint(wrap(3).unwrap_or(0));\n",
+    "\tprint(apply(Some as |i32| Option<i32>, 9).unwrap_or(0));\n",
+    "\teach((|text| print(text.len())) as |&str| void);\n",
+    "\tprint(wide then 4 else panic(\"unreachable\") as i32);\n",
+    "\tmut xs = [1, 2];\n",
+    "\tmut ys = xs as List<i32>;\n",
+    "\tys.push(3);\n",
+    "\tprint(xs.len());\n",
+    "\tprint(ys.len());\n",
+    "\tlet kept = keep(xs as List<i32>);\n",
+    "\tprint(xs.len());\n",
+    "\tprint(kept.len());\n",
+    "\tmut back = echo(xs);\n",
+    "\tback.push(5);\n",
+    "\tprint(xs.len());\n",
+    "\tlet p = Point { x = 1, y = 2 };\n",
+    "\tmut q = p as Point;\n",
+    "\tq.x = 10;\n",
+    "\tprint(p.x);\n",
+    "\tprint((p as Point).y);\n",
+    "\tprint(1.5 + 2 as f64);\n",
+    "\tprint(-xs.len().as_i32() as i32);\n",
+    "\tlet limit: usize = 10;\n",
+    "\tprint(xs.len() as usize < limit);\n",
+    "\tprint(Some(4) as Option<i32> is Some(let v) && v == 4);\n",
+    "\tlet count = [\"a\", \"bb\", \"ccc\"] as List<str>\n",
+    "\t\t.map(|word| word.len()) as List<usize>\n",
+    "\t\t.filter(|length| length > 1) as List<usize>\n",
+    "\t\t.len() as usize;\n",
+    "\tprint(count);\n",
+    "\tprint(if wide { 7 } else { 8 } as usize);\n",
+    "\tprint(show(Square { side = 5 } as Square));\n",
+    "\tprint(show(Square { side = 6 } as Shape));\n",
+    "\tlet named = (x = 1, y = 2) as (y: i32, x: i32);\n",
+    "\tprint(named.0 + named.x * 10);\n",
+    "\tlet one = (x = 5) as (x: i32);\n",
+    "\tprint((3, 4) as (w: i32, h: i32).h + one.x);\n",
     "}\n",
 );
 
@@ -5951,15 +6400,15 @@ const ORDER_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tmut list = [0, 0, 0, 0];\n",
-    "\tlist[next()] = next() * 10;\n",
+    "\tlist[next().as_usize()] = next() * 10;\n",
     "\tprint(i\"{list[0]} {list[1]} {list[2]} {list[3]}\");\n",
     "\tmut grid = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];\n",
-    "\tgrid[next() - 3][next() - 3] = next();\n",
+    "\tgrid[(next() - 3).as_usize()][(next() - 3).as_usize()] = next();\n",
     "\tprint(i\"{grid[0][0]} {grid[0][1]} {grid[1][0]} {grid[1][2]} {grid[2][1]}\");\n",
     "\tmut points = [Point { x = 0, y = 0 }, Point { x = 0, y = 0 }];\n",
-    "\tpoints[next() - 6].x = next();\n",
+    "\tpoints[(next() - 6).as_usize()].x = next();\n",
     "\tprint(i\"{points[0].x} {points[1].x}\");\n",
-    "\tlist[next() - 8] += next();\n",
+    "\tlist[(next() - 8).as_usize()] += next();\n",
     "\tprint(i\"{list[0]} {list[1]}\");\n",
     "}\n",
 );
@@ -6567,18 +7016,15 @@ fn the_native_leak_census_matches_its_table() {
         CAPTURED_CYCLE_PROBE,
     )
     .expect("write the captured-cycle probe");
-    let mut rows = Vec::new();
-    for program in DEFAULT_SUITE
+    let programs: Vec<&str> = DEFAULT_SUITE
         .iter()
         .copied()
         .chain(["native_probe_board.vl", "native_probe_captured_cycle.vl"])
-    {
-        let (minted, live) = leak_census_of(&staged, program);
-        rows.push(format!(
-            "{}\t{minted}\t{live}",
-            program.trim_end_matches(".vl")
-        ));
-    }
+        .collect();
+    let rows = legs_in_parallel("leaks", programs, |program, target| {
+        let (minted, live) = leak_census_of_in(&staged, program, target);
+        format!("{}\t{minted}\t{live}", program.trim_end_matches(".vl"))
+    });
     let measured = format!(
         "{}{}\n",
         concat!(
@@ -6630,7 +7076,12 @@ const CAPTURED_CYCLE_PROBE: &str = concat!(
 /// Runs `program` natively under `VILAN_NATIVE_LEAK_CENSUS=1` and answers
 /// `(minted, live)` from the line the runtime prints on stderr.
 fn leak_census_of(staged: &Path, program: &str) -> (u64, u64) {
-    let output = vilan(staged)
+    leak_census_of_in(staged, program, &shared_target())
+}
+
+/// [`leak_census_of`] building into `target` ([`legs_in_parallel`]).
+fn leak_census_of_in(staged: &Path, program: &str, target: &Path) -> (u64, u64) {
+    let output = vilan_in(staged, target)
         .env("VILAN_NATIVE_LEAK_CENSUS", "1")
         .args(["run", "--backend", "rust", program])
         .output()
@@ -7526,18 +7977,20 @@ fn the_native_copy_census_matches_its_table() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
         .expect("write the board probe");
-    let mut rows = Vec::new();
-    for program in DEFAULT_SUITE
+    let programs: Vec<&str> = DEFAULT_SUITE
         .iter()
         .copied()
         .chain(std::iter::once("native_probe_board.vl"))
-    {
+        .collect();
+    // An emission (`build --stdout`) runs no cargo: the worker's target is
+    // never written.
+    let rows = legs_in_parallel("copies", programs, |program, _| {
         let (copied, elided, captured) = copy_census_line_of(&staged, program);
-        rows.push(format!(
+        format!(
             "{}\t{copied}\t{elided}\t{captured}",
             program.trim_end_matches(".vl")
-        ));
-    }
+        )
+    });
     let measured = format!(
         "{}{}\n",
         concat!(
@@ -8120,21 +8573,19 @@ fn a_resource_is_moved_not_copied_at_its_move_sites_natively() {
     }
 }
 
-/// F56's other half, as F97 left it: a resource ENUM with a `Drop` impl is
-/// still refused by name (its body before the variant's payloads is not
-/// emitted), and the STRUCT that was refused beside it builds and agrees.
+/// F56's other half: a resource ENUM with a `Drop` impl was refused by
+/// name until F116 (its body before the variant's payloads); it builds and
+/// agrees now, as the STRUCT refused beside it has since F97.
 #[test]
-fn a_resource_enum_with_drop_is_refused_by_name_and_its_struct_twin_builds_natively() {
+fn a_resource_enum_with_drop_and_its_struct_twin_build_natively() {
     let staged = stage();
     std::fs::write(staged.join("native_probe_drop_enum.vl"), DROP_ENUM_PROBE)
         .expect("write the probe program");
-    match compare(&staged, "native_probe_drop_enum.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("the enum `Slot` with a `Drop` impl"),
-            "refused for another reason: {reason}"
-        ),
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_drop_enum.vl"),
+        Verdict::Identical,
+        "a resource enum with a `Drop` impl builds natively (F116)"
+    );
     std::fs::write(
         staged.join("native_probe_drop_struct.vl"),
         DROP_STRUCT_PROBE,
@@ -9049,22 +9500,23 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 
 /// F108's native half: a refusal raised inside a function body in ANOTHER
 /// file named no expression — its span indexed the other file's bytes and
-/// the CLI rendered it against the entry: `names.push_many([])` (whose `[]`
-/// stays `List<unknown>`, the solver half) printed one bare `Error:` line, no
-/// file and no line, and a refusal inside a user module was drawn over the
-/// entry's `import` line. A library body's refusal is now anchored at the
-/// user's call that instantiated it, naming the body and its file; a user
-/// module's is drawn in that module.
+/// the CLI rendered it against the entry: `names.push_many([])` printed one
+/// bare `Error:` line, no file and no line, and a refusal inside a user module
+/// was drawn over the entry's `import` line. A library body's refusal is now
+/// anchored at the user's call that instantiated it, naming the body and its
+/// file; a user module's is drawn in that module. (F108's solver half grounds
+/// `push_many([])` now, so the library-body probe is an `Option::None` whose
+/// payload nothing states, instantiating `is_some`'s body open.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
-    let file = "native_probe_f108_push_many.vl";
+    let file = "native_probe_f108_open_option.vl";
     std::fs::write(
         staged.join(file),
         concat!(
-            "import std::io::print;\n\n",
-            "fun main() {\n\tmut names: List<str> = [\"a\"];\n\tnames.push_many([]);\n",
-            "\tprint(names.len());\n}\n",
+            "import std::io::print;\nimport std::option::Option;\n\n",
+            "fun main() {\n\tlet present = Option::None.is_some();\n",
+            "\tprint(present);\n}\n",
         ),
     )
     .expect("write the probe");
@@ -9073,16 +9525,13 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         .output()
         .expect("build the probe");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the probe is refused natively");
     assert!(
-        !output.status.success(),
-        "the probe is still refused (F108's solver half)"
-    );
-    assert!(
-        stderr.contains(&format!("{file}:5:2")) && stderr.contains("names.push_many([])"),
+        stderr.contains(&format!("{file}:5:16")) && stderr.contains("Option::None.is_some()"),
         "the refusal is drawn at the user's call:\n{stderr}"
     );
     assert!(
-        stderr.contains("The construct is in `push_many`'s body (`list.vl`)"),
+        stderr.contains("The construct is in `is_some`'s body (`option.vl`)"),
         "the refusal names the body and its file:\n{stderr}"
     );
     let module = staged.join("native_probe_f108_module");
@@ -9290,11 +9739,12 @@ fn a_const_aggregate_is_identical_on_both_backends() {
 /// match-patterns.vl and capture-clones.vl, and the last of resource_take.vl
 /// (behind F97). A leg's guard is Rust's guard, and a `str`-backed variant
 /// nested in a payload or a tuple is a guard over a binder (match-patterns'
-/// next wall). capture-clones.vl's next wall is an operator over two numeric
-/// widths the analyzer admits, now refused by name rather than by rustc. The
+/// next wall). capture-clones.vl's next wall was an operator over two numeric
+/// widths, which the analyzer refuses since B579 (the program converts). The
 /// probe: guarded bindings, variants and tuples, a guard on outer state, a
 /// guarded wildcard, a string capture compared in a guard, the nested
-/// backed variant beside a guard; plus the two programs F93 completes.
+/// backed variant beside a guard; plus the two programs F93 completes, and
+/// capture-clones.vl, whose operator wall B579 removed.
 #[test]
 fn a_guarded_match_leg_is_identical_on_both_backends() {
     let staged = stage();
@@ -9313,13 +9763,14 @@ fn a_guarded_match_leg_is_identical_on_both_backends() {
             "{program}: F93 was its last wall"
         );
     }
-    match compare(&staged, "capture-clones.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("an operator over two numeric types"),
-            "capture-clones.vl's next wall is the mixed-width operator: {reason}"
-        ),
-        other => panic!("capture-clones.vl must be refused by name: {other:?}"),
-    }
+    // B579 (v0.47.0) refuses the mixed-width operator in the analyzer, which
+    // was capture-clones.vl's last wall natively: the corpus program converts
+    // its operand now, and runs the same on both backends.
+    assert_eq!(
+        compare(&staged, "capture-clones.vl"),
+        Verdict::Identical,
+        "capture-clones.vl: B579 took its last wall"
+    );
 }
 
 /// F94: a SPREAD parameter was refused by name — the first wall of
@@ -10454,30 +10905,22 @@ fn a_default_calling_a_hook_through_a_blanket_is_identical_on_both_backends() {
 
 /// A152: `zip_some`'s mapped-tuple stage (start, pull and attach over every
 /// input flow) and `unzip`'s split of a tuple-valued cell, at arity two and
-/// three. The claim is the differential's own — a refusal by name, never a
-/// different answer. F101 lowered the mapped tuple and its comprehension;
-/// `unzip`'s next wall is the walk by position (`for key in current.keys()`,
-/// a `TupleKey` per element type), refused as the `TupleKeys` intrinsic.
+/// three. F101 lowered the mapped tuple and its comprehension; F118 the walk
+/// by position (`for key in current.keys()`, a `TupleKey` per element type),
+/// the program's last wall — so the claim is the differential's own now.
 #[test]
-fn zip_some_and_unzip_are_never_a_different_answer_natively() {
+fn zip_some_and_unzip_are_identical_natively() {
     let staged = stage();
     std::fs::write(
         staged.join("native_probe_zip_some_unzip.vl"),
         include_str!("native/zip_some_unzip.vl"),
     )
     .expect("write the probe program");
-    let verdict = compare(&staged, "native_probe_zip_some_unzip.vl");
-    match &verdict {
-        Verdict::Identical => {}
-        Verdict::Refused(reason) => assert!(
-            reason.contains("the intrinsic `TupleKeys`"),
-            "refused for another reason than the walk by position: {reason}"
-        ),
-        other => panic!(
-            "the native backend must refuse this program by name or print what node prints: \
-             {other:?}"
-        ),
-    }
+    assert_eq!(
+        compare(&staged, "native_probe_zip_some_unzip.vl"),
+        Verdict::Identical,
+        "`zip_some` and `unzip` must print what node prints"
+    );
 }
 
 /// F68 + B503: `print` lays a value out by ONE rule on both backends — node's
@@ -10923,6 +11366,41 @@ fn a149_s3_collection_fields_build_and_wake_the_same_on_both_backends() {
     );
 }
 
+/// A153 S1: the mirrored store's server half — the reply, the slot forwards, the
+/// per-turn patch and the teardown — sends the same frames on both backends.
+#[test]
+fn a153_s1_a_mirrored_store_sends_the_same_frames_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_server.vl"),
+        include_str!("native/store_mirror_server.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_server.vl"),
+        Verdict::Identical,
+        "a mirrored store's frames must be the same on both backends"
+    );
+}
+
+/// A153 S2: the mirrored store's client half — mint on the first hold, the
+/// replica's seed and patches, a key's slot on and off the wire, a re-mint —
+/// behaves the same on both backends.
+#[test]
+fn a153_s2_a_store_mirror_behaves_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_client.vl"),
+        include_str!("native/store_mirror_client.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_client.vl"),
+        Verdict::Identical,
+        "a store mirror must behave the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair
@@ -10954,7 +11432,12 @@ struct Run {
 }
 
 fn run_on(staged: &Path, backend: Option<&str>, program: &str) -> Run {
-    let mut command = vilan(staged);
+    run_on_in(staged, backend, program, &shared_target())
+}
+
+/// [`run_on`] building into `target` ([`legs_in_parallel`]).
+fn run_on_in(staged: &Path, backend: Option<&str>, program: &str, target: &Path) -> Run {
+    let mut command = vilan_in(staged, target);
     command.arg("run");
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
@@ -11064,31 +11547,36 @@ fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
             "from the closure",
         ),
     ];
-    let mut wrong = Vec::new();
-    for (path, location, message) in cases {
+    // One program per path, each under its OWN file name (N158: the legs
+    // run at once, and a native binary is named by its program), so a site
+    // names that file.
+    let legs = legs_in_parallel("panics", cases, |(path, location, message), target| {
+        let file = format!("native_probe_panic_locations_{path}.vl");
+        let location = location.replacen(PANIC_LOCATIONS_FILE, &file, 1);
         let expected = format!("panicked at {location}: {message}");
-        // One program per path, all under the same FILE name so the sites
-        // read the same; each is written over the last.
         std::fs::write(
-            staged.join(PANIC_LOCATIONS_FILE),
+            staged.join(&file),
             PANIC_LOCATIONS.replace("\"PATH\"", &format!("{path:?}")),
         )
         .expect("write the probe program");
-        let native = run_on(&staged, Some("rust"), PANIC_LOCATIONS_FILE);
+        let mut wrong = Vec::new();
+        let native = run_on_in(&staged, Some("rust"), &file, target);
         if native.code != Some(1) || native.stderr != format!("{expected}\n") {
             wrong.push(format!(
                 "{path}: native exited {:?} with stderr {:?}, expected exit 1 and {expected:?}",
                 native.code, native.stderr
             ));
         }
-        let javascript = run_on(&staged, None, PANIC_LOCATIONS_FILE);
+        let javascript = run_on_in(&staged, None, &file, target);
         if javascript.code != Some(1) || !javascript.stderr.lines().any(|line| line == expected) {
             wrong.push(format!(
                 "{path}: node exited {:?} with stderr {:?}, expected exit 1 and the line {expected:?}",
                 javascript.code, javascript.stderr
             ));
         }
-    }
+        wrong
+    });
+    let wrong: Vec<String> = legs.into_iter().flatten().collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
@@ -11098,10 +11586,10 @@ fn s0_every_panic_path_reports_its_vilan_site_on_both_backends() {
 /// `error.message`, the native payload's message) — identical on both backends.
 #[test]
 fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
-    // Its OWN program name. The native binary lands at `<shared target>/debug/<name>`, and the
-    // sibling test above builds `PANIC_LOCATIONS_FILE` fifteen times with other paths; two tests
-    // building one name at once run each other's binary (the Order 47 seal: this test read the
-    // `"panic"` build's exit 1 under load).
+    // Its OWN program name. The native binary lands at `<target>/debug/<name>`, and the
+    // sibling test above built `PANIC_LOCATIONS_FILE` fifteen times with other paths until N158
+    // gave each path its own name; two tests building one name at once run each other's binary
+    // (the Order 47 seal: this test read the `"panic"` build's exit 1 under load).
     const CALLER_FILE: &str = "native_probe_panic_caller.vl";
     let staged = stage();
     std::fs::write(
@@ -11126,7 +11614,7 @@ fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
         (line, column)
     };
     let expected = format!(
-        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
+        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\nSome(\"expected Some but got None\")\n",
         site("print(here())", "here"),
     );
     assert_eq!(native.stdout, expected);
@@ -11154,6 +11642,29 @@ fn s1_dbg_writes_the_same_bytes_on_both_backends() {
     let expected_stdout = include_str!("native/dbg_printer.stdout");
     let javascript = run_on(&staged, None, DBG_PRINTER_FILE);
     let native = run_on(&staged, Some("rust"), DBG_PRINTER_FILE);
+    assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
+    assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
+    assert_eq!(javascript.stderr, expected_stderr, "the JS leg's dbg lines");
+    assert_eq!(native.stderr, expected_stderr, "the native leg's dbg lines");
+    assert_eq!(javascript.stdout, expected_stdout);
+    assert_eq!(native.stdout, expected_stdout);
+}
+
+/// B569 S3: `dbg` prints a labelled tuple as its literal — nested, in a
+/// list, on one line or broken at 80 columns — and a tuple reached through a
+/// generic's substitution erased (label sets share one instance); by-name
+/// patterns in a `let`, a `match` and a `for` bind the same slots. The same
+/// bytes on both backends, and the committed ones (`native/dbg_labels.*`).
+#[test]
+fn b569_labels_print_and_destructure_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b569_dbg_labels.vl";
+    std::fs::write(staged.join(file), include_str!("native/dbg_labels.vl"))
+        .expect("write the probe program");
+    let expected_stderr = include_str!("native/dbg_labels.stderr");
+    let expected_stdout = include_str!("native/dbg_labels.stdout");
+    let javascript = run_on(&staged, None, file);
+    let native = run_on(&staged, Some("rust"), file);
     assert_eq!(javascript.code, Some(0), "js: {}", javascript.stderr);
     assert_eq!(native.code, Some(0), "rust: {}", native.stderr);
     assert_eq!(javascript.stderr, expected_stderr, "the JS leg's dbg lines");
@@ -11273,6 +11784,57 @@ fn s1b_a_dyn_value_prints_what_it_holds_on_both_backends() {
         include_str!("native/dbg_dyn.vl"),
         "4\nrect\nalso rect\n",
         include_str!("native/dbg_dyn.stderr"),
+    );
+}
+
+/// debugging.md S2: `dbg_stack()` prints every binding in scope — innermost
+/// scope first, a shadowed one under the binding hiding it, a closure's
+/// captures marked, a moved resource (at a concrete site and in a generic
+/// body's resource instance) and an invalidated view without reading them, a
+/// cell without subscribing (the effect does not re-run on the captured cell's
+/// `set`), a pipe and a `lazy` parameter without running them — the same bytes
+/// on both backends (`native/dbg_stack.*`). Each listed binding is a use at
+/// the call, so `let copied = numbers` copies where it used to move, and
+/// `dbg(first)` of a scalar view prints the value (not the JS pair).
+#[test]
+fn s2_dbg_stack_prints_the_scope_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_stack.vl",
+        include_str!("native/dbg_stack.vl"),
+        include_str!("native/dbg_stack.stdout"),
+        include_str!("native/dbg_stack.stderr"),
+    );
+}
+
+/// E283: `[derive(Debug)]` and `T: Debug` take std's handles (`HashMap`,
+/// `HashSet`, `Shared` with its cycle cut, `SignalCell` read untracked), a
+/// closure field by its type and a literal-length array field (nested, empty,
+/// in a variant) element by element, and `.debug()` spells what `dbg` prints —
+/// the same bytes on both backends (`native/debug_handles.*`).
+#[test]
+fn e283_debug_takes_every_type_dbg_prints_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_debug_handles.vl",
+        include_str!("native/debug_handles.vl"),
+        include_str!("native/debug_handles.stdout"),
+        include_str!("native/debug_handles.stderr"),
+    );
+}
+
+/// debugging.md S3 (P2 and the 2026-10-09 ruling's five points): `print`
+/// writes an aggregate through the `dbg` printer on ONE line — a struct, an
+/// enum, a tuple, a list (nested, empty), an option, a map, a `dyn`, a long
+/// list that `dbg` would break — a float inside it keeping its `.0`, a backed
+/// enum by its name, a generic `T` per instance; a top-level number, string
+/// and bool print as before (`3.0` prints `3`). The same stdout on both
+/// backends (`native/print_aggregates.*`).
+#[test]
+fn s3_print_writes_aggregates_through_the_printer_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_print_aggregates.vl",
+        include_str!("native/print_aggregates.vl"),
+        include_str!("native/print_aggregates.stdout"),
+        "",
     );
 }
 
@@ -11608,5 +12170,459 @@ fun main() {
         compare(&staged, "native_probe_b545.vl"),
         Verdict::Identical,
         "a one-slot tuple leaf under a view subject must write in place on both backends"
+    );
+}
+
+/// F113: a pattern over a `borrows` call's VIEW — `is`, `match`, a read
+/// view, an `Option` behind a view, a destructuring `let` — binds copies, as
+/// a pattern over a place does (rule 1). The base bound references under
+/// Rust's default binding modes and rustc refused the arithmetic (E0277).
+#[test]
+fn f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f113_view_call_subjects.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/view_call_subjects.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a destructured view from a `borrows` call must bind copies natively"
+    );
+}
+
+/// F114: a reading intrinsic over a spine of a `Shared` VIEW reads through
+/// a view of the cell, as F49's boxed binding does — `cell.read().items.len()`
+/// had copied the whole list out of the borrow to count it. The emission
+/// pin: the three copies left are the std calls (`contains`, `get`,
+/// `contains_key`), which run user `Hash`/`Eq` and are not intrinsics.
+#[test]
+fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f114_shared_view_reading_intrinsics.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_reading_intrinsics.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a reading intrinsic over a `Shared` view's field must answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("read_with(").count(),
+        3,
+        "only the three std calls copy their field out of the cell:\n{main}"
+    );
+}
+
+/// F116: F97's remainder — a GENERIC resource with a `Drop` impl calls the
+/// `drop` instance its instantiation binds (two instantiations of one
+/// declaration, a two-parameter impl, a generic resource holding two
+/// others, a move into a function and into `drop`), and an ENUM with one
+/// tears down through a Rust `Drop` impl: through a view it drops at its
+/// last use, and a by-value `match` CONSUMES it (R6: its teardown is
+/// suppressed, the captures own the payloads — rustc's E0509 before).
+#[test]
+fn f116_a_generic_resource_and_an_enum_with_drop_tear_down_alike_on_both_backends() {
+    let staged = stage();
+    for (file, source) in [
+        (
+            "native_probe_f116_generic_resource_teardown.vl",
+            include_str!("native/generic_resource_teardown.vl"),
+        ),
+        (
+            "native_probe_f116_enum_resource_teardown.vl",
+            include_str!("native/enum_resource_teardown.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, file),
+            Verdict::Identical,
+            "{file}: the teardowns must run in the same order on both backends"
+        );
+    }
+}
+
+/// A tuple, a fixed array or one enum variant holding TWO values that owe a
+/// teardown printed the teardowns in the opposite order to the JS backend,
+/// silently: vilan drops an aggregate's members in reverse (destruction.md
+/// §5), Rust drops a tuple's, an array's and a variant's in declaration
+/// order, and only a struct's fields can be declared reversed (F97). Each
+/// is refused by name now where Rust's glue would drop it WHOLE; ONE such
+/// member, a struct holding two, and a variant CONSUMED by a `match` (its
+/// captures drop on their own, resource_take.vl's `Couple::Two`) still build
+/// and agree.
+#[test]
+fn an_aggregate_with_two_teardowns_is_refused_by_name_rather_than_reordered() {
+    let staged = stage();
+    let handle = concat!(
+        "import std::drop::Drop;\n",
+        "import std::io::print;\n",
+        "\n",
+        "[resource]\n",
+        "struct Handle {\n",
+        "\tname: str,\n",
+        "}\n",
+        "\n",
+        "impl Handle with Drop {\n",
+        "\tfun drop(&mut self) {\n",
+        "\t\tprint(i\"closing {self.name}\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+    );
+    let cases = [
+        (
+            "native_probe_unordered_variant.vl",
+            "[resource]\nenum Slot {\n\tEmpty,\n\tHeld(Handle, Handle),\n}\n\nfun main() {\n\
+             \tlet held = Slot::Held(Handle { name = \"a\" }, Handle { name = \"b\" });\n\
+             \tprint(\"end\");\n}\n",
+            "the variant `Slot::Held` holding two or more values that owe a teardown",
+        ),
+        (
+            "native_probe_unordered_tuple.vl",
+            "fun main() {\n\tlet pair = (Handle { name = \"a\" }, Handle { name = \"b\" });\n\
+             \tprint(\"end\");\n}\n",
+            "a tuple holding two or more values that owe a teardown",
+        ),
+        (
+            "native_probe_unordered_array.vl",
+            "fun main() {\n\
+             \tlet fixed: [Handle; 2] = [Handle { name = \"a\" }, Handle { name = \"b\" }];\n\
+             \tprint(\"end\");\n}\n",
+            "a fixed array holding two or more values that owe a teardown",
+        ),
+    ];
+    for (file, main, reason) in cases {
+        std::fs::write(staged.join(file), format!("{handle}{main}"))
+            .expect("write the probe program");
+        match compare(&staged, file) {
+            Verdict::Refused(refused) => assert!(
+                refused.contains(reason),
+                "{file}: refused for another reason: {refused}"
+            ),
+            other => panic!("{file}: expected a refusal by name, got {other:?}"),
+        }
+    }
+    let ordered = "native_probe_ordered_teardowns.vl";
+    std::fs::write(
+        staged.join(ordered),
+        format!(
+            "{handle}[resource]\nstruct Both {{\n\tfirst: Handle,\n\tsecond: Handle,\n}}\n\n\
+             [resource]\nenum One {{\n\tNone,\n\tHeld(Handle, i32),\n}}\n\n\
+             [resource]\nenum Couple {{\n\tTwo(Handle, Handle),\n\tNeither,\n}}\n\n\
+             fun main() {{\n\
+             \tlet consumed = Couple::Two(Handle {{ name = \"e\" }}, Handle {{ name = \"f\" }});\n\
+             \tmatch consumed {{\n\
+             \t\tCouple::Two(let left, let right) => print(left.name + right.name),\n\
+             \t\tCouple::Neither => print(\"neither\"),\n\
+             \t}}\n\
+             \tlet both = Both {{ first = Handle {{ name = \"a\" }}, second = Handle {{ name = \"b\" }} }};\n\
+             \tlet one = One::Held(Handle {{ name = \"c\" }}, 1);\n\
+             \tlet pair = (Handle {{ name = \"d\" }}, 2);\n\
+             \tprint(\"end\");\n}}\n"
+        ),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, ordered),
+        Verdict::Identical,
+        "one teardown per aggregate, or a struct's fields, keep building and agreeing"
+    );
+}
+
+/// F117: a `Self` written in a member of a bare-trait impl is the receiver
+/// the instance is minted for — the analyzer types it as the trait (B567
+/// made the CALL read the receiver), and natively a trait is no value, so
+/// the member was refused as "a trait object". The rewrite is a trait
+/// default's (`current_self_type`), scoped to the impl's subject trait.
+#[test]
+fn f117_a_self_in_a_bare_trait_impl_member_is_the_receiver_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f117_bare_trait_self.vl";
+    std::fs::write(staged.join(file), include_str!("native/bare_trait_self.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a bare-trait impl member's `Self` must be its receiver natively"
+    );
+}
+
+/// A generic operator (`a != b` with `a: T`, `T: PartialEq`; `<` over
+/// `PartialOrd`; `+` over `Add`) whose concrete type has a WRITTEN impl
+/// calls that impl natively, as the JS emitter re-dispatches it. The base
+/// emitted Rust's own operator, whose `==` over an emitted struct is the
+/// derived structural one: `Loose`'s one-field `eq` answered `true` through
+/// a generic `!=`, a `List`'s `==` and an `Option`'s, where JS answered with
+/// the program's impl.
+#[test]
+fn a_generic_operator_calls_the_written_impl_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_generic_operator_impls.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_operator_impls.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic operator must call the concrete type's written impl natively"
+    );
+}
+
+/// F118: std's tuple-family blankets (B443: `compare`'s `eq`, `hash`'s key,
+/// `debug`'s rendering) build natively — `TupleKeys`, `TupleEntries`,
+/// `TupleLen` and `TupleGet` against the instance's tuple, and a `for` over
+/// a tuple unrolled one body per position (its jumps labelled).
+#[test]
+fn f118_the_tuple_blankets_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f118_tuple_blankets.vl";
+    std::fs::write(staged.join(file), include_str!("native/tuple_blankets.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "tuple `==`, a tuple key and a tuple's `debug` must agree natively"
+    );
+}
+
+/// F119: a blanket method on an unannotated FUNCTION ITEM (`let f =
+/// nothing; f.leaf()`, B565) mints its instance at the item's own type,
+/// which the native backend refused to render ("a value of type `a function
+/// value`"). The type is the counted closure the item's value is, keyed per
+/// item; a binding of it calls the item through its parameters' receiving
+/// forms (`b(&mut count)` was rustc's E0308).
+#[test]
+fn f119_a_blanket_method_on_a_function_item_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f119_function_item_receivers.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/function_item_receivers.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a blanket method on a function item must answer the same natively"
+    );
+}
+
+/// F120: an `async` block whose body is itself a handle (`async { async {
+/// "s" } }`, nested three deep, or a call answering a `Task`) is one
+/// `Task<payload>`, as the analyzer types it and JS's promise adoption
+/// answers: natively each layer is one more `.await` inside the block, where
+/// the base handed the inner handle back as the value and rustc refused it.
+#[test]
+fn f120_a_nested_async_block_is_assimilated_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f120_nested_async_blocks.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/nested_async_blocks.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested `async` block must answer its payload natively"
+    );
+}
+
+/// F121: a struct with a fixed-array field emits a `Js` impl that reads it,
+/// and vilan-rt had none for `[T; N]`, so the struct did not build natively
+/// whether or not it was printed (rustc E0277). The probe prints arrays
+/// whole, in a struct, in an `Option`, through a generic, by element and by
+/// loop. F109's repro is its head: a list literal under `[i32; 3]`, which
+/// F100 had already lowered to a Rust array.
+#[test]
+fn f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f121_fixed_array_values.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/fixed_array_values.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a fixed array and a struct holding one must print the same natively"
+    );
+}
+
+/// N158: the four longest legs run under [`legs_in_parallel`], whose two
+/// claims are the serial loop's: answers come back in the ITEMS' order
+/// whatever order the workers finish in, and a leg's panic fails the test
+/// with the leg's own payload once every worker has stopped.
+#[test]
+fn parallel_legs_answer_in_order_and_resume_a_legs_panic() {
+    let items: Vec<usize> = (0..23).collect();
+    let answers = legs_in_parallel("order-check", items.clone(), |item, _| {
+        // Later items finish first, so completion order is not item order.
+        std::thread::sleep(std::time::Duration::from_millis((23 - item as u64) % 5));
+        item * 10
+    });
+    assert_eq!(
+        answers,
+        items.iter().map(|item| item * 10).collect::<Vec<_>>()
+    );
+    let caught = std::panic::catch_unwind(|| {
+        legs_in_parallel("panic-check", (0..9).collect(), |item: usize, _| {
+            assert_ne!(item, 6, "leg six fails");
+            item
+        })
+    });
+    let payload = caught.expect_err("a leg's panic fails the call");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains("leg six fails"),
+        "the leg's own message: {message:?}"
+    );
+}
+
+/// B588: a parameter whose TUPLE bound sits inside a tuple blanket's subject
+/// bound (`T: (2..: PartialEq)`, std's `impl type T: (2..: PartialEq) with
+/// PartialEq`) is `PartialEq` abstractly, and each instance dispatches on its
+/// own: a user's `impl (i32, i32) with PartialEq` answers at its instance, the
+/// blanket at the others, and `(2..: Hashable)` keys a map — on both backends.
+#[test]
+fn a_tuple_bound_inside_a_tuple_blanket_dispatches_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b588.vl"),
+        r#"import std::io::print;
+import std::compare::PartialEq;
+import std::hash::Hashable;
+import std::hash_map::HashMap;
+import std::option::Option;
+
+impl (i32, i32) with PartialEq {
+    fun eq(self, other: (i32, i32)): bool {
+        true
+    }
+}
+
+fun same<U: PartialEq>(a: U, b: U): bool {
+    a == b
+}
+
+fun all_eq<T: (2..: PartialEq)>(values: T, other: T): bool {
+    same(values, other) && !(values != other) && values.eq(other)
+}
+
+fun count<K: (2..: Hashable)>(key: K): i32 {
+    mut counts: HashMap<K, i32> = HashMap::new();
+    counts.insert(key, 7);
+    counts.get(key).unwrap_or(0)
+}
+
+fun main() {
+    print(all_eq((1, "a"), (1, "a")));
+    print(all_eq((1, 2, 3), (1, 2, 4)));
+    print(all_eq((1, 2), (1, 3)));
+    print(count((1, "a")));
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b588.vl"),
+        Verdict::Identical,
+        "a tuple-bounded parameter dispatches its blanket's trait per instance on both backends"
+    );
+}
+
+/// B587: a TOP-LEVEL tuple pattern under `match &mut <tuple place>` binds a
+/// view per one-slot leaf (payload-views.md's door A, one level up) on both
+/// backends: the writes land in the tuple, through `is` too, and a struct leaf
+/// writes its field in place. The copy it was compiled on JS without the
+/// write landing, and natively rustc refused the emitted match.
+#[test]
+fn a_top_level_tuple_pattern_under_a_view_subject_writes_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_b587.vl"),
+        r#"import std::io::print;
+
+struct Point {
+    x: i32,
+}
+
+fun main() {
+    mut pair = (1, 2);
+    match &mut pair {
+        (let a, let b) => {
+            a += 10;
+            b = *b * 3;
+        },
+    }
+    print(pair.0);
+    print(pair.1);
+    mut nested = (1, Point { x = 5 }, "s");
+    match &mut nested {
+        (let n, let p, _) => {
+            n += 1;
+            p.x = 50;
+        },
+    }
+    print(nested.0);
+    print(nested.1.x);
+    let shown = (7, 8);
+    match &shown {
+        (let a, _) => print(*a),
+    }
+    if &mut pair is (let first, _) {
+        first = 100;
+    }
+    print(pair.0);
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b587.vl"),
+        Verdict::Identical,
+        "a top-level tuple leaf under a view subject is a view on both backends"
+    );
+}
+
+/// F108's solver half: an EMPTY list literal at a parameter whose element is
+/// fixed only through its bound (`names.push_many([])`, `push_many<S:
+/// Items<T>>`) is grounded `List<str>` from the bound, so the native build has
+/// an element type to emit (it was refused "does not emit a value of type `an
+/// unresolved type`").
+#[test]
+fn an_empty_literal_at_a_bounded_generic_is_grounded_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_f108.vl"),
+        r#"import std::io::print;
+
+fun main() {
+    mut names: List<str> = ["a"];
+    names.push_many([]);
+    names.push_many(["b"]);
+    print(names.len());
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f108.vl"),
+        Verdict::Identical,
+        "an empty literal grounded through its parameter's bound builds on both backends"
     );
 }

@@ -70,15 +70,25 @@ fn ci_side() -> String {
 /// command is the gate: `release.yml` runs the suite legs inside its `gate` job
 /// while `ci.yml` runs them in `test`, and that difference is deliberate and
 /// harmless. What must not differ is what gets run.
-const LEGS: &[(&str, &str)] = &[
-    ("the suite", "cargo nextest run --workspace"),
-    ("the doc-tests", "cargo test --workspace --doc"),
-    ("formatting", "cargo fmt --all --check"),
+// (leg, the command `scripts/ci-local.sh` runs for it, the script's name for it).
+// A workflow runs a leg either by writing the command itself or by calling the
+// script's leg — `scripts/ci-local.sh test` — which is what ci.yml's leg jobs do
+// and what release.yml's sharded gate does since L17 (the shard is an env the
+// script reads, so the command stays one).
+const LEGS: &[(&str, &str, &str)] = &[
+    ("the suite", "cargo nextest run --workspace", "test"),
+    ("the doc-tests", "cargo test --workspace --doc", "doctest"),
+    ("formatting", "cargo fmt --all --check", "fmt"),
     (
         "clippy",
         "cargo clippy --workspace --all-targets -- -D warnings",
+        "clippy",
     ),
-    ("the advisory database", "cargo audit --deny unsound"),
+    (
+        "the advisory database",
+        "cargo audit --deny unsound",
+        "audit",
+    ),
 ];
 
 /// The lines of `text` that are a step's `run:` command, one-liners only —
@@ -116,7 +126,7 @@ fn every_ci_leg_runs_on_the_release_side_too() {
     let ci = ci_side();
     let release = run_commands(&workflow("release.yml"));
     let mut missing = Vec::new();
-    for (leg, command) in LEGS {
+    for (leg, command, script_leg) in LEGS {
         assert!(
             ci.contains(command),
             "`{leg}` is listed here as a CI leg but `scripts/ci-local.sh` — the script \
@@ -124,8 +134,12 @@ fn every_ci_leg_runs_on_the_release_side_too() {
              reworded or dropped, and this file's roster is now describing a gate \
              that no longer exists"
         );
-        if !release.iter().any(|run| run == command) {
-            missing.push(format!("  {leg}: `{command}`"));
+        let script_call = format!("scripts/ci-local.sh {script_leg}");
+        if !release
+            .iter()
+            .any(|run| run == command || *run == script_call)
+        {
+            missing.push(format!("  {leg}: `{command}` (or `{script_call}`)"));
         }
     }
     assert!(

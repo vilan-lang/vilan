@@ -42,6 +42,34 @@ entries as fit the 80 columns. A list stops after 100 entries with `… N more`.
 `debug` preset prints, the `release` preset refuses the build, `"strip"` makes
 each call its argument, `"keep"` prints in release too.
 
+## `dbg_stack`
+
+```vilan,fragment
+fun dbg_stack()    // no arguments; in the prelude
+```
+
+`dbg_stack()` writes a `[file:line:column] dbg_stack() in <function>` line and
+then one `  name: Type = value` line per binding in scope at the call, to the
+stream `dbg` writes to. The compiler expands each call from the scope it sits
+in:
+
+- the parameters and locals visible at the call, innermost scope first and in
+  declaration order within a scope; a shadowed binding follows the one that
+  hides it as `x (shadowed at L:C): T`; inside a closure, its own bindings and
+  then the ones it captures, `(captured)`; no module-level binding;
+- a view is typed `view T`, with `(a view into rows)` naming what it views;
+- a moved resource prints `<moved at L:C>`, or `<moved on some paths>`; a view
+  invalidated since its last use prints `<view, invalidated by push at L:C>`
+  (or `by assignment`); a pipe `<pipe, not sampled>`; a `lazy` parameter
+  `<lazy, not forced>` — none of them is read;
+- a `SignalCell` prints its current value without subscribing, `(read without
+  tracking)`;
+- every other value prints as `dbg` prints it, laid out from where it starts,
+  its broken entries two spaces under the binding.
+
+Every binding it reads counts as a use at the call. `[build] dbg` applies to it
+as it does to `dbg`.
+
 ## `Debug`
 
 ```vilan,fragment
@@ -54,10 +82,15 @@ trait Debug {
 implements it for `str` (quoted and escaped as `dbg` writes it), `bool`, every
 number (a float keeps its `.0`: `3.0.debug()` is `"3.0"`, and negative zero is
 `"-0.0"`), and for `List`, `Option`, `Result` and tuples whose elements are
-`Debug` (`(1, "two").debug()` is `(1, "two")`);
+`Debug` (`(1, "two").debug()` is `(1, "two")`), and for std's handles as
+`dbg` prints them: `HashMap { "ada" => 36 }` and `HashSet { 1, 2 }` in insertion
+order, `Shared(..)` (a cell met again inside its own rendering is `<cycle>`),
+`SignalCell(3)` (read without subscribing) and a `BigInt`'s digits.
 `[derive(Debug)]` writes it for a struct or an enum from its fields
 (`Point { x = 1, y = 2 }`, `Shape::Circle(1.5)`), so a struct holding a
-`List<i32>` or an `Option<f64>` derives it. `.debug()` is opt-in: a type has
+`List<i32>`, an `Option<f64>` or a `HashMap` derives it. A closure field prints
+its type (`<closure |i32| i32>`) and a fixed-array field of a literal length
+its elements (`[1, 2]`), since neither has an impl of its own. `.debug()` is opt-in: a type has
 it only through the derive or an impl of its own.
 
 `dbg` needs none of this: it prints every type. A `Debug` impl you WRITE decides

@@ -381,7 +381,7 @@ impl<'src> Analyzer<'src> {
         true
     }
 
-    fn mentions_a_hinted_type(&self, type_: &Type, depth: usize) -> bool {
+    pub(super) fn mentions_a_hinted_type(&self, type_: &Type, depth: usize) -> bool {
         if depth > 24 {
             return false;
         }
@@ -392,7 +392,7 @@ impl<'src> Analyzer<'src> {
                         self.mentions_a_hinted_type(argument.borrow_type(self), depth + 1)
                     })
             }
-            Type::Tuple(items) => items
+            Type::Tuple(items, _) => items
                 .iter()
                 .any(|item| self.mentions_a_hinted_type(item.borrow_type(self), depth + 1)),
             Type::Array(element, _) => {
@@ -411,7 +411,7 @@ impl<'src> Analyzer<'src> {
     /// `~Trait<args>` with the hint's arguments read under the instantiation,
     /// recursively. Every form it does not descend into is the full renderer's
     /// — nothing it cannot abbreviate is printed any differently.
-    fn render_hint_label(
+    pub(super) fn render_hint_label(
         &mut self,
         type_: &Type,
         admitted: &mut HashMap<TypeId, bool>,
@@ -440,13 +440,20 @@ impl<'src> Analyzer<'src> {
                 self.push_rendered_arguments(&mut rendered, &arguments, admitted, hosts, depth);
                 rendered
             }
-            Type::Tuple(items) => {
-                let items = items.clone();
+            // B569 §12: a labelled tuple abbreviates in place, labels kept —
+            // `(x: ~Pipe<i32>, y: i32)`.
+            Type::Tuple(items, labels) => {
+                let (items, labels) = (items.clone(), labels.clone());
                 let parts: Vec<String> = items
                     .iter()
-                    .map(|item| {
+                    .enumerate()
+                    .map(|(index, item)| {
                         let item = item.get_type(self);
-                        self.render_hint_label(&item, admitted, hosts, depth + 1)
+                        let rendered = self.render_hint_label(&item, admitted, hosts, depth + 1);
+                        match labels.get(index) {
+                            Some(label) => format!("{label}: {rendered}"),
+                            None => rendered,
+                        }
                     })
                     .collect();
                 format!("({})", parts.join(", "))
@@ -515,6 +522,33 @@ impl<'src> Analyzer<'src> {
         hosts: &mut Vec<String>,
         depth: usize,
     ) -> Option<String> {
+        let (trait_id, required) = self.admitted_hint(type_, id, arguments, admitted)?;
+        let host = self
+            .structs
+            .get(&id)
+            .map(|structure| structure.name)
+            .or_else(|| self.enums.get(&id).map(|enumeration| enumeration.name))?;
+        if !hosts.iter().any(|known| known == host) {
+            hosts.push(host.to_string());
+        }
+        let trait_name = self.traits.get(&trait_id)?.name;
+        let mut rendered = format!("~{trait_name}");
+        self.push_rendered_arguments(&mut rendered, &required, admitted, hosts, depth);
+        Some(rendered)
+    }
+
+    /// The hinted trait application a struct or enum instantiation is shown
+    /// as — its `[hint]`'s trait and arguments read under the instantiation —
+    /// when an impl of that application ADMITS it (Q3, per instantiation),
+    /// else `None`. The inlay hint's `~Trait<..>` and the written bare trait
+    /// (`written_types`, B570 door (b) / E278) are both this answer.
+    pub(super) fn admitted_hint(
+        &mut self,
+        type_: &Type,
+        id: Id,
+        arguments: &[TypeId],
+        admitted: &mut HashMap<TypeId, bool>,
+    ) -> Option<(Id, Vec<TypeId>)> {
         let hint = self.hint_attributes.get(&id)?.clone();
         let parameters = self
             .structs
@@ -547,20 +581,6 @@ impl<'src> Analyzer<'src> {
                 answer
             }
         };
-        if !is_admitted {
-            return None;
-        }
-        let host = self
-            .structs
-            .get(&id)
-            .map(|structure| structure.name)
-            .or_else(|| self.enums.get(&id).map(|enumeration| enumeration.name))?;
-        if !hosts.iter().any(|known| known == host) {
-            hosts.push(host.to_string());
-        }
-        let trait_name = self.traits.get(&hint.trait_id)?.name;
-        let mut rendered = format!("~{trait_name}");
-        self.push_rendered_arguments(&mut rendered, &required, admitted, hosts, depth);
-        Some(rendered)
+        is_admitted.then_some((hint.trait_id, required))
     }
 }

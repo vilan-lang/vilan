@@ -1537,10 +1537,10 @@ import std::reactive::{ ListCell, SequenceCell, comp };
 fun main() {
 	let numbers: ListCell<i32> = ListCell::of([1, 2, 3, 4]);
 	let (big, scope) = comp(|| numbers.filter(|n| n > 2).map(|n| n * 10).memo());
-	print(big.get());            // [ 30, 40 ]
+	print(big.get());            // [30, 40]
 	numbers.push(7);             // the closures run for 7 alone
 	numbers.remove_at(0);        // nothing runs
-	print(big.get());            // [ 30, 40, 70 ]
+	print(big.get());            // [30, 40, 70]
 	scope.dispose();
 }
 ```
@@ -1568,11 +1568,11 @@ fun main() {
 		people.filter(|at| online[at].derive(|on| on)).memo(),
 		people.any(|at| online[at].derive(|on| on)).memo()
 	));
-	print(here.get());           // [ 0 ]
+	print(here.get());           // [0]
 	online[0].set(false);        // one splice out
 	print(anyone.get());         // false
 	online[1].set(true);         // one splice in; the counter moves once
-	print(here.get());           // [ 1 ]
+	print(here.get());           // [1]
 	scope.dispose();
 }
 ```
@@ -1628,7 +1628,7 @@ fun main() {
 	let fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
 	let (evens, scope) = comp(|| fetched.coll().filter(|n| n % 2 == 0).memo());
 	fetched.set([1, 2, 3, 4]);   // one splice of one element: 4 arrived
-	print(evens.get());          // [ 2, 4 ]
+	print(evens.get());          // [2, 4]
 	scope.dispose();
 }
 ```
@@ -1827,7 +1827,7 @@ fun main() {
 	stock.insert("pens", 1);       // one Put: the filter runs once
 	stock.insert("pads", 9);       // the key set gains one Add
 	print(names.get().len());      // 3
-	print(low.get());              // [ 0, 1 ]: "pens" joined the filter after "ink"
+	print(low.get());              // [0, 1]: "pens" joined the filter after "ink"
 	print(total.get());            // 10
 	scope.dispose();
 }

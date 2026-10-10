@@ -47,6 +47,7 @@
 // borrows self` hands back a view, and a write through it is visible through
 // every other handle to the same cell.
 
+import pkg::debug::Debug;
 import pkg::option::Option::{ self, None, Some };
 
 export *;
@@ -185,4 +186,25 @@ impl Weak<type T> {
 	/// extent defers the cell's drop to the view's block end: deterministic,
 	/// merely later.
 	external fun get(&self): Option<&T> borrows self;
+}
+
+/// The cells a `debug()` is inside, by identity: one met again closes a cycle (only
+/// a `Shared` can form one), which prints `<cycle>` as `dbg` prints it.
+let debug_inside: Shared<List<i32>> = Shared::new([]);
+
+/// `Shared(Point { x = 7, y = 8 })`: what `dbg` prints, on one line, with `<cycle>`
+/// for a cell this rendering is already inside (E283).
+impl Shared<type T: Debug> with Debug {
+	fun debug(self): str {
+		let identity = self.identity();
+		for inside in debug_inside.read() {
+			if inside == identity {
+				ret "<cycle>";
+			}
+		}
+		debug_inside.write().push(identity);
+		let inner = self.read().debug();
+		debug_inside.write().pop();
+		"Shared(" + inner + ")"
+	}
 }

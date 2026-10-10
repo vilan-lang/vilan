@@ -6265,3 +6265,101 @@ fn b546_the_restore_target_is_followed_out_of_the_scope() {
     assert_eq!(open, "open=second", "the last autofocus wins the focus");
     assert_eq!(closed, "closed=opener");
 }
+
+// --- A165: an optional child ---------------------------------------------
+
+/// An `Option<View>` (and an `Option` of any child) in a hole, statically, and
+/// a `Source<Option<View>>` reactively, on the browser twin.
+const OPTIONAL_CHILD: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ View, mount_root };
+
+[extern("__tree")]
+external fun tree(): str;
+
+fun main() {
+	let badge: Option<View> = Some(<b>"new"</b>);
+	let none: Option<View> = None;
+	let label: Option<str> = Some("!");
+	let held: SignalCell<Option<View>> = Signal::new(None);
+	let _root = mount_root("app", || <p>"item"{badge}{none}{label}{held}"end"</p>);
+	print(i"none:  {tree()}");
+	held.set(Some(<i>"hot"</i>));
+	print(i"some:  {tree()}");
+	held.set(Some(<u>"cold"</u>));
+	print(i"other: {tree()}");
+	held.set(None);
+	print(i"gone:  {tree()}");
+}
+
+main();
+"#;
+
+/// A165 (R-f): `Some(child)` places the child and `None` places nothing — the
+/// static twin of `when` — and B268's pairing gives the reactive arm: a
+/// `Source<Option<View>>` places its view while it holds one, replaces it, and
+/// takes it out at `None`, keeping the hole's place between its siblings (the
+/// region's anchor is the empty text node before `'end'`). Red on the base:
+/// `Option<View>` is not a `Slot` (E271's refusal).
+#[test]
+fn a165_an_optional_child_places_its_view_or_nothing_and_its_source_follows() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("optional_child", OPTIONAL_CHILD, &harness);
+    assert_eq!(
+        stdout,
+        "none:  root#1 p#2 #text#3'item' b#4 #text#5'new' #text#6'!' #text#7 #text#8'end'\n\
+         some:  root#1 p#2 #text#3'item' b#4 #text#5'new' #text#6'!' i#9 #text#10'hot' #text#7 #text#8'end'\n\
+         other: root#1 p#2 #text#3'item' b#4 #text#5'new' #text#6'!' u#11 #text#12'cold' #text#7 #text#8'end'\n\
+         gone:  root#1 p#2 #text#3'item' b#4 #text#5'new' #text#6'!' #text#7 #text#8'end'\n",
+        "an optional child went differently"
+    );
+}
+
+/// The process twin of `OPTIONAL_CHILD`, rendered once.
+const OPTIONAL_CHILD_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ View, render };
+
+fun main() {
+	let badge: Option<View> = Some(<b>"new"</b>);
+	let none: Option<View> = None;
+	let label: Option<str> = Some("!");
+	let held: SignalCell<Option<View>> = Signal::new(Some(<i>"hot"</i>));
+	let empty: SignalCell<Option<View>> = Signal::new(None);
+	print(render(<p>"item"{badge}{none}{label}{held}{empty}"end"</p>));
+}
+
+main();
+"#;
+
+/// A165 on the process twin: the same arms, read once — the payload where a
+/// `Some` stands, nothing where a `None` does, for a value and for a source.
+#[test]
+fn a165_the_process_twin_renders_an_optional_child_once() {
+    let dir = temp_project("optional_child_ssr");
+    std::fs::create_dir_all(&dir).expect("create the program directory");
+    let source = dir.join("app.vl");
+    std::fs::write(&source, OPTIONAL_CHILD_SSR).expect("write the program");
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&source)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new("node")
+        .arg("app.mjs")
+        .current_dir(&dir)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert_eq!(stdout, "<p>item<b>new</b>!<i>hot</i>end</p>\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

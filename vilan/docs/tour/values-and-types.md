@@ -17,6 +17,26 @@ fun main() {
 }
 ```
 
+Where there is no `let` to annotate, `as` names a type in place. It
+directs inference exactly as an annotation would, and it never converts
+anything:
+
+```vilan
+import std::reactive::SignalCell;
+
+fun main() {
+	let ratio = 7 as f64 / 2.0;
+	let sizes = SignalCell::new([] as List<usize>);
+	print(i"{ratio} {sizes.get().len()}");
+}
+```
+
+`7 as f64` makes the literal an `f64` the way `let seven: f64 = 7` would,
+and the empty list is a `List<usize>` because the ascription says so. A
+value that already has another type is refused rather than converted:
+with `n: i32`, `n as f64` is an error that points you at `n.as_f64()`.
+The method converts; the keyword constrains.
+
 One thing to know up front: everything in Vilan is a **value**. Assigning
 a value to a new binding gives you a copy, not a second name for the same
 thing. If that sounds strange coming from JavaScript, start with
@@ -39,7 +59,7 @@ A few more words mean something only in one position and are ordinary
 identifiers everywhere else: `own` (a parameter that takes ownership —
 see [the memory model](memory-model.md)), `jump` (the prefix on `break`
 and `continue`), `lazy`, `dyn`, `with`, `borrows`, `self`, `Self`, `void`,
-`context`, `sync`, `as`, and the attribute names in `[...]`. So `let own =
+`context`, `sync`, `as`, `auto`, and the attribute names in `[...]`. So `let own =
 owner();`, a field called `with` and a method called `jump` are all fine,
 beside the keyword readings in the same file. Even a reserved word names a
 MEMBER — a field `type`, a method `match`, read as `event.type` and called
@@ -232,6 +252,46 @@ Note this is a *shallow* concatenation: `..outer` contributes `outer`'s
 elements, so an element that is itself a tuple stays one. And `..` only
 means this at the start of an entry — `a..b` after an expression is not
 a spread, and vilan has no range operator for it to be confused with.
+
+### Naming the positions
+
+A tuple's positions can carry **labels**, so a reader does not have to
+remember which slot is which. Write them in the type with `:` and in the
+value with `=`, the way a struct literal names its fields:
+
+```vilan
+fun bounds(xs: List<i32>): (min: i32, max: i32) {
+	mut low = xs[0];
+	mut high = xs[0];
+	for x in xs {
+		x < low then low = x;
+		x > high then high = x;
+	}
+	(min = low, max = high)
+}
+
+fun main() {
+	let b = bounds([3, 1, 4, 1, 5]);
+	print(i"{b.min}..{b.max}");
+	let (max = top, min = bottom) = b;            // destructure by name
+	print(top - bottom);
+	let point: (x: f64, y: f64) = (y = 7, x = 5); // by name: (5, 7)
+	print(point.x);
+	print(point.0);                               // positions still work
+}
+```
+
+A labelled value goes anywhere its unlabelled shape goes, and back:
+labels are names for positions, not part of the type. The one thing
+refused is a label that would land at a *different* position —
+`(x: f64, y: f64)` into `(y: f64, x: f64)` — because nobody can tell
+whether that was a reorder or a swap; the error offers both rewrites.
+Every slot is labelled or none, and `(x = 5)` is a one-slot tuple whose
+label makes it one. `dbg` prints the labels too: `b = (min = 1, max = 5)`.
+
+Reach for a **struct** instead once the shape has an identity: it is named
+in more than one signature, it needs methods or derives, it crosses the
+wire, or it has more than three fields.
 
 ## Collections
 

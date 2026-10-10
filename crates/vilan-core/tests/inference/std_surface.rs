@@ -547,7 +547,7 @@ fn i9_hash_map_and_hash_set_iterate_in_insertion_order() {
             print(s.values());
         }
         "#,
-        "[ 'a', 'c', 'b', 'd' ]\n[ 10, 3, 20, 4 ]\n[ 3, 2, 1 ]\n",
+        "[\"a\", \"c\", \"b\", \"d\"]\n[10, 3, 20, 4]\n[3, 2, 1]\n",
     );
 }
 
@@ -6971,7 +6971,7 @@ fn a118_an_integer_range_still_answers_every_value_below_its_bound() {
                 if value < 0 || value > 2 {
                     outside += 1;
                 } else {
-                    seen[value] = true;
+                    seen[value.as_usize()] = true;
                 }
                 draws += 1;
             }

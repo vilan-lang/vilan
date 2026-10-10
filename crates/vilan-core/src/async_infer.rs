@@ -748,7 +748,9 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
             .iter()
             .find(|(_, trait_)| trait_.declarations.values().any(|id| id == declaration))
     {
-        return trait_method_candidates(program, *declaring_trait, member);
+        return trait_method_candidates(program, *declaring_trait, member)
+            .as_ref()
+            .clone();
     }
     let Some(dispatch) = dispatch_at(program, call_id) else {
         return Vec::new();
@@ -783,16 +785,34 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
             {
                 bounds.push(trait_id);
             }
-            let mut precise: Vec<Id> = Vec::new();
+            // M132: the candidate list per (declaring trait, member) is the
+            // program's memo, and the union is deduplicated by a set — the
+            // linear `contains` made a site over a trait with N impls cost N².
+            let mut declaring: Vec<Id> = Vec::new();
             for trait_id in bounds {
-                for declaring in declaring_traits_in_chain(program, trait_id, member) {
-                    for candidate in trait_method_candidates(program, declaring, member) {
-                        if !precise.contains(&candidate) {
-                            precise.push(candidate);
-                        }
+                for found in declaring_traits_in_chain(program, trait_id, member) {
+                    if !declaring.contains(&found) {
+                        declaring.push(found);
                     }
                 }
             }
+            let precise: Vec<Id> = match declaring.as_slice() {
+                [only] => trait_method_candidates(program, *only, member)
+                    .as_ref()
+                    .clone(),
+                _ => {
+                    let mut seen: HashSet<Id> = HashSet::default();
+                    let mut union = Vec::new();
+                    for trait_id in declaring {
+                        for candidate in trait_method_candidates(program, trait_id, member).iter() {
+                            if seen.insert(*candidate) {
+                                union.push(*candidate);
+                            }
+                        }
+                    }
+                    union
+                }
+            };
             // A parameter whose bounds declare no such member (a bound the
             // record cannot name) falls back to every same-named member —
             // over-approximate but sound.
@@ -1123,7 +1143,21 @@ fn declaring_traits_in_chain(program: &Program, trait_id: Id, member: &str) -> V
     declaring
 }
 
-fn trait_method_candidates(program: &Program, trait_id: Id, member: &str) -> Vec<Id> {
+fn trait_method_candidates(
+    program: &Program,
+    trait_id: Id,
+    member: &str,
+) -> std::sync::Arc<Vec<Id>> {
+    let key = (trait_id, member.to_string());
+    if let Some(cached) = program.trait_method_memo().get(&key) {
+        return cached.clone();
+    }
+    let computed = std::sync::Arc::new(compute_trait_method_candidates(program, trait_id, member));
+    program.trait_method_memo().insert(key, computed.clone());
+    computed
+}
+
+fn compute_trait_method_candidates(program: &Program, trait_id: Id, member: &str) -> Vec<Id> {
     let mut candidates = Vec::new();
     if let Some(trait_) = program.traits.get(&trait_id)
         && let Some(default_id) = trait_.declarations.get(member)

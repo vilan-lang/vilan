@@ -188,6 +188,29 @@ pub enum ParseErrorReason {
     /// are written out of [`attribute_rank`]'s order, and nothing else out of
     /// order. `canonical` is the head respelled in it; the parse read it so.
     AttributeOrder { canonical: String },
+    /// An assignment where its value is used (B569 S1): `written` is the
+    /// assignment's own text when it fits on one line, `place` its target.
+    /// (`name = value` as an entry of parentheses never reaches here: it is
+    /// a tuple's label, or a call's named argument.)
+    ValuedAssignment {
+        written: Option<String>,
+        place: String,
+    },
+    /// `(x = 5);` — a one-slot labelled tuple standing as a statement (B569
+    /// §3.2), which an author writes meaning the assignment. `value` is the
+    /// entry's text when it fits on one line.
+    DiscardedLabelledTuple {
+        label: String,
+        value: Option<String>,
+    },
+    /// A generic list written SPACED after an ascribed type's name (B571,
+    /// type-ascription.md §5.1, RULED): `xs as List <i32>;`. In an ascribed
+    /// type a `<` opens a generic list only when it touches the name before
+    /// it; this one could not be the comparison the rule reads it as (nothing
+    /// follows its `>`), so the parse went on as if it had been written tight,
+    /// and `vilan fmt` writes it so. `written` is the type as written up to
+    /// the name, `tight` the type respelled.
+    SpacedAscribedGenerics { written: String, tight: String },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -450,6 +473,14 @@ const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibil
 /// R1's `[platform(..)]` today), so it leads the file — the one place a reader
 /// looks for what the whole file is. Curated: the rule states itself and names
 /// the move that satisfies it.
+/// B569 §2: a tuple's written slots are all labelled or none are.
+pub const A_TUPLE_LABELS_EVERY_SLOT_OR_NONE: &str = "a tuple labels every slot or none: \
+     label this one too, or drop the labels and use positions (`.0`, `.1`, …)";
+
+/// B569 §2: each label names one slot.
+pub const A_TUPLE_LABEL_IS_WRITTEN_ONCE: &str = "a tuple's labels name its slots, so each is \
+     written once: this label is already on another slot";
+
 pub const MODULE_SELF_LEADS_THE_FILE: &str = "`mod self;` carries the attributes of the whole file, so it is the file's first statement: \
      move it above the first import. To fence one function instead, write `[platform(..)]` on \
      the function";
@@ -537,9 +568,10 @@ const NULL_MODULE_IS_NOT_IMPORTED: &str = "`null` is a keyword, so no import pat
 /// function where every other curated rule is a constant.
 /// Whether `export` can take this statement (B321): an ITEM, an `import`/`use`,
 /// or another `export`. The attribute wrappers are transparent — they annotate
-/// the item under them and `export [derive(Wire)] struct S { .. }` is the same
-/// declaration — so they are asked about their inner node rather than admitted
-/// blindly.
+/// the item under them and `[derive(Wire)] export struct S { .. }` (the spelling
+/// an author writes; the parser holds it rotated to `export [derive(Wire)]
+/// struct S { .. }`, which B485 S3 refuses as source) is the same declaration —
+/// so they are asked about their inner node rather than admitted blindly.
 ///
 /// [`Node::Error`] is admitted: it is the nesting bound's stand-in, already
 /// refused once, and a second message about the same input is the double-report
@@ -1749,6 +1781,20 @@ pub fn render(error: &ParseError) -> String {
         ParseErrorReason::ForeignSpelling(spelling) => spelling.message().to_string(),
         ParseErrorReason::MarkerOrder { canonical } => marker_order_rule(canonical),
         ParseErrorReason::AttributeOrder { canonical } => attribute_order_rule(canonical),
+        ParseErrorReason::ValuedAssignment { written, place } => {
+            valued_assignment_rule(written.as_deref(), place)
+        }
+        ParseErrorReason::DiscardedLabelledTuple { label, value } => {
+            let value = value.as_deref().unwrap_or("…");
+            format!(
+                "`({label} = {value})` is a tuple with the label `{label}`, and a statement \
+                 discards it: to assign, write `{label} = {value};`"
+            )
+        }
+        ParseErrorReason::SpacedAscribedGenerics { written, tight } => format!(
+            "`as {written}` then `<`: a generic list after `as` touches its type, `{tight}` — \
+             spaced, the `<` after an ascribed type is a comparison"
+        ),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -2085,6 +2131,18 @@ struct Parser<'a, 'src> {
     /// restored around each statement's expression, so a statement nested in
     /// a block inside it has its own.
     statement_head: Option<usize>,
+    /// The token index at which an expression whose value is DISCARDED
+    /// begins (B569 S1, `named-tuple-fields.md` §3.2): a statement's, a
+    /// block's tail, a `match` arm's body, a closure's expression body, and a
+    /// `then`/`else` branch of a conditional that itself stands at one. An
+    /// assignment is legal only there — its value is `void`, so it is a
+    /// statement — and [`Parser::parse_assignment`] refuses one that begins
+    /// anywhere else, where its value would be used. A position, not a flag:
+    /// the only expression that can begin at the recorded token is the one
+    /// the discarding production asked for, so every nested operand reads
+    /// false without being told. Set and restored by
+    /// [`Parser::parse_discarded`].
+    assignment_head: Option<usize>,
     /// The diagnostics of the parser's in-place TOKEN REWRITES (B520's
     /// foreign spellings), held aside from `errors` for `nesting_refusal`'s
     /// reason: [`Parser::attempt`] truncates `errors` when a branch declines,
@@ -2108,6 +2166,22 @@ struct Parser<'a, 'src> {
     /// is refused; [`parse_with_warnings`] hands them back beside the errors.
     /// One per span, held aside from `errors` for `rewrite_refusals`' reason.
     warnings: Vec<ParseError>,
+    /// Whether an ASCRIBED type is being read (B571, type-ascription.md §5.1):
+    /// the type after `as`, the one type position followed by more
+    /// expression. There a `<` opens a generic list only when it is
+    /// span-adjacent to the name before it, so `n as usize < limit` is a
+    /// comparison. `None` outside one; inside, the depth of generic lists the
+    /// reading is in — at depth 0 a spaced `<` may be the comparison, inside a
+    /// list it cannot be (a type holds no comparison).
+    ascribed_type: Option<usize>,
+    /// A block-like form (`match`, `if`, `for`, `{`) followed by `as` (B571
+    /// Q4, RULED): the form was parsed at its head, and the ascription after
+    /// its brace commits the position to an expression, so the operand is
+    /// handed to the chain tier, which reads `as T` and whatever follows as
+    /// over any other operand. Taken by [`Parser::parse_member_accessor`]
+    /// in place of its call base; set only immediately before descending to
+    /// it.
+    seeded_operand: Option<Spanned<Node<'src>>>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -2135,6 +2209,10 @@ enum Postfix<'src> {
     LiftBare,
     /// `subject(args)` where the subject is itself a postfix result.
     DirectCall(Spanned<NodeList<'src>>),
+    /// `subject as T` — a type ascription (B571). Not absorbed into a `?.`
+    /// link's continuation: what stands left of `as` is the whole chain so
+    /// far, so `a?.b() as Option<B>` ascribes the lifted result.
+    Ascribe(Spanned<Node<'src>>),
 }
 
 /// Stamps a binder pattern's bindings mutable (or not) — `mut` at the binder
@@ -2163,6 +2241,13 @@ fn apply_binding_mutability(pattern: Pattern<'_>, mutable: bool) -> Pattern<'_> 
                 .map(|(pattern, span)| (apply_binding_mutability(pattern, mutable), span))
                 .collect(),
         ),
+        Pattern::Labelled(label, inner) => {
+            let (inner, span) = *inner;
+            Pattern::Labelled(
+                label,
+                Box::new((apply_binding_mutability(inner, mutable), span)),
+            )
+        }
         other => other,
     }
 }
@@ -2415,6 +2500,19 @@ fn marker_keywords_are_legal(keywords: &[MarkerKeyword], word: &str) -> bool {
 /// attributes first, then the keywords in one order, then the declaration
 /// word. `canonical` is the head respelled in that order, attributes
 /// abbreviated. An ERROR ([`MarkerOrderDiagnostic::Keywords`]).
+/// [`ParseErrorReason::ValuedAssignment`]'s message: the rule, and the
+/// statement to write in its place.
+fn valued_assignment_rule(written: Option<&str>, place: &str) -> String {
+    let statement = written.map_or_else(
+        || "the assignment as a statement".to_string(),
+        |written| format!("`{written};`"),
+    );
+    format!(
+        "an assignment is a statement and has no value: write {statement} before this, and \
+         use `{place}`"
+    )
+}
+
 fn marker_order_rule(canonical: &str) -> String {
     format!(
         "a declaration's markers are written in one order — its attributes, then the keywords \
@@ -2781,9 +2879,12 @@ impl<'a, 'src> Parser<'a, 'src> {
             contextual_readings: Vec::new(),
             member_readings: Vec::new(),
             statement_head: None,
+            assignment_head: None,
             rewrite_refusals: Vec::new(),
             written_starts: Vec::new(),
             warnings: Vec::new(),
+            ascribed_type: None,
+            seeded_operand: None,
         }
     }
 
@@ -3533,6 +3634,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         None
     }
 
+    /// Whether the `(` at `position` is an i-string interpolation hole's —
+    /// the lexer's desugaring gives a hole's parens the `{…}` span
+    /// ([`Parser::istring_brace_hint`] reads the same mark).
+    fn opener_is_interpolation_hole(&self, position: usize) -> bool {
+        self.tokens
+            .get(position)
+            .is_some_and(|(_, span)| self.source[span.start..].starts_with('{'))
+    }
+
     /// The anchor for a missing statement terminator: the LAST CHARACTER of the
     /// token before `position` — the gap where the `;` belongs (`editing-dx.md`
     /// §4.4, drawn under the `}` of `… y = 4 }`). One character rather than the
@@ -4188,6 +4298,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             let head = parser.position;
             let expression = parser.parse_statement_expression()?;
             if parser.eat_ctrl(';') {
+                parser.refuse_a_discarded_one_slot_tuple(&expression);
                 return Some(parser.read_at_statement_position(expression, head));
             }
             // A block-bearing form needs no `;` (chumsky's `not_block_end`). Its
@@ -4799,6 +4910,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is(&Token::Const) {
             let start = self.position;
             self.bump();
+            // `const x = 3;` at a statement is the JS declaration habit, which
+            // the analyzer steers to `const let` by name: the assignment under
+            // the prefix stands where the prefix does, so S1's refusal leaves
+            // it to that steer.
+            if self.assignment_head == Some(start) {
+                self.assignment_head = Some(self.position);
+            }
             // `const const .. 1` recurses HERE, not through `parse_secondary`,
             // so it carries its own nesting level (B142).
             let inner = self.parse_nested(Self::NESTING_REFUSAL, Self::parse_expression)?;
@@ -4812,8 +4930,23 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// may be the statement reading and the guard may stand (B459).
     fn parse_statement_expression(&mut self) -> Option<Spanned<Node<'src>>> {
         let outer = self.statement_head.replace(self.position);
-        let expression = self.parse_expression();
+        let expression = self.parse_discarded(Self::parse_expression);
         self.statement_head = outer;
+        expression
+    }
+
+    /// `parse` at a position whose value is DISCARDED, where an assignment
+    /// may stand ([`Parser::assignment_head`]). Restores the enclosing one,
+    /// so a discarding production nested inside (a block in an operand, a
+    /// closure in an argument) has its own and the operand around it has
+    /// none.
+    fn parse_discarded(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Option<Spanned<Node<'src>>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        let outer = self.assignment_head.replace(self.position);
+        let expression = parse(self);
+        self.assignment_head = outer;
         expression
     }
 
@@ -4860,6 +4993,7 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_secondary`]'s body, past the depth bound.
     fn parse_secondary_inner(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
         let block_like = match self.peek() {
             // A closure literal (`|params| body`, `|| body`) — always tried before
             // the tower, so a leading `||` is never a logical-or (which needs a left
@@ -4901,8 +5035,56 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return self.parse_operators(no_struct);
             }
         };
+        // B571 Q4 (RULED): `as` after the brace continues the form. It cannot
+        // begin a statement where it stands — except as a NAME on a later
+        // line, which is why a statement head takes it only on the brace's
+        // own line.
+        if self.ascription_follows_block_like(self.statement_head != Some(start)) {
+            self.seeded_operand = Some(block_like);
+            return self.parse_operators(no_struct);
+        }
         self.refuse_block_like_continuation(no_struct);
         Some(block_like)
+    }
+
+    /// Whether an ascription (`as T`) follows the block-like form just parsed
+    /// (B571 Q4): the word, on the brace's line unless `across_lines`, and a
+    /// type after it. Probed, never consumed: the chain tier reads it.
+    fn ascription_follows_block_like(&mut self, across_lines: bool) -> bool {
+        if !self.peek_is_word("as") || !self.type_can_start_at(1) {
+            return false;
+        }
+        if !across_lines && self.line_break_before_cursor() {
+            return false;
+        }
+        self.probe(|parser| parser.parse_ascription().is_some())
+    }
+
+    /// Whether a line break stands between the previous token and the cursor's.
+    fn line_break_before_cursor(&self) -> bool {
+        let (Some(previous), Some(current)) = (
+            self.position
+                .checked_sub(1)
+                .and_then(|index| self.tokens.get(index)),
+            self.tokens.get(self.position),
+        ) else {
+            return false;
+        };
+        self.source
+            .get(previous.1.end..current.1.start)
+            .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// Runs `body` and rolls back EVERYTHING it did — cursor, errors,
+    /// contextual readings — whatever it answers: a lookahead question asked
+    /// in the grammar's own terms.
+    fn probe(&mut self, body: impl FnOnce(&mut Self) -> bool) -> bool {
+        let mut answer = false;
+        self.attempt(|parser| {
+            answer = body(parser);
+            None::<()>
+        });
+        answer
     }
 
     /// The operator tower above the postfix/precedence chain: the `is` pattern test,
@@ -4935,6 +5117,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_conditional(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let at_statement_head = self.statement_head == Some(start);
+        // A branch's value is discarded exactly when the form's is: `c then
+        // x = 5;` assigns, `let v = c then x = 5 else 0;` is refused.
+        let discarded = self.assignment_head == Some(start);
         let condition = self.parse_logical_or(no_struct)?;
         let guard = at_statement_head && self.peek_is(&Token::Else);
         if !self.peek_is_word("then") && !guard {
@@ -4946,14 +5131,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                 let word = parser.here_span();
                 parser.contextual_readings.push(parser.position);
                 parser.bump();
-                Some((word, parser.parse_then_branch(no_struct)?))
+                Some((word, parser.parse_then_branch(no_struct, discarded)?))
             } else {
                 None
             };
             let otherwise = if parser.peek_is(&Token::Else) {
                 let word = parser.here_span();
                 parser.bump();
-                Some((word, parser.parse_then_branch(no_struct)?))
+                Some((word, parser.parse_then_branch(no_struct, discarded)?))
             } else {
                 None
             };
@@ -5004,11 +5189,22 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// statement position — every statement vilan has is an expression
     /// production), in the enclosing condition mode. A `let` parses and is
     /// refused (Q8, [`A_BRANCH_BINDS_NOTHING`]).
-    fn parse_then_branch(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        let branch = if no_struct {
-            self.parse_secondary(true)?
+    fn parse_then_branch(
+        &mut self,
+        no_struct: bool,
+        discarded: bool,
+    ) -> Option<Spanned<Node<'src>>> {
+        let parse = |parser: &mut Self| {
+            if no_struct {
+                parser.parse_secondary(true)
+            } else {
+                parser.parse_expression()
+            }
+        };
+        let branch = if discarded {
+            self.parse_discarded(parse)?
         } else {
-            self.parse_expression()?
+            parse(self)?
         };
         if matches!(branch.0, Node::Let(..)) {
             self.errors.push(ParseError {
@@ -5253,6 +5449,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         // through `parse_secondary`, so every one of them takes its own level
         // of the nesting counter (B142). Without that, `!!!..!1` — measured at
         // ~14.1 KiB per `!` unoptimized — would still be unbounded.
+        // A block-like form seeded by its `as` (B571 Q4) is the operand
+        // itself: what follows its brace is the ascription, never a prefix.
+        if self.seeded_operand.is_some() {
+            return self.parse_member_accessor(no_struct);
+        }
         let start = self.position;
         if self.eat_op("!") {
             let inner = self.parse_nested(Self::NESTING_REFUSAL, |parser| {
@@ -5316,13 +5517,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         // body — the same ambiguity `no_struct` already resolves for struct
         // literals and `css` blocks — so there it stays refused and parentheses
         // are the spelling.
-        match self.peek() {
-            Some(Token::Match) => return self.parse_match(),
-            Some(Token::If) => return self.parse_if(),
-            Some(Token::Ctrl('{')) if !no_struct => return self.parse_block_as_expression(),
-            _ => {}
+        let block_like = match self.peek() {
+            Some(Token::Match) => self.parse_match()?,
+            Some(Token::If) => self.parse_if()?,
+            Some(Token::Ctrl('{')) if !no_struct => self.parse_block_as_expression()?,
+            _ => return self.parse_member_accessor(no_struct),
+        };
+        // B571 Q4: an operand's `as` after the brace ascribes the form, and
+        // the chain goes on from there.
+        if self.ascription_follows_block_like(true) {
+            self.seeded_operand = Some(block_like);
+            return self.parse_member_accessor(no_struct);
         }
-        self.parse_member_accessor(no_struct)
+        Some(block_like)
     }
 
     /// The postfix chain over a call/static-access base: `.member`, `[index]`, `!`,
@@ -5330,7 +5537,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// grouped so a `?.` link absorbs the following plain postfixes into its
     /// continuation (up to the next `?.`/`!`/chain end).
     fn parse_member_accessor(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        let base = self.parse_call(no_struct)?;
+        let base = match self.seeded_operand.take() {
+            Some(seeded) => seeded,
+            None => self.parse_call(no_struct)?,
+        };
         let mut postfixes: Vec<(Postfix<'src>, Span)> = Vec::new();
         loop {
             let start = self.position;
@@ -5396,7 +5606,103 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.eat_op("?") {
             return Some(Some(Postfix::LiftBare));
         }
+        // `as T` — a type ascription (B571). `as` is CONTEXTUAL (Q6): it is
+        // read here, after a complete operand, where no name can stand —
+        // vilan never puts two names side by side — so `let as = 5;` and
+        // `print(as)` keep their meaning. ATTEMPTED: an `as` no type follows
+        // is not an ascription, so a missing `;` before a line that starts
+        // with a name `as` is still reported as the missing `;`.
+        if self.peek_is_word("as") && self.type_can_start_at(1) {
+            return Some(self.attempt(Self::parse_ascription).map(Postfix::Ascribe));
+        }
         Some(None)
+    }
+
+    /// Whether a type can begin `offset` tokens ahead: a name (a path, `dyn`,
+    /// `sync`, `_`), `(`, `[`, `&`, a closure type's `|`/`||`, `type`,
+    /// `async`. Asked before an ascription is attempted, so an `as` that no
+    /// type follows records no "expected a type" deeper than the failure the
+    /// author actually made (`as = 5` after a missing `;`).
+    fn type_can_start_at(&self, offset: usize) -> bool {
+        matches!(
+            self.peek_at(offset),
+            Some(
+                Token::Ident(_)
+                    | Token::Ctrl('(' | '[')
+                    | Token::Op("&" | "|" | "||")
+                    | Token::Type
+                    | Token::Async
+            )
+        )
+    }
+
+    /// `as T` past a complete operand (B571): the word, then the ascribed
+    /// type ([`Parser::parse_ascribed_type`]).
+    fn parse_ascription(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !self.eat_word("as") {
+            return None;
+        }
+        self.parse_ascribed_type()
+    }
+
+    /// The type after `as` (type-ascription.md §5): the type grammar's own
+    /// production, with the ruled whitespace rule on every generic list in
+    /// it — a `<` opens a list only when it touches the name before it.
+    fn parse_ascribed_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let outer = self.ascribed_type.replace(0);
+        let type_ = self.parse_type();
+        self.ascribed_type = outer;
+        type_
+    }
+
+    /// The generic list after a type path's name, under the ascribed-type
+    /// whitespace rule when one is being read (B571 §5.1).
+    ///
+    /// Outside an ascribed type this is the plain optional list. Inside one, a
+    /// list TOUCHING the name is read as always, one level deeper. A SPACED
+    /// `<` is the comparison the rule says it is — except where no comparison
+    /// could stand: inside another generic list, or where the list's `>` is
+    /// followed by a token that ends an expression (`;`, `,`, a closer, a `.`,
+    /// end of input). There the list is refused with the tight spelling and
+    /// read as written tight (the formatter's fix), so the analysis still
+    /// sees the type the author meant.
+    fn parse_path_generic_arguments(&mut self, written: &str) -> Option<GenericArguments<'src>> {
+        let Some(depth) = self.ascribed_type else {
+            return self.attempt(Self::parse_generic_arguments);
+        };
+        if !self.peek_is_ctrl('<') {
+            return None;
+        }
+        let touching = self.position > 0
+            && self.tokens[self.position - 1].1.end == self.tokens[self.position].1.start;
+        let start = self.position;
+        self.ascribed_type = Some(depth + 1);
+        let arguments = self.attempt(|parser| {
+            let arguments = parser.parse_generic_arguments()?;
+            let ends_an_expression = matches!(
+                parser.peek(),
+                None | Some(Token::Ctrl(';' | ',' | ')' | ']' | '}' | '.'))
+            );
+            // At the type's own level a spaced `<` is the comparison, unless
+            // no comparison could stand where its list ends.
+            (touching || depth > 0 || ends_an_expression).then_some(arguments)
+        });
+        self.ascribed_type = Some(depth);
+        let arguments = arguments?;
+        if !touching {
+            let source = self.source;
+            let list = &source[self.tokens[start].1.start..self.tokens[self.position - 1].1.end];
+            self.errors.push(ParseError {
+                span: self.span_from(start),
+                reason: ParseErrorReason::SpacedAscribedGenerics {
+                    written: written.to_string(),
+                    tight: format!("{written}{}", tighten_generic_list(list)),
+                },
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
+        Some(arguments)
     }
 
     /// A member after `.`/`?.`: a tuple index (`.0`), or a name with at most ONE
@@ -5467,9 +5773,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_argument_list(&mut self) -> Option<Spanned<NodeList<'src>>> {
         let start = self.position;
         self.expect_ctrl('(')?;
-        let arguments = self.comma_list(Self::parse_element_or_spread, |parser| {
-            parser.peek_is_ctrl(')')
-        })?;
+        let arguments =
+            self.comma_list(Self::parse_tuple_entry, |parser| parser.peek_is_ctrl(')'))?;
         self.expect_ctrl(')')?;
         Some((arguments, self.span_from(start)))
     }
@@ -5962,12 +6267,26 @@ impl<'a, 'src> Parser<'a, 'src> {
             if let Some(spread) = parser.parse_spread_element() {
                 let mut items = vec![spread];
                 while parser.eat_ctrl(',') {
-                    items.push(parser.parse_element_or_spread()?);
+                    items.push(parser.parse_tuple_entry()?);
                 }
                 parser.expect_ctrl(')')?;
+                parser.check_tuple_labels(&items);
                 return Some((Node::Tuple(items), parser.span_from(start)));
             }
-            let first = parser.parse_expression()?;
+            // An i-string's interpolation hole is lexed as a group whose `(`
+            // carries the `{…}` span: its expression is a VALUE, never an
+            // entry that could carry a label.
+            let first = if parser.opener_is_interpolation_hole(start) {
+                parser.parse_expression()?
+            } else {
+                parser.parse_labelled_entry_or(Self::parse_expression)?
+            };
+            // B569 §7: `(x = 5)` is the one-slot labelled tuple — the label is
+            // what makes it a tuple, where `(5)` stays a group.
+            if matches!(first.0, Node::Labelled(..)) && parser.peek_is_ctrl(')') {
+                parser.bump();
+                return Some((Node::Tuple(vec![first]), parser.span_from(start)));
+            }
             if parser.peek_is_ctrl(',') {
                 // A tuple is `expr (',' expr)*` (≥2 elements) with NO trailing comma
                 // — unlike a list literal, the chumsky `tuple` atom has no
@@ -5975,9 +6294,10 @@ impl<'a, 'src> Parser<'a, 'src> {
                 // either). Every `,` here must be followed by an expression.
                 let mut items = vec![first];
                 while parser.eat_ctrl(',') {
-                    items.push(parser.parse_element_or_spread()?);
+                    items.push(parser.parse_tuple_entry()?);
                 }
                 parser.expect_ctrl(')')?;
+                parser.check_tuple_labels(&items);
                 Some((Node::Tuple(items), parser.span_from(start)))
             } else {
                 parser.expect_ctrl(')')?;
@@ -5992,13 +6312,34 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// One entry of a tuple construction or an argument list: a spread (`..e`) or
-    /// an ordinary expression.
-    fn parse_element_or_spread(&mut self) -> Option<Spanned<Node<'src>>> {
+    /// One entry of a tuple literal or an argument list: a spread, a labelled
+    /// entry `MEMBER "=" expression` (B569 §2 — in an argument list, a NAMED
+    /// argument, §8), or an expression.
+    fn parse_tuple_entry(&mut self) -> Option<Spanned<Node<'src>>> {
         match self.parse_spread_element() {
             Some(spread) => Some(spread),
-            None => self.parse_expression(),
+            None => self.parse_labelled_entry_or(Self::parse_expression),
         }
+    }
+
+    /// `MEMBER "=" expression` — a labelled tuple entry, the struct literal's
+    /// `name = value` spelling — when one begins here, else `otherwise`.
+    fn parse_labelled_entry_or(
+        &mut self,
+        otherwise: fn(&mut Self) -> Option<Spanned<Node<'src>>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        if !self.at_tuple_label("=") {
+            return otherwise(self);
+        }
+        let start = self.position;
+        let label_span = self.here_span();
+        let label = self.eat_member_name()?;
+        self.bump(); // `=`
+        let value = self.parse_expression()?;
+        Some((
+            Node::Labelled((label, label_span), Box::new(value)),
+            self.span_from(start),
+        ))
     }
 
     /// `..e` — a tuple-value spread, recognized ONLY where an element begins
@@ -6867,7 +7208,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // other legitimate reading (it is the one thing in a block that needs
             // no `;`), and it must close the block to be one.
             if let Some(expression) = self.attempt(|parser| {
-                let expression = parser.parse_expression()?;
+                let expression = parser.parse_discarded(Self::parse_expression)?;
                 parser.peek_is_ctrl('}').then_some(expression)
             }) {
                 tail = Some(expression);
@@ -7099,7 +7440,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             None
         };
         self.expect_op("=>")?;
-        let body = self.parse_expression()?;
+        let body = self.parse_discarded(Self::parse_expression)?;
         Some((patterns, guard, body))
     }
 
@@ -7395,11 +7736,57 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return None;
             };
             let value = parser.parse_expression()?;
-            Some((
-                Node::Assign(Box::new(target), op, Box::new(value)),
-                parser.span_from(start),
-            ))
+            let span = parser.span_from(start);
+            if parser.assignment_head != Some(start) {
+                parser.refuse_valued_assignment(&target, span);
+            }
+            Some((Node::Assign(Box::new(target), op, Box::new(value)), span))
         })
+    }
+
+    /// B569 §3.2's second steer: `(x = 5);` as a statement builds a one-slot
+    /// labelled tuple and throws it away — the parentheses an assignment
+    /// never needed, written out of habit.
+    fn refuse_a_discarded_one_slot_tuple(&mut self, expression: &Spanned<Node<'src>>) {
+        let Node::Tuple(entries) = &expression.0 else {
+            return;
+        };
+        let [(Node::Labelled((label, _), value), _)] = &entries[..] else {
+            return;
+        };
+        let written = &self.source[value.1.start..value.1.end];
+        self.errors.push(ParseError {
+            span: expression.1,
+            reason: ParseErrorReason::DiscardedLabelledTuple {
+                label: label.to_string(),
+                value: (!written.contains('\n')).then(|| written.to_string()),
+            },
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// B569 S1 (`named-tuple-fields.md` §3.2): an assignment whose value would
+    /// be USED — an operand, an argument, a tuple or list entry, a `let`
+    /// initializer, the right of another `=`. Its value is `void`, so the
+    /// author meant the statement; and inside parentheses `name = value` is a
+    /// tuple's label, which is why the place left. The tree keeps the
+    /// assignment, so everything after it still analyzes.
+    fn refuse_valued_assignment(&mut self, target: &Spanned<Node<'src>>, span: Span) {
+        let written = &self.source[span.start..span.end];
+        let place = &self.source[target.1.start..target.1.end];
+        // One line of source quotes; a statement spread over lines quotes
+        // only its place.
+        let written = (!written.contains('\n')).then(|| written.to_string());
+        self.errors.push(ParseError {
+            span,
+            reason: ParseErrorReason::ValuedAssignment {
+                written,
+                place: place.to_string(),
+            },
+            context: Vec::new(),
+            hint: None,
+        });
     }
 
     /// A closure literal: `|param, …| : return_type? body` or `|| : return_type?
@@ -7447,7 +7834,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 } else {
                     None
                 };
-            let return_value = parser.parse_expression()?;
+            let return_value = parser.parse_discarded(Self::parse_expression)?;
             Some((
                 Node::Closure(Closure {
                     parameters,
@@ -7476,18 +7863,64 @@ impl<'a, 'src> Parser<'a, 'src> {
         )
     }
 
+    /// B569 S3: `MEMBER "=" sub-pattern` — a by-name element of a tuple
+    /// pattern, the literal's spelling (label, then what its slot meets) —
+    /// when one begins here, else `otherwise`.
+    fn parse_labelled_pattern_or(
+        &mut self,
+        otherwise: fn(&mut Self) -> Option<Spanned<Pattern<'src>>>,
+    ) -> Option<Spanned<Pattern<'src>>> {
+        if !self.at_tuple_label("=") {
+            return otherwise(self);
+        }
+        let start = self.position;
+        let label_span = self.here_span();
+        let label = self.eat_member_name()?;
+        self.bump(); // `=`
+        let inner = otherwise(self)?;
+        Some((
+            Pattern::Labelled((label, label_span), Box::new(inner)),
+            self.span_from(start),
+        ))
+    }
+
+    /// A tuple pattern holds two or more elements — a single parenthesized
+    /// pattern is no grouping — save the one-slot BY-NAME pattern `(x = a)`,
+    /// which the label makes a tuple, as it makes `(x = 5)` one (B569 §7).
+    fn tuple_pattern_arity_holds(&self, patterns: &[Spanned<Pattern<'src>>]) -> bool {
+        patterns.len() >= 2 || matches!(patterns, [(Pattern::Labelled(..), _)])
+    }
+
+    /// [`Parser::check_tuple_labels`] for a tuple PATTERN: every element by
+    /// name or none, each label once.
+    fn check_pattern_labels(&mut self, patterns: &[Spanned<Pattern<'src>>]) {
+        let entries = patterns
+            .iter()
+            .map(|pattern| match &pattern.0 {
+                Pattern::Labelled((label, label_span), _) => {
+                    (Some((*label, *label_span)), pattern.1)
+                }
+                _ => (None, pattern.1),
+            })
+            .collect();
+        self.refuse_unbalanced_labels(entries);
+    }
+
     /// [`Parser::parse_binder`]'s body, past the depth bound.
     fn parse_binder_inner(&mut self) -> Option<Spanned<Pattern<'src>>> {
         let start = self.position;
         if self.peek_is_ctrl('(') {
             return self.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let patterns =
-                    parser.comma_list(Self::parse_binder, |parser| parser.peek_is_ctrl(')'))?;
+                let patterns = parser.comma_list(
+                    |parser| parser.parse_labelled_pattern_or(Self::parse_binder),
+                    |parser| parser.peek_is_ctrl(')'),
+                )?;
                 parser.expect_ctrl(')')?;
-                if patterns.len() < 2 {
+                if !parser.tuple_pattern_arity_holds(&patterns) {
                     return None;
                 }
+                parser.check_pattern_labels(&patterns);
                 Some((Pattern::Tuple(patterns), parser.span_from(start)))
             });
         }
@@ -7590,12 +8023,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_ctrl('(') {
             return self.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let patterns =
-                    parser.comma_list(Self::parse_pattern, |parser| parser.peek_is_ctrl(')'))?;
+                let patterns = parser.comma_list(
+                    |parser| parser.parse_labelled_pattern_or(Self::parse_pattern),
+                    |parser| parser.peek_is_ctrl(')'),
+                )?;
                 parser.expect_ctrl(')')?;
-                if patterns.len() < 2 {
+                if !parser.tuple_pattern_arity_holds(&patterns) {
                     return None;
                 }
+                parser.check_pattern_labels(&patterns);
                 Some((Pattern::Tuple(patterns), parser.span_from(start)))
             });
         }
@@ -7663,8 +8099,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_type(&mut self) -> Option<Spanned<Node<'src>>> {
         // The type grammar is a closed cycle that reaches no expression rule at
         // all (B142) — `& & & ..`, `[[..; 1]; 1]`, `L<L<..>>`, `((..))`, closure
-        // types and bounds all come back through here, and `parse_type_atom` has
-        // this as its only caller, so this is the type grammar's single door. It
+        // types and bounds all come back through here, and `parse_type_atom` is
+        // reached only through a depth-bounded door (this one, and `auto`'s
+        // written type, B570), so this is the type grammar's bound. It
         // is reachable from a bounded expression too, through a call's generic
         // arguments, which is why one level of expression nesting cannot stand in
         // for it.
@@ -7707,6 +8144,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_word("dyn") && !self.peek_at_is_op(1, "::") {
             return self.parse_dyn_type();
         }
+        // B570: `auto` is contextual by `dyn`'s rule — the toolchain-kept
+        // marker at a type's head, except `auto::`. A type follows, or the
+        // annotation ends there (`= .. ;`, `{`, a `context` or `borrows`
+        // clause): the bare `auto`, filled by `check --fix`. Where nothing is
+        // inferred (a parameter, a field) the analyzer refuses it by name.
+        if self.peek_is_word("auto") && !self.peek_at_is_op(1, "::") {
+            return self.parse_auto_type();
+        }
         if let Some(closure) = self.parse_closure_type() {
             return Some(closure);
         }
@@ -7723,6 +8168,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.note_expected("a type");
         None
+    }
+
+    /// `auto T` / `auto` (B570): the marker, then the written type when one
+    /// follows — read without its own `context` suffix, which the enclosing
+    /// [`Parser::parse_type_inner`] takes over the whole annotation, so a
+    /// return's clause still binds to the function.
+    fn parse_auto_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        if !self.eat_word("auto") {
+            return None;
+        }
+        let ends_here = !self.type_can_start_at(0)
+            || self.peek_is_word("context")
+            || self.peek_is_word("borrows");
+        let written = match ends_here {
+            true => None,
+            false => Some(Box::new(
+                self.parse_nested(Self::TYPE_NESTING_REFUSAL, Self::parse_type_atom)?,
+            )),
+        };
+        Some((Node::AutoType(written), self.span_from(start)))
     }
 
     /// `dyn Source<i32>` — a trait object type (A124 R3).
@@ -7945,7 +8411,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.bump(); // `::`
             name = self.eat_ident().expect("peeked as an identifier");
         }
-        let generic_arguments = self.attempt(Self::parse_generic_arguments);
+        let source = self.source;
+        let written = &source[self.tokens[start].1.start..self.tokens[self.position - 1].1.end];
+        let generic_arguments = self.parse_path_generic_arguments(written);
         if generic_arguments.is_some() && namespace.is_none() {
             self.refuse_generic_self(name, start);
         }
@@ -7991,9 +8459,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.attempt(|parser| {
             let start = parser.position;
             parser.expect_ctrl('(')?;
-            let elements =
-                parser.comma_list(Self::parse_type, |parser| parser.peek_is_ctrl(')'))?;
+            let elements = parser.comma_list(Self::parse_tuple_type_slot, |parser| {
+                parser.peek_is_ctrl(')')
+            })?;
             parser.expect_ctrl(')')?;
+            parser.check_tuple_labels(&elements);
             // N113: `()` reads as the EMPTY tuple, and nothing can produce one
             // — a field, parameter or return written at it is uninhabited, so
             // every program that touched it was refused somewhere else, with a
@@ -8014,6 +8484,83 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             Some((Node::Tuple(elements), parser.span_from(start)))
         })
+    }
+
+    /// One slot of a tuple type: `MEMBER ":" type` (a labelled slot, B569
+    /// §2) or a type. Decided at the second token — `name :` and not `name
+    /// ::`, which is a path.
+    fn parse_tuple_type_slot(&mut self) -> Option<Spanned<Node<'src>>> {
+        if self.at_tuple_label(":") {
+            let start = self.position;
+            let label_span = self.here_span();
+            let label = self.eat_member_name()?;
+            self.bump(); // `:`
+            let slot = self.parse_type()?;
+            return Some((
+                Node::Labelled((label, label_span), Box::new(slot)),
+                self.span_from(start),
+            ));
+        }
+        self.parse_type()
+    }
+
+    /// Whether a tuple label begins at the cursor: a member name (any word,
+    /// B414 S4 — never a position number) followed by `separator` (`:` in a
+    /// type, `=` in a literal). `::`, `==` and `=>` are tokens of their own,
+    /// so none of them reads as one.
+    fn at_tuple_label(&self, separator: &str) -> bool {
+        !matches!(self.peek(), Some(Token::Number(..)))
+            && self.peek_is_member_name()
+            && matches!(self.peek_at(1), Some(Token::Op(op)) if *op == separator)
+    }
+
+    /// B569 §2: a tuple — its type or its literal — labels every written
+    /// slot or none, and names each label once. A spread brings its operand's
+    /// slots, which only the analyzer can see, so spreads are left to it.
+    fn check_tuple_labels(&mut self, entries: &[Spanned<Node<'src>>]) {
+        let written = entries
+            .iter()
+            .filter(|entry| !matches!(entry.0, Node::Spread(_)))
+            .map(|entry| match &entry.0 {
+                Node::Labelled((label, label_span), _) => (Some((*label, *label_span)), entry.1),
+                _ => (None, entry.1),
+            });
+        self.refuse_unbalanced_labels(written.collect());
+    }
+
+    /// The one rule [`Parser::check_tuple_labels`] and
+    /// [`Parser::check_pattern_labels`] state: each entry is its label (with
+    /// the label's span) or `None`, beside the entry's own span.
+    fn refuse_unbalanced_labels(&mut self, entries: Vec<(Option<(&'src str, Span)>, Span)>) {
+        let labelled = entries.iter().filter(|(label, _)| label.is_some()).count();
+        if labelled == 0 {
+            return;
+        }
+        if labelled < entries.len() {
+            let first = entries
+                .iter()
+                .find(|(label, _)| label.is_none())
+                .map_or(Span::from(0..0), |(_, span)| *span);
+            self.errors.push(ParseError {
+                span: first,
+                reason: ParseErrorReason::Rule(A_TUPLE_LABELS_EVERY_SLOT_OR_NONE),
+                context: Vec::new(),
+                hint: None,
+            });
+            return;
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for (label, label_span) in entries.into_iter().flat_map(|(label, _)| label) {
+            if seen.contains(&label) {
+                self.errors.push(ParseError {
+                    span: label_span,
+                    reason: ParseErrorReason::Rule(A_TUPLE_LABEL_IS_WRITTEN_ONCE),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            seen.push(label);
+        }
     }
 
     /// `context name` / `context (a, b)` — the optional context clause on a type
@@ -10554,11 +11101,35 @@ impl<'a, 'src> Parser<'a, 'src> {
 
 /// Whether a node is a block-bearing form that may be a statement without a
 /// trailing `;` (the chumsky `if_`/`for_`/`match_`/`block` statement alternatives).
-fn is_block_like(node: &Node<'_>) -> bool {
+pub(crate) fn is_block_like(node: &Node<'_>) -> bool {
     matches!(
         node,
         Node::If(_) | Node::For(..) | Node::ForIn(..) | Node::Match(..) | Node::Block(_)
     ) && !is_then_form(node)
+}
+
+/// A generic list's text respelled tight (B571 §5.1's refusal): no space
+/// after a `<`, before a `<` or before a `>` — `< i32 >` is `<i32>`, `<str,
+/// List <i32>>` is `<str, List<i32>>`. The separator's space is kept.
+fn tighten_generic_list(list: &str) -> String {
+    let mut tight = String::with_capacity(list.len());
+    let mut characters = list.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() {
+            let previous = tight.chars().next_back();
+            while characters.peek().is_some_and(|next| next.is_whitespace()) {
+                characters.next();
+            }
+            let next = characters.peek().copied();
+            if previous == Some('<') || matches!(next, Some('<' | '>')) {
+                continue;
+            }
+            tight.push(' ');
+            continue;
+        }
+        tight.push(character);
+    }
+    tight
 }
 
 /// Apply one plain postfix to a subject, spanning from the chain's start. A
@@ -10590,6 +11161,7 @@ fn apply_postfix<'src>(
             span,
         ),
         Postfix::DirectCall(arguments) => (Node::Call(Box::new(subject), None, arguments), span),
+        Postfix::Ascribe(type_) => (Node::Ascribe(Box::new(subject), Box::new(type_)), span),
     }
 }
 
@@ -11132,6 +11704,252 @@ mod tests {
             Node::Assign(target, None, _) => assert!(matches!(target.0, Node::Dereference(_))),
             other => panic!("expected Assign over a Dereference target, got {other:?}"),
         }
+    }
+
+    /// The rendered diagnostics of `source` parsed as a whole program.
+    fn program_errors(source: &str) -> Vec<String> {
+        let (tree, errors) = parse(source);
+        assert!(tree.is_some(), "no tree came back for {source:?}");
+        errors.iter().map(render).collect()
+    }
+
+    /// B569 S1 (`named-tuple-fields.md` §3.2): every position whose value is
+    /// DISCARDED keeps assignment — a statement, a block's tail, a `match`
+    /// arm, a closure's expression body, the branches of a `then`/`else` form
+    /// standing at one, nested — and parses clean.
+    #[test]
+    fn b569_an_assignment_stands_where_its_value_is_discarded() {
+        for body in [
+            "x = 5;",
+            "x += 1;",
+            "*view = 5;",
+            "point.x = 5;",
+            "rows[0] = 5;",
+            "{ x = 5 }",
+            "let unit = { x = 5 };",
+            "match x { 0 => x = 1, _ => x = 2 }",
+            "let pick = match x { 0 => x = 1, _ => x = 2 };",
+            "let set = |v: i32| x = v;",
+            "list.each(|v| total += v);",
+            "c then x = 5;",
+            "c else x = 5;",
+            "c then x = 5 else x = 6;",
+            "c then x = 5 else d then x = 6 else x = 7;",
+            "if c { x = 5 } else { x = 6 }",
+            "for v in vs { total += v }",
+            "let nested = || { x = 5; |v: i32| x = v };",
+            "match x { 0 => c then x = 1 else x = 2, _ => {} }",
+        ] {
+            let source = format!("fun f() {{ {body} }}");
+            assert_eq!(
+                program_errors(&source),
+                Vec::<String>::new(),
+                "`{body}` discards the assignment's value"
+            );
+        }
+    }
+
+    /// B569 S1: every position whose value is USED refuses an assignment,
+    /// naming the statement to write instead. (`name = value` as an entry of
+    /// parentheses is no assignment at all since S2/S4: a tuple's label, or a
+    /// call's named argument.)
+    #[test]
+    fn b569_an_assignment_is_refused_where_its_value_is_used() {
+        let general = "an assignment is a statement and has no value: write ";
+        for (body, expected) in [
+            (
+                "let y = (x += 5);",
+                format!("{general}`x += 5;` before this, and use `x`"),
+            ),
+            (
+                "let y = (p.x = 5);",
+                format!("{general}`p.x = 5;` before this, and use `p.x`"),
+            ),
+            (
+                "let y = x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "w = x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let list = [x = 5];",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "ret x = 5;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let v = c then x = 5 else 0;",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "takes(p.x = 5);",
+                format!("{general}`p.x = 5;` before this, and use `p.x`"),
+            ),
+            (
+                "takes(c then x = 5 else 0);",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+            (
+                "let s = Point { x = y = 5 };",
+                format!("{general}`y = 5;` before this, and use `y`"),
+            ),
+            (
+                "let s = i\"{x = 5}\";",
+                format!("{general}`x = 5;` before this, and use `x`"),
+            ),
+        ] {
+            let source = format!("fun f() {{ {body} }}");
+            assert_eq!(
+                program_errors(&source),
+                vec![expected],
+                "`{body}` uses the assignment's value"
+            );
+        }
+    }
+
+    /// B569 S1: an assignment that spans lines is not quoted whole — the
+    /// steer names its place.
+    #[test]
+    fn b569_a_multi_line_assignment_is_steered_by_its_place() {
+        assert_eq!(
+            program_errors("fun f() { let y = [x =\n 5 + 1]; }"),
+            vec![
+                "an assignment is a statement and has no value: write the assignment as a \
+                 statement before this, and use `x`"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// B569 §2: a tuple type's slot is `MEMBER ":" type` or a type, every
+    /// slot labelled or none; a one-slot labelled type is a tuple, `(T)` a
+    /// group; `name ::` stays a path.
+    #[test]
+    fn b569_a_tuple_type_takes_labelled_slots() {
+        match &type_("(x: f64, y: f64)").0 {
+            Node::Tuple(slots) => {
+                assert!(
+                    matches!(&slots[0].0, Node::Labelled(("x", _), inner) if matches!(inner.0, Node::Accessor("f64")))
+                );
+                assert!(matches!(&slots[1].0, Node::Labelled(("y", _), _)));
+            }
+            other => panic!("expected a labelled tuple type, got {other:?}"),
+        }
+        assert!(
+            matches!(&type_("(x: i32)").0, Node::Tuple(slots) if matches!(slots[..], [(Node::Labelled(..), _)]))
+        );
+        assert!(
+            matches!(&type_("(type: str, if: bool)").0, Node::Tuple(slots) if matches!(&slots[1].0, Node::Labelled(("if", _), _)))
+        );
+        assert!(
+            matches!(&type_("(a::B, C)").0, Node::Tuple(slots) if matches!(slots[0].0, Node::StaticAccessor(..)))
+        );
+        assert!(matches!(
+            &type_("(U in T: List<U>)").0,
+            Node::MappedType { .. }
+        ));
+        for refused in [
+            "fun f(p: (x: f64, f64)) {}",
+            "fun f(p: (x: f64, x: f64)) {}",
+        ] {
+            assert_eq!(program_errors(refused).len(), 1, "{refused}");
+        }
+    }
+
+    /// B569 §2/§7: a literal's entry is `MEMBER "=" expression` once
+    /// assignment has left value position; `(x = 5)` is the one-slot tuple,
+    /// `(5)` a group, `==`/`=>` never a label, and an i-string hole a value.
+    #[test]
+    fn b569_a_tuple_literal_takes_labelled_entries() {
+        match &expr("(x = 5, y = 7)").0 {
+            Node::Tuple(entries) => {
+                assert!(
+                    matches!(&entries[0].0, Node::Labelled(("x", _), value) if matches!(value.0, Node::Number(..)))
+                );
+                assert!(matches!(&entries[1].0, Node::Labelled(("y", _), _)));
+            }
+            other => panic!("expected a labelled tuple, got {other:?}"),
+        }
+        assert!(
+            matches!(&expr("(x = 5)").0, Node::Tuple(entries) if matches!(entries[..], [(Node::Labelled(..), _)]))
+        );
+        assert!(matches!(expr("(5)").0, Node::Number(..)));
+        assert!(matches!(expr("(x == 5)").0, Node::Binary(..)));
+        assert!(
+            matches!(&expr("(..p, z = 3)").0, Node::Tuple(entries) if matches!(entries[1].0, Node::Labelled(("z", _), _)))
+        );
+        assert!(
+            matches!(&expr("(type = 1, match = 2)").0, Node::Tuple(entries) if matches!(entries[1].0, Node::Labelled(("match", _), _)))
+        );
+        assert_eq!(program_errors("fun f() { let a = (x = 1, 2); }").len(), 1);
+        assert_eq!(
+            program_errors("fun f() { let a = (x = 1, x = 2); }").len(),
+            1
+        );
+        assert_eq!(
+            program_errors("fun f() { let a = (..p, x = 1); }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { print(i\"{(x = 5)}\"); }"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// B569 S3: a tuple pattern's element may be written by name — `MEMBER
+    /// "="` then the sub-pattern — in a binder and a match pattern alike;
+    /// the one-slot by-name pattern is a tuple, every element named or none.
+    #[test]
+    fn b569_a_tuple_pattern_takes_labelled_elements() {
+        let (tree, errors) = parse("fun f() { let (y = top, x = left) = p; }");
+        assert!(errors.is_empty(), "{errors:?}");
+        let rendered = format!("{tree:?}");
+        assert!(rendered.contains("Labelled((\"y\""), "{rendered}");
+        assert_eq!(
+            program_errors(
+                "fun f() { match q { (x = 0, y = let v) => v, (x = let h, y = _) => h } }"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { let (x = only) = p; }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            program_errors("fun f() { for (y = b, x = a) in rows { } }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(program_errors("fun f() { let (x = a, b) = p; }").len(), 1);
+        assert_eq!(
+            program_errors("fun f() { let (x = a, x = b) = p; }").len(),
+            1
+        );
+        // A single parenthesized pattern without a label is still no tuple.
+        assert!(!program_errors("fun f() { let (a) = p; }").is_empty());
+    }
+
+    /// B569 S4: a call's argument may be NAMED — `MEMBER "=" expression`, a
+    /// labelled entry of the literal a spread parameter collects; a place
+    /// that is not a bare name is still an assignment, and refused.
+    #[test]
+    fn b569_an_argument_may_be_named() {
+        match &expr("draw(x = 1, y = 2)").0 {
+            Node::Call(_, _, arguments) => {
+                assert!(matches!(&arguments.0[0].0, Node::Labelled(("x", _), _)));
+                assert!(matches!(&arguments.0[1].0, Node::Labelled(("y", _), _)));
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+        assert!(matches!(&expr("p.draw(x = 1)").0, Node::MemberAccessor(..)));
+        assert_eq!(
+            program_errors("fun f() { draw(x = 1, y = 2); }"),
+            Vec::<String>::new()
+        );
+        assert_eq!(program_errors("fun f() { takes(p.x = 1); }").len(), 1);
     }
 
     // --- Closures ------------------------------------------------------------
@@ -14765,5 +15583,299 @@ mod tests {
             moved_std_module_edit(source, "cannot find 'x'", Span::from(11..14)),
             None
         );
+    }
+}
+
+/// B571 — the ascription's grammar (`proposal/type-ascription.md` §4–§6): the
+/// postfix in the chain tier, the ascribed-type whitespace rule, `as` after a
+/// block-like brace, and `as` still a name where a name can stand. Trees are
+/// rendered as S-expressions with every type spelled as written, so a pin
+/// reads as the paper's tables do.
+#[cfg(test)]
+mod ascription_tests {
+    use super::*;
+
+    fn shape(source: &str, node: &Spanned<Node<'_>>) -> String {
+        let text = |span: Span| source[span.start..span.end].to_string();
+        match &node.0 {
+            Node::Accessor(name) => name.to_string(),
+            Node::Number(..) | Node::String(_) | Node::Bool(_) => text(node.1),
+            Node::Ascribe(value, type_) => {
+                format!("(as {} {})", shape(source, value), text(type_.1))
+            }
+            Node::Binary(operator, left, right) => format!(
+                "({operator:?} {} {})",
+                shape(source, left),
+                shape(source, right)
+            ),
+            Node::Unary(operator, inner) => format!("({operator} {})", shape(source, inner)),
+            Node::Await(inner) => format!("(await {})", shape(source, inner)),
+            Node::Reference(mutable, inner) => format!(
+                "({} {})",
+                if *mutable { "&mut" } else { "&" },
+                shape(source, inner)
+            ),
+            Node::TryAssert(inner) => format!("(! {})", shape(source, inner)),
+            Node::Lifted(inner) => format!("(? {})", shape(source, inner)),
+            Node::Lift(subject, continuation) => format!(
+                "(?. {} {})",
+                shape(source, subject),
+                shape(source, continuation)
+            ),
+            Node::LiftBinder => "_".to_string(),
+            Node::Is(subject, pattern) => {
+                format!("(is {} {})", shape(source, subject), text(pattern.1))
+            }
+            Node::MemberAccessor(subject, member) => {
+                format!("(. {} {})", shape(source, subject), shape(source, member))
+            }
+            Node::Call(subject, _, arguments) => {
+                let arguments: Vec<String> = arguments
+                    .0
+                    .iter()
+                    .map(|argument| shape(source, argument))
+                    .collect();
+                format!(
+                    "(call {} [{}])",
+                    shape(source, subject),
+                    arguments.join(" ")
+                )
+            }
+            Node::Match(subject, _) => format!("(match {})", shape(source, subject)),
+            Node::If(NodeIfBranch::If(if_)) => format!(
+                "(if {} {})",
+                shape(source, &if_.condition),
+                shape(source, &if_.then.0.1)
+            ),
+            Node::Block(body) => format!("{{{}}}", shape(source, &body.0.1)),
+            _ => format!("<{}>", text(node.1)),
+        }
+    }
+
+    fn expression(source: &str) -> String {
+        let (mut tokens, errors) = lexing::tokenize(source);
+        assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let node = parser.parse_expression().expect("expression did not parse");
+        assert_eq!(
+            parser.position, token_count,
+            "unconsumed tokens in {source:?}"
+        );
+        assert!(
+            parser.errors.is_empty(),
+            "errors on {source:?}: {:?}",
+            parser.errors
+        );
+        shape(source, &node)
+    }
+
+    /// The statements of `main`'s body in a whole program, each shaped.
+    fn statements(body: &str) -> Vec<String> {
+        let source = format!("fun main() {{\n{body}\n}}\n");
+        let (tree, errors) = parse(&source);
+        assert!(errors.is_empty(), "parse errors on {source:?}: {errors:?}");
+        let (items, _) = tree.expect("program did not parse");
+        let Node::Func(function) = &items[0].0 else {
+            panic!("expected a function");
+        };
+        let ((statements, tail), _) = function.body.as_ref().expect("a body");
+        let mut shapes: Vec<String> = statements
+            .iter()
+            .map(|statement| shape(&source, statement))
+            .collect();
+        if !matches!(tail.0, Node::Void) {
+            shapes.push(shape(&source, tail));
+        }
+        shapes
+    }
+
+    fn rendered_errors(source: &str) -> Vec<String> {
+        let (_, errors) = parse(source);
+        errors.iter().map(render).collect()
+    }
+
+    // --- §6: the precedence rows ---------------------------------------------
+
+    #[test]
+    fn as_is_a_postfix_tighter_than_every_operator() {
+        assert_eq!(expression("a + b as f64"), "(Add a (as b f64))");
+        assert_eq!(expression("-x as f64"), "(- (as x f64))");
+        assert_eq!(expression("a < b as T"), "(Lt a (as b T))");
+        assert_eq!(expression("await p as T"), "(await (as p T))");
+        assert_eq!(expression("&x as &T"), "(& (as x &T))");
+        assert_eq!(
+            expression("x as T is Some(let v)"),
+            "(is (as x T) Some(let v))"
+        );
+        assert_eq!(expression("c then a as T else b"), "(if c (as a T))");
+        assert_eq!(expression("(a + b) as T"), "(as (Add a b) T)");
+    }
+
+    #[test]
+    fn the_chain_goes_on_after_the_type() {
+        assert_eq!(
+            expression("a() as A .b() as B .c() as C"),
+            "(as (. (as (. (as (call a []) A) (call b [])) B) (call c [])) C)"
+        );
+        assert_eq!(expression("x as T?"), "(? (as x T))");
+        assert_eq!(expression("x as T!"), "(! (as x T))");
+        assert_eq!(expression("x as List<i32>[0]"), "<x as List<i32>[0]>");
+        assert_eq!(expression("x as Point.y"), "(. (as x Point) y)");
+        assert_eq!(
+            expression("f as |i32| i32(3)"),
+            "(call (as f |i32| i32) [3])"
+        );
+        assert_eq!(expression("x as (A, B).0"), "(. (as x (A, B)) 0)");
+    }
+
+    /// The ascription is not absorbed into a `?.` link's continuation: what
+    /// stands left of `as` is the whole chain so far.
+    #[test]
+    fn a_lift_link_ends_at_the_ascription() {
+        assert_eq!(
+            expression("a?.b() as T .c()"),
+            "(. (as (?. a (. _ (call b []))) T) (call c []))"
+        );
+    }
+
+    // --- §5.1: the whitespace rule -------------------------------------------
+
+    #[test]
+    fn a_spaced_less_than_after_an_ascribed_type_is_a_comparison() {
+        assert_eq!(expression("n as usize < limit"), "(Lt (as n usize) limit)");
+        assert_eq!(expression("xs as List<usize>"), "(as xs List<usize>)");
+        assert_eq!(expression("x as List<i32> > y"), "(Gt (as x List<i32>) y)");
+        assert_eq!(
+            expression("n as (usize) < limit"),
+            "(Lt (as n (usize)) limit)"
+        );
+        assert_eq!(
+            expression("m as HashMap<str, List<i32>>"),
+            "(as m HashMap<str, List<i32>>)"
+        );
+        assert_eq!(
+            expression("n as usize < a && b > c"),
+            "(And (Lt (as n usize) a) (Gt b c))"
+        );
+        // Tight, the rule reads a generic list — which `usize` refuses later.
+        assert_eq!(expression("n as usize<limit>"), "(as n usize<limit>)");
+    }
+
+    #[test]
+    fn outside_an_ascription_a_spaced_generic_list_parses_as_before() {
+        // The paper's a04/a05: type and expression positions keep reading a
+        // spaced list (Q3 RULED: expression position is its own later item).
+        assert!(rendered_errors("fun main() { let xs: List <i32> = []; }").is_empty());
+        assert!(rendered_errors("fun main() { let xs = List <i32>::new(); }").is_empty());
+    }
+
+    #[test]
+    fn a_spaced_list_no_comparison_could_be_is_refused_and_read_tight() {
+        let source = "fun main() { let xs = [] as List <i32>; }";
+        assert_eq!(
+            rendered_errors(source),
+            vec![
+                "`as List` then `<`: a generic list after `as` touches its type, `List<i32>` — \
+                 spaced, the `<` after an ascribed type is a comparison"
+                    .to_string()
+            ]
+        );
+        let nested = "fun main() { let m = x as HashMap<str, List < i32 >>; }";
+        assert_eq!(
+            rendered_errors(nested),
+            vec![
+                "`as List` then `<`: a generic list after `as` touches its type, `List<i32>` — \
+                 spaced, the `<` after an ascribed type is a comparison"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            tighten_generic_list("< str ,  List <i32> >"),
+            "<str , List<i32>>"
+        );
+    }
+
+    // --- §4.3 (Q4): after a block-like brace ---------------------------------
+
+    #[test]
+    fn as_after_a_block_like_brace_continues_the_form() {
+        assert_eq!(expression("match k { _ => 1 } as T"), "(as (match k) T)");
+        assert_eq!(expression("if c { 1 } else { 2 } as T"), "(as (if c 1) T)");
+        assert_eq!(
+            expression("match k { _ => 1 } as T .b()"),
+            "(. (as (match k) T) (call b []))"
+        );
+        assert_eq!(
+            expression("a + match k { _ => 1 } as T"),
+            "(Add a (as (match k) T))"
+        );
+        assert_eq!(
+            expression("match k { _ => 1 } as T + 1"),
+            "(Add (as (match k) T) 1)"
+        );
+        assert_eq!(expression("{ 1 } as T"), "(as {1} T)");
+    }
+
+    #[test]
+    fn at_a_statement_head_the_brace_line_decides() {
+        assert_eq!(
+            statements("\tmatch k { _ => 1 } as T;"),
+            vec!["(as (match k) T)"]
+        );
+        // On a later line `as` is a NAME beginning the next statement.
+        assert_eq!(
+            statements("\tmatch k { _ => 1 }\n\tas(5);"),
+            vec!["(match k)", "(call as [5])"]
+        );
+    }
+
+    // --- Q6: contextual ------------------------------------------------------
+
+    #[test]
+    fn as_is_a_name_where_a_name_can_stand() {
+        assert_eq!(statements("\tlet as = 5;\n\tprint(as);").len(), 2);
+        assert_eq!(expression("as + 1"), "(Add as 1)");
+        assert_eq!(expression("f(as)"), "(call f [as])");
+        assert!(rendered_errors("fun as(value: i32) { }").is_empty());
+        assert!(rendered_errors("import a::{b as c};").is_empty());
+    }
+
+    #[test]
+    fn an_as_no_type_follows_is_not_an_ascription() {
+        // A missing `;` before a line starting with a name `as` is still the
+        // missing `;`.
+        assert_eq!(
+            rendered_errors("fun main() {\n\tlet x = foo()\n\tas = 5;\n}\n"),
+            vec!["expected `;` to end this statement".to_string()]
+        );
+    }
+
+    // --- B570: `auto` -------------------------------------------------------
+
+    fn type_shape(source: &str) -> String {
+        let (mut tokens, errors) = lexing::tokenize(source);
+        assert!(errors.is_empty());
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let node = parser.parse_type().expect("a type");
+        assert_eq!(
+            parser.position, token_count,
+            "unconsumed tokens in {source:?}"
+        );
+        format!("{:?}", node.0)
+    }
+
+    #[test]
+    fn auto_is_a_marker_at_a_types_head_and_a_name_elsewhere() {
+        assert!(type_shape("auto i32").starts_with("AutoType(Some("));
+        assert!(type_shape("auto List<str>").starts_with("AutoType(Some("));
+        assert!(type_shape("auto").starts_with("AutoType(None)"));
+        assert!(type_shape("auto::Thing").starts_with("StaticAccessor"));
+        assert!(rendered_errors("fun f(): auto { 5 }").is_empty());
+        assert!(rendered_errors("fun f(): auto i32 context settings { 5 }").is_empty());
+        assert!(rendered_errors("fun main() { let x: auto = 5; let auto = 1; }").is_empty());
+        assert!(rendered_errors("fun main() { let w = Length::auto(); }").is_empty());
+        assert_eq!(expression("x as auto List<i32>"), "(as x auto List<i32>)");
     }
 }

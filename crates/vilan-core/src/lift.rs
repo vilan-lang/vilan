@@ -95,7 +95,8 @@ fn count_direct_splits(node: &Node) -> usize {
         | Node::Dereference(inner)
         | Node::Spread(inner)
         | Node::TryAssert(inner)
-        | Node::Await(inner) => count_direct_splits(&inner.0),
+        | Node::Await(inner)
+        | Node::Ascribe(inner, _) => count_direct_splits(&inner.0),
         Node::MemberAccessor(subject, _) => count_direct_splits(&subject.0),
         // A call's or subscript's SUBJECT is flat; the arguments / the index
         // are slots.
@@ -165,6 +166,10 @@ fn linearize<'src>(
         Node::Await(inner) => {
             let inner = flat_operand(*inner, steps, remaining);
             (Node::Await(Box::new(inner)), span)
+        }
+        Node::Ascribe(value, type_) => {
+            let value = flat_operand(*value, steps, remaining);
+            (Node::Ascribe(Box::new(value), type_), span)
         }
         Node::MemberAccessor(subject, member) => {
             let subject = flat_operand(*subject, steps, remaining);
@@ -321,6 +326,7 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
         Node::Spread(inner) => Node::Spread(seal_boxed(inner)),
         Node::TryAssert(inner) => Node::TryAssert(seal_boxed(inner)),
         Node::Await(inner) => Node::Await(seal_boxed(inner)),
+        Node::Ascribe(value, type_) => Node::Ascribe(seal_boxed(value), type_),
         Node::Async(inner) => Node::Async(seal_boxed(inner)),
         Node::FuncReturn(value) => Node::FuncReturn(seal_opt(value)),
         Node::Export(scope, inner, labels) => Node::Export(scope, seal_boxed(inner), labels),

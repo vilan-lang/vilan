@@ -279,7 +279,9 @@ guards the subject place, and every prefix of it, from the arm's start to
 the capture's LAST use. A binding inside a payload's tuple sub-pattern
 (`Some((let a, let b))`) is a view into its slot of the tuple when it is one
 slot of it; a binding of a whole sub-tuple spans several slots of the flat
-tuple and stays a copy (bind the tuple whole to write it).
+tuple and stays a copy (bind the tuple whole to write it). The same holds a
+level up, for a TUPLE subject: under `match &mut pair`, `(let a, let b)`
+binds a view into each slot of `pair` (B587).
 The parameter conventions:
 
 | Convention | Written | Data | Resource |
