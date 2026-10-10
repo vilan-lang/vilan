@@ -1,0 +1,36 @@
+// F128: `*` over a binding that is a VALUE natively — a by-value closure or
+// function parameter, a local holding a value — reads the value, as the JS
+// backend's `*` does; a `*` over a view still copies through it.
+import std::io::print;
+
+fun bump(n: i32): i32 {
+	*n + 1
+}
+
+fun shout(word: str): str {
+	*word + "!"
+}
+
+fun through(view: &i32): i32 {
+	*view + 10
+}
+
+fun main() {
+	let count = ["a", "bb", "ccc"].map(|word| word.len()).filter(|length| *length > 1).len();
+	print(count);
+	let lengths: List<usize> = [1, 2, 3];
+	print(lengths.filter(|length| *length > 1).len());
+	print(["x", "y"].map(|word| *word + "?"));
+	print(bump(4));
+	print(shout("hey"));
+	let n: usize = 3;
+	let copied = n;
+	print(*n + *copied);
+	let words = ["kept"];
+	let first = words[0];
+	print(*first);
+	mut seven = 7;
+	let view = &seven;
+	print(through(view));
+	print(*view);
+}

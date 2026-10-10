@@ -1,0 +1,28 @@
+// F127: a spread of a tuple LITERAL into a spread parameter or a tuple —
+// `draw(..(3, 4))`, labelled, beside other parts, nested, with calls whose
+// order shows — is the literal's parts in order, on both backends.
+import std::io::print;
+
+fun draw(...at: (f64, f64)): f64 {
+	at.0 * 10 + at.1
+}
+
+fun three(...parts: (i32, str, i32)): str {
+	i"{parts.0}{parts.1}{parts.2}"
+}
+
+fun noisy(value: i32): i32 {
+	print(i"evaluated {value}");
+	value
+}
+
+fun main() {
+	print(draw(..(3, 4)));
+	print(draw(..(x = 1, y = 2)));
+	let p = (5.0, 6.0);
+	print(draw(..p));
+	print(three(..(1, "-"), 2));
+	print(three(noisy(7), ..(i"{noisy(8) - 8}", noisy(9))) == "709");
+	let joined = (..(1, 2), 3, ..(4, ..(5, 6)));
+	print(joined.0 + joined.1 + joined.2 + joined.3 + joined.4 + joined.5);
+}

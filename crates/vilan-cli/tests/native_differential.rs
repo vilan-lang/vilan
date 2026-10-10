@@ -12196,8 +12196,8 @@ fn f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends() {
 /// F114: a reading intrinsic over a spine of a `Shared` VIEW reads through
 /// a view of the cell, as F49's boxed binding does — `cell.read().items.len()`
 /// had copied the whole list out of the borrow to count it. The emission
-/// pin: the three copies left are the std calls (`contains`, `get`,
-/// `contains_key`), which run user `Hash`/`Eq` and are not intrinsics.
+/// pin: no copy is left — the three std calls (`contains`, `get`,
+/// `contains_key`) had kept theirs until F123.
 #[test]
 fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends() {
     let staged = stage();
@@ -12215,8 +12215,9 @@ fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_bac
     let main = emitted_main(&staged, file);
     assert_eq!(
         main.matches("read_with(").count(),
-        3,
-        "only the three std calls copy their field out of the cell:\n{main}"
+        0,
+        "no read copies its field out of the cell (F123 took the three std \
+         lookups):\n{main}"
     );
 }
 
@@ -12625,4 +12626,243 @@ fun main() {
         Verdict::Identical,
         "an empty literal grounded through its parameter's bound builds on both backends"
     );
+}
+
+/// F126: `print(caller())` handed rustc a `vilan_rt::print` of a
+/// `vilan_rt::Location`, which had no `Js` impl (E0277, a backend defect by
+/// the CLI's own sentence). The location prints its text at the top level,
+/// as `console.log` prints the JS string it is, and inside a list or an
+/// `Option` the printer names it `<Location>` on both backends.
+#[test]
+fn f126_print_of_a_location_writes_its_text_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f126_location_print.vl";
+    std::fs::write(staged.join(file), include_str!("native/location_print.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "`print` of a `Location` must write the same bytes natively"
+    );
+}
+
+/// F128: `*length` in `.filter(|length| *length > 1)` over a `List<usize>`
+/// emitted `(*length)` over the by-value closure parameter `filter`'s
+/// `|T| bool` hands over (rustc E0614) — the premise's "the predicate takes
+/// `&T`" was wrong: it takes the element by value, and the JS backend's `*`
+/// on a value is the value. A by-value function parameter and a local
+/// holding a value read the same way; a `*` over a view still copies
+/// through it.
+#[test]
+fn f128_a_dereference_of_a_value_binding_reads_the_value_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f128_value_dereference.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/value_dereference.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `*` over a value binding must read the value natively"
+    );
+}
+
+/// F127: a spread of a tuple LITERAL (`draw(..(3, 4))`, labelled or not)
+/// was refused natively "a spread element whose tuple type did not
+/// resolve": the literal has no settled type of its own to read an arity
+/// off. Its parts are now the pack's slots, each written at the slot's
+/// type and evaluated once in order — beside other arguments, nested
+/// inside another literal spread, and in a tuple literal of spreads.
+#[test]
+fn f127_a_spread_of_a_tuple_literal_is_its_parts_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f127_spread_tuple_literals.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/spread_tuple_literals.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a spread of a tuple literal must build and answer the same natively"
+    );
+}
+
+/// F125: a `BigInt` as TEXT — `i"{big}"`, `"" + big`, `big.to_string()`
+/// (std's `Display` impl is that interpolation), a generic `T: Display`, a
+/// `join` — was refused natively "does not emit an interpolation of a value
+/// with its own `render`", while JS wrote `12` (`String(12n)`, no `n`).
+/// The concatenation now renders a `BigInt` operand as its digits; `print`
+/// of the value itself keeps node's `12n`.
+#[test]
+fn f125_a_bigint_as_text_writes_its_digits_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f125_bigint_text.vl";
+    std::fs::write(staged.join(file), include_str!("native/bigint_text.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `BigInt` as text must write the same digits natively"
+    );
+}
+
+/// F123: std's keyed LOOKUPS over a field of a `Shared` view —
+/// `cell.read().seen.contains("x")`, `counts.get("k")`,
+/// `counts.contains_key("z")` — copied the whole collection out of the
+/// cell per call (F114 read the intrinsics only). They run `key.hash()`
+/// and the table's lookup, nothing else, so over a key whose `hash` is
+/// std's (a `str`, an integer, a tuple of those) the receiver is now read
+/// through a view of the cell, taken after the key is evaluated — a key
+/// argument that writes the cell is seen by the lookup, as on JS (the copy
+/// had been taken first, and printed `false` against JS's `true`). A user
+/// key type's written `hash` keeps the copy. The emission pin: one
+/// `read_with(` left in `main`, the user key's.
+#[test]
+fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f123_shared_view_std_lookups.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_std_lookups.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a std lookup over a `Shared` view's field must answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("read_with(").count(),
+        1,
+        "only the user key's lookup copies its set out of the cell:\n{main}"
+    );
+}
+
+/// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
+/// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
+/// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
+/// stack" where JS printed the element. Both sides of the threshold are
+/// pinned (`[i32; 256]` and `[str; 64]` inline, `[i32; 257]`, `[u8; 1025]`
+/// and `[str; 300]` on the heap), each built, written, copied by value, passed, returned, iterated,
+/// held in a struct and printed; the emission pin reads the rendering on
+/// each side.
+#[test]
+fn f122_a_fixed_array_past_one_kib_lives_on_the_heap_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f122_heap_arrays.vl";
+    std::fs::write(staged.join(file), include_str!("native/heap_arrays.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a large fixed array must not overflow the native stack"
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        main.contains("vilan_rt::heap_repeat::<_, 4000000>(")
+            && main.contains("vilan_rt::heap_repeat::<_, 257>(")
+            && main.contains("vilan_rt::heap_repeat::<_, 300>(")
+            && main.contains("std::array::from_fn::<_, 256, _>(")
+            && main.contains("std::array::from_fn::<_, 64, _>("),
+        "1024 bytes stays inline and 1028 goes to the heap:\n{main}"
+    );
+}
+
+/// F124 §2.1 (F99's aliasing half; `F99-aliasing-loans.md`): a view binding
+/// initialized from another view (`let c: &mut i32 = b;`) was refused by
+/// name (F21). In a loan group whose members' live intervals NEST — no
+/// ancestor touched while a member lives — the alias is a Rust reborrow
+/// (`let c = &mut *b;`), free at run time: an alias of an alias, an alias
+/// declared inside a loop, an alias of a struct view, and an alias of a
+/// shared view (a copy of the `&`).
+#[test]
+fn f124_a_nested_loan_group_reborrows_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f124_loans_nested.vl";
+    std::fs::write(staged.join(file), include_str!("native/loans_nested.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested loan group must build and answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("= &mut *").count(),
+        4,
+        "each `&mut` alias is a reborrow of its source, and nothing is boxed:\n{main}"
+    );
+    assert!(!main.contains("Captured::new"), "{main}");
+}
+
+/// F124 §2.2: a loan group whose members INTERLEAVE — the views and their
+/// root take turns, which no assignment of Rust lifetimes accepts —
+/// promotes its root into the counted cell a captured `mut` binding uses,
+/// and each view is a HANDLE on it (`let b = a.clone();`, the same cell):
+/// reads and writes through either view and the root, a compound write, a
+/// `&mut` callee over a view and over the root, a compound write through a
+/// `borrows` call of a view (its value settled before the place borrows),
+/// and field writes through handles of a struct root.
+/// transparent-references.vl, the corpus program this was for, flips with
+/// it (the whole-set sweep).
+#[test]
+fn f124_an_interleaved_loan_group_shares_one_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f124_loans_interleaved.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/loans_interleaved.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an interleaved loan group must build and answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("Captured::new(").count(),
+        2,
+        "the two roots live in cells and the four views are handles on them:\n{main}"
+    );
+    assert_eq!(
+        compare(&staged, "transparent-references.vl"),
+        Verdict::Identical
+    );
+}
+
+/// F124 §2.2's hazard and §2.3's remainder, refused by name: a call handed
+/// two loans of one promoted root, one `&mut` (the `&mut` holds the cell
+/// for the call, and the other loan would abort the run where JS answers),
+/// and an interleaved group whose view projects a field (a handle into part
+/// of a cell, a lens this backend has not got).
+#[test]
+fn f124_two_loans_in_one_call_and_a_projected_interleaved_view_are_refused_by_name() {
+    let staged = stage();
+    for (file, source, reason) in [
+        (
+            "native_probe_f124_two_loans.vl",
+            "import std::io::print;\n\nfun both(x: &mut i32, y: &mut i32) {\n\tx += 1;\n\ty += 1;\n}\n\nfun main() {\n\tmut a: i32 = 1;\n\tlet b: &mut i32 = &mut a;\n\tlet c: &mut i32 = b;\n\tb = 2;\n\tprint(a);\n\tboth(b, c);\n\tprint(*c);\n}\n",
+            "a call handed two loans of one place",
+        ),
+        (
+            "native_probe_f124_projected.vl",
+            "import std::io::print;\n\nstruct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tmut p = Point { x = 1, y = 2 };\n\tlet b: &mut i32 = &mut p.x;\n\tlet c: &mut i32 = b;\n\tb = 5;\n\tprint(p.y);\n\tc = 6;\n\tprint(*b);\n}\n",
+            "an interleaved loan group whose view projects a field",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        match compare(&staged, file) {
+            Verdict::Refused(message) => assert!(
+                message.contains(reason),
+                "{file}: refused, but not by this name: {message}"
+            ),
+            other => panic!("{file}: must be refused by name, was {other:?}"),
+        }
+    }
 }
