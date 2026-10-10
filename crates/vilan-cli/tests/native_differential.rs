@@ -12772,3 +12772,30 @@ fn f122_a_fixed_array_past_one_kib_lives_on_the_heap_on_both_backends() {
         "1024 bytes stays inline and 1028 goes to the heap:\n{main}"
     );
 }
+
+/// F124 §2.1 (F99's aliasing half; `F99-aliasing-loans.md`): a view binding
+/// initialized from another view (`let c: &mut i32 = b;`) was refused by
+/// name (F21). In a loan group whose members' live intervals NEST — no
+/// ancestor touched while a member lives — the alias is a Rust reborrow
+/// (`let c = &mut *b;`), free at run time: an alias of an alias, an alias
+/// declared inside a loop, an alias of a struct view, and an alias of a
+/// shared view (a copy of the `&`).
+#[test]
+fn f124_a_nested_loan_group_reborrows_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f124_loans_nested.vl";
+    std::fs::write(staged.join(file), include_str!("native/loans_nested.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested loan group must build and answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("= &mut *").count(),
+        4,
+        "each `&mut` alias is a reborrow of its source, and nothing is boxed:\n{main}"
+    );
+    assert!(!main.contains("Captured::new"), "{main}");
+}

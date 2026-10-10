@@ -80,6 +80,11 @@ written down.
 
 ---
 
+<!-- family: feature -->
+**F124 §2.1: a view binding initialized from another view builds natively where the loans NEST — `let c: &mut i32 = b;` over a view `b` was refused by name (F21, "a view binding that ALIASES another view binding") even where `c` is used and done with before `b` or its root is touched again, the shape Rust's own reborrow takes.** The native backend now models aliasing loans (native-49's design note, `F99-aliasing-loans.md`): a root binding and every view binding whose origin is it form a LOAN GROUP, and a group that holds an alias is lowered by the order of its accesses, which the emitter walks once per body (a `let` declares after its initializer; a `for` body's touch of a binding declared before the loop counts again at the loop's end). Where every member's live interval holds no access to any of its ancestors, the alias is a Rust reborrow, `let c = &mut *b;`, free at run time; an alias of a SHARED view copies the `&`. A group whose members interleave keeps F21's refusal until §2.2 (the next entry). Pin: `f124_a_nested_loan_group_reborrows_on_both_backends` (`native/loans_nested.vl`: an alias of an alias, an alias inside a loop, a struct view's alias, a shared view's alias; four reborrows emitted, no cell).
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->

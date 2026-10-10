@@ -177,6 +177,12 @@ pub fn emit(program: &Program<'_>, options: &BuildOptions) -> Result<Emitted, Er
 /// and the executor has to be entered from a synchronous frame.
 const ASYNC_MAIN_BODY: &str = "vilan_async_main";
 
+/// F124: the refusal an INTERLEAVED loan group keeps until its root can live
+/// in a cell (§2.2) — F21's sentence, which names the shape.
+const INTERLEAVED_LOANS: &str = "a view binding that ALIASES another view binding (`let c = b;` \
+     where `b` is a view, and the two and their root take turns: two live loans of one place, \
+     which needs a model of aliasing views this backend has not got)";
+
 /// F122 (array-lengths.md Q12): a fixed array whose estimated size passes
 /// this many BYTES keeps its `[T; N]` type and lives on the heap natively
 /// (`vilan_rt::HeapArray`), where the JS backend's array lives at any length.
@@ -422,6 +428,9 @@ struct Emitter<'a, 'src> {
     /// merely loads `std::json` would otherwise report two boxes its binary
     /// does not contain.
     boxed_emitted: HashSet<Id>,
+    /// F124: how each LOAN GROUP that holds an alias (`let c = b;` over a view
+    /// `b`) is lowered — see [`Emitter::compute_loan_groups`].
+    loans: LoanPlan,
     /// Every module-level binding in the world, lowered to a `thread_local!`.
     module_bindings: HashSet<Id>,
     /// The module-level bindings this program actually READ, in reach order,
@@ -724,6 +733,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             literal_guards: None,
             boxed: HashSet::new(),
             boxed_emitted: HashSet::new(),
+            loans: LoanPlan::default(),
             module_bindings: HashSet::new(),
             module_binding_cells: BTreeMap::new(),
             module_bindings_started: HashSet::new(),
@@ -786,6 +796,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // them must carry none of them.
         self.module_bindings = self.program.module_level_bindings().into_iter().collect();
         self.compute_boxed_bindings();
+        self.compute_loan_groups();
 
         let main = self.ensure_function(main_id, &HashMap::default())?;
         let mut main_body = self
@@ -895,6 +906,300 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
             }
         }
+    }
+
+    /// F124, the aliasing-loans model (`F99-aliasing-loans.md`): a root
+    /// binding and every view binding whose origin is it form a LOAN GROUP,
+    /// and a group that holds an ALIAS — `let c = b;` over a view `b`, two
+    /// loans of one place, rule 3's aliasing that Rust's one-`&mut` rule
+    /// forbids — is lowered by the shape of its accesses:
+    ///
+    /// * shared views only: the alias copies the `&` (`let c = b;`);
+    /// * §2.1, NESTED (every member's accesses fall inside its source's
+    ///   live interval, no ancestor touched while it lives — stack
+    ///   discipline): the alias is a Rust reborrow, `let c = &mut *b;`,
+    ///   which the borrow checker accepts and costs nothing;
+    /// * §2.2, INTERLEAVED (transparent-references.vl: `b`, `a`, `c` take
+    ///   turns) — the next slice, refused by name until it lands: the root
+    ///   lives in the counted cell a captured `mut` binding
+    ///   already uses (R3's `Captured`), and each view is a HANDLE on it —
+    ///   `let b = a.clone();`, an `Rc` naming the same cell — so every
+    ///   access is a momentary borrow, a `&mut` callee runs under one
+    ///   `borrow_mut`, and a write settles its value before it borrows;
+    /// * §2.3, the rest stay named: a root that is a parameter or a
+    ///   module binding, a view projecting a field or an element of an
+    ///   interleaved root, a member a closure names, a group in an `async`
+    ///   body.
+    ///
+    /// Groups without an alias are untouched: a lone view of a place is a
+    /// Rust reference as it always was.
+    fn compute_loan_groups(&mut self) {
+        // Every view binding of a local root: `let v = &[mut] place`.
+        let mut sources: HashMap<Id, Id> = HashMap::default();
+        let mut mutable: HashMap<Id, bool> = HashMap::default();
+        let mut projects: HashSet<Id> = HashSet::default();
+        let mut roots: HashMap<Id, Id> = HashMap::default();
+        let mut variables: Vec<(Id, Id)> = self
+            .program
+            .variables
+            .values()
+            .filter_map(|variable| Some((variable.id, variable.initial?)))
+            .collect();
+        variables.sort_by_key(|(binding, _)| binding.0);
+        for (binding, initial) in &variables {
+            let Some(&Expr::Reference(place, writes)) = self.program.entity_map.get(initial) else {
+                continue;
+            };
+            let Some((root, path_is_empty)) = self.loan_root(place) else {
+                continue;
+            };
+            sources.insert(*binding, root);
+            roots.insert(*binding, root);
+            mutable.insert(*binding, writes);
+            if !path_is_empty {
+                projects.insert(*binding);
+            }
+        }
+        // The ALIASES: `let c = b;` over a member, to a fixpoint (an alias of
+        // an alias). Declarations come in source order within a body, so ids
+        // order them too.
+        let mut aliases: Vec<Id> = Vec::new();
+        loop {
+            let mut changed = false;
+            for (binding, initial) in &variables {
+                if roots.contains_key(binding) {
+                    continue;
+                }
+                let Some(&Expr::Local(source)) = self.program.entity_map.get(initial) else {
+                    continue;
+                };
+                let Some(root) = roots.get(&source).copied() else {
+                    continue;
+                };
+                sources.insert(*binding, source);
+                roots.insert(*binding, root);
+                let writes = mutable.get(&source).copied().unwrap_or(false);
+                mutable.insert(*binding, writes);
+                aliases.push(*binding);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        if aliases.is_empty() {
+            return;
+        }
+        // The groups that hold an alias, by root, members in id order.
+        let mut groups: BTreeMap<u32, (Id, Vec<Id>)> = BTreeMap::new();
+        for alias in &aliases {
+            let root = roots[alias];
+            groups.entry(root.0).or_insert_with(|| (root, Vec::new()));
+        }
+        let mut members_by_id: Vec<(Id, Id)> = roots
+            .iter()
+            .map(|(member, root)| (*member, *root))
+            .collect();
+        members_by_id.sort_by_key(|(member, _)| member.0);
+        for (member, root) in members_by_id {
+            if let Some((_, members)) = groups.get_mut(&root.0) {
+                members.push(member);
+            }
+        }
+        // The ordered access list (§3), for every binding a group names.
+        let tracked: HashSet<Id> = groups
+            .values()
+            .flat_map(|(root, members)| std::iter::once(*root).chain(members.iter().copied()))
+            .collect();
+        let mut log = AccessLog::default();
+        let mut functions: Vec<Id> = self.program.functions.keys().copied().collect();
+        functions.sort_by_key(|function| function.0);
+        for function_id in functions {
+            let Some(function) = self.program.functions.get(&function_id) else {
+                continue;
+            };
+            let (statements, tail, _) = function.body.clone();
+            for parameter in &function.parameters {
+                if tracked.contains(parameter) {
+                    log.owner.insert(*parameter, function_id);
+                }
+            }
+            let mut visited = HashSet::default();
+            for statement in statements.iter().chain(std::iter::once(&tail)) {
+                self.log_accesses(*statement, function_id, &tracked, &mut log, &mut visited, false);
+            }
+        }
+        for (_, (root, members)) in groups {
+            let any_mutable = members
+                .iter()
+                .any(|member| mutable.get(member).copied().unwrap_or(false));
+            let group_aliases: Vec<Id> = members
+                .iter()
+                .copied()
+                .filter(|member| aliases.contains(member))
+                .collect();
+            if !any_mutable {
+                for alias in group_aliases {
+                    self.loans.copies.insert(alias, sources[&alias]);
+                }
+                continue;
+            }
+            let interleaved = members
+                .iter()
+                .any(|member| self.loan_interleaves(*member, &sources, &log));
+            if !interleaved {
+                for alias in group_aliases {
+                    self.loans.reborrows.insert(alias, sources[&alias]);
+                }
+                continue;
+            }
+            // §2.2 (the cell and its handles) is the next slice; until it
+            // lands an interleaved group keeps F21's refusal.
+            let _ = (&projects, root, &log.in_closures, &log.owner);
+            for alias in group_aliases {
+                self.loans.refused.insert(alias, INTERLEAVED_LOANS);
+            }
+        }
+    }
+
+    /// F124: the ROOT binding a borrowed place names — a local `let` (a
+    /// parameter's or a module binding's root is not one a group can promote,
+    /// and is left to the lowering it has) — and whether the place IS the
+    /// root (no field, element or slot in between).
+    fn loan_root(&self, place: Id) -> Option<(Id, bool)> {
+        let mut current = place;
+        let mut path_is_empty = true;
+        loop {
+            match self.program.entity_map.get(&current)? {
+                Expr::Local(binding) => {
+                    let binding = *binding;
+                    let local = self.program.variables.contains_key(&binding)
+                        && !self.program.parameters.contains_key(&binding)
+                        && !self.module_bindings.contains(&binding);
+                    return local.then_some((binding, path_is_empty));
+                }
+                Expr::Field(subject, _, _)
+                | Expr::Index(subject, _)
+                | Expr::TupleIndex(subject, _, _) => {
+                    path_is_empty = false;
+                    current = *subject;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// F124 §3: one body's accesses to the tracked bindings, in evaluation
+    /// order — a `let` declares after its initializer runs, a `for` body's
+    /// touch of a binding declared before the loop counts again at the
+    /// loop's end (the next iteration reaches it), and a closure body's
+    /// names are recorded apart.
+    fn log_accesses(
+        &self,
+        expr_id: Id,
+        function_id: Id,
+        tracked: &HashSet<Id>,
+        log: &mut AccessLog,
+        visited: &mut HashSet<Id>,
+        in_closure: bool,
+    ) {
+        if !visited.insert(expr_id) {
+            return;
+        }
+        let Some(expr) = self.program.entity_map.get(&expr_id) else {
+            return;
+        };
+        match expr {
+            Expr::Variable(binding) => {
+                let binding = *binding;
+                if let Some(initial) = self
+                    .program
+                    .variables
+                    .get(&binding)
+                    .and_then(|variable| variable.initial)
+                {
+                    self.log_accesses(initial, function_id, tracked, log, visited, in_closure);
+                }
+                if tracked.contains(&binding) {
+                    log.declared.insert(binding, log.next);
+                    log.owner.insert(binding, function_id);
+                    log.next += 1;
+                }
+            }
+            Expr::Local(binding) | Expr::Parameter(binding) => {
+                let binding = *binding;
+                if !tracked.contains(&binding) {
+                    return;
+                }
+                if in_closure {
+                    log.in_closures.insert(binding);
+                    return;
+                }
+                log.accesses.entry(binding).or_default().push(log.next);
+                log.next += 1;
+                let declared_at = log.declared.get(&binding).copied();
+                for (start, touched) in &mut log.loops {
+                    if declared_at.is_none_or(|declared| declared < *start) {
+                        touched.insert(binding);
+                    }
+                }
+            }
+            Expr::Closure(_) => {
+                for child in self.children_of(expr_id) {
+                    self.log_accesses(child, function_id, tracked, log, visited, true);
+                }
+            }
+            Expr::For(..) | Expr::ForEach(..) if !in_closure => {
+                log.loops.push((log.next, HashSet::new()));
+                for child in self.children_of(expr_id) {
+                    self.log_accesses(child, function_id, tracked, log, visited, in_closure);
+                }
+                let (_, touched) = log.loops.pop().unwrap_or_default();
+                let mut touched: Vec<Id> = touched.into_iter().collect();
+                touched.sort_by_key(|binding| binding.0);
+                for binding in touched {
+                    log.accesses.entry(binding).or_default().push(log.next);
+                    log.next += 1;
+                }
+            }
+            _ => {
+                for child in self.children_of(expr_id) {
+                    self.log_accesses(child, function_id, tracked, log, visited, in_closure);
+                }
+            }
+        }
+    }
+
+    /// F124 §2.1's test: whether a member's live interval — its declaration
+    /// to its last access — holds an access to any of its ANCESTORS (its
+    /// source, that one's source, up to the root). Nested loans never do,
+    /// which is exactly what a chain of Rust reborrows needs.
+    fn loan_interleaves(&self, member: Id, sources: &HashMap<Id, Id>, log: &AccessLog) -> bool {
+        let Some(&declared) = log.declared.get(&member) else {
+            return true;
+        };
+        let last = log
+            .accesses
+            .get(&member)
+            .and_then(|accesses| accesses.iter().max().copied())
+            .unwrap_or(declared);
+        let mut ancestor = sources.get(&member).copied();
+        let mut steps = 0;
+        while let Some(current) = ancestor {
+            steps += 1;
+            if steps > 64 {
+                return true;
+            }
+            if log.accesses.get(&current).is_some_and(|accesses| {
+                accesses
+                    .iter()
+                    .any(|access| *access > declared && *access < last)
+            }) {
+                return true;
+            }
+            ancestor = sources.get(&current).copied();
+        }
+        false
     }
 
     /// The native type a context's THREADED VALUE has — `let ambient_nursery:
@@ -5945,6 +6250,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.program.payload_view_captures.get(&binding) == Some(&true) {
             return true;
         }
+        // F124: a reborrowed alias is a `&mut` loan.
+        if self.loans.reborrows.contains_key(&binding) {
+            return true;
+        }
         self.program
             .variables
             .get(&binding)
@@ -6304,6 +6613,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// pointee's), so this is read off the initializer, which is where the
     /// `&` was written.
     fn binding_holds_a_view(&self, binding: Id) -> bool {
+        // F124: a reborrowed or copied alias is the view its source is.
+        if self.loans.reborrows.contains_key(&binding) || self.loans.copies.contains_key(&binding)
+        {
+            return true;
+        }
         let Some(initial) = self
             .program
             .variables
@@ -6817,6 +7131,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // A binding whose initializer is a `&place` or a `borrows` call
                 // HOLDS the view, so the initializer is not read through — see
                 // [`Emitter::declaring_a_view`].
+                // F124: a member of a loan group holding an alias takes the
+                // lowering [`Self::compute_loan_groups`] chose for its group.
+                if let Some(source) = self.loans.reborrows.get(&binding).copied() {
+                    return Ok(format!("let {name} = &mut *{}", self.binding_name(source)));
+                }
+                if let Some(source) = self.loans.copies.get(&binding).copied() {
+                    return Ok(format!("let {name} = {}", self.binding_name(source)));
+                }
+                if let Some(reason) = self.loans.refused.get(&binding).copied() {
+                    return Err(unsupported(reason, self.span_of(binding)));
+                }
                 let holds_a_view = self.reads_through_a_view(initial);
                 // F21: a view binding initialized from ANOTHER view binding —
                 // `let c: &mut i32 = b;` — is a second live loan of one place,
@@ -15215,4 +15540,35 @@ pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) 
          \n\
          [workspace]\n"
     )
+}
+
+/// F124 (`sweeps/order49/native-49/F99-aliasing-loans.md`): the lowering
+/// [`Emitter::compute_loan_groups`] chose for each view binding of a loan
+/// group that holds an ALIAS (a view binding initialized from another).
+#[derive(Default)]
+struct LoanPlan {
+    /// §2.1: an alias of a `&mut` view in a NESTED group — a reborrow of its
+    /// source (`let c = &mut *b;`), free at run time.
+    reborrows: HashMap<Id, Id>,
+    /// An alias of a shared view: a copy of the `&` (`let c = b;`).
+    copies: HashMap<Id, Id>,
+    /// §2.3: an alias the backend still names, with the reason.
+    refused: HashMap<Id, &'static str>,
+}
+
+/// One walk's ordered record of the accesses to the bindings a loan-group
+/// test reads (F124 §3: the ordered access list no record holds).
+#[derive(Default)]
+struct AccessLog {
+    next: usize,
+    declared: HashMap<Id, usize>,
+    accesses: HashMap<Id, Vec<usize>>,
+    /// Tracked bindings a closure body names: no interval test reaches into
+    /// a closure, so a group touching one keeps its refusal.
+    in_closures: HashSet<Id>,
+    /// The function whose body declared each tracked binding.
+    owner: HashMap<Id, Id>,
+    /// The `for` loops being walked: where each began, and the tracked
+    /// bindings declared before it that its body touched.
+    loops: Vec<(usize, HashSet<Id>)>,
 }
