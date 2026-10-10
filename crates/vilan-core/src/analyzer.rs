@@ -21,6 +21,7 @@ mod auto_annotations;
 mod dbg_stack;
 mod hint_labels;
 mod hover_labels;
+pub mod id_windows;
 mod liveness;
 mod written_types;
 
@@ -5729,6 +5730,9 @@ pub struct Analyzer<'src> {
     traits: IndexMap<Id, Trait<'src>>,
     type_id_to_type_map: TypeTable,
     type_id: u32,
+    /// M110 S5: the id-window spike's windows, anchor and census
+    /// (`VILAN_ID_WINDOWS`; off, it is three empty vectors and a flag).
+    id_windows: id_windows::IdWindows,
     variables: IndexMap<Id, Variable<'src>>,
     // True while walking a trait body, where a bodyless method is a legitimate
     // requirement; elsewhere a bodyless function must be declared `external`.
@@ -7913,6 +7917,7 @@ impl<'src> Analyzer<'src> {
             traits: IndexMap::default(),
             type_id_to_type_map: TypeTable::default(),
             type_id: 0,
+            id_windows: id_windows::IdWindows::new(),
             variables: IndexMap::default(),
             walking_trait_body: false,
             trait_body_scopes: HashSet::default(),
@@ -8015,9 +8020,55 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_entity_id(&mut self) -> Id {
+        if self.id_windows.on() {
+            let (id, _) = self
+                .id_windows
+                .mint(id_windows::Lane::Entity, &mut self.entity_id);
+            return Id(id);
+        }
         let id = self.entity_id;
         self.entity_id += 1;
         Id(id)
+    }
+
+    /// M110 S5: walks a module-level node list one ITEM at a time, each under
+    /// its own id window when the spike is on (`id_windows`). The six
+    /// module-level walks (modules, std's and the dependencies' `lib.vl`,
+    /// generated expansions, the hot set, the entry) come through here, so
+    /// the windows are laid out in load order by construction.
+    fn walk_module_items(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
+        if !self.id_windows.on() {
+            return self.walk_expr_nodes(list, scope_id);
+        }
+        self.id_windows.phase = id_windows::Phase::Walk;
+        list.iter()
+            .map(|child| {
+                let window = self.id_windows.open(
+                    self.current_source_id,
+                    self.entity_id,
+                    self.type_id,
+                    self.scope_id,
+                );
+                let id = self.walk_expr_node(child, scope_id);
+                if let Some(window) = window {
+                    let padded = self.id_windows.close(
+                        window,
+                        id,
+                        &mut self.entity_id,
+                        &mut self.type_id,
+                        &mut self.scope_id,
+                    );
+                    // The type census stays dense (indexed by the id): the
+                    // room is padded with the window's source, which is what
+                    // a mint relocated into it later would have recorded.
+                    let (from, to) = padded[1];
+                    debug_assert_eq!(self.type_id_sources.len(), from as usize);
+                    self.type_id_sources
+                        .resize(to as usize, self.current_source_id);
+                }
+                id
+            })
+            .collect()
     }
 
     fn get_entity_by_id(&self, id: Id) -> &Expr<'src> {
@@ -25467,6 +25518,12 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_scope_id(&mut self) -> Id {
+        if self.id_windows.on() {
+            let (id, _) = self
+                .id_windows
+                .mint(id_windows::Lane::Scope, &mut self.scope_id);
+            return Id(id);
+        }
         let id = self.scope_id;
         self.scope_id += 1;
         Id(id)
@@ -25588,7 +25645,7 @@ impl<'src> Analyzer<'src> {
         let expansion_scope_id = self.create_owned_scope(Some(module_scope_id)).id;
         self.generated_expansion_scopes
             .insert(expansion_scope_id, module_scope_id);
-        self.walk_expr_nodes(generated, expansion_scope_id);
+        self.walk_module_items(generated, expansion_scope_id);
         for item in generated {
             self.hoist_generated_declarations(&item.0, expansion_scope_id, module_scope_id);
         }
@@ -25734,6 +25791,19 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_type_id(&mut self) -> TypeId {
+        if self.id_windows.on() {
+            let (id, from_counter) = self
+                .id_windows
+                .mint(id_windows::Lane::Type, &mut self.type_id);
+            if from_counter {
+                debug_assert_eq!(self.type_id_sources.len(), id as usize);
+                self.type_id_sources.push(self.current_source_id);
+            }
+            // A mint relocated into a window has its row already: the
+            // window's room was padded with its source at close.
+            crate::counters::count_type_slot();
+            return TypeId(id);
+        }
         let id = self.type_id;
         self.type_id += 1;
         // M19 T0: stamp the minting source. The counter is dense and monotone,
@@ -25832,6 +25902,10 @@ impl<'src> Analyzer<'src> {
                 );
             }
             self.type_map_writes += 1;
+            if !self.types_settled {
+                // M110 S5: whose window the rewritten slot sits in.
+                self.id_windows.note_slot_write(type_id);
+            }
             // M19 T0's second addition: the same write, read as an
             // ATTRIBUTION. A world-changing write made after the entry tail
             // opened moved a slot somebody else minted, and if that somebody
@@ -51809,6 +51883,8 @@ impl<'src> Analyzer<'src> {
             // B583: who asks, for std's own reach (a field write; the source
             // is looked up only where two candidates disagree on it).
             self.lookup_asker = Some(constraint.anchor());
+            // M110 S5: the item this constraint mints for.
+            self.id_windows.set_anchor(constraint.anchor());
             // B401: the file whose admission this constraint's method lookups
             // read — asked only when some file restricts anything.
             if self.lookup_admission.is_some() {
@@ -51847,6 +51923,7 @@ impl<'src> Analyzer<'src> {
                 Resolution::Deferred => self.deferred.push((constraint, waiting_on)),
             }
         }
+        self.id_windows.clear_anchor();
         progress
     }
 
@@ -63343,6 +63420,8 @@ impl<'src> Analyzer<'src> {
     }
 
     fn build(&mut self) {
+        // M110 S5: the census's phase for everything `build()` mints.
+        self.id_windows.phase = id_windows::Phase::Build;
         self.resolve_world();
         self.finalize_build();
     }
@@ -63797,6 +63876,10 @@ impl<'src> Analyzer<'src> {
     /// nothing is committed, defaulted, or diagnosed — constraints the
     /// entry may still bind stay open for the final build to finish.
     fn resolve_world(&mut self) {
+        // M110 S5: the census's phase — `build()` sets its own first.
+        if self.id_windows.phase != id_windows::Phase::Build {
+            self.id_windows.phase = id_windows::Phase::Resolve;
+        }
         // M73's instrument: the sub-split of this pass, printed on the
         // `[vilan phase]` line when `VILAN_PHASE_TIMING` asks — the same
         // treatment `const-lower`/`const-interp` give the const pass (N43),
@@ -71128,6 +71211,8 @@ pub struct Program<'src> {
     /// `None` for an analysis no world key describes (a macro world, an
     /// entry that is itself a module, a clean analysis).
     pub(crate) seam: Option<Box<ReuseSeam>>,
+    /// M110 S5: the id-window spike's census, when `VILAN_ID_WINDOWS` is on.
+    pub id_windows: Option<id_windows::IdWindowsReport>,
     // Functions and closures that are async (declared `async`, or inferred — its
     // body awaits, directly or by calling an async function). Filled by the
     // async inference pass; the transformer emits these as `async` and awaits
@@ -77409,7 +77494,7 @@ fn load_hot_modules<'src>(
         analyzer.module_scope_ids.insert(*module_scope_id);
         analyzer.select_platform_twins(&ast.0, text);
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&ast.0, *module_scope_id);
+        analyzer.walk_module_items(&ast.0, *module_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -80085,7 +80170,7 @@ fn analyze_inner<'src>(
             analyzer.select_platform_twins(&ast.0, text);
         }
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&ast.0, *module_scope_id);
+        analyzer.walk_module_items(&ast.0, *module_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -80110,7 +80195,7 @@ fn analyze_inner<'src>(
         analyzer.set_current_source(lib_source_id);
         analyzer.module_scope_ids.insert(std_scope_id);
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&lib_ast.0, std_scope_id);
+        analyzer.walk_module_items(&lib_ast.0, std_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -80124,7 +80209,7 @@ fn analyze_inner<'src>(
         analyzer.set_current_source(*source_id);
         analyzer.module_scope_ids.insert(*namespace_scope_id);
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&lib_ast.0, *namespace_scope_id);
+        analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -80984,7 +81069,7 @@ fn analyze_over_world<'src>(
             analyzer.select_platform_twins(&nodes.0, entry_text);
         }
         let entry_walk_start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&nodes.0, global_scope_id);
+        analyzer.walk_module_items(&nodes.0, global_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start: entry_walk_start,
             end: analyzer.entity_id,
@@ -81064,6 +81149,7 @@ fn analyze_over_world<'src>(
         analyzer.build();
     }
     analyzer.types_settled = true;
+    analyzer.id_windows.phase = id_windows::Phase::Checks;
     // ------------------------------------------------------------------
     // M19 T1: which of this world's modules are reusable for THIS analysis
     // (`per-module-analysis-reuse.md` §4.1). Three terms, and all three have
@@ -82682,6 +82768,23 @@ fn analyze_over_world<'src>(
         _ => None,
     };
 
+    // M110 S5: the spike's census over the final tables, printed per analysis.
+    let id_windows_report = analyzer.id_windows.on().then(|| {
+        let report = analyzer.id_windows.report(
+            analyzer.entity_id,
+            analyzer.type_id,
+            analyzer.scope_id,
+            analyzer
+                .expr_id_to_type_id_map
+                .iter()
+                .map(|(expression, type_id)| (*expression, *type_id)),
+        );
+        if !crate::macros::in_macro_world() {
+            eprintln!("{}", report.line());
+            report.dump();
+        }
+        report
+    });
     Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -82877,6 +82980,7 @@ fn analyze_over_world<'src>(
         dyn_dispatched_members: std::mem::take(&mut analyzer.dyn_dispatched_members),
         next_entity_id: analyzer.entity_id,
         seam: reuse_seam,
+        id_windows: id_windows_report,
         async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
         view_suspension_checks: std::mem::take(&mut analyzer.view_suspension_checks),
