@@ -73,7 +73,7 @@ impl Node {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CallGraph {
     /// Forward edges: the calls each node makes, in source order.
     calls: HashMap<Id, Vec<Call>>,
@@ -196,10 +196,201 @@ impl CallGraph {
     pub fn build(program: &Program) -> CallGraph {
         BUILD_COUNT.with(|count| count.set(count.get() + 1));
         let mut graph = CallGraph::default();
+        graph.add_all(program, |_| true);
+        graph.build_reverse_edges();
+        graph
+    }
+
+    /// M110 S3 (Order 50): the subgraph over the nodes, module bindings and
+    /// const regions `keep` admits — the cold half of a graph, recorded with
+    /// the world ([`crate::analyzer::PostRecord`]). A kept closure's parent is
+    /// kept with it (a closure is cold exactly when its enclosing body is), so
+    /// the parent links survive the cut; the reverse edges are rebuilt over
+    /// what remains.
+    pub fn restricted(&self, keep: impl Fn(Id) -> bool) -> CallGraph {
+        let filter_calls = |map: &HashMap<Id, Vec<Call>>| -> HashMap<Id, Vec<Call>> {
+            map.iter()
+                .filter(|(id, _)| keep(**id))
+                .map(|(id, calls)| (*id, calls.clone()))
+                .collect()
+        };
+        let filter_ids = |map: &HashMap<Id, Vec<Id>>| -> HashMap<Id, Vec<Id>> {
+            map.iter()
+                .filter(|(id, _)| keep(**id))
+                .map(|(id, ids)| (*id, ids.clone()))
+                .collect()
+        };
+        let filter_pairs = |map: &HashMap<Id, Vec<(Id, Id)>>| -> HashMap<Id, Vec<(Id, Id)>> {
+            map.iter()
+                .filter(|(id, _)| keep(**id))
+                .map(|(id, pairs)| (*id, pairs.clone()))
+                .collect()
+        };
+        let mut graph = CallGraph {
+            calls: filter_calls(&self.calls),
+            callers: HashMap::default(),
+            closure_parent: self
+                .closure_parent
+                .iter()
+                .filter(|(closure, _)| keep(**closure))
+                .map(|(closure, parent)| (*closure, *parent))
+                .collect(),
+            closure_children: filter_ids(&self.closure_children),
+            awaits: self.awaits.iter().copied().filter(|id| keep(*id)).collect(),
+            nodes: self
+                .nodes
+                .iter()
+                .copied()
+                .filter(|node| keep(node.id()))
+                .collect(),
+            global_references: filter_pairs(&self.global_references),
+            function_references: filter_pairs(&self.function_references),
+            initializer_calls: filter_calls(&self.initializer_calls),
+            initializer_closures: filter_ids(&self.initializer_closures),
+            initializer_awaits: filter_ids(&self.initializer_awaits),
+            const_initializer_calls: filter_calls(&self.const_initializer_calls),
+            const_initializer_closures: filter_ids(&self.const_initializer_closures),
+            const_global_references: filter_pairs(&self.const_global_references),
+            const_function_references: filter_pairs(&self.const_function_references),
+            const_regions: self
+                .const_regions
+                .iter()
+                .copied()
+                .filter(|region| keep(*region))
+                .collect(),
+        };
+        graph.build_reverse_edges();
+        graph
+    }
+
+    /// M110 S3: adds the nodes, module bindings and const regions `fresh`
+    /// admits — the hot set and the entry over a recorded cold graph — walked
+    /// from `program` exactly as [`Self::build`] walks them, then rebuilds the
+    /// reverse edges and restores the order a clean build lays the nodes and
+    /// regions out in, so nothing downstream can tell the two apart.
+    pub fn extend(&mut self, program: &Program, fresh: impl Fn(Id) -> bool) {
+        BUILD_COUNT.with(|count| count.set(count.get() + 1));
+        self.add_all(program, fresh);
+        self.build_reverse_edges();
+        self.nodes = program
+            .functions
+            .keys()
+            .copied()
+            .filter(|id| self.calls.contains_key(id))
+            .map(Node::Function)
+            .chain(
+                program
+                    .closures
+                    .keys()
+                    .copied()
+                    .filter(|id| self.calls.contains_key(id))
+                    .map(Node::Closure),
+            )
+            .collect();
+        let in_regions: HashSet<Id> = self.const_regions.iter().copied().collect();
+        let mut regions: Vec<Id> = Vec::with_capacity(in_regions.len());
+        for binding in program.module_level_bindings() {
+            if in_regions.contains(&binding) {
+                regions.push(binding);
+            }
+        }
+        for region in &program.const_exprs {
+            if in_regions.contains(region) && !regions.contains(region) {
+                regions.push(*region);
+            }
+        }
+        self.const_regions = regions;
+    }
+
+    /// M110 S3: whether a node's or a region's calls name an entity in
+    /// `[from, to)` — the ids between the stored world's and the rewrite's
+    /// base, which are this analysis's own and no cold node should name.
+    pub fn names_entities_in(&self, from: u32, to: u32) -> bool {
+        let names = |calls: &HashMap<Id, Vec<Call>>| {
+            calls
+                .values()
+                .flatten()
+                .any(|call| call.call_id.0 >= from && call.call_id.0 < to)
+        };
+        names(&self.calls) || names(&self.initializer_calls) || names(&self.const_initializer_calls)
+    }
+
+    /// M110 S3: renumbers the call entities the recorded rewrite minted —
+    /// every call id at or past `from` — onto this analysis's base `to`.
+    pub fn remap_minted(&mut self, from: u32, to: u32) {
+        if from == to {
+            return;
+        }
+        let remap = |calls: &mut HashMap<Id, Vec<Call>>| {
+            for call in calls.values_mut().flatten() {
+                if call.call_id.0 >= from {
+                    call.call_id = Id(call.call_id.0 - from + to);
+                }
+            }
+        };
+        remap(&mut self.calls);
+        remap(&mut self.initializer_calls);
+        remap(&mut self.const_initializer_calls);
+    }
+
+    /// What the graph retains, in bytes — the record's currency (M46).
+    pub fn bytes(&self) -> usize {
+        let calls: usize = self
+            .calls
+            .values()
+            .chain(self.initializer_calls.values())
+            .chain(self.const_initializer_calls.values())
+            .map(|calls| {
+                std::mem::size_of::<(Id, Vec<Call>)>() + calls.len() * std::mem::size_of::<Call>()
+            })
+            .sum();
+        let callers: usize = self
+            .callers
+            .values()
+            .map(|nodes| {
+                std::mem::size_of::<(Id, Vec<Node>)>() + nodes.len() * std::mem::size_of::<Node>()
+            })
+            .sum();
+        let ids: usize = self
+            .closure_children
+            .values()
+            .chain(self.initializer_closures.values())
+            .chain(self.initializer_awaits.values())
+            .chain(self.const_initializer_closures.values())
+            .map(|ids| std::mem::size_of::<(Id, Vec<Id>)>() + ids.len() * std::mem::size_of::<Id>())
+            .sum();
+        let pairs: usize = self
+            .global_references
+            .values()
+            .chain(self.function_references.values())
+            .chain(self.const_global_references.values())
+            .chain(self.const_function_references.values())
+            .map(|pairs| {
+                std::mem::size_of::<(Id, Vec<(Id, Id)>)>()
+                    + pairs.len() * std::mem::size_of::<(Id, Id)>()
+            })
+            .sum();
+        let singles = self.nodes.len()
+            + self.const_regions.len()
+            + self.closure_parent.len() * 2
+            + self.awaits.len();
+        calls + callers + ids + pairs + singles * std::mem::size_of::<Id>()
+    }
+
+    /// The walk [`Self::build`] is made of, over the functions, closures,
+    /// module bindings and const regions `admit` names.
+    fn add_all(&mut self, program: &Program, admit: impl Fn(Id) -> bool) {
+        let graph = self;
         // Built once and reused below — the vector is not free to rebuild
-        // (`b33-emission-order.md` §4).
-        let bindings = program.module_level_bindings();
-        let module_bindings: HashSet<Id> = bindings.iter().copied().collect();
+        // (`b33-emission-order.md` §4). Every binding, so a hot node's
+        // reference to a cold global is still a global reference.
+        let all_bindings = program.module_level_bindings();
+        let module_bindings: HashSet<Id> = all_bindings.iter().copied().collect();
+        let bindings: Vec<Id> = all_bindings
+            .iter()
+            .copied()
+            .filter(|binding| admit(*binding))
+            .collect();
         let const_exprs: HashSet<Id> = program.const_exprs.iter().copied().collect();
         // E189: the shape of the calls that never wired, so the walk below can
         // descend into them exactly as it descends into the ones that did.
@@ -213,7 +404,7 @@ impl CallGraph {
 
         for (id, function) in &program.functions {
             // A signature-only trait method has no body to walk.
-            if !function.has_body {
+            if !function.has_body || !admit(*id) {
                 continue;
             }
             graph.add_node(
@@ -232,6 +423,9 @@ impl CallGraph {
         // roots directly; the walk of their defining body only records the
         // lexical parent link (it does not descend into the closure).
         for (id, closure) in &program.closures {
+            if !admit(*id) {
+                continue;
+            }
             graph.add_node(
                 Node::Closure(*id),
                 program,
@@ -314,7 +508,7 @@ impl CallGraph {
         // a nest), and re-walking an outer region that contains an inner one
         // costs a second visit of a subtree the const interpreter evaluates
         // twice over anyway.
-        let const_initializers: HashSet<Id> = bindings
+        let const_initializers: HashSet<Id> = all_bindings
             .iter()
             .filter_map(|binding| {
                 let initial = program.variables.get(binding)?.initial?;
@@ -327,7 +521,10 @@ impl CallGraph {
             }
         }
         for &region in &program.const_exprs {
-            if const_initializers.contains(&region) || graph.const_regions.contains(&region) {
+            if !admit(region)
+                || const_initializers.contains(&region)
+                || graph.const_regions.contains(&region)
+            {
                 continue;
             }
             let mut collector = Collector {
@@ -356,9 +553,6 @@ impl CallGraph {
                 .insert(region, collector.function_references);
             graph.const_regions.push(region);
         }
-
-        graph.build_reverse_edges();
-        graph
     }
 
     /// Walks one node's body with a fresh collector, recording its forward

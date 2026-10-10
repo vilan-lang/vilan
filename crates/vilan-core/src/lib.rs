@@ -1286,8 +1286,10 @@ pub fn post_analysis_passes(
         return;
     }
     let phase_contexts_start = PhaseClock::now();
-    let call_graph =
-        context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
+    // M110 S3 (Order 50): the graph comes back from the pass — the one it
+    // analyzed over when it rewrote nothing, the one built (or replayed from
+    // the world's record) over the rewritten tree when it did.
+    let call_graph = context::thread_contexts(program);
     let phase_contexts = phase_contexts_start.elapsed();
     // debugging.md S0: `[track_caller]`'s hidden locations, threaded over the
     // graph just built. It appends ARGUMENTS only (a location is a value, not

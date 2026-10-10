@@ -89,6 +89,30 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // which the plain fixpoint must then propagate to ITS callers, which can
     // in turn create new adapted instances. Both are monotone over
     // `async_set`, so this terminates.
+    // M110 S3b (M127, Order 50): the fixpoint starts from the world's COLD
+    // result — the least fixpoint over the cold nodes with every hot callee
+    // unknown — when the record carries one; the hot nodes and whatever they
+    // make async are what the rounds below still settle. Never from the last
+    // analysis's settled set (the plant): a monotone fixpoint cannot shrink
+    // from a seed that already holds an effect the keystroke removed.
+    // Read and written only while the record describes this analysis's
+    // rewrite state: a lowered `run` is a call of its body, so the cold
+    // result moves with the rewrite (a hot edit that stands it down makes a
+    // prefix function synchronous again).
+    let record = program
+        .seam
+        .as_ref()
+        .filter(|seam| seam.record_matches)
+        .and_then(|seam| seam.record.clone());
+    let seeded = record
+        .as_ref()
+        .and_then(|record| record.async_cold.get())
+        .is_some();
+    if let Some(cold) = record.as_ref().and_then(|record| record.async_cold.get()) {
+        async_set.extend(cold.iter().copied());
+        crate::incremental::update_census(|census| census.seeded_passes += 1);
+    }
+    let seeds = async_set.clone();
     let adaptation = loop {
         base_fixpoint(program, graph, &held_values, &mut async_set);
         let before = async_set.len();
@@ -101,6 +125,47 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         program.push_diagnostic(error, source);
     }
     program.adapted_instances = adaptation.instances;
+    // The record this analysis filed (or read without a cold result yet)
+    // takes the cold result now: the base fixpoint over the cold nodes alone,
+    // from the program's own seeds, so a hot callee is never in the set and
+    // never counts as suspending. The plant records the settled set instead.
+    if let Some(record) = record.as_ref().filter(|_| !seeded) {
+        let settled = crate::incremental::planted(crate::incremental::Plant::PostSeedFromSettled);
+        let mut cold: HashSet<Id> = if settled {
+            async_set.clone()
+        } else {
+            seeds
+                .iter()
+                .copied()
+                .filter(|id| program.cold_entity(*id))
+                .collect()
+        };
+        if !settled {
+            loop {
+                let mut changed = false;
+                for node in graph.nodes() {
+                    let id = node.id();
+                    if cold.contains(&id) || !program.cold_entity(id) {
+                        continue;
+                    }
+                    if graph
+                        .calls_of(id)
+                        .iter()
+                        .any(|call| call_suspends(program, call, &held_values, &cold))
+                    {
+                        cold.insert(id);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        let mut cold: Vec<Id> = cold.into_iter().collect();
+        cold.sort_unstable_by_key(|id| id.0);
+        let _ = record.async_cold.set(cold);
+    }
 
     // --- Materialize the value-flow channels for emission (J2): adopted
     // bindings — unannotated ones holding an async closure — join
