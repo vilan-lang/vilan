@@ -106,6 +106,20 @@ full type, and hover shows both: the full type in the declaration, and
 its iterator adapters (`~Iterator<T>`) carry the attribute, and a package's
 own types can too. `vilan.inlayHints.abbreviate` turns it off.
 
+A chain written **one stage per line** is hinted per stage, in the
+spelling an ascription is written in: each line that ends a stage shows
+` as List<usize>` — or ` as ~Pipe<str>` where the abbreviation applies —
+and so does the chain's head when the first link breaks onto a new line.
+A stage you have already ascribed shows nothing, and neither does the
+last stage of a chain that lands in an annotated `let`. On a hinted line
+the refactor **Ascribe this stage** writes it into the file — the full
+type, or the bare trait for an abbreviated hint (`as Pipe<str>`, which is
+checked against the trait and keeps the concrete type, so nothing after
+it changes) — and **Ascribe every stage of this chain** writes them all.
+A type is written the shortest way the file can name it, through a module
+the file imports where needed; a type the file cannot name without a new
+import offers no action, because the action never adds one.
+
 **Semantic highlighting** from the analyzer, over the TextMate grammar,
 which also highlights `vilan` fences inside Markdown.
 
@@ -318,7 +332,7 @@ sees it.
 
 ## Quick fixes
 
-Twenty-three, each attached to the diagnostic that earns it:
+Twenty-five, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -345,13 +359,16 @@ Twenty-three, each attached to the diagnostic that earns it:
 | ``Import all 2 traits this file calls`` | either trait-method diagnostic above, when the file needs more than one trait — every one of them imported in ONE edit, a trait called twice imported once. A trait more than one module declares is left to its own fix |
 | ``Take the parameter as `&str` `` | ``this closure takes `str` by value where its type takes a view `&str` …`` — a closure LITERAL whose parameter is written in the other mode from the closure type it meets (a value closure and a view closure are different types, and no adapter is inserted). The edit rewrites that parameter's type in the type's mode — `&`, `&mut` or by value — and nothing else; a body that read the value may then want a `*` |
 | ``Adapt it: `\|c\| g(*c)` `` | the same refusal on a NAMED one-parameter closure (`apply(g)`), or on a named one-parameter FUNCTION (``the function `count` takes …``), which a call cannot rewrite: the adapter the refusal names, written around it — `\|c\| g(*c)` copies a view's value out for a value closure, `\|c\| g(&c)` lends a view closure the value. Only around a plain name or path, since around any other expression the adapter would evaluate it on every call; a writable view meeting a value closure has none |
+| ``Write `auto str` `` | a stale `auto` (``stale `auto`: `load` now returns `str`, not the written `auto i32` …``) or a bare one's warning (``unfilled `auto`: …``): the annotation the message ends with, written over it — the edit `vilan check --fix` makes |
+| ``Add `auto` type (`auto i32`)`` | not a diagnostic: the name of any unannotated function return or `let` binding whose type the file can name — `: auto T` after its parameter list or its name, never on a void return |
 
-and two source actions:
+and three source actions:
 
 | Action | Does |
 |---|---|
 | **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. A statement whose every leaf is unused is *rewritten* rather than deleted when the module's file is where an `impl` the code calls a method from lives — `impl`s travel with any import that reaches the module, so deleting the statement would break the build. The rewrite is the narrowest statement that keeps it: an impl SELECTOR (`import pkg::a::b;` becomes `import pkg::a::{ (impl Style) };`) when everything the file uses from that module is one subject's blocks, and the bare module import (`import pkg::a;`) when it is not. A selector is a leaf like any other: one whose implementation the file never calls a method from fades and prunes, one it does use stays. Visibility spellings are preserved verbatim, never rewritten: a reach marker (`#helper`) stays on its leaf, a trailing `only` stays on its statement, and a selector keeps the type it was written with. The module-level `export *;` is not an import and does not move — a NEW leading import is inserted above it, so the marker keeps the slot `vilan fmt` gives it, just below the file's import run. Offered only when it would change something |
 | **Add All Missing Imports** | applies every unambiguous import quickfix in the file at once, skipping the ambiguous ones |
+| **Keep `auto` types current** | rewrites every stale `auto` in the file and fills every bare one (`source.fixAll.vilan.auto`, what `vilan.autoTypes.onSave` runs) — nothing while the file has any other error |
 
 An import the **prelude** covers is stripped for the same reason an unused
 one is: `import std::io::print;` in a package whose prelude binds `print`
@@ -370,6 +387,19 @@ is kept.
 save. It is the extension's own hook rather than a line in your
 `editor.codeActionsOnSave`, and organizing is a fixed point, so turning
 both on is harmless.
+
+**`auto` types** ([`auto` annotations](../spec/types.md#auto-types-the-toolchain-keeps)).
+`vilan.autoTypes.onSave` (off by default) runs the server's **Keep `auto`
+types current** source action (`source.fixAll.vilan.auto`) on save: every
+stale `auto T` in the file is rewritten to what its item now infers and
+every bare `auto` is filled — the edits `vilan check --fix` makes, from the
+analysis the editor already holds. It writes nothing while the file has
+any other error, since a type filled from a broken program is noise. While
+you type, a stale `auto` shows the type it would become after it
+(`: auto i32` ⟶ `str`), and its diagnostic carries the rewrite as a quick
+fix. On any unannotated return or `let` binding, **Add `auto` type** writes
+`: auto T` after its parameter list or its name — never on a void return,
+and never for a type the file cannot name without a new import.
 
 ## Refactors
 
@@ -450,6 +480,7 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 | `vilan.completion.functionCall` | `full` | `parensOnly`, or `none` |
 | `vilan.autoClosing.generics` | `true` | pair a generic `<` and type over its `>`; off for Vim emulation |
 | `vilan.organizeImports.onSave` | `false` | |
+| `vilan.autoTypes.onSave` | `false` | rewrite stale and fill bare `auto` types on save |
 
 Everything but the two paths applies live. **Vilan: Restart Language
 Server** is in the command palette when you want the blunt instrument, and

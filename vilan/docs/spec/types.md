@@ -1198,6 +1198,70 @@ already a value and never coerces.
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
 
+### Ascription: `EXP as T`
+
+`EXP as T` names the type a value has, in place, where no `let` is at
+hand. It is typed exactly as the initializer of `let tmp: T = EXP` is:
+the type flows into `EXP` (an unsuffixed literal, an empty list, a bare
+`None` and a generic call's result take it), every coercion an annotated
+binding performs is performed (a value erased to `dyn T`, §5.12; a named
+function or a tuple variant re-typed as a closure, above; a closure
+literal's parameters adopting the type's modes; `Never` yielding), a bare
+trait is checked and the value keeps its concrete type (§5.5, as at a
+binding), and a mismatch is refused. The result has type `T` — or the
+concrete type, under a bare trait.
+
+```vilan,fragment
+SignalCell::new([1, 2, 3] as List<usize>)
+make() as List<str>
+match pick { true => Source::constant(1), false => cell.derive(f) } as dyn Flow<i32>
+```
+
+It is **not a binding**: nothing is copied that the unascribed value
+would not copy (`f(xs as List<i32>)` passes `xs` exactly as `f(xs)`
+does, and `let ys = xs as List<i32>` copies as `let ys = xs` does), it
+has no drop point and no name, and a resource moves exactly when the
+unascribed expression would. It is a **value, never a place**: an
+assignment through one, a `&mut` view of one and a mutating method called
+on one are refused (`(p as Point).x = 1` — write `p.x = 1`).
+
+**The method converts, the keyword constrains.** `n.as_f64()` makes an
+`f64`; `n as f64` says `n` already is one, and with `n: i32` it is
+refused with the conversion that exists. vilan has no cast: a `dyn`
+value never narrows back (§5.12), so `as` cannot downcast either.
+
+### `auto`: types the toolchain keeps
+
+`auto T` on a function's return, a `let`/`mut` binding (a module's or a
+local), or an ascription (`as auto T`) is a type the toolchain writes and
+keeps current. It is a **signature, not a constraint**: the body — a
+function's, a binding's initializer, an ascription's value — is inferred
+exactly as if nothing were written, so `T` never directs it (`fun f():
+auto f64 { 5 }` infers `i32`); everything outside reads `T` — a
+function's callers, a binding's uses, hover; and `vilan check` (and
+`build`, `run`, `test`) compares the two and refuses a difference as
+**stale**, naming how many callers were checked against the written type
+in the meantime. `vilan check --fix` rewrites it, and a bare `auto`,
+which promised nothing yet, is a warning the same command fills. In a
+program that checks, deleting every `auto` changes nothing it does.
+
+```vilan,fragment
+fun load(): auto List<str> { … }         // callers read List<str>
+mut names: auto List<str> = [];           // a use elsewhere cannot widen it
+fun doubled(cell): auto Pipe<i32> { … }   // a stage type, by its trait
+```
+
+Two types agree when their resolved forms are equal, except that a bare
+trait anywhere in the written type is met by any type that implements it
+(§5.5, as at a binding) — which is how a long pipe-stage type is written:
+as the inlay hint shows it, `~Pipe<T>` written as the bare trait
+`Pipe<T>`. Such an item is no firewall: its callers still hold the
+concrete type. A labelled tuple is written with its labels, and labels
+agree as §5.9 reconciles them — except one label at two different
+slots, which callers would read from the wrong slot. `fmt` prints an `auto` canonically and never fills one;
+`auto` stands nowhere a type is not inferred — a parameter, a field, a
+generic argument, a trait member's return is refused.
+
 ## 5.9 Variadic tuples
 
 A generic parameter with a **tuple bound** ranges over tuples:

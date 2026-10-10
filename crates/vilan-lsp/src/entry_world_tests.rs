@@ -1062,3 +1062,47 @@ async fn e254_a_twin_no_entry_admits_keeps_the_files_own_analysis() {
         .expect("open");
     assert_eq!(document.world_root(), None, "its own analysis");
 }
+
+/// E278 under reuse: a per-stage hint is still served for a module the
+/// session REUSES rather than re-walks — an edit in another file, then the
+/// hint request on the untouched module. `stage_hints` is built for every id
+/// on every analysis (it takes no part in a per-module label record), and
+/// the shape the C3 merge gate caught for hovers is held here for stages.
+#[tokio::test]
+async fn e278_a_stage_hint_is_served_on_a_module_reused_after_an_edit_elsewhere() {
+    const STAGED: &str = "import pkg::model::{ Model, total };\n\n\
+         export fun page(): i32 {\n\tlet words = [\"a\", \"bb\"];\n\tlet count = words\n\
+         \t\t.map(|word| word.len())\n\t\t.len();\n\ttotal(Model { count = count.as_i32() })\n}\n";
+    let package = Package::new("stage-reused");
+    std::fs::write(package.directory.join("src/views.vl"), STAGED).expect("a source");
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(
+        server,
+        &package,
+        &[
+            ("client.vl", CLIENT),
+            ("views.vl", STAGED),
+            ("channel.vl", CHANNEL),
+        ],
+    )
+    .await;
+    let edited = CHANNEL.replace("count = 3", "count = 4");
+    edit(server, &package.uri("channel.vl"), 2, &edited).await;
+    at_rest(server).await;
+    let document = server
+        .documents
+        .get(&package.uri("views.vl"))
+        .expect("open");
+    let stages: Vec<String> = document
+        .keystroke_hints_served(false, true)
+        .into_iter()
+        .map(|hint| hint.label)
+        .filter(|label| label.starts_with(" as "))
+        .collect();
+    assert_eq!(
+        stages,
+        vec![" as List<str>", " as List<usize>", " as usize"],
+        "the reused module's head and both stages still hint",
+    );
+}

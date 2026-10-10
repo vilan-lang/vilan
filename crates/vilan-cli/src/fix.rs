@@ -61,6 +61,10 @@ pub(crate) struct Fixed {
     pub(crate) generated: BTreeMap<PathBuf, (PathBuf, BTreeSet<usize>)>,
     /// Moved std paths no one edit rewrites correctly, per file, by offset.
     pub(crate) for_a_hand: BTreeMap<PathBuf, BTreeMap<usize, ForAHand>>,
+    /// B570: `auto` annotations rewritten (stale) or filled (bare), and the
+    /// files they were in.
+    pub(crate) autos: usize,
+    pub(crate) auto_files: BTreeSet<PathBuf>,
 }
 
 /// A moved std path `--fix` leaves to a person, and why.
@@ -150,6 +154,8 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
             &workspace,
         );
         let mut by_file: BTreeMap<PathBuf, Vec<NumericFix>> = BTreeMap::new();
+        // B570: each stale or unfilled `auto`'s rewrite, over its span.
+        let mut autos: BTreeMap<PathBuf, Vec<(Span, String)>> = BTreeMap::new();
         let mut moved: BTreeMap<PathBuf, BTreeMap<Span, StdPathFix>> = BTreeMap::new();
         let mut for_a_hand: BTreeMap<PathBuf, BTreeMap<usize, ForAHand>> = BTreeMap::new();
         let mut texts: BTreeMap<PathBuf, String> = BTreeMap::new();
@@ -209,6 +215,13 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
                 }
                 continue;
             }
+            if let Some(rewrite) = vilan_core::analyzer::auto_annotation_rewrite(&diagnostic.msg) {
+                autos
+                    .entry(path)
+                    .or_default()
+                    .push((diagnostic.span, rewrite.to_string()));
+                continue;
+            }
             // The PREFERRED edit only: a counter's declaration where there is
             // one, else the conversion — the one the bulk action takes.
             if let Some(preferred) = numeric_fixes(text, diagnostic.span, &diagnostic.msg)
@@ -216,6 +229,32 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
                 .next()
             {
                 by_file.entry(path).or_default().push(preferred);
+            }
+        }
+        // B570: an unfilled `auto` is a WARNING, and the fill is its fix.
+        if let Some(program) = program.as_ref() {
+            for (index, warning) in program.warnings.iter().enumerate() {
+                let Some(rewrite) = vilan_core::analyzer::auto_annotation_rewrite(&warning.msg)
+                else {
+                    continue;
+                };
+                let Some(path) = program.source_path(program.warning_source(index)) else {
+                    continue;
+                };
+                let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                if !path.starts_with(&package_root) {
+                    continue;
+                }
+                if !texts.contains_key(&path) {
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    texts.insert(path.clone(), text);
+                }
+                autos
+                    .entry(path)
+                    .or_default()
+                    .push((warning.span, rewrite.to_string()));
             }
         }
         // The moved paths first, and alone: the round after them reads the
@@ -240,6 +279,7 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
         // its sites for a hand replace any an earlier round recorded.
         fixed.for_a_hand.extend(for_a_hand);
         let mut applied_this_round = 0;
+        let mut converted: BTreeSet<PathBuf> = BTreeSet::new();
         for (path, fixes) in by_file {
             let (rewritten, applied) = apply_numeric_fixes(&texts[&path], fixes);
             if applied == 0 {
@@ -248,10 +288,30 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
             std::fs::write(&path, rewritten)
                 .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
             applied_this_round += applied;
+            converted.insert(path.clone());
             fixed.files.insert(path);
         }
         fixed.edits += applied_this_round;
-        if applied_this_round == 0 {
+        // B570: the `auto` rewrites, in the same round — a rewrite that
+        // changes what callers read re-checks them in the next one.
+        let mut autos_this_round = 0;
+        for (path, fixes) in autos {
+            // A file a conversion just rewrote has moved under these spans;
+            // the next round reads it as it now stands.
+            if converted.contains(&path) {
+                continue;
+            }
+            let (rewritten, applied) = apply_spans(&texts[&path], fixes);
+            if applied == 0 {
+                continue;
+            }
+            std::fs::write(&path, rewritten)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            autos_this_round += applied;
+            fixed.auto_files.insert(path);
+        }
+        fixed.autos += autos_this_round;
+        if applied_this_round == 0 && autos_this_round == 0 {
             return Ok(());
         }
     }
@@ -260,6 +320,25 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
          a fix is re-creating its own diagnostic; the files hold every round's edits",
         unit.entry.display()
     ))
+}
+
+/// `(span, replacement)` edits applied to `text` from the last to the first,
+/// one per span, an overlapping one skipped (the next round recomputes it).
+fn apply_spans(text: &str, mut fixes: Vec<(Span, String)>) -> (String, usize) {
+    fixes.sort_by_key(|(span, _)| std::cmp::Reverse((span.start, span.end)));
+    fixes.dedup_by_key(|(span, _)| (span.start, span.end));
+    let mut rewritten = text.to_string();
+    let mut applied = 0;
+    let mut floor = usize::MAX;
+    for (span, replacement) in fixes {
+        if span.end > floor || rewritten.get(span.into_range()).is_none() {
+            continue;
+        }
+        rewritten.replace_range(span.into_range(), &replacement);
+        floor = span.start;
+        applied += 1;
+    }
+    (rewritten, applied)
 }
 
 /// `fixes` applied to `text` (each replaces its span), from the last to the
@@ -412,6 +491,15 @@ pub(crate) fn report(fixed: &Fixed) {
         plural(edits, "", "es"),
         plural(files, "", "s"),
     );
+    if fixed.autos > 0 {
+        let files = fixed.auto_files.len();
+        println!(
+            "{fixed_word} {} `auto` annotation{} in {files} file{}",
+            fixed.autos,
+            plural(fixed.autos, "", "s"),
+            plural(files, "", "s"),
+        );
+    }
 }
 
 #[cfg(test)]

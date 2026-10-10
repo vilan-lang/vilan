@@ -203,6 +203,14 @@ pub enum ParseErrorReason {
         label: String,
         value: Option<String>,
     },
+    /// A generic list written SPACED after an ascribed type's name (B571,
+    /// type-ascription.md §5.1, RULED): `xs as List <i32>;`. In an ascribed
+    /// type a `<` opens a generic list only when it touches the name before
+    /// it; this one could not be the comparison the rule reads it as (nothing
+    /// follows its `>`), so the parse went on as if it had been written tight,
+    /// and `vilan fmt` writes it so. `written` is the type as written up to
+    /// the name, `tight` the type respelled.
+    SpacedAscribedGenerics { written: String, tight: String },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1783,6 +1791,10 @@ pub fn render(error: &ParseError) -> String {
                  discards it: to assign, write `{label} = {value};`"
             )
         }
+        ParseErrorReason::SpacedAscribedGenerics { written, tight } => format!(
+            "`as {written}` then `<`: a generic list after `as` touches its type, `{tight}` — \
+             spaced, the `<` after an ascribed type is a comparison"
+        ),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -2154,6 +2166,22 @@ struct Parser<'a, 'src> {
     /// is refused; [`parse_with_warnings`] hands them back beside the errors.
     /// One per span, held aside from `errors` for `rewrite_refusals`' reason.
     warnings: Vec<ParseError>,
+    /// Whether an ASCRIBED type is being read (B571, type-ascription.md §5.1):
+    /// the type after `as`, the one type position followed by more
+    /// expression. There a `<` opens a generic list only when it is
+    /// span-adjacent to the name before it, so `n as usize < limit` is a
+    /// comparison. `None` outside one; inside, the depth of generic lists the
+    /// reading is in — at depth 0 a spaced `<` may be the comparison, inside a
+    /// list it cannot be (a type holds no comparison).
+    ascribed_type: Option<usize>,
+    /// A block-like form (`match`, `if`, `for`, `{`) followed by `as` (B571
+    /// Q4, RULED): the form was parsed at its head, and the ascription after
+    /// its brace commits the position to an expression, so the operand is
+    /// handed to the chain tier, which reads `as T` and whatever follows as
+    /// over any other operand. Taken by [`Parser::parse_member_accessor`]
+    /// in place of its call base; set only immediately before descending to
+    /// it.
+    seeded_operand: Option<Spanned<Node<'src>>>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -2181,6 +2209,10 @@ enum Postfix<'src> {
     LiftBare,
     /// `subject(args)` where the subject is itself a postfix result.
     DirectCall(Spanned<NodeList<'src>>),
+    /// `subject as T` — a type ascription (B571). Not absorbed into a `?.`
+    /// link's continuation: what stands left of `as` is the whole chain so
+    /// far, so `a?.b() as Option<B>` ascribes the lifted result.
+    Ascribe(Spanned<Node<'src>>),
 }
 
 /// Stamps a binder pattern's bindings mutable (or not) — `mut` at the binder
@@ -2851,6 +2883,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             rewrite_refusals: Vec::new(),
             written_starts: Vec::new(),
             warnings: Vec::new(),
+            ascribed_type: None,
+            seeded_operand: None,
         }
     }
 
@@ -4959,6 +4993,7 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_secondary`]'s body, past the depth bound.
     fn parse_secondary_inner(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
         let block_like = match self.peek() {
             // A closure literal (`|params| body`, `|| body`) — always tried before
             // the tower, so a leading `||` is never a logical-or (which needs a left
@@ -5000,8 +5035,56 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return self.parse_operators(no_struct);
             }
         };
+        // B571 Q4 (RULED): `as` after the brace continues the form. It cannot
+        // begin a statement where it stands — except as a NAME on a later
+        // line, which is why a statement head takes it only on the brace's
+        // own line.
+        if self.ascription_follows_block_like(self.statement_head != Some(start)) {
+            self.seeded_operand = Some(block_like);
+            return self.parse_operators(no_struct);
+        }
         self.refuse_block_like_continuation(no_struct);
         Some(block_like)
+    }
+
+    /// Whether an ascription (`as T`) follows the block-like form just parsed
+    /// (B571 Q4): the word, on the brace's line unless `across_lines`, and a
+    /// type after it. Probed, never consumed: the chain tier reads it.
+    fn ascription_follows_block_like(&mut self, across_lines: bool) -> bool {
+        if !self.peek_is_word("as") || !self.type_can_start_at(1) {
+            return false;
+        }
+        if !across_lines && self.line_break_before_cursor() {
+            return false;
+        }
+        self.probe(|parser| parser.parse_ascription().is_some())
+    }
+
+    /// Whether a line break stands between the previous token and the cursor's.
+    fn line_break_before_cursor(&self) -> bool {
+        let (Some(previous), Some(current)) = (
+            self.position
+                .checked_sub(1)
+                .and_then(|index| self.tokens.get(index)),
+            self.tokens.get(self.position),
+        ) else {
+            return false;
+        };
+        self.source
+            .get(previous.1.end..current.1.start)
+            .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// Runs `body` and rolls back EVERYTHING it did — cursor, errors,
+    /// contextual readings — whatever it answers: a lookahead question asked
+    /// in the grammar's own terms.
+    fn probe(&mut self, body: impl FnOnce(&mut Self) -> bool) -> bool {
+        let mut answer = false;
+        self.attempt(|parser| {
+            answer = body(parser);
+            None::<()>
+        });
+        answer
     }
 
     /// The operator tower above the postfix/precedence chain: the `is` pattern test,
@@ -5366,6 +5449,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         // through `parse_secondary`, so every one of them takes its own level
         // of the nesting counter (B142). Without that, `!!!..!1` — measured at
         // ~14.1 KiB per `!` unoptimized — would still be unbounded.
+        // A block-like form seeded by its `as` (B571 Q4) is the operand
+        // itself: what follows its brace is the ascription, never a prefix.
+        if self.seeded_operand.is_some() {
+            return self.parse_member_accessor(no_struct);
+        }
         let start = self.position;
         if self.eat_op("!") {
             let inner = self.parse_nested(Self::NESTING_REFUSAL, |parser| {
@@ -5429,13 +5517,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         // body — the same ambiguity `no_struct` already resolves for struct
         // literals and `css` blocks — so there it stays refused and parentheses
         // are the spelling.
-        match self.peek() {
-            Some(Token::Match) => return self.parse_match(),
-            Some(Token::If) => return self.parse_if(),
-            Some(Token::Ctrl('{')) if !no_struct => return self.parse_block_as_expression(),
-            _ => {}
+        let block_like = match self.peek() {
+            Some(Token::Match) => self.parse_match()?,
+            Some(Token::If) => self.parse_if()?,
+            Some(Token::Ctrl('{')) if !no_struct => self.parse_block_as_expression()?,
+            _ => return self.parse_member_accessor(no_struct),
+        };
+        // B571 Q4: an operand's `as` after the brace ascribes the form, and
+        // the chain goes on from there.
+        if self.ascription_follows_block_like(true) {
+            self.seeded_operand = Some(block_like);
+            return self.parse_member_accessor(no_struct);
         }
-        self.parse_member_accessor(no_struct)
+        Some(block_like)
     }
 
     /// The postfix chain over a call/static-access base: `.member`, `[index]`, `!`,
@@ -5443,7 +5537,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// grouped so a `?.` link absorbs the following plain postfixes into its
     /// continuation (up to the next `?.`/`!`/chain end).
     fn parse_member_accessor(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        let base = self.parse_call(no_struct)?;
+        let base = match self.seeded_operand.take() {
+            Some(seeded) => seeded,
+            None => self.parse_call(no_struct)?,
+        };
         let mut postfixes: Vec<(Postfix<'src>, Span)> = Vec::new();
         loop {
             let start = self.position;
@@ -5509,7 +5606,103 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.eat_op("?") {
             return Some(Some(Postfix::LiftBare));
         }
+        // `as T` — a type ascription (B571). `as` is CONTEXTUAL (Q6): it is
+        // read here, after a complete operand, where no name can stand —
+        // vilan never puts two names side by side — so `let as = 5;` and
+        // `print(as)` keep their meaning. ATTEMPTED: an `as` no type follows
+        // is not an ascription, so a missing `;` before a line that starts
+        // with a name `as` is still reported as the missing `;`.
+        if self.peek_is_word("as") && self.type_can_start_at(1) {
+            return Some(self.attempt(Self::parse_ascription).map(Postfix::Ascribe));
+        }
         Some(None)
+    }
+
+    /// Whether a type can begin `offset` tokens ahead: a name (a path, `dyn`,
+    /// `sync`, `_`), `(`, `[`, `&`, a closure type's `|`/`||`, `type`,
+    /// `async`. Asked before an ascription is attempted, so an `as` that no
+    /// type follows records no "expected a type" deeper than the failure the
+    /// author actually made (`as = 5` after a missing `;`).
+    fn type_can_start_at(&self, offset: usize) -> bool {
+        matches!(
+            self.peek_at(offset),
+            Some(
+                Token::Ident(_)
+                    | Token::Ctrl('(' | '[')
+                    | Token::Op("&" | "|" | "||")
+                    | Token::Type
+                    | Token::Async
+            )
+        )
+    }
+
+    /// `as T` past a complete operand (B571): the word, then the ascribed
+    /// type ([`Parser::parse_ascribed_type`]).
+    fn parse_ascription(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !self.eat_word("as") {
+            return None;
+        }
+        self.parse_ascribed_type()
+    }
+
+    /// The type after `as` (type-ascription.md §5): the type grammar's own
+    /// production, with the ruled whitespace rule on every generic list in
+    /// it — a `<` opens a list only when it touches the name before it.
+    fn parse_ascribed_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let outer = self.ascribed_type.replace(0);
+        let type_ = self.parse_type();
+        self.ascribed_type = outer;
+        type_
+    }
+
+    /// The generic list after a type path's name, under the ascribed-type
+    /// whitespace rule when one is being read (B571 §5.1).
+    ///
+    /// Outside an ascribed type this is the plain optional list. Inside one, a
+    /// list TOUCHING the name is read as always, one level deeper. A SPACED
+    /// `<` is the comparison the rule says it is — except where no comparison
+    /// could stand: inside another generic list, or where the list's `>` is
+    /// followed by a token that ends an expression (`;`, `,`, a closer, a `.`,
+    /// end of input). There the list is refused with the tight spelling and
+    /// read as written tight (the formatter's fix), so the analysis still
+    /// sees the type the author meant.
+    fn parse_path_generic_arguments(&mut self, written: &str) -> Option<GenericArguments<'src>> {
+        let Some(depth) = self.ascribed_type else {
+            return self.attempt(Self::parse_generic_arguments);
+        };
+        if !self.peek_is_ctrl('<') {
+            return None;
+        }
+        let touching = self.position > 0
+            && self.tokens[self.position - 1].1.end == self.tokens[self.position].1.start;
+        let start = self.position;
+        self.ascribed_type = Some(depth + 1);
+        let arguments = self.attempt(|parser| {
+            let arguments = parser.parse_generic_arguments()?;
+            let ends_an_expression = matches!(
+                parser.peek(),
+                None | Some(Token::Ctrl(';' | ',' | ')' | ']' | '}' | '.'))
+            );
+            // At the type's own level a spaced `<` is the comparison, unless
+            // no comparison could stand where its list ends.
+            (touching || depth > 0 || ends_an_expression).then_some(arguments)
+        });
+        self.ascribed_type = Some(depth);
+        let arguments = arguments?;
+        if !touching {
+            let source = self.source;
+            let list = &source[self.tokens[start].1.start..self.tokens[self.position - 1].1.end];
+            self.errors.push(ParseError {
+                span: self.span_from(start),
+                reason: ParseErrorReason::SpacedAscribedGenerics {
+                    written: written.to_string(),
+                    tight: format!("{written}{}", tighten_generic_list(list)),
+                },
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
+        Some(arguments)
     }
 
     /// A member after `.`/`?.`: a tuple index (`.0`), or a name with at most ONE
@@ -7906,8 +8099,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_type(&mut self) -> Option<Spanned<Node<'src>>> {
         // The type grammar is a closed cycle that reaches no expression rule at
         // all (B142) — `& & & ..`, `[[..; 1]; 1]`, `L<L<..>>`, `((..))`, closure
-        // types and bounds all come back through here, and `parse_type_atom` has
-        // this as its only caller, so this is the type grammar's single door. It
+        // types and bounds all come back through here, and `parse_type_atom` is
+        // reached only through a depth-bounded door (this one, and `auto`'s
+        // written type, B570), so this is the type grammar's bound. It
         // is reachable from a bounded expression too, through a call's generic
         // arguments, which is why one level of expression nesting cannot stand in
         // for it.
@@ -7950,6 +8144,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_word("dyn") && !self.peek_at_is_op(1, "::") {
             return self.parse_dyn_type();
         }
+        // B570: `auto` is contextual by `dyn`'s rule — the toolchain-kept
+        // marker at a type's head, except `auto::`. A type follows, or the
+        // annotation ends there (`= .. ;`, `{`, a `context` or `borrows`
+        // clause): the bare `auto`, filled by `check --fix`. Where nothing is
+        // inferred (a parameter, a field) the analyzer refuses it by name.
+        if self.peek_is_word("auto") && !self.peek_at_is_op(1, "::") {
+            return self.parse_auto_type();
+        }
         if let Some(closure) = self.parse_closure_type() {
             return Some(closure);
         }
@@ -7966,6 +8168,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.note_expected("a type");
         None
+    }
+
+    /// `auto T` / `auto` (B570): the marker, then the written type when one
+    /// follows — read without its own `context` suffix, which the enclosing
+    /// [`Parser::parse_type_inner`] takes over the whole annotation, so a
+    /// return's clause still binds to the function.
+    fn parse_auto_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        if !self.eat_word("auto") {
+            return None;
+        }
+        let ends_here = !self.type_can_start_at(0)
+            || self.peek_is_word("context")
+            || self.peek_is_word("borrows");
+        let written = match ends_here {
+            true => None,
+            false => Some(Box::new(
+                self.parse_nested(Self::TYPE_NESTING_REFUSAL, Self::parse_type_atom)?,
+            )),
+        };
+        Some((Node::AutoType(written), self.span_from(start)))
     }
 
     /// `dyn Source<i32>` — a trait object type (A124 R3).
@@ -8188,7 +8411,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.bump(); // `::`
             name = self.eat_ident().expect("peeked as an identifier");
         }
-        let generic_arguments = self.attempt(Self::parse_generic_arguments);
+        let source = self.source;
+        let written = &source[self.tokens[start].1.start..self.tokens[self.position - 1].1.end];
+        let generic_arguments = self.parse_path_generic_arguments(written);
         if generic_arguments.is_some() && namespace.is_none() {
             self.refuse_generic_self(name, start);
         }
@@ -10876,11 +11101,35 @@ impl<'a, 'src> Parser<'a, 'src> {
 
 /// Whether a node is a block-bearing form that may be a statement without a
 /// trailing `;` (the chumsky `if_`/`for_`/`match_`/`block` statement alternatives).
-fn is_block_like(node: &Node<'_>) -> bool {
+pub(crate) fn is_block_like(node: &Node<'_>) -> bool {
     matches!(
         node,
         Node::If(_) | Node::For(..) | Node::ForIn(..) | Node::Match(..) | Node::Block(_)
     ) && !is_then_form(node)
+}
+
+/// A generic list's text respelled tight (B571 §5.1's refusal): no space
+/// after a `<`, before a `<` or before a `>` — `< i32 >` is `<i32>`, `<str,
+/// List <i32>>` is `<str, List<i32>>`. The separator's space is kept.
+fn tighten_generic_list(list: &str) -> String {
+    let mut tight = String::with_capacity(list.len());
+    let mut characters = list.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() {
+            let previous = tight.chars().next_back();
+            while characters.peek().is_some_and(|next| next.is_whitespace()) {
+                characters.next();
+            }
+            let next = characters.peek().copied();
+            if previous == Some('<') || matches!(next, Some('<' | '>')) {
+                continue;
+            }
+            tight.push(' ');
+            continue;
+        }
+        tight.push(character);
+    }
+    tight
 }
 
 /// Apply one plain postfix to a subject, spanning from the chain's start. A
@@ -10912,6 +11161,7 @@ fn apply_postfix<'src>(
             span,
         ),
         Postfix::DirectCall(arguments) => (Node::Call(Box::new(subject), None, arguments), span),
+        Postfix::Ascribe(type_) => (Node::Ascribe(Box::new(subject), Box::new(type_)), span),
     }
 }
 
@@ -15333,5 +15583,299 @@ mod tests {
             moved_std_module_edit(source, "cannot find 'x'", Span::from(11..14)),
             None
         );
+    }
+}
+
+/// B571 — the ascription's grammar (`proposal/type-ascription.md` §4–§6): the
+/// postfix in the chain tier, the ascribed-type whitespace rule, `as` after a
+/// block-like brace, and `as` still a name where a name can stand. Trees are
+/// rendered as S-expressions with every type spelled as written, so a pin
+/// reads as the paper's tables do.
+#[cfg(test)]
+mod ascription_tests {
+    use super::*;
+
+    fn shape(source: &str, node: &Spanned<Node<'_>>) -> String {
+        let text = |span: Span| source[span.start..span.end].to_string();
+        match &node.0 {
+            Node::Accessor(name) => name.to_string(),
+            Node::Number(..) | Node::String(_) | Node::Bool(_) => text(node.1),
+            Node::Ascribe(value, type_) => {
+                format!("(as {} {})", shape(source, value), text(type_.1))
+            }
+            Node::Binary(operator, left, right) => format!(
+                "({operator:?} {} {})",
+                shape(source, left),
+                shape(source, right)
+            ),
+            Node::Unary(operator, inner) => format!("({operator} {})", shape(source, inner)),
+            Node::Await(inner) => format!("(await {})", shape(source, inner)),
+            Node::Reference(mutable, inner) => format!(
+                "({} {})",
+                if *mutable { "&mut" } else { "&" },
+                shape(source, inner)
+            ),
+            Node::TryAssert(inner) => format!("(! {})", shape(source, inner)),
+            Node::Lifted(inner) => format!("(? {})", shape(source, inner)),
+            Node::Lift(subject, continuation) => format!(
+                "(?. {} {})",
+                shape(source, subject),
+                shape(source, continuation)
+            ),
+            Node::LiftBinder => "_".to_string(),
+            Node::Is(subject, pattern) => {
+                format!("(is {} {})", shape(source, subject), text(pattern.1))
+            }
+            Node::MemberAccessor(subject, member) => {
+                format!("(. {} {})", shape(source, subject), shape(source, member))
+            }
+            Node::Call(subject, _, arguments) => {
+                let arguments: Vec<String> = arguments
+                    .0
+                    .iter()
+                    .map(|argument| shape(source, argument))
+                    .collect();
+                format!(
+                    "(call {} [{}])",
+                    shape(source, subject),
+                    arguments.join(" ")
+                )
+            }
+            Node::Match(subject, _) => format!("(match {})", shape(source, subject)),
+            Node::If(NodeIfBranch::If(if_)) => format!(
+                "(if {} {})",
+                shape(source, &if_.condition),
+                shape(source, &if_.then.0.1)
+            ),
+            Node::Block(body) => format!("{{{}}}", shape(source, &body.0.1)),
+            _ => format!("<{}>", text(node.1)),
+        }
+    }
+
+    fn expression(source: &str) -> String {
+        let (mut tokens, errors) = lexing::tokenize(source);
+        assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let node = parser.parse_expression().expect("expression did not parse");
+        assert_eq!(
+            parser.position, token_count,
+            "unconsumed tokens in {source:?}"
+        );
+        assert!(
+            parser.errors.is_empty(),
+            "errors on {source:?}: {:?}",
+            parser.errors
+        );
+        shape(source, &node)
+    }
+
+    /// The statements of `main`'s body in a whole program, each shaped.
+    fn statements(body: &str) -> Vec<String> {
+        let source = format!("fun main() {{\n{body}\n}}\n");
+        let (tree, errors) = parse(&source);
+        assert!(errors.is_empty(), "parse errors on {source:?}: {errors:?}");
+        let (items, _) = tree.expect("program did not parse");
+        let Node::Func(function) = &items[0].0 else {
+            panic!("expected a function");
+        };
+        let ((statements, tail), _) = function.body.as_ref().expect("a body");
+        let mut shapes: Vec<String> = statements
+            .iter()
+            .map(|statement| shape(&source, statement))
+            .collect();
+        if !matches!(tail.0, Node::Void) {
+            shapes.push(shape(&source, tail));
+        }
+        shapes
+    }
+
+    fn rendered_errors(source: &str) -> Vec<String> {
+        let (_, errors) = parse(source);
+        errors.iter().map(render).collect()
+    }
+
+    // --- §6: the precedence rows ---------------------------------------------
+
+    #[test]
+    fn as_is_a_postfix_tighter_than_every_operator() {
+        assert_eq!(expression("a + b as f64"), "(Add a (as b f64))");
+        assert_eq!(expression("-x as f64"), "(- (as x f64))");
+        assert_eq!(expression("a < b as T"), "(Lt a (as b T))");
+        assert_eq!(expression("await p as T"), "(await (as p T))");
+        assert_eq!(expression("&x as &T"), "(& (as x &T))");
+        assert_eq!(
+            expression("x as T is Some(let v)"),
+            "(is (as x T) Some(let v))"
+        );
+        assert_eq!(expression("c then a as T else b"), "(if c (as a T))");
+        assert_eq!(expression("(a + b) as T"), "(as (Add a b) T)");
+    }
+
+    #[test]
+    fn the_chain_goes_on_after_the_type() {
+        assert_eq!(
+            expression("a() as A .b() as B .c() as C"),
+            "(as (. (as (. (as (call a []) A) (call b [])) B) (call c [])) C)"
+        );
+        assert_eq!(expression("x as T?"), "(? (as x T))");
+        assert_eq!(expression("x as T!"), "(! (as x T))");
+        assert_eq!(expression("x as List<i32>[0]"), "<x as List<i32>[0]>");
+        assert_eq!(expression("x as Point.y"), "(. (as x Point) y)");
+        assert_eq!(
+            expression("f as |i32| i32(3)"),
+            "(call (as f |i32| i32) [3])"
+        );
+        assert_eq!(expression("x as (A, B).0"), "(. (as x (A, B)) 0)");
+    }
+
+    /// The ascription is not absorbed into a `?.` link's continuation: what
+    /// stands left of `as` is the whole chain so far.
+    #[test]
+    fn a_lift_link_ends_at_the_ascription() {
+        assert_eq!(
+            expression("a?.b() as T .c()"),
+            "(. (as (?. a (. _ (call b []))) T) (call c []))"
+        );
+    }
+
+    // --- §5.1: the whitespace rule -------------------------------------------
+
+    #[test]
+    fn a_spaced_less_than_after_an_ascribed_type_is_a_comparison() {
+        assert_eq!(expression("n as usize < limit"), "(Lt (as n usize) limit)");
+        assert_eq!(expression("xs as List<usize>"), "(as xs List<usize>)");
+        assert_eq!(expression("x as List<i32> > y"), "(Gt (as x List<i32>) y)");
+        assert_eq!(
+            expression("n as (usize) < limit"),
+            "(Lt (as n (usize)) limit)"
+        );
+        assert_eq!(
+            expression("m as HashMap<str, List<i32>>"),
+            "(as m HashMap<str, List<i32>>)"
+        );
+        assert_eq!(
+            expression("n as usize < a && b > c"),
+            "(And (Lt (as n usize) a) (Gt b c))"
+        );
+        // Tight, the rule reads a generic list — which `usize` refuses later.
+        assert_eq!(expression("n as usize<limit>"), "(as n usize<limit>)");
+    }
+
+    #[test]
+    fn outside_an_ascription_a_spaced_generic_list_parses_as_before() {
+        // The paper's a04/a05: type and expression positions keep reading a
+        // spaced list (Q3 RULED: expression position is its own later item).
+        assert!(rendered_errors("fun main() { let xs: List <i32> = []; }").is_empty());
+        assert!(rendered_errors("fun main() { let xs = List <i32>::new(); }").is_empty());
+    }
+
+    #[test]
+    fn a_spaced_list_no_comparison_could_be_is_refused_and_read_tight() {
+        let source = "fun main() { let xs = [] as List <i32>; }";
+        assert_eq!(
+            rendered_errors(source),
+            vec![
+                "`as List` then `<`: a generic list after `as` touches its type, `List<i32>` — \
+                 spaced, the `<` after an ascribed type is a comparison"
+                    .to_string()
+            ]
+        );
+        let nested = "fun main() { let m = x as HashMap<str, List < i32 >>; }";
+        assert_eq!(
+            rendered_errors(nested),
+            vec![
+                "`as List` then `<`: a generic list after `as` touches its type, `List<i32>` — \
+                 spaced, the `<` after an ascribed type is a comparison"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            tighten_generic_list("< str ,  List <i32> >"),
+            "<str , List<i32>>"
+        );
+    }
+
+    // --- §4.3 (Q4): after a block-like brace ---------------------------------
+
+    #[test]
+    fn as_after_a_block_like_brace_continues_the_form() {
+        assert_eq!(expression("match k { _ => 1 } as T"), "(as (match k) T)");
+        assert_eq!(expression("if c { 1 } else { 2 } as T"), "(as (if c 1) T)");
+        assert_eq!(
+            expression("match k { _ => 1 } as T .b()"),
+            "(. (as (match k) T) (call b []))"
+        );
+        assert_eq!(
+            expression("a + match k { _ => 1 } as T"),
+            "(Add a (as (match k) T))"
+        );
+        assert_eq!(
+            expression("match k { _ => 1 } as T + 1"),
+            "(Add (as (match k) T) 1)"
+        );
+        assert_eq!(expression("{ 1 } as T"), "(as {1} T)");
+    }
+
+    #[test]
+    fn at_a_statement_head_the_brace_line_decides() {
+        assert_eq!(
+            statements("\tmatch k { _ => 1 } as T;"),
+            vec!["(as (match k) T)"]
+        );
+        // On a later line `as` is a NAME beginning the next statement.
+        assert_eq!(
+            statements("\tmatch k { _ => 1 }\n\tas(5);"),
+            vec!["(match k)", "(call as [5])"]
+        );
+    }
+
+    // --- Q6: contextual ------------------------------------------------------
+
+    #[test]
+    fn as_is_a_name_where_a_name_can_stand() {
+        assert_eq!(statements("\tlet as = 5;\n\tprint(as);").len(), 2);
+        assert_eq!(expression("as + 1"), "(Add as 1)");
+        assert_eq!(expression("f(as)"), "(call f [as])");
+        assert!(rendered_errors("fun as(value: i32) { }").is_empty());
+        assert!(rendered_errors("import a::{b as c};").is_empty());
+    }
+
+    #[test]
+    fn an_as_no_type_follows_is_not_an_ascription() {
+        // A missing `;` before a line starting with a name `as` is still the
+        // missing `;`.
+        assert_eq!(
+            rendered_errors("fun main() {\n\tlet x = foo()\n\tas = 5;\n}\n"),
+            vec!["expected `;` to end this statement".to_string()]
+        );
+    }
+
+    // --- B570: `auto` -------------------------------------------------------
+
+    fn type_shape(source: &str) -> String {
+        let (mut tokens, errors) = lexing::tokenize(source);
+        assert!(errors.is_empty());
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let node = parser.parse_type().expect("a type");
+        assert_eq!(
+            parser.position, token_count,
+            "unconsumed tokens in {source:?}"
+        );
+        format!("{:?}", node.0)
+    }
+
+    #[test]
+    fn auto_is_a_marker_at_a_types_head_and_a_name_elsewhere() {
+        assert!(type_shape("auto i32").starts_with("AutoType(Some("));
+        assert!(type_shape("auto List<str>").starts_with("AutoType(Some("));
+        assert!(type_shape("auto").starts_with("AutoType(None)"));
+        assert!(type_shape("auto::Thing").starts_with("StaticAccessor"));
+        assert!(rendered_errors("fun f(): auto { 5 }").is_empty());
+        assert!(rendered_errors("fun f(): auto i32 context settings { 5 }").is_empty());
+        assert!(rendered_errors("fun main() { let x: auto = 5; let auto = 1; }").is_empty());
+        assert!(rendered_errors("fun main() { let w = Length::auto(); }").is_empty());
+        assert_eq!(expression("x as auto List<i32>"), "(as x auto List<i32>)");
     }
 }

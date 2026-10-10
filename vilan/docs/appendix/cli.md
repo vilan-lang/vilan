@@ -253,8 +253,7 @@ the package's own files (never to std or a dependency), analyzes again,
 and repeats until a round finds nothing more to fix; then it checks as
 usual and reports what is left. The edits are the editor's quick fixes,
 computed by the same functions, so the two never disagree. It cannot be
-combined with `--watch`. It fixes two kinds of diagnostic, each the
-migration tool for one release:
+combined with `--watch`. It fixes four kinds of diagnostic:
 
 - **A moved std path** (v0.44.0, where std's modules were grouped under
   namespaces): every `import std::dom::…` becomes `import
@@ -286,11 +285,22 @@ migration tool for one release:
   literal (**Convert with `.as_usize()`**, **Declare `at` a `usize`**).
   What it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
   arithmetic that should convert once at its end — stays a diagnostic,
-  for a person.
+  for a person. An ascription to another width (`n as f64`, which names
+  a type and never converts) is rewritten to the conversion in its place,
+  `n.as_f64()`.
+- **A stale or unfilled `auto`** ([`auto` annotations](../spec/types.md#auto-types-the-toolchain-keeps)):
+  the written type is rewritten to what the item now infers, and a bare
+  `auto` is filled, spelled the shortest way the file can name the type —
+  by name, or through a module it imports. It never adds an import: a
+  type the file cannot name is left, with the import that would let it.
+  A rewrite that changes what callers read re-checks them in the next
+  round, so a caller's own `auto`, or a conversion a caller now needs,
+  follows it.
 
 It prints what it did before the check's own report: for moved paths, a
 total and then one line per file with its count, and a line for each
-path it left; then, always, the numeric line.
+path it left; then, always, the numeric line; then, when it wrote any,
+a line counting the `auto` annotations.
 
 ```text
 fixed 4 moved std paths in 3 files
@@ -331,6 +341,23 @@ key. Each lint is `"allow"` (the default) or `"warn"`, and a lint name or a
 level the section does not have is a manifest error rather than a silent
 no-op. The section is read from the entry package's manifest; std's own uses,
 and a dependency's, are their authors' and never warn.
+
+**Keeping `auto` types: `[check] auto`.** A package can ask `vilan check` to
+keep its inferred types written as [`auto` annotations](../spec/types.md#auto-types-the-toolchain-keeps):
+
+```toml
+[check]
+auto = "exported"
+```
+
+Under `"exported"` each return and module binding reachable from outside
+its module — `export`-marked, in an `export *;` file, or an inherent method
+of an exported type — whose type is inferred gets a warning carrying its
+`: auto T`, which `vilan check --fix` (and the editor's on-save action)
+writes; `"all"` covers every return and module binding; `"off"` is the
+default. A void return and a local binding are never asked for, and a type
+the file cannot name without a new import is left for a person. Like
+`[lints]`, the section is read from the entry package's manifest.
 
 ## `vilan run [file] [args…]`
 
@@ -408,6 +435,14 @@ is the current directory. Formatting is conservative and a fixed point:
   lowest-precedence operator and operator-leading. The permission stops at the
   head: a loop body is a fresh statement list and a `match`'s legs earn their
   own breaks from their own lines.
+- A chain with a type ascription on MORE than one stage splits regardless
+  of width, one stage per line, each `as T` closing its stage's line:
+  `let n = words as List<str>` on the first line, then `.map(f) as
+  List<usize>` and `.len() as usize` below it. A single ascription follows
+  the ordinary chain rule. A closure type after `as` is printed
+  parenthesized — `f as (|i32| i32)` — so its greedy return type never has
+  to be found by eye, and a spaced generic list after `as` is written tight
+  (`as List<i32>`), the spelling the grammar reads as one.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
 - A call's *argument* list is never wrapped, but the split reaches the

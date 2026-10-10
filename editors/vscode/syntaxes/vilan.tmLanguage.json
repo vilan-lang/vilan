@@ -334,8 +334,8 @@
      }
     },
     {
-     "comment": "The `as` ALIAS in an import path \u2014 `import a::b as c;`, `use a::{ b as c };` (E142/E145). Contextual like `context` and `sync`: the lexer hands `as` back as an identifier and `let as = 1` parses, so the guard is BOTH sides \u2014 an identifier character before it and a name after it, which is the only place the alias can sit.",
-     "match": "(?<=[A-Za-z0-9_])\\s+(as)\\b(?=\\s+[A-Za-z_])",
+     "comment": "`as` \u2014 the ALIAS in an import path (`import a::b as c;`, `use a::{ b as c };`, E142/E145) and the type ASCRIPTION after a complete operand (`[] as List<str>`, `f() as A`, `match k { .. } as T`, `x as (|i32| i32)`, B571). Contextual like `context` and `sync`: the lexer hands `as` back as an identifier and `let as = 1` parses, so the guard is BOTH sides \u2014 something an operand ENDS with before it (a name, a closer, a quote) and something a type BEGINS with after it (a name, `(`, `&`, `|`), which is the only place either reading can sit. `let as = 1`, `f(as)` and `value.as` stay plain.",
+     "match": "(?<=[A-Za-z0-9_\\)\\]\\}\"'])\\s+(as)\\b(?=\\s+[A-Za-z_(&|])",
      "captures": {
       "1": {
        "name": "keyword.control.import.vilan"
@@ -390,6 +390,15 @@
     {
      "comment": "B414: `dyn` \u2014 see `own` above; the trait-object marker in type position.",
      "match": "\\b(dyn)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "keyword.other.vilan"
+      }
+     }
+    },
+    {
+     "comment": "B570: `auto` \u2014 the toolchain-kept type at an annotation's head: after a `:` (never a `::`, so `Length::auto()` stays a name) or after `as`, and never before `::` (a path into a module named `auto`). `let auto = 1` and a field named `auto` stay plain.",
+     "match": "(?:(?<=[^:]:)|(?<=\\b[a][s]\\s))\\s*(auto)\\b(?!\\s*::)",
      "captures": {
       "1": {
        "name": "keyword.other.vilan"

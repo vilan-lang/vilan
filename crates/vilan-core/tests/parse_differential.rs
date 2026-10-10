@@ -227,6 +227,18 @@ fn corpus_absent_constructs() -> Vec<(String, String)> {
             "nested_module",
             "mod outer { mod inner { fun deep() { } } struct Local { n: i32 } }",
         ),
+        // B571: type ascription — a chain ascribed per stage, after a block-like
+        // brace, beside a spaced comparison, and `as` still a name.
+        (
+            "ascription_chain",
+            "fun a(): C { make() as List<A>\n.map(f) as List<B>\n.first() as C }",
+        ),
+        (
+            "ascription_block_like",
+            "fun b(): T { let x = match k { _ => 1 } as T; if c { 1 } else { 2 } as T }",
+        ),
+        ("ascription_comparison", "fun c(): bool { n as usize < limit }"),
+        ("ascription_name", "fun as(as: i32): i32 { as }"),
     ]
     .into_iter()
     .map(|(label, source)| (format!("adversarial:{label}"), source.to_string()))

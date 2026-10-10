@@ -4081,6 +4081,7 @@ fn server_capabilities() -> ServerCapabilities {
                 CodeActionKind::QUICKFIX,
                 CodeActionKind::REFACTOR_REWRITE,
                 fix_all_imports_kind(),
+                fix_all_auto_kind(),
             ]),
             ..Default::default()
         })),
@@ -5008,7 +5009,9 @@ impl LanguageServer for Backend {
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
                         tooltip: hint.full.map(|full| {
-                            InlayHintTooltip::String(full.trim_start_matches(": ").to_string())
+                            // `: T` for a binding, ` as T` for a stage (E278).
+                            let full = full.trim_start_matches(": ").trim_start_matches(" as ");
+                            InlayHintTooltip::String(full.to_string())
                         }),
                         padding_left: Some(false),
                         padding_right: Some(false),
@@ -5639,9 +5642,15 @@ impl LanguageServer for Backend {
                 action_kind_requested(&params.context.only, &fix_all_imports_kind());
             let wants_refactor =
                 action_kind_requested(&params.context.only, &CodeActionKind::REFACTOR_REWRITE);
+            let wants_auto = action_kind_requested(&params.context.only, &fix_all_auto_kind());
             // Skip the work entirely when the client asked for a kind none of
-            // these four answer.
-            if !wants_organize && !wants_quickfix && !wants_fix_all_imports && !wants_refactor {
+            // these five answer.
+            if !wants_organize
+                && !wants_quickfix
+                && !wants_fix_all_imports
+                && !wants_refactor
+                && !wants_auto
+            {
                 return Ok(None);
             }
             let uri = params.text_document.uri;
@@ -5768,6 +5777,57 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }));
             }
+            // B570 S3: every stale or unfilled `auto` in the file rewritten —
+            // nothing while the file has any other error, or while the buffer
+            // is ahead of the analysis.
+            if wants_auto {
+                let edits = document.auto_fix_all();
+                if !edits.is_empty() {
+                    let text_edits: Vec<TextEdit> = edits
+                        .into_iter()
+                        .map(|(span, new_text)| TextEdit {
+                            range: document.line_index.range(&span),
+                            new_text,
+                        })
+                        .collect();
+                    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                    changes.insert(uri.clone(), text_edits);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Keep `auto` types current".to_string(),
+                        kind: Some(fix_all_auto_kind()),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
+            // E278: "Ascribe this stage" and "Ascribe every stage of this
+            // chain", the per-stage hints written into the file.
+            if wants_refactor {
+                for (title, edits) in document.stage_ascriptions(live_span(&document, params.range))
+                {
+                    let text_edits: Vec<TextEdit> = edits
+                        .into_iter()
+                        .map(|(span, new_text)| TextEdit {
+                            range: document.line_index.range(&span),
+                            new_text,
+                        })
+                        .collect();
+                    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                    changes.insert(uri.clone(), text_edits);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title,
+                        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
             if let Some(program) = document.program.as_ref() {
                 if wants_quickfix {
                     let range = live_span(&document, params.range);
@@ -5863,6 +5923,12 @@ fn live_span(document: &Document, range: Range) -> Span {
 /// kind is what avoids ever needing one.
 fn fix_all_imports_kind() -> CodeActionKind {
     CodeActionKind::new("source.fixAll.imports")
+}
+
+/// B570 S3 (Q5 RULED): the `auto` rewrites' own source action — what
+/// `vilan.autoTypes.onSave` asks for, separate from every other fix.
+fn fix_all_auto_kind() -> CodeActionKind {
+    CodeActionKind::new("source.fixAll.vilan.auto")
 }
 
 /// Whether a code-action request wants `kind` — an unfiltered request (no

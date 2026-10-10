@@ -208,6 +208,23 @@ pub(crate) fn count_settled_type_slot() {
     SETTLED_TYPE_SLOTS_MINTED.with(|count| count.set(count.get() + 1));
 }
 
+thread_local! {
+    static READING_AIDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Reading-aid entries this thread's analyses have typed and spelled — one
+/// per E278 stage hint and per B570 `auto` fill (or `[check] auto` warning)
+/// considered after the types settled. Zero for an analysis no front end reads
+/// them from (`Workspace::reading_aids` off, no opt-in): the cold-check
+/// invariant. Monotonic; read as a difference around the work in question.
+pub fn reading_aids_rendered() -> u64 {
+    READING_AIDS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_reading_aid() {
+    READING_AIDS.with(|count| count.set(count.get() + 1));
+}
+
 pub(crate) fn count_type_slot() {
     TYPE_SLOTS_MINTED.with(|count| count.set(count.get() + 1));
 }

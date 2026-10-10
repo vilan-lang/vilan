@@ -34,11 +34,12 @@ ret       struct    trait    type    use     true    false
 
 Contextual keywords (an identifier everywhere but their one position;
 B414 made `with`, `borrows`, `own`, `dyn`, `lazy` and `jump` contextual, and
-B459 added `then`):
+B459 added `then`, B570 `auto`):
 
 ```text
-as        borrows   context   dyn       jump      lazy      only
-own       self      Self      sync      then      void      with
+as        auto      borrows   context   dyn       jump      lazy
+only      own       self      Self      sync      then      void
+with
 ```
 
 Also matched by text in one position: `break`/`continue` (after `jump`), and the

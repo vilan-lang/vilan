@@ -92,6 +92,187 @@ fn every_steered_mismatch_is_converted_and_the_check_then_passes() {
     assert!(text.contains("{width.as_usize() < at}"), "{text}");
 }
 
+/// B571 Q7 (RULED): `as` names a type and never converts, so `n as f64` over
+/// an `i32` is refused with the conversion — and `check --fix` writes the
+/// conversion IN PLACE of the ascription (`n.as_f64()`), a stage's too
+/// (`xs.len().as_i32()`), never `(n as f64).as_f64()`.
+#[test]
+fn b571_an_ascription_to_another_width_is_rewritten_to_the_conversion() {
+    let dir = temp_package(
+        "ascribe",
+        concat!(
+            "fun main() {\n",
+            "\tlet n: i32 = 3;\n",
+            "\tlet ratio = n as f64 / 2.0;\n",
+            "\tlet xs = [\"a\", \"b\"];\n",
+            "\tlet count = xs.len() as i32 + 1;\n",
+            "\tprint(i\"{ratio} {count}\");\n",
+            "}\n",
+        ),
+    );
+    assert!(
+        !vilan(&dir, &["check", "."]).status.success(),
+        "the program is refused before the fix, so the pin is not vacuous"
+    );
+    let output = vilan(&dir, &["check", "--fix", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = entry(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("let ratio = n.as_f64() / 2.0;"), "{text}");
+    assert!(
+        text.contains("let count = xs.len().as_i32() + 1;"),
+        "{text}"
+    );
+}
+
+/// B570: a stale `auto` is rewritten and a bare one filled, in `--fix`'s
+/// rounds — and a rewrite that changes what callers read re-checks them in the
+/// next round (here a caller's numeric conversion follows the rewrite).
+#[test]
+fn b570_stale_and_unfilled_autos_are_rewritten_to_a_clean_check() {
+    let dir = temp_package(
+        "auto",
+        concat!(
+            "fun ratio(): auto f64 {\n",
+            "\t5\n",
+            "}\n",
+            "\n",
+            "fun greeting(): auto {\n",
+            "\t\"hi\"\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet half: f64 = ratio();\n",
+            "\tprint(i\"{half} {greeting()}\");\n",
+            "}\n",
+        ),
+    );
+    assert!(
+        !vilan(&dir, &["check", "."]).status.success(),
+        "the stale `auto` is refused before the fix"
+    );
+    let output = vilan(&dir, &["check", "--fix", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = entry(&dir);
+    let second = vilan(&dir, &["check", "--fix", "."]);
+    let after = entry(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("fixed 2 `auto` annotations in 1 file"),
+        "{stdout}"
+    );
+    assert!(text.contains("fun ratio(): auto i32 {"), "{text}");
+    assert!(text.contains("fun greeting(): auto str {"), "{text}");
+    assert!(text.contains("let half: f64 = ratio().as_f64();"), "{text}");
+    assert!(second.status.success());
+    assert_eq!(text, after, "a second run changes nothing");
+}
+
+/// B570 S2: a stale `as auto T` is rewritten in place, its `auto` kept.
+#[test]
+fn b570_a_stale_auto_ascription_is_rewritten() {
+    let dir = temp_package(
+        "auto_as",
+        concat!(
+            "fun main() {\n",
+            "\tlet words = [\"a\", \"bb\"];\n",
+            "\tlet count = words.len() as auto i32;\n",
+            "\tprint(count);\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "--fix", "."]);
+    let text = entry(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        text.contains("let count = words.len() as auto usize;"),
+        "{text}"
+    );
+}
+
+/// B570 S4 (§8, Q6 RULED): under `[check] auto = "exported"`, each exported
+/// return and module binding whose type is inferred is warned about and
+/// written by `--fix` — an exported free function, an inherent method of an
+/// exported type, an exported module binding — and a private one, a void
+/// return and a local are left alone.
+#[test]
+fn b570_the_exported_opt_in_writes_auto_on_exported_items_only() {
+    let dir = temp_tree(
+        "auto_opt_in",
+        &[
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\n\n[check]\nauto = \"exported\"\n",
+            ),
+            (
+                "src/main.vl",
+                "import pkg::model::{ total, Counter, names, #(impl Counter) };\n\nfun main() {\n\tlet c = Counter { n = 2 };\n\tprint(i\"{total(3)} {c.double()} {names.len()}\");\n}\n",
+            ),
+            (
+                "src/model.vl",
+                "export struct Counter {\n\tn: i32,\n}\n\nimpl Counter {\n\tfun double(self) {\n\t\tself.n * 2\n\t}\n}\n\nexport fun total(x: i32) {\n\tlet local = helper(x);\n\tlocal + 1\n}\n\nfun helper(x: i32) {\n\tx\n}\n\nexport fun shout() {\n\tprint(\"!\");\n}\n\nexport let names = [\"a\"];\nlet hidden = 3;\n",
+            ),
+        ],
+    );
+    let (warned, warn_stdout, warn_stderr) = run(&dir, &["check", "."]);
+    let (ok, stdout, stderr) = run(&dir, &["check", "--fix", "."]);
+    let model = read(&dir, "src/model.vl");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        warned,
+        "the opt-in warns, it does not refuse: {warn_stdout}{warn_stderr}"
+    );
+    assert!(
+        format!("{warn_stdout}{warn_stderr}").contains(
+            "`total`'s return is inferred, and this package asks for its `auto` \
+             (`[check] auto = \"exported\"`)"
+        ),
+        "{warn_stdout}{warn_stderr}"
+    );
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("fixed 3 `auto` annotations in 1 file"),
+        "{stdout}"
+    );
+    assert!(model.contains("fun double(self): auto i32 {"), "{model}");
+    assert!(
+        model.contains("export fun total(x: i32): auto i32 {"),
+        "{model}"
+    );
+    assert!(
+        model.contains("export let names: auto List<str> = [\"a\"];"),
+        "{model}"
+    );
+    assert!(
+        model.contains("fun helper(x: i32) {"),
+        "the private function is left: {model}"
+    );
+    assert!(
+        model.contains("export fun shout() {"),
+        "a void return is never written: {model}"
+    );
+    assert!(
+        model.contains("let local = helper(x);"),
+        "a local is never written: {model}"
+    );
+    assert!(model.contains("let hidden = 3;"), "{model}");
+}
+
 #[test]
 fn a_literal_counter_is_declared_usize_and_its_other_uses_convert_in_later_rounds() {
     let dir = temp_package(

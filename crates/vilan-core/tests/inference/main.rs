@@ -17,6 +17,8 @@
 
 mod support;
 
+mod ascription;
+mod auto_annotations;
 mod backed_enums;
 mod borrows;
 mod bounds;
