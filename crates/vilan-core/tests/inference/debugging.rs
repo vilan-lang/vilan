@@ -947,6 +947,335 @@ fn e282_an_invalidation_follows_the_paths_and_the_loops_to_a_dbg_stack_call() {
     );
 }
 
+/// S2 (debugging.md §4.1): the parameters and locals in scope at the call,
+/// innermost scope first and in declaration order within a scope, each
+/// shadowed binding directly under the one hiding it with where it was hidden;
+/// a binding declared after the call, and a module-level one, are not listed;
+/// a value lays out from where it starts, broken entries two spaces under the
+/// binding; the header names the function.
+#[test]
+fn s2_dbg_stack_lists_the_scope_innermost_first_with_shadowed_bindings_under_their_shadows() {
+    assert_dbg_runs(
+        concat!(
+            "struct Point { x: i32, y: i32 }\n",
+            "let global = 7;\n",
+            "fun area(point: Point, scale: i32): i32 {\n",
+            "\tlet x = point.x * scale;\n",
+            "\t{\n",
+            "\t\tlet x = \"inner\";\n",
+            "\t\tlet points = [point, point, point, point, point];\n",
+            "\t\tdbg_stack();\n",
+            "\t}\n",
+            "\tlet later = 1;\n",
+            "\tx * point.y + later\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(area(Point { x = 1, y = 2 }, 3) + global);\n",
+            "}\n",
+        ),
+        "14\n",
+        concat!(
+            "[test.vl:8:3] dbg_stack() in area\n",
+            "  x: str = \"inner\"\n",
+            "  x (shadowed at 6:7): i32 = 3\n",
+            "  points: List<Point> = [\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "    Point { x = 1, y = 2 },\n",
+            "  ]\n",
+            "  point: Point = Point { x = 1, y = 2 }\n",
+            "  scale: i32 = 3\n",
+        ),
+    );
+}
+
+/// S2 on debug-48's repro: E281's and E282's records decide that `guard` (moved)
+/// and `first` (a capture view a push invalidated since its last use) print
+/// their state and are NOT read — a read of either would be refused — while a
+/// view still valid at the call prints through, marked as one.
+#[test]
+fn s2_dbg_stack_prints_a_moved_resource_and_an_invalidated_view_without_reading_them() {
+    assert_dbg_runs(
+        concat!(
+            "[resource]\n",
+            "struct Guard { id: i32 }\n",
+            "fun consume(own guard: Guard) {\n",
+            "\tprint(guard.id);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet guard = Guard { id = 1 };\n",
+            "\tconsume(guard);\n",
+            "\tmut rows = [Some(1), Some(2)];\n",
+            "\tmatch &rows[1] {\n",
+            "\t\tSome(let second) => {\n",
+            "\t\t\tdbg_stack();\n",
+            "\t\t\tprint(*second);\n",
+            "\t\t},\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "\tmatch &rows[0] {\n",
+            "\t\tSome(let first) => {\n",
+            "\t\t\tprint(*first);\n",
+            "\t\t\trows.push(None);\n",
+            "\t\t\tdbg_stack();\n",
+            "\t\t},\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "1\n2\n1\n",
+        concat!(
+            "[test.vl:12:4] dbg_stack() in main\n",
+            "  second: view i32 = 2  (a view into rows)\n",
+            "  guard: Guard = <moved at 8:10>\n",
+            "  rows: List<Option<i32>> = [Some(1), Some(2)]\n",
+            "[test.vl:21:4] dbg_stack() in main\n",
+            "  first: view i32 = <view, invalidated by push at 20:4>  (a view into rows)\n",
+            "  guard: Guard = <moved at 8:10>\n",
+            "  rows: List<Option<i32>> = [Some(1), Some(2), None]\n",
+        ),
+    );
+}
+
+/// S2 inside a closure: its own parameters and locals, then the enclosing
+/// bindings it CAPTURES, marked — and not one it does not (listing it would
+/// capture it); the header names the function the closure is written in.
+#[test]
+fn s2_dbg_stack_in_a_closure_lists_its_own_bindings_then_its_captures() {
+    assert_dbg_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet base = 10;\n",
+            "\tlet unused = \"not captured\";\n",
+            "\tlet add = |n: i32| {\n",
+            "\t\tlet sum = n + base;\n",
+            "\t\tdbg_stack();\n",
+            "\t\tsum\n",
+            "\t};\n",
+            "\tprint(add(1));\n",
+            "}\n",
+        ),
+        "11\n",
+        concat!(
+            "[test.vl:6:3] dbg_stack() in a closure in main\n",
+            "  sum: i32 = 11\n",
+            "  n: i32 = 1\n",
+            "  base: i32 = 10  (captured)\n",
+        ),
+    );
+}
+
+/// S2 (§4.2): a cell prints its current value WITHOUT subscribing. Inside an
+/// effect, a `dbg_stack()` reading a captured cell leaves the effect
+/// subscribed to what it was — a `set` of that cell does not re-run it.
+#[test]
+fn s2_dbg_stack_reads_a_cell_without_subscribing() {
+    assert_dbg_runs(
+        concat!(
+            "import std::reactive::{ Owner, Signal, SignalCell, owner_scope };\n",
+            "fun main() {\n",
+            "\tlet count: SignalCell<i32> = Signal::new(3);\n",
+            "\tlet other: SignalCell<i32> = Signal::new(5);\n",
+            "\tlet owner = Owner::new();\n",
+            "\towner_scope.run(owner, || {\n",
+            "\t\tcount.effect(|value| {\n",
+            "\t\t\tif value > 100 {\n",
+            "\t\t\t\tother.set(0);\n",
+            "\t\t\t}\n",
+            "\t\t\tdbg_stack();\n",
+            "\t\t});\n",
+            "\t});\n",
+            "\tother.set(6);\n",
+            "\tcount.set(4);\n",
+            "}\n",
+        ),
+        "",
+        concat!(
+            "[test.vl:11:4] dbg_stack() in a closure in main\n",
+            "  value: i32 = 3\n",
+            "  other: SignalCell<i32> = SignalCell(5)  (captured, read without tracking)\n",
+            "[test.vl:11:4] dbg_stack() in a closure in main\n",
+            "  value: i32 = 4\n",
+            "  other: SignalCell<i32> = SignalCell(6)  (captured, read without tracking)\n",
+        ),
+    );
+}
+
+/// S2 (§4.2): looking must not change the program. A pipe prints by its type
+/// alone (sampling it would run its bodies) and a `lazy` parameter is not
+/// forced — the argument's side effect never happens.
+#[test]
+fn s2_dbg_stack_prints_a_pipe_and_a_lazy_parameter_without_running_them() {
+    assert_dbg_runs(
+        concat!(
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "fun noisy(): str {\n",
+            "\tprint(\"forced\");\n",
+            "\t\"noisy\"\n",
+            "}\n",
+            "fun forces(lazy message: str, read: bool): str {\n",
+            "\tdbg_stack();\n",
+            "\tif read { message } else { \"unread\" }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet count: SignalCell<i32> = Signal::new(3);\n",
+            "\tlet doubled = count.derive(|value| {\n",
+            "\t\tprint(\"sampled\");\n",
+            "\t\tvalue * 2\n",
+            "\t});\n",
+            "\tprint(forces(noisy(), false));\n",
+            "\tdbg_stack();\n",
+            "}\n",
+        ),
+        "unread\n",
+        concat!(
+            "[test.vl:7:2] dbg_stack() in forces\n",
+            "  message: str = <lazy, not forced>\n",
+            "  read: bool = false\n",
+            "[test.vl:17:2] dbg_stack() in main\n",
+            "  count: SignalCell<i32> = SignalCell(3)  (read without tracking)\n",
+            "  doubled: Derive<SignalCell<i32>, i32, i32> = <pipe, not sampled>\n",
+        ),
+    );
+}
+
+/// S2 in a generic body: each instance prints its own types, and a `T`-typed
+/// binding moved where an instantiation makes `T` a resource (R11's scan, the
+/// generic half of E281's record) prints as moved in every instance — a read
+/// would keep it alive past the move, which would then have to copy a
+/// resource.
+#[test]
+fn s2_dbg_stack_in_a_generic_body_prints_each_instance() {
+    assert_dbg_runs(
+        concat!(
+            "[resource]\n",
+            "struct Guard { id: i32 }\n",
+            "fun pass<T>(own value: T, label: str): T {\n",
+            "\tlet kept = value;\n",
+            "\tdbg_stack();\n",
+            "\tkept\n",
+            "}\n",
+            "fun show<T>(value: T) {\n",
+            "\tdbg_stack();\n",
+            "}\n",
+            "fun main() {\n",
+            "\tshow(2.5);\n",
+            "\tshow([\"a\"]);\n",
+            "\tprint(pass(5, \"number\"));\n",
+            "\tlet guard = pass(Guard { id = 3 }, \"guard\");\n",
+            "\tprint(guard.id);\n",
+            "}\n",
+        ),
+        "5\n3\n",
+        concat!(
+            "[test.vl:9:2] dbg_stack() in show\n",
+            "  value: f64 = 2.5\n",
+            "[test.vl:9:2] dbg_stack() in show\n",
+            "  value: List<str> = [\"a\"]\n",
+            "[test.vl:5:2] dbg_stack() in pass\n",
+            "  value: i32 = <moved at 4:13>\n",
+            "  label: str = \"number\"\n",
+            "  kept: i32 = 5\n",
+            "[test.vl:5:2] dbg_stack() in pass\n",
+            "  value: Guard = <moved at 4:13>\n",
+            "  label: str = \"guard\"\n",
+            "  kept: Guard = Guard { id = 3 }\n",
+        ),
+    );
+}
+
+/// S2 (§4.2, "each listed binding counts as a use"): the read at the call keeps
+/// a resource owned to the `dbg_stack()` line, so its drop runs after the
+/// listing rather than right after its last use above it.
+#[test]
+fn s2_a_listed_binding_is_a_use_at_the_call() {
+    assert_dbg_runs(
+        concat!(
+            "import std::drop::Drop;\n",
+            "[resource]\n",
+            "struct Guard { id: i32 }\n",
+            "impl Guard with Drop {\n",
+            "\tfun drop(&mut self) {\n",
+            "\t\tdbg(self.id);\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet guard = Guard { id = 1 };\n",
+            "\tprint(guard.id);\n",
+            "\tdbg_stack();\n",
+            "\tdbg();\n",
+            "}\n",
+        ),
+        "1\n",
+        concat!(
+            "[test.vl:12:2] dbg_stack() in main\n",
+            "  guard: Guard = Guard { id = 1 }\n",
+            "[test.vl:6:3] self.id = 1\n",
+            "[test.vl:13:2]\n",
+        ),
+    );
+}
+
+/// S2: `dbg_stack()` takes no arguments — the expansion supplies them.
+#[test]
+fn s2_dbg_stack_takes_no_arguments() {
+    assert_fails_with(
+        "fun main() {\n\tlet x = 1;\n\tdbg_stack(x);\n}\n",
+        "`dbg_stack()` takes no arguments: it prints every binding in scope at the call",
+    );
+}
+
+/// S2 writes where `dbg` writes: stderr on node, `console.log` in the browser.
+#[test]
+fn s2_dbg_stack_writes_to_the_console_log_in_the_browser() {
+    let javascript = compile_on(
+        "fun main() {\n\tlet x = 1;\n\tdbg_stack();\n}\n",
+        Platform::Browser,
+    )
+    .expect("a clean browser compile");
+    assert!(
+        javascript.contains("__dbg_stack(console.log, \"test.vl:3:2\", \"dbg_stack() in main\""),
+        "{javascript}"
+    );
+    let node = compile("fun main() {\n\tlet x = 1;\n\tdbg_stack();\n}\n").expect("a clean compile");
+    assert!(
+        node.contains("__dbg_stack(console.error, \"test.vl:3:2\""),
+        "{node}"
+    );
+}
+
+/// `dbg(view)` of a scalar view prints the VALUE on JS, as the native backend's
+/// borrow does — not the `(base, key)` pair a scalar view is represented by
+/// (found building S2, which reads views the same way).
+#[test]
+fn s2_dbg_of_a_scalar_view_prints_its_value() {
+    assert_dbg_runs(
+        concat!(
+            "fun main() {\n",
+            "\tmut rows = [Some(1), Some(2)];\n",
+            "\tmatch &rows[0] {\n",
+            "\t\tSome(let first) => {\n",
+            "\t\t\tdbg(first);\n",
+            "\t\t\tprint(*first);\n",
+            "\t\t},\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "\tmut points = [(1, 2)];\n",
+            "\tfor pair in &mut points {\n",
+            "\t\tdbg(pair);\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "1\n",
+        concat!(
+            "[test.vl:5:4] first = 1\n",
+            "[test.vl:12:3] pair = (1, 2)\n",
+        ),
+    );
+}
+
 /// N149: N136's recording is static, so `print(value)` with `value: T` was not
 /// wrapped where `T` is a number and negative zero printed `-0` on JS (`0`
 /// natively). The type is read per instance now: the number instances share a

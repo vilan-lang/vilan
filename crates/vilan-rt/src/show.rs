@@ -142,6 +142,19 @@ pub fn dbg(location: Location, entries: Vec<(&str, Doc)>) {
     }
 }
 
+/// `dbg_stack()`'s lines (debugging.md S2): the `[file:line:col] title`
+/// header, then `  name: Type = value` per binding — the value laid out from
+/// where it starts, its broken entries two spaces under the binding — and the
+/// binding's note after it, to stderr.
+pub fn dbg_stack(location: Location, title: &str, entries: Vec<(&str, Doc, &str)>) {
+    eprintln!("[{}] {title}", location.0);
+    for (head, document, note) in entries {
+        let head = format!("  {head} = ");
+        let laid_out = document.layout(width(&head), 2);
+        eprintln!("{head}{laid_out}{note}");
+    }
+}
+
 /// A `List`'s document: at most 100 entries, then `… N more`; `fill` for a
 /// list of scalars (E277).
 pub fn list<T>(items: &[T], fill: bool, show: impl Fn(&T) -> Doc) -> Doc {

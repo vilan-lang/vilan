@@ -19,7 +19,7 @@
 //! are the runtimes' (`__dbg_*` on JS, `vilan_rt::show` natively), written
 //! twice and pinned against each other by the native differential.
 
-use crate::analyzer::{BackingValue, Program};
+use crate::analyzer::{BackingValue, DbgStackBinding, DbgStackSite, DbgStackValue, Program};
 use crate::id::Id;
 use crate::impl_select;
 use crate::type_::{Type, TypeId};
@@ -131,7 +131,108 @@ fn is_integer_name(name: &str) -> bool {
 /// The slot is one function reference per (trait, type) table, so a program
 /// that never calls `dbg` pays nothing (§2.3).
 pub fn tables_carry_show(program: &Program, policy: crate::options::DbgPolicy) -> bool {
-    policy != crate::options::DbgPolicy::Strip && !program.dbg_calls.is_empty()
+    policy != crate::options::DbgPolicy::Strip
+        && (!program.dbg_calls.is_empty() || !program.dbg_stack_sites.is_empty())
+}
+
+// --- `dbg_stack()` (debugging.md S2) ---
+//
+// A site prints a header line, then one line per listed binding:
+//
+//     [src/main.vl:12:5] dbg_stack() in main
+//       rows: List<i32> = [1, 2]
+//       first: view i32 = 1  (a view into rows)
+//       guard: Guard = <moved at 9:10>
+//       x (shadowed at 7:6): i32 = 1
+//
+// A value lays out from where it starts, its broken entries two spaces under
+// the binding. The text around the values is spelled here, once, so the two
+// emitters write the same bytes; each emitter only reads the value.
+
+/// The header line's text after the location: `dbg_stack() in main`.
+pub fn dbg_stack_title(site: &DbgStackSite) -> String {
+    match &site.owner {
+        Some(owner) => format!("dbg_stack() in {owner}"),
+        None => "dbg_stack()".to_string(),
+    }
+}
+
+/// A binding line's head, before ` = `: `x (shadowed at 7:6): view i32`. The
+/// type is resolved under the emitter's active substitution.
+pub fn dbg_stack_head(
+    program: &Program,
+    binding: &DbgStackBinding,
+    resolve: &dyn Fn(TypeId) -> TypeId,
+) -> String {
+    let shadowed = binding
+        .shadowed_at
+        .as_ref()
+        .map(|at| format!(" (shadowed at {at})"))
+        .unwrap_or_default();
+    let view = if binding.view { "view " } else { "" };
+    format!(
+        "{}{shadowed}: {view}{}",
+        binding.name,
+        type_text(program, binding.type_id, resolve)
+    )
+}
+
+/// What a binding prints INSTEAD of its value, when it prints one: a moved
+/// resource, an invalidated view, a pipe (sampling it would run it) and a
+/// `lazy` parameter (reading it would force it) are never read.
+pub fn dbg_stack_unread_value(
+    program: &Program,
+    binding: &DbgStackBinding,
+    resolve: &dyn Fn(TypeId) -> TypeId,
+) -> Option<String> {
+    match &binding.value {
+        DbgStackValue::Read(_) => is_pipe_type(program, binding.type_id, resolve)
+            .then(|| "<pipe, not sampled>".to_string()),
+        DbgStackValue::Moved(at) => Some(format!("<moved at {at}>")),
+        DbgStackValue::MovedOnSomePaths => Some("<moved on some paths>".to_string()),
+        DbgStackValue::Invalidated { by, at } => {
+            Some(format!("<view, invalidated by {by} at {at}>"))
+        }
+        DbgStackValue::Pipe => Some("<pipe, not sampled>".to_string()),
+        DbgStackValue::Lazy => Some("<lazy, not forced>".to_string()),
+    }
+}
+
+/// What follows a binding's value: `  (a view into rows)`, `  (captured)`, a
+/// cell's `  (read without tracking)` — or nothing.
+pub fn dbg_stack_note(
+    program: &Program,
+    binding: &DbgStackBinding,
+    resolve: &dyn Fn(TypeId) -> TypeId,
+) -> String {
+    let mut notes: Vec<String> = Vec::new();
+    if !binding.view_into.is_empty() {
+        notes.push(format!("a view into {}", binding.view_into.join(", ")));
+    }
+    if binding.captured {
+        notes.push("captured".to_string());
+    }
+    if matches!(binding.value, DbgStackValue::Read(_))
+        && matches!(
+            shape_of(program, binding.type_id, resolve),
+            Shape::Cell { .. }
+        )
+    {
+        notes.push("read without tracking".to_string());
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", notes.join(", "))
+    }
+}
+
+/// Whether `type_id` (under `resolve`) is a std pipe, which prints by its type.
+fn is_pipe_type(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) -> TypeId) -> bool {
+    matches!(
+        program.type_id_to_type_map.get(&resolve(type_id)),
+        Some(Type::Struct(struct_id, _)) if is_a_pipe(program, *struct_id)
+    )
 }
 
 /// E275: the trait a WRITTEN `Debug` impl for `type_id` is reached through —

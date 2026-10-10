@@ -20,7 +20,10 @@ mod hint_labels;
 mod hover_labels;
 mod liveness;
 
-pub use dbg_stack::{DbgStackInvalidation, DbgStackMove};
+pub use dbg_stack::{
+    DbgStackBinding, DbgStackInvalidation, DbgStackMove, DbgStackSite, DbgStackValue,
+    refuse_release_dbg_stack,
+};
 use dbg_stack::{DbgStackViewSite, DbgStackViewState};
 pub use hint_labels::HintLabel;
 pub use hover_labels::{DEFINITION_MEMBER_CAP, PatternLabel, ReferenceHover, TypeDefinitions};
@@ -5800,6 +5803,8 @@ pub struct Analyzer<'src> {
     // last use, with a rule-4 event on their root since (the view-invalidation
     // scan's per-site record).
     dbg_stack_invalidated: HashMap<Id, Vec<DbgStackInvalidation>>,
+    // S2: each `dbg_stack()` call's expansion, for both emitters.
+    dbg_stack_sites: HashMap<Id, DbgStackSite>,
     panic_fn_id: Option<Id>,
     // Every call's `(call id, subject id)` pair, banked at WALK time (B204).
     // `function_calls` holds the same pair, but only once the call's own
@@ -7623,6 +7628,7 @@ impl<'src> Analyzer<'src> {
             dbg_stack_calls: IndexMap::default(),
             dbg_stack_moves: HashMap::default(),
             dbg_stack_invalidated: HashMap::default(),
+            dbg_stack_sites: HashMap::default(),
             call_subjects: Vec::new(),
             call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
@@ -68063,6 +68069,9 @@ pub struct Program<'src> {
     /// E282: at each `dbg_stack()` call, the capture views past their last
     /// use that a rule-4 event has invalidated since.
     pub dbg_stack_invalidated: HashMap<Id, Vec<DbgStackInvalidation>>,
+    /// S2: each `dbg_stack()` call's expansion — every binding in scope, how
+    /// it prints, and the minted read (a call argument) of the ones it reads.
+    pub dbg_stack_sites: HashMap<Id, DbgStackSite>,
     /// N136: the `print` arguments the analysis typed as a number of the
     /// language's own (every integer width, `f32`, `f64`) — the JS backend
     /// prints them through `String(x)`.
@@ -78874,6 +78883,12 @@ fn analyze_over_world<'src>(
         intrinsics.insert(id, Intrinsic::QuerySelectorAll);
     }
 
+    // debugging.md S2: each `dbg_stack()` call becomes one minted `Ref` read
+    // per binding it may read, from the scope at the call and the two per-site
+    // records the move and view checks wrote (E281, E282) — AFTER every check
+    // (they judged the program as written) and BEFORE the last-use dataflow,
+    // so the reads count as uses for liveness, copy elision and drop extents.
+    analyzer.expand_dbg_stacks();
     // Transparent references (R5): rewrite bare assignments to a view into the
     // write-through deref form before codegen reads the targets.
     analyzer.rewrite_view_assignment_targets();
@@ -79795,6 +79810,7 @@ fn analyze_over_world<'src>(
         dbg_stack_fn_id: analyzer.dbg_stack_fn_id,
         dbg_stack_moves: std::mem::take(&mut analyzer.dbg_stack_moves),
         dbg_stack_invalidated: std::mem::take(&mut analyzer.dbg_stack_invalidated),
+        dbg_stack_sites: std::mem::take(&mut analyzer.dbg_stack_sites),
         number_print_arguments: std::mem::take(&mut analyzer.number_print_arguments),
         track_caller_parameters: HashMap::default(),
         index_location_arguments: HashMap::default(),

@@ -11450,6 +11450,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if Some(target) == self.program.dbg_fn_id {
             return self.dbg_call(call_id, &function_call.argument_ids, depth, span);
         }
+        if Some(target) == self.program.dbg_stack_fn_id {
+            return self.dbg_stack_call(call_id, &function_call.argument_ids, depth, span);
+        }
         if Some(target) == self.program.print_fn_id {
             self.refuse_unprintable(&function_call.argument_ids, span)?;
             let value = self.place_argument(&function_call.argument_ids, 0, depth)?;

@@ -42,6 +42,34 @@ entries as fit the 80 columns. A list stops after 100 entries with `… N more`.
 `debug` preset prints, the `release` preset refuses the build, `"strip"` makes
 each call its argument, `"keep"` prints in release too.
 
+## `dbg_stack`
+
+```vilan,fragment
+fun dbg_stack()    // no arguments; in the prelude
+```
+
+`dbg_stack()` writes a `[file:line:column] dbg_stack() in <function>` line and
+then one `  name: Type = value` line per binding in scope at the call, to the
+stream `dbg` writes to. The compiler expands each call from the scope it sits
+in:
+
+- the parameters and locals visible at the call, innermost scope first and in
+  declaration order within a scope; a shadowed binding follows the one that
+  hides it as `x (shadowed at L:C): T`; inside a closure, its own bindings and
+  then the ones it captures, `(captured)`; no module-level binding;
+- a view is typed `view T`, with `(a view into rows)` naming what it views;
+- a moved resource prints `<moved at L:C>`, or `<moved on some paths>`; a view
+  invalidated since its last use prints `<view, invalidated by push at L:C>`
+  (or `by assignment`); a pipe `<pipe, not sampled>`; a `lazy` parameter
+  `<lazy, not forced>` — none of them is read;
+- a `SignalCell` prints its current value without subscribing, `(read without
+  tracking)`;
+- every other value prints as `dbg` prints it, laid out from where it starts,
+  its broken entries two spaces under the binding.
+
+Every binding it reads counts as a use at the call. `[build] dbg` applies to it
+as it does to `dbg`.
+
 ## `Debug`
 
 ```vilan,fragment

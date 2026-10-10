@@ -11411,6 +11411,25 @@ fn s1b_a_dyn_value_prints_what_it_holds_on_both_backends() {
     );
 }
 
+/// debugging.md S2: `dbg_stack()` prints every binding in scope — innermost
+/// scope first, a shadowed one under the binding hiding it, a closure's
+/// captures marked, a moved resource (at a concrete site and in a generic
+/// body's resource instance) and an invalidated view without reading them, a
+/// cell without subscribing (the effect does not re-run on the captured cell's
+/// `set`), a pipe and a `lazy` parameter without running them — the same bytes
+/// on both backends (`native/dbg_stack.*`). Each listed binding is a use at
+/// the call, so `let copied = numbers` copies where it used to move, and
+/// `dbg(first)` of a scalar view prints the value (not the JS pair).
+#[test]
+fn s2_dbg_stack_prints_the_scope_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_stack.vl",
+        include_str!("native/dbg_stack.vl"),
+        include_str!("native/dbg_stack.stdout"),
+        include_str!("native/dbg_stack.stderr"),
+    );
+}
+
 /// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
 /// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
 /// N136's `0`; the same bytes on both backends.

@@ -694,3 +694,4 @@ row	flagship	key
 670	-	A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children in one element (`<div>…</div>`), or make this position a `List<View>`
 671	-	Expected {expected}, but got {got} instead: inside the impl that declares it, a bare `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's own. Write `{suggested}::{member}(..)` to call it at another instantiation
 NEW	-	`dbg_stack()` takes no arguments: it prints every binding in scope at the call. To print chosen values, use `dbg(..)`
+NEW	-	`dbg_stack()` left in a release build: a release build refuses it, so a debugging line cannot ship by accident

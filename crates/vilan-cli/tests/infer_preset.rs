@@ -192,6 +192,19 @@ fn run_under_node(label: &str, javascript: &str) -> (String, i32) {
 /// the build's output and, when it succeeded, what `node` printed (stdout,
 /// stderr) running it.
 fn build_dbg_project(tag: &str, build: &str) -> (std::process::Output, Option<(String, String)>) {
+    build_debugging_project(
+        tag,
+        build,
+        "fun main() {\n\tlet total = dbg(2 * 3) + 1;\n\tprint(total);\n}\n",
+    )
+}
+
+/// [`build_dbg_project`] over a `src/main.vl` of `source`.
+fn build_debugging_project(
+    tag: &str,
+    build: &str,
+    source: &str,
+) -> (std::process::Output, Option<(String, String)>) {
     let work =
         support::scratch_root().join(format!("vilan_dbg_policy_{}_{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
@@ -201,11 +214,7 @@ fn build_dbg_project(tag: &str, build: &str) -> (std::process::Output, Option<(S
         format!("[package]\nname = \"probe\"\n[build]\n{build}"),
     )
     .expect("write manifest");
-    std::fs::write(
-        work.join("src/main.vl"),
-        "fun main() {\n\tlet total = dbg(2 * 3) + 1;\n\tprint(total);\n}\n",
-    )
-    .expect("write source");
+    std::fs::write(work.join("src/main.vl"), source).expect("write source");
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .arg("build")
         .arg(&work)
@@ -237,6 +246,51 @@ fn a_release_build_refuses_a_dbg_left_in_it() {
         stderr.contains("`dbg` left in a release build")
             && stderr.contains("`[build] dbg = \"strip\"`"),
         "{stderr}"
+    );
+}
+
+/// debugging.md S2 under Q4: a release build refuses a `dbg_stack()` as it
+/// refuses a `dbg`, at the call; `strip` makes it nothing and `keep` prints
+/// it in release too.
+#[test]
+fn a_release_build_refuses_strips_or_keeps_a_dbg_stack_as_dbg() {
+    let source = "fun main() {\n\tlet total = 7;\n\tdbg_stack();\n\tprint(total);\n}\n";
+    let (output, _) = build_debugging_project("stack_refuse", "preset = \"release\"\n", source);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the release build must fail");
+    assert!(
+        stderr.contains("`dbg_stack()` left in a release build")
+            && stderr.contains("`[build] dbg = \"strip\"`")
+            && stderr.contains("main.vl:3:2"),
+        "{stderr}"
+    );
+    let (output, ran) = build_debugging_project(
+        "stack_strip",
+        "preset = \"release\"\ndbg = \"strip\"\n",
+        source,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(ran, Some(("7\n".to_string(), String::new())));
+    let (output, ran) = build_debugging_project(
+        "stack_keep",
+        "preset = \"release\"\ndbg = \"keep\"\n",
+        source,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        ran,
+        Some((
+            "7\n".to_string(),
+            "[src/main.vl:3:2] dbg_stack() in main\n  total: i32 = 7\n".to_string()
+        ))
     );
 }
 

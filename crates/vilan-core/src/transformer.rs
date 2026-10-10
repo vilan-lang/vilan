@@ -1135,6 +1135,11 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__panic");
         added = true;
     }
+    // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
+    if helpers.contains(&"__dbg_stack") && !helpers.contains(&"__dbg") {
+        helpers.push("__dbg");
+        added = true;
+    }
     if added {
         helpers.sort();
     }
@@ -2009,6 +2014,20 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              \tfor (const entry of document.e) out += pad + entry[0] + __dbg_layout(entry[1], __dbg_width(pad + entry[0]), indent + 2) + \",\\n\";\n\
              \treturn out + \" \".repeat(indent) + document.c;\n\
+             }"
+        }
+        // `dbg_stack()`'s runtime (debugging.md S2): the header line, then one
+        // `  name: Type = value` line per binding, the value laid out from
+        // where it starts with its broken entries two spaces under the
+        // binding, and the binding's note after it — `vilan_rt::show::
+        // dbg_stack`'s twin. Each entry is `[head, document, note]`.
+        "__dbg_stack" => {
+            "function __dbg_stack(write, location, title, entries) {\n\
+             \twrite(\"[\" + location + \"] \" + title);\n\
+             \tfor (const entry of entries) {\n\
+             \t\tconst head = \"  \" + entry[0] + \" = \";\n\
+             \t\twrite(head + __dbg_layout(entry[1], __dbg_width(head), 2) + entry[2]);\n\
+             \t}\n\
              }"
         }
         // `panic(message)` (debugging.md S0): an `Error`, so a stack exists, whose
@@ -6025,6 +6044,13 @@ impl<'src> Transformer<'src> {
                         }
                         if Some(target_id) == self.program.dbg_fn_id {
                             return Some(self.dbg_call(*id, &function_call.argument_ids, args));
+                        }
+                        if Some(target_id) == self.program.dbg_stack_fn_id {
+                            return Some(self.dbg_stack_call(
+                                *id,
+                                &function_call.argument_ids,
+                                args,
+                            ));
                         }
                         if target_id == self.print_fn_id {
                             return Some(js::Node::Call(
@@ -14146,6 +14172,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__dbg_members",
     "__dbg_map",
     "__dbg_set",
+    "__dbg_stack",
     "__scan",
     "__parse_i32",
     "__parse_f64",
