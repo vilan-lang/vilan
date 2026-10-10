@@ -11990,13 +11990,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // the call (see [`Emitter::cell_view_place`]), taken after every
         // by-value argument has been evaluated — the same hoist.
         let views_allowed = !self.no_cell_views && self.views_its_arguments(target, callee_bits);
+        // F123: a std lookup that runs no user code (`HashSet::contains`,
+        // `HashMap::get`/`contains_key` over a key whose `hash` is std's)
+        // reads a `Shared` view's field receiver through the cell, as F114's
+        // reading intrinsics do, instead of copying the collection out.
+        let reads_a_shared_receiver = views_allowed
+            && matches!(conventions.first(), Some(Receiving::Ref))
+            && self.std_lookup_runs_no_user_code(target, argument_ids)
+            && argument_ids
+                .first()
+                .is_some_and(|receiver| self.is_a_cell_read_place(*receiver));
         let takes_a_view: Vec<bool> = argument_ids
             .iter()
             .enumerate()
             .map(|(index, argument)| {
                 views_allowed
                     && matches!(conventions.get(index), Some(Receiving::Ref))
-                    && self.takes_a_cell_view(argument_ids, index, *argument)
+                    && (self.takes_a_cell_view(argument_ids, index, *argument)
+                        || (index == 0 && reads_a_shared_receiver))
             })
             .collect();
         let views_a_cell = takes_a_view.contains(&true);
@@ -12045,7 +12056,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     prelude,
                     &mut view_borrows,
                     &mut views,
-                    false,
+                    index == 0 && reads_a_shared_receiver,
                 )?
             {
                 rendered.push(format!("&{path}"));
@@ -12402,6 +12413,94 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     && !function.returns_view
                     && !function.returns_mut_view
             })
+    }
+
+    /// F123: whether a call to `target` is one of std's keyed LOOKUPS —
+    /// `HashSet::contains`, `HashMap::get`, `HashMap::contains_key` — over a
+    /// key whose `hash` runs no user code, so nothing the call runs can reach
+    /// a cell through another handle while the receiver is borrowed (F39's
+    /// runtime half). Their bodies run `key.hash()` and the table's own
+    /// lookup, nothing else; the key is a by-value argument evaluated before
+    /// the borrow is taken.
+    fn std_lookup_runs_no_user_code(&mut self, target: Id, argument_ids: &[Id]) -> bool {
+        let Some(function) = self.program.functions.get(&target) else {
+            return false;
+        };
+        if !matches!(function.name, "contains" | "get" | "contains_key") {
+            return false;
+        }
+        let in_std = |id: Id| {
+            self.program
+                .source_of(id)
+                .is_some_and(|source| self.program.std_sources.contains(&source))
+        };
+        if !in_std(target) {
+            return false;
+        }
+        let owner = function.parameters.first().and_then(|receiver| {
+            let parameter = self.program.parameters.get(receiver)?;
+            if parameter.name != "self" {
+                return None;
+            }
+            match self.resolve(parameter.type_id)? {
+                Type::Struct(struct_id, _) => self.program.structs.get(struct_id),
+                _ => None,
+            }
+        });
+        let Some(owner) = owner else {
+            return false;
+        };
+        let (owner_id, owner_name) = (owner.id, owner.name);
+        let curated = matches!(
+            (owner_name, function.name),
+            ("HashSet", "contains") | ("HashMap", "get" | "contains_key")
+        );
+        if !curated || !in_std(owner_id) || argument_ids.len() != 2 {
+            return false;
+        }
+        // The key's type is the receiver's first argument (`HashSet<T>`'s
+        // `T`, `HashMap<K, V>`'s `K`): a literal key records none of its own.
+        let key = self
+            .settled_value_type(argument_ids[0])
+            .and_then(|receiver| match self.resolve(receiver) {
+                Some(Type::Struct(_, arguments)) => arguments.first().copied(),
+                _ => None,
+            });
+        key.is_some_and(|key| self.hashes_without_user_code(key))
+    }
+
+    /// F123: whether a key of `type_id` hashes by std's impls alone — a
+    /// scalar, `str`, `BigInt`, `bool`, or a tuple, fixed array or `List` of
+    /// those. A user type (whose `Hashable` may be written, and may write a
+    /// cell) is not, nor (for now) any other std type.
+    fn hashes_without_user_code(&self, type_id: TypeId) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, arguments)) => {
+                let arguments = arguments.clone();
+                self.program.structs.get(struct_id).is_some_and(|declaration| {
+                    declaration.external
+                        && match declaration.name {
+                            "BigInt" => true,
+                            "List" => arguments
+                                .iter()
+                                .all(|argument| self.hashes_without_user_code(*argument)),
+                            name => scalar_type(name).is_some(),
+                        }
+                })
+            }
+            Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id == Some(*enum_id),
+            Some(Type::Tuple(elements, _)) => {
+                let elements = elements.clone();
+                elements
+                    .iter()
+                    .all(|element| self.hashes_without_user_code(*element))
+            }
+            Some(Type::Array(element, _)) => self.hashes_without_user_code(*element),
+            _ => false,
+        }
     }
 
     /// Whether `id` (or the place a `&` the source wrote names) is a place

@@ -70,6 +70,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**F123: std's keyed lookups over a field of a `Shared` view read through the cell — `cell.read().seen.contains("x")`, `cell.read().counts.get("k")` and `contains_key` copied the whole collection out of the cell per call natively (F114 had taken only the reading intrinsics), and because that copy was taken BEFORE the key argument ran, `cell.read().seen.contains(mark(cell, "late"))` with a `mark` that inserts `"late"` printed `false` natively against JS's `true`, silently.** `HashSet::contains`, `HashMap::get` and `HashMap::contains_key` run `key.hash()` and the table's lookup and nothing else, so when the key's `hash` is std's own (a scalar, `str`, `BigInt`, `bool`, or a tuple, fixed array or `List` of those) no user code can reach the cell under the borrow (F39's runtime half): the receiver is now read through a view of the cell, settled before the key and borrowed after it, as F114 reads an intrinsic's. A user key type, whose written `hash` could touch the cell, keeps the copy. Pins: `f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends` (`native/shared_view_std_lookups.vl`; one `read_with(` left in `main`, the user key's), and F114's emission pin now counts no copy at all.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->

@@ -12196,8 +12196,8 @@ fn f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends() {
 /// F114: a reading intrinsic over a spine of a `Shared` VIEW reads through
 /// a view of the cell, as F49's boxed binding does — `cell.read().items.len()`
 /// had copied the whole list out of the borrow to count it. The emission
-/// pin: the three copies left are the std calls (`contains`, `get`,
-/// `contains_key`), which run user `Hash`/`Eq` and are not intrinsics.
+/// pin: no copy is left — the three std calls (`contains`, `get`,
+/// `contains_key`) had kept theirs until F123.
 #[test]
 fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends() {
     let staged = stage();
@@ -12215,8 +12215,9 @@ fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_bac
     let main = emitted_main(&staged, file);
     assert_eq!(
         main.matches("read_with(").count(),
-        3,
-        "only the three std calls copy their field out of the cell:\n{main}"
+        0,
+        "no read copies its field out of the cell (F123 took the three std \
+         lookups):\n{main}"
     );
 }
 
@@ -12706,5 +12707,38 @@ fn f125_a_bigint_as_text_writes_its_digits_on_both_backends() {
         compare(&staged, file),
         Verdict::Identical,
         "a `BigInt` as text must write the same digits natively"
+    );
+}
+
+/// F123: std's keyed LOOKUPS over a field of a `Shared` view —
+/// `cell.read().seen.contains("x")`, `counts.get("k")`,
+/// `counts.contains_key("z")` — copied the whole collection out of the
+/// cell per call (F114 read the intrinsics only). They run `key.hash()`
+/// and the table's lookup, nothing else, so over a key whose `hash` is
+/// std's (a `str`, an integer, a tuple of those) the receiver is now read
+/// through a view of the cell, taken after the key is evaluated — a key
+/// argument that writes the cell is seen by the lookup, as on JS (the copy
+/// had been taken first, and printed `false` against JS's `true`). A user
+/// key type's written `hash` keeps the copy. The emission pin: one
+/// `read_with(` left in `main`, the user key's.
+#[test]
+fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f123_shared_view_std_lookups.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_std_lookups.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a std lookup over a `Shared` view's field must answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("read_with(").count(),
+        1,
+        "only the user key's lookup copies its set out of the cell:\n{main}"
     );
 }
