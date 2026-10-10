@@ -169,12 +169,14 @@ wall-clock-waits = { max-threads = 1 }
 # to land before the top-level gray it asserts can exist at all.
 #
 # `cancellation_tests` (M26) is that same shape again, and one of them adds a
-# reason of its own: `a_burst_of_edits_...` types eight keystrokes a debounce
-# window apart and counts how many of the analyses they started ran to the end.
-# Its assertion is a COUNT and load can only push it the safe way — a slower box
-# cancels MORE — but the burst itself is eight debounce windows of wall clock
-# with real analyses behind them, which is precisely the work this group exists
-# to stop the suite from piling onto itself.
+# reason of its own: `a_burst_of_edits_...` types eight keystrokes, each sent
+# once the server's own counter says the previous one's analysis has started
+# (N164: a sleep-paced burst folded into one window on a stalled runner), and
+# counts how many of the analyses they started ran to the end. Its assertion
+# is a COUNT and load can only push it the safe way — a slower box cancels
+# MORE — but the burst itself is eight debounce windows of wall clock with real
+# analyses behind them, which is precisely the work this group exists to stop
+# the suite from piling onto itself.
 filter = '''
     binary(hmr) + binary(hmr_swap) + binary(hmr_css_matrix) + binary(watch_lifecycle)
     + binary(watch_leg_reuse)

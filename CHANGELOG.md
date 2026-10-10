@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**N164: the language server's burst pin is paced by the server's own counter, not by a sleep.** `a_burst_of_edits_performs_one_complete_analysis_plus_at_most_one_partial` typed its eight keystrokes `DEBOUNCE_MS + 20` apart and then asserted that at least two analyses had started; on a stalled hosted runner the server's debounce task woke more than its 20 ms margin late, every keystroke superseded the one before it, ONE analysis started, and the non-vacuity premise ("1 started") fired before the claim the pin exists for was read - twice in three CI runs on the Windows shard. Each keystroke now waits until the server's `started` counter has moved past where it stood when the keystroke was sent, then leaves the analysis 20 ms in flight before the next one, so a slow host stretches the burst instead of folding it, and the premise is `started >= 8` - a number the loop guarantees and the server must meet. The old form was reproduced by taking the margin to -40 ms ("1 started", the CI message); the new one is green at load 23-30 beside other lanes' builds.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
