@@ -85,6 +85,11 @@ written down.
 
 ---
 
+<!-- family: feature -->
+**F124 §2.2: an INTERLEAVED loan group builds natively — transparent-references.vl (`let b: &mut i32 = &mut a; let c: &mut i32 = b;` with `b`, `a` and `c` taking turns, a `&mut` callee over the root and over a view, `same(c) /= 10` through a `borrows` call) was the last platform-free corpus program refused for a native gap besides the two host ones, and now prints the same bytes on both backends.** No assignment of Rust lifetimes accepts such a group, so its root lives in the counted cell a captured `mut` binding already uses (R3's `Captured`) and every view is a HANDLE on it (`let b = a.clone();`, the same cell): a read is the cell's momentary `get`, a write its `set`, a `&mut` callee runs under one `borrow_mut` for the call, and a compound write through a `borrows` call settles its value before the place borrows the cell. Kept refused by name (§2.3): a call handed two loans of one promoted root with one `&mut` (the `&mut` holds the cell for the call, and the other would abort the run where JS answers), a view projecting a field, element or slot of an interleaved root (a lens into part of a cell), a view a closure names, a group in an `async` body, and a view bound from a `borrows` call over a member. Whole-set native triple 130/127/3/0 → 130/128/2/0 (left: async-await's host `sleep`, signal-update's aliasing `&mut` closure). Pins: `f124_an_interleaved_loan_group_shares_one_cell_on_both_backends` (`native/loans_interleaved.vl` and transparent-references.vl itself), `f124_two_loans_in_one_call_and_a_projected_interleaved_view_are_refused_by_name`.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->

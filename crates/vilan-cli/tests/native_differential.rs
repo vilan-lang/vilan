@@ -12799,3 +12799,70 @@ fn f124_a_nested_loan_group_reborrows_on_both_backends() {
     );
     assert!(!main.contains("Captured::new"), "{main}");
 }
+
+/// F124 §2.2: a loan group whose members INTERLEAVE — the views and their
+/// root take turns, which no assignment of Rust lifetimes accepts —
+/// promotes its root into the counted cell a captured `mut` binding uses,
+/// and each view is a HANDLE on it (`let b = a.clone();`, the same cell):
+/// reads and writes through either view and the root, a compound write, a
+/// `&mut` callee over a view and over the root, a compound write through a
+/// `borrows` call of a view (its value settled before the place borrows),
+/// and field writes through handles of a struct root.
+/// transparent-references.vl, the corpus program this was for, flips with
+/// it (the whole-set sweep).
+#[test]
+fn f124_an_interleaved_loan_group_shares_one_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f124_loans_interleaved.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/loans_interleaved.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an interleaved loan group must build and answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("Captured::new(").count(),
+        2,
+        "the two roots live in cells and the four views are handles on them:\n{main}"
+    );
+    assert_eq!(
+        compare(&staged, "transparent-references.vl"),
+        Verdict::Identical
+    );
+}
+
+/// F124 §2.2's hazard and §2.3's remainder, refused by name: a call handed
+/// two loans of one promoted root, one `&mut` (the `&mut` holds the cell
+/// for the call, and the other loan would abort the run where JS answers),
+/// and an interleaved group whose view projects a field (a handle into part
+/// of a cell, a lens this backend has not got).
+#[test]
+fn f124_two_loans_in_one_call_and_a_projected_interleaved_view_are_refused_by_name() {
+    let staged = stage();
+    for (file, source, reason) in [
+        (
+            "native_probe_f124_two_loans.vl",
+            "import std::io::print;\n\nfun both(x: &mut i32, y: &mut i32) {\n\tx += 1;\n\ty += 1;\n}\n\nfun main() {\n\tmut a: i32 = 1;\n\tlet b: &mut i32 = &mut a;\n\tlet c: &mut i32 = b;\n\tb = 2;\n\tprint(a);\n\tboth(b, c);\n\tprint(*c);\n}\n",
+            "a call handed two loans of one place",
+        ),
+        (
+            "native_probe_f124_projected.vl",
+            "import std::io::print;\n\nstruct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tmut p = Point { x = 1, y = 2 };\n\tlet b: &mut i32 = &mut p.x;\n\tlet c: &mut i32 = b;\n\tb = 5;\n\tprint(p.y);\n\tc = 6;\n\tprint(*b);\n}\n",
+            "an interleaved loan group whose view projects a field",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        match compare(&staged, file) {
+            Verdict::Refused(message) => assert!(
+                message.contains(reason),
+                "{file}: refused, but not by this name: {message}"
+            ),
+            other => panic!("{file}: must be refused by name, was {other:?}"),
+        }
+    }
+}

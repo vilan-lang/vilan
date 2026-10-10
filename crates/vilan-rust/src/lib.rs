@@ -177,12 +177,6 @@ pub fn emit(program: &Program<'_>, options: &BuildOptions) -> Result<Emitted, Er
 /// and the executor has to be entered from a synchronous frame.
 const ASYNC_MAIN_BODY: &str = "vilan_async_main";
 
-/// F124: the refusal an INTERLEAVED loan group keeps until its root can live
-/// in a cell (§2.2) — F21's sentence, which names the shape.
-const INTERLEAVED_LOANS: &str = "a view binding that ALIASES another view binding (`let c = b;` \
-     where `b` is a view, and the two and their root take turns: two live loans of one place, \
-     which needs a model of aliasing views this backend has not got)";
-
 /// F122 (array-lengths.md Q12): a fixed array whose estimated size passes
 /// this many BYTES keeps its `[T; N]` type and lives on the heap natively
 /// (`vilan_rt::HeapArray`), where the JS backend's array lives at any length.
@@ -920,8 +914,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ///   discipline): the alias is a Rust reborrow, `let c = &mut *b;`,
     ///   which the borrow checker accepts and costs nothing;
     /// * §2.2, INTERLEAVED (transparent-references.vl: `b`, `a`, `c` take
-    ///   turns) — the next slice, refused by name until it lands: the root
-    ///   lives in the counted cell a captured `mut` binding
+    ///   turns): the root lives in the counted cell a captured `mut` binding
     ///   already uses (R3's `Captured`), and each view is a HANDLE on it —
     ///   `let b = a.clone();`, an `Rc` naming the same cell — so every
     ///   access is a momentary borrow, a `&mut` callee runs under one
@@ -1026,7 +1019,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             let mut visited = HashSet::default();
             for statement in statements.iter().chain(std::iter::once(&tail)) {
-                self.log_accesses(*statement, function_id, &tracked, &mut log, &mut visited, false);
+                self.log_accesses(
+                    *statement,
+                    function_id,
+                    &tracked,
+                    &mut log,
+                    &mut visited,
+                    false,
+                );
             }
         }
         for (_, (root, members)) in groups {
@@ -1053,13 +1053,66 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 continue;
             }
-            // §2.2 (the cell and its handles) is the next slice; until it
-            // lands an interleaved group keeps F21's refusal.
-            let _ = (&projects, root, &log.in_closures, &log.owner);
-            for alias in group_aliases {
-                self.loans.refused.insert(alias, INTERLEAVED_LOANS);
+            match self.loan_group_refusal(root, &members, &projects, &log) {
+                Some(reason) => {
+                    for alias in group_aliases {
+                        self.loans.refused.insert(alias, reason);
+                    }
+                }
+                None => {
+                    self.boxed.insert(root);
+                    self.loans.group_of.insert(root, root);
+                    for member in members {
+                        self.boxed.insert(member);
+                        self.loans.handles.insert(member, sources[&member]);
+                        self.loans.group_of.insert(member, root);
+                    }
+                }
             }
         }
+    }
+
+    /// F124 §2.2's one hazard, refused at compile time: a call handed two
+    /// loans of one PROMOTED root, one of them `&mut` — `both(b, c)` with `b`
+    /// and `c` handles on the same cell. The `&mut` argument holds the cell's
+    /// `borrow_mut` for the call's length, so the other would abort the run
+    /// (`REENTRANT_READ`) where JS answers; named instead.
+    fn refuse_two_loans_of_one_promoted_root(
+        &self,
+        conventions: &[Receiving],
+        argument_ids: &[Id],
+    ) -> Result<(), Error> {
+        if self.loans.group_of.is_empty() {
+            return Ok(());
+        }
+        let mut loans: Vec<(Id, bool, Id)> = Vec::new();
+        for (index, argument) in argument_ids.iter().enumerate() {
+            let writes = match conventions.get(index) {
+                Some(Receiving::RefMut) => true,
+                Some(Receiving::Ref) => false,
+                _ => continue,
+            };
+            let reached = match self.program.entity_map.get(argument) {
+                Some(Expr::Local(binding)) => Some(*binding),
+                Some(&Expr::Reference(place, _)) => self.loan_root(place).map(|(root, _)| root),
+                _ => None,
+            };
+            let Some(group) = reached.and_then(|binding| self.loans.group_of.get(&binding)) else {
+                continue;
+            };
+            if let Some((_, other_writes, _)) = loans.iter().find(|(root, _, _)| root == group)
+                && (writes || *other_writes)
+            {
+                return Err(unsupported(
+                    "a call handed two loans of one place, one of them `&mut` (`both(b, c)` \
+                     where `b` and `c` alias one root: the `&mut` holds the place for the call, \
+                     and the other loan would meet it at run time)",
+                    self.span_of(*argument),
+                ));
+            }
+            loans.push((*group, writes, *argument));
+        }
+        Ok(())
     }
 
     /// F124: the ROOT binding a borrowed place names — a local `let` (a
@@ -1200,6 +1253,77 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ancestor = sources.get(&current).copied();
         }
         false
+    }
+
+    /// F124 §2.3: why an interleaved group cannot be promoted, or `None`
+    /// when it can.
+    fn loan_group_refusal(
+        &self,
+        root: Id,
+        members: &[Id],
+        projects: &HashSet<Id>,
+        log: &AccessLog,
+    ) -> Option<&'static str> {
+        if members.iter().any(|member| projects.contains(member)) {
+            return Some(
+                "an interleaved loan group whose view projects a field, an element or a slot \
+                 (`let b = &mut a.x; let c = b;` with `a`, `b` and `c` taking turns: a view \
+                 handle into part of a cell, F124's lens, this backend has not got)",
+            );
+        }
+        if std::iter::once(&root)
+            .chain(members)
+            .any(|binding| log.in_closures.contains(binding) && *binding != root)
+        {
+            return Some(
+                "an interleaved loan group a closure names (`let c = b;` with `b`, `c` and \
+                 their root taking turns, and a closure reading one of the views)",
+            );
+        }
+        // A view BOUND from a `borrows` call over a member (`let d =
+        // same(b);`) would hold a borrow of the cell past its statement.
+        let group: HashSet<Id> = std::iter::once(root)
+            .chain(members.iter().copied())
+            .collect();
+        let binds_a_projection = self.program.variables.values().any(|variable| {
+            variable.initial.is_some_and(|initial| {
+                self.is_a_view_call(initial)
+                    && matches!(self.program.entity_map.get(&initial), Some(Expr::Call(call_id))
+                    if self.program.function_calls.get(call_id).is_some_and(|call| {
+                        call.argument_ids.iter().any(|argument| {
+                            match self.program.entity_map.get(argument) {
+                                Some(Expr::Local(binding)) => group.contains(binding),
+                                Some(&Expr::Reference(place, _)) => self
+                                    .loan_root(place)
+                                    .is_some_and(|(reached, _)| group.contains(&reached)),
+                                _ => false,
+                            }
+                        })
+                    }))
+            })
+        });
+        if binds_a_projection {
+            return Some(
+                "an interleaved loan group one of whose views is handed to a `borrows` call \
+                 whose answer is bound (`let d = same(b);` with `b`, `c` and their root \
+                 taking turns: the view it answers is a projection of a cell)",
+            );
+        }
+        let async_body = log.owner.get(&root).is_some_and(|function| {
+            self.program.async_functions.contains(function)
+                || self
+                    .program
+                    .functions
+                    .get(function)
+                    .is_some_and(|declared| declared.is_async)
+        });
+        if async_body {
+            return Some(
+                "an interleaved loan group in an `async` body (`let c = b;` with `b`, `c` and \
+                 their root taking turns across a suspension)",
+            );
+        }
+        None
     }
 
     /// The native type a context's THREADED VALUE has — `let ambient_nursery:
@@ -4323,8 +4447,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Result<(), Error> {
         for element in elements {
             let spread = self.program.spread_elements.contains(element);
-            if spread && let Some(Expr::Tuple(inner)) = self.program.entity_map.get(element).cloned() {
-                self.spread_parts(&inner, true, slot_types, (prelude, slots, parts), depth, span)?;
+            if spread
+                && let Some(Expr::Tuple(inner)) = self.program.entity_map.get(element).cloned()
+            {
+                self.spread_parts(
+                    &inner,
+                    true,
+                    slot_types,
+                    (prelude, slots, parts),
+                    depth,
+                    span,
+                )?;
                 continue;
             }
             let value = match slot_types.get(slots.len()) {
@@ -6081,8 +6214,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
             _ => return false,
         };
+        // A boxed binding's read is its cell's `get()`, a value — and so is
+        // a promoted view handle's (F124: `*b` over the root's cell).
+        if self.boxed.contains(&binding) {
+            return true;
+        }
         if let Some(parameter) = self.program.parameters.get(&binding) {
-            return !self.program.context_hidden_parameters.contains_key(&binding)
+            return !self
+                .program
+                .context_hidden_parameters
+                .contains_key(&binding)
                 && !(parameter.lazy && !self.program.lazy_eager_parameters.contains(&binding))
                 && self.receiving_form(parameter) == Receiving::ByValue;
         }
@@ -6250,9 +6391,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.program.payload_view_captures.get(&binding) == Some(&true) {
             return true;
         }
-        // F124: a reborrowed alias is a `&mut` loan.
+        // F124: a reborrowed alias is a `&mut` loan; a promoted handle is not.
         if self.loans.reborrows.contains_key(&binding) {
             return true;
+        }
+        if self.loans.handles.contains_key(&binding) {
+            return false;
         }
         self.program
             .variables
@@ -6372,6 +6516,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let named = match self.program.entity_map.get(&target) {
             Some(Expr::Local(binding)) => Some(*binding),
+            // F124: a write THROUGH a view (R5) the analyzer spelled as a
+            // dereference of it — over a promoted handle, the cell's own write.
+            Some(Expr::Dereference(inner)) => match self.program.entity_map.get(inner) {
+                Some(Expr::Local(binding)) if self.loans.handles.contains_key(binding) => {
+                    Some(*binding)
+                }
+                _ => None,
+            },
             _ => None,
         };
         if let Some(binding) = named {
@@ -6613,9 +6765,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// pointee's), so this is read off the initializer, which is where the
     /// `&` was written.
     fn binding_holds_a_view(&self, binding: Id) -> bool {
-        // F124: a reborrowed or copied alias is the view its source is.
-        if self.loans.reborrows.contains_key(&binding) || self.loans.copies.contains_key(&binding)
-        {
+        // F124: a promoted member is a handle on a cell, read and written as
+        // a boxed binding is; a reborrowed or copied alias is the view its
+        // source is.
+        if self.loans.handles.contains_key(&binding) {
+            return false;
+        }
+        if self.loans.reborrows.contains_key(&binding) || self.loans.copies.contains_key(&binding) {
             return true;
         }
         let Some(initial) = self
@@ -7133,6 +7289,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // [`Emitter::declaring_a_view`].
                 // F124: a member of a loan group holding an alias takes the
                 // lowering [`Self::compute_loan_groups`] chose for its group.
+                if let Some(source) = self.loans.handles.get(&binding).copied() {
+                    return Ok(format!(
+                        "let {name} = {}.clone()",
+                        self.binding_name(source)
+                    ));
+                }
                 if let Some(source) = self.loans.reborrows.get(&binding).copied() {
                     return Ok(format!("let {name} = &mut *{}", self.binding_name(source)));
                 }
@@ -8169,10 +8331,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         _ => 16,
                     }
                 } else {
-                    let entries = self.nominal_entries(
-                        &declaration.generic_parameter_constraint_ids,
-                        &arguments,
-                    );
+                    let entries = self
+                        .nominal_entries(&declaration.generic_parameter_constraint_ids, &arguments);
                     let mut total = 0usize;
                     for field in &declaration.fields {
                         let field_type = self.substituted(field.type_id, &entries);
@@ -8185,10 +8345,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if self.program.bool_enum_id == Some(enum_id) {
                     1
                 } else if let Some(declaration) = self.program.enums.get(&enum_id).cloned() {
-                    let entries = self.nominal_entries(
-                        &declaration.generic_parameter_constraint_ids,
-                        &arguments,
-                    );
+                    let entries = self
+                        .nominal_entries(&declaration.generic_parameter_constraint_ids, &arguments);
                     let mut largest = 0usize;
                     for variant in &declaration.variants {
                         let mut payload = 0usize;
@@ -8214,7 +8372,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if self.array_lives_on_the_heap(element, length) {
                     8
                 } else {
-                    self.estimated_size(element, visiting).saturating_mul(length)
+                    self.estimated_size(element, visiting)
+                        .saturating_mul(length)
                 }
             }
             Type::Closure(..) | Type::Function(_) | Type::Dyn(..) => 16,
@@ -12496,6 +12655,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut view_borrows = String::new();
         let mut views = 0;
         self.refuse_a_closure_beside_a_cell_view(&conventions, argument_ids)?;
+        self.refuse_two_loans_of_one_promoted_root(&conventions, argument_ids)?;
         // The callee's WHOLE parameter list, hidden context parameters
         // included (they have no `parameters` record, so `declared` omits
         // them). A call can carry MORE arguments than that: the context pass
@@ -12961,16 +13121,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         match self.resolve(type_id) {
             Some(Type::Struct(struct_id, arguments)) => {
                 let arguments = arguments.clone();
-                self.program.structs.get(struct_id).is_some_and(|declaration| {
-                    declaration.external
-                        && match declaration.name {
-                            "BigInt" => true,
-                            "List" => arguments
-                                .iter()
-                                .all(|argument| self.hashes_without_user_code(*argument)),
-                            name => scalar_type(name).is_some(),
-                        }
-                })
+                self.program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        declaration.external
+                            && match declaration.name {
+                                "BigInt" => true,
+                                "List" => arguments
+                                    .iter()
+                                    .all(|argument| self.hashes_without_user_code(*argument)),
+                                name => scalar_type(name).is_some(),
+                            }
+                    })
             }
             Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id == Some(*enum_id),
             Some(Type::Tuple(elements, _)) => {
@@ -14844,6 +15007,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 | Expr::TupleIndex(subject, _, _)
                 | Expr::Reference(subject, _),
             ) => self.place_lives_in_a_cell(*subject),
+            // F124: the place a `borrows` call hands back over a cell's
+            // borrow — `same(c) /= 10` with `c` a handle on a promoted root —
+            // borrows the cell for the statement, so the value it re-reads is
+            // settled first.
+            Some(Expr::Dereference(inner)) => match self.program.entity_map.get(inner) {
+                Some(Expr::Call(call_id)) if self.is_a_view_call(*inner) => self
+                    .program
+                    .function_calls
+                    .get(call_id)
+                    .is_some_and(|call| {
+                        call.argument_ids
+                            .iter()
+                            .any(|argument| self.place_lives_in_a_cell(*argument))
+                    }),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -15547,6 +15726,12 @@ pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) 
 /// group that holds an ALIAS (a view binding initialized from another).
 #[derive(Default)]
 struct LoanPlan {
+    /// §2.2: a view of an INTERLEAVED group, promoted to a handle on its
+    /// root's counted cell — the binding whose handle it clones (its alias
+    /// source, or the root itself). The root and every member are boxed.
+    handles: HashMap<Id, Id>,
+    /// The root of every promoted member (and of the root itself).
+    group_of: HashMap<Id, Id>,
     /// §2.1: an alias of a `&mut` view in a NESTED group — a reborrow of its
     /// source (`let c = &mut *b;`), free at run time.
     reborrows: HashMap<Id, Id>,
