@@ -12,6 +12,7 @@ import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::iterator::Items;
 import pkg::js::native_map::NativeMap;
+import pkg::wire::{ Deserialize, Serialize, Wire };
 
 export *;
 
@@ -173,5 +174,35 @@ impl HashSet<type T: Hashable + Debug> with Debug {
 			out = out + value.debug();
 		}
 		out + " }"
+	}
+}
+
+/// A set narrates as the LIST of its members, in insertion order — `HashMap`'s
+/// `{key, value}` list without the values (tracker A168) — so a struct with a set
+/// field derives `Wire`, and a mirrored store carries one (a member is a demand
+/// boundary of its own, `contains(x)`). A duplicate member on the wire is one
+/// member, as `insert` keeps it. Here rather than beside the map's impl in
+/// `std::wire`: every program loads `std::wire`, and a program that never names a
+/// set must not load this module for it.
+impl HashSet<type T: Hashable + Wire> with Wire {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
+		let members = self.values();
+		serializer.begin_list(members.len().as_i32());
+		for member in members {
+			member.describe(serializer);
+		}
+		serializer.end_list();
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: &mut D): HashSet<T> {
+		let length = deserializer.begin_list();
+		mut result: HashSet<T> = HashSet::new();
+		mut index = 0;
+		for index < length {
+			result.insert(T::rebuild(deserializer));
+			index += 1;
+		}
+		deserializer.end_list();
+		result
 	}
 }

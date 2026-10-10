@@ -1,0 +1,137 @@
+// A153 S3 on both backends: a list field crosses by splices (`Seq`), a map's and
+// a set's key sets by `Keys` (`proposal/mirrored-store.md` §3.2).
+
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::batch;
+import std::reactive::delta::SequenceCell;
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Room {
+	id: u53,
+	name: str,
+	messages: List<u53>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+	motd: str,
+	tags: HashSet<str>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun ids(list: Option<List<u53>>): str {
+	match list {
+		Some(let held) => {
+			mut out = "[";
+			mut first = true;
+			for id in held {
+				if !first {
+					out = out + ",";
+				}
+				first = false;
+				out = out + i"{id}";
+			}
+			out + "]"
+		},
+		None => "-",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(0, Room { id = 0, name = "general", messages = [1, 2, 3] });
+	rooms.insert(5, Room { id = 5, name = "random", messages = [] });
+	mut tags: HashSet<str> = HashSet::new();
+	tags.insert("pinned");
+	let global = Store::new(Global { rooms, motd = "hi", tags });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.rooms().at(0).some().messages().effect(|list| print(i"general {ids(list)}"));
+		g.rooms().keys().effect(|keys| {
+			mut out = "";
+			for key in keys {
+				out = out + i" {key}";
+			}
+			print(i"rooms:{out}");
+		});
+		g.tags().keys().effect(|members| {
+			mut out = "";
+			for member in members {
+				out = out + i" {member}";
+			}
+			print(i"tags:{out}");
+		});
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	let general = global.rooms().at(0).some().messages();
+	print("-- a push is a splice at the end");
+	general.push(4);
+	sleep_for(Duration::millis(0));
+	print("-- one turn's splices are one");
+	batch(|| {
+		general.insert_at(0, 0);
+		general.remove_at(2);
+		general.push(9);
+	});
+	sleep_for(Duration::millis(0));
+	print("-- a whole write is the list again");
+	let _whole = general.patch([7, 8]);
+	sleep_for(Duration::millis(0));
+	print("-- a room's name is not a key change");
+	let _named = global.rooms().at(5).some().name().patch("chat");
+	sleep_for(Duration::millis(0));
+	print("-- a room created and one deleted");
+	global.rooms().at(9).set(Some(Room { id = 9, name = "new", messages = [] }));
+	global.rooms().at(5).set(None);
+	sleep_for(Duration::millis(0));
+	print("-- a set's members are its key set");
+	global.tags().insert("urgent");
+	sleep_for(Duration::millis(0));
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
