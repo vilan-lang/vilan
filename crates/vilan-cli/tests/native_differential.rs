@@ -12626,3 +12626,21 @@ fun main() {
         "an empty literal grounded through its parameter's bound builds on both backends"
     );
 }
+
+/// F126: `print(caller())` handed rustc a `vilan_rt::print` of a
+/// `vilan_rt::Location`, which had no `Js` impl (E0277, a backend defect by
+/// the CLI's own sentence). The location prints its text at the top level,
+/// as `console.log` prints the JS string it is, and inside a list or an
+/// `Option` the printer names it `<Location>` on both backends.
+#[test]
+fn f126_print_of_a_location_writes_its_text_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f126_location_print.vl";
+    std::fs::write(staged.join(file), include_str!("native/location_print.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "`print` of a `Location` must write the same bytes natively"
+    );
+}

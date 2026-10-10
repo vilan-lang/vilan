@@ -50,6 +50,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**F126: `print(caller())` builds natively — a `std::debug::Location` printed at the top level handed rustc `vilan_rt::print` of a `vilan_rt::Location`, which had no `Js` impl, and the build failed E0277 ("a BACKEND defect" by the CLI's own sentence) while JS printed `src/main.vl:9:8`.** The runtime's `Location` now renders as the JS backend's location is — its text, `file:line:column` (and quoted as a `str` is where it nests; the printer names a nested one `<Location>` on both backends before it gets there). Pin: `f126_print_of_a_location_writes_its_text_on_both_backends` (`native/location_print.vl`: a bare `caller()`, a `[track_caller]` answer, a list and an `Option` of them).
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->

@@ -446,6 +446,19 @@ pub fn panic_with(message: &str) -> ! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Location(pub &'static str);
 
+/// F126: `print(caller())` — the JS backend's location IS its text, so
+/// `console.log` writes `file:line:column`; it renders as a `str` does
+/// (quoted when nested, though the printer names a nested one `<Location>`
+/// before it reaches here).
+impl Js for Location {
+    fn js(&self) -> String {
+        self.0.to_string()
+    }
+    fn js_nested(&self) -> String {
+        inspect::string(self.0)
+    }
+}
+
 /// A vilan `panic` — what [`panic_at`] raises: the message, and the site the
 /// report names. [`describe_panic`] answers the message alone, so a catcher
 /// (`guarded`, a task's failure) sees exactly what the JS `error.message`
