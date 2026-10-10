@@ -1,0 +1,10 @@
+Registry { names = HashMap { "ada" => 36, "alan" => 41 }, tags = HashSet { "x" }, cell = Shared(7), count = SignalCell(3) }
+Fixed { cells = [1, 2], grid = [[1, 2], [3, 4]], none = [], run = <closure |i32| i32> }
+Event::Moved([1.0, 2.5])
+Event::Handler(<closure |str| void>)
+Event::Empty
+HashMap {}
+HashSet {}
+Shared([1, 2])
+SignalCell(3)
+Shared(Link { label = "head", next = Some(<cycle>) })

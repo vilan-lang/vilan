@@ -1276,6 +1276,109 @@ fn s2_dbg_of_a_scalar_view_prints_its_value() {
     );
 }
 
+/// E283 on debug-48's repro: a derive over a `HashMap`, a `Shared` and a
+/// `BigInt` field compiles (it failed inside the generated code: "HashMap<str,
+/// i32> has no method 'debug'") and spells what `dbg` prints, on one line.
+#[test]
+fn e283_the_derive_takes_stds_handles() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "import std::hash_map::HashMap;\n",
+            "import std::hash_set::HashSet;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "import std::shared::Shared;\n",
+            "[derive(Debug)]\n",
+            "struct Registry {\n",
+            "\tnames: HashMap<str, i32>,\n",
+            "\ttags: HashSet<i32>,\n",
+            "\tcell: Shared<i32>,\n",
+            "\tcount: SignalCell<i32>,\n",
+            "\tbig: BigInt,\n",
+            "}\n",
+            "fun main() {\n",
+            "\tmut names: HashMap<str, i32> = HashMap::new();\n",
+            "\tnames.insert(\"a\", 1);\n",
+            "\tlet tags: HashSet<i32> = HashSet::new();\n",
+            "\tlet count: SignalCell<i32> = Signal::new(2);\n",
+            "\tlet registry = Registry { names = names, tags = tags, cell = Shared::new(1), count = count, big = 10n };\n",
+            "\tprint(registry.debug());\n",
+            "}\n",
+        ),
+        "Registry { names = HashMap { \"a\" => 1 }, tags = HashSet {}, cell = Shared(1), count = SignalCell(2), big = 10 }\n",
+    );
+}
+
+/// E283's other half: a closure field prints its written type and a fixed
+/// array of a LITERAL length prints element by element — nested, empty, and in
+/// an enum variant's payload — as `dbg` prints them.
+#[test]
+fn e283_the_derive_prints_a_closure_and_a_literal_length_array_field() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "[derive(Debug)]\n",
+            "struct Fixed {\n",
+            "\tcells: [i32; 2],\n",
+            "\tgrid: [[u8; 2]; 2],\n",
+            "\tnone: [str; 0],\n",
+            "\trun: |i32| i32,\n",
+            "}\n",
+            "[derive(Debug)]\n",
+            "enum Event {\n",
+            "\tMoved([f64; 2]),\n",
+            "\tHandler(|str| void),\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(Fixed { cells = [1, 2], grid = [[1, 2], [3, 4]], none = [], run = |x| x }.debug());\n",
+            "\tprint(Event::Moved([1.0, 2.5]).debug());\n",
+            "\tprint(Event::Handler(|text| print(text)).debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "Fixed { cells = [1, 2], grid = [[1, 2], [3, 4]], none = [], run = <closure |i32| i32> }\n",
+            "Event::Moved([1.0, 2.5])\n",
+            "Event::Handler(<closure |str| void>)\n",
+        ),
+    );
+}
+
+/// E283: `T: Debug` takes each handle, and a `Shared` cycle prints `<cycle>`
+/// rather than recursing forever, as `dbg` cuts it.
+#[test]
+fn e283_t_debug_takes_stds_handles_and_cuts_a_cycle() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "import std::hash_map::HashMap;\n",
+            "import std::shared::Shared;\n",
+            "[derive(Debug)]\n",
+            "struct Link {\n",
+            "\tlabel: str,\n",
+            "\tnext: Option<Shared<Link>>,\n",
+            "}\n",
+            "fun show<T: Debug>(value: T) {\n",
+            "\tprint(value.debug());\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet empty: HashMap<str, i32> = HashMap::new();\n",
+            "\tshow(empty);\n",
+            "\tshow(Shared::new([1, 2]));\n",
+            "\tshow(123456789012345678901234567890n);\n",
+            "\tlet head = Shared::new(Link { label = \"head\", next = None });\n",
+            "\thead.write().next = Some(head.clone());\n",
+            "\tshow(head);\n",
+            "}\n",
+        ),
+        concat!(
+            "HashMap {}\n",
+            "Shared([1, 2])\n",
+            "123456789012345678901234567890\n",
+            "Shared(Link { label = \"head\", next = Some(<cycle>) })\n",
+        ),
+    );
+}
+
 /// N149: N136's recording is static, so `print(value)` with `value: T` was not
 /// wrapped where `T` is a number and negative zero printed `-0` on JS (`0`
 /// natively). The type is read per instance now: the number instances share a

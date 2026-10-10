@@ -11430,6 +11430,21 @@ fn s2_dbg_stack_prints_the_scope_the_same_on_both_backends() {
     );
 }
 
+/// E283: `[derive(Debug)]` and `T: Debug` take std's handles (`HashMap`,
+/// `HashSet`, `Shared` with its cycle cut, `SignalCell` read untracked), a
+/// closure field by its type and a literal-length array field (nested, empty,
+/// in a variant) element by element, and `.debug()` spells what `dbg` prints —
+/// the same bytes on both backends (`native/debug_handles.*`).
+#[test]
+fn e283_debug_takes_every_type_dbg_prints_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_debug_handles.vl",
+        include_str!("native/debug_handles.vl"),
+        include_str!("native/debug_handles.stdout"),
+        include_str!("native/debug_handles.stderr"),
+    );
+}
+
 /// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
 /// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
 /// N136's `0`; the same bytes on both backends.

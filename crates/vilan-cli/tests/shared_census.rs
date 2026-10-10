@@ -196,10 +196,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "shared.vl",
-        1,
+        2,
         "R: `fresh_identity`'s draw (A147) — a cell made only for the stamp \
          `Shared::identity` gives it, which is how every `identity()` in std \
-         draws from ONE space; it is dropped at once",
+         draws from ONE space; it is dropped at once — and the module-level \
+         `debug_inside` stack `Shared`'s `Debug` keeps to print a cycle as \
+         `<cycle>` (E283)",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     ("web/router.vl", 1, "R: the module-level `wired` latch"),
@@ -316,7 +318,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 222,
+        total, 223,
         "the total number of `Shared` construction sites in std changed"
     );
 

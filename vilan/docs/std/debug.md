@@ -82,10 +82,15 @@ trait Debug {
 implements it for `str` (quoted and escaped as `dbg` writes it), `bool`, every
 number (a float keeps its `.0`: `3.0.debug()` is `"3.0"`, and negative zero is
 `"-0.0"`), and for `List`, `Option`, `Result` and tuples whose elements are
-`Debug` (`(1, "two").debug()` is `(1, "two")`);
+`Debug` (`(1, "two").debug()` is `(1, "two")`), and for std's handles as
+`dbg` prints them: `HashMap { "ada" => 36 }` and `HashSet { 1, 2 }` in insertion
+order, `Shared(..)` (a cell met again inside its own rendering is `<cycle>`),
+`SignalCell(3)` (read without subscribing) and a `BigInt`'s digits.
 `[derive(Debug)]` writes it for a struct or an enum from its fields
 (`Point { x = 1, y = 2 }`, `Shape::Circle(1.5)`), so a struct holding a
-`List<i32>` or an `Option<f64>` derives it. `.debug()` is opt-in: a type has
+`List<i32>`, an `Option<f64>` or a `HashMap` derives it. A closure field prints
+its type (`<closure |i32| i32>`) and a fixed-array field of a literal length
+its elements (`[1, 2]`), since neither has an impl of its own. `.debug()` is opt-in: a type has
 it only through the derive or an impl of its own.
 
 `dbg` needs none of this: it prints every type. A `Debug` impl you WRITE decides

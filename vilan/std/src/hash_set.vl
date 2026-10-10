@@ -7,6 +7,7 @@
 // yields real `T`s in INSERTION order, on both backends: a duplicate insert keeps
 // its value's place, and a value removed and inserted again goes to the end.
 import pkg::compare::PartialEq;
+import pkg::debug::Debug;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::iterator::Items;
@@ -152,5 +153,25 @@ impl List<type T: Hashable> {
 impl HashSet<type T: Hashable> with Default {
 	fun default(): HashSet<T> {
 		HashSet::new()
+	}
+}
+
+/// `HashSet { "a", "b" }` in insertion order, `HashSet {}` empty: what `dbg`
+/// prints, on one line (E283).
+impl HashSet<type T: Hashable + Debug> with Debug {
+	fun debug(self): str {
+		if self.is_empty() {
+			ret "HashSet {}";
+		}
+		mut out = "HashSet { ";
+		mut first = true;
+		for value in self.values() {
+			if !first {
+				out = out + ", ";
+			}
+			first = false;
+			out = out + value.debug();
+		}
+		out + " }"
 	}
 }
