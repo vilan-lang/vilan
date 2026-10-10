@@ -7796,3 +7796,15 @@ fn b574_a_trait_sharing_its_derives_name_gets_the_import_steer() {
         outcome.diagnostics
     );
 }
+
+// --- A164 (R-g): `null`'s type stays unwritable ------------------------------
+
+/// A164 (RULED: unwritable): a mismatch names the `null` VALUE, never a type
+/// the author cannot spell — "Expected i32, but got null instead" named one.
+#[test]
+fn a164_a_mismatch_names_the_null_value() {
+    assert_fails_once_with(
+        "fun main() {\n\tlet _wrong: i32 = null;\n}\n",
+        "Expected i32, but got the `null` value instead.",
+    );
+}

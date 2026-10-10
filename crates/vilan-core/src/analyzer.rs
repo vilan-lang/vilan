@@ -51448,8 +51448,18 @@ impl<'src> Analyzer<'src> {
         {
             return message;
         }
-        let expected = self.pretty_print_type(expected_type, substitution_context);
-        let got = self.pretty_print_type(got_type, substitution_context);
+        // A164 (R-g): `null`'s type is UNWRITABLE — `null` is a value, and
+        // `void` the unit type — so a mismatch names the value, never a type
+        // the author could not spell (`let wrong: i32 = null` read "Expected
+        // i32, but got null instead", and `null` in an annotation is refused).
+        let expected = match self.is_null_type(expected_type) {
+            true => "the `null` value".to_string(),
+            false => self.pretty_print_type(expected_type, substitution_context),
+        };
+        let got = match self.is_null_type(got_type) {
+            true => "the `null` value".to_string(),
+            false => self.pretty_print_type(got_type, substitution_context),
+        };
         // B569 §4.3: two tuples whose labels CONTRADICT — a label both carry
         // at different positions — do not convert, and the sentence says
         // which label moved. `with_fragment_steer` appends the two spellings
@@ -51855,6 +51865,12 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Whether `type_` is the index type, `usize`.
+    /// Whether `type_` is the `null` value's type (A164).
+    fn is_null_type(&self, type_: &Type) -> bool {
+        matches!(type_, Type::Struct(id, _)
+            if self.primitive_struct_ids.get("null") == Some(id))
+    }
+
     fn is_usize(&self, type_: &Type) -> bool {
         matches!(type_, Type::Struct(id, _)
             if self.primitive_struct_ids.get("usize") == Some(id))

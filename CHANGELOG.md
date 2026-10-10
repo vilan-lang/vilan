@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**A164 (R-g): a mismatch names the `null` VALUE — "Expected i32, but got the `null` value instead." — where it named a type the author cannot write ("Expected i32, but got null instead", while `let x: null = null` is refused "found 'null' expected a type in type annotation").** The ruling keeps `null`'s type unwritable: `null` is a value, `void` is the unit type, and `std::js::null`'s declaration stays internal. Pin: `inference::modules::a164_a_mismatch_names_the_null_value`.
+
+<!-- family: diagnostics -->
 **B574: a miss of `Storable` gets its import steer — `fun keep<T: Storable>(..)` was refused bare "cannot find type 'Storable'", and so was `let x: Storable = ..`, where `Store::new(1)` said "; import it first (`import std::reactive::store::Store;`)".** The item's premise was wrong: a bound's miss already goes through the one type-position site and asks `import_steer` (`fun keep<T: Hashable>` is steered). What failed was std's import index: the derive MACRO `Storable` (`std::reactive::store`) and the TRAIT `Storable` (`store_core`) read as two homes for one name, and an ambiguous name is dropped. A macro lives in its own namespace (macro-engine.md §4), so the index takes items first and a macro only for a name no item declares; the trait's home then resolves to the facade that re-exports it beside its derive, `import std::reactive::store::Storable;` (one import brings both). Pin: `inference::modules::b574_a_trait_sharing_its_derives_name_gets_the_import_steer`.
 
 <!-- family: fix -->
