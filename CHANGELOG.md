@@ -40,6 +40,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**N162: std is not checked as an entry, and the CLI reference says so.** `vilan check <file>` on a file inside the toolchain's own `std/src/` reports errors on twelve of its seventy-one files (v0.47.0) that no program importing std ever sees: five declare compiler intrinsics as bodyless `external fun`s (`context.vl`, `process.vl`, `random.vl`, `shared.vl`, `web/dom.vl`), five platform-layer files import their base layer by `pkg::`, which has one root in file mode, and `reactive/store.vl` and `rpc/mirror.vl` read an `[internal]` field only std may. Measured, the three causes are the analyzer's (the intrinsic table is resolved by name against a program that imports std, and B568's internal-field rule treats the entry as outside std) and module loading's (a layer overlays its base), not file mode's, so none is the small fix the item hoped for; the appendix's `vilan check [file]` section now says std is checked through the programs and tests that import it.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
