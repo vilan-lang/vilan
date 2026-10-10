@@ -9340,22 +9340,23 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 
 /// F108's native half: a refusal raised inside a function body in ANOTHER
 /// file named no expression — its span indexed the other file's bytes and
-/// the CLI rendered it against the entry: `names.push_many([])` (whose `[]`
-/// stays `List<unknown>`, the solver half) printed one bare `Error:` line, no
-/// file and no line, and a refusal inside a user module was drawn over the
-/// entry's `import` line. A library body's refusal is now anchored at the
-/// user's call that instantiated it, naming the body and its file; a user
-/// module's is drawn in that module.
+/// the CLI rendered it against the entry: `names.push_many([])` printed one
+/// bare `Error:` line, no file and no line, and a refusal inside a user module
+/// was drawn over the entry's `import` line. A library body's refusal is now
+/// anchored at the user's call that instantiated it, naming the body and its
+/// file; a user module's is drawn in that module. (F108's solver half grounds
+/// `push_many([])` now, so the library-body probe is an `Option::None` whose
+/// payload nothing states, instantiating `is_some`'s body open.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
-    let file = "native_probe_f108_push_many.vl";
+    let file = "native_probe_f108_open_option.vl";
     std::fs::write(
         staged.join(file),
         concat!(
-            "import std::io::print;\n\n",
-            "fun main() {\n\tmut names: List<str> = [\"a\"];\n\tnames.push_many([]);\n",
-            "\tprint(names.len());\n}\n",
+            "import std::io::print;\nimport std::option::Option;\n\n",
+            "fun main() {\n\tlet present = Option::None.is_some();\n",
+            "\tprint(present);\n}\n",
         ),
     )
     .expect("write the probe");
@@ -9364,16 +9365,13 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         .output()
         .expect("build the probe");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the probe is refused natively");
     assert!(
-        !output.status.success(),
-        "the probe is still refused (F108's solver half)"
-    );
-    assert!(
-        stderr.contains(&format!("{file}:5:2")) && stderr.contains("names.push_many([])"),
+        stderr.contains(&format!("{file}:5:16")) && stderr.contains("Option::None.is_some()"),
         "the refusal is drawn at the user's call:\n{stderr}"
     );
     assert!(
-        stderr.contains("The construct is in `push_many`'s body (`list.vl`)"),
+        stderr.contains("The construct is in `is_some`'s body (`option.vl`)"),
         "the refusal names the body and its file:\n{stderr}"
     );
     let module = staged.join("native_probe_f108_module");
@@ -12438,5 +12436,33 @@ fun main() {
         compare(&staged, "native_probe_b587.vl"),
         Verdict::Identical,
         "a top-level tuple leaf under a view subject is a view on both backends"
+    );
+}
+
+/// F108's solver half: an EMPTY list literal at a parameter whose element is
+/// fixed only through its bound (`names.push_many([])`, `push_many<S:
+/// Items<T>>`) is grounded `List<str>` from the bound, so the native build has
+/// an element type to emit (it was refused "does not emit a value of type `an
+/// unresolved type`").
+#[test]
+fn an_empty_literal_at_a_bounded_generic_is_grounded_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_f108.vl"),
+        r#"import std::io::print;
+
+fun main() {
+    mut names: List<str> = ["a"];
+    names.push_many([]);
+    names.push_many(["b"]);
+    print(names.len());
+}
+"#,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f108.vl"),
+        Verdict::Identical,
+        "an empty literal grounded through its parameter's bound builds on both backends"
     );
 }

@@ -777,3 +777,39 @@ fn b580_a_filled_written_or_generic_binding_is_not_refused() {
         "Expected str, but got i32 instead.",
     );
 }
+
+// --- F108: an empty literal grounded through its parameter's bound ----------
+
+/// F108's solver half: `names.push_many([])` on a `List<str>` bound `S =
+/// List<unknown>` — the literal's element slot stayed open (JS ran it, the
+/// native build had nothing to emit). The bound `S: Items<T>` with `T = str`
+/// from the receiver, and the one `Items` impl a `List` meets, say `S =
+/// List<str>`: the slot is filled from the bound, as a `push` fills it.
+#[test]
+fn f108_an_empty_literal_at_a_bounded_generic_is_grounded_from_the_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut names: List<str> = ["a"];
+            names.push_many([]);
+            print(names.len());
+        }
+        "#,
+        "1\n",
+    );
+    // The binding the literal lands in is grounded too — B580 would refuse a
+    // `let none = []` whose element nothing states.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut names: List<str> = ["a"];
+            let none = [];
+            names.push_many(none);
+            print(names.len());
+        }
+        "#,
+        "1\n",
+    );
+}

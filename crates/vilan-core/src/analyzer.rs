@@ -42959,6 +42959,10 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // F108: an argument whose type still holds a list literal's element
+        // slot (`push_many([])`) is grounded through the BOUND its parameter
+        // carries, once the bound's arguments are known.
+        self.ground_list_slots_through_bounds(&bindable, substitution);
         if !closures_read {
             self.derive_generics_from_bounds(&bindable, &bindable, substitution);
             self.bind_from_written_closure_parameters(
@@ -55941,6 +55945,140 @@ impl<'src> Analyzer<'src> {
                     || self.tuple_literal_holds_unsuffixed_numeric(*element_id)
             }),
             _ => false,
+        }
+    }
+
+    /// F108's solver half: an EMPTY list literal handed to a generic parameter
+    /// whose element is fixed only through its bound — `names.push_many([])`
+    /// on a `List<str>`, `push_many<S: Items<T>>` — bound `S = List<unknown>`,
+    /// and nothing ever filled the slot: JS ran it, natively the instance had
+    /// no element type to emit. The bound says what the slot is: `T = str`
+    /// from the receiver, so `S` must implement `Items<str>`, and the one impl
+    /// of `Items` that admits a `List<_>` (`impl List<type U> with Items<U>`)
+    /// does at `U = str` — `S = List<str>`. Asked only of a bound generic
+    /// whose binding still holds a list slot, whose bound's arguments are
+    /// known, and which exactly ONE impl of the bound's trait admits; the
+    /// slot is filled in place, as a `push` fills it.
+    fn ground_list_slots_through_bounds(
+        &mut self,
+        bindable: &[TypeId],
+        substitution: &SubstitutionContext,
+    ) {
+        if self.list_element_slots.is_empty() {
+            return;
+        }
+        for owner in bindable {
+            let Some(concrete_id) = substitution.get(owner).copied() else {
+                continue;
+            };
+            // The shape asked about is a nominal holding an open slot as one
+            // of its own arguments (`List<_>`): a one-level look, where the
+            // full hole walk would be paid on every generic call.
+            let holds_an_open_argument = match self.borrow_type_by_type_id(concrete_id) {
+                Type::Struct(_, arguments) | Type::Enum(_, arguments) => {
+                    arguments.iter().any(|argument| {
+                        matches!(self.borrow_type_by_type_id(*argument), Type::Unknown)
+                    })
+                }
+                _ => false,
+            };
+            if !holds_an_open_argument {
+                continue;
+            }
+            let concrete = concrete_id.get_type(self);
+            for (trait_id, trait_arguments) in self.generic_bound_traits(*owner) {
+                let required: Vec<Type> = trait_arguments
+                    .iter()
+                    .map(|argument| {
+                        let argument = argument.get_type(self);
+                        self.substitute_type(&argument, substitution)
+                    })
+                    .collect();
+                if required.is_empty()
+                    || required.iter().any(|argument| {
+                        matches!(argument, Type::Generic(_)) || self.type_value_has_hole(argument)
+                    })
+                {
+                    continue;
+                }
+                let rows = self.trait_impl_rows(&concrete, &[trait_id]);
+                let mut admitting: Vec<usize> = Vec::new();
+                for index in rows {
+                    let subject = self.implementations[index].subject;
+                    if self.impl_subject_admits(
+                        &concrete,
+                        subject.borrow_type(self),
+                        &HashMap::default(),
+                    ) && self.impl_bounds_hold(subject, &concrete)
+                    {
+                        admitting.push(index);
+                    }
+                }
+                let [index] = admitting.as_slice() else {
+                    continue;
+                };
+                let implementation = &self.implementations[*index];
+                let subject = implementation.subject;
+                let written: Vec<TypeId> = implementation
+                    .trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)
+                    .map(|(_, arguments)| arguments.clone())
+                    .unwrap_or_default();
+                let subject_type = subject.get_type(self);
+                let mut binders = Vec::new();
+                self.collect_generics(&subject_type, 0, &mut binders);
+                let mut bindings: SubstitutionContext = HashMap::default();
+                for (written, required) in written.iter().zip(&required) {
+                    let written = written.get_type(self);
+                    let previously_inferable =
+                        std::mem::replace(&mut self.inferable_generics, binders.clone());
+                    let reconciled = self.reconcile_type(&written, required, &bindings);
+                    self.inferable_generics = previously_inferable;
+                    if let Some((_, found)) = reconciled {
+                        for (binder, type_id) in found {
+                            if binders.contains(&binder) {
+                                bindings.insert(binder, type_id);
+                            }
+                        }
+                    }
+                }
+                if bindings.is_empty() {
+                    continue;
+                }
+                let expected = self.substitute_type(&subject_type, &bindings);
+                self.fill_list_slots(concrete_id, &expected, 0);
+            }
+        }
+    }
+
+    /// Writes `expected` into every list literal element slot `held` still
+    /// leaves open, walking the two types in step (F108).
+    fn fill_list_slots(&mut self, held: TypeId, expected: &Type, depth: usize) {
+        if depth > 16 {
+            return;
+        }
+        let held_type = held.get_type(self);
+        match (&held_type, expected) {
+            (Type::Unknown, _) => {
+                let is_slot = self.list_element_slots.values().any(|slot| *slot == held);
+                if is_slot && !self.type_value_has_hole(expected) {
+                    self.write_type_slot(held, expected.clone());
+                }
+            }
+            (
+                Type::Struct(held_id, held_arguments),
+                Type::Struct(expected_id, expected_arguments),
+            )
+            | (Type::Enum(held_id, held_arguments), Type::Enum(expected_id, expected_arguments))
+                if held_id == expected_id && held_arguments.len() == expected_arguments.len() =>
+            {
+                for (held, expected) in held_arguments.clone().into_iter().zip(expected_arguments) {
+                    let expected = expected.get_type(self);
+                    self.fill_list_slots(held, &expected, depth + 1);
+                }
+            }
+            _ => {}
         }
     }
 
