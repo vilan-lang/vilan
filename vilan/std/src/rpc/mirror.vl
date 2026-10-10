@@ -821,6 +821,9 @@ struct MirrorView {
 	subscribing: Shared<List<i32>>,
 	unsubscribing: Shared<List<i32>>,
 	pending: Shared<i32>,
+	/// Released boundaries whose value stays in the replica because a boundary
+	/// held BELOW it still reads it there: each leaves with the last hold under it.
+	parked: Shared<List<ClientSlot>>,
 	/// Its connection dropped (A153 S4): the channel it names died with the
 	/// session, so it sends nothing more — a `Subscribe` or an `Unsubscribe` for
 	/// that id would reach the FRESH session, which may have minted it for
@@ -865,6 +868,7 @@ fun mirror_view(client: ReactiveClient, channel: i32): MirrorView {
 		subscribing = Shared::new([]),
 		unsubscribing = Shared::new([]),
 		pending = Shared::new(0 - 1),
+		parked = Shared::new([]),
 		dead = Shared::new(false),
 	};
 	mirror_views.write().push((owner, made));
@@ -1039,7 +1043,7 @@ impl MirrorView {
 				// demand (§6.2) — but a base keeps its last value for the next mint
 				// to compare against.
 				if held.slot >= 0 {
-					batch(|| (held.boundary.gone)());
+					self.parked.write().push(held);
 				}
 				// A slot whose `Subscribe` went out is told off, and its reader
 				// stays for the frames still in flight — until the view closes: no
@@ -1054,6 +1058,7 @@ impl MirrorView {
 			kept.push(held);
 		}
 		self.slots.write() = kept;
+		self.leave_replica();
 		let codec = self.codec;
 		let channel = self.channel;
 		if !subscribe.is_empty() {
@@ -1089,6 +1094,32 @@ impl MirrorView {
 		if !self.dead.read() {
 			self.dead.write() = true;
 			self.close();
+		}
+	}
+
+	/// Every released boundary nothing is held below leaves the replica: memory
+	/// follows demand (§6.2), and a boundary's value stays only while a boundary
+	/// inside it is still watched.
+	fun leave_replica(self) {
+		mut staying: List<ClientSlot> = [];
+		mut leaving: List<ClientSlot> = [];
+		for parked in self.parked.read() {
+			mut below = false;
+			for held in self.slots.read() {
+				if held.boundary.place.len() > parked.boundary.place.len()
+					&& starts_with(held.boundary.place, parked.boundary.place) {
+					below = true;
+				}
+			}
+			if below {
+				staying.push(parked);
+			} else {
+				leaving.push(parked);
+			}
+		}
+		self.parked.write() = staying;
+		for parked in leaving {
+			batch(|| (parked.boundary.gone)());
 		}
 	}
 
@@ -1473,6 +1504,7 @@ impl StoreMint<type T: StoreWire + Storable> {
 		MirrorBoundary {
 			path = boundary.path,
 			identity,
+			place = boundary.place,
 			apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 				apply(rel, deserializer);
 				mint.hear(identity);
@@ -1619,6 +1651,7 @@ fun base_boundary<T: StoreWire + Storable>(replica: Store<Option<T>>): MirrorBou
 	MirrorBoundary {
 		path = [],
 		identity = store_identity_at(replica.root, []),
+		place = [],
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			match replica.get() {

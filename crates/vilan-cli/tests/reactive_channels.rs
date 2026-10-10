@@ -6723,3 +6723,159 @@ fn a153_s4_a_reconnect_replays_the_root_once_resubscribes_in_one_frame_and_resee
         "the mirrored store's reconnect went differently:\n{stdout}"
     );
 }
+
+// --- A168: a set crosses the wire ---------------------------------------------
+
+/// A struct with a `HashSet` field derives `Wire`, and a mirrored store carries
+/// it: each watched member is a boundary of its own.
+const MIRROR_SET: &str = r##"import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Room {
+	name: str,
+	members: HashSet<str>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut members: HashSet<str> = HashSet::new();
+	members.insert("amy");
+	members.insert("bob");
+	let room = Room { name = "lounge", members };
+	// The set's own `Wire`: the list of its members, in insertion order.
+	let (record, finish) = (codec.writer)();
+	mut writer = record;
+	room.describe(&mut writer);
+	let frame = finish();
+	print(i"wire {text(frame)}");
+	mut reader = (codec.reader)(frame);
+	let back = Room::rebuild(&mut reader);
+	print(i"back {back.name} amy={back.members.contains("amy")} zed={back.members.contains("zed")} n={back.members.len()}");
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(1, room);
+	let global = Store::new(Global { rooms });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	let watching = Owner::new();
+	run_with_owner(page, || {
+		g.rooms().at(1).some().name().effect(|name| print(i"name {name.unwrap_or("-")}"));
+	});
+	run_with_owner(watching, || {
+		let lounge = g.rooms().at(1).some();
+		lounge.members().contains("amy").effect(|present| print(i"amy {present.unwrap_or(false)}"));
+		lounge.members().contains("zed").effect(|present| print(i"zed {present.unwrap_or(false)}"));
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print("-- zed joins, amy leaves, bob stays: only the watched members cross");
+	let _zed = global.rooms().at(1).some().members().insert("zed");
+	let _amy = global.rooms().at(1).some().members().remove("amy");
+	let _cat = global.rooms().at(1).some().members().insert("cat");
+	sleep_for(Duration::millis(0));
+	print("-- the room's own hold goes; the members watched inside it keep it");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	let _back = global.rooms().at(1).some().members().insert("amy");
+	sleep_for(Duration::millis(0));
+	print("-- the last hold inside it goes: the room leaves the replica");
+	watching.dispose();
+	sleep_for(Duration::millis(0));
+	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	print("done");
+}
+"##;
+
+#[test]
+fn a168_a_set_field_crosses_the_wire_and_each_watched_member_is_a_boundary() {
+    // A168: the set's `Wire` is the list of its members in insertion order, and
+    // a round trip keeps them. Mirrored, the room's seed carries the set EMPTY
+    // (its members are boundaries), `contains("amy")` and `contains("zed")` are
+    // two slots seeded `true`/`false`, and of four writes only the two watched
+    // members cross. And the fix beside it: the room's own hold going does NOT
+    // take the room out of the replica while members inside it are watched (the
+    // member's next seed still lands); the last hold inside it does.
+    let stdout = run_program("mirror_set", MIRROR_SET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "wire {\"name\":\"lounge\",\"members\":[\"amy\",\"bob\"]}",
+            "back lounge amy=true zed=false n=2",
+            "name -",
+            "amy false",
+            "zed false",
+            "name -",
+            "amy false",
+            "zed false",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,1]],[1,-1,[0,1,1,1,\"amy\"]],[2,-1,[0,1,1,1,\"zed\"]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"name\":\"lounge\",\"members\":[]}]},{\"Seed\":[1,true]},{\"Seed\":[2,false]}]]}",
+            "name lounge",
+            "amy true",
+            "zed false",
+            "-- zed joins, amy leaves, bob stays: only the watched members cross",
+            "down {\"Patch\":[0,[{\"Seed\":[2,true]}]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[1,false]}]]}",
+            "zed true",
+            "amy false",
+            "-- the room's own hold goes; the members watched inside it keep it",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "room held: true",
+            "down {\"Patch\":[0,[{\"Seed\":[1,true]}]]}",
+            "amy true",
+            "-- the last hold inside it goes: the room leaves the replica",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "up   {\"Unsubscribe\":[0,[2]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "room held: false",
+            "done",
+        ],
+        "the mirrored set went differently:\n{stdout}"
+    );
+}

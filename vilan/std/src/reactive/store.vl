@@ -825,6 +825,17 @@ export impl Store<HashSet<type T: Hashable>> {
 }
 
 export impl StoreSome<HashSet<type T: Hashable>> {
+	/// `member` joins the set while every variant on the path is live —
+	/// `contains(member).patch(true)`: whether it landed.
+	fun insert(self, member: T): bool {
+		self.contains(member).patch(true)
+	}
+
+	/// `member` leaves the set — `contains(member).patch(false)`.
+	fun remove(self, member: T): bool {
+		self.contains(member).patch(false)
+	}
+
 	fun contains(self, member: T): StoreSome<bool> {
 		self.descend(StoreStep::Key(member.hash()), |held: &HashSet<T>, f: |&bool| void| {
 			let present = held.contains(member);
@@ -1489,6 +1500,10 @@ export enum MirrorStep {
 export struct MirrorBoundary {
 	path: List<MirrorStep>,
 	identity: i32,
+	/// Its place in the REPLICA: the boundary's value lives at this path, and a
+	/// boundary held below it keeps it there (a released key's value stays while a
+	/// member or a key inside it is still watched).
+	place: List<StoreStep>,
 	apply: (|List<StoreStep>, Deserializer| void) context turn_scope,
 	gone: (|| void) context turn_scope,
 }
@@ -1561,6 +1576,7 @@ export fun mirror_boundary<T: StoreWire + Storable>(
 	MirrorBoundary {
 		path,
 		identity = store_identity_at(local.root, local.path),
+		place = local.path,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			mut copy = local.get();
@@ -1706,22 +1722,62 @@ export impl RemoteStoreSome<HashMap<type K: Hashable + Wire, type V: StoreWire +
 			at = MirrorAt {
 				link = at.link,
 				path = at.path,
-				boundary = mirror_boundary_some(local, at.path),
+				boundary = mirror_boundary_some(local, at.path, || {
+					let _patched = local.patch(None);
+				}),
+			},
+		}
+	}
+}
+
+/// A set's member is a BOUNDARY (§2.2 point 2): `contains(member)` on a remote set
+/// is a handle whose subscription puts that member's own slot on the wire, seeded
+/// with whether the set holds it (A168).
+export impl RemoteStore<HashSet<type T: Hashable + Wire>> {
+	fun contains(self, member: T): RemoteStore<bool> {
+		let local = self.local.contains(member);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)));
+		RemoteStore {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary(local, at.path, || local.set(false)),
+			},
+		}
+	}
+}
+
+export impl RemoteStoreSome<HashSet<type T: Hashable + Wire>> {
+	fun contains(self, member: T): RemoteStoreSome<bool> {
+		let local = self.local.contains(member);
+		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)));
+		RemoteStoreSome {
+			local,
+			at = MirrorAt {
+				link = at.link,
+				path = at.path,
+				boundary = mirror_boundary_some(local, at.path, || {
+					let _patched = local.patch(false);
+				}),
 			},
 		}
 	}
 }
 
 /// `mirror_boundary` for a boundary reached through a variant: the frame lands
-/// through `patch`, and lands nowhere while the variant is not live.
+/// through `patch`, and lands nowhere while the variant is not live; `gone` is
+/// what the boundary reads when the server says it is not there.
 [internal("the mirrored store's client half (A153 S2)")]
 export fun mirror_boundary_some<P: StoreWire + Storable>(
-	local: StoreSome<Option<P>>,
+	local: StoreSome<P>,
 	path: List<MirrorStep>,
+	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
 	MirrorBoundary {
 		path,
 		identity = store_identity_at(local.root, local.path),
+		place = local.path,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			match local.get() {
@@ -1733,9 +1789,7 @@ export fun mirror_boundary_some<P: StoreWire + Storable>(
 				None => {},
 			}
 		},
-		gone = || {
-			let _patched = local.patch(None);
-		},
+		gone,
 	}
 }
 

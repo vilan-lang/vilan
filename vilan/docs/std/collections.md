@@ -317,12 +317,17 @@ impl HashSet<type T: Hashable> {
 impl List<type T: Hashable> { fun to_set(self): HashSet<T> }
 impl HashSet<type T: Hashable> with Default { fun default(): HashSet<T> }  // the empty set
 impl HashSet<type T: Hashable> with PartialEq                             // same members; order ignored
+impl HashSet<type T: Hashable + Wire> with Wire                          // the list of its members
 ```
 
 Value-keyed like `HashMap` (element `T` must be `Hashable`); `for x in set`
 iterates the elements in insertion order (a duplicate insert keeps its value's
 place; a value removed and inserted again goes to the end). `std::set::Set` was its
 name before v0.42, removed in v0.44 as `Map` was.
+
+A set of `Wire` members is `Wire`: it crosses as the list of its members, in
+insertion order, so a struct with a set field derives `Wire` (and a mirrored
+store carries one, each member a boundary of its own — `contains(x)`).
 
 `union`/`intersection`/`difference` are the standard set operations, each
 returning a new `HashSet` and leaving both receivers untouched:

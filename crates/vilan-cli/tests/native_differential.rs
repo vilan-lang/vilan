@@ -11437,6 +11437,23 @@ fn a153_s4_a_mirrored_store_reconnects_the_same_on_both_backends() {
     );
 }
 
+/// A168: a mirrored set — its `Wire`, a member's boundary, a parent released
+/// while a member inside it is watched — behaves the same on both backends.
+#[test]
+fn a168_a_mirrored_set_behaves_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_set.vl"),
+        include_str!("native/store_mirror_set.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_set.vl"),
+        Verdict::Identical,
+        "a mirrored set must behave the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair
