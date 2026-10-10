@@ -9809,3 +9809,92 @@ fn b558_a_written_instantiation_in_the_declaring_impl_runs() {
         "x\n1\n",
     );
 }
+
+// --- B589: a closure whose parameters are all written binds in the first phase
+
+/// B589: a closure argument whose parameters are ALL annotated needs nothing
+/// from the call to type them, so its written types bind the generics they
+/// stand at before a sibling literal defaults — the method path's `fold(0,
+/// |acc: usize, n: usize| acc + n)` and the free path's `apply(5, |x: u32| x *
+/// 2)` were refused "Expected |i32, usize| i32, but got |usize, usize| usize",
+/// and so was the closure standing FIRST (`apply_first(|x: u8| x + 1, 7)`).
+#[test]
+fn b589_an_annotated_closure_binds_the_generic_a_sibling_literal_takes() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+
+        fun apply<T>(value: T, f: |T| T): T {
+            f(value)
+        }
+
+        fun apply_first<T>(f: |T| T, value: T): T {
+            f(value)
+        }
+
+        fun main() {
+            let words = ["a", "bb"];
+            let total = words.iter().map(|w: str| w.len()).fold(0, |acc: usize, n: usize| acc + n);
+            let wide = apply(5, |x: u32| x * 2);
+            let small = apply_first(|x: u8| x + 1, 7);
+            let half = apply(2.5, |x: f64| x / 2.0);
+            let index: usize = total;
+            let unsigned: u32 = wide;
+            let byte: u8 = small;
+            print(index);
+            print(unsigned);
+            print(byte);
+            print(half);
+        }
+        "#,
+        "3\n10\n8\n1.25\n",
+    );
+}
+
+/// B589's boundary: only a closure with EVERY parameter written moves. An
+/// unannotated parameter still takes the generic the other arguments bind; a
+/// zero-parameter closure is typed against the call as before (its return
+/// leans on the expectation); and a written type that contradicts a SUFFIXED
+/// sibling is still refused.
+#[test]
+fn b589_only_a_fully_annotated_closure_binds_first() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option;
+
+        fun apply<T>(value: T, f: |T| T): T {
+            f(value)
+        }
+
+        fun or_else<T>(value: Option<T>, fallback: || T): T {
+            match value {
+                Some(let inner) => inner,
+                None => fallback(),
+            }
+        }
+
+        fun main() {
+            let small: u8 = 7;
+            print(apply(small, |x| x + 1));
+            let none: Option<u8> = None;
+            let byte: u8 = or_else(none, || 3);
+            print(byte);
+        }
+        "#,
+        "8\n3\n",
+    );
+    assert_fails_with(
+        r#"
+        fun apply<T>(value: T, f: |T| T): T {
+            f(value)
+        }
+
+        fun main() {
+            let _clash = apply(5u8, |x: u32| x);
+        }
+        "#,
+        "Expected",
+    );
+}

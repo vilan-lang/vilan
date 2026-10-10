@@ -42654,6 +42654,47 @@ impl<'src> Analyzer<'src> {
         if bindable.is_empty() {
             return unresolved_closure_argument;
         }
+        // B589: a closure argument whose parameters are ALL written needs
+        // nothing from the call to type them, so in the first phase its written
+        // parameter types bind the generics they stand at — BEFORE the other
+        // arguments, so `fold(0, |acc: usize, n: usize| acc + n)` binds `B =
+        // usize` from the closure and the literal `0` then takes `usize` as its
+        // expectation, where it defaulted to `i32` first and the closure was
+        // refused against `|i32, usize| i32`. Only the PARAMETERS are read: the
+        // closure itself is typed in the second phase as before (its body and
+        // return may still lean on the call's expectation).
+        if skip_closures {
+            for (index, argument_id) in argument_ids.iter().enumerate() {
+                let Some(written) = self.closure_written_parameter_types(*argument_id) else {
+                    continue;
+                };
+                let Some(Type::Closure(positions, ..)) = parameter_ids
+                    .get(index + self_parameter_offset)
+                    .and_then(|parameter_id| self.parameters.get(parameter_id))
+                    .map(|parameter| parameter.type_id.get_type(self))
+                else {
+                    continue;
+                };
+                if positions.len() != written.len() {
+                    continue;
+                }
+                for (position, written) in positions.iter().zip(written) {
+                    let position = position.get_type(self);
+                    let written = written.get_type(self);
+                    let previously_inferable =
+                        std::mem::replace(&mut self.inferable_generics, bindable.clone());
+                    let reconciled = self.reconcile_type(&position, &written, substitution);
+                    self.inferable_generics = previously_inferable;
+                    if let Some((_, bindings)) = reconciled {
+                        for (constraint_id, type_id) in bindings {
+                            if bindable.contains(&constraint_id) {
+                                self.record_generic_binding(substitution, constraint_id, type_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for (index, argument_id) in argument_ids.iter().enumerate() {
             let is_closure = matches!(
                 self.expr_id_to_expr_map.get(argument_id),
@@ -55518,6 +55559,30 @@ impl<'src> Analyzer<'src> {
             }),
             _ => false,
         }
+    }
+
+    /// B589: the WRITTEN parameter types of a closure literal with at least
+    /// one parameter, every one of them annotated — `None` for anything else.
+    fn closure_written_parameter_types(&self, expr_id: Id) -> Option<Vec<TypeId>> {
+        let Some(Expr::Closure(closure_id)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return None;
+        };
+        let closure = self.closures.get(closure_id)?;
+        if closure.parameters.is_empty() {
+            return None;
+        }
+        closure
+            .parameters
+            .iter()
+            .map(|parameter_id| {
+                let parameter = self.parameters.get(parameter_id)?;
+                (!matches!(
+                    parameter.type_id.borrow_type(self),
+                    Type::Unknown | Type::Unresolved
+                ))
+                .then_some(parameter.type_id)
+            })
+            .collect()
     }
 
     /// The arity of a closure literal with at least one unannotated
