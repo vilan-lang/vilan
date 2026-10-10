@@ -49271,11 +49271,22 @@ impl<'src> Analyzer<'src> {
         if with_tables.is_empty() {
             return;
         }
+        let mut label_sources: HashSet<SourceId> = HashSet::default();
         for source in &with_tables {
             if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
                 self.restored_tables.absorb(tables);
+                if tables.labels_recorded {
+                    label_sources.insert(*source);
+                }
             }
         }
+        self.restored_tables.label_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| label_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.restored_tables.label_ranges.sort_unstable();
         self.world_table_ranges = self
             .source_ranges
             .iter()
@@ -49296,9 +49307,11 @@ impl<'src> Analyzer<'src> {
         if stale_table_planted() {
             let nominals = self.restored_tables.drop_nominals_world;
             let agree = self.restored_tables.drop_nominals_agree;
+            let label_ranges = std::mem::take(&mut self.restored_tables.label_ranges);
             self.restored_tables = RestoredTables {
                 drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
+                label_ranges,
                 ..RestoredTables::default()
             };
         }
@@ -49314,6 +49327,16 @@ impl<'src> Analyzer<'src> {
     /// at all about a `LastUse` row or a clone decision the emitter reads. And
     /// a module whose diagnostics replay may still have no tables recorded, in
     /// which case it recomputes them.
+    /// M110 S2b: whether `id`'s module restored its LABEL rows — the only
+    /// case the tail may skip rendering it ([`RestoredTables::label_ranges`]).
+    /// A reused module whose record was filed by an unseeded analysis carries
+    /// no rows and is rendered like a hot one.
+    fn label_row_restored(&self, id: Id) -> bool {
+        let ranges = &self.restored_tables.label_ranges;
+        let index = ranges.partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < ranges[index - 1].1
+    }
+
     fn table_entity(&self, id: Id) -> bool {
         let index = self
             .world_table_ranges
@@ -72909,6 +72932,12 @@ struct ModuleTables {
     /// on kolt at ~0.5 MB of strings per stored world.
     expr_types: Vec<(Id, String)>,
     declaration_labels: Vec<(Id, String)>,
+    /// Whether the two label rows above were FILED for this module — only an
+    /// analysis a front end seeded files them (a cold `vilan check` never
+    /// reads a record back), so a record written by any other analysis
+    /// carries none, and the tail must render that module's labels rather
+    /// than skip them.
+    labels_recorded: bool,
 }
 
 impl ModuleTables {
@@ -72994,6 +73023,9 @@ struct RestoredTables {
     /// rendering the reused ranges skip.
     expr_types: HashMap<Id, String>,
     declaration_labels: HashMap<Id, String>,
+    /// The id ranges of the modules whose record CARRIED label rows — the
+    /// only ids the tail's builders may skip rendering for. Sorted, disjoint.
+    label_ranges: Vec<(u32, u32)>,
 }
 
 impl Default for RestoredTables {
@@ -73017,6 +73049,7 @@ impl Default for RestoredTables {
             drop_nominals_agree: true,
             expr_types: HashMap::default(),
             declaration_labels: HashMap::default(),
+            label_ranges: Vec::new(),
         }
     }
 }
@@ -78783,7 +78816,7 @@ fn analyze_over_world<'src>(
     {
         // M110 S2b: a reused module's label is restored from its record
         // below; its type id is still this analysis's to carry.
-        if analyzer.table_entity(*expr_id) {
+        if analyzer.label_row_restored(*expr_id) {
             expr_type_ids.insert(*expr_id, *type_id);
             continue;
         }
@@ -78807,7 +78840,7 @@ fn analyze_over_world<'src>(
     // (an `Expr::Local`/`Expr::Parameter`) carries no type on its own expr id, so
     // hover resolves through the binding.
     for (binding_id, variable) in &analyzer.variables {
-        if analyzer.table_entity(*binding_id) {
+        if analyzer.label_row_restored(*binding_id) {
             continue;
         }
         let type_ = variable.type_id.borrow_type(&analyzer);
@@ -78817,7 +78850,7 @@ fn analyze_over_world<'src>(
         );
     }
     for (binding_id, parameter) in &analyzer.parameters {
-        if analyzer.table_entity(*binding_id) {
+        if analyzer.label_row_restored(*binding_id) {
             continue;
         }
         let type_ = parameter.type_id.borrow_type(&analyzer);
@@ -78835,14 +78868,14 @@ fn analyze_over_world<'src>(
         .copied()
         .collect::<Vec<_>>()
     {
-        if analyzer.table_entity(function_id) {
+        if analyzer.label_row_restored(function_id) {
             continue;
         }
         let label = analyzer.pretty_print_type(&Type::Function(function_id), &empty_substitution);
         expr_types.insert(function_id, label);
     }
     for struct_id in analyzer.structs.keys().copied().collect::<Vec<_>>() {
-        if analyzer.table_entity(struct_id) {
+        if analyzer.label_row_restored(struct_id) {
             continue;
         }
         let label =
@@ -78850,7 +78883,7 @@ fn analyze_over_world<'src>(
         expr_types.insert(struct_id, label);
     }
     for enum_id in analyzer.enums.keys().copied().collect::<Vec<_>>() {
-        if analyzer.table_entity(enum_id) {
+        if analyzer.label_row_restored(enum_id) {
             continue;
         }
         let label =
@@ -78878,7 +78911,7 @@ fn analyze_over_world<'src>(
         .map(|(member_id, trait_id)| (analyzer.resolve_member_function_id(member_id), trait_id))
         .collect();
     for (function_id, function) in &analyzer.functions {
-        if analyzer.table_entity(*function_id) {
+        if analyzer.label_row_restored(*function_id) {
             continue;
         }
         let label = match declaring_trait_of_member.get(function_id) {
@@ -78955,7 +78988,7 @@ fn analyze_over_world<'src>(
         call_signature_labels.insert(subject_id, computed);
     }
     for (function_id, external) in &analyzer.external_functions {
-        if analyzer.table_entity(*function_id) {
+        if analyzer.label_row_restored(*function_id) {
             continue;
         }
         let mut parameters: Vec<String> = Vec::new();
@@ -78987,19 +79020,19 @@ fn analyze_over_world<'src>(
         );
     }
     for (struct_id, struct_) in &analyzer.structs {
-        if analyzer.table_entity(*struct_id) {
+        if analyzer.label_row_restored(*struct_id) {
             continue;
         }
         declaration_labels.insert(*struct_id, analyzer.struct_declaration_label(struct_));
     }
     for (enum_id, enum_) in &analyzer.enums {
-        if analyzer.table_entity(*enum_id) {
+        if analyzer.label_row_restored(*enum_id) {
             continue;
         }
         declaration_labels.insert(*enum_id, analyzer.enum_declaration_label(enum_));
     }
     for trait_id in analyzer.traits.keys().copied().collect::<Vec<_>>() {
-        if analyzer.table_entity(trait_id) {
+        if analyzer.label_row_restored(trait_id) {
             continue;
         }
         let label =
@@ -79155,6 +79188,8 @@ fn analyze_over_world<'src>(
         // exactly the module whose gate cost the most to answer.
         for slice in tables.values_mut() {
             slice.drop_nominals_world = analyzer.drop_nominals_world_digest;
+            // M110 S2b: the label rows ride only a seeded analysis's record.
+            slice.labels_recorded = seeded;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
     }
