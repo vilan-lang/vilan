@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**B585: a static-path refusal `resolve_world` raises inside a MODULE renders in that module — `T::missing()` on an unconstrained parameter and `Option::nothing_here()` in `pkg::user` pointed into std's `lib.vl` (`:1`, `:2`) with std's comment text under the label.** The static-member arms of `resolve_world` pushed with no attribution, so the diagnostic inherited the last walk's mark (std's root walks last). layout-48 anchored the module arm; the other six now anchor at their own expression too (`push_anchored`): an unconstrained parameter's member, a type's missing static, a bounded parameter's missing member, a body-less associated function, an ambiguous static, and a trait member reached on the type's path. Pins: `module_resolution::b585_*` (6, one per arm).
+
+<!-- family: diagnostics -->
 **E285: a fragment written straight inside a fragment says it is one — `<><i>"a"</i><><b>"b"</b></></>` was refused "Expected View (this literal's element type), but got List<View> instead." with no word about fragments.** The list literal's own element check is a fifth site for E272's marker (a list literal whose written text opens with `<`), and now appends "A fragment does not flatten into a fragment: put the inner one in a child position (`<span>…</span>`), or write its children into the outer one"; a written `[..]` keeps the plain sentence. E272's detection is shared (`is_fragment_at_a_view`). Pin: `inference::modules::e285_a_fragment_inside_a_fragment_is_named_with_the_fix`.
 
 <!-- family: diagnostics -->

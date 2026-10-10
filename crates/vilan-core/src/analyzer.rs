@@ -64402,19 +64402,22 @@ impl<'src> Analyzer<'src> {
                                         source: self.source_of_id(member_id),
                                     })
                             });
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note,
-                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                msg: format!(
-                                    "'{trait_name}::{member_name}' has no default body, so \
-                                     '{trait_name}::{member_name}(..)' has nothing to call: an \
-                                     associated function without one is a per-impl requirement. \
-                                     Call it through an implementing type — \
-                                     '<Type>::{member_name}(..)' — or give '{member_name}' a \
-                                     default body on '{trait_name}'"
-                                ),
-                            });
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note,
+                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "'{trait_name}::{member_name}' has no default body, so \
+                                         '{trait_name}::{member_name}(..)' has nothing to call: an \
+                                         associated function without one is a per-impl requirement. \
+                                         Call it through an implementing type — \
+                                         '<Type>::{member_name}(..)' — or give '{member_name}' a \
+                                         default body on '{trait_name}'"
+                                    ),
+                                },
+                                id,
+                            );
                             self.expr_id_to_expr_map.insert(id, Expr::Error);
                         }
                         // Two traits provide it as a STATIC, and nothing the
@@ -64443,20 +64446,23 @@ impl<'src> Analyzer<'src> {
                                     format!("'{}'", self.trait_label_for(&subject_type, *trait_id))
                                 })
                                 .collect();
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                msg: format!(
-                                    "'{member_name}' is ambiguous on '{subject_str}': {}{} \
-                                     provide it as a static, and a static has no receiver for a \
-                                     `Trait::{member_name}` path to select through; declare \
-                                     '{subject_str}''s own '{member_name}', which outranks every \
-                                     trait-provided one",
-                                    if providers.len() == 2 { "both " } else { "" },
-                                    join_with(&providers, "and"),
-                                ),
-                            });
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "'{member_name}' is ambiguous on '{subject_str}': {}{} \
+                                         provide it as a static, and a static has no receiver for a \
+                                         `Trait::{member_name}` path to select through; declare \
+                                         '{subject_str}''s own '{member_name}', which outranks every \
+                                         trait-provided one",
+                                        if providers.len() == 2 { "both " } else { "" },
+                                        join_with(&providers, "and"),
+                                    ),
+                                },
+                                id,
+                            );
                         }
                         // Every candidate belongs to a trait: `Type::member` no
                         // longer reaches them (§3.1), and the fix is to name the
@@ -64499,18 +64505,21 @@ impl<'src> Analyzer<'src> {
                                     format!("'{trait_name}::{member_name}(..)'")
                                 })
                                 .collect();
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                msg: format!(
-                                    "'{member_name}' is not an inherent member of \
-                                     '{subject_str}': {} provide{} it; call {} instead",
-                                    join_with(&providers, "and"),
-                                    plural(providers.len(), "s", ""),
-                                    join_with(&steers, "or"),
-                                ),
-                            });
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "'{member_name}' is not an inherent member of \
+                                         '{subject_str}': {} provide{} it; call {} instead",
+                                        join_with(&providers, "and"),
+                                        plural(providers.len(), "s", ""),
+                                        join_with(&steers, "or"),
+                                    ),
+                                },
+                                id,
+                            );
                         }
                         None => {
                             let subject_str =
@@ -64549,20 +64558,23 @@ impl<'src> Analyzer<'src> {
                                 ))
                             })
                             .unwrap_or_default();
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                msg: format!(
-                                    "cannot find '{}' in {}{}{}",
-                                    member_name,
-                                    subject_str,
-                                    trait_only_note,
-                                    // B471: `Length::css(…)`, renamed `raw`.
-                                    self.css_rename_steer(&subject_type, member_name)
-                                        .unwrap_or_default()
-                                ),
-                            });
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "cannot find '{}' in {}{}{}",
+                                        member_name,
+                                        subject_str,
+                                        trait_only_note,
+                                        // B471: `Length::css(…)`, renamed `raw`.
+                                        self.css_rename_steer(&subject_type, member_name)
+                                            .unwrap_or_default()
+                                    ),
+                                },
+                                id,
+                            );
                         }
                     }
                 }
@@ -64619,15 +64631,18 @@ impl<'src> Analyzer<'src> {
                 Type::Generic(constraint_id) => {
                     let bound_trait_ids = self.generic_bound_trait_ids(constraint_id);
                     if bound_trait_ids.is_empty() {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "cannot access '{}' on an unconstrained type parameter",
-                                member_name
-                            ),
-                        });
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "cannot access '{}' on an unconstrained type parameter",
+                                    member_name
+                                ),
+                            },
+                            id,
+                        );
                     } else {
                         // Record the accessor so codegen can monomorphize it to
                         // the concrete type's member at each call site.
@@ -64665,15 +64680,18 @@ impl<'src> Analyzer<'src> {
                                     })
                                     .collect::<Vec<_>>()
                                     .join(" + ");
-                                self.diagnostics.push(Error {
-                                    trace: Vec::new(),
-                                    note: None,
-                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                    msg: format!(
-                                        "no bound of this type parameter ({}) has a member '{}'",
-                                        bounds, member_name
-                                    ),
-                                });
+                                self.push_anchored(
+                                    Error {
+                                        trace: Vec::new(),
+                                        note: None,
+                                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                        msg: format!(
+                                            "no bound of this type parameter ({}) has a member '{}'",
+                                            bounds, member_name
+                                        ),
+                                    },
+                                    id,
+                                );
                             }
                         }
                     }
