@@ -7550,13 +7550,14 @@ fn b553_an_entry_operator_impl_serves_a_module() {
     assert_eq!(stdout, "true\n");
 }
 
-/// B553's second shape: a module's `Context::new()` whose only `run` is in the
-/// entry takes its value type from that run. Not an order question: the world
-/// resolved ONCE, after the entry walked (the deferred order the impl half
-/// takes), still reports `T` unbounded, while a `run` in any module — loaded
-/// before or after `c.vl` — grounds it.
+/// B553's second shape, B584: a module's `Context::new()` whose only `run` is
+/// in the entry takes its value type from that run. Not an order question: a
+/// call on the context while its value slot was open (`flavor.get()`, with no
+/// `run` pending in the modules' fixpoint) bound nothing and typed as the
+/// impl's abstract `T`, so `get() + 1` was refused "`T` is unbounded"; the
+/// call now binds the impl's parameter to the open slot itself, which the
+/// entry's `run` fills.
 #[test]
-#[ignore = "B553: an entry `run` does not ground a module's `Context::new()` even when the world resolves after the entry walks; the context half is the solver's (incr-48)"]
 fn b553_a_module_context_grounded_only_by_an_entry_run() {
     let (_, stdout) = compile_and_run_package(
         &[
@@ -7831,4 +7832,39 @@ fn a164_a_mismatch_names_the_null_value() {
         "fun main() {\n\tlet _wrong: i32 = null;\n}\n",
         "Expected i32, but got the `null` value instead.",
     );
+}
+
+/// B584's other faces: the slot the entry's `run` fills is the type the
+/// module's calls see — a `str` use of an `i32` context is refused at the
+/// module's operator — and a `run` in a module loaded before or after the
+/// context's still grounds it.
+#[test]
+fn b584_an_entry_run_types_a_modules_context_calls() {
+    let module = "import std::context::Context;\n\nexport let flavor = Context::new();\n\nexport fun read_it(): str {\n\tflavor.get() + \"!\"\n}\n";
+    let main = "import std::io::print;\nimport pkg::c::{ flavor, read_it };\n\nfun main() {\n\tflavor.run(5, || {\n\t\tprint(read_it());\n\t});\n}\n";
+    let outcome = analyze_package(&[("c.vl", module), ("main.vl", main)], "main.vl");
+    let [(message, _, file)] = outcome.diagnostics.as_slice() else {
+        panic!("one refusal: {:?}", outcome.diagnostics);
+    };
+    assert_eq!(file.as_deref(), Some("c.vl"));
+    assert!(
+        message.starts_with("`+` on `i32` adds, and `str` is not a number"),
+        "{message}"
+    );
+    let context = "import std::context::Context;\n\nexport let flavor = Context::new();\n\nexport fun read_it(): i32 {\n\tflavor.get() + 1\n}\n";
+    for runner in ["a.vl", "r.vl"] {
+        let runner_module = "import std::io::print;\nimport pkg::c::{ flavor, read_it };\n\nexport fun go() {\n\tflavor.run(5, || {\n\t\tprint(read_it());\n\t});\n}\n";
+        let name = runner.trim_end_matches(".vl");
+        let entry = format!("import pkg::{name}::go;\n\nfun main() {{\n\tgo();\n}}\n");
+        let (_, stdout) = compile_and_run_package(
+            &[
+                ("c.vl", context),
+                (runner, runner_module),
+                ("main.vl", &entry),
+            ],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("a run in {runner} grounds it: {errors:?}"));
+        assert_eq!(stdout, "6\n");
+    }
 }

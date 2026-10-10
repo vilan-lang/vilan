@@ -46,7 +46,9 @@ body argument must be a closure literal (or an injected closure value,
 §8.5); `clear`'s must be a closure literal.
 
 `Context<T>`'s value type is inferred from its first `run`, exactly as
-a `List<T>`'s element type is inferred from `push`.
+a `List<T>`'s element type is inferred from `push` — wherever that `run`
+is written: a module's `get()` takes its type from a `run` in the entry
+as from one in any module (B584).
 
 ```vilan
 import std::context::Context;

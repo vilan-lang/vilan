@@ -530,9 +530,13 @@ fn the_differential_sees_a_hot_impl_the_prefix_needed() {
 }
 
 /// S1's plant: the use-inferred-binding guard dropped. A hot module that
-/// decides a prefix binding's type by its first use — a context's `run`, a
-/// push into a module's empty list — is then walked after the prefix decided
-/// it, where the canonical world walks it first.
+/// decides a prefix binding's type by its first use — a push into a module's
+/// empty list — is then walked after the prefix decided it, where the
+/// canonical world walks it first. (A context's `run` no longer is such a
+/// hazard: since B584 a call on a context's open value slot binds to the slot
+/// itself, so the prefix's calls take whatever `run` fills it, in either walk
+/// order — the context edit agrees under the plant, and the guard's context
+/// arm is incr's to retire.)
 #[test]
 fn the_differential_sees_a_binding_the_hot_set_should_have_decided() {
     let _switch = SWITCH_LOCK
@@ -540,10 +544,10 @@ fn the_differential_sees_a_binding_the_hot_set_should_have_decided() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let divergences = replay_with_plant(Plant::UseInferredGuardOff);
     assert!(
-        divergences
+        !divergences
             .iter()
             .any(|divergence| divergence.contains("grounds a prefix context")),
-        "the use-inferred plant must turn the context edit red; it found: {divergences:#?}"
+        "B584: the context edit is order-free, even with the guard off: {divergences:#?}"
     );
     assert!(
         divergences

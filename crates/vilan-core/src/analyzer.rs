@@ -42626,6 +42626,36 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B584: a call on a `Context<_>` whose value slot is still OPEN binds the
+    /// impl's parameter to that very slot. The open slot reconciles with
+    /// anything and binds nothing, so `flavor.get()` on a module's
+    /// `Context::new()` typed as the impl's abstract `T` whenever no `run` was
+    /// pending in the same fixpoint — and a `run` in the ENTRY never is in the
+    /// modules' (they resolve before the entry walks): the module's `get() + 1`
+    /// was then refused "`T` is unbounded" although the entry's `run` filled
+    /// the slot a moment later. Bound to the slot, the call's type IS the slot
+    /// and lands when any `run` in the world fills it (`spec/contexts.md` §8.1).
+    fn bind_open_context_slot(
+        &self,
+        impl_subject: &Type,
+        subject_type: &Type,
+        bindings: &mut SubstitutionContext,
+    ) {
+        let (Type::Struct(id, parameters), Some(slot)) =
+            (impl_subject, self.list_element_slot(subject_type))
+        else {
+            return;
+        };
+        if self.primitive_struct_ids.get("Context") != Some(id) {
+            return;
+        }
+        if let [parameter] = parameters.as_slice()
+            && let Type::Generic(constraint_id) = self.borrow_type_by_type_id(*parameter)
+        {
+            bindings.entry(*constraint_id).or_insert(slot);
+        }
+    }
+
     /// Whether a struct is an element-slot container — `List` or `Context` —
     /// whose single type argument is inferred from a method call (`List::push`
     /// fills `List<T>`; `Context::run`'s value fills `Context<T>`).
@@ -54181,6 +54211,7 @@ impl<'src> Analyzer<'src> {
                             &subject_type,
                             &mut bindings,
                         );
+                        self.bind_open_context_slot(&impl_subject, &subject_type, &mut bindings);
                         if !bindings.is_empty() {
                             self.method_call_substitution.insert(id, bindings);
                         }
