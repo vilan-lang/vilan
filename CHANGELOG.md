@@ -45,6 +45,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**N163: the nextest priority tiers re-measured under `ci-test`.** The tiers were ranked at opt-level 0; one full run of the suite under the `ci-test` profile (10,157 tests, 762.7 s wall at `-j 6`, load 10-25) shows what moved: the edit-replay corpus leg 293 s -> 97 s, the docs gate 212 s -> 29 s, the check-scope corpus legs 100 s -> 23 s, the native differential's legs 119-184 s -> 22-32 s, the replay differential 60-170 s -> 24 s. `.config/nextest.toml` now starts first (priority 100) the stragglers - the edit-replay differential, the permutation differential (untiered until now: three tests of 36-45 s, 297 CPU-s on its corpus leg), `dependent_edit_measurement` and the diagnostics ledger's single-thread 35 s scan - and second (90) the 15-35 s tier, which now includes the two tests that WAIT (a transport retry budget and a service socket: 25 s of wall for ~1.5 CPU-s, a slot held idle that is free to overlap only when started early); the replay differential, the marker census, `examples` and `corpus` leave tier 100/90 for what they now cost. The header of the file carries the measurements and why the order moves only the tail of a throughput-bound run.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
