@@ -44,180 +44,180 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 256_501_430
-measured_at = "v0.46.0's seal"
+ceiling = 250_556_961
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 323_198_913
-measured_at = "v0.46.0's seal"
+ceiling = 316_493_354
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_450_646_599
-measured_at = "v0.46.0's seal"
+ceiling = 1_401_397_525
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_070_421_860
-measured_at = "v0.46.0's seal"
+ceiling = 2_921_719_082
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_694_294_616
-measured_at = "v0.46.0's seal"
+ceiling = 1_618_079_748
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_846_849_513
-measured_at = "v0.46.0's seal"
+ceiling = 1_754_915_302
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_829_587_271
-measured_at = "v0.46.0's seal"
+ceiling = 3_624_023_661
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_455_262_510
-measured_at = "v0.46.0's seal"
+ceiling = 1_409_226_385
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_018_583_086
-measured_at = "v0.46.0's seal"
+ceiling = 1_838_173_993
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 5_015_326_748
-measured_at = "v0.46.0's seal"
+ceiling = 4_623_601_746
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 5_086_895_866
-measured_at = "v0.46.0's seal"
+ceiling = 4_724_277_314
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 8_757_545_783
-measured_at = "v0.46.0's seal"
+ceiling = 8_301_520_925
+measured_at = "v0.47.0's seal"
 
 [[row]]
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 268_246_549
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 263_350_377
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 336_618_515
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 331_341_576
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_509_563_038
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_462_043_834
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_187_134_322
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 3_042_396_360
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_760_796_838
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_689_683_219
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_917_566_257
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_828_817_217
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_972_928_013
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 3_777_130_688
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_515_211_742
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_472_645_016
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_091_098_856
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 1_911_572_862
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 5_196_874_356
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 4_804_246_863
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 5_274_963_649
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 4_906_794_890
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 9_055_409_317
-measured_at = "CI perf job on the v0.46.0 release commit 1e358814 (run 37945371245, pinned toolchain 1.98.1); re-adopted whole from its uploaded counts at the release, after the cut reset the ci bumps (N161)"
+ceiling = 8_604_423_549
+measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
 tolerance = 0.005
 
 [[growth]]
@@ -229,8 +229,8 @@ max_ratio = 2.3
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
+green_seals = 0
+blocking = false
 
 [[e121]]
 scenario = "shared.vl keystroke"
@@ -243,173 +243,26 @@ blocking = false
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
+green_seals = 1
+blocking = false
 
 [[e121]]
 scenario = "model.vl keystroke, importers open"
 metric = "cpu_ms"
 target_ms = 500
-green_seals = 1
+green_seals = 0
 blocking = false
 
 [[e121]]
 scenario = "css keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
+green_seals = 0
+blocking = false
 
 [[e121]]
 scenario = "parse break"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
-blocking = true
-
-[[bump]]
-subject = "example:fullstack"
-class = "ci"
-ratio = 1.012
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0068 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:router"
-class = "ci"
-ratio = 1.018
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0124 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "ci"
-ratio = 1.017
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0112 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.018
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0127 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:canvas"
-class = "ci"
-ratio = 1.013
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0082 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.014
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0092 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.015
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0101 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.01
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0045 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:rpc"
-class = "ci"
-ratio = 1.01
-reason = "store-49's std additions, M120's class: A165's two Slot arms in both ui twins (Option<V: Slot>, S: Flow<Option<View>>) cost 0.2-0.7% of every web program's check (measured by reverting them: reactive-ui x1.0068, ssr x1.0064, router x1.0063) and A153 S1/S2's std half (rpc.vl, store, wire, the StoreWire derive) the rest; x1.0044 on CI run 38001426195 at 6bae4173 against the v0.46.0 ci ceilings (limit x1.005). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:math"
-class = "ci"
-ratio = 1.009
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0066 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:watch"
-class = "ci"
-ratio = 1.013
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0100 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.006
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0036 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:fullstack"
-class = "ci"
-ratio = 1.006
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0036 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:router"
-class = "ci"
-ratio = 1.006
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0035 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "ci"
-ratio = 1.005
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0023 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.004
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0017 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:canvas"
-class = "ci"
-ratio = 1.007
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0045 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:rpc"
-class = "ci"
-ratio = 1.006
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0038 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.005
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0026 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.006
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0031 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
-
-[[bump]]
-subject = "genapp:46"
-class = "ci"
-ratio = 1.006
-reason = "debug-49's std additions, M120's class: `dbg_stack` in std::debug and the prelude (debugging.md S2), and E283's `Debug` impls beside `HashMap`, `HashSet`, `Shared` and `SignalCell` plus the derive's closure/array members; x1.0033 instructions:u locally against next @71d61dde (the compiler's own share x0.9994-x1.0002: the per-site records cost nothing without a `dbg_stack()` call). Each generic `.debug()` call std adds is costed by `async_infer::dispatch_candidates`, which scans every impl of the trait per site (filed, debug-49). Re-taken at the Order 49 seal."
-item = "M120"
+green_seals = 0
+blocking = false
