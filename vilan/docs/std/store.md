@@ -23,6 +23,7 @@ import std::reactive::store::{ Storable, Store, StoreSome, StoreFlag };
 | `[reactive(coarse)]` | field attribute | the field is one slot, compared whole |
 | `[reactive(name = "..")]` | field attribute | the name the field's projection is generated under |
 | `when_live(handle, body)` | `std::web::ui` | a variant as content: rebuilt only when the variant changes, the payload's `Store<P>` in hand |
+| `when_remote_live(handle, body)` | `std::web::remote` | `when_live` for a mirrored store's handle (`RemoteStoreSome<P>`), the payload's `RemoteStore<P>` in hand |
 | `.at(key)` | on a `HashMap` field | one key's value as a `Store<Option<V>>` that wakes for that key only |
 | `.contains(x)` | on a `HashSet` field | one member's presence as a `Store<bool>` |
 | `.by_key(k)` | on a keyed `List` field | one element, found by its `Keyed` key, as a `Store<Option<T>>` |
@@ -444,9 +445,22 @@ let global: RemoteStoreSome<Global> = client.global();
 global.messages().at(7).some().content().effect(|content| print(content.unwrap_or("")));
 ```
 
-The `[rpc]` spelling waits on the compiler reading `Store<T>` and `StoreSome<P>`
-as handle returns (tracker A153); std's half — the repliers, the stub, the
-replica — is in place.
+A frame's ops land in ONE client turn, so an observer never sees half a patch.
+
+A handle through a variant or a key is a transient, as a `RemoteSource` is: its
+value is `None` both before its boundary's seed lands and after the server says
+there is nothing there, and `states()` tells the two apart — `Pending`, then
+`Ready(value)` or `Absent`; `Refreshing(value)` while a fresher value is owed
+(a re-mint, a re-subscribe); `Failed(error, last)` when the minting call failed
+(`TransientSource<P, RpcError>`). A boundary's value as content is
+`std::web::remote::when_remote_live` — `when_live`'s twin for a remote handle,
+whose body gets the payload's `RemoteStore<P>`, its fields plain and seeded:
+
+```vilan,fragment
+import std::web::remote::when_remote_live;
+
+<li>{when_remote_live(global.messages().at(id).some(), |message| <span>{message.content()}</span>)}</li>
+```
 
 ## What it costs
 

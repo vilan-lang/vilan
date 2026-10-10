@@ -48,6 +48,7 @@ import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::store::{
 	MirrorAt,
 	MirrorBoundary,
+	MirrorKnown,
 	MirrorLink,
 	MirrorStep,
 	RemoteStoreSome,
@@ -67,13 +68,21 @@ import pkg::reactive::store_core::{
 	store_wire_detach,
 	store_wire_since,
 };
+import pkg::reactive::transient::{ TransientSource, TransientState };
 import pkg::reactive::{
 	DeltaCursor,
 	Disposable,
+	MemoCell,
+	Pipe,
 	SignalCell,
+	Source,
 	Subscription,
+	at_release_settle,
 	at_settle,
+	batch,
+	combine,
 	fresh_id,
+	register_with_owner,
 	turn_scope,
 };
 import pkg::result::Result::{ self, Err, Ok };
@@ -927,9 +936,7 @@ impl MirrorView {
 		for held in self.slots.read() {
 			if held.boundary.identity == boundary.identity {
 				held.holds.write() = held.holds.read() + 1;
-				let slot = held.slot;
-				let view = self;
-				ret || view.release(slot);
+				ret self.releasing(held.slot);
 			}
 		}
 		let slot = self.next_slot.read();
@@ -937,8 +944,14 @@ impl MirrorView {
 		self.slots.write().push(ClientSlot { slot, base, boundary, holds = Shared::new(1) });
 		self.subscribing.write().push(slot);
 		self.schedule();
+		self.releasing(slot)
+	}
+
+	/// `slot`'s release, made with no turn ambient: it is stored, and runs in the
+	/// turn of whoever lets the hold go.
+	fun releasing(self, slot: i32): || void {
 		let view = self;
-		|| view.release(slot)
+		turn_scope.clear(|| || view.release(slot))
 	}
 
 	/// The grant's last hold went: its base is released with the turn's
@@ -961,18 +974,35 @@ impl MirrorView {
 				held.holds.write() = left;
 				if left == 0 {
 					self.unsubscribing.write().push(slot);
-					self.schedule();
+					self.schedule_release();
 				}
 			}
 		}
 	}
 
+	/// Owe the view one flush when the AMBIENT turn settles — a hold's, whose
+	/// turn is its caller's.
 	fun schedule(self) {
 		if self.pending.read() < 0 {
 			let id = fresh_id();
 			self.pending.write() = id;
 			let slots = self.slots;
 			at_settle(id, || match find_view(slots) {
+				Some(let held) => held.flush(),
+				None => {},
+			});
+		}
+	}
+
+	/// `schedule` for a RELEASE: owed to the turn ambient at the release (B283's
+	/// rule, as a `RemoteSource`'s `Unsubscribe` is), so a re-hold in the same turn
+	/// cancels it — the release closure is stored, and made with no turn of its own.
+	fun schedule_release(self) {
+		if self.pending.read() < 0 {
+			let id = fresh_id();
+			self.pending.write() = id;
+			let slots = self.slots;
+			at_release_settle(id, || match find_view(slots) {
 				Some(let held) => held.flush(),
 				None => {},
 			});
@@ -1000,7 +1030,7 @@ impl MirrorView {
 				// demand (§6.2) — but a base keeps its last value for the next mint
 				// to compare against.
 				if held.slot >= 0 {
-					(held.boundary.gone)();
+					batch(|| (held.boundary.gone)());
 				}
 				// A slot whose `Subscribe` went out is told off, and its reader
 				// stays for the frames still in flight — until the view closes: no
@@ -1093,11 +1123,17 @@ impl MirrorView {
 		None
 	}
 
-	/// One `Patch`: each op lands through its slot's boundary, in order, inside the
-	/// frame's turn (the client's receive loop batches it), so the replica's
-	/// subscribers see one consistent state. A slot the client never named stops
-	/// the frame: its value cannot be read at any type.
+	/// One `Patch`: each op lands through its slot's boundary, in order, inside ONE
+	/// turn, so the replica's subscribers see one consistent state (§5). The turn
+	/// is opened here, not inherited: the route that delivers the frame is a closure
+	/// made with no turn, and the boundaries land in their caller's.
 	fun receive(self, frame: Frame) {
+		batch(|| self.land(frame));
+	}
+
+	/// `receive`'s ops, in the turn it opened. A slot the client never named stops
+	/// the frame: its value cannot be read at any type.
+	fun land(self, frame: Frame) {
 		mut reader = (self.codec.reader)(frame);
 		let tag = reader.variant_tag();
 		if tag != "Patch" {
@@ -1219,13 +1255,26 @@ struct StoreMint<T> {
 	/// What to run when the mirror lets its grant go: the origin table drops its
 	/// entry, so the next stub call mints afresh (A134).
 	retire: Shared<List<|| void>>,
+	/// The identities of the boundaries heard from in this binding — the base's
+	/// with the reply, a key's with its first `Seed` or `Gone` — which is what
+	/// `known` answers `Heard` for.
+	heard: Shared<List<i32>>,
+	/// Moves whenever `known` may answer differently: the link's `heard`.
+	epoch: SignalCell<i32>,
+	/// One cell per boundary a handle's `states()` follows (`follow`), set only
+	/// when its answer changes, and dropped with the boundary's last hold.
+	cells: Shared<List<(i32, SignalCell<MirrorKnown>)>>,
 }
 
 impl StoreMint<type T: StoreWire + Storable> {
-	/// Hold `boundary`; the first hold of an unbound mirror asks.
-	fun hold(self, boundary: MirrorBoundary): || void {
+	/// Hold `boundary`; the first hold of an unbound mirror asks. What the channel
+	/// is handed is the boundary with its frames HEARD on the way in, so `known`
+	/// can tell a seeded boundary from one whose `Subscribe` is still out.
+	fun hold(self, given: MirrorBoundary): || void {
 		let id = fresh_id();
 		let release: Shared<Option<|| void>> = Shared::new(None);
+		let mint = self;
+		let boundary = turn_scope.clear(|| mint.hearing(given));
 		self.holds.write().push(MintHold { id, boundary, release });
 		match self.bound.read() {
 			Some(let binding) => {
@@ -1234,27 +1283,44 @@ impl StoreMint<type T: StoreWire + Storable> {
 			},
 			None => self.ask(),
 		}
-		let mint = self;
-		|| mint.release(id)
+		turn_scope.clear(|| || mint.release(id))
 	}
 
 	fun release(self, id: i32) {
 		mut kept: List<MintHold> = [];
+		mut gone: List<i32> = [];
 		for held in self.holds.read() {
 			if held.id == id {
 				match held.release.read() {
 					Some(let release) => release(),
 					None => {},
 				}
+				gone.push(held.boundary.identity);
 			} else {
 				kept.push(held);
 			}
 		}
 		self.holds.write() = kept;
+		// A boundary nobody holds any more is owed a fresh seed when it is held
+		// again: its slot goes with its last hold.
+		for identity in gone {
+			if !self.holding(identity) {
+				self.unhear(identity);
+				mut cells: List<(i32, SignalCell<MirrorKnown>)> = [];
+				for entry in self.cells.read() {
+					let (held, _cell) = entry;
+					if held != identity {
+						cells.push(entry);
+					}
+				}
+				self.cells.write() = cells;
+			}
+		}
 		if kept.is_empty() {
-			// At the settle, so a release and a re-hold in one turn keep the grant.
+			// At the settle of the turn the release happens in, so a release and a
+			// re-hold in one turn keep the grant.
 			let mint = self;
-			at_settle(self.settle_id, || mint.let_go());
+			at_release_settle(self.settle_id, || mint.let_go());
 		}
 	}
 
@@ -1269,6 +1335,8 @@ impl StoreMint<type T: StoreWire + Storable> {
 				self.bound.write() = None;
 				view.release_base(base);
 				self.status.set(StoreMintStatus::Waiting);
+				self.heard.write() = [];
+				self.touch();
 				for retire in self.retire.read() {
 					retire();
 				}
@@ -1278,17 +1346,127 @@ impl StoreMint<type T: StoreWire + Storable> {
 		}
 	}
 
+	/// What the wire has told this mirror about the boundary whose identity is
+	/// `identity` (the link's `known`).
+	fun known(self, identity: i32): MirrorKnown {
+		match self.status.get() {
+			StoreMintStatus::Failed(let _failure) => MirrorKnown::Failed,
+			_ => match self.bound.read() {
+				None => MirrorKnown::Waiting,
+				Some(let _binding) => {
+					if self.heard.read().contains(identity) {
+						MirrorKnown::Heard
+					} else {
+						MirrorKnown::Waiting
+					}
+				},
+			},
+		}
+	}
+
+	/// `known` may answer differently now: every followed boundary's cell takes
+	/// its answer if it moved, and the link's `heard` moves.
+	fun touch(self) {
+		for entry in self.cells.read() {
+			let (identity, cell) = entry;
+			let now = self.known(identity);
+			if cell.get() != now {
+				cell.set(now);
+			}
+		}
+		self.epoch.set(self.epoch.get() + 1);
+	}
+
+	/// The cell that follows what `known` answers for `identity` (the link's
+	/// `follow`).
+	fun follow(self, identity: i32): SignalCell<MirrorKnown> {
+		for entry in self.cells.read() {
+			let (held, cell) = entry;
+			if held == identity {
+				ret cell;
+			}
+		}
+		let cell = SignalCell::new(self.known(identity));
+		self.cells.write().push((identity, cell));
+		cell
+	}
+
+	fun holding(self, identity: i32): bool {
+		for held in self.holds.read() {
+			if held.boundary.identity == identity {
+				ret true;
+			}
+		}
+		false
+	}
+
+	/// A frame for the boundary `identity` landed. Only a HELD boundary is heard: a
+	/// released slot's late frames, and the replica's own drop of a released key,
+	/// land without saying anything about a boundary nobody watches.
+	fun hear(self, identity: i32) {
+		if self.holding(identity) && !self.heard.read().contains(identity) {
+			self.heard.write().push(identity);
+			self.touch();
+		}
+	}
+
+	fun unhear(self, identity: i32) {
+		if self.heard.read().contains(identity) {
+			mut kept: List<i32> = [];
+			for held in self.heard.read() {
+				if held != identity {
+					kept.push(held);
+				}
+			}
+			self.heard.write() = kept;
+			self.touch();
+		}
+	}
+
+	/// `boundary`, its frames heard on their way into the replica.
+	fun hearing(self, boundary: MirrorBoundary): MirrorBoundary {
+		let mint = self;
+		let identity = boundary.identity;
+		let apply = boundary.apply;
+		let gone = boundary.gone;
+		MirrorBoundary {
+			path = boundary.path,
+			identity,
+			apply = |rel: List<StoreStep>, deserializer: Deserializer| {
+				apply(rel, deserializer);
+				mint.hear(identity);
+			},
+			gone = || {
+				gone();
+				mint.hear(identity);
+			},
+		}
+	}
+
 	fun ask(self) {
 		if self.asking.read() {
 			ret;
 		}
 		self.asking.write() = true;
+		// A failed mint asked again is on its way, not failed: its handles read
+		// `Refreshing` (or `Pending`) until the reply says.
+		match self.status.get() {
+			StoreMintStatus::Failed(let _failure) => {
+				self.status.set(StoreMintStatus::Waiting);
+				self.touch();
+			},
+			_ => {},
+		}
 		let mint = self;
 		let _asking = async {
 			let answered = (mint.call)();
 			mint.asking.write() = false;
 			match answered {
-				Err(let failure) => mint.status.set(StoreMintStatus::Failed(failure)),
+				Err(let failure) => {
+					set_mint_failure(mint.epoch, Some(failure));
+					mint.status.set(StoreMintStatus::Failed(failure));
+					mint.touch();
+				},
 				Ok(let reply) => mint.bind(reply),
 			}
 		};
@@ -1297,15 +1475,30 @@ impl StoreMint<type T: StoreWire + Storable> {
 	/// The reply landed: adopt the base, seed the replica, and put every hold taken
 	/// meanwhile onto the channel — unless every hold went while the call was in
 	/// flight, when the grant is let go at once.
+	///
+	/// One turn: the seed, the status and what the base is known to hold land
+	/// together, so a handle's `states()` moves from `Pending` to `Ready` without a
+	/// `Refreshing` between.
 	fun bind(self, reply: StoreReply<T>) {
+		// What the view STORES is made with no turn ambient: a closure captures its
+		// context at creation (spec §8.4), and a frame landing through one made in
+		// the batch below would write into a turn long settled.
 		let view = mirror_view(self.client, reply.channel);
-		view.adopt_base(reply.base, base_boundary(self.replica));
-		self.replica.set(reply.seed);
-		self.bound.write() = Some((view, reply.base));
-		self.status.set(StoreMintStatus::Bound);
-		for held in self.holds.read() {
-			held.release.write() = Some(view.hold(held.boundary, reply.base));
-		}
+		let replica = self.replica;
+		view.adopt_base(reply.base, turn_scope.clear(|| base_boundary(replica)));
+		batch(|| {
+			self.replica.set(reply.seed);
+			self.bound.write() = Some((view, reply.base));
+			set_mint_failure(self.epoch, None);
+			self.status.set(StoreMintStatus::Bound);
+			// The reply carried the base's seed: the base is heard, and every other
+			// boundary waits for its own.
+			self.heard.write() = [store_identity_at(self.replica.root, [])];
+			self.touch();
+			for held in self.holds.read() {
+				held.release.write() = Some(view.hold(held.boundary, reply.base));
+			}
+		});
 		if self.holds.read().is_empty() {
 			self.let_go();
 		}
@@ -1364,9 +1557,15 @@ fun minted_store<T: StoreWire + Storable>(
 		status = SignalCell::new(StoreMintStatus::Waiting),
 		settle_id = fresh_id(),
 		retire,
+		heard = Shared::new([]),
+		epoch = SignalCell::new(0),
+		cells = Shared::new([]),
 	};
 	let link = turn_scope.clear(|| MirrorLink {
 		hold = |boundary: MirrorBoundary| mint.hold(boundary),
+		known = |identity: i32| mint.known(identity),
+		follow = |identity: i32| mint.follow(identity),
+		heard = mint.epoch,
 	});
 	remote_store_some(replica.some(), MirrorAt {
 		link,
@@ -1405,5 +1604,148 @@ export fun origin_store<T: StoreWire + Storable>(
 			client.enrol(table.entries.identity(), || table.forget_prefix(client.origin_prefix()));
 			mirror
 		},
+	}
+}
+
+// --- Where a remote handle stands: `states()` (A153 S2, A150) ----------------
+//
+// A remote handle IS a transient, as a `RemoteSource` is: its replica value says
+// what it holds, and its mint says what the wire has told it about the handle's
+// boundary (`MirrorLink::known`). Together they are the five states — nothing yet
+// (`Pending`), the server's value (`Ready`), a value with a fresher one owed
+// (`Refreshing`: a re-mint, a re-subscribe, a connection down), "there is no such
+// thing" (`Absent`: a boundary seeded `null`, or told it is `Gone`), and a failed
+// minting call (`Failed`, carrying the last value).
+
+/// The last failure of each mint whose call failed and has not bound since, keyed
+/// by the identity of the mint's `heard` cell — the one thing a handle can name its
+/// mint by, since `std::reactive::store` cannot name an `RpcError`. Small and
+/// short-lived: an entry goes with the mint's next bind, or its next ask's
+/// failure replaces it.
+let mint_failures: Shared<List<(i32, RpcError)>> = Shared::new([]);
+
+/// A mint's key in `mint_failures`: its `heard` cell's identity, which a cell
+/// always has.
+fun mint_key(epoch: SignalCell<i32>): i32 {
+	epoch.identity().unwrap_or(0 - 1)
+}
+
+fun set_mint_failure(epoch: SignalCell<i32>, failure: Option<RpcError>) {
+	let key = mint_key(epoch);
+	mut kept: List<(i32, RpcError)> = [];
+	for entry in mint_failures.read() {
+		let (held, _error) = entry;
+		if held != key {
+			kept.push(entry);
+		}
+	}
+	match failure {
+		Some(let error) => kept.push((key, error)),
+		None => {},
+	}
+	mint_failures.write() = kept;
+}
+
+fun mint_failure(epoch: SignalCell<i32>): Option<RpcError> {
+	let key = mint_key(epoch);
+	for entry in mint_failures.read() {
+		let (held, error) = entry;
+		if held == key {
+			ret Some(error);
+		}
+	}
+	None
+}
+
+/// Where `handle` stands now: its value read passively, beside what its mint
+/// knows about its boundary.
+fun remote_state<P>(handle: RemoteStoreSome<P>): TransientState<P, RpcError> {
+	transient_of(handle.local.get(), known_of(handle), handle.at.link)
+}
+
+fun known_of<P>(handle: RemoteStoreSome<P>): MirrorKnown {
+	(handle.at.link.known)(handle.at.boundary.identity)
+}
+
+/// What the mint says about `handle`'s boundary, as a source that moves only when
+/// THAT answer moves (the link's `heard` moves for every boundary of the mint).
+fun told<P>(handle: RemoteStoreSome<P>): dyn Source<MirrorKnown> {
+	let cell: dyn Source<MirrorKnown> = (handle.at.link.follow)(handle.at.boundary.identity);
+	cell
+}
+
+/// `value` as the state `known` makes it.
+fun transient_of<P>(value: Option<P>, known: MirrorKnown, link: MirrorLink): TransientState<P, RpcError> {
+	match known {
+		MirrorKnown::Heard => match value {
+			Some(let held) => TransientState::Ready(held),
+			None => TransientState::Absent,
+		},
+		MirrorKnown::Failed => match mint_failure(link.heard) {
+			Some(let error) => TransientState::Failed(error, value),
+			None => refreshing_or_pending(value),
+		},
+		_ => refreshing_or_pending(value),
+	}
+}
+
+fun refreshing_or_pending<P>(value: Option<P>): TransientState<P, RpcError> {
+	match value {
+		Some(let held) => TransientState::Refreshing(held),
+		None => TransientState::Pending,
+	}
+}
+
+/// A remote handle through a variant or a key is a transient (A153 S2, §6.1): its
+/// value is `None` both before its boundary's seed lands and after the server says
+/// there is nothing there, and `states()` is what tells the two apart.
+///
+/// `state()` REPORTS, as a mirror's does: it holds nothing, so a handle nobody
+/// watches stays where its mint last left it. `states()`, `latest()` and
+/// `is_pending()` are pipes a view binds in the handle's place, each HOLDING the
+/// handle's boundary while its consumer holds the pipe — so `Pending` moves on.
+export impl RemoteStoreSome<type P> with TransientSource<P, RpcError> {
+	fun state(self): MemoCell<TransientState<P, RpcError>> {
+		let derived = SignalCell::new(remote_state(self));
+		let _valued = register_with_owner(self.local.on_change(|_value| {
+			derived.set(remote_state(self));
+		}));
+		let _heard = register_with_owner(self.at.link.heard.on_change(|_moved| {
+			derived.set(remote_state(self));
+		}));
+		MemoCell { cell = derived }
+	}
+
+	fun states(self): dyn Pipe<TransientState<P, RpcError>> {
+		let leased: dyn Source<Option<P>> = self;
+		let link = self.at.link;
+		let pipe: dyn Pipe<TransientState<P, RpcError>> = combine((leased, told(self)))
+			.derive(|both| {
+				let (value, known) = both;
+				transient_of(value, known, link)
+			});
+		pipe
+	}
+
+	fun latest(self): dyn Pipe<Option<P>> {
+		let leased: dyn Source<Option<P>> = self;
+		let link = self.at.link;
+		let pipe: dyn Pipe<Option<P>> = combine((leased, told(self)))
+			.derive(|both| {
+				let (value, known) = both;
+				transient_of(value, known, link).latest()
+			});
+		pipe
+	}
+
+	fun is_pending(self): dyn Pipe<bool> {
+		let leased: dyn Source<Option<P>> = self;
+		let link = self.at.link;
+		let pipe: dyn Pipe<bool> = combine((leased, told(self)))
+			.derive(|both| {
+				let (value, known) = both;
+				transient_of(value, known, link).is_pending()
+			});
+		pipe
 	}
 }

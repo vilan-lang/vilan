@@ -3635,6 +3635,128 @@ fn a152_when_all_some_updates_its_cells_in_place_and_releases_on_none() {
     );
 }
 
+// --- A153 S2: a mirrored store's handles as content ------------------------
+//
+// `when_remote_live` (the second function, as ruled) and `when_all_some` over
+// remote handles: a body built when the boundary's value is live, its row kept
+// across a patch inside it, disposed when the key goes and rebuilt when it is
+// back. The mirror runs in process (a local transport), so the store is a real
+// server's.
+
+const WHEN_REMOTE_LIVE: &str = r#"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStore, RemoteStoreSome, Storable, Store };
+import std::reactive::{ Flow, Source, on_cleanup };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::web::remote::when_remote_live;
+import std::web::ui::{ View, mount_root, view, when_all_some };
+import std::wire::{ Deserializer, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	author: str,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, author = "bob", content = "hello" });
+	let global = Store::new(Global { messages, motd = "welcome" });
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let root = mount_root("app", || {
+		view("div")
+			.child(when_remote_live(g.messages().at(7).some(), |message: RemoteStore<Message>| {
+				print("build seven");
+				on_cleanup(|| print("released seven"));
+				view("p").bind_text(message.content())
+			}))
+			.child(when_all_some((g.motd(), g.messages().at(7).some().author()), |(motd, author)| {
+				print("build both");
+				on_cleanup(|| print("released both"));
+				view("b")
+					.child(view("i").bind_text(motd.derive(|text| text)))
+					.child(view("u").bind_text(author.derive(|name| name)))
+			}))
+	});
+	sleep_for(Duration::millis(0));
+	print(i"seeded={tree()}");
+	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	global.motd().set("bye");
+	sleep_for(Duration::millis(0));
+	print(i"patched={tree()}");
+	global.messages().at(7).set(None);
+	sleep_for(Duration::millis(0));
+	print(i"gone={tree()}");
+	global.messages().at(7).set(Some(Message { id = 7, author = "amy", content = "back" }));
+	sleep_for(Duration::millis(0));
+	print(i"back={tree()}");
+	root.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+#[test]
+fn a153_s2_when_remote_live_and_when_all_some_take_remote_handles() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("when_remote_live", WHEN_REMOTE_LIVE, &harness);
+    // The seed builds both bodies once; a patch inside the message rewrites the
+    // SAME `<p>` (p#4) and the same `<i>`, and builds nothing; the key's removal
+    // releases both bodies (one depends on the key's author); its return builds
+    // them afresh.
+    assert_eq!(
+        stdout,
+        "build seven\n\
+         build both\n\
+         seeded=root#1 div#2 #text#3 p#4'hello' #text#5 #text#6 b#7 i#8'welcome' u#9'bob' #text#10\n\
+         patched=root#1 div#2 #text#3 p#4'goodbye' #text#5 #text#6 b#7 i#8'bye' u#9'bob' #text#10\n\
+         released seven\n\
+         released both\n\
+         gone=root#1 div#2 #text#5 #text#10\n\
+         build seven\n\
+         build both\n\
+         back=root#1 div#2 #text#11 p#12'back' #text#5 #text#13 b#14 i#15'bye' u#16'amy' #text#10\n\
+         released seven\n\
+         released both\n\
+         done\n",
+        "the remote handles as content went differently"
+    );
+}
+
 /// The server twin: the zip is read ONCE — an all-`Some` renders the body with
 /// its cells holding the current payloads, and any `None` renders nothing.
 const WHEN_ALL_SOME_SSR: &str = r#"import std::io::print;

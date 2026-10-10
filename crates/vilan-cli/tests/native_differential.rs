@@ -11401,6 +11401,25 @@ fn a153_s2_a_store_mirror_behaves_the_same_on_both_backends() {
     );
 }
 
+/// A153 S2: a patch's ops land in ONE client turn on both backends — an observer
+/// woken by the first op reads the second op's field already landed — and a key
+/// the server does not hold is seeded `null`. (`states()` itself stays on the JS
+/// pin, `reactive_channels`: natively a generic `dyn Pipe` is not emitted yet.)
+#[test]
+fn a153_s2_a_patch_lands_in_one_client_turn_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_turn.vl"),
+        include_str!("native/store_mirror_turn.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_turn.vl"),
+        Verdict::Identical,
+        "a patch must land in one client turn on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair

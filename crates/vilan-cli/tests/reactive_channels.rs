@@ -6322,3 +6322,205 @@ fn a153_s2_a_generated_store_stub_mints_on_its_first_hold_and_lets_go_with_its_l
         "the generated store stub went differently:\n{stdout}"
     );
 }
+
+/// A remote handle's `states()` (A150's leased pipe, `mirrored-store.md` §6.1),
+/// the minting call made to FAIL once; down frames land a microtask later, each in
+/// its own turn, as a socket's do.
+const MIRROR_STATES: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::transient::{ TransientSource, TransientState };
+import std::reactive::{ Owner, Source, batch, combine, queue_microtask, run_with_owner };
+import std::result::Result::{ self, Err };
+import std::rpc::mirror::{ StoreReply, mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcError,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun shown<T>(state: TransientState<T, RpcError>, show: |T| str): str {
+	match state {
+		TransientState::Pending => "Pending",
+		TransientState::Ready(let value) => i"Ready({show(value)})",
+		TransientState::Refreshing(let value) => i"Refreshing({show(value)})",
+		TransientState::Failed(let error, let stale) => i"Failed({error.debug()}, {stale.map(show).unwrap_or("-")})",
+		TransientState::Absent => "Absent",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	let global = Store::new(Global { messages, motd = "welcome" });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	// Down frames land a microtask later, each in its own turn, as a socket's do.
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let fail_next = Shared::new(true);
+	let dispatcher = Dispatcher::new().on("global", |request: RpcRequest| {
+		print("  rpc  global");
+		reply_store(request, global)
+	});
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || {
+		if fail_next.read() {
+			fail_next.write() = false;
+			let refused: Result<StoreReply<Global>, RpcError> = Err(RpcError::Unavailable);
+			ret refused;
+		}
+		call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false))
+	});
+	print(i"passive: {shown(g.state().get(), |value: Global| value.motd)}");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
+	});
+	sleep_for(Duration::millis(0));
+	print("-- the next hold asks again");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	let again = Owner::new();
+	run_with_owner(again, || {
+		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
+		g
+			.messages()
+			.at(7)
+			.some()
+			.states()
+			.effect(|state| print(i"seven {shown(state, |value: Message| value.content)}"));
+		g
+			.messages()
+			.at(9)
+			.some()
+			.states()
+			.effect(|state| print(i"nine {shown(state, |value: Message| value.content)}"));
+		g.messages().at(7).some().is_pending().effect(|pending| print(i"seven pending {pending}"));
+		let content: dyn Source<Option<str>> = g.messages().at(7).some().content();
+		let id: dyn Source<Option<u53>> = g.messages().at(7).some().id();
+		combine((content, id)).effect(|both| {
+			let (text, number) = both;
+			print(i"seven's pair {number.unwrap_or(0)}:{text.unwrap_or("-")}");
+		});
+	});
+	sleep_for(Duration::millis(0));
+	print("-- two fields in one patch: one turn on the client");
+	batch(|| {
+		let _content = global.messages().at(7).some().content().patch("both");
+		let _id = global.messages().at(7).some().id().patch(70);
+	});
+	sleep_for(Duration::millis(0));
+	print("-- the key goes, then comes back");
+	global.messages().at(7).set(None);
+	sleep_for(Duration::millis(0));
+	global.messages().at(7).set(Some(Message { id = 7, content = "back" }));
+	sleep_for(Duration::millis(0));
+	again.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a153_s2_a_remote_handle_tells_pending_ready_absent_and_failed_through_states() {
+    // §6.1. `state()` reports without holding (`passive: Pending`). The first
+    // hold's call fails: `Failed(Unavailable, -)`, no value to carry. The next
+    // hold asks again and reads `Pending` while it is out, `Ready` with the
+    // reply; a key's handle reads `Pending` until ITS seed lands — `Ready` for a
+    // key the server holds, `Absent` for one it does not (both seeded in the
+    // turn's one `Subscribe`/`Patch`) — and `is_pending` follows. Two fields
+    // written in one server turn land in ONE client turn: the pair's observer
+    // wakes once, never with the content beside the old id. A removed key reads
+    // `Absent`, and `Ready` again when it is back.
+    let stdout = run_program("mirror_states", MIRROR_STATES);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "passive: Pending",
+            "root Pending",
+            "root Failed(RpcError::Unavailable, -)",
+            "-- the next hold asks again",
+            "rpc  global",
+            "root Pending",
+            "seven Pending",
+            "nine Pending",
+            "seven pending true",
+            "seven's pair 0:-",
+            "root Ready(welcome)",
+            "seven Pending",
+            "nine Pending",
+            "seven pending true",
+            "seven's pair 0:-",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,7]],[1,-1,[0,9]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"hello\"}]},{\"Seed\":[1,null]}]]}",
+            "root Ready(welcome)",
+            "seven Ready(hello)",
+            "nine Absent",
+            "seven pending false",
+            "seven's pair 7:hello",
+            "-- two fields in one patch: one turn on the client",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,1],\"both\"]},{\"Set\":[0,[1,0],70]}]]}",
+            "root Ready(welcome)",
+            "seven Ready(both)",
+            "seven pending false",
+            "seven's pair 70:both",
+            "-- the key goes, then comes back",
+            "down {\"Patch\":[0,[{\"Seed\":[0,null]}]]}",
+            "root Ready(welcome)",
+            "seven Absent",
+            "seven pending false",
+            "seven's pair 0:-",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"back\"}]}]]}",
+            "root Ready(welcome)",
+            "seven Ready(back)",
+            "seven pending false",
+            "seven's pair 7:back",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "done",
+        ],
+        "the remote handle's states went differently:\n{stdout}"
+    );
+}

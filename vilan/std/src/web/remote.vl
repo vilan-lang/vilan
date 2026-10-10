@@ -1,0 +1,34 @@
+// `std::web::remote` — a MIRRORED store's handles as content (tracker A153 S2,
+// `proposal/mirrored-store.md` §6.3).
+//
+// `std::web::ui::when_live` takes a local `StoreSome<P>`; a mirrored store's
+// client holds a read-only face instead (`RemoteStoreSome<P>`, `std::reactive::store`),
+// and its variant as content is this function — a SECOND function rather than a
+// trait over both handle kinds, as ruled: with one generic `when_live`, a body's
+// parameter type could not be inferred without an annotation.
+//
+// A module of its own beside the twins rather than a member of them, because the
+// face lives in `std::reactive::store`, which a web program that mirrors nothing
+// never loads: every program that imports `std::web::ui` would otherwise pay for
+// the mirrored store's types. Platform-neutral: `when` is each twin's, so the
+// same component compiles on both legs (the process twin reads the variant once).
+
+import pkg::reactive::owner_scope;
+import pkg::reactive::store::{ RemoteStore, RemoteStoreFlag, RemoteStoreSome };
+import pkg::web::ui::{ Conditional, Slot, when };
+
+/// A mirrored store's variant — or a key's value — as CONTENT at THIS position,
+/// with the payload's `RemoteStore<P>` in hand: built under a fresh owner when the
+/// boundary's value goes live, and disposed when it goes away. A patch inside the
+/// payload wakes only the bindings that read what changed; it never rebuilds the
+/// body. Inside the body a field handle is plain — seeded with its boundary, never
+/// a maybe (the owner's rule, §6.3) — and holds its LAST value while a `Gone` on
+/// its way disposes the body.
+///
+///     <li>{when_remote_live(g.messages().at(id).some(), |message| <span>{message.content()}</span>)}</li>
+export fun when_remote_live<P, C: Slot>(
+	handle: RemoteStoreSome<P>,
+	render: (sync |RemoteStore<P>| C) context owner_scope,
+): Conditional<RemoteStoreFlag, C> {
+	when(handle.live(), || render(handle.assume()))
+}

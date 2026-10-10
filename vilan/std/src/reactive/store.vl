@@ -107,7 +107,7 @@ import pkg::reactive::store_core::{
 	touch_spine,
 	watch_at,
 };
-import pkg::reactive::{ Signal, Source, Subscriber, Subscription, also_releasing };
+import pkg::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, also_releasing, turn_scope };
 import pkg::shared::{ Shared, fresh_identity };
 import pkg::wire::{ Deserialize, Deserializer, Keyed, Serialize, Serializer, Wire };
 
@@ -1481,18 +1481,49 @@ export enum MirrorStep {
 /// grant's base, the identity of its place in the replica (two handles on one
 /// boundary share one slot), and how a frame for its slot lands — `apply` at a path
 /// below it, `gone` when the server says it is no longer reachable.
+///
+/// Both land in the CALLER's turn (`context turn_scope`): a closure otherwise
+/// writes in the turn it was made in, and a frame's ops — made by handles built
+/// long before the frame — must land as ONE turn, so the replica's subscribers see
+/// one consistent state (§5).
 export struct MirrorBoundary {
 	path: List<MirrorStep>,
 	identity: i32,
-	apply: |List<StoreStep>, Deserializer| void,
-	gone: || void,
+	apply: (|List<StoreStep>, Deserializer| void) context turn_scope,
+	gone: (|| void) context turn_scope,
 }
 
 /// The connection a remote handle subscribes through, erased to what a handle
-/// needs from it: hold a boundary, answer the release. Made by `std::rpc::mirror`,
-/// which owns the channel, its slots and its frames.
+/// needs from it: hold a boundary and answer the release, and say what the wire
+/// has told it about a boundary, by the boundary's identity — once (`known`), or
+/// as a cell that moves when that answer does (`follow`, what a handle's
+/// `states()` binds beside its value; kept while the boundary is held). `heard`
+/// moves whenever any answer may have. Made by `std::rpc::mirror`, which owns the
+/// channel, its slots and its frames.
 export struct MirrorLink {
 	hold: |MirrorBoundary| (|| void),
+	known: |i32| MirrorKnown,
+	follow: |i32| SignalCell<MirrorKnown>,
+	heard: SignalCell<i32>,
+}
+
+/// What the wire has told a remote handle's mint about one of its boundaries
+/// (A153 S2): what `states()` reads beside the replica's value, to tell a value on
+/// its way from one that is not there.
+[derive(Debug, PartialEq)]
+export enum MirrorKnown {
+	/// Nothing yet in this binding: the minting call is out, or the boundary's
+	/// `Subscribe` is — the replica's value, if it holds one, is the last one it
+	/// was told.
+	Waiting,
+	/// The boundary has been seeded (or told it is gone): the replica's value is
+	/// the server's.
+	Heard,
+	/// The connection is down: the replica keeps its last value, and a refresh is
+	/// owed (§7).
+	Down,
+	/// The minting call failed; the next hold asks again.
+	Failed,
 }
 
 /// Where a remote handle hangs: the link, its wire path from the grant's base, and
@@ -1525,7 +1556,7 @@ impl MirrorAt {
 export fun mirror_boundary<T: StoreWire + Storable>(
 	local: Store<T>,
 	path: List<MirrorStep>,
-	gone: || void,
+	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
 	MirrorBoundary {
 		path,
