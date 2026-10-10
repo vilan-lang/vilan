@@ -11471,6 +11471,23 @@ fn a153_s3_mirrored_collections_cross_the_same_on_both_backends() {
     );
 }
 
+/// A169: a released slot's `Gone` acknowledgement, and the client forgetting
+/// the reader on it, behave the same on both backends.
+#[test]
+fn a169_an_acknowledged_unsubscribe_is_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_ack.vl"),
+        include_str!("native/store_mirror_ack.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_ack.vl"),
+        Verdict::Identical,
+        "an acknowledged unsubscribe must be the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair

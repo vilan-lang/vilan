@@ -5830,6 +5830,7 @@ fn a153_s1_a_mirrored_store_seeds_once_and_patches_at_the_writers_paths() {
             "-- a whole-root write",
             "down {\"Patch\":[0,[{\"Seed\":[-1,{\"rooms\":[],\"messages\":[],\"motd\":\"reset\"}]},{\"Seed\":[0,null]},{\"Seed\":[1,null]}]]}",
             "-- release the client slots, then the bases",
+            "down {\"Patch\":[0,[{\"Gone\":0},{\"Gone\":1}]]}",
             "bases only: slots=1 nodes=1 wire=1",
             "down {\"Patch\":[0,[{\"Set\":[-1,[2],\"still the root's\"]}]]}",
             "released: slots=0 nodes=1 wire=0",
@@ -5962,6 +5963,7 @@ fn a153_s1_a_subscription_reaches_only_below_a_grant_and_a_grant_counts_its_repl
             "-- and comes back",
             "down {\"Patch\":[0,[{\"Seed\":[-2,\"phone\"]}]]}",
             "-- the deduped grant needs both releases",
+            "down {\"Patch\":[0,[{\"Gone\":7}]]}",
             "down {\"Patch\":[0,[{\"Set\":[-1,[1,1],\"once\"]}]]}",
             "one grant left: slots=1 nodes=3 wire=1",
             "-- the session ends: every mirror torn down",
@@ -6180,6 +6182,7 @@ fn a153_s2_a_store_mirror_mints_on_its_first_hold_and_patches_its_replica() {
             "seven goodbye",
             "-- the page goes: the grant is let go",
             "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
             "up   {\"Unsubscribe\":[0,[-1]]}",
             "held: bye",
             "the released key left the replica: true",
@@ -6517,7 +6520,9 @@ fn a153_s2_a_remote_handle_tells_pending_ready_absent_and_failed_through_states(
             "seven pending false",
             "seven's pair 7:back",
             "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
             "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
             "up   {\"Unsubscribe\":[0,[-1]]}",
             "done",
         ],
@@ -6716,7 +6721,9 @@ fn a153_s4_a_reconnect_replays_the_root_once_resubscribes_in_one_frame_and_resee
             "root Ready(after)",
             "root Ready(after)",
             "up   {\"Unsubscribe\":[1,[1]]}",
+            "down {\"Patch\":[1,[{\"Gone\":1}]]}",
             "up   {\"Unsubscribe\":[1,[0]]}",
+            "down {\"Patch\":[1,[{\"Gone\":0}]]}",
             "up   {\"Unsubscribe\":[1,[-1]]}",
             "done",
         ],
@@ -6866,12 +6873,15 @@ fn a168_a_set_field_crosses_the_wire_and_each_watched_member_is_a_boundary() {
             "amy false",
             "-- the room's own hold goes; the members watched inside it keep it",
             "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
             "room held: true",
             "down {\"Patch\":[0,[{\"Seed\":[1,true]}]]}",
             "amy true",
             "-- the last hold inside it goes: the room leaves the replica",
             "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
             "up   {\"Unsubscribe\":[0,[2]]}",
+            "down {\"Patch\":[0,[{\"Gone\":2}]]}",
             "up   {\"Unsubscribe\":[0,[-1]]}",
             "room held: false",
             "done",
@@ -7061,11 +7071,151 @@ fn a153_s3_a_list_crosses_by_splices_and_a_key_set_by_keys() {
             "down {\"Patch\":[0,[{\"Keys\":[2,{\"Reset\":[\"pinned\",\"urgent\"]}]}]]}",
             "tags: pinned urgent",
             "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
             "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
             "up   {\"Unsubscribe\":[0,[2]]}",
+            "down {\"Patch\":[0,[{\"Gone\":2}]]}",
             "up   {\"Unsubscribe\":[0,[-1]]}",
             "done",
         ],
         "the mirrored collections went differently:\n{stdout}"
+    );
+}
+
+// --- A169: the server acknowledges an `Unsubscribe` -------------------------------
+
+/// A released slot's reader is kept until the server says nothing will name the
+/// slot again.
+const MIRROR_ACK: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, mirror_retired_census, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	messages.insert(8, Message { id = 8, content = "hi" });
+	let global = Store::new(Global { messages });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	let row = Owner::new();
+	run_with_owner(page, || {
+		g
+			.messages()
+			.at(7)
+			.some()
+			.content()
+			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
+	});
+	run_with_owner(row, || {
+		g
+			.messages()
+			.at(8)
+			.some()
+			.content()
+			.effect(|content| print(i"eight {content.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print("-- eight's row goes; a write to eight is already on its way");
+	let _late = global.messages().at(8).some().content().patch("late");
+	row.dispose();
+	print(i"retired readers while the acknowledgement is on its way: {mirror_retired_census()}");
+	sleep_for(Duration::millis(0));
+	print(i"after it lands: {mirror_retired_census()}");
+	print("-- eight is written again: nothing names its slot");
+	let _again = global.messages().at(8).some().content().patch("unwatched");
+	sleep_for(Duration::millis(0));
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"##;
+
+#[test]
+fn a169_the_server_acknowledges_an_unsubscribe_with_gone_and_the_client_forgets_the_reader() {
+    // Door (a): a released client slot is answered with `Gone(slot)` in the
+    // server's next patch, AFTER every op it sent for the slot — here a write
+    // already on its way when the row went, which still lands through the kept
+    // reader (into nothing) — and the client forgets the reader on it: one
+    // retired reader while the acknowledgement is in flight, none after. A later
+    // write to the key names no slot. Red before: the census stayed at 1 for the
+    // life of the channel view.
+    let stdout = run_program("mirror_ack", MIRROR_ACK);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "seven -",
+            "eight -",
+            "seven -",
+            "eight -",
+            "up   {\"Subscribe\":[0,[[0,-1,[0,7]],[1,-1,[0,8]]]]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"id\":7,\"content\":\"hello\"}]},{\"Seed\":[1,{\"id\":8,\"content\":\"hi\"}]}]]}",
+            "seven hello",
+            "eight hi",
+            "-- eight's row goes; a write to eight is already on its way",
+            "down {\"Patch\":[0,[{\"Set\":[1,[1,1],\"late\"]}]]}",
+            "up   {\"Unsubscribe\":[0,[1]]}",
+            "down {\"Patch\":[0,[{\"Gone\":1}]]}",
+            "retired readers while the acknowledgement is on its way: 1",
+            "after it lands: 0",
+            "-- eight is written again: nothing names its slot",
+            "up   {\"Unsubscribe\":[0,[0]]}",
+            "down {\"Patch\":[0,[{\"Gone\":0}]]}",
+            "up   {\"Unsubscribe\":[0,[-1]]}",
+            "done",
+        ],
+        "the acknowledged unsubscribe went differently:\n{stdout}"
     );
 }

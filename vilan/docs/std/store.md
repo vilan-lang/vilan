@@ -421,7 +421,8 @@ the three handle shapes of a local store, with the same projections (the derive
 writes both). A subscription on a face holds its nearest BOUNDARY: the grant's
 base, or a map key reached with `at(k)`. The first hold on a key puts that key's
 slot on the wire with the turn's one `Subscribe`; the last one takes it off, and
-the key leaves the replica. A frame lands in the replica as an ordinary
+the key leaves the replica (the server answers the release with the slot's
+`Gone`, after which nothing names it). A frame lands in the replica as an ordinary
 comparing write, so a client observer wakes only when its own value changed.
 
 A service method returning a store hands the client a `RemoteStoreSome<T>`

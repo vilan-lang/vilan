@@ -184,6 +184,10 @@ struct MirrorChannel {
 	seeding: Shared<List<i32>>,
 	pending: Shared<i32>,
 	next_base: Shared<i32>,
+	/// The client slots released since the last frame: each is told `Gone` in the
+	/// next one, the acknowledgement after which the client forgets the slot's
+	/// reader (A169) — nothing will name it again.
+	acked: Shared<List<i32>>,
 }
 
 /// Every open mirror channel, by channel id — what a settled turn's flush finds its
@@ -242,6 +246,7 @@ fun mirror_channel(session: ReactiveServer, root: Shared<StoreNode>): MirrorChan
 		seeding,
 		pending = Shared::new(0 - 1),
 		next_base = Shared::new(0 - 1),
+		acked = Shared::new([]),
 	};
 	mirror_channels.write().push(opened);
 	opened
@@ -586,6 +591,8 @@ impl MirrorChannel {
 		}
 		if self.grants.read().is_empty() {
 			self.session.revoke(self.channel);
+		} else if !self.acked.read().is_empty() {
+			self.flush();
 		}
 	}
 
@@ -597,6 +604,7 @@ impl MirrorChannel {
 				held.holds.write() = left;
 				if left <= 0 {
 					held.watch.dispose();
+					self.acked.write().push(slot);
 					jump continue;
 				}
 			}
@@ -661,6 +669,8 @@ impl MirrorChannel {
 		let seeding = self.seeding.read();
 		self.seeding.write() = [];
 		let written = store_wire_since(self.root, self.cursor);
+		let acked = self.acked.read();
+		self.acked.write() = [];
 		mut ops: List<MirrorOp> = [];
 		for held in self.slots.read() {
 			let grant = match self.grant_of(held.base) {
@@ -682,6 +692,17 @@ impl MirrorChannel {
 				None => ops.push(seed_or_gone(grant, held)),
 				Some(let paths) => plan(&mut ops, grant, held, paths),
 			}
+		}
+		// The released slots' acknowledgements come last: every op before them in
+		// this frame or an earlier one is still read with the slot's reader.
+		for slot in acked {
+			ops.push(MirrorOp {
+				kind = MirrorOpKind::Gone,
+				slot,
+				describe = |_at: List<StoreStep>, _serializer: Serializer| StoreReach::Absent,
+				at = [],
+				rel = [],
+			});
 		}
 		if ops.is_empty() {
 			ret;
@@ -941,7 +962,8 @@ struct MirrorView {
 	slots: Shared<List<ClientSlot>>,
 	/// Released slots whose frames may still be in flight: a frame's values are
 	/// read at their own types, so a slot the client let go of still needs its
-	/// reader until the server stops naming it. They land in nothing.
+	/// reader until the server acknowledges the release with `Gone` (A169). They
+	/// land in nothing.
 	retired: Shared<List<ClientSlot>>,
 	next_slot: Shared<i32>,
 	subscribing: Shared<List<i32>>,
@@ -1172,9 +1194,9 @@ impl MirrorView {
 					self.parked.write().push(held);
 				}
 				// A slot whose `Subscribe` went out is told off, and its reader
-				// stays for the frames still in flight — until the view closes: no
-				// frame says the server has stopped naming it. One opened and
-				// closed within the turn never reached the wire.
+				// stays for the frames still in flight — until the server's `Gone`
+				// acknowledges the release (A169). One opened and closed within
+				// the turn never reached the wire.
 				if !opened.contains(held.slot) {
 					unsubscribe.push(held.slot);
 					self.retired.write().push(held);
@@ -1284,6 +1306,23 @@ impl MirrorView {
 		self.transport.send(finish());
 	}
 
+	/// Forget a released slot's reader, if `slot` is one: whether it was.
+	fun forget_retired(self, slot: i32): bool {
+		mut kept: List<ClientSlot> = [];
+		mut found = false;
+		for held in self.retired.read() {
+			if held.slot == slot {
+				found = true;
+			} else {
+				kept.push(held);
+			}
+		}
+		if found {
+			self.retired.write() = kept;
+		}
+		found
+	}
+
 	fun slot_named(self, slot: i32): Option<ClientSlot> {
 		for held in self.slots.read() {
 			if held.slot == slot {
@@ -1351,12 +1390,18 @@ impl MirrorView {
 					}
 					reader.end_variant();
 				},
+				// `Gone` for a slot the client released is the server's
+				// acknowledgement (A169): nothing will name the slot again, so its
+				// reader is forgotten. For a live slot it says the boundary is no
+				// longer reachable.
 				"Gone" => {
 					reader.begin_variant(op, 1);
 					let slot = reader.i32_value();
-					match self.slot_named(slot) {
-						Some(let held) => (held.boundary.gone)(),
-						None => {},
+					if !self.forget_retired(slot) {
+						match self.slot_named(slot) {
+							Some(let held) => (held.boundary.gone)(),
+							None => {},
+						}
 					}
 					reader.end_variant();
 				},
@@ -2060,4 +2105,16 @@ export impl RemoteStoreSome<type P> with TransientSource<P, RpcError> {
 			});
 		pipe
 	}
+}
+
+/// How many released slots' readers every client view still keeps — what A169's
+/// acknowledgement drains (a pin's census).
+[internal("the mirrored store's client census (A169)")]
+export fun mirror_retired_census(): usize {
+	mut count: usize = 0;
+	for entry in mirror_views.read() {
+		let (_owner, view) = entry;
+		count += view.retired.read().len();
+	}
+	count
 }
