@@ -73,7 +73,10 @@ exactly as addressing the directory would — so `vilan check src/main.vl`
 answers about that file what `vilan check .` answers. What it does *not* do is
 run the package's `[build]` hooks: naming one file asks for that file, not for
 the package's build pipeline. A file with no `vilan.toml` above it compiles on
-its own, with the default prelude and no dependencies.
+its own, with the default prelude and no dependencies. A file of a `[library]`
+is a *module* of it (no `main` is asked for), rooted at the library's layer
+for `pkg::` paths, and imports the library's `[library.dependencies]` as the
+editor does.
 
 - `--stdout`: print the JavaScript instead of writing a file.
 - `--rerun-hooks`: run every `[[build.hook]]` even if it is fresh — the

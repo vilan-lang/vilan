@@ -35,6 +35,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B594: `vilan check <file>` on a `[library]` file resolves the library's `[library.dependencies]`.** `import dep::d;` in a module of a library that declares `dep` reported "cannot find module 'dep' to import" (and "cannot find 'd' in this scope") when the module was addressed by path, while `vilan check <library>` and the editor resolved it: B586 rooted the file at its layer but handed it no dependency workspace. File mode now gives a library file the library's own directory as its package, so its dependencies (and its prelude, as the language server's `[library]` arm reads them) apply; a library that does not declare the dependency still refuses the import. Pins: `b594_a_library_file_resolves_the_librarys_dependencies`, red against the previous `file_project`.
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
