@@ -12644,3 +12644,26 @@ fn f126_print_of_a_location_writes_its_text_on_both_backends() {
         "`print` of a `Location` must write the same bytes natively"
     );
 }
+
+/// F128: `*length` in `.filter(|length| *length > 1)` over a `List<usize>`
+/// emitted `(*length)` over the by-value closure parameter `filter`'s
+/// `|T| bool` hands over (rustc E0614) — the premise's "the predicate takes
+/// `&T`" was wrong: it takes the element by value, and the JS backend's `*`
+/// on a value is the value. A by-value function parameter and a local
+/// holding a value read the same way; a `*` over a view still copies
+/// through it.
+#[test]
+fn f128_a_dereference_of_a_value_binding_reads_the_value_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f128_value_dereference.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/value_dereference.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `*` over a value binding must read the value natively"
+    );
+}

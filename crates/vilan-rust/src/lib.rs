@@ -5344,6 +5344,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Dereference(operand) if self.yields_through_value_tails(operand) => {
                 self.expression(operand, depth)?
             }
+            // F128: `*length` over a binding that is a VALUE natively — a
+            // by-value parameter (`filter`'s `|T| bool` hands the element
+            // over by value), a local initialized with a value — reads the
+            // value: the JS backend's `*` on a value is the value itself, and
+            // `(*length)` was rustc's E0614.
+            Expr::Dereference(operand) if self.dereferences_a_value(operand) => {
+                self.expression(operand, depth)?
+            }
             Expr::Dereference(operand) => format!("(*{})", self.expression(operand, depth)?),
             Expr::Call(call_id) => self.call(id, call_id, depth, span)?,
             Expr::Async(spawned) => self.async_spawn(id, spawned, depth, span)?,
@@ -5663,6 +5671,77 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.program.entity_map.get(&id),
             Some(Expr::Reference(_, _))
         ) || self.is_a_view_call(id)
+    }
+
+    /// F128: whether `*operand` reads a binding this backend holds as a
+    /// VALUE, not a reference — so the `*` has nothing to cross. A parameter
+    /// received by value (a bare one other than `self`, `own`, a closure's
+    /// `|T|` parameter), or a local whose initializer is a value: not a
+    /// written `&`, a `borrows` call or another view binding, and not a
+    /// `for e in &mut` element or a payload-view capture. Anything else keeps
+    /// its `(*operand)`; a binding misread as a value fails rustc's build
+    /// (a reference where a value goes), never the answer.
+    fn dereferences_a_value(&self, operand: Id) -> bool {
+        let binding = match self.program.entity_map.get(&operand) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
+            _ => return false,
+        };
+        if let Some(parameter) = self.program.parameters.get(&binding) {
+            return !self.program.context_hidden_parameters.contains_key(&binding)
+                && !(parameter.lazy && !self.program.lazy_eager_parameters.contains(&binding))
+                && self.receiving_form(parameter) == Receiving::ByValue;
+        }
+        self.local_holds_a_value(binding)
+    }
+
+    /// [`Self::dereferences_a_value`]'s local half: a `let` whose initializer
+    /// is a value, followed through a chain of bare locals (`let c = b;`).
+    fn local_holds_a_value(&self, binding: Id) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        if self.program.for_each_views.contains_key(&binding)
+            || self.program.payload_view_captures.contains_key(&binding)
+        {
+            return false;
+        }
+        let Some(initial) = self
+            .program
+            .variables
+            .get(&binding)
+            .and_then(|variable| variable.initial)
+        else {
+            return false;
+        };
+        // Only initializers that are values by their shape: a call may be a
+        // `borrows` one reached through a method, a branch may choose a view
+        // (F81), so those keep their `(*operand)`.
+        match self.program.entity_map.get(&initial) {
+            Some(Expr::Local(source)) | Some(Expr::Parameter(source)) => {
+                match self.program.parameters.get(source) {
+                    Some(parameter) => self.receiving_form(parameter) == Receiving::ByValue,
+                    None => self.local_holds_a_value(*source),
+                }
+            }
+            Some(
+                Expr::Number(..)
+                | Expr::Bool(_)
+                | Expr::String(_)
+                | Expr::MultilineString(_)
+                | Expr::Binary(..)
+                | Expr::Unary(..)
+                | Expr::Dereference(_)
+                | Expr::Field(..)
+                | Expr::TupleIndex(..)
+                | Expr::Index(..)
+                | Expr::Tuple(_)
+                | Expr::List(_)
+                | Expr::Repeat(..)
+                | Expr::ArrayLen(..)
+                | Expr::StructInitializer(..),
+            ) => true,
+            _ => false,
+        }
     }
 
     /// Whether `id` is a call to a `borrows` function whose return is a view

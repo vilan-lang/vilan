@@ -55,6 +55,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**F128: `*` over a binding the native backend holds as a VALUE reads the value — `["a", "bb", "ccc"].map(|word| word.len()).filter(|length| *length > 1).len()` printed `2` on JS and was refused by rustc natively (E0614, "type `usize` cannot be dereferenced"), and so were `*n` over a by-value function parameter and over a `let` holding a value.** The item's premise was half wrong: `filter`'s predicate is `|T| bool`, so the element arrives BY VALUE on both backends, and the checker accepts `*` on a value (the JS backend's `*` of a value is the value). The emitter's dereference now reads the operand itself when it names a parameter received by value or a local whose initializer is a value by its shape (a literal, an operator, a copy, a field, subscript or tuple slot, an aggregate literal, or a chain of such locals); a view binding, a `borrows` call, a `for e in &mut` element, a payload-view capture and a branch-chosen initializer keep `(*operand)`. A misread binding could only fail rustc's build, never change an answer. Pin: `f128_a_dereference_of_a_value_binding_reads_the_value_on_both_backends` (`native/value_dereference.vl`).
+
+---
+
 ## v0.47.0 — 2026-10-10
 
 <!-- family: breaking -->
