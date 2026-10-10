@@ -8697,3 +8697,46 @@ fn b443_a_tuple_is_a_map_key() {
         "2\n7\n1\ntrue\n",
     );
 }
+
+// --- B581 (R-e, door (a)): a direct spread call always collects --------------
+
+/// B581: the spec said a spread call and its tuple call are one call
+/// (`log(1, "hi") == log((1, "hi"))`); the RULING is that a direct call by
+/// name always collects — `draw((3, 4))` passes a one-slot pack and is
+/// refused — and a tuple already built is passed as the pack with a
+/// tuple-value spread, `draw(..pair)`. The spec's comment is corrected; this
+/// pins the behaviour it now describes.
+#[test]
+fn b581_a_direct_spread_call_collects_and_a_built_tuple_spreads() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::tuple::Tuple;
+        fun draw(...at: (f64, f64)): f64 {
+            at.0 + at.1
+        }
+        fun count<T: (2..)>(...items: T): usize {
+            items.len()
+        }
+        fun main() {
+            print(draw(1.0, 2.0));
+            let pair = (3.0, 4.0);
+            print(draw(..pair));
+            print(count(1, "hi"));
+            print(count(..(1, "hi")));
+        }
+        "#,
+        "3\n7\n2\n2\n",
+    );
+    assert_fails_with(
+        r#"
+        fun draw(...at: (f64, f64)): f64 {
+            at.0 + at.1
+        }
+        fun main() {
+            let _sum = draw((3.0, 4.0));
+        }
+        "#,
+        "Expected (f64, f64)",
+    );
+}

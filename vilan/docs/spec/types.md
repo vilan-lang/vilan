@@ -1266,7 +1266,7 @@ ordinary tuple parameter — the call site writes the pack's elements out
 flat, and they are collected into that one tuple argument:
 
 ```vilan,fragment
-fun log<T: (..: Display)>(...items: T)      //  log(1, "hi")  ==  log((1, "hi"))
+fun log<T: (..: Display)>(...items: T)      //  log(1, "hi") collects the pack (1, "hi")
 fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T>
 ```
 
@@ -1280,6 +1280,13 @@ what makes 0- and 1-arity tuple *values* reachable; tuple types already
 admit them. Since the convention lives on the declaration, a spread
 function used as a **value** has its tuple type, and is called with a
 tuple.
+
+A direct call by name always **collects**, whatever its arguments' types:
+`log((1, "hi"))` passes ONE argument, so its pack is the one-slot
+`((1, "hi"))`, and against `fun draw(...at: (f64, f64))` the call
+`draw((3, 4))` is refused. A tuple already built is passed AS the pack
+with a tuple-value spread (below): `draw(..pair)`, `log(..(1, "hi"))`
+(B581).
 
 Grammar and the positions where `...` is rejected: §3.3.
 
