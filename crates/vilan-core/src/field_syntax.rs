@@ -29,14 +29,14 @@
 use crate::analyzer::{Expr, Function, Implementation, Parameter, Struct};
 use crate::fx::{FxHashMap as HashMap, FxIndexMap as IndexMap};
 use crate::id::Id;
-use crate::type_::{Type, TypeId};
+use crate::type_::{Type, TypeTable};
 
 /// The records a reading consults: the analyzer's while it solves, the
 /// `Program`'s afterwards. Both own the same maps under the same names.
 pub struct Surface<'a, 'src> {
     pub structs: &'a IndexMap<Id, Struct<'src>>,
     pub implementations: &'a [Implementation<'src>],
-    pub types: &'a HashMap<TypeId, Type>,
+    pub types: &'a TypeTable,
     pub entities: &'a HashMap<Id, Expr<'src>>,
     pub functions: &'a IndexMap<Id, Function<'src>>,
     pub parameters: &'a IndexMap<Id, Parameter<'src>>,

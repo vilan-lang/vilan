@@ -8245,7 +8245,7 @@ fn a_bound_selection_tests_only_the_impls_that_can_answer_it() {
                 .type_id_to_type_map
                 .iter()
                 .find(|(_, type_)| matches!(type_, Type::Struct(id, arguments) if *id == plaque && arguments.is_empty()))
-                .map(|(type_id, _)| *type_id)
+                .map(|(type_id, _)| type_id)
                 .expect("`Plaque` has a type slot");
             let expected: Vec<_> = program
                 .implementations

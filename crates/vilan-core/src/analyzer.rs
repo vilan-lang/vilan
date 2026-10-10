@@ -12,7 +12,9 @@ use crate::node::{
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
-use crate::type_::{Mode, ParameterMode, SubstitutionContext, TupleLabels, Type, TypeId};
+use crate::type_::{
+    Mode, ParameterMode, SubstitutionContext, TupleLabels, Type, TypeId, TypeTable,
+};
 use crate::util::{join_with, plural};
 
 mod auto_annotations;
@@ -5719,7 +5721,7 @@ pub struct Analyzer<'src> {
     struct_initializer_to_def: HashMap<Id, Id>, // initializer_id -> struct definition id
     structs: IndexMap<Id, Struct<'src>>,
     traits: IndexMap<Id, Trait<'src>>,
-    type_id_to_type_map: HashMap<TypeId, Type>,
+    type_id_to_type_map: TypeTable,
     type_id: u32,
     variables: IndexMap<Id, Variable<'src>>,
     // True while walking a trait body, where a bodyless method is a legitimate
@@ -7902,7 +7904,7 @@ impl<'src> Analyzer<'src> {
             struct_initializer_to_def: HashMap::default(),
             structs: IndexMap::default(),
             traits: IndexMap::default(),
-            type_id_to_type_map: HashMap::default(),
+            type_id_to_type_map: TypeTable::default(),
             type_id: 0,
             variables: IndexMap::default(),
             walking_trait_body: false,
@@ -33859,7 +33861,7 @@ impl<'src> Analyzer<'src> {
     /// record, it was measured here and did not clear the noise floor at
     /// loadavg 110+, and it is left unshipped rather than shipped unmeasured.
     fn compute_resource_types(&mut self) -> HashSet<TypeId> {
-        let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().copied().collect();
+        let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().collect();
         type_ids
             .into_iter()
             .filter(|type_id| self.type_is_resource(*type_id))
@@ -70685,7 +70687,7 @@ pub struct Program<'src> {
     pub scopes: IndexMap<Id, Scope<'src>>,
     pub span_map: HashMap<Id, &'src Span>,
     pub structs: IndexMap<Id, Struct<'src>>,
-    pub type_id_to_type_map: HashMap<TypeId, Type>,
+    pub type_id_to_type_map: TypeTable,
     pub variables: IndexMap<Id, Variable<'src>>,
     pub parameters: IndexMap<Id, Parameter<'src>>,
     // The source files that make up this program: `sources[0]` is the entry
@@ -83943,7 +83945,7 @@ fn selector_takes_block(
 /// supertrait along. A selector naming no trait takes every block of the
 /// subject.
 fn selector_names_block_trait(
-    types: &HashMap<TypeId, Type>,
+    types: &TypeTable,
     implementation: &Implementation,
     selector: &ImportImplSelector,
 ) -> bool {

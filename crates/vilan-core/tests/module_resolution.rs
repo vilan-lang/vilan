@@ -7103,7 +7103,7 @@ fn analyze_inherited_default_package(p1_import: &str) -> InheritedDefaultProgram
         .find(|declared| declared.name == "Box")
         .expect("`Box`")
         .id;
-    let box_type = *program
+    let box_type = program
         .type_id_to_type_map
         .iter()
         .find(|(_, type_)| {
