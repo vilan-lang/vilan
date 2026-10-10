@@ -201,6 +201,9 @@ pub enum Plant {
     /// — an impl moved in a hot module then leaves the prefix's old verdict
     /// in place.
     BoundRecordUnguarded,
+    /// S2b: the tail skips rendering a reused module's labels but drops the
+    /// restored rows — the prefix's hovers and declaration labels vanish.
+    LabelTablesUnrecorded,
 }
 
 impl Plant {
@@ -215,6 +218,7 @@ impl Plant {
             Plant::ConstKeyWithoutWorld => 8,
             Plant::BoundAuditUnrecorded => 9,
             Plant::BoundRecordUnguarded => 10,
+            Plant::LabelTablesUnrecorded => 11,
         }
     }
 }

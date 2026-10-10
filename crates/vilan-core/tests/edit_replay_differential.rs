@@ -663,6 +663,23 @@ fn the_differential_sees_a_bound_record_kept_over_a_moved_impl() {
     );
 }
 
+/// S2b's plant: the tail skips a reused module's label rendering and drops
+/// the restored rows — the prefix's hover types and declaration labels are
+/// then missing on the hit; the gate must see it.
+#[test]
+fn the_differential_sees_label_tables_served_without_their_rows() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::LabelTablesUnrecorded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("type ") || divergence.contains("declaration ")),
+        "the unrecorded-labels plant must turn a hover label red; it found: {divergences:#?}"
+    );
+}
+
 /// M121 / B553's cost: a check whose late files write no impl on a type they
 /// do not declare RECORDS NOTHING — the pre-entry resolve asks the impl table
 /// thousands of questions and none of them is kept (`reach_questions` 0), which
