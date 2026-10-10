@@ -9797,6 +9797,83 @@ fn b576_a_stored_worlds_web_set_steer_names_the_serving_calls_repair() {
     );
 }
 
+/// The sources an analysis of `entry` loaded, as the paths' strings — for
+/// the pins about WHAT a program's seeds pull in.
+fn loaded_sources(files: &[(&str, &str)], entry: &str, platform: Platform) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!(
+        "vilan_modres_loaded_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, _) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    program
+        .expect("the analysis produces a program")
+        .sources
+        .iter()
+        .map(|path| path.display().to_string().replace('\\', "/"))
+        .collect()
+}
+
+/// kolt's shape: the service file IMPORTS the store and holds a `Store<T>`
+/// field, and no member returns a handle — the import rule seeded mirror for
+/// it, the surface rule does not.
+const A167_SERVICE_WITHOUT_STORE: &str = "import std::io::print;\nimport std::reactive::store::{ Storable, Store };\nimport std::shared::Shared;\n\n[derive(Storable)]\nstruct Global {\n\tcount: i32,\n}\n\n[service(PingClient)]\nstruct Ping {\n\tcalls: Shared<i32>,\n\tglobal: Store<Global>,\n}\n\nimpl Ping {\n\t[rpc]\n\tfun ping(self): i32 {\n\t\t1\n\t}\n}\n\nfun main() {\n\tprint(\"up\");\n}\n";
+
+const A167_SERVICE_WITH_STORE: &str = "import std::io::print;\nimport std::reactive::store::{ Storable, Store };\nimport std::shared::Shared;\n\n[derive(Storable)]\nstruct Global {\n\tcount: i32,\n}\n\n[service(GlobalClient)]\nstruct Api {\n\tglobal: Store<Global>,\n}\n\nimpl Api {\n\t[rpc]\n\tfun global(self): Store<Global> {\n\t\tself.global\n\t}\n}\n\nfun main() {\n\tprint(\"up\");\n}\n";
+
+/// A167 / C3b: a `[service]` whose surface returns no store handle loads
+/// `std::rpc` and NOT `std::rpc::mirror` — the seed is keyed on the surface,
+/// not on the file importing the store (kolt's service file imports it for a
+/// field and paid mirror's 1,409 lines on every keystroke).
+#[test]
+fn a167_a_service_without_a_store_return_does_not_load_rpc_mirror() {
+    let sources = loaded_sources(
+        &[("main.vl", A167_SERVICE_WITHOUT_STORE)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        sources.iter().any(|path| path.ends_with("/std/src/rpc.vl")),
+        "the service seeds std::rpc: {sources:#?}"
+    );
+    assert!(
+        !sources.iter().any(|path| path.ends_with("/rpc/mirror.vl")),
+        "a service returning no store handle must not load std::rpc::mirror: {sources:#?}"
+    );
+}
+
+/// The control: a surface returning `Store<T>` seeds `std::rpc::mirror`.
+#[test]
+fn a167_a_service_returning_a_store_loads_rpc_mirror() {
+    let sources = loaded_sources(
+        &[("main.vl", A167_SERVICE_WITH_STORE)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        sources.iter().any(|path| path.ends_with("/rpc/mirror.vl")),
+        "a service returning a store handle seeds std::rpc::mirror: {sources:#?}"
+    );
+}
+
 /// B572: a std name a facade re-exports is steered to the facade, not to the
 /// internal module that declares it — `Store` and `StoreSome` are declared in
 /// `std::reactive::store_core` and re-exported by `std::reactive::store`, the

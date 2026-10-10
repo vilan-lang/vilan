@@ -70863,14 +70863,36 @@ fn service_seeds(nodes: &NodeList) -> &'static [&'static str] {
     if !contains_service(nodes) {
         return &[];
     }
-    let reaches_store = collect_module_paths(nodes, "std")
-        .iter()
-        .any(|(module, _)| *module == "reactive::store" || module.starts_with("reactive::store::"));
-    if reaches_store {
+    // C3b (incr-49): keyed on the service's SURFACE — a function in the file
+    // whose written return is a store handle — not on the file importing
+    // `std::reactive::store`: kolt's service file imports the store for a
+    // field and returns no handle, and the import rule loaded `rpc::mirror`
+    // (1,409 lines) for it on every keystroke, +5% of each.
+    if service_surface_returns_store(nodes) {
         &["rpc", "rpc::mirror"]
     } else {
         &["rpc"]
     }
+}
+
+/// Whether a function in `nodes` — at any depth: the service's `[rpc]`
+/// members sit in its impl block — writes a `Store<T>` / `StoreSome<P>`
+/// return, which is what the `[service]` expansion names `std::rpc::mirror`
+/// for (A153).
+fn service_surface_returns_store(nodes: &NodeList) -> bool {
+    fn walk(node: &Spanned<Node>) -> bool {
+        if let Node::Func(function) = &node.0
+            && let Some(return_type) = function.return_type.as_deref()
+            && is_store_handle_spelling(&return_type.0)
+        {
+            return true;
+        }
+        let mut found = false;
+        node.0
+            .for_each_child(&mut |child| found = found || walk(child));
+        found
+    }
+    nodes.iter().any(walk)
 }
 
 /// Whether an AST carries a `[service(..)]` item at any depth — the trigger
