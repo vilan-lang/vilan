@@ -11261,7 +11261,7 @@ fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
         (line, column)
     };
     let expected = format!(
-        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\n[ 0, 'expected Some but got None' ]\n",
+        "{}\n{CALLER_FILE}\n{line}\n{column}\n{own}\nSome(\"expected Some but got None\")\n",
         site("print(here())", "here"),
     );
     assert_eq!(native.stdout, expected);
@@ -11442,6 +11442,23 @@ fn e283_debug_takes_every_type_dbg_prints_on_both_backends() {
         include_str!("native/debug_handles.vl"),
         include_str!("native/debug_handles.stdout"),
         include_str!("native/debug_handles.stderr"),
+    );
+}
+
+/// debugging.md S3 (P2 and the 2026-10-09 ruling's five points): `print`
+/// writes an aggregate through the `dbg` printer on ONE line — a struct, an
+/// enum, a tuple, a list (nested, empty), an option, a map, a `dyn`, a long
+/// list that `dbg` would break — a float inside it keeping its `.0`, a backed
+/// enum by its name, a generic `T` per instance; a top-level number, string
+/// and bool print as before (`3.0` prints `3`). The same stdout on both
+/// backends (`native/print_aggregates.*`).
+#[test]
+fn s3_print_writes_aggregates_through_the_printer_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_print_aggregates.vl",
+        include_str!("native/print_aggregates.vl"),
+        include_str!("native/print_aggregates.stdout"),
+        "",
     );
 }
 

@@ -687,8 +687,8 @@ fn e259_a_generic_instance_is_named_after_its_function() {
 
 /// N136 (R-g door (a)): a number prints by the language's own conversion —
 /// negative zero is `0`, a float and an integer alike, as on the native
-/// backend — and only numbers are wrapped: a list still prints by node's
-/// layout.
+/// backend — and only numbers are wrapped: a list prints through the
+/// printer (debugging.md S3).
 #[test]
 fn n136_print_writes_negative_zero_as_zero() {
     let source = concat!(
@@ -706,11 +706,12 @@ fn n136_print_writes_negative_zero_as_zero() {
         javascript.contains("console.log(String(0.0 * -(1.0)));"),
         "{javascript}"
     );
+    // A list prints through the printer (debugging.md S3), unwrapped.
     assert!(
-        javascript.contains("console.log([ 1, 2 ]);"),
+        javascript.contains("console.log(__dbg_flat(__show_List_i32([ 1, 2 ])));"),
         "{javascript}"
     );
-    assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[ 1, 2 ]\n");
+    assert_compiles_and_runs(source, "0\n0\n0\n2.5\n[1, 2]\n");
 }
 
 // --- S2: `dbg_stack()` ---------------------------------------------------
@@ -1375,6 +1376,79 @@ fn e283_t_debug_takes_stds_handles_and_cuts_a_cycle() {
             "Shared([1, 2])\n",
             "123456789012345678901234567890\n",
             "Shared(Link { label = \"head\", next = Some(<cycle>) })\n",
+        ),
+    );
+}
+
+// --- S3: `print` of non-scalars ------------------------------------------
+
+/// S3 (the ruling's five points): an aggregate prints in vilan's literal
+/// syntax on ONE line, a float inside it keeping its `.0`; a backed enum by its
+/// name; a top-level number, string and bool as `print` always printed them
+/// (`3.0` is `3`, a string bare).
+#[test]
+fn s3_print_writes_an_aggregate_through_the_printer_on_one_line() {
+    assert_compiles_and_runs(
+        concat!(
+            "struct Point { x: i32, y: f64 }\n",
+            "enum Color { Red = \"red\", Green = \"green\" }\n",
+            "fun main() {\n",
+            "\tprint(3.0);\n",
+            "\tprint(\"raw\");\n",
+            "\tprint(true);\n",
+            "\tprint(Point { x = 1, y = 3.0 });\n",
+            "\tprint(Color::Green);\n",
+            "\tprint([Some(\"a\"), None]);\n",
+            "\tprint((1, [2.5, 3.0]));\n",
+            "\tprint([Point { x = 1, y = 1.0 }, Point { x = 2, y = 2.0 }, Point { x = 3, y = 3.0 }, Point { x = 4, y = 4.0 }]);\n",
+            "}\n",
+        ),
+        concat!(
+            "3\n",
+            "raw\n",
+            "true\n",
+            "Point { x = 1, y = 3.0 }\n",
+            "Color::Green\n",
+            "[Some(\"a\"), None]\n",
+            "(1, [2.5, 3.0])\n",
+            "[Point { x = 1, y = 1.0 }, Point { x = 2, y = 2.0 }, Point { x = 3, y = 3.0 }, Point { x = 4, y = 4.0 }]\n",
+        ),
+    );
+}
+
+/// S3: a generic `print(value)` prints each instance's type through the
+/// printer — a struct as a struct, a number as a number — and a `dyn` value
+/// prints what it holds (its table carries the `show` slot with no `dbg` in
+/// the program).
+#[test]
+fn s3_print_of_a_generic_value_and_a_dyn_prints_per_instance() {
+    assert_compiles_and_runs(
+        concat!(
+            "trait Area {\n",
+            "\tfun area(self): i32;\n",
+            "}\n",
+            "struct Square { side: i32 }\n",
+            "impl Square with Area {\n",
+            "\tfun area(self): i32 { self.side * self.side }\n",
+            "}\n",
+            "fun show<T>(value: T) {\n",
+            "\tprint(value);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tshow(Square { side = 2 });\n",
+            "\tshow(2.5);\n",
+            "\tshow(\"text\");\n",
+            "\tlet shape: dyn Area = Square { side = 3 };\n",
+            "\tprint(shape);\n",
+            "\tprint([shape]);\n",
+            "}\n",
+        ),
+        concat!(
+            "Square { side = 2 }\n",
+            "2.5\n",
+            "text\n",
+            "dyn Area(Square { side = 3 })\n",
+            "[dyn Area(Square { side = 3 })]\n",
         ),
     );
 }

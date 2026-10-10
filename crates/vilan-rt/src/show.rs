@@ -142,6 +142,12 @@ pub fn dbg(location: Location, entries: Vec<(&str, Doc)>) {
     }
 }
 
+/// `print` of an aggregate (debugging.md S3): the document on one line, to
+/// stdout — `print` never breaks lines.
+pub fn print(document: Doc) {
+    println!("{}", document.flat());
+}
+
 /// `dbg_stack()`'s lines (debugging.md S2): the `[file:line:col] title`
 /// header, then `  name: Type = value` per binding — the value laid out from
 /// where it starts, its broken entries two spaces under the binding — and the

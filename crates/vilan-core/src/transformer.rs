@@ -6024,13 +6024,28 @@ impl<'src> Transformer<'src> {
                             .get(&target_id)
                             .and_then(|external| external.extern_binding.clone())
                         {
-                            let args =
-                                self.host_arguments(target_id, &function_call.argument_ids, args);
-                            let args = self.number_print_arguments(
+                            // debugging.md S3: a `print` of an aggregate writes the
+                            // printer's text, from the value as vilan holds it;
+                            // anything else reaches the host as before.
+                            let (args, printed) = self.printed_aggregates(
                                 target_id,
                                 &function_call.argument_ids,
                                 args,
                             );
+                            let args = if printed {
+                                args
+                            } else {
+                                let args = self.host_arguments(
+                                    target_id,
+                                    &function_call.argument_ids,
+                                    args,
+                                );
+                                self.number_print_arguments(
+                                    target_id,
+                                    &function_call.argument_ids,
+                                    args,
+                                )
+                            };
                             let call = self.emit_extern(target_id, binding, args);
                             return Some(self.maybe_await(target_id, call));
                         }

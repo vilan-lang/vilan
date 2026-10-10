@@ -242,6 +242,54 @@ impl<'src> Transformer<'src> {
         )
     }
 
+    /// debugging.md S3: a `print` of an aggregate writes the printer's document
+    /// on one line (`__dbg_flat`), so a struct prints `Point { x = 1, y = 2 }`
+    /// rather than its field array; every other argument is left as it is.
+    pub(super) fn printed_aggregates(
+        &mut self,
+        target_id: Id,
+        argument_ids: &[Id],
+        args: Vec<js::Node<'src>>,
+    ) -> (Vec<js::Node<'src>>, bool) {
+        if target_id != self.print_fn_id {
+            return (args, false);
+        }
+        let mut printed = false;
+        let args = argument_ids
+            .iter()
+            .zip(args)
+            .map(|(argument, value)| {
+                let Some(type_id) = self.printed_type(*argument) else {
+                    return value;
+                };
+                printed = true;
+                self.used_helpers.insert("__dbg");
+                let value = self.read_through_scalar_view(*argument, value);
+                let printer = self.printer_for(type_id);
+                call("__dbg_flat", vec![call(&printer, vec![value])])
+            })
+            .collect();
+        (args, printed)
+    }
+
+    /// S3: the type a `print` argument prints through the printer at, under
+    /// the active substitution — `None` for a value `print` keeps rendering as
+    /// it always has (a number, a string, a host handle).
+    fn printed_type(&self, argument: Id) -> Option<TypeId> {
+        if self.program.number_print_arguments.contains(&argument) {
+            return None;
+        }
+        let type_id = self
+            .program
+            .print_argument_types
+            .get(&argument)
+            .copied()
+            .or_else(|| self.expr_type_id(argument))?;
+        let resolve = |type_id| self.ground_printer_type(type_id);
+        let shape = shape_of(self.program, resolve(type_id), &resolve);
+        crate::printer::print_uses_the_printer(&shape).then_some(type_id)
+    }
+
     /// A value read in place for printing: a binding that holds a scalar view
     /// emits its `(base, key)` pair, so the printer is handed `base[key]` —
     /// the value, as the native backend's borrow reads it (a view of an

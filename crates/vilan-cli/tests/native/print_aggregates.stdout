@@ -1,0 +1,19 @@
+3
+raw
+true
+Point { x = 1, y = 3.0 }
+Shape::Circle(1.5)
+Shape::Empty
+Color::Red
+[1, 2, 3]
+["a", "b"]
+[[1.0, 2.5], []]
+(1, "two", 3.0)
+Some(5)
+None
+HashMap { "ada" => 36 }
+dyn Area(Point { x = 4, y = 0.5 })
+[Point { x = 1, y = 1.0 }, Point { x = 2, y = 2.0 }, Point { x = 3, y = 3.0 }, Point { x = 4, y = 4.0 }]
+Point { x = 7, y = 8.0 }
+2.5
+generic

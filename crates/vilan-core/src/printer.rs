@@ -131,8 +131,80 @@ fn is_integer_name(name: &str) -> bool {
 /// The slot is one function reference per (trait, type) table, so a program
 /// that never calls `dbg` pays nothing (§2.3).
 pub fn tables_carry_show(program: &Program, policy: crate::options::DbgPolicy) -> bool {
-    policy != crate::options::DbgPolicy::Strip
-        && (!program.dbg_calls.is_empty() || !program.dbg_stack_sites.is_empty())
+    (policy != crate::options::DbgPolicy::Strip
+        && (!program.dbg_calls.is_empty() || !program.dbg_stack_sites.is_empty()))
+        || program
+            .print_argument_types
+            .values()
+            .any(|type_id| may_hold_an_object(program, *type_id, &mut Vec::new()))
+}
+
+/// S3: whether a value of `type_id` may hold a trait object a `print` reaches —
+/// the type names a `dyn`, or a generic an instance could bind to one.
+fn may_hold_an_object(program: &Program, type_id: TypeId, seen: &mut Vec<TypeId>) -> bool {
+    if seen.contains(&type_id) {
+        return false;
+    }
+    seen.push(type_id);
+    match program.type_id_to_type_map.get(&type_id) {
+        Some(Type::Dyn(..) | Type::Generic(_)) => true,
+        Some(Type::Tuple(elements)) => elements
+            .iter()
+            .any(|element| may_hold_an_object(program, *element, seen)),
+        Some(Type::Array(element, _)) => may_hold_an_object(program, *element, seen),
+        Some(Type::Struct(struct_id, arguments)) => {
+            arguments
+                .iter()
+                .any(|argument| may_hold_an_object(program, *argument, seen))
+                || program.structs.get(struct_id).is_some_and(|declaration| {
+                    declaration
+                        .fields
+                        .iter()
+                        .any(|field| may_hold_an_object(program, field.type_id, seen))
+                })
+        }
+        Some(Type::Enum(enum_id, arguments)) => {
+            arguments
+                .iter()
+                .any(|argument| may_hold_an_object(program, *argument, seen))
+                || program.enums.get(enum_id).is_some_and(|declaration| {
+                    declaration.variants.iter().any(|variant| {
+                        variant
+                            .data_type_ids
+                            .iter()
+                            .any(|payload| may_hold_an_object(program, *payload, seen))
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
+/// debugging.md S3 (P2, the 2026-10-09 ruling): whether `print` writes a value
+/// of this shape through the printer — on one line (`print` never breaks
+/// lines), a float inside it keeping its `.0`, a backed enum by its NAME. A
+/// number, a bool, a string and `()` keep `print`'s own rendering (`console.log`
+/// on JS: `3.0` prints `3`, a string raw), and so does a host or opaque value
+/// the printer could only name (`<Location>`), which `console.log` shows — a
+/// bare closure among them, which the native backend refuses to print (F25).
+/// A closure INSIDE an aggregate prints its type, as `dbg` prints it.
+pub fn print_uses_the_printer(shape: &Shape) -> bool {
+    match shape {
+        Shape::Integer | Shape::Float | Shape::BigInt | Shape::Bool | Shape::Str | Shape::Void => {
+            false
+        }
+        Shape::Text(text) => text.starts_with("<pipe "),
+        Shape::Struct { .. }
+        | Shape::Enum { .. }
+        | Shape::Backed { .. }
+        | Shape::Tuple(_)
+        | Shape::List(_)
+        | Shape::Shared(_)
+        | Shape::Cell { .. }
+        | Shape::Map { .. }
+        | Shape::Set { .. }
+        | Shape::Object { .. } => true,
+    }
 }
 
 // --- `dbg_stack()` (debugging.md S2) ---

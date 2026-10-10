@@ -151,6 +151,47 @@ impl<'a, 'src> Emitter<'a, 'src> {
         ))
     }
 
+    /// debugging.md S3: `print` of an aggregate writes the printer's document
+    /// on one line — the JS backend's `__dbg_flat` — so a struct prints
+    /// `Point { x = 1, y = 2 }`. `None` for a value `print` keeps rendering as
+    /// it always has (a number, a string, a host handle).
+    pub(crate) fn printed_aggregate(
+        &mut self,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        let Some(&argument) = argument_ids.first() else {
+            return Ok(None);
+        };
+        if self.program.number_print_arguments.contains(&argument) {
+            return Ok(None);
+        }
+        let Some(type_id) = self
+            .program
+            .print_argument_types
+            .get(&argument)
+            .copied()
+            .or_else(|| self.type_of(argument))
+        else {
+            return Ok(None);
+        };
+        let program = self.program;
+        let shape = {
+            let concrete = self.concrete(type_id);
+            let resolve = |type_id| self.concrete(type_id);
+            shape_of(program, concrete, &resolve)
+        };
+        if !vilan_core::printer::print_uses_the_printer(&shape) {
+            return Ok(None);
+        }
+        let printer = self.native_printer_for(type_id, span)?;
+        let place = self.place_argument(argument_ids, 0, depth)?;
+        Ok(Some(format!(
+            "vilan_rt::show::print({printer}(&({place})))"
+        )))
+    }
+
     fn dbg_argument_type(&self, argument: Id) -> Option<TypeId> {
         self.program
             .dbg_argument_types

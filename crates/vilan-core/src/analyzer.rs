@@ -5784,6 +5784,10 @@ pub struct Analyzer<'src> {
     dbg_argument_types: HashMap<Id, TypeId>,
     // N136: the `print` arguments typed as a number.
     number_print_arguments: HashSet<Id>,
+    // debugging.md S3: every other `print` argument's settled type — which
+    // may name the enclosing function's generics — so both emitters print an
+    // aggregate through the `dbg` printer.
+    print_argument_types: HashMap<Id, TypeId>,
     // `std::debug::dbg_stack` (debugging.md S2): the call the analyzer expands
     // from the scope it sits in (`analyzer/dbg_stack.rs`).
     dbg_stack_fn_id: Option<Id>,
@@ -7624,6 +7628,7 @@ impl<'src> Analyzer<'src> {
             dbg_statement_calls: HashSet::default(),
             dbg_argument_types: HashMap::default(),
             number_print_arguments: HashSet::default(),
+            print_argument_types: HashMap::default(),
             dbg_stack_fn_id: None,
             dbg_stack_calls: IndexMap::default(),
             dbg_stack_moves: HashMap::default(),
@@ -52380,11 +52385,15 @@ impl<'src> Analyzer<'src> {
                         }
                         // N136: a NUMBER handed to `print` prints by the
                         // language's own conversion on JS, which needs to
-                        // know it is one.
-                        if Some(function_id) == self.print_fn_id
-                            && self.is_a_number_type(&argument_type)
-                        {
-                            self.number_print_arguments.insert(argument_id);
+                        // know it is one. Anything else keeps its type for
+                        // S3: an aggregate prints through the printer.
+                        if Some(function_id) == self.print_fn_id {
+                            if self.is_a_number_type(&argument_type) {
+                                self.number_print_arguments.insert(argument_id);
+                            } else {
+                                let type_id = argument_type.clone().get_type_id(self);
+                                self.print_argument_types.insert(argument_id, type_id);
+                            }
                         }
                         // B372: an argument BUILT FROM a closure parameter that
                         // is still awaiting its fill — `wrap(m * 2)` inside
@@ -68076,6 +68085,11 @@ pub struct Program<'src> {
     /// language's own (every integer width, `f32`, `f64`) — the JS backend
     /// prints them through `String(x)`.
     pub number_print_arguments: HashSet<Id>,
+    /// debugging.md S3: every other `print` argument's type as the analysis
+    /// settled it (it may name the enclosing function's generics; an emitter
+    /// resolves it under the instance it emits). An aggregate prints through
+    /// the `dbg` printer, on one line.
+    pub print_argument_types: HashMap<Id, TypeId>,
     /// `[track_caller]` (debugging.md S0): each tracking function's hidden
     /// trailing `Location` parameter, minted by
     /// [`crate::track_caller::thread_locations`].
@@ -79812,6 +79826,7 @@ fn analyze_over_world<'src>(
         dbg_stack_invalidated: std::mem::take(&mut analyzer.dbg_stack_invalidated),
         dbg_stack_sites: std::mem::take(&mut analyzer.dbg_stack_sites),
         number_print_arguments: std::mem::take(&mut analyzer.number_print_arguments),
+        print_argument_types: std::mem::take(&mut analyzer.print_argument_types),
         track_caller_parameters: HashMap::default(),
         index_location_arguments: HashMap::default(),
         std_sources: std::mem::take(&mut analyzer.std_sources),

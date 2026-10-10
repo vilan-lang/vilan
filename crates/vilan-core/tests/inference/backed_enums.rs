@@ -19,11 +19,13 @@ use crate::support::*;
 fn b76_a_string_backed_enum_lowers_to_its_bare_string() {
     // §3.5, the whole thesis: `Align::Start` IS `"flex-start"` at runtime,
     // exactly as `Ordering::Greater` IS `1` (P1). No array, no wrapper.
+    // `.value()` folds to its receiver, so the print shows the value itself
+    // (a bare `print(Align::Start)` prints the NAME since debugging.md S3).
     let javascript = compile(
         r#"
         import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
-        fun main() { print(Align::Start); }
+        fun main() { print(Align::Start.value()); }
         "#,
     )
     .expect("a clean compile");
@@ -1051,7 +1053,7 @@ fn b76_a_backing_string_keeps_its_escapes() {
         enum Quoted { Tab = "a\tb", Quote = "say \"hi\"" }
         fun main() {
             print(match Quoted::Quote { Quoted::Tab => "tab", Quoted::Quote => "quote" });
-            print(Quoted::Tab);
+            print(Quoted::Tab.value());
         }
         "#,
         "quote\na\tb\n",

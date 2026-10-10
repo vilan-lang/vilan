@@ -1832,11 +1832,11 @@ fn a142_a_source_object_stays_copyable_though_flow_is_a_resource_trait() {
     );
 }
 
-/// B436: `print` of a trait OBJECT prints the value it erased — `[ 5 ]`, the
-/// `Square` — not the backend's `[ value, table ]` pair (`[ [ 5 ], {} ]`). The
-/// pair is how the JS backend carries an object; at the host boundary (an
-/// `any` parameter) the value crosses — and, since B503, inside a list handed
-/// there too (`b503_printing_a_list_of_trait_objects_prints_their_values`).
+/// B436: `print` of a trait OBJECT prints the value it erased — `dyn
+/// Shape(Square { side = 5 })` through the printer since debugging.md S3 —
+/// not the backend's `[ value, table ]` pair (`[ [ 5 ], {} ]`), which is how
+/// the JS backend carries an object (`b503_printing_a_list_of_trait_objects_
+/// prints_their_values` holds a list of them).
 #[test]
 fn b436_printing_a_trait_object_prints_its_value() {
     assert_compiles_and_runs(
@@ -1863,17 +1863,15 @@ fn b436_printing_a_trait_object_prints_its_value() {
 
         main();
         "#,
-        "[ 5 ]\n25\n",
+        "dyn Shape(Square { side = 5 })\n25\n",
     );
 }
 
 /// B503: a LIST of trait objects handed to `print` prints each object's value
-/// — the JS backend maps the list at the host boundary into a new array, as
-/// B436 converts a lone object — and so does a list of such lists. The
+/// — through the printer since debugging.md S3, `dyn Shape(Square { side =
+/// 2 })` — and so does a list of such lists, and an object inside an `Option`
+/// (which crossed the host boundary as its stored pair before S3). The
 /// program's own list is untouched (its objects still dispatch afterwards).
-/// An object inside any other container (an `Option`) still crosses as the
-/// stored pair; `native_differential`'s `print_layout` probe holds the native
-/// twin to the same split.
 #[test]
 fn b503_printing_a_list_of_trait_objects_prints_their_values() {
     assert_compiles_and_runs(
@@ -1905,7 +1903,12 @@ fn b503_printing_a_list_of_trait_objects_prints_their_values() {
 
         main();
         "#,
-        "[ [ 2 ], [ 3 ] ]\n[ [ [ 2 ], [ 3 ] ], [ [ 4 ] ] ]\n9\n[ 0, [ [ 5 ], {} ] ]\n",
+        concat!(
+            "[dyn Shape(Square { side = 2 }), dyn Shape(Square { side = 3 })]\n",
+            "[[dyn Shape(Square { side = 2 }), dyn Shape(Square { side = 3 })], [dyn Shape(Square { side = 4 })]]\n",
+            "9\n",
+            "Some(dyn Shape(Square { side = 5 }))\n",
+        ),
     );
 }
 
@@ -1985,7 +1988,7 @@ fn b437_two_positions_of_one_application_share_one_table_and_one_instance() {
     let js = compile(source).expect("compiles");
     assert_eq!(js.matches("Object.create(").count(), 1, "one table:\n{js}");
     assert_eq!(js.matches("(shape) {").count(), 1, "one instance:\n{js}");
-    assert_compiles_and_runs(source, "[ 4 ]\n[ 9 ]\n");
+    assert_compiles_and_runs(source, "[4]\n[9]\n");
 }
 
 // --- B502: a trait object binds a bound's arguments from what it CARRIES ------

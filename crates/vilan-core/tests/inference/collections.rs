@@ -51,7 +51,7 @@ fn a142_s4_operators_chain_and_seal_into_a_granular_source() {
         }
         main();
         "#,
-        "[ 30, 40 ]\n2\n3\n3\n[ 90, 30, 40, 70 ]\n[ 91, 31, 41, 71 ]\n",
+        "[30, 40]\n2\n3\n3\n[90, 30, 40, 70]\n[91, 31, 41, 71]\n",
     );
 }
 
@@ -164,7 +164,7 @@ fn a142_s4_filter_map_over_transients_follows_and_releases() {
             main();
             "#
         ),
-        "[ 'a', 'c' ]\n3\n[ 'a', 'b', 'c' ]\n2\n[ 'b', 'c' ]\n0\n",
+        "[\"a\", \"c\"]\n3\n[\"a\", \"b\", \"c\"]\n2\n[\"b\", \"c\"]\n0\n",
     );
 }
 
@@ -236,7 +236,7 @@ fn a142_s4_filter_map_and_any_over_transients() {
         }
         main();
         "#,
-        "[ 'a' ]\ntrue\n[ 'a', 'b' ]\nfalse\n",
+        "[\"a\"]\ntrue\n[\"a\", \"b\"]\nfalse\n",
     );
 }
 
@@ -265,7 +265,7 @@ fn a142_s4_filter_map_over_source_objects() {
         }
         main();
         "#,
-        "[ 'a', 'b' ]\n",
+        "[\"a\", \"b\"]\n",
     );
 }
 
@@ -299,7 +299,7 @@ fn a142_s4_map_starts_a_pipe_and_keeps_a_source() {
         }
         main();
         "#,
-        "2\n[ 10, 2 ]\n[ 20, 4 ]\n[ 10, 2, 30 ]\n[ 20, 4, 60 ]\n30\n",
+        "2\n[10, 2]\n[20, 4]\n[10, 2, 30]\n[20, 4, 60]\n30\n",
     );
 }
 
@@ -327,7 +327,7 @@ fn a142_s4_an_element_run_is_released_when_it_leaves_or_reruns() {
         }
         main();
         "#,
-        "[ 2, 1 ]\n[ 700, 300 ]\n[ 2, 1, 7, 3 ]\n",
+        "[2, 1]\n[700, 300]\n[2, 1, 7, 3]\n",
     );
 }
 
@@ -392,7 +392,7 @@ fn a142_s4_sample_and_memo_global() {
         }
         main();
         "#,
-        "[ 2, 3, 4 ]\n3\n[ 2, 4, 6, 8 ]\n",
+        "[2, 3, 4]\n3\n[2, 4, 6, 8]\n",
     );
 }
 
@@ -537,7 +537,7 @@ fn a142_s5_coll_emits_one_splice_for_append_insert_and_remove() {
             main();
             "#
         ),
-        "splice(4,-0,+1) \nsplice(2,-0,+1) \nsplice(2,-1,+0) \n0\n[ 1, 2, 3, 4, 5 ]\n",
+        "splice(4,-0,+1) \nsplice(2,-0,+1) \nsplice(2,-1,+0) \n0\n[1, 2, 3, 4, 5]\n",
     );
 }
 
@@ -566,7 +566,7 @@ fn a142_s5_coll_by_moves_a_reordered_element_and_sets_a_changed_one() {
             main();
             "#
         ),
-        "move(3,1,0) \nset(1) \nsplice(3,-1,+0) splice(1,-1,+0) splice(2,-0,+1) \n[ 14, 12, 15 ]\n",
+        "move(3,1,0) \nset(1) \nsplice(3,-1,+0) splice(1,-1,+0) splice(2,-0,+1) \n[14, 12, 15]\n",
     );
 }
 
@@ -614,7 +614,7 @@ fn a142_s5_coll_by_then_filter_map_joins_a_coarse_list_of_sources() {
         }
         main();
         "#,
-        "[ 'a' ]\n[ 'a', 'b' ]\n[ 'c', 'a', 'b' ]\n[ 'c', 'b' ]\n",
+        "[\"a\"]\n[\"a\", \"b\"]\n[\"c\", \"a\", \"b\"]\n[\"c\", \"b\"]\n",
     );
 }
 

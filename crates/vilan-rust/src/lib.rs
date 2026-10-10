@@ -11454,6 +11454,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return self.dbg_stack_call(call_id, &function_call.argument_ids, depth, span);
         }
         if Some(target) == self.program.print_fn_id {
+            if let Some(printed) =
+                self.printed_aggregate(&function_call.argument_ids, depth, span)?
+            {
+                return Ok(printed);
+            }
             self.refuse_unprintable(&function_call.argument_ids, span)?;
             let value = self.place_argument(&function_call.argument_ids, 0, depth)?;
             return Ok(format!("vilan_rt::print(&({value}))"));
