@@ -57,6 +57,14 @@ an anchor is missing, or when an edit's anchor occurs more than once (the edit
 would land on the first, which may not be the place it means). `--json` records
 which source the run replayed, so the seal can say the two sides differed.
 
+A MEASUREMENT OF A BROKEN PROGRAM IS NOT A MEASUREMENT (N165): the server stops
+early on a program with errors, so every row reads a fraction of its true cost.
+Before the first edit the harness runs `vilan check .` in the copy it prepared,
+under the compiler it will drive (`--vilan`, default the `vilan` beside
+`--lsp`, with the same `VILAN_STD`), and refuses the run, printing the errors,
+when that exits non-zero. Order 49's seal read x2..x7 for want of the gitignored
+`src/lucide` in the base's archive; this is the check that would have said so.
+
 `--callgrind DIR` runs the server under valgrind's callgrind with instrumentation
 OFF, switches it on for ONE scenario's measured edit only (`callgrind_control
 -i on`), and prints `callgrind_annotate`'s top offenders. Use a binary built
@@ -940,6 +948,29 @@ def copy_untracked_inputs(kolt, target):
             shutil.copytree(source, target / relative)
 
 
+def vilan_beside(lsp):
+    """The `vilan` compiler that ships beside a `vilan-lsp` binary (the installed pair, or one build's
+    `target/<profile>/`), else None."""
+    found = shutil.which(lsp) or lsp
+    for name in ("vilan", "vilan.exe"):
+        candidate = Path(os.path.abspath(found)).with_name(name)
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def unclean_copy(root, vilan, env):
+    """N165: why `root` (the copy about to be edited) does not check under `vilan`: the compiler's own first
+    lines, or [] when `vilan check .` exits 0. A broken program stops the analysis early, so a latency row
+    measured on one is a fraction of the true cost - never a number to compare."""
+    run = subprocess.run([vilan, "check", "."], cwd=root, env=env, capture_output=True, text=True)
+    if run.returncode == 0:
+        return []
+    lines = [line for line in (run.stderr + run.stdout).splitlines() if line.strip()]
+    shown = lines[:12] + ([f"... and {len(lines) - 12} more lines"] if len(lines) > 12 else [])
+    return [f"`{Path(vilan).name} check .` exits {run.returncode}"] + shown
+
+
 def checkout_std_above(path):
     for directory in [path, *path.parents]:
         if (directory / "vilan" / "std" / "vilan.toml").is_file():
@@ -1034,6 +1065,12 @@ def main():
     )
     parser.add_argument("--commit", default="HEAD", help="the commit to copy (git checkouts; default HEAD)")
     parser.add_argument("--lsp", default="vilan-lsp", help="the vilan-lsp binary (default: the one on PATH)")
+    parser.add_argument(
+        "--vilan",
+        default=None,
+        help="the vilan compiler the copy must check clean under before the first edit (N165; default: the "
+        "`vilan` beside --lsp)",
+    )
     parser.add_argument("--scratch", default=None, help="where the copy goes (default: a temp dir)")
     parser.add_argument("--std", default=None, help="VILAN_STD for the server (default: the server's own discovery)")
     parser.add_argument("--runs", type=int, default=5, help="repetitions per edit (default 5)")
@@ -1073,6 +1110,25 @@ def main():
         if "VILAN_STD" in env
         else (f"std discovered at {discovered} (an ancestor checkout)" if discovered else "the server's embedded std")
     )
+    vilan = (
+        (os.path.abspath(arguments.vilan) if os.sep in arguments.vilan else shutil.which(arguments.vilan))
+        if arguments.vilan
+        else vilan_beside(lsp)
+    )
+    if vilan is None:
+        raise SystemExit(
+            f"cannot find the `vilan` compiler beside {lsp}: pass --vilan, the compiler the copy of {described} "
+            "must check clean under before any edit (N165). Nothing was run."
+        )
+    broken = unclean_copy(root, vilan, env)
+    if broken:
+        raise SystemExit(
+            f"the copy of {described} does not check clean under {vilan}:\n  "
+            + "\n  ".join(broken)
+            + "\nA measurement of a broken program is not a measurement (the server stops early on one): "
+            "carry the package's generated inputs (src/lucide, src/search-dict) into the source, or pass the "
+            "commit/tree that checks under this compiler. Nothing was run."
+        )
     if arguments.session:
         return run_session_main(arguments, root, described, lsp, version, env, scratch, std_note)
     scenarios = [s for s in SCENARIOS if not arguments.scenario or s["name"] in arguments.scenario]

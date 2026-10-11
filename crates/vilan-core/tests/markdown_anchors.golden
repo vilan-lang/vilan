@@ -327,6 +327,7 @@ spec/types.md h3 a-trait-annotation-on-a-return
 spec/types.md h3 a-trait-annotation-on-a-struct-field
 spec/types.md h3 associated-functions
 spec/types.md h2 56-generic-binding-and-inference
+spec/types.md h3 length-parameters-const-n
 spec/types.md h2 57-operator-and-method-dispatch
 spec/types.md h2 58-conversions-and-coercions
 spec/types.md h3 ascription-exp-as-t
@@ -357,6 +358,7 @@ std/collections.md h3 ordering
 std/collections.md h3 splicing
 std/collections.md h3 appending-a-run
 std/collections.md h3 joining
+std/collections.md h2 fixed-arrays-t-n
 std/collections.md h2 hashmapk-v
 std/collections.md h2 hashsett
 std/collections.md h2 memok-v

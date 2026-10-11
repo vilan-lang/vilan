@@ -1,0 +1,44 @@
+// F124 §2.2: a loan group whose members INTERLEAVE (the views and the root
+// take turns) promotes its root into a counted cell, and each view is a
+// handle on it: reads, writes, compound writes, a `&mut` callee over a view
+// and over the root, a compound write through a `borrows` call of a view,
+// field writes through handles of a struct root.
+import std::io::print;
+
+fun add_ten(x: &mut i32) {
+	x += 10;
+}
+
+fun same(x: &mut i32): &mut i32 borrows x {
+	x
+}
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+fun main() {
+	mut a: i32 = 1;
+	let b: &mut i32 = &mut a;
+	let c: &mut i32 = b;
+	b = 2;
+	print(i"{a} {*b} {*c}");
+	c += 3;
+	print(i"{a} {*b} {*c}");
+	add_ten(&mut a);
+	add_ten(c);
+	print(i"{a} {*b} {*c}");
+	same(b) *= 2;
+	print(i"{a} {*c}");
+	print(a + *b);
+	print(i"{a} {*b} {*c}");
+
+	mut p = Point { x = 1, y = 2 };
+	let left: &mut Point = &mut p;
+	let right: &mut Point = left;
+	left.x = 10;
+	print(p.x);
+	right.y = p.x + 5;
+	print(i"{left.x} {left.y} {right.x} {p.y}");
+}

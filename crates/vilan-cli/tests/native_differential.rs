@@ -7301,54 +7301,46 @@ const ASYNC_PANIC_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F25: printing a host handle or a value holding a function is refused where
-/// it is WRITTEN.
+/// F25: printing a host handle is refused where it is WRITTEN (a function
+/// prints its type on both backends since E293).
 ///
 /// Order 38 answered both with a runtime panic carrying the reason, which is
 /// honest and one release too late — what node prints there is its own object
 /// inspection (`Promise { <pending> }`, `[Function (anonymous)]`), so the
 /// program cannot work and nothing is gained by letting it build.
 #[test]
-fn printing_a_host_handle_or_a_function_is_refused_at_compile_time() {
+fn printing_a_host_handle_is_refused_at_compile_time() {
     let staged = stage();
-    for (file, source, needle) in [
-        (
-            "native_probe_print_task.vl",
-            PRINT_HANDLE_PROBE,
-            "`print` of the host handle `Task`",
-        ),
-        (
-            "native_probe_print_fn.vl",
-            PRINT_FUNCTION_PROBE,
-            "`print` of a value holding a function",
-        ),
-    ] {
-        std::fs::write(staged.join(file), source).expect("write the probe program");
-        let output = vilan(&staged)
-            .args(["build", "--backend", "rust", "--stdout", file])
-            .output()
-            .expect("build the probe");
-        let message = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !output.status.success(),
-            "{file} must be refused rather than built"
-        );
-        assert!(
-            message.contains(needle),
-            "{file} must be refused by name (`{needle}`); it said:\n{message}"
-        );
-        // Non-vacuous: the JS backend BUILDS the same program, so the refusal
-        // is the native backend's answer and not a defect in the probe.
-        let javascript = vilan(&staged)
-            .args(["build", file])
-            .output()
-            .expect("build the probe on the JS backend");
-        assert!(
-            javascript.status.success(),
-            "{file} must be a program the JS backend accepts:\n{}",
-            String::from_utf8_lossy(&javascript.stderr)
-        );
-    }
+    let (file, source, needle) = (
+        "native_probe_print_task.vl",
+        PRINT_HANDLE_PROBE,
+        "`print` of the host handle `Task`",
+    );
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    let output = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "{file} must be refused rather than built"
+    );
+    assert!(
+        message.contains(needle),
+        "{file} must be refused by name (`{needle}`); it said:\n{message}"
+    );
+    // Non-vacuous: the JS backend BUILDS the same program, so the refusal
+    // is the native backend's answer and not a defect in the probe.
+    let javascript = vilan(&staged)
+        .args(["build", file])
+        .output()
+        .expect("build the probe on the JS backend");
+    assert!(
+        javascript.status.success(),
+        "{file} must be a program the JS backend accepts:\n{}",
+        String::from_utf8_lossy(&javascript.stderr)
+    );
 }
 
 const PRINT_HANDLE_PROBE: &str = concat!(
@@ -7363,15 +7355,6 @@ const PRINT_HANDLE_PROBE: &str = concat!(
     "async fun main() {\n",
     "\tlet task = async work();\n",
     "\tprint(task);\n",
-    "}\n",
-);
-
-const PRINT_FUNCTION_PROBE: &str = concat!(
-    "import std::io::print;\n",
-    "\n",
-    "fun main() {\n",
-    "\tlet f = |x: i32| x + 1;\n",
-    "\tprint(f);\n",
     "}\n",
 );
 
@@ -9505,8 +9488,11 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// was drawn over the entry's `import` line. A library body's refusal is now
 /// anchored at the user's call that instantiated it, naming the body and its
 /// file; a user module's is drawn in that module. (F108's solver half grounds
-/// `push_many([])` now, so the library-body probe is an `Option::None` whose
-/// payload nothing states, instantiating `is_some`'s body open.)
+/// `push_many([])`, and B600 refuses the `Option::None.is_some()` that
+/// replaced it at `vilan check` — "cannot infer the type of this value" at the
+/// user's call — so the library-body probe now proves that the refusal comes
+/// from the CHECK, at the call, before any body is instantiated; the
+/// in-body note has no reachable std probe left, filed with B600's report.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
@@ -9531,21 +9517,22 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         "the refusal is drawn at the user's call:\n{stderr}"
     );
     assert!(
-        stderr.contains("The construct is in `is_some`'s body (`option.vl`)"),
-        "the refusal names the body and its file:\n{stderr}"
+        stderr.contains("cannot infer the type of this value: it is `Option<…>`")
+            && stderr.contains("that `is_some` is instantiated at"),
+        "B600 refuses the open instance at the check, naming the callee:\n{stderr}"
     );
     let module = staged.join("native_probe_f108_module");
     std::fs::create_dir_all(&module).expect("make the package");
     // The module's refusal is F25's, which is by design and stays: `print`
-    // of a value holding a function.
+    // of a host handle (a bare closure printed natively since E293).
     std::fs::write(
         module.join("util.vl"),
-        "import std::io::print;\n\nexport fun banner() {\n\tlet shown = || 1;\n\tprint(shown);\n}\n",
+        "import std::io::print;\nimport std::time::sleep;\n\nasync fun work(): i32 {\n\tsleep(1);\n\t7\n}\n\nexport async fun banner() {\n\tlet task = async work();\n\tprint(task);\n}\n",
     )
     .expect("write the module");
     std::fs::write(
         module.join("main.vl"),
-        "import pkg::util::banner;\n\nfun main() {\n\tbanner();\n}\n",
+        "import pkg::util::banner;\n\nasync fun main() {\n\tbanner();\n}\n",
     )
     .expect("write the entry");
     let output = vilan(&module)
@@ -9554,7 +9541,7 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         .expect("build the package");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("util.vl:5:2") && stderr.contains("print(shown)"),
+        stderr.contains("util.vl:11:2") && stderr.contains("print(task)"),
         "a user module's refusal is drawn in that module:\n{stderr}"
     );
 }
@@ -10094,6 +10081,116 @@ fn an_injected_clause_written_out_of_order_is_identical_on_both_backends() {
         compare(&staged, "native_probe_clause_order.vl"),
         Verdict::Identical,
         "a `context` clause in any written order must build and thread the same values"
+    );
+}
+
+/// B596: a struct literal runs its initializers in the order it WRITES them.
+/// The JS array lays the struct out in declaration order, and two plain calls
+/// written the other way round ran in layout order; a Rust struct literal runs
+/// them as written. Two fields swapped, four rotated around a literal, a `mut`
+/// read ahead of the call that writes it, and a nested generic literal.
+#[test]
+fn a_struct_literal_written_out_of_declaration_order_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_struct_literal_written_order.vl"),
+        include_str!("native/struct_literal_written_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_struct_literal_written_order.vl"),
+        Verdict::Identical,
+        "a struct literal must run its initializers as written on both backends"
+    );
+}
+
+/// B599: fill-from-use — a binding whose hole a later use states (an
+/// argument at a concrete, bare-trait or bounded parameter, a receiver's
+/// call, a push, a binder of the enclosing body) takes the stated type, and
+/// both backends build it there: before, `vilan check` refused every one of
+/// these (B580), and on JS alone the binding kept the hole.
+#[test]
+fn a_binding_filled_from_its_use_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_fill_from_use.vl"),
+        include_str!("native/fill_from_use.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_fill_from_use.vl"),
+        Verdict::Identical,
+        "a binding filled from its use must build and print the same on both backends"
+    );
+}
+
+/// B602: a float beside an integer, or two float types, compute through a
+/// conversion (a literal takes the float's type) — the forms the refusal
+/// leaves, the same answer on both backends.
+#[test]
+fn a_float_beside_a_converted_integer_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_float_integer_operands.vl"),
+        include_str!("native/float_integer_operands.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_float_integer_operands.vl"),
+        Verdict::Identical,
+        "a float beside a converted integer must compute the same on both backends"
+    );
+}
+
+/// B592: a list of array literals under `List<[T; n]>` — the inner literals
+/// are the arrays, at a binding, a parameter, a push and a nested level.
+#[test]
+fn a_list_of_fixed_array_literals_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_list_of_fixed_arrays.vl"),
+        include_str!("native/list_of_fixed_arrays.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_list_of_fixed_arrays.vl"),
+        Verdict::Identical,
+        "a list of fixed-array literals must build and print the same on both backends"
+    );
+}
+
+/// B593: function items in a list are their closure type — `[double,
+/// triple]` has an element type, and an element calls by index, in a loop,
+/// beside a closure literal and after a push.
+#[test]
+fn a_list_of_function_items_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_listed_function_items.vl"),
+        include_str!("native/listed_function_items.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_listed_function_items.vl"),
+        Verdict::Identical,
+        "a list of function items must build and call the same on both backends"
+    );
+}
+
+/// B595: a blanket's static on a concrete head (`str::tag(1)` over `impl
+/// type T: Leaf with Tag`) binds the blanket's binder to the head.
+#[test]
+fn a_blankets_static_on_a_concrete_head_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_blanket_static_heads.vl"),
+        include_str!("native/blanket_static_heads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_blanket_static_heads.vl"),
+        Verdict::Identical,
+        "a blanket's static on a concrete head must resolve the same on both backends"
     );
 }
 
@@ -11401,6 +11498,93 @@ fn a153_s2_a_store_mirror_behaves_the_same_on_both_backends() {
     );
 }
 
+/// A153 S2: a patch's ops land in ONE client turn on both backends — an observer
+/// woken by the first op reads the second op's field already landed — and a key
+/// the server does not hold is seeded `null`. (`states()` itself stays on the JS
+/// pin, `reactive_channels`: natively a generic `dyn Pipe` is not emitted yet.)
+#[test]
+fn a153_s2_a_patch_lands_in_one_client_turn_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_turn.vl"),
+        include_str!("native/store_mirror_turn.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_turn.vl"),
+        Verdict::Identical,
+        "a patch must land in one client turn on both backends"
+    );
+}
+
+/// A153 S4: a mirrored store's reconnect — one replayed call, one re-subscribe,
+/// comparing re-seeds — behaves the same on both backends.
+#[test]
+fn a153_s4_a_mirrored_store_reconnects_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_reconnect.vl"),
+        include_str!("native/store_mirror_reconnect.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_reconnect.vl"),
+        Verdict::Identical,
+        "a mirrored store must reconnect the same on both backends"
+    );
+}
+
+/// A168: a mirrored set — its `Wire`, a member's boundary, a parent released
+/// while a member inside it is watched — behaves the same on both backends.
+#[test]
+fn a168_a_mirrored_set_behaves_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_set.vl"),
+        include_str!("native/store_mirror_set.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_set.vl"),
+        Verdict::Identical,
+        "a mirrored set must behave the same on both backends"
+    );
+}
+
+/// A153 S3: a mirrored list's splices and a map's and a set's key sets cross and
+/// land the same on both backends.
+#[test]
+fn a153_s3_mirrored_collections_cross_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_collections.vl"),
+        include_str!("native/store_mirror_collections.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_collections.vl"),
+        Verdict::Identical,
+        "mirrored collections must cross the same on both backends"
+    );
+}
+
+/// A169: a released slot's `Gone` acknowledgement, and the client forgetting
+/// the reader on it, behave the same on both backends.
+#[test]
+fn a169_an_acknowledged_unsubscribe_is_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_ack.vl"),
+        include_str!("native/store_mirror_ack.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_ack.vl"),
+        Verdict::Identical,
+        "an acknowledged unsubscribe must be the same on both backends"
+    );
+}
+
 /// B436 + B437: a trait object prints as its value, alone, and as the pair a
 /// list holds; two applications of one trait over one type dispatch through
 /// their own tables — identical on both backends (the JS leg printed the pair
@@ -11838,6 +12022,37 @@ fn s3_print_writes_aggregates_through_the_printer_on_both_backends() {
     );
 }
 
+/// E293: `print` of a bare closure writes its written type (`<closure |i32|
+/// i32>`) where node printed `[Function: add]` and the native backend refused
+/// it (F25) - a closure with captures, a literal, a nullary one, a named
+/// function, a generic `T` per instance, a closure inside a struct and an
+/// option; the same bytes on both backends (`native/print_closures.*`).
+#[test]
+fn e293_print_of_a_bare_closure_writes_its_type_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_print_closures.vl",
+        include_str!("native/print_closures.vl"),
+        include_str!("native/print_closures.stdout"),
+        "",
+    );
+}
+
+/// E283's array half: `T: Debug` and `[derive(Debug)]` take a fixed array of
+/// every length (std's `impl [type T: Debug; _] with Debug`) - nested, empty,
+/// of structs and options, as a struct field, an enum payload, an option's
+/// payload, a tuple slot, a list element, a map value and through a generic
+/// `T: Debug` and a `const N` function - printing as a `List` does; the same
+/// bytes on both backends (`native/debug_arrays.*`).
+#[test]
+fn e283_debug_takes_a_fixed_array_of_every_length_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_debug_arrays.vl",
+        include_str!("native/debug_arrays.vl"),
+        include_str!("native/debug_arrays.stdout"),
+        "",
+    );
+}
+
 /// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
 /// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
 /// N136's `0`; the same bytes on both backends.
@@ -12196,8 +12411,8 @@ fn f113_a_pattern_over_a_borrows_calls_view_binds_copies_on_both_backends() {
 /// F114: a reading intrinsic over a spine of a `Shared` VIEW reads through
 /// a view of the cell, as F49's boxed binding does — `cell.read().items.len()`
 /// had copied the whole list out of the borrow to count it. The emission
-/// pin: the three copies left are the std calls (`contains`, `get`,
-/// `contains_key`), which run user `Hash`/`Eq` and are not intrinsics.
+/// pin: no copy is left — the three std calls (`contains`, `get`,
+/// `contains_key`) had kept theirs until F123.
 #[test]
 fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_backends() {
     let staged = stage();
@@ -12215,8 +12430,9 @@ fn f114_a_reading_intrinsic_over_a_shared_views_field_reads_in_place_on_both_bac
     let main = emitted_main(&staged, file);
     assert_eq!(
         main.matches("read_with(").count(),
-        3,
-        "only the three std calls copy their field out of the cell:\n{main}"
+        0,
+        "no read copies its field out of the cell (F123 took the three std \
+         lookups):\n{main}"
     );
 }
 
@@ -12460,6 +12676,87 @@ fn f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends() 
     );
 }
 
+/// array-lengths.md S2: one impl head over every array length — `[type T; _]`
+/// at lengths 1, 3 and 5, `[type T: Display; _]` walking its element, a
+/// literal `[i32; 3]` outranking the binder, and `Option<[type T; const N]>`
+/// reading `N` as a `usize` and repeating it. Each length is its own instance
+/// on both backends, and the length folds per instance.
+#[test]
+fn array_lengths_s2_an_any_length_impl_head_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_length_heads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_length_heads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an any-length impl head must answer the same natively"
+    );
+}
+
+/// array-lengths.md S3: `<const N>` on functions, a struct and an enum — the
+/// length bound from an argument, a directed literal, the expected type and
+/// an explicit `zeros<2>()`; `N` read as a value; a length parameter passed on
+/// as a generic argument (`Slots<N>`). Each length is its own instance on both
+/// backends.
+#[test]
+fn array_lengths_s3_const_length_parameters_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_length_generics.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_length_generics.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a length-generic function, struct and enum must answer the same natively"
+    );
+}
+
+/// array-lengths.md S5: std's first wave over every array length — `==` and
+/// `!=` (A166) including a derived struct with an array field, an array as a
+/// `HashMap` key and a `HashSet` member, `T: Debug` (E283's array half),
+/// `push_many` (A161), `to_list` and `iter`.
+#[test]
+fn array_lengths_s5_std_array_impls_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_std_surface.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_std_surface.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "std's array impls must answer the same natively"
+    );
+}
+
+/// array-lengths.md S4: a named length — a top-level `const let`, a `let`
+/// chained through it, a local `let` — in a type and in a repeat literal,
+/// resolved to its number before the fixpoint, the same on both backends.
+#[test]
+fn array_lengths_s4_named_lengths_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_named_lengths.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_named_lengths.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a named length must answer the same natively"
+    );
+}
+
 /// N158: the four longest legs run under [`legs_in_parallel`], whose two
 /// claims are the serial loop's: answers come back in the ITEMS' order
 /// whatever order the workers finish in, and a leg's panic fails the test
@@ -12625,4 +12922,243 @@ fun main() {
         Verdict::Identical,
         "an empty literal grounded through its parameter's bound builds on both backends"
     );
+}
+
+/// F126: `print(caller())` handed rustc a `vilan_rt::print` of a
+/// `vilan_rt::Location`, which had no `Js` impl (E0277, a backend defect by
+/// the CLI's own sentence). The location prints its text at the top level,
+/// as `console.log` prints the JS string it is, and inside a list or an
+/// `Option` the printer names it `<Location>` on both backends.
+#[test]
+fn f126_print_of_a_location_writes_its_text_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f126_location_print.vl";
+    std::fs::write(staged.join(file), include_str!("native/location_print.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "`print` of a `Location` must write the same bytes natively"
+    );
+}
+
+/// F128: `*length` in `.filter(|length| *length > 1)` over a `List<usize>`
+/// emitted `(*length)` over the by-value closure parameter `filter`'s
+/// `|T| bool` hands over (rustc E0614) — the premise's "the predicate takes
+/// `&T`" was wrong: it takes the element by value, and the JS backend's `*`
+/// on a value is the value. A by-value function parameter and a local
+/// holding a value read the same way; a `*` over a view still copies
+/// through it.
+#[test]
+fn f128_a_dereference_of_a_value_binding_reads_the_value_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f128_value_dereference.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/value_dereference.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `*` over a value binding must read the value natively"
+    );
+}
+
+/// F127: a spread of a tuple LITERAL (`draw(..(3, 4))`, labelled or not)
+/// was refused natively "a spread element whose tuple type did not
+/// resolve": the literal has no settled type of its own to read an arity
+/// off. Its parts are now the pack's slots, each written at the slot's
+/// type and evaluated once in order — beside other arguments, nested
+/// inside another literal spread, and in a tuple literal of spreads.
+#[test]
+fn f127_a_spread_of_a_tuple_literal_is_its_parts_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f127_spread_tuple_literals.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/spread_tuple_literals.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a spread of a tuple literal must build and answer the same natively"
+    );
+}
+
+/// F125: a `BigInt` as TEXT — `i"{big}"`, `"" + big`, `big.to_string()`
+/// (std's `Display` impl is that interpolation), a generic `T: Display`, a
+/// `join` — was refused natively "does not emit an interpolation of a value
+/// with its own `render`", while JS wrote `12` (`String(12n)`, no `n`).
+/// The concatenation now renders a `BigInt` operand as its digits; `print`
+/// of the value itself keeps node's `12n`.
+#[test]
+fn f125_a_bigint_as_text_writes_its_digits_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f125_bigint_text.vl";
+    std::fs::write(staged.join(file), include_str!("native/bigint_text.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a `BigInt` as text must write the same digits natively"
+    );
+}
+
+/// F123: std's keyed LOOKUPS over a field of a `Shared` view —
+/// `cell.read().seen.contains("x")`, `counts.get("k")`,
+/// `counts.contains_key("z")` — copied the whole collection out of the
+/// cell per call (F114 read the intrinsics only). They run `key.hash()`
+/// and the table's lookup, nothing else, so over a key whose `hash` is
+/// std's (a `str`, an integer, a tuple of those) the receiver is now read
+/// through a view of the cell, taken after the key is evaluated — a key
+/// argument that writes the cell is seen by the lookup, as on JS (the copy
+/// had been taken first, and printed `false` against JS's `true`). A user
+/// key type's written `hash` keeps the copy. The emission pin: one
+/// `read_with(` left in `main`, the user key's.
+#[test]
+fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f123_shared_view_std_lookups.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_std_lookups.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a std lookup over a `Shared` view's field must answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("read_with(").count(),
+        1,
+        "only the user key's lookup copies its set out of the cell:\n{main}"
+    );
+}
+
+/// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
+/// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
+/// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
+/// stack" where JS printed the element. Both sides of the threshold are
+/// pinned (`[i32; 256]` and `[str; 64]` inline, `[i32; 257]`, `[u8; 1025]`
+/// and `[str; 300]` on the heap), each built, written, copied by value, passed, returned, iterated,
+/// held in a struct and printed; the emission pin reads the rendering on
+/// each side.
+#[test]
+fn f122_a_fixed_array_past_one_kib_lives_on_the_heap_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f122_heap_arrays.vl";
+    std::fs::write(staged.join(file), include_str!("native/heap_arrays.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a large fixed array must not overflow the native stack"
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        main.contains("vilan_rt::heap_repeat::<_, 4000000>(")
+            && main.contains("vilan_rt::heap_repeat::<_, 257>(")
+            && main.contains("vilan_rt::heap_repeat::<_, 300>(")
+            && main.contains("std::array::from_fn::<_, 256, _>(")
+            && main.contains("std::array::from_fn::<_, 64, _>("),
+        "1024 bytes stays inline and 1028 goes to the heap:\n{main}"
+    );
+}
+
+/// F124 §2.1 (F99's aliasing half; `F99-aliasing-loans.md`): a view binding
+/// initialized from another view (`let c: &mut i32 = b;`) was refused by
+/// name (F21). In a loan group whose members' live intervals NEST — no
+/// ancestor touched while a member lives — the alias is a Rust reborrow
+/// (`let c = &mut *b;`), free at run time: an alias of an alias, an alias
+/// declared inside a loop, an alias of a struct view, and an alias of a
+/// shared view (a copy of the `&`).
+#[test]
+fn f124_a_nested_loan_group_reborrows_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f124_loans_nested.vl";
+    std::fs::write(staged.join(file), include_str!("native/loans_nested.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested loan group must build and answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("= &mut *").count(),
+        4,
+        "each `&mut` alias is a reborrow of its source, and nothing is boxed:\n{main}"
+    );
+    assert!(!main.contains("Captured::new"), "{main}");
+}
+
+/// F124 §2.2: a loan group whose members INTERLEAVE — the views and their
+/// root take turns, which no assignment of Rust lifetimes accepts —
+/// promotes its root into the counted cell a captured `mut` binding uses,
+/// and each view is a HANDLE on it (`let b = a.clone();`, the same cell):
+/// reads and writes through either view and the root, a compound write, a
+/// `&mut` callee over a view and over the root, a compound write through a
+/// `borrows` call of a view (its value settled before the place borrows),
+/// and field writes through handles of a struct root.
+/// transparent-references.vl, the corpus program this was for, flips with
+/// it (the whole-set sweep).
+#[test]
+fn f124_an_interleaved_loan_group_shares_one_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f124_loans_interleaved.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/loans_interleaved.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an interleaved loan group must build and answer the same natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("Captured::new(").count(),
+        2,
+        "the two roots live in cells and the four views are handles on them:\n{main}"
+    );
+    assert_eq!(
+        compare(&staged, "transparent-references.vl"),
+        Verdict::Identical
+    );
+}
+
+/// F124 §2.2's hazard and §2.3's remainder, refused by name: a call handed
+/// two loans of one promoted root, one `&mut` (the `&mut` holds the cell
+/// for the call, and the other loan would abort the run where JS answers),
+/// and an interleaved group whose view projects a field (a handle into part
+/// of a cell, a lens this backend has not got).
+#[test]
+fn f124_two_loans_in_one_call_and_a_projected_interleaved_view_are_refused_by_name() {
+    let staged = stage();
+    for (file, source, reason) in [
+        (
+            "native_probe_f124_two_loans.vl",
+            "import std::io::print;\n\nfun both(x: &mut i32, y: &mut i32) {\n\tx += 1;\n\ty += 1;\n}\n\nfun main() {\n\tmut a: i32 = 1;\n\tlet b: &mut i32 = &mut a;\n\tlet c: &mut i32 = b;\n\tb = 2;\n\tprint(a);\n\tboth(b, c);\n\tprint(*c);\n}\n",
+            "a call handed two loans of one place",
+        ),
+        (
+            "native_probe_f124_projected.vl",
+            "import std::io::print;\n\nstruct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tmut p = Point { x = 1, y = 2 };\n\tlet b: &mut i32 = &mut p.x;\n\tlet c: &mut i32 = b;\n\tb = 5;\n\tprint(p.y);\n\tc = 6;\n\tprint(*b);\n}\n",
+            "an interleaved loan group whose view projects a field",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        match compare(&staged, file) {
+            Verdict::Refused(message) => assert!(
+                message.contains(reason),
+                "{file}: refused, but not by this name: {message}"
+            ),
+            other => panic!("{file}: must be refused by name, was {other:?}"),
+        }
+    }
 }

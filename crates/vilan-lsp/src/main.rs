@@ -9297,6 +9297,25 @@ mod cancellation_tests {
         false
     }
 
+    /// How long a started analysis is left in flight before the next keystroke
+    /// supersedes it - the span the first form of the burst pin got from
+    /// `DEBOUNCE_MS + 20` (the analysis starts at the debounce, the keystroke
+    /// follows 20 ms later), now counted from the server's own `started`.
+    const IN_FLIGHT: Duration = Duration::from_millis(20);
+
+    /// Polls the server's own counter for an analysis to START after `since`
+    /// (N164: the burst is paced by the server's clock, not the test's).
+    async fn started_beyond(backend: &Backend, since: u64) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend.analyses.counts().started > since {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
     /// Polls for `uri`'s analyzed snapshot to become `text`.
     async fn settled_on(backend: &Backend, uri: &Url, text: &str) -> bool {
         let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
@@ -9464,6 +9483,22 @@ mod cancellation_tests {
     /// keystroke, plus at most one that outran its own cancellation), and the
     /// rest were cancelled. A slow machine makes MORE of them cancelled, never
     /// fewer, so there is no bound here for load to break.
+    ///
+    /// **The burst is driven by the server's own counter, not by a sleep**
+    /// (N164). The first form slept `DEBOUNCE_MS + 20` between keystrokes and
+    /// then asserted that at least two analyses had started, so that the
+    /// numbers below were not vacuous. On a stalled hosted runner the test's
+    /// sleeps and the server's debounce drifted together, every edit landed
+    /// inside one window, ONE analysis started, and the non-vacuity premise
+    /// fired before the real claim was read (twice in three CI runs on the
+    /// Windows shard). Now each keystroke waits until `started` has moved past
+    /// where it was when the keystroke was sent - the server's debounce has
+    /// elapsed and its analysis is in flight - and only then, after a fixed
+    /// in-flight span measured from the START rather than from the keystroke,
+    /// sends the next. A slow host stretches the wait and cannot fold the
+    /// burst; "every keystroke started an analysis" is something the loop
+    /// guarantees, so the non-vacuity assertion below (`started >=
+    /// KEYSTROKES`) holds the loop and the server to it.
     #[tokio::test]
     async fn a_burst_of_edits_performs_one_complete_analysis_plus_at_most_one_partial() {
         const KEYSTROKES: usize = 8;
@@ -9476,14 +9511,24 @@ mod cancellation_tests {
         assert!(landed(backend, &uri).await, "the open's analysis lands");
         let settled_counts = backend.analyses.counts();
 
-        // One keystroke per debounce window, as a person typing does.
+        // One keystroke per debounce window, as a person typing does - the
+        // window measured by the SERVER: the next keystroke is sent a fixed
+        // span after the previous one's analysis started, however long the
+        // debounce took on this host (N164).
         let mut last = base.clone();
         for keystroke in 0..KEYSTROKES {
             last = format!("{base}\nfun typed_{keystroke}(): i32 {{\n\t{keystroke}\n}}\n");
+            let started_before = backend.analyses.counts().started;
             backend
                 .did_change(whole_file_change(&uri, 2 + keystroke as i32, &last))
                 .await;
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS + 20)).await;
+            if keystroke + 1 < KEYSTROKES {
+                assert!(
+                    started_beyond(backend, started_before).await,
+                    "keystroke {keystroke} never started an analysis within the liveness bound",
+                );
+                tokio::time::sleep(IN_FLIGHT).await;
+            }
         }
         assert!(
             settled_on(backend, &uri, &last).await,
@@ -9500,9 +9545,9 @@ mod cancellation_tests {
             crate::keystroke::gate::loadavg_1m(),
         );
         assert!(
-            started >= 2,
-            "the burst must actually schedule analyses, or the numbers below are vacuous \
-             — {started} started",
+            started >= KEYSTROKES as u64,
+            "the burst must start an analysis per keystroke (the loop above waits for each), \
+             or the numbers below are vacuous — {started} started of {KEYSTROKES}",
         );
         assert!(
             landed_count <= 2,

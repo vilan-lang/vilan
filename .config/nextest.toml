@@ -11,96 +11,100 @@
 [profile.default]
 fail-fast = false
 
-# The Linux leak plateaus are the suite's longest single tests (10-32 s of
-# looped analyses each). Scheduled last they ARE the critical path; higher
-# priority starts them first so they overlap the wide middle of the run.
-[[profile.default.overrides]]
-filter = 'test(leak_measurement)'
-priority = 100
+# N163 (Order 50): THE TIERS, RE-MEASURED UNDER `ci-test`. Every figure below is
+# from one full run of the 10,157-test suite under `--cargo-profile ci-test`
+# (vilan-core at opt-level 1, N156), 762.7 s wall at -j 6 and loadavg 10-25 on
+# the 16-core dev box, next @5fe24f86, per-test wall from nextest's JUnit output;
+# the CPU figures are one test alone (`-j 1`, the process tree's user+system).
+# The tiers used to be ranked at opt-level 0, where analysis-bound tests cost
+# ~3.2x more: the edit-replay corpus leg was 293 s then and is 97 s now (839 CPU-s
+# alone, because it fans out 16 ways inside), the docs gate 212 s -> 29 s, the
+# check-scope corpus legs 100 s -> 23 s, the native differential's whole-suite legs
+# 119-184 s -> 22-32 s, and the Linux leak plateaus 10-32 s -> 17-22 s. The suite
+# is throughput-bound at -j 6 (4,572 test-seconds / 6 = 762 s), so the order
+# barely shows in the total and decides only the TAIL: a long test started late
+# is the last thing running. Longest-first is the classic makespan rule.
+#
+# Two kinds of long test, and a tier is for both:
+#   - COMPUTE: wall is long because the work is (or because it fans out wide and
+#     takes every core while it runs);
+#   - WAITING: ~0 CPU (`transport_robustness`' retry budget 1.8 CPU-s in 25 s,
+#     `service_layer`' socket test 1.5 in 25 s) - it holds a slot and does
+#     nothing, so started LATE it extends the tail for free and started early its
+#     idle time overlaps the compute.
+# The names are a schedule, not a gate: a name that rots costs the run its order,
+# never a test. Re-measure before trusting the ranking on a different box, and
+# when a binary's cost moves by a factor (the next profile change, the next
+# differential that earns its own binary).
 
-# The stragglers start FIRST, for the same reason the leak plateaus do
-# (tracker N46, from two sibling lanes' unions).
+# TIER 100 - the stragglers: >= 35 s of wall in the suite, or hundreds of CPU-s.
 #
-# Neither of these asserts anything about TIME — `dependent_edit_measurement`
-# prints its per-analysis wall clocks and asserts on leak-tally BYTES, and
-# `style_chain_order` has no clock in it at all — so there is nothing here for a
-# liveness bound or a CPU clock to fix. They are simply long, and a long test
-# scheduled late is the critical path: `dependent_edit_measurement` was the sole
-# straggler of a 5455-test union at 246.6 s, holding the run open about four
-# minutes after everything else had finished.
+# `edit_replay_differential` is 17 tests and 474 s of the run's 4,572: its corpus leg
+# (97 s wall) is the single longest test, and the nine edit-class tests beside it
+# are 34-42 s each (24 CPU-s each: they wait on the corpus's pool). The
+# permutation differential (P0, Order 49) is the same shape - three tests of
+# 36-45 s, the corpus leg 297 CPU-s alone - and was UNTIERED until now, so it
+# started wherever the alphabet put it. `dependent_edit_measurement` (35 s) and
+# the diagnostics ledger's `n99_` test (35 s, 32 CPU-s on ONE thread: it scans
+# the analyzer's source) are the single-thread stragglers: nothing inside them
+# shortens the wall, so only starting them first does.
 #
-# `release_differential` was the third member and is not one any more (tracker
-# N49). It was 607.3 s of a 698.7 s union, and priority was the only lever there
-# was while the leg was ONE test; split into one test per corpus program, 600 of
-# those seconds turned out to be `watch.vl` waiting out two 300 s node deadlines
-# for a filesystem change that never came. That program now makes its own change
-# and exits (tracker N51), so it is run like any other, and the binary's longest
-# member is about 20 s under the suite's own parallelism — no straggler left to
-# schedule around, and a priority that named it would be a claim about a shape
-# that is gone. `infer_differential` took the same split (tracker N52) and is
-# not a member here either, for the same reason.
-[[profile.default.overrides]]
-filter = '''
-    test(dependent_edit_measurement) + binary(style_chain_order)
-'''
-priority = 100
-
-# M19 T1's replay differential is the run's single longest member, and it is a
-# member of its own binary for that reason (tracker N57). It re-hosts all ~124
-# corpus programs as package modules, then analyzes every one of them warm
-# TWICE — once replaying its modules' remembered checks, once re-deriving them —
-# so 60-170 s is not a bound anyone tuned, it is the sweep. Started last it IS
-# the critical path, exactly as `dependent_edit_measurement` was above; started
-# first it overlaps the wide middle of the run.
-#
-# It is deliberately NOT in `wall-clock-waits` below, for the reason the two
-# other differentials are not: that group is one thread because its members WAIT
-# on work happening elsewhere and pile onto each other doing nothing. This one
-# waits on nothing — it is compute, on a 16-way `thread::scope` of its own — and
-# one thread for it would turn the run's longest test into a longer one.
-#
-# `slow-timeout` is raised from the 60 s default so a leg whose honest cost is
-# two and a half minutes is not reported as a runaway on every run; the kill is
-# at 15 minutes, which nothing but a hang can reach.
-[[profile.default.overrides]]
-filter = 'binary(replay_differential)'
-priority = 100
-slow-timeout = { period = "180s", terminate-after = 5 }
-
-# N151's measurement (Order 48, a per-test CPU runner over a whole run, base
-# next @dfe0c5fc): the next tier of long tests, which ran at their default
-# priority and so started wherever the alphabet put them — the edit-replay
-# differential's seven at +1677 s of a 3712 s run (its corpus leg alone 923 CPU
-# seconds, 293 s wall: the run's single longest test), the docs gate (212 s)
-# and `check_scope_differential`'s two corpus legs (100-105 s) beside them, and
-# the native differential's two whole-suite legs and its two censuses (119-184
-# s) at +850 s. Under a loaded box the run is throughput-bound and the order
-# barely shows; on a quiet one, a test that long started past the middle IS the
-# tail. Longest first is the classic makespan rule, so they start ahead of the
-# wide middle, one tier below the stragglers above.
-#
-# The names are a schedule, not a gate: one that rots costs the run its order,
-# never a test. Durations are wall under load 33-49; re-measure before trusting
-# the ranking on a different box.
+# Neither of the measurement pins asserts anything about TIME -
+# `dependent_edit_measurement` prints its per-analysis wall clocks and asserts on
+# leak-tally BYTES (tracker N46) - so there is nothing here for a liveness bound
+# or a CPU clock to fix. They are simply long.
 [[profile.default.overrides]]
 filter = '''
     binary(edit_replay_differential)
+    + binary(permutation_differential)
+    + test(dependent_edit_measurement)
+    + (binary(diagnostics_ledger) & test(n99_the_two_unreachable_messages))
+'''
+priority = 100
+# The edit-replay differential's corpus leg is 97 s in the suite and 149 s alone
+# under load 12; the 60 s default flags it as slow on every run. The kill is at
+# 15 minutes, which nothing but a hang can reach.
+slow-timeout = { period = "180s", terminate-after = 5 }
+
+# TIER 90 - 15-35 s of wall in the suite, or tens of CPU-s that fan out wide.
+#
+# The Linux leak plateaus (17-22 s: looped analyses), the replay differential's
+# two legs (24-25 s in the suite, 65 CPU-s each; they were tier 100 at 60-170 s),
+# `style_chain_order` (19 s), the docs gate (29 s wall, 51 CPU-s), the check-scope
+# corpus legs (20-23 s, 62 CPU-s), the native differential's whole-suite legs and
+# its five longest programs (13-32 s), the diagnostics ledger's source scans
+# (17-18 s each, five of them), and the two waiting tests named above.
+#
+# Dropped from the old tier 90 as no longer long: `examples`' `every_example_builds`
+# (6.5 s) and `corpus`' golden leg (13.8 s). The binary this block used to keep
+# at 100 for `slow-timeout` (`replay_differential`) keeps its raised timeout here.
+[[profile.default.overrides]]
+filter = '''
+    test(leak_measurement)
+    + binary(style_chain_order)
+    + binary(replay_differential)
     + (binary(docs) & test(every_doc_example_compiles))
     + (binary(check_scope_differential) & test(/^corpus_agrees_/))
-    + (binary(examples) & test(every_example_builds))
-    + (binary(corpus) & test(every_corpus_golden_is_byte_identical))
     + (binary(native_differential)
-        & test(/^(the_default_suite_is_byte_identical|s0_every_panic_path_reports|the_native_(leak|copy)_census)/))
+        & test(/^(the_default_suite_is_byte_identical|s0_every_panic_path_reports|the_native_(leak|copy)_census|a138_|a142_|a_mapped_tuple_and_its_comprehension|every_platform_bound_program)/))
+    + binary(diagnostics_ledger)
+    + (binary(transport_robustness) & test(a_spent_retry_budget))
+    + (binary(service_layer) & test(/^(a_bare_connect_socket_offers_vilan_rpc|a_trusted_forwarded_header)/))
 '''
 priority = 90
 
+[[profile.default.overrides]]
+filter = 'binary(replay_differential)'
+slow-timeout = { period = "180s", terminate-after = 5 }
+
 # The marker census (B485) analyzes a few hundred probe programs on a worker
-# pool of its own — compute, like the replay differential above, so it starts
-# first rather than holding the run open at the end, and its honest cost
-# under a loaded box (20 s alone, ~2 min at loadavg 60) is not a runaway.
+# pool of its own - compute, like the replay differential above - and is 12 s in the
+# suite now (6.8 CPU-s alone; it was "20 s alone, ~2 min at loadavg 60" at
+# opt-level 0). It keeps a tier-90 start and its raised timeout for the loaded
+# box it can still meet.
 [[profile.default.overrides]]
 filter = 'binary(marker_census)'
-priority = 100
+priority = 90
 slow-timeout = { period = "180s", terminate-after = 5 }
 
 # The wall-clock waits run ONE AT A TIME (tracker N46).
@@ -169,12 +173,14 @@ wall-clock-waits = { max-threads = 1 }
 # to land before the top-level gray it asserts can exist at all.
 #
 # `cancellation_tests` (M26) is that same shape again, and one of them adds a
-# reason of its own: `a_burst_of_edits_...` types eight keystrokes a debounce
-# window apart and counts how many of the analyses they started ran to the end.
-# Its assertion is a COUNT and load can only push it the safe way — a slower box
-# cancels MORE — but the burst itself is eight debounce windows of wall clock
-# with real analyses behind them, which is precisely the work this group exists
-# to stop the suite from piling onto itself.
+# reason of its own: `a_burst_of_edits_...` types eight keystrokes, each sent
+# once the server's own counter says the previous one's analysis has started
+# (N164: a sleep-paced burst folded into one window on a stalled runner), and
+# counts how many of the analyses they started ran to the end. Its assertion
+# is a COUNT and load can only push it the safe way — a slower box cancels
+# MORE — but the burst itself is eight debounce windows of wall clock with real
+# analyses behind them, which is precisely the work this group exists to stop
+# the suite from piling onto itself.
 filter = '''
     binary(hmr) + binary(hmr_swap) + binary(hmr_css_matrix) + binary(watch_lifecycle)
     + binary(watch_leg_reuse)

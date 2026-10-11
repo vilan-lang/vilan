@@ -205,9 +205,15 @@ impl<'program, 'src> Renderer<'program, 'src> {
                 )
             ),
             Type::Tuple(elements, _) => format!("({})", self.list(elements, substitution)),
-            Type::Array(element, length) => {
-                format!("[{}; {length}]", self.render(*element, substitution))
-            }
+            // The length renders as its number (array-lengths.md §3: a length
+            // is a type-level number, and the hash writes what it resolves to,
+            // so an rpc signature holding `[u8; 4]` keeps its hash).
+            Type::Array(element, length) => format!(
+                "[{}; {}]",
+                self.render(*element, substitution),
+                self.render(*length, substitution)
+            ),
+            Type::Length(length) => length.to_string(),
             // B495: a closure type's parameter modes are part of the type, so
             // they are part of its spelling (`|&str| void`).
             Type::Closure(parameters, returned, _, modes) => {

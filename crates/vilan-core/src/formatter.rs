@@ -5687,6 +5687,19 @@ impl<'src> Printer<'src> {
     fn print_type(&mut self, node: &Node<'src>) {
         match node {
             Node::Accessor(name) => self.out.push_str(name),
+            // `const N` — an impl subject's length binder (array-lengths.md §4).
+            Node::LengthBinder((name, _)) => {
+                self.out.push_str("const ");
+                self.out.push_str(name);
+            }
+            // A length given as a generic argument (`zeros<4>()`, array-lengths.md
+            // §4) — the one value a type position holds.
+            Node::Number(whole, None, suffix) => {
+                self.out.push_str(whole);
+                if let Some(suffix) = suffix {
+                    self.out.push_str(suffix);
+                }
+            }
             Node::AccessorWithGenerics(name, arguments) => {
                 self.out.push_str(name);
                 self.print_type_arguments(arguments);
@@ -5794,12 +5807,18 @@ impl<'src> Printer<'src> {
                 self.out.push(')');
             }
             // `[T; n]` — a fixed-length array type (proposal/fixed-arrays.md): the
-            // element type and a length (an integer literal). Nests as `[[T; m]; n]`.
+            // element type and a length. Nests as `[[T; m]; n]`. The length is a
+            // number, a length parameter's name, or an impl subject's length
+            // binder — `_` or `const N` (array-lengths.md §4), which parse as a
+            // `TypeBinder` and print with the keyword the length position spells.
             Node::ArrayType(element, length) => {
                 self.out.push('[');
                 self.print_type(&element.0);
                 self.out.push_str("; ");
-                self.print_expr(length);
+                match &length.0 {
+                    Node::Number(..) => self.print_expr(length),
+                    _ => self.print_type(&length.0),
+                }
                 self.out.push(']');
             }
             // `(|| void) context turn_scope` / `T context (a, b)` — a type with the
@@ -5999,6 +6018,9 @@ impl<'src> Printer<'src> {
             }
             if parameter.is_type {
                 self.out.push_str("type ");
+            }
+            if parameter.is_const {
+                self.out.push_str("const ");
             }
             self.out.push_str(parameter.name);
             self.print_bounds(&parameter.bounds);

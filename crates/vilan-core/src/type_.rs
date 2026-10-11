@@ -117,11 +117,24 @@ pub enum Type {
     // ignore them ([`TupleLabels`]), unification carries them, mono and the
     // emitters erase them.
     Tuple(Vec<TypeId>, TupleLabels),
-    // A fixed-length array `[T; n]` — the element type and a compile-time-known
-    // length (`[i32; 4]` -> `Array(i32, 4)`). Unlike `List<T>` (a growable
+    // A fixed-length array `[T; n]` — the element type and the LENGTH's type id
+    // (`[i32; 4]` -> `Array(i32, Length(4))`). Unlike `List<T>` (a growable
     // `Struct(list_id, [T])`), the length is part of the type, so `[i32; 3]` and
     // `[i32; 4]` are distinct and neither resizes. Lowers to a plain JS array.
-    Array(TypeId, usize),
+    //
+    // The length is a TYPE-LEVEL NUMBER (array-lengths.md §3, R2): its id
+    // resolves to a [`Type::Length`] or to a length-kinded `Generic` (a
+    // `const N` binder), so a length binds, substitutes and keys through the
+    // same machinery every type argument does — one substitution map, one
+    // `bind_subject`, one key writer. A reader that wants the number asks
+    // [`TypeTable::array_length`] (or the analyzer's substitution-aware
+    // `array_length`), which answers `None` for a length still generic.
+    Array(TypeId, TypeId),
+    // A length, the second id of an [`Type::Array`]: never a value's type,
+    // never written where one stands (the kind checks refuse `let x: N`), and
+    // printed as the bare number. Two lengths are the same exactly when the
+    // numbers are, so the derived equality IS length identity.
+    Length(usize),
     // A mapped tuple type `(U in T: F<U>)`, symbolic while the source tuple `T` is
     // still abstract: the binder `U`'s generic id, the source tuple type, and the
     // template `F<U>`. Expands to a concrete `Tuple` once `T` resolves to one
@@ -318,6 +331,18 @@ impl TypeTable {
     #[inline]
     pub fn get(&self, type_id: &TypeId) -> Option<&Type> {
         self.slots.get(type_id.0 as usize).and_then(Option::as_ref)
+    }
+
+    /// The number an array LENGTH id holds: `Some(n)` for a
+    /// [`Type::Length`], `None` for a length still generic (a `const N`
+    /// binder no substitution has reached) or an unwritten slot. The one
+    /// reader of `Type::Array`'s second id that wants a number, for every
+    /// pass that holds the table and no substitution.
+    pub fn array_length(&self, length: TypeId) -> Option<usize> {
+        match self.get(&length) {
+            Some(Type::Length(length)) => Some(*length),
+            _ => None,
+        }
     }
 
     /// Whether slot `type_id` holds a type.

@@ -1,0 +1,25 @@
+// F125: a `BigInt` as text — an i-string hole, a concatenation, `to_string`,
+// a generic `Display` and `join` — writes its digits without node's `n`, on
+// both backends (`print` of the value itself keeps the `n`). An operator's
+// result in a hole printed `144n` natively, silently, before.
+import std::display::Display;
+import std::display::format;
+import std::io::print;
+
+fun describe<T: Display>(value: T): str {
+	"value " + value.to_string()
+}
+
+fun main() {
+	let big = 12n;
+	print(i"{big}");
+	print("" + big);
+	print(big.to_string());
+	let negative = -98765432109876543210n;
+	print(i"[{negative}] and {big * big}");
+	print(describe(big));
+	print(format(negative));
+	print([1n, 2n, 3n].join(", "));
+	print("x" + (big + 1n));
+	print(big);
+}

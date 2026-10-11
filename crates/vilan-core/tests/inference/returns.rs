@@ -5635,6 +5635,89 @@ fn b452_struct_fields_run_in_the_order_the_literal_writes_them() {
     );
 }
 
+// --- B596: a struct literal's plain initializers run as WRITTEN ---
+//
+// The JS array lays a struct out in declaration order, and an array runs its
+// items in that order — so two plain calls written out of declaration order
+// ran in layout order (`Point { y = say("y"), x = say("x") }` printed `x`
+// first), where a Rust struct literal runs them as written. Pinned here (JS)
+// and in `native_differential`'s B596 probe (both backends agree).
+
+const B596_SAY: &str = r#"
+import std::io::print;
+
+fun say(label: str, value: i32): i32 {
+    print(label);
+    value
+}
+"#;
+
+#[test]
+fn b596_two_plain_initializers_run_in_the_order_the_literal_writes_them() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B596_SAY}\nstruct Point {{ x: i32, y: i32 }}\n\nfun main() {{\n\
+             let p = Point {{ y = say(\"y\", 2), x = say(\"x\", 1) }};\n\
+             print(p.x * 10 + p.y);\n}}\n"
+        ),
+        "y\nx\n12\n",
+    );
+}
+
+#[test]
+fn b596_a_rotated_literal_runs_as_written_and_reads_back_by_name() {
+    // Three fields rotated, a literal between two calls, and a field read of
+    // each slot: the layout is still the declaration's.
+    assert_compiles_and_runs(
+        &format!(
+            "{B596_SAY}\nstruct Triple {{ a: i32, b: i32, c: i32, d: i32 }}\n\nfun main() {{\n\
+             let t = Triple {{ c = say(\"c\", 3), d = 4, a = say(\"a\", 1), b = say(\"b\", 2) }};\n\
+             print(t.a * 1000 + t.b * 100 + t.c * 10 + t.d);\n}}\n"
+        ),
+        "c\na\nb\n1234\n",
+    );
+}
+
+#[test]
+fn b596_a_mut_binding_read_before_a_call_that_writes_it_keeps_its_old_value() {
+    // `b = count` is read BEFORE `a = bump(&mut count)` runs: the read is
+    // bound first, so the slot holds the old value.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Pair { a: i32, b: i32 }
+
+        fun bump(counter: &mut i32): i32 {
+            counter += 1;
+            counter
+        }
+
+        fun main() {
+            mut count = 0;
+            let p = Pair { b = count, a = bump(&mut count) };
+            print(p.a * 10 + p.b);
+        }
+        "#,
+        "10\n",
+    );
+}
+
+#[test]
+fn b596_a_nested_generic_literal_runs_as_written_at_every_level() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B596_SAY}\nstruct Wrap<T> {{ first: T, second: T }}\n\nfun main() {{\n\
+             let w = Wrap {{\n\
+                 second = Wrap {{ second = say(\"s.s\", 4), first = say(\"s.f\", 3) }},\n\
+                 first = Wrap {{ second = say(\"f.s\", 2), first = say(\"f.f\", 1) }},\n\
+             }};\n\
+             print(w.first.first * 1000 + w.first.second * 100 + w.second.first * 10 + w.second.second);\n}}\n"
+        ),
+        "s.s\ns.f\nf.s\nf.f\n1234\n",
+    );
+}
+
 #[test]
 fn b452_an_if_argument_runs_after_the_arguments_before_it() {
     assert_compiles_and_runs(

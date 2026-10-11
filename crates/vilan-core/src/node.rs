@@ -10,6 +10,10 @@ pub struct GenericParameter<'src> {
     pub name_span: Span,
     // Declared with the `type` keyword (a binder, e.g. `impl Foo<type T>`).
     pub is_type: bool,
+    // Declared with the `const` keyword: a LENGTH parameter (`fun f<const N>`,
+    // array-lengths.md §5.1), standing for a `usize` length. Takes no bound
+    // and no default.
+    pub is_const: bool,
     // Trait bounds: `T: A + B` collects `[A, B]`.
     pub bounds: Vec<Spanned<Node<'src>>>,
     // A tuple bound: `T: (2..)` / `(..10)` / `(..: Display)` — the parameter is a
@@ -675,6 +679,12 @@ pub enum Node<'src> {
         Vec<Spanned<Self>>,
         Option<Box<TupleBound<'src>>>,
     ),
+    // `const N` — a LENGTH binder in an impl subject (array-lengths.md §4):
+    // an array's length position (`impl [type T; const N]`) or a `const`
+    // parameter's argument position (`impl Ring<type T, const N>`). The name
+    // carries its own span, as `TypeBinder`'s does. The anonymous length
+    // binder is `_`, which stays a `TypeBinder`: its kind is the position's.
+    LengthBinder(Spanned<&'src str>),
     // `x = v` or a compound assignment like `x += v` (the operator is the
     // binary op the assignment applies, e.g. `Add` for `+=`). The target is an
     // lvalue: a local (`Accessor`) or a field place (`MemberAccessor`, e.g.
@@ -1254,6 +1264,7 @@ impl<'src> Node<'src> {
                 }
                 visit(body);
             }
+            Node::LengthBinder(_) => {}
             Node::TypeBinder(_, bounds, tuple_bound) => {
                 for bound in bounds {
                     visit(bound);

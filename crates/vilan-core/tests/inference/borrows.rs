@@ -13245,7 +13245,7 @@ fn b545_a_one_slot_tuple_leaf_follows_the_payload_view_rules() {
             }
         }
         "#,
-        "`mut a` would bind a COPY of the payload, but this matches a view (`&mut held`)",
+        "`mut a` would bind a COPY of the tuple's slot, but this matches a view (`&mut held`)",
     );
     assert_fails_once_with(
         r#"
@@ -13448,7 +13448,7 @@ fn b587_a_top_level_tuple_leaf_follows_the_payload_view_rules() {
             }
         }
         "#,
-        "`mut a` would bind a COPY of the payload, but this matches a view (`&mut pair`)",
+        "`mut a` would bind a COPY of the tuple's slot, but this matches a view (`&mut pair`)",
     );
     assert_fails_once_with(
         r#"
@@ -13471,5 +13471,69 @@ fn b587_a_top_level_tuple_leaf_follows_the_payload_view_rules() {
         }
         "#,
         "a capture of a sub-tuple",
+    );
+}
+
+/// E290: under a TUPLE view subject (B587) the inherited refusals say what
+/// the capture views — a slot of the tuple, never "the payload" — and a
+/// sub-tuple leaf's steer names the tuple bound whole as a view, nothing more.
+/// The variant payload's own sentence is unchanged.
+#[test]
+fn e290_a_tuple_view_subjects_refusals_name_the_slot_not_a_payload() {
+    let mutable_leaf = r#"
+        fun main() {
+            mut pair = (1, 2);
+            match &mut pair {
+                (mut a, let b) => { a += 10; },
+            }
+        }
+        "#;
+    assert_fails_once_with(
+        mutable_leaf,
+        "`mut a` would bind a COPY of the tuple's slot, but this matches a view (`&mut pair`), \
+         whose captures are views into the tuple's slots: bind `let a` to write the tuple's slot \
+         in place",
+    );
+    assert_fails_without(mutable_leaf, "payload");
+    let readonly_leaf = r#"
+        fun main() {
+            let pair = (1, 2);
+            match &pair {
+                (let a, _) => { a += 1; },
+            }
+        }
+        "#;
+    assert_fails_once_with(
+        readonly_leaf,
+        "so its captures are readonly views into the tuple's slots — match `&mut pair` to write \
+         the tuple's slots in place",
+    );
+    assert_fails_without(readonly_leaf, "payload");
+    let sub_tuple = r#"
+        fun main() {
+            mut deep = ((1, 2), 3);
+            match &mut deep {
+                (mut inner, _) => { inner = (5, 6); },
+            }
+        }
+        "#;
+    assert_fails_once_with(
+        sub_tuple,
+        "bind the tuple whole (`let pair`), which is a view, and write `pair.0`",
+    );
+    assert_fails_without(sub_tuple, "payload");
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held = Some(1);
+            match &mut held {
+                Some(mut p) => { p += 1; },
+                None => {},
+            }
+        }
+        "#,
+        "`mut p` would bind a COPY of the payload, but this matches a view (`&mut held`), whose \
+         captures are views into the payload",
     );
 }

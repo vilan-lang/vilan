@@ -1,0 +1,80 @@
+// E283's array half: `T: Debug` and `[derive(Debug)]` take a fixed array of
+// EVERY length (std's `impl [type T: Debug; _] with Debug`, array-lengths.md
+// S5) - nested, empty, of structs and options, inside a struct, an enum payload,
+// an option, a tuple, a list and a map - printing as a `List` does, the same
+// bytes on both backends.
+import std::debug::Debug;
+import std::hash_map::HashMap;
+
+[derive(Debug)]
+struct Point {
+	x: i32,
+	y: f64,
+}
+
+[derive(Debug)]
+struct Holder {
+	grid: [[i32; 2]; 2],
+	points: [Point; 2],
+	maybe: Option<[str; 2]>,
+	none: [i32; 0],
+}
+
+[derive(Debug)]
+struct Fixed<T> {
+	items: [T; 3],
+}
+
+[derive(Debug)]
+enum Frame {
+	Bytes([u8; 4]),
+	Pair([i32; 2], [str; 1]),
+	Empty,
+}
+
+fun show<T: Debug>(value: T) {
+	print(value.debug());
+}
+
+fun total<const N>(items: [i32; N]): str {
+	items.debug()
+}
+
+fun main() {
+	print([1, 2, 3].debug());
+	print([[1, 2], [3, 4]].debug());
+	print([Point { x = 1, y = 2.0 }, Point { x = 3, y = 4.5 }].debug());
+	print(["a\"b", "c"].debug());
+	print([1.0, 2.5].debug());
+	print([Some(1), None].debug());
+	let empty: [i32; 0] = [];
+	print(empty.debug());
+	show([7, 8]);
+	show([true; 4]);
+	show([[1.5; 2]; 2]);
+	show(empty);
+	print(total([9, 8, 7]));
+	print(total([]));
+	let holder = Holder {
+		grid = [[1, 2], [3, 4]],
+		points = [Point { x = 1, y = 2.0 }, Point { x = 3, y = 4.5 }],
+		maybe = Some(["p", "q"]),
+		none = [],
+	};
+	print(holder.debug());
+	print(Fixed { items = [1.5, 2.0, 3.0] }.debug());
+	print(Frame::Bytes([1, 2, 3, 4]).debug());
+	print(Frame::Pair([1, 2], ["s"]).debug());
+	print(Frame::Empty.debug());
+	let rows: List<[i32; 2]> = [[1, 2], [3, 4]];
+	print(rows.debug());
+	print(Some([1, 2]).debug());
+	print(([1, 2], [3]).debug());
+	mut ages: HashMap<str, [i32; 2]> = HashMap::new();
+	ages.insert("k", [1, 2]);
+	print(ages.debug());
+	let nested: [[[i32; 1]; 2]; 2] = [[[1], [2]], [[3], [4]]];
+	print(nested.debug());
+	print(nested);
+	print(holder);
+}

@@ -21,6 +21,7 @@ mod auto_annotations;
 mod dbg_stack;
 mod hint_labels;
 mod hover_labels;
+pub mod id_windows;
 mod liveness;
 mod written_types;
 
@@ -805,13 +806,20 @@ pub enum Expr<'src> {
     Is(Id, ExprPattern),
     List(Vec<Id>),
     // `[value; n]` — a fixed-length array literal: the value expr and the
-    // compile-time length `n` (an integer literal in v1). `value` copied per slot.
-    Repeat(Id, usize),
-    // `arr.len()` on a `[T; n]` subject — the subject and the compile-time
-    // length `n` read off its type. There is no member to dispatch to (`[T; n]`
-    // is structural); a pure subject folds to the literal, a side-effectful one
-    // still evaluates (fixed-arrays.md §10).
-    ArrayLen(Id, usize),
+    // LENGTH's type id (a `Type::Length`, or a length parameter the instance
+    // substitutes — array-lengths.md §5.3). `value` copied per slot.
+    Repeat(Id, TypeId),
+    // `arr.len()` on a `[T; n]` subject — the subject and the length's type id
+    // read off its type. There is no member to dispatch to (`[T; n]` is
+    // structural); a pure subject folds to the number, a side-effectful one
+    // still evaluates (fixed-arrays.md §10), and a length parameter folds per
+    // instance.
+    ArrayLen(Id, TypeId),
+    // A length parameter read as a value — `N` in the body of
+    // `impl [type T; const N]` (array-lengths.md §5.3) — by the id of its
+    // `Type::Generic`: a `usize`, folded per instance to the number the
+    // instance binds it to.
+    LengthValue(TypeId),
     Local(Id),
     // A match expression: the subject and the resolved legs.
     Match(Id, Vec<ExprMatchLeg>),
@@ -872,6 +880,16 @@ pub enum Expr<'src> {
     // resolve it and go-to-definition lands on the definition. Not a value:
     // referencing it outside `[name]` / `macro name(..)` is a clean error.
     Macro,
+}
+
+/// What a `mut` capture under a view subject would copy (B509, B545): a
+/// variant's PAYLOAD, one SLOT of a tuple, or a SUB-TUPLE spanning several
+/// slots — E290 words the refusal by which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TupleLeaf {
+    Payload,
+    Slot,
+    SubTuple,
 }
 
 #[derive(Clone, Debug)]
@@ -4579,6 +4597,12 @@ pub struct Analyzer<'src> {
     /// module's bound question names (the reach filter's reading, in which
     /// case no log was kept).
     prefix_impl_count: Option<usize>,
+    /// M110 S3 (Order 50): the entity counter of the STORED world — every
+    /// entity below it was minted by the prefix (the same ids on every hit,
+    /// §2.1's guarantee), every one at or past it by this analysis (the hot
+    /// set, the entry, the resolve of their constraints, the post passes).
+    /// `None` until the world is stored or served.
+    prefix_entity_end: Option<u32>,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -4643,7 +4667,7 @@ pub struct Analyzer<'src> {
     // through `source_ranges`; `TypeId`s are a separate counter and had
     // nothing, which is what made "did the entry move THIS module's slots?"
     // unanswerable.
-    type_id_sources: Vec<SourceId>,
+    type_id_sources: id_windows::TypeSourceRuns,
     // M19 T1: the sources whose record this analysis must NOT write, because
     // something it derived for them reaches OUTSIDE the world — a note or a
     // trace hop pointing into the entry. Such a diagnostic is about a module
@@ -4810,6 +4834,28 @@ pub struct Analyzer<'src> {
     // (`check_generic_bound_satisfaction`); the element bound's type id is
     // stored unresolved like `generic_bounds` entries.
     tuple_bounds: HashMap<TypeId, TupleBoundRequirement>,
+    // array-lengths.md §3/§4: the LENGTH parameters — an impl subject's `_` or
+    // `const N` in an array's length position, by constraint id. A length
+    // parameter is an ordinary generic (it binds, substitutes and keys like a
+    // type argument); this set is its KIND, which the kind checks read: such a
+    // parameter may stand only in a length position, and a length position
+    // only holds one of these or a number.
+    length_parameters: HashSet<TypeId>,
+    // The length binders an impl subject registered, by the occurrence's
+    // `(source, name span)`: what tells a `const N` the head declared from one
+    // written where no binder may be introduced.
+    registered_length_binders: HashSet<(SourceId, Span)>,
+    // The slots of every length written as a NAME or a binder (`[T; N]`,
+    // `[T; const N]`): the `prepped_type_locals` drain refuses a type there and
+    // a length parameter anywhere else (§3's two kind checks).
+    length_position_type_ids: HashSet<TypeId>,
+    // The slots of the generic arguments written as a bare NAME — where a
+    // length parameter may stand (`Slots<N>`), held to the parameter's kind by
+    // the application's check instead of the drain's.
+    generic_argument_type_ids: HashSet<TypeId>,
+    // The calls that WROTE generic arguments (`zeros<4>()`, `f<i32>(..)`), the
+    // only ones the call-site kind check has anything to read.
+    calls_writing_generics: Vec<Id>,
     // B399: a mapped type's binder (`U` in `(U in T: F<U>)`), keyed by its
     // constraint id, -> the SOURCE type id it ranges over. A binder is
     // registered with no bound of its own, but when its source is a parameter
@@ -5059,6 +5105,17 @@ pub struct Analyzer<'src> {
     // `push` unifies it with the pushed value's type, so a built-up list's
     // element is inferred (`List::new(); push(p: Point)` -> `List<Point>`).
     list_element_slots: HashMap<Id, TypeId>,
+    /// B599: the holes a payload-less variant of a generic enum (`None`,
+    /// `Holder::Empty`) answers with at each USE SITE, keyed by the use's id —
+    /// minted once, as an empty list's element slot is, so every inference of
+    /// the site (and of a call built from it) reads the same slots and a use
+    /// that fills one fills it for all of them ([`Self::fill_holes_from_use`]).
+    /// Minted per inference, `Cell::new(None)` answered a fresh hole each time
+    /// it was asked, and its binding's slot was not the one a later use filled.
+    variant_use_holes: HashMap<Id, Vec<TypeId>>,
+    /// B600: `(call, operand, the operand's type)` for each operand a call
+    /// resolved over while its type held a hole ([`Self::record_hole_operand`]).
+    hole_operands: Vec<(Id, Id, TypeId)>,
     /// B554: the argument whose `push`/`run` FILLED each element slot — the
     /// first use in walk order — so a later use that contradicts it can tell
     /// whether the two sit in different files (where walk order is the
@@ -5131,6 +5188,10 @@ pub struct Analyzer<'src> {
     // loaded file's namespace scope, and every `mod { .. }` body. `export` is
     // legal exactly in these (a block-scoped `import` is not exportable, H2).
     module_scope_ids: HashSet<Id>,
+    /// The scope the ENTRY walks in (the world's global scope), for the
+    /// trait-reach questions that are asked before the post-build passes hand
+    /// it over ([`Self::files_reached_by`], B598).
+    entry_scope_id: Option<Id>,
     prepped_locals: Vec<(Id, &'src str)>,
     // B270: a desugar's scope-independent std references — `(id, module, item)`
     // for each `Node::StdItem`. They resolve through `std`'s own namespace, not
@@ -5723,6 +5784,9 @@ pub struct Analyzer<'src> {
     traits: IndexMap<Id, Trait<'src>>,
     type_id_to_type_map: TypeTable,
     type_id: u32,
+    /// M110 S5: the id-window spike's windows, anchor and census
+    /// (`VILAN_ID_WINDOWS`; off, it is three empty vectors and a flag).
+    id_windows: id_windows::IdWindows,
     variables: IndexMap<Id, Variable<'src>>,
     // True while walking a trait body, where a bodyless method is a legitimate
     // requirement; elsewhere a bodyless function must be declared `external`.
@@ -7680,6 +7744,7 @@ impl<'src> Analyzer<'src> {
             bound_questions_derived: HashMap::default(),
             bound_recompute_ranges: Vec::new(),
             prefix_impl_count: None,
+            prefix_entity_end: None,
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -7692,7 +7757,7 @@ impl<'src> Analyzer<'src> {
             source_range_index: std::cell::RefCell::new(RangeIndex::default()),
             tuple_member_index: std::cell::RefCell::new(None),
             derived_origin_index: std::cell::RefCell::new(RangeIndex::default()),
-            type_id_sources: Vec::new(),
+            type_id_sources: id_windows::TypeSourceRuns::default(),
             reuse_derived: HashMap::default(),
             reuse_unrecordable: HashSet::default(),
             entry_dirty_sources: HashSet::default(),
@@ -7723,6 +7788,11 @@ impl<'src> Analyzer<'src> {
             defaulted_parameter_types: HashSet::default(),
             defaulted_parameter_mentions: HashMap::default(),
             tuple_bounds: HashMap::default(),
+            length_parameters: HashSet::default(),
+            registered_length_binders: HashSet::default(),
+            length_position_type_ids: HashSet::default(),
+            calls_writing_generics: Vec::new(),
+            generic_argument_type_ids: HashSet::default(),
             mapped_binder_sources: HashMap::default(),
             tuple_walk_binders: HashMap::default(),
             tuple_walk_views: HashMap::default(),
@@ -7770,6 +7840,8 @@ impl<'src> Analyzer<'src> {
             field_syntax_reads: HashSet::default(),
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
+            variant_use_holes: HashMap::default(),
+            hole_operands: Vec::new(),
             slot_fill_sites: HashMap::default(),
             lenient_subscript_indexes: Vec::new(),
             pinned_diagnostic_anchors: Vec::new(),
@@ -7787,6 +7859,7 @@ impl<'src> Analyzer<'src> {
             macro_expression_expansions: HashMap::default(),
             macro_failed_sites: HashSet::default(),
             module_scope_ids: HashSet::default(),
+            entry_scope_id: None,
             prepped_locals: Vec::new(),
             prepped_std_items: Vec::new(),
             css_scope_depth: 0,
@@ -7906,6 +7979,7 @@ impl<'src> Analyzer<'src> {
             traits: IndexMap::default(),
             type_id_to_type_map: TypeTable::default(),
             type_id: 0,
+            id_windows: id_windows::IdWindows::new(),
             variables: IndexMap::default(),
             walking_trait_body: false,
             trait_body_scopes: HashSet::default(),
@@ -8008,9 +8082,54 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_entity_id(&mut self) -> Id {
+        if self.id_windows.on() {
+            let (id, _) = self
+                .id_windows
+                .mint(id_windows::Lane::Entity, &mut self.entity_id);
+            return Id(id);
+        }
         let id = self.entity_id;
         self.entity_id += 1;
         Id(id)
+    }
+
+    /// M110 S5: walks a module-level node list one ITEM at a time, each under
+    /// its own id window when the spike is on (`id_windows`). The six
+    /// module-level walks (modules, std's and the dependencies' `lib.vl`,
+    /// generated expansions, the hot set, the entry) come through here, so
+    /// the windows are laid out in load order by construction.
+    fn walk_module_items(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
+        if !self.id_windows.on() {
+            return self.walk_expr_nodes(list, scope_id);
+        }
+        self.id_windows.phase = id_windows::Phase::Walk;
+        list.iter()
+            .map(|child| {
+                let window = self.id_windows.open(
+                    self.current_source_id,
+                    self.entity_id,
+                    self.type_id,
+                    self.scope_id,
+                );
+                let id = self.walk_expr_node(child, scope_id);
+                if let Some(window) = window {
+                    let padded = self.id_windows.close(
+                        window,
+                        id,
+                        &mut self.entity_id,
+                        &mut self.type_id,
+                        &mut self.scope_id,
+                    );
+                    // The type census stays dense (indexed by the id): the
+                    // room is padded with the window's source, which is what
+                    // a mint relocated into it later would have recorded.
+                    let (from, to) = padded[1];
+                    self.type_id_sources
+                        .note_range(from, to, self.current_source_id);
+                }
+                id
+            })
+            .collect()
     }
 
     fn get_entity_by_id(&self, id: Id) -> &Expr<'src> {
@@ -8403,7 +8522,7 @@ impl<'src> Analyzer<'src> {
             }
             (Type::Tuple(lefts, _), Type::Tuple(rights, _)) => all(&lefts, &rights),
             (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
-                left_length == right_length
+                self.same_type_structure(left_length, right_length, depth + 1)
                     && self.same_type_structure(left_element, right_element, depth + 1)
             }
             (
@@ -8964,6 +9083,8 @@ impl<'src> Analyzer<'src> {
         let mut satisfaction_memo: SatisfactionMemo = HashMap::default();
         let mut unrankable_memo: UnrankableMemo = HashMap::default();
         for (call_id, substitution) in recorded {
+            // M134: the audit's mints at this site belong to the site's item.
+            self.id_windows.set_anchor(call_id);
             // M26's per-site checkpoint (`editor-latency.md` §4.2). This is the
             // loop the `checks` phase is mostly made of — every recorded call
             // site of the whole program, 63% of the phase before M19's memo and
@@ -9224,6 +9345,8 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (call_id, member_id) in wired_calls {
+            // M134: the declaration walk's mints belong to the call's item.
+            self.id_windows.set_anchor(call_id);
             let Some((_, own_generics)) = self.method_signature(member_id) else {
                 continue;
             };
@@ -9312,15 +9435,25 @@ impl<'src> Analyzer<'src> {
                         None => "nothing it is passed binds it, and its result is typed by it"
                             .to_string(),
                     };
-                errors.push((
-                    call_id,
-                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
-                    format!(
+                // array-lengths.md §5.2: a LENGTH nothing binds is the same
+                // refusal, and its explicit form is a number (`zeros<4>()`).
+                let message = match self.length_parameters.contains(&constraint_id) {
+                    true => format!(
+                        "cannot infer the length '{generic_label}' for this call: {why}. Write \
+                         it — on the binding the result lands in (`let value: [_; 4] = …`), \
+                         as the call's argument (`{member}<4>(…)`), or ascribe the call"
+                    ),
+                    false => format!(
                         "cannot infer '{generic_label}' for this call: {why}. Write the type — on \
                          the binding the result lands in (`let value: … = …`), as the call's \
                          type argument (`{member}<…>(…)`), or ascribe the call \
                          (`{member}(…) as …`)"
                     ),
+                };
+                errors.push((
+                    call_id,
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    message,
                     constraint_id,
                 ));
             }
@@ -9368,6 +9501,7 @@ impl<'src> Analyzer<'src> {
         // --- Greet>` is wrong at the literal).                          ---
         let mut constructions: Vec<(Id, &'src str, Vec<TypeId>, Vec<TypeId>)> = Vec::new();
         for (&initializer_id, &struct_def_id) in &self.struct_initializer_to_def {
+            self.id_windows.set_anchor(initializer_id);
             let Some(struct_) = self.structs.get(&struct_def_id) else {
                 continue;
             };
@@ -9411,6 +9545,7 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (call_id, enum_id, variant_index, argument_ids) in variant_calls {
+            self.id_windows.set_anchor(call_id);
             let Some(enum_) = self.enums.get(&enum_id) else {
                 continue;
             };
@@ -9461,6 +9596,7 @@ impl<'src> Analyzer<'src> {
             constructions.push((call_id, enum_name, bound_constraints, bound_arguments));
         }
         for (site_id, owner_name, declared_constraints, arguments) in constructions {
+            self.id_windows.set_anchor(site_id);
             // A declared bound's arguments may name SIBLING parameters
             // (`struct S<A, B: Feed<A>>`) — ground them in this
             // construction's own bindings.
@@ -9932,6 +10068,9 @@ impl<'src> Analyzer<'src> {
         for (owner_id, written_arguments, span, source_id, type_id, generics_exempt) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
+            // M134: the site's own slot is the anchor (the owner is declared
+            // elsewhere); a written type that lives in no window stays unanchored.
+            self.id_windows.set_check_anchor_type(type_id);
             let Some((owner_name, declared, _)) = self.nominal_bound_owner(owner_id) else {
                 continue;
             };
@@ -9951,6 +10090,26 @@ impl<'src> Analyzer<'src> {
             for (index, (constraint_id, argument_type_id)) in
                 declared.iter().zip(&written_arguments).enumerate()
             {
+                // array-lengths.md §4: the argument's KIND first — a length
+                // where a type belongs, or the other way, is refused here.
+                let parameter_name = parameter_names.get(index).copied().unwrap_or("_");
+                if let Some(message) = self.generic_argument_kind_error(
+                    *constraint_id,
+                    parameter_name,
+                    *argument_type_id,
+                ) {
+                    self.push_at_written_type(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: message,
+                        },
+                        source_id,
+                        type_id,
+                    );
+                    continue;
+                }
                 let bound_traits = self.generic_bound_traits(*constraint_id);
                 if bound_traits.is_empty() {
                     continue;
@@ -10855,6 +11014,7 @@ impl<'src> Analyzer<'src> {
             if self.frozen_entity(check.impl_function_id) {
                 continue;
             }
+            self.id_windows.set_anchor(check.impl_function_id);
             self.check_one_conformance(check, &written_type_names);
         }
     }
@@ -11699,8 +11859,10 @@ impl<'src> Analyzer<'src> {
             (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.same_impl_types(left_items, right_items, comparing)
             }
+            // A length is one more argument (array-lengths.md §3): two length
+            // binders are one position as two type binders are.
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                left_length == right_length
+                self.same_impl_type(*left_length, *right_length, comparing)
                     && self.same_impl_type(*left_item, *right_item, comparing)
             }
             // B309: the `context` clause is deliberately NOT compared. Impl
@@ -12532,10 +12694,11 @@ impl<'src> Analyzer<'src> {
                 )
             }
             Type::Array(element_id, length) => {
+                let length = self.substitute_length(*length, context);
                 let element = element_id.get_type(self);
                 let substituted =
                     self.substitute_member_type(&element, self_trait, subject, context);
-                Type::Array(substituted.get_type_id(self), *length)
+                Type::Array(substituted.get_type_id(self), length)
             }
             Type::Closure(parameter_ids, return_type_id, contexts, modes) => {
                 let parameter_ids = parameter_ids.clone();
@@ -12759,6 +12922,7 @@ impl<'src> Analyzer<'src> {
                 | Type::Closure(..)
                 | Type::Function(_)
                 | Type::Module(_)
+                | Type::Length(_)
                 | Type::Mapped(_, _, _) => Members::Answer(false, true),
                 // A trait default body's `Self` (B463): a resource iff THIS
                 // instantiation says so, exactly as a `Generic` above — R11
@@ -12898,14 +13062,17 @@ impl<'src> Analyzer<'src> {
                     .all(|parameter| self.substitution_fixed(*parameter))
                     && self.substitution_fixed(*return_type)
             }
-            Type::Array(element, _) => self.substitution_fixed(*element),
+            Type::Array(element, length) => {
+                self.substitution_fixed(*element) && self.substitution_fixed(*length)
+            }
             Type::Any
             | Type::Never
             | Type::Void
             | Type::Unknown
             | Type::Unresolved
             | Type::Function(_)
-            | Type::Module(_) => true,
+            | Type::Module(_)
+            | Type::Length(_) => true,
         }
     }
 
@@ -13201,6 +13368,7 @@ impl<'src> Analyzer<'src> {
             | Type::Closure(..)
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Trait(_, _)
             | Type::Generic(_)
             | Type::Mapped(_, _, _) => (false, true),
@@ -13326,8 +13494,11 @@ impl<'src> Analyzer<'src> {
             Type::Array(element, length) => {
                 buf.push('[');
                 self.render_type_canonical(element, depth + 1, visiting, buf);
-                buf.push_str(&format!("; {length}]"));
+                buf.push_str("; ");
+                self.render_type_canonical(length, depth + 1, visiting, buf);
+                buf.push(']');
             }
+            Type::Length(length) => buf.push_str(&length.to_string()),
             // B309: the clause is not rendered into the CANONICAL key — the
             // key is a structural identity (same shape = same entry), and the
             // clause is a discipline over the shape.
@@ -13442,6 +13613,8 @@ impl<'src> Analyzer<'src> {
         let mut reported_instantiations: HashSet<TypeId> = HashSet::default();
         let mut reported_structures: HashSet<String> = restored_structures;
         for (type_id, span, source) in applications {
+            // M134: the mints this tier makes about a type belong to its item.
+            self.id_windows.set_check_anchor_type(type_id);
             // M19 T1d: a reused module's written applications are not visited.
             // Its diagnostics are replayed and the keys it contributed above
             // are already in `reported_structures`, so both halves of what this
@@ -13475,6 +13648,7 @@ impl<'src> Analyzer<'src> {
         // site of a type could ever be the earliest.
         let mut examined: HashSet<TypeId> = HashSet::default();
         for (_, type_id, span, source) in sites {
+            self.id_windows.set_check_anchor_type(type_id);
             if !examined.insert(type_id) {
                 continue;
             }
@@ -13497,6 +13671,9 @@ impl<'src> Analyzer<'src> {
         // `List`'s own parameter, which IS the receiver's type, spelled by the
         // solver instead of by the program.
         for (container_id, arguments, span, source) in self.container_receiver_sites(&containers) {
+            // M134: the receiver site's container (the argument types were
+            // minted in its item's window).
+            self.id_windows.set_anchor(container_id);
             let container_type = Type::Struct(container_id, arguments).get_type_id(self);
             let Some(found) = self.container_resource_at(
                 container_type,
@@ -13531,6 +13708,7 @@ impl<'src> Analyzer<'src> {
             let Some(span) = self.span_map.get(call_id) else {
                 continue;
             };
+            self.id_windows.set_anchor(*call_id);
             // M19 T1d: a reused module's native receiver sites are its own — the
             // call is in its body and the diagnostic publishes to its file — so
             // they are skipped with the rest of its tier.
@@ -14343,6 +14521,8 @@ impl<'src> Analyzer<'src> {
         let variables: Vec<(Id, TypeId)> =
             self.variables.values().map(|v| (v.id, v.type_id)).collect();
         for (id, type_id) in variables {
+            // M134: the planner's mints for a binding belong to its item.
+            self.id_windows.set_anchor(id);
             if self.type_is_resource(type_id) {
                 bindings.insert(id);
             }
@@ -14353,6 +14533,7 @@ impl<'src> Analyzer<'src> {
             .map(|p| (p.id, p.type_id))
             .collect();
         for (id, type_id) in parameters {
+            self.id_windows.set_anchor(id);
             if self.type_is_resource(type_id) {
                 bindings.insert(id);
             }
@@ -14672,6 +14853,8 @@ impl<'src> Analyzer<'src> {
             if !function.has_body || function.returns_view {
                 continue;
             }
+            // M134: a crossing's mints belong to the function's item.
+            self.id_windows.set_anchor(function.id);
             let mut leaves = Vec::new();
             self.collect_tail_leaves(seam, &mut leaves);
             for leaf in leaves {
@@ -14800,7 +14983,8 @@ impl<'src> Analyzer<'src> {
             | Type::Unknown
             | Type::Unresolved
             | Type::Function(_)
-            | Type::Module(_) => false,
+            | Type::Module(_)
+            | Type::Length(_) => false,
         }
     }
 
@@ -15259,6 +15443,7 @@ impl<'src> Analyzer<'src> {
             | Expr::FunctionReturn(None)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::Null
@@ -16083,6 +16268,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Async(_)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -16657,6 +16843,10 @@ impl<'src> Analyzer<'src> {
             }
             Type::Array(element, length) => {
                 let mut fields = Vec::new();
+                // Glue is built per concrete instantiation, so the length is a
+                // number here; a length parameter (which no instance carries)
+                // has no slots to name.
+                let length = self.type_id_to_type_map.array_length(length).unwrap_or(0);
                 if self.type_is_resource(element) {
                     for index in 0..length {
                         fields.push((index, element));
@@ -16727,7 +16917,7 @@ impl<'src> Analyzer<'src> {
 
         // Function bodies: the body tail is returned, so it is consuming AND
         // terminal (R4 — a returned `if`/`match` tail moves out per branch).
-        let bodies: Vec<(Vec<Id>, Id, Vec<Id>)> = self
+        let bodies: Vec<(Vec<Id>, Id, Vec<Id>, Id)> = self
             .functions
             .values()
             .filter(|function| function.has_body)
@@ -16742,16 +16932,19 @@ impl<'src> Analyzer<'src> {
                     function.body.0.clone(),
                     function.body.1,
                     function.parameters.clone(),
+                    function.id,
                 )
             })
             .collect();
-        for (statements, tail, parameters) in &bodies {
+        for (statements, tail, parameters, function_id) in &bodies {
             // M26's per-FUNCTION checkpoint: `bodies` is one entry per function
             // with a body, so a cancel lands within one function's move scan.
             // The violations collected so far go with the frame.
             if crate::cancel::cancelled() {
                 return violations;
             }
+            // M134: the scan's mints for this body belong to its item.
+            self.id_windows.set_anchor(*function_id);
             let mut flow = MoveFlow::new();
             for parameter in parameters {
                 if scan.resource_bindings.contains(parameter) {
@@ -16773,21 +16966,23 @@ impl<'src> Analyzer<'src> {
         // Closure bodies are their own roots (a fresh function-like boundary — an
         // enclosing loop does not repeat a closure invocation, so loop depth
         // resets to 0). Captures of OUTER resources are R9's business, below.
-        let closures: Vec<(Vec<Id>, Vec<Id>, Id)> = self
+        let closures: Vec<(Vec<Id>, Vec<Id>, Id, Id)> = self
             .closures
             .iter()
             // M19 T1: a closure is its own root and lives in exactly one body,
             // so it reuses with the source that wrote it.
             .filter(|(closure_id, _)| !self.reusable_entity(**closure_id))
-            .map(|(_, closure)| {
+            .map(|(closure_id, closure)| {
                 (
                     closure.parameters.clone(),
                     closure.parameter_destructures.clone(),
                     closure.return_,
+                    *closure_id,
                 )
             })
             .collect();
-        for (parameters, destructures, return_id) in &closures {
+        for (parameters, destructures, return_id, closure_id) in &closures {
+            self.id_windows.set_anchor(*closure_id);
             let mut flow = MoveFlow::new();
             for binding in parameters.iter().chain(destructures) {
                 if scan.resource_bindings.contains(binding) {
@@ -17154,6 +17349,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Async(_)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -18844,6 +19040,8 @@ impl<'src> Analyzer<'src> {
         let mut seed_memo: HashMap<TypeId, bool> = HashMap::default();
         let all_calls: Vec<Id> = self.function_calls.keys().copied().collect();
         for call_id in all_calls {
+            // M134: R11's mints at this instantiation belong to the call's item.
+            self.id_windows.set_anchor(call_id);
             self.r11_discover(
                 call_id,
                 &empty,
@@ -20189,6 +20387,8 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (subject, impl_id, trait_ids) in implementations {
+            // M134: the admission's mints belong to the impl.
+            self.id_windows.set_anchor(impl_id);
             if !self.type_is_resource(subject) {
                 continue;
             }
@@ -20448,6 +20648,7 @@ impl<'src> Analyzer<'src> {
             Expr::FunctionReturn(None)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -20710,6 +20911,8 @@ impl<'src> Analyzer<'src> {
     fn check_rpc_signatures(&mut self) {
         let checks = std::mem::take(&mut self.rpc_signatures_to_check);
         for (method_name, subject_name, method_id, members) in checks {
+            // M134: the signature check's mints belong to the method's item.
+            self.id_windows.set_anchor(method_id);
             // §9.3/R4: on a `[client_service]` struct every `[rpc]` method is a
             // NOTIFICATION, so the two return-type rules invert — a declared
             // return is refused, and its absence is the only legal spelling.
@@ -22474,8 +22677,11 @@ impl<'src> Analyzer<'src> {
             (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.impl_subject_arguments_match(&left_items, &right_items)
             }
+            // A length binder is a hole like any other (array-lengths.md §5.4):
+            // `[type T; _]` matches `[i32; 3]`, and not the other way.
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                left_length == right_length && self.impl_subject_matches(left_item, right_item)
+                self.impl_subject_matches(left_length, right_length)
+                    && self.impl_subject_matches(left_item, right_item)
             }
             (left, right) => left == right,
         }
@@ -22513,7 +22719,10 @@ impl<'src> Analyzer<'src> {
                     self.collect_subject_binders(item, binders);
                 }
             }
-            Type::Array(item, _) => self.collect_subject_binders(item, binders),
+            Type::Array(item, length) => {
+                self.collect_subject_binders(item, binders);
+                self.collect_subject_binders(length, binders);
+            }
             _ => {}
         }
     }
@@ -23241,7 +23450,8 @@ impl<'src> Analyzer<'src> {
                         .all(|(left, right)| self.bound_argument_agrees(*left, *right, depth + 1))
             }
             (Type::Array(left, left_length), Type::Array(right, right_length)) => {
-                left_length == right_length && self.bound_argument_agrees(*left, *right, depth + 1)
+                self.bound_argument_agrees(*left_length, *right_length, depth + 1)
+                    && self.bound_argument_agrees(*left, *right, depth + 1)
             }
             _ => provided == required,
         }
@@ -25460,6 +25670,12 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_scope_id(&mut self) -> Id {
+        if self.id_windows.on() {
+            let (id, _) = self
+                .id_windows
+                .mint(id_windows::Lane::Scope, &mut self.scope_id);
+            return Id(id);
+        }
         let id = self.scope_id;
         self.scope_id += 1;
         Id(id)
@@ -25581,7 +25797,7 @@ impl<'src> Analyzer<'src> {
         let expansion_scope_id = self.create_owned_scope(Some(module_scope_id)).id;
         self.generated_expansion_scopes
             .insert(expansion_scope_id, module_scope_id);
-        self.walk_expr_nodes(generated, expansion_scope_id);
+        self.walk_module_items(generated, expansion_scope_id);
         for item in generated {
             self.hoist_generated_declarations(&item.0, expansion_scope_id, module_scope_id);
         }
@@ -25727,14 +25943,25 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_type_id(&mut self) -> TypeId {
+        if self.id_windows.on() {
+            let (id, from_counter) = self
+                .id_windows
+                .mint(id_windows::Lane::Type, &mut self.type_id);
+            if from_counter {
+                self.type_id_sources.note(id, self.current_source_id);
+            }
+            // A mint relocated into a window has its row already: the
+            // window's room was padded with its source at close.
+            crate::counters::count_type_slot();
+            return TypeId(id);
+        }
         let id = self.type_id;
         self.type_id += 1;
         // M19 T0: stamp the minting source. The counter is dense and monotone,
         // so the push keeps `type_id_sources` indexed by the id itself — one
         // `u32` per slot, and the only thing that makes `write_type_slot`'s
         // dirty bit attributable to a MODULE rather than to the program.
-        debug_assert_eq!(self.type_id_sources.len(), id as usize);
-        self.type_id_sources.push(self.current_source_id);
+        self.type_id_sources.note(id, self.current_source_id);
         crate::counters::count_type_slot();
         TypeId(id)
     }
@@ -25825,6 +26052,10 @@ impl<'src> Analyzer<'src> {
                 );
             }
             self.type_map_writes += 1;
+            if !self.types_settled {
+                // M110 S5: whose window the rewritten slot sits in.
+                self.id_windows.note_slot_write(type_id);
+            }
             // M19 T0's second addition: the same write, read as an
             // ATTRIBUTION. A world-changing write made after the entry tail
             // opened moved a slot somebody else minted, and if that somebody
@@ -25840,7 +26071,7 @@ impl<'src> Analyzer<'src> {
             // everything past it is the entry's doing. Over-dirtying costs
             // reuse; under-dirtying costs soundness.
             if self.entry_phase
-                && let Some(source) = self.type_id_sources.get(type_id.0 as usize).copied()
+                && let Some(source) = self.type_id_sources.get(type_id.0)
             {
                 self.entry_dirty_sources.insert(source);
             }
@@ -26828,6 +27059,8 @@ impl<'src> Analyzer<'src> {
         // are themselves walk order, so this is source order.
         assignments.sort_unstable_by_key(|(assignment_id, _, _)| assignment_id.0);
         for (assignment_id, target_id, value_id) in assignments {
+            // M134: the synthetic derefs are the assignment's item's (S6 anchor).
+            self.id_windows.set_anchor(assignment_id);
             // The target: a bare view writes *through*, so deref it.
             if !matches!(
                 self.expr_id_to_expr_map.get(&target_id),
@@ -26859,6 +27092,7 @@ impl<'src> Analyzer<'src> {
                     .insert(value_id, Expr::Binary(op, deref_id, rhs_id));
             }
         }
+        self.id_windows.clear_anchor();
     }
 
     /// Mint a synthetic `Dereference` of `operand_id`, carrying its span / scope /
@@ -27297,34 +27531,72 @@ impl<'src> Analyzer<'src> {
                 function.bumps = positions;
             }
         }
-        loop {
-            let mut updates: Vec<(Id, BTreeSet<u32>)> = Vec::new();
-            for function_id in &function_ids {
-                if self.bumps_tabled.contains(function_id) || restored_ids.contains(function_id) {
+        // M127 (Order 50): the seventh worklist as a WORKLIST. Every body is
+        // scanned once; the scan also names the callees whose verdict it read
+        // (`BumpScan::callees`), and only the CALLERS of a function whose
+        // verdict then moved are rescanned. The Jacobi form rescanned every
+        // non-restored body per round (kolt's client leg: 51-102 ms cold,
+        // 31-48 ms on a served keystroke, three to four rounds); the answer is
+        // the same least fixpoint, because the verdicts only grow and a body's
+        // positions depend on nothing but its callees' verdicts.
+        let mut callers_of: HashMap<Id, Vec<Id>> = HashMap::default();
+        let mut moved: Vec<Id> = Vec::new();
+        for function_id in &function_ids {
+            if self.bumps_tabled.contains(function_id) || restored_ids.contains(function_id) {
+                continue;
+            }
+            let (has_body, current) = {
+                let Some(function) = self.functions.get(function_id) else {
                     continue;
-                }
-                let (has_body, current) = {
-                    let Some(function) = self.functions.get(function_id) else {
-                        continue;
-                    };
-                    (function.has_body, function.bumps.clone())
                 };
-                if !has_body {
-                    continue;
+                (function.has_body, function.bumps.clone())
+            };
+            if !has_body {
+                continue;
+            }
+            let mut scan = BumpScan {
+                positions: current.clone(),
+                callees: Vec::new(),
+            };
+            self.collect_bumps_positions(*function_id, &mut scan);
+            for callee in scan.callees {
+                callers_of.entry(callee).or_default().push(*function_id);
+            }
+            if scan.positions != current {
+                if let Some(function) = self.functions.get_mut(function_id) {
+                    function.bumps = scan.positions;
                 }
-                let mut positions = current.clone();
-                self.collect_bumps_positions(*function_id, &mut positions);
-                if positions != current {
-                    updates.push((*function_id, positions));
+                moved.push(*function_id);
+            }
+        }
+        let mut worklist: Vec<Id> = Vec::new();
+        let mut queued: HashSet<Id> = HashSet::default();
+        let enqueue_callers = |callee: Id, worklist: &mut Vec<Id>, queued: &mut HashSet<Id>| {
+            for caller in callers_of.get(&callee).into_iter().flatten() {
+                if queued.insert(*caller) {
+                    worklist.push(*caller);
                 }
             }
-            if updates.is_empty() {
-                break;
-            }
-            for (function_id, positions) in updates {
+        };
+        for function_id in moved {
+            enqueue_callers(function_id, &mut worklist, &mut queued);
+        }
+        while let Some(function_id) = worklist.pop() {
+            queued.remove(&function_id);
+            let current = match self.functions.get(&function_id) {
+                Some(function) => function.bumps.clone(),
+                None => continue,
+            };
+            let mut scan = BumpScan {
+                positions: current.clone(),
+                callees: Vec::new(),
+            };
+            self.collect_bumps_positions(function_id, &mut scan);
+            if scan.positions != current {
                 if let Some(function) = self.functions.get_mut(&function_id) {
-                    function.bumps = positions;
+                    function.bumps = scan.positions;
                 }
+                enqueue_callers(function_id, &mut worklist, &mut queued);
             }
         }
     }
@@ -27367,7 +27639,7 @@ impl<'src> Analyzer<'src> {
 
     /// Scan a function body for the `&mut` parameter positions its bumps, growing
     /// `positions` (the monotone step of `infer_bumps`).
-    fn collect_bumps_positions(&self, function_id: Id, positions: &mut BTreeSet<u32>) {
+    fn collect_bumps_positions(&self, function_id: Id, scan: &mut BumpScan) {
         let Some(function) = self.functions.get(&function_id) else {
             return;
         };
@@ -27375,9 +27647,9 @@ impl<'src> Analyzer<'src> {
         let tail = function.body.1;
         let mut visited = HashSet::default();
         for statement in &statements {
-            self.scan_bumps(*statement, function_id, positions, &mut visited);
+            self.scan_bumps(*statement, function_id, scan, &mut visited);
         }
-        self.scan_bumps(tail, function_id, positions, &mut visited);
+        self.scan_bumps(tail, function_id, scan, &mut visited);
     }
 
     /// Walk one expression, recording any `&mut` parameter of `function_id` that it
@@ -27390,7 +27662,7 @@ impl<'src> Analyzer<'src> {
         &self,
         expr_id: Id,
         function_id: Id,
-        positions: &mut BTreeSet<u32>,
+        scan: &mut BumpScan,
         visited: &mut HashSet<Id>,
     ) {
         if !visited.insert(expr_id) {
@@ -27401,65 +27673,65 @@ impl<'src> Analyzer<'src> {
         };
         match expr {
             Expr::Assignment(target_id, value_id) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
                 if let Some(position) = self.assignment_bumps_position(target_id, function_id) {
-                    positions.insert(position);
+                    scan.positions.insert(position);
                 }
-                self.scan_bumps(target_id, function_id, positions, visited);
+                self.scan_bumps(target_id, function_id, scan, visited);
             }
             Expr::Call(call_id) => {
-                self.call_bumps_positions(call_id, function_id, positions);
+                self.call_bumps_positions(call_id, function_id, scan);
                 if let Some(function_call) = self.function_calls.get(&call_id) {
                     for argument in function_call.argument_ids.clone() {
-                        self.scan_bumps(argument, function_id, positions, visited);
+                        self.scan_bumps(argument, function_id, scan, visited);
                     }
                 }
             }
             Expr::Variable(variable_id) => {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
-                    self.scan_bumps(initial, function_id, positions, visited);
+                    self.scan_bumps(initial, function_id, scan, visited);
                 }
             }
             Expr::Block((statements, tail)) => {
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
             Expr::For(condition, (statements, tail)) => {
                 if let Some(condition) = condition {
-                    self.scan_bumps(condition, function_id, positions, visited);
+                    self.scan_bumps(condition, function_id, scan, visited);
                 }
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
             Expr::ForEach(iterable, _, (statements, tail)) => {
-                self.scan_bumps(iterable, function_id, positions, visited);
+                self.scan_bumps(iterable, function_id, scan, visited);
                 for statement in statements {
-                    self.scan_bumps(statement, function_id, positions, visited);
+                    self.scan_bumps(statement, function_id, scan, visited);
                 }
-                self.scan_bumps(tail, function_id, positions, visited);
+                self.scan_bumps(tail, function_id, scan, visited);
             }
-            Expr::If(branch) => self.scan_bumps_if(&branch, function_id, positions, visited),
+            Expr::If(branch) => self.scan_bumps_if(&branch, function_id, scan, visited),
             Expr::Match(subject_id, legs) => {
-                self.scan_bumps(subject_id, function_id, positions, visited);
+                self.scan_bumps(subject_id, function_id, scan, visited);
                 for leg in legs {
                     if let Some(guard) = leg.guard {
-                        self.scan_bumps(guard, function_id, positions, visited);
+                        self.scan_bumps(guard, function_id, scan, visited);
                     }
-                    self.scan_bumps(leg.body, function_id, positions, visited);
+                    self.scan_bumps(leg.body, function_id, scan, visited);
                 }
             }
             Expr::Closure(inner_id) | Expr::Async(inner_id) => {
                 if let Some(inner) = self.closures.get(&inner_id) {
-                    self.scan_bumps(inner.return_, function_id, positions, visited);
+                    self.scan_bumps(inner.return_, function_id, scan, visited);
                 }
             }
             Expr::Binary(_, lhs, rhs) => {
-                self.scan_bumps(lhs, function_id, positions, visited);
-                self.scan_bumps(rhs, function_id, positions, visited);
+                self.scan_bumps(lhs, function_id, scan, visited);
+                self.scan_bumps(rhs, function_id, scan, visited);
             }
             Expr::Reference(operand, _)
             | Expr::Dereference(operand)
@@ -27471,43 +27743,43 @@ impl<'src> Analyzer<'src> {
             | Expr::TryAssert(operand)
             | Expr::Ascribe(operand)
             | Expr::ArrayLen(operand, _) => {
-                self.scan_bumps(operand, function_id, positions, visited);
+                self.scan_bumps(operand, function_id, scan, visited);
             }
             Expr::Index(subject, index) => {
-                self.scan_bumps(subject, function_id, positions, visited);
-                self.scan_bumps(index, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
+                self.scan_bumps(index, function_id, scan, visited);
             }
             Expr::List(ids) | Expr::Tuple(ids) => {
                 for id in ids {
-                    self.scan_bumps(id, function_id, positions, visited);
+                    self.scan_bumps(id, function_id, scan, visited);
                 }
             }
             Expr::StructInitializer(_, fields) => {
                 for value in fields.values() {
-                    self.scan_bumps(*value, function_id, positions, visited);
+                    self.scan_bumps(*value, function_id, scan, visited);
                 }
             }
             // Expression-carrying forms `scan_move` also walks — a bumping call can
             // hide inside any of these (a lift region's steps carry real calls), so
             // the coverage set mirrors the move scan's, not a shorter list.
             Expr::Destructure(value_id, _) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
             }
             Expr::Repeat(value_id, _) => {
-                self.scan_bumps(value_id, function_id, positions, visited);
+                self.scan_bumps(value_id, function_id, scan, visited);
             }
             Expr::Is(subject, _) => {
-                self.scan_bumps(subject, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
             }
             Expr::Lift(subject, _, continuation) => {
-                self.scan_bumps(subject, function_id, positions, visited);
-                self.scan_bumps(continuation, function_id, positions, visited);
+                self.scan_bumps(subject, function_id, scan, visited);
+                self.scan_bumps(continuation, function_id, scan, visited);
             }
             Expr::LiftRegion(steps, body) => {
                 for (step_id, _, _) in &steps {
-                    self.scan_bumps(*step_id, function_id, positions, visited);
+                    self.scan_bumps(*step_id, function_id, scan, visited);
                 }
-                self.scan_bumps(body, function_id, positions, visited);
+                self.scan_bumps(body, function_id, scan, visited);
             }
             // A comprehension's source and body are executable — a bump inside
             // (`(s in xs => { h.inner = [0]; .. })`) counts like any other.
@@ -27516,9 +27788,9 @@ impl<'src> Analyzer<'src> {
             // list, and the omission read as content-stable, an unsafe default.)
             Expr::TupleComprehension(bindings, body) => {
                 for (_, source) in bindings {
-                    self.scan_bumps(source, function_id, positions, visited);
+                    self.scan_bumps(source, function_id, scan, visited);
                 }
-                self.scan_bumps(body, function_id, positions, visited);
+                self.scan_bumps(body, function_id, scan, visited);
             }
             _ => {}
         }
@@ -27528,25 +27800,25 @@ impl<'src> Analyzer<'src> {
         &self,
         branch: &ExprIfBranch,
         function_id: Id,
-        positions: &mut BTreeSet<u32>,
+        scan: &mut BumpScan,
         visited: &mut HashSet<Id>,
     ) {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.scan_bumps(*condition, function_id, positions, visited);
+                self.scan_bumps(*condition, function_id, scan, visited);
                 for statement in statements {
-                    self.scan_bumps(*statement, function_id, positions, visited);
+                    self.scan_bumps(*statement, function_id, scan, visited);
                 }
-                self.scan_bumps(*tail, function_id, positions, visited);
+                self.scan_bumps(*tail, function_id, scan, visited);
                 if let Some(else_branch) = else_branch {
-                    self.scan_bumps_if(else_branch, function_id, positions, visited);
+                    self.scan_bumps_if(else_branch, function_id, scan, visited);
                 }
             }
             ExprIfBranch::Else((statements, tail)) => {
                 for statement in statements {
-                    self.scan_bumps(*statement, function_id, positions, visited);
+                    self.scan_bumps(*statement, function_id, scan, visited);
                 }
-                self.scan_bumps(*tail, function_id, positions, visited);
+                self.scan_bumps(*tail, function_id, scan, visited);
             }
         }
     }
@@ -27607,14 +27879,19 @@ impl<'src> Analyzer<'src> {
             })
     }
 
-    fn call_bumps_positions(&self, call_id: Id, function_id: Id, positions: &mut BTreeSet<u32>) {
+    fn call_bumps_positions(&self, call_id: Id, function_id: Id, scan: &mut BumpScan) {
         let Some(function_call) = self.function_calls.get(&call_id) else {
             return;
         };
         let argument_ids = function_call.argument_ids.clone();
         let callee_bumps: Option<BTreeSet<u32>> =
             match self.expr_id_to_expr_map.get(&function_call.subject_id) {
-                Some(Expr::Local(callee_id)) => self.callee_bumps_set(callee_id),
+                Some(Expr::Local(callee_id)) => {
+                    // The verdict this scan READ: a change to it re-scans this
+                    // body (`infer_bumps`' worklist).
+                    scan.callees.push(*callee_id);
+                    self.callee_bumps_set(callee_id)
+                }
                 _ => None,
             };
         match callee_bumps {
@@ -27624,7 +27901,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(caller_position) =
                             self.argument_root_mutable_position(*argument_id, function_id)
                     {
-                        positions.insert(caller_position);
+                        scan.positions.insert(caller_position);
                     }
                 }
             }
@@ -27638,7 +27915,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(caller_position) =
                             self.argument_root_mutable_position(*argument_id, function_id)
                     {
-                        positions.insert(caller_position);
+                        scan.positions.insert(caller_position);
                     }
                 }
             }
@@ -29424,7 +29701,7 @@ impl<'src> Analyzer<'src> {
                     _ => "place",
                 };
                 return Some(format!(
-                    "cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                    "cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view, and write `pair.0`"
                 ));
             }
             if !captures.contains(&capture_id) {
@@ -29437,8 +29714,13 @@ impl<'src> Analyzer<'src> {
                         _ => return None,
                     };
                     let place = self.receiver_spelling(operand).unwrap_or("place");
+                    // E290: a tuple's slot is not a payload.
+                    let held = match tuple_leaves.contains(&capture_id) {
+                        true => "the tuple's slots",
+                        false => "the payload",
+                    };
                     Some(format!(
-                        "cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into the payload — match `&mut {place}` to write the payload in place"
+                        "cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into {held} — match `&mut {place}` to write {held} in place"
                     ))
                 }
                 Some(true) => None,
@@ -29462,7 +29744,7 @@ impl<'src> Analyzer<'src> {
     /// was written to make (B528's trap: the old steer led there, and the
     /// write silently did not land).
     fn check_mut_captures_under_view_subjects(&mut self) {
-        let mut refusals: Vec<(Id, &'src str, Option<&'src str>, bool, bool)> = Vec::new();
+        let mut refusals: Vec<(Id, &'src str, Option<&'src str>, bool, TupleLeaf)> = Vec::new();
         for expr in self.expr_id_to_expr_map.values() {
             let (subject_id, patterns): (Id, Vec<&ExprPattern>) = match expr {
                 Expr::Match(subject_id, legs) => {
@@ -29487,29 +29769,36 @@ impl<'src> Analyzer<'src> {
                 Self::collect_payload_captures(pattern, &mut captures);
                 Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
-            // B545: a one-slot tuple leaf is a payload view like any capture;
+            // B545: a one-slot tuple leaf is a view like a payload capture;
             // only a multi-slot one (a reslice, a copy) keeps the tuple steer.
-            let tuple_leaves: Vec<(Id, bool)> = tuple_leaves
+            // E290: and it is a view into a SLOT, which the sentence says.
+            let tuple_leaves: Vec<(Id, TupleLeaf)> = tuple_leaves
                 .into_iter()
-                .map(|capture_id| (capture_id, !self.tuple_leaf_is_one_slot(capture_id)))
+                .map(|capture_id| {
+                    let leaf = match self.tuple_leaf_is_one_slot(capture_id) {
+                        true => TupleLeaf::Slot,
+                        false => TupleLeaf::SubTuple,
+                    };
+                    (capture_id, leaf)
+                })
                 .collect();
-            for (capture_id, in_tuple) in captures
+            for (capture_id, leaf) in captures
                 .into_iter()
-                .map(|capture_id| (capture_id, false))
+                .map(|capture_id| (capture_id, TupleLeaf::Payload))
                 .chain(tuple_leaves)
             {
                 if let Some(variable) = self.variables.get(&capture_id)
                     && variable.mutable
                 {
                     let place = operand.and_then(|operand| self.receiver_spelling(operand));
-                    refusals.push((capture_id, variable.name, place, mutable, in_tuple));
+                    refusals.push((capture_id, variable.name, place, mutable, leaf));
                 }
             }
         }
         refusals.sort_unstable_by_key(|(capture_id, ..)| capture_id.0);
-        for (capture_id, name, place, mutable, in_tuple) in refusals {
+        for (capture_id, name, place, mutable, leaf) in refusals {
             let place = place.unwrap_or("place");
-            if in_tuple {
+            if leaf == TupleLeaf::SubTuple {
                 // B545: a multi-slot tuple leaf is a copy under any subject;
                 // `mut` on it under a view subject reads as the in-place write
                 // it is not.
@@ -29519,17 +29808,21 @@ impl<'src> Analyzer<'src> {
                         note: None,
                         span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                            "`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view, and write `pair.0`"
                         ),
                     },
                     capture_id,
                 );
                 continue;
             }
+            let (held, holds) = match leaf {
+                TupleLeaf::Slot => ("the tuple's slot", "the tuple's slots"),
+                _ => ("the payload", "the payload"),
+            };
             let (subject, steer) = if mutable {
                 (
                     format!("&mut {place}"),
-                    format!("bind `let {name}` to write the payload in place"),
+                    format!("bind `let {name}` to write {held} in place"),
                 )
             } else {
                 (
@@ -29543,7 +29836,7 @@ impl<'src> Analyzer<'src> {
                     note: None,
                     span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
-                        "`mut {name}` would bind a COPY of the payload, but this matches a view (`{subject}`), whose captures are views into the payload: {steer}, and write `*{name}` where a copy is wanted"
+                        "`mut {name}` would bind a COPY of {held}, but this matches a view (`{subject}`), whose captures are views into {holds}: {steer}, and write `*{name}` where a copy is wanted"
                     ),
                 },
                 capture_id,
@@ -33864,7 +34157,11 @@ impl<'src> Analyzer<'src> {
         let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().collect();
         type_ids
             .into_iter()
-            .filter(|type_id| self.type_is_resource(*type_id))
+            .filter(|type_id| {
+                // M134: a classification's mints belong to the type's item.
+                self.id_windows.set_check_anchor_type(*type_id);
+                self.type_is_resource(*type_id)
+            })
             .collect()
     }
 
@@ -33936,6 +34233,7 @@ impl<'src> Analyzer<'src> {
             .map(|(parameter_id, parameter)| (*parameter_id, parameter.name, parameter.type_id))
             .collect();
         for (parameter_id, name, type_id) in mutable_parameters {
+            self.id_windows.set_anchor(parameter_id);
             if self.type_is_resource(type_id) {
                 resource_rejections.push((parameter_id, name));
                 continue;
@@ -35711,6 +36009,11 @@ impl<'src> Analyzer<'src> {
                     &parameter.bounds,
                     scope_id,
                 );
+                // array-lengths.md §5.1: `<const N>` is a LENGTH parameter — an
+                // ordinary generic whose kind is a length.
+                if parameter.is_const {
+                    self.length_parameters.insert(constraint_type_id);
+                }
                 // A tuple bound (`T: (2..: Display)`) records against the same
                 // constraint id; the element bound walks now and resolves at
                 // check time, like trait bounds.
@@ -36462,7 +36765,7 @@ impl<'src> Analyzer<'src> {
                 })
             }
             (Type::Array(wanted, wanted_length), Type::Array(got, got_length))
-                if wanted_length == got_length =>
+                if self.array_lengths_agree(*wanted_length, *got_length) =>
             {
                 let got = got.get_type(self);
                 self.annotation_admits(*wanted, &got, depth + 1)
@@ -36692,6 +36995,16 @@ impl<'src> Analyzer<'src> {
     /// one site as constraints settle, and a refusal pushed on every pass
     /// would tell the reader the same thing a dozen times.
     fn refuse_dyn_narrowing(&mut self, expr_id: Id, constraint: &Type, inferred: &Type) {
+        // B601: a reference (`let square: Square = shape`) is typed by typing
+        // what it names under the same constraint, so the BINDING's entity
+        // met this seam too and the one mistake was refused twice at one
+        // span. The reference is the site (B5: one diagnostic per mistake).
+        if matches!(
+            self.expr_id_to_expr_map.get(&expr_id),
+            Some(Expr::Variable(_))
+        ) {
+            return;
+        }
         if !self.dyn_refusals_reported.insert(expr_id) {
             return;
         }
@@ -36700,16 +37013,17 @@ impl<'src> Analyzer<'src> {
         };
         let object = self.pretty_print_type(inferred, &HashMap::default());
         let expected = self.pretty_print_type(constraint, &HashMap::default());
+        let msg = format!(
+            "Expected {expected}, but got {object} instead: an object does not narrow back \
+             to the type it erased. `dyn` is where the concrete type went — the program \
+             cannot ask for it again — so a value that must stay a {expected} is held as \
+             one, or taken through a generic bound"
+        );
         self.diagnostics.push(Error {
             trace: Vec::new(),
             note: None,
             span,
-            msg: format!(
-                "Expected {expected}, but got {object} instead: an object does not narrow back \
-                 to the type it erased. `dyn` is where the concrete type went — the program \
-                 cannot ask for it again — so a value that must stay a {expected} is held as \
-                 one, or taken through a generic bound"
-            ),
+            msg,
         });
     }
 
@@ -36962,6 +37276,7 @@ impl<'src> Analyzer<'src> {
             | Type::Void
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Unknown
             | Type::Unresolved => false,
         }
@@ -37254,6 +37569,30 @@ impl<'src> Analyzer<'src> {
                     false => self.declared_generic_constraint_ids(subject_name, scope_id),
                 };
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
+                    // array-lengths.md §4: `const N` at a `const` parameter's
+                    // position binds the length, aliasing the declaration's own
+                    // parameter as a bare `type T` does (B77).
+                    if let Node::LengthBinder((binder_name, binder_span)) = &argument.0 {
+                        let inherited_constraint = inherited
+                            .as_ref()
+                            .and_then(|ids| ids.get(position).copied());
+                        let constraint_id = match inherited_constraint {
+                            Some(constraint_id) => {
+                                self.register_generic_parameter(
+                                    binder_name,
+                                    binder_span,
+                                    constraint_id,
+                                    scope_id,
+                                );
+                                constraint_id
+                            }
+                            None => self.register_binder(binder_name, binder_span, &[], scope_id),
+                        };
+                        self.length_parameters.insert(constraint_id);
+                        self.registered_length_binders
+                            .insert((self.current_source_id, *binder_span));
+                        continue;
+                    }
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.
                     if let Node::TypeBinder((binder_name, binder_span), bounds, None) = &argument.0
@@ -37263,6 +37602,21 @@ impl<'src> Analyzer<'src> {
                             .as_ref()
                             .and_then(|ids| ids.get(position).copied())
                         {
+                            // array-lengths.md §4: a `const` parameter's position
+                            // takes `const N` or `_`, never a TYPE binder.
+                            if *binder_name != ANONYMOUS_TYPE_BINDER
+                                && self.length_parameters.contains(&constraint_id)
+                            {
+                                self.diagnostics.push(Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: argument.1,
+                                    msg: format!(
+                                        "this position is a length parameter, so its binder is \
+                                         `const {binder_name}`, not `type {binder_name}`"
+                                    ),
+                                });
+                            }
                             self.register_generic_parameter(
                                 binder_name,
                                 binder_span,
@@ -37315,11 +37669,30 @@ impl<'src> Analyzer<'src> {
             }
             // B582 (array-lengths.md §11, S0): a fixed array's ELEMENT binds
             // like a tuple's — `impl [type T; 3] with Count` declares `T`, and
-            // selection already binds through an array's element
-            // (`impl_select::bind_subject`'s `Type::Array` arm). The length is a
-            // literal; a length binder is the paper's S2.
-            Node::ArrayType(element, _) => {
+            // selection binds through an array's element
+            // (`impl_select::bind_subject`'s `Type::Array` arm).
+            //
+            // S2: so does its LENGTH. `_` and `const N` in the length position
+            // are binders (the parser reads them as the element position's
+            // `TypeBinder`), registered as an unbounded generic whose KIND is a
+            // length: `[type T; _]` is `[type T; const N]` with the name
+            // declined, as B294's `_` is `type T`'s.
+            Node::ArrayType(element, length) => {
                 self.register_subject_binders(element, scope_id);
+                if let Node::TypeBinder((name, name_span), _, _)
+                | Node::LengthBinder((name, name_span)) = &length.0
+                {
+                    let constraint_type_id = self.register_binder(name, name_span, &[], scope_id);
+                    self.length_parameters.insert(constraint_type_id);
+                    self.registered_length_binders
+                        .insert((self.current_source_id, *name_span));
+                    self.withdraw_anonymous_binder_name(
+                        name,
+                        name_span,
+                        constraint_type_id,
+                        scope_id,
+                    );
+                }
             }
             _ => {}
         }
@@ -38062,24 +38435,339 @@ impl<'src> Analyzer<'src> {
         scope.name_to_id_map.insert("Self", self_id);
     }
 
-    /// The compile-time length of a `[T; n]` type or `[value; n]` literal — a
-    /// non-negative integer literal in v1 (a `const`-named length is deferred).
-    /// Emits an error and returns 0 (harmlessly failing the compile) otherwise.
-    fn array_length_literal(&mut self, node: &Spanned<Node<'src>>) -> usize {
-        if let Node::Number(whole, None, _) = &node.0
-            && let Ok(length) = whole.parse::<usize>()
-        {
-            return length;
-        }
+    /// The compile-time length of a `[T; n]` type, a `[value; n]` literal or a
+    /// number written as a generic argument: a non-negative integer literal,
+    /// unsuffixed or `usize` (array-lengths.md §5.6 — a length is a count).
+    /// Anything else is refused with what a length may be, and answers `None`:
+    /// the caller types the length `Unresolved`, so no second error follows
+    /// from a stand-in number.
+    fn array_length_literal(&mut self, node: &Spanned<Node<'src>>) -> Option<usize> {
+        let message = match &node.0 {
+            Node::Number(whole, None, None | Some("usize")) => match whole.parse::<usize>() {
+                Ok(length) => return Some(length),
+                Err(_) => format!("`{whole}` is too large for an array length"),
+            },
+            Node::Number(whole, fraction, suffix) => {
+                let fraction = fraction
+                    .map(|fraction| format!(".{fraction}"))
+                    .unwrap_or_default();
+                let suffix = suffix.unwrap_or_default();
+                format!(
+                    "an array length is a count: write it as a whole number, unsuffixed or \
+                     `usize` (`3`, `3usize`), not `{whole}{fraction}{suffix}`"
+                )
+            }
+            _ => "an array length is a number, a length parameter (`<const N>`), or a name \
+                  bound to a number (`const let SIZE = 4;`); this one needs evaluating, and \
+                  const evaluation runs after the program is typed"
+                .to_string(),
+        };
         self.diagnostics.push(Error {
             trace: Vec::new(),
             note: None,
             span: node.1,
-            msg: "an array length must be a non-negative integer literal \
-                  (a `const` length is not supported yet)"
-                .to_string(),
+            msg: message,
         });
-        0
+        None
+    }
+
+    /// The number a NAMED length stands for (array-lengths.md §6, S4): an
+    /// immutable binding — `let` or `const let`, at any scope the name
+    /// resolves in, imported included — whose initializer is an integer
+    /// literal (unsuffixed or `usize`) or another such name. Read
+    /// syntactically, the way `const_eval::classify` draws its literal line,
+    /// so a length is known before the fixpoint. A chain that comes back to
+    /// itself is refused, and so is anything that would need evaluating.
+    fn named_length(&self, binding: Id, name: &str) -> Result<usize, String> {
+        let mut current = binding;
+        let mut current_name = name;
+        let mut seen: Vec<Id> = Vec::new();
+        loop {
+            if self.parameters.contains_key(&current) {
+                return Err(format!(
+                    "`{current_name}` is a parameter, a value known only when the function \
+                     runs; an array length is a number, a length parameter (`<const N>`), or \
+                     a name bound to a number"
+                ));
+            }
+            let Some(variable) = self.variables.get(&current) else {
+                return Err(format!(
+                    "`{current_name}` is not a length; an array length is a number, a length \
+                     parameter (`<const N>`), or a name bound to a number"
+                ));
+            };
+            if variable.mutable {
+                return Err(format!(
+                    "`{current_name}` is `mut`, so its value can change; a length is fixed — \
+                     bind it with `let` or `const let` to a number"
+                ));
+            }
+            if seen.contains(&current) {
+                return Err(format!("`{name}`'s length refers back to itself"));
+            }
+            seen.push(current);
+            let Some(initial) = variable.initial else {
+                return Err(format!("`{current_name}` has no value to be a length"));
+            };
+            match self.expr_id_to_expr_map.get(&initial) {
+                Some(Expr::Number(whole, None, None | Some("usize"))) => {
+                    return whole
+                        .parse::<usize>()
+                        .map_err(|_| format!("`{whole}` is too large for an array length"));
+                }
+                Some(Expr::Number(whole, fraction, suffix)) => {
+                    let fraction = fraction
+                        .map(|fraction| format!(".{fraction}"))
+                        .unwrap_or_default();
+                    let suffix = suffix.unwrap_or_default();
+                    return Err(format!(
+                        "`{current_name}` is `{whole}{fraction}{suffix}`, and an array length is \
+                         a count: bind it to a whole number, unsuffixed or `usize`"
+                    ));
+                }
+                Some(Expr::Local(next)) => {
+                    current = *next;
+                    current_name = self
+                        .variables
+                        .get(next)
+                        .map(|next| next.name)
+                        .or_else(|| self.parameters.get(next).map(|next| next.name))
+                        .unwrap_or(current_name);
+                }
+                _ => {
+                    return Err(format!(
+                        "an array length is a number, a length parameter (`<const N>`), or a \
+                         name bound to a number; `{current_name}`'s initializer needs \
+                         evaluating, and const evaluation runs after the program is typed — \
+                         bind it to a literal (`const let` keeps it compile-time)"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The type id of an array LENGTH as written in a `[T; n]` type or a
+    /// `[value; n]` literal (array-lengths.md §3, R2, and §4's grammar):
+    ///
+    /// - a number mints a `Type::Length`;
+    /// - a binder (`_`, `const N`) is the generic its impl subject registered,
+    ///   walked as the element position's binder is — and refused where no
+    ///   subject registered it (B294's rule: a binder is introduced in an impl
+    ///   subject or a generic list, nowhere else);
+    /// - a name (`N`) is walked as a type name and resolves with the others;
+    ///   the `prepped_type_locals` drain holds it to the length kind.
+    fn walk_array_length(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        match &node.0 {
+            Node::TypeBinder((name, name_span), _, _) | Node::LengthBinder((name, name_span)) => {
+                let registered = if *name == ANONYMOUS_TYPE_BINDER {
+                    self.anonymous_binder_parameters
+                        .contains_key(&(self.current_source_id, *name_span))
+                } else {
+                    self.registered_length_binders
+                        .contains(&(self.current_source_id, *name_span))
+                };
+                if !registered {
+                    let written = match *name == ANONYMOUS_TYPE_BINDER {
+                        true => "`_`".to_string(),
+                        false => format!("`const {name}`"),
+                    };
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: format!(
+                            "{written} introduces a length parameter, and only an `impl` \
+                             subject introduces one this way (`impl [type T; _]`, \
+                             `impl [type T; const N]`); write the length here as a number"
+                        ),
+                    });
+                    return Type::Unresolved.get_type_id(self);
+                }
+                let length = self.walk_type_node(node, scope_id);
+                self.length_position_type_ids.insert(length);
+                length
+            }
+            Node::Accessor(_) => {
+                let length = self.walk_type_node(node, scope_id);
+                self.length_position_type_ids.insert(length);
+                length
+            }
+            _ => match self.array_length_literal(node) {
+                Some(length) => self.length_type_id(length),
+                None => Type::Unresolved.get_type_id(self),
+            },
+        }
+    }
+
+    /// The kind check of one GENERIC ARGUMENT against the parameter it binds
+    /// (array-lengths.md §4): a `const` parameter takes a number or a length
+    /// parameter, and a type parameter takes no length. `None` when they agree,
+    /// or when the argument is still indeterminate (another diagnostic's).
+    fn generic_argument_kind_error(
+        &self,
+        parameter: TypeId,
+        parameter_name: &str,
+        argument: TypeId,
+    ) -> Option<String> {
+        let argument_type = self.type_id_to_type_map.get(&argument)?;
+        let argument_is_a_length = match argument_type {
+            Type::Length(_) => true,
+            Type::Generic(constraint_id) => self.length_parameters.contains(constraint_id),
+            Type::Any | Type::Unknown | Type::Unresolved => return None,
+            _ => false,
+        };
+        let rendered = self.pretty_print_type(argument_type, &HashMap::default());
+        match (
+            self.length_parameters.contains(&parameter),
+            argument_is_a_length,
+        ) {
+            (true, false) => Some(format!(
+                "`{parameter_name}` is a length parameter: give it a number (`<4>`) or another \
+                 length parameter, not the type `{rendered}`"
+            )),
+            (false, true) => Some(format!(
+                "`{rendered}` is a length, and `{parameter_name}` takes a type"
+            )),
+            _ => None,
+        }
+    }
+
+    /// The call-site half of [`Self::generic_argument_kind_error`]: every
+    /// call that WROTE generic arguments (recorded by the walk — a handful in
+    /// any program), against its callee's parameters.
+    fn check_call_generic_argument_kinds(&mut self) {
+        let mut refusals = Vec::new();
+        for call_id in &self.calls_writing_generics {
+            let Some(function_call) = self.function_calls.get(call_id) else {
+                continue;
+            };
+            let Some(Expr::Local(callee)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let Some(function) = self.functions.get(callee) else {
+                continue;
+            };
+            let names: Vec<&str> = self
+                .declared_generic_parameters
+                .get(callee)
+                .map(|declared| declared.iter().map(|parameter| parameter.name).collect())
+                .unwrap_or_default();
+            for (index, (parameter, argument)) in function
+                .generic_parameter_constraint_ids
+                .iter()
+                .zip(&function_call.generic_argument_ids)
+                .enumerate()
+            {
+                let name = names.get(index).copied().unwrap_or("_");
+                if let Some(message) = self.generic_argument_kind_error(*parameter, name, *argument)
+                {
+                    refusals.push((function_call.id, function_call.arguments_span, message));
+                }
+            }
+        }
+        for (call_id, arguments_span, message) in refusals {
+            let diagnostics_before = self.diagnostics.len();
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: self.clamp_span_to_first_line(arguments_span, call_id),
+                msg: message,
+            });
+            if let Some(source) = self.source_of_id(call_id) {
+                self.attribute_new_diagnostics(diagnostics_before, source);
+            }
+        }
+    }
+
+    /// One written GENERIC ARGUMENT, walked as a type. A bare name there may
+    /// name a length parameter (`Slots<N>`, `zeros<N>()`, array-lengths.md
+    /// §4) — whether it may is the PARAMETER's kind, which the application's
+    /// own check reads — so its slot is recorded and the drain's "a length is
+    /// not a type" refusal passes it by.
+    fn walk_generic_argument(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        let type_id = self.walk_type_node(node, scope_id);
+        if matches!(node.0, Node::Accessor(_)) {
+            self.generic_argument_type_ids.insert(type_id);
+        }
+        type_id
+    }
+
+    /// The kind check of a name the `prepped_type_locals` drain resolved
+    /// (array-lengths.md §3): a length parameter stands only in a length
+    /// position, and a length position holds only a length parameter (a
+    /// number never reaches the drain). `None` when the kinds agree.
+    fn length_kind_error(
+        &self,
+        type_id: TypeId,
+        subject_type: &Type,
+        name: &str,
+    ) -> Option<String> {
+        let names_a_length = matches!(
+            subject_type,
+            Type::Generic(constraint_id) if self.length_parameters.contains(constraint_id)
+        );
+        if names_a_length && self.generic_argument_type_ids.contains(&type_id) {
+            return None;
+        }
+        match (
+            self.length_position_type_ids.contains(&type_id),
+            names_a_length,
+        ) {
+            (true, false) => Some(format!(
+                "`{name}` is not a length; an array length is a number, a length parameter \
+                 (`<const N>`), or a name bound to a number"
+            )),
+            (false, true) => Some(format!(
+                "`{name}` is a length, not a type; it may stand only where an array's \
+                 length does (`[T; {name}]`)"
+            )),
+            _ => None,
+        }
+    }
+
+    /// A fresh id holding the length `length`. Lengths are minted like every
+    /// other type (never interned, see `type_id_for_type`); the derived
+    /// equality of `Type::Length` is what makes two of them the same length.
+    fn length_type_id(&mut self, length: usize) -> TypeId {
+        self.type_id_for_type(Type::Length(length))
+    }
+
+    /// An array length id through `substitution`: a length parameter the
+    /// substitution binds is what it is bound to, and every other length is
+    /// handed back AS IS — a `Type::Length` never changes under substitution,
+    /// so it is never re-minted (the element's walk mints; the length's does
+    /// not, which keeps a substituted array's ids where they were).
+    fn substitute_length(&self, length: TypeId, substitution: &SubstitutionContext) -> TypeId {
+        let mut current = length;
+        // A chain of length parameters bound to one another is short; the
+        // bound guards a self-binding (`N -> N`) the way `resolve_type_id` does.
+        for _ in 0..8 {
+            let Some(Type::Generic(constraint)) = self.type_id_to_type_map.get(&current) else {
+                return current;
+            };
+            match substitution.get(constraint) {
+                Some(bound) if *bound != current => current = *bound,
+                _ => return current,
+            }
+        }
+        current
+    }
+
+    /// Whether two array length ids are the same length, read without a
+    /// substitution: two equal numbers, or one length parameter on both
+    /// sides. (The comparators that read a parameter as a HOLE recurse into
+    /// the length as a type argument instead.)
+    fn array_lengths_agree(&self, left: TypeId, right: TypeId) -> bool {
+        left == right
+            || match (
+                self.type_id_to_type_map.get(&left),
+                self.type_id_to_type_map.get(&right),
+            ) {
+                (Some(Type::Length(left)), Some(Type::Length(right))) => left == right,
+                (Some(Type::Generic(left)), Some(Type::Generic(right))) => left == right,
+                _ => false,
+            }
     }
 
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
@@ -38393,7 +39081,7 @@ impl<'src> Analyzer<'src> {
                 None
             }
             // `type X` binders only appear in type position (impl subjects).
-            Node::TypeBinder(..) => Some(Expr::Error),
+            Node::TypeBinder(..) | Node::LengthBinder(_) => Some(Expr::Error),
             Node::Index(subject, index) => {
                 let subject_id = self.walk_expr_node(subject, scope_id);
                 let index_id = self.walk_expr_node(index, scope_id);
@@ -38480,10 +39168,13 @@ impl<'src> Analyzer<'src> {
                                     .as_ref()
                                     .map(|x| {
                                         x.0.iter()
-                                            .map(|y| self.walk_type_node(y, scope_id))
+                                            .map(|y| self.walk_generic_argument(y, scope_id))
                                             .collect()
                                     })
                                     .unwrap_or_else(Vec::new);
+                                if !generic_argument_ids.is_empty() {
+                                    self.calls_writing_generics.push(id);
+                                }
                                 self.written_call_arguments.push((
                                     id,
                                     subject_id,
@@ -38598,7 +39289,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::Repeat(value, length_node) => {
                 let value_id = self.walk_expr_node(value, scope_id);
-                let length = self.array_length_literal(length_node);
+                let length = self.walk_array_length(length_node, scope_id);
                 Some(Expr::Repeat(value_id, length))
             }
             Node::ArrayType(..) => {
@@ -39262,10 +39953,13 @@ impl<'src> Analyzer<'src> {
                     .as_ref()
                     .map(|x| {
                         x.0.iter()
-                            .map(|y| self.walk_type_node(y, scope_id))
+                            .map(|y| self.walk_generic_argument(y, scope_id))
                             .collect()
                     })
                     .unwrap_or_else(Vec::new);
+                if !generic_argument_ids.is_empty() {
+                    self.calls_writing_generics.push(id);
+                }
                 // E189: bank the argument entities as the WALK saw them,
                 // beside the subject above. `function_calls` records the same
                 // list, but only for a call that RESOLVED, so a closure
@@ -39830,7 +40524,7 @@ impl<'src> Analyzer<'src> {
                     .as_ref()
                     .map(|x| {
                         x.0.iter()
-                            .map(|y| self.walk_type_node(y, scope_id))
+                            .map(|y| self.walk_generic_argument(y, scope_id))
                             .collect()
                     })
                     .unwrap_or_else(Vec::new);
@@ -40844,7 +41538,7 @@ impl<'src> Analyzer<'src> {
                     let argument_type_ids = generic_arguments
                         .0
                         .iter()
-                        .map(|argument| self.walk_type_node(argument, body_scope_id))
+                        .map(|argument| self.walk_generic_argument(argument, body_scope_id))
                         .collect();
                     (Some(*name), argument_type_ids)
                 }
@@ -42123,6 +42817,28 @@ impl<'src> Analyzer<'src> {
                 let expected = expected_type_id.get_type(self);
                 let element_type_id = match expected {
                     Type::Array(element_id, length) => {
+                        // A length that was already refused says nothing more.
+                        if matches!(
+                            self.type_id_to_type_map.get(&length),
+                            Some(Type::Unresolved)
+                        ) {
+                            return None;
+                        }
+                        let Some(length) = self.type_id_to_type_map.array_length(length) else {
+                            let length =
+                                self.pretty_print_type(&length.get_type(self), &HashMap::default());
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: *span,
+                                msg: format!(
+                                    "a destructuring needs the array's length, and this \
+                                     array's is the length parameter `{length}`; index it \
+                                     (`values[0]`) or walk it with `for`"
+                                ),
+                            });
+                            return None;
+                        };
                         if length != patterns.len() {
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
@@ -42274,7 +42990,7 @@ impl<'src> Analyzer<'src> {
                 let argument_type_ids: Vec<TypeId> = generic_arguments
                     .0
                     .iter()
-                    .map(|argument| self.walk_type_node(argument, scope_id))
+                    .map(|argument| self.walk_generic_argument(argument, scope_id))
                     .collect();
                 // R10 (destruction.md §4): a written generic type application is a
                 // candidate for the native-container / external-generic resource
@@ -42321,6 +43037,38 @@ impl<'src> Analyzer<'src> {
             // annotation, a field, a parameter): it falls through to the same
             // name resolution every other type spelling takes, which refuses it
             // and says what `_` is for.
+            // `const N` (array-lengths.md §4): the length binder an impl
+            // subject registered, resolved by name as a named `type T` is; one
+            // written where no subject declared it is refused (B294's rule).
+            Node::LengthBinder((name, name_span)) => {
+                if self
+                    .registered_length_binders
+                    .contains(&(self.current_source_id, *name_span))
+                {
+                    self.length_position_type_ids.insert(type_id);
+                    self.prepped_type_locals.push((
+                        type_id,
+                        name,
+                        scope_id,
+                        *name_span,
+                        Vec::new(),
+                        self.current_source_id,
+                    ));
+                    None
+                } else {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: format!(
+                            "`const {name}` introduces a length parameter, and only an `impl` \
+                             subject introduces one this way (`impl [type T; _]`, \
+                             `impl [type T; const N]`); write the length here as a number"
+                        ),
+                    });
+                    Some(Type::Unresolved)
+                }
+            }
             Node::TypeBinder((name, name_span), _bounds, _) => {
                 match self
                     .anonymous_binder_parameters
@@ -42356,7 +43104,7 @@ impl<'src> Analyzer<'src> {
                 let argument_type_ids: Vec<TypeId> = generic_arguments
                     .iter()
                     .flat_map(|arguments| &arguments.0)
-                    .map(|argument| self.walk_type_node(argument, scope_id))
+                    .map(|argument| self.walk_generic_argument(argument, scope_id))
                     .collect();
                 if generic_arguments.is_some() {
                     // R10 (destruction.md §4), as on the unqualified form: a
@@ -42567,9 +43315,16 @@ impl<'src> Analyzer<'src> {
             // is an integer literal (v1) resolved to a `usize`.
             Node::ArrayType(element, length) => {
                 let element_type_id = self.walk_type_node(element, scope_id);
-                let length = self.array_length_literal(length);
+                let length = self.walk_array_length(length, scope_id);
                 Some(Type::Array(element_type_id, length))
             }
+            // array-lengths.md §4: a NUMBER as a generic argument is a length
+            // (`zeros<4>()`, `Ring<i32, 4>`); the parameter it lands on must be
+            // a `const` one, which the kind checks hold it to.
+            Node::Number(..) => Some(
+                self.array_length_literal(node)
+                    .map_or(Type::Unresolved, Type::Length),
+            ),
             // A parse-recovery hole (B142's depth stand-in is the one
             // type-position producer): the parser already reported it, so the
             // type degrades to the non-cascading `Unresolved` without a second
@@ -43109,8 +43864,9 @@ impl<'src> Analyzer<'src> {
                     self.collect_residual_generics(&item.get_type(self), out);
                 }
             }
-            Type::Array(element, _) => {
+            Type::Array(element, length) => {
                 self.collect_residual_generics(&element.get_type(self), out);
+                self.collect_residual_generics(&length.get_type(self), out);
             }
             _ => {}
         }
@@ -43137,14 +43893,22 @@ impl<'src> Analyzer<'src> {
             Type::Tuple(items, _) => items
                 .iter()
                 .all(|item| self.type_is_fully_determined(&item.get_type(self))),
-            Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
+            Type::Array(element_id, length_id) => {
+                self.type_is_fully_determined(&element_id.get_type(self))
+                    && self.type_is_fully_determined(&length_id.get_type(self))
+            }
             Type::Closure(parameter_ids, return_id, _, _) => {
                 parameter_ids
                     .iter()
                     .all(|parameter| self.type_is_fully_determined(&parameter.get_type(self)))
                     && self.type_is_fully_determined(&return_id.get_type(self))
             }
-            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+            Type::Any
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void
+            | Type::Length(_) => true,
         }
     }
 
@@ -43742,7 +44506,8 @@ impl<'src> Analyzer<'src> {
             | Type::Mapped(..)
             | Type::Function(_)
             | Type::Module(_)
-            | Type::Void => false,
+            | Type::Void
+            | Type::Length(_) => false,
         }
     }
 
@@ -44041,6 +44806,40 @@ impl<'src> Analyzer<'src> {
     /// by the non-empty path whose elements did not type (B305: the same
     /// erasure, manufactured for `[x]` over a closure parameter nothing had
     /// filled yet).
+    /// B599: a payload-less variant of a generic enum that answered a HOLE per
+    /// parameter (B357: nothing named its arguments) answers the SAME holes at
+    /// the same use site every time ([`Analyzer::variant_use_holes`]). `None`
+    /// when `subject` is not that answer.
+    fn stable_variant_use_holes(
+        &mut self,
+        use_id: Id,
+        subject_id: Id,
+        subject: &Type,
+    ) -> Option<Type> {
+        let Type::Enum(enum_id, arguments) = subject else {
+            return None;
+        };
+        if arguments.is_empty()
+            || !matches!(
+                self.expr_id_to_expr_map.get(&subject_id),
+                Some(Expr::EnumVariant(variant_enum_id, _)) if variant_enum_id == enum_id
+            )
+            || !arguments
+                .iter()
+                .all(|argument| matches!(argument.borrow_type(self), Type::Unknown))
+        {
+            return None;
+        }
+        if let Some(holes) = self.variant_use_holes.get(&use_id) {
+            if holes.len() == arguments.len() {
+                return Some(Type::Enum(*enum_id, holes.clone()));
+            }
+            return None;
+        }
+        self.variant_use_holes.insert(use_id, arguments.clone());
+        None
+    }
+
     fn list_literal_element_slot(&mut self, literal_id: Id) -> TypeId {
         if let Some(slot) = self.list_element_slots.get(&literal_id).copied() {
             return slot;
@@ -45412,7 +46211,22 @@ impl<'src> Analyzer<'src> {
                 // is inferred against `T`. (`[a, b, c]` is otherwise a `List`.)
                 if let Type::Array(element_type_id, length) = constraint.as_ref() {
                     let element_type = element_type_id.get_type(self);
-                    if item_ids.len() != *length && self.reported_literal_errors.insert(expr_id) {
+                    // A length parameter the site is still inferring
+                    // (array-lengths.md §5.2: `total([1, 2, 3])` against
+                    // `[i32; N]`) takes the literal's COUNT — the literal's type
+                    // carries its own length, and the call binds `N` from it. A
+                    // bound one (or a number) is checked against the count.
+                    let expected_length = self
+                        .type_id_to_type_map
+                        .array_length(self.substitute_length(*length, substitution_context));
+                    let length = match expected_length {
+                        Some(_) => *length,
+                        None => self.length_type_id(item_ids.len()),
+                    };
+                    if let Some(length) = expected_length
+                        && item_ids.len() != length
+                        && self.reported_literal_errors.insert(expr_id)
+                    {
                         self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -45422,6 +46236,16 @@ impl<'src> Analyzer<'src> {
                             ),
                         });
                     }
+                    // A literal at an OPEN element (`first(["a", "b", "c"])`
+                    // against `fun first<T>(values: [T; 3])`) types by its
+                    // items, the way it takes its own count at an open length:
+                    // answered with the constraint's own `T`, the call bound
+                    // `T` to itself and nothing grounded it (natively an
+                    // "unbound generic type parameter"; JS never asked).
+                    let substituted_element =
+                        self.substitute_type(&element_type, substitution_context);
+                    let element_is_open = !self.type_is_fully_determined(&substituted_element);
+                    let mut literal_element: Option<Type> = None;
                     for item_id in &item_ids {
                         let item_type = self.infer_type_inner(
                             *item_id,
@@ -45431,6 +46255,14 @@ impl<'src> Analyzer<'src> {
                         );
                         if matches!(item_type, Type::Unresolved) {
                             return Type::Unresolved;
+                        }
+                        if element_is_open {
+                            literal_element = Some(match literal_element.take() {
+                                None => item_type.clone(),
+                                Some(previous) => self
+                                    .reconcile_type(&previous, &item_type, substitution_context)
+                                    .map_or(previous, |(unified, _)| unified),
+                            });
                         }
                         // Each element must actually BE a `T` — the constraint
                         // directs inference but doesn't enforce, and this arm
@@ -45452,7 +46284,13 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                     }
-                    return Type::Array(*element_type_id, *length);
+                    let element_type_id = match literal_element {
+                        Some(element) if self.type_is_fully_determined(&element) => {
+                            element.get_type_id(self)
+                        }
+                        _ => *element_type_id,
+                    };
+                    return Type::Array(element_type_id, length);
                 }
                 if item_ids.is_empty() {
                     return match self.primitive_struct_ids.get("List").copied() {
@@ -45600,6 +46438,15 @@ impl<'src> Analyzer<'src> {
                             && self.type_is_fully_determined(expected)
                     })
                     .cloned();
+                // B592: and a FIXED ARRAY element type directs a list literal
+                // element to elaborate as that array (`[[1, 2], [3, 4]]`
+                // against `List<[i32; 2]>`), as the array literal arm does one
+                // level down — the one expectation that changes what a literal
+                // IS, not merely how it is typed.
+                let array_literal_element = seeded_element
+                    .as_ref()
+                    .filter(|expected| matches!(expected, Type::Array(..)))
+                    .cloned();
                 let mut element_type = match seeded_element {
                     Some(expected @ Type::Dyn(..)) => expected,
                     _ => Type::Unknown,
@@ -45617,6 +46464,15 @@ impl<'src> Analyzer<'src> {
                         {
                             tuple_literal_element.clone().unwrap_or(Type::Unknown)
                         }
+                        (_, Type::Unknown)
+                            if array_literal_element.is_some()
+                                && matches!(
+                                    self.expr_id_to_expr_map.get(item_id),
+                                    Some(Expr::List(_))
+                                ) =>
+                        {
+                            array_literal_element.clone().unwrap_or(Type::Unknown)
+                        }
                         _ => element_type.clone(),
                     };
                     let item_type = self.infer_type_inner(
@@ -45628,6 +46484,17 @@ impl<'src> Analyzer<'src> {
                     if matches!(item_type, Type::Unresolved) {
                         return Type::Unresolved;
                     }
+                    // B593: a function ITEM in a list is its closure type, as
+                    // at an annotated binding (`let g: |i32| i32 = double`):
+                    // every item has its own type, so `[double, triple]` had
+                    // no element type at all, and `[double, double]`'s
+                    // element (`fn double`) was no callable value type.
+                    let item_type = match item_type {
+                        Type::Function(function_id) => self
+                            .function_closure_type(function_id)
+                            .unwrap_or(Type::Function(function_id)),
+                        other => other,
+                    };
                     element_type = match self.reconcile_type(
                         &element_type,
                         &item_type,
@@ -45728,7 +46595,7 @@ impl<'src> Analyzer<'src> {
             // `arr.len()` — the length is a compile-time constant; the result is
             // a `usize`, as every length is (B590: fixed-arrays.md §10 typed it
             // `i32` "matching `List.len()`", and I5 S2 moved `List.len()`).
-            Expr::ArrayLen(_, _) => self.primitive_struct_type("usize"),
+            Expr::ArrayLen(_, _) | Expr::LengthValue(_) => self.primitive_struct_type("usize"),
             Expr::Tuple(item_ids) => {
                 // A construction that is EXACTLY one spread is the concatenation
                 // of one: its type is the operand's, unchanged. This is the only
@@ -45979,6 +46846,9 @@ impl<'src> Analyzer<'src> {
                     && let Some(written) = self.written_payload_less_variant(expr_id, subject_id)
                 {
                     return written;
+                }
+                if let Some(stable) = self.stable_variant_use_holes(expr_id, subject_id, &subject) {
+                    return stable;
                 }
                 match subject {
                     Type::Unresolved => Type::Unresolved,
@@ -48862,16 +49732,32 @@ impl<'src> Analyzer<'src> {
                 (Type::Tuple(result_items, labels), all_bindings)
             }
             // Two arrays unify only at the SAME length (the length is part of the
-            // type) — a mismatch falls through to the no-reconcile path, so
-            // `[i32; 3]` and `[i32; 4]` are distinct. Same length → reconcile the
-            // element (binding a generic element like `List<T>` does).
-            (Type::Array(l_element, l_length), Type::Array(r_element, r_length))
-                if l_length == r_length =>
-            {
+            // type), so `[i32; 3]` and `[i32; 4]` are distinct. The length
+            // reconciles as a type argument does (array-lengths.md §3): two
+            // numbers agree by value, and a length parameter the site infers
+            // BINDS — `[T; N]` against `[i32; 3]` records `N = 3` beside
+            // `T = i32`. Then the element reconciles.
+            (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
+                let (l_length, r_length) = (*l_length, *r_length);
+                let (left_length, right_length) =
+                    (l_length.get_type(self), r_length.get_type(self));
+                let (length, mut bindings) =
+                    self.reconcile_type(&left_length, &right_length, substitution_context)?;
+                // The reconciled length is one side's own (a number, or the
+                // parameter itself), so it keeps that side's id: nothing mints.
+                let length = if length == left_length {
+                    l_length
+                } else if length == right_length {
+                    r_length
+                } else {
+                    length.get_type_id(self)
+                };
                 let l = l_element.get_type(self);
                 let r = r_element.get_type(self);
-                let (element, bindings) = self.reconcile_type(&l, &r, substitution_context)?;
-                (Type::Array(element.get_type_id(self), *l_length), bindings)
+                let (element, element_bindings) =
+                    self.reconcile_type(&l, &r, substitution_context)?;
+                bindings.extend(element_bindings);
+                (Type::Array(element.get_type_id(self), length), bindings)
             }
             // Same nominal type: unify argument-wise, keeping the instantiated
             // side when the other is erased. Reconciling the arguments collects
@@ -49283,7 +50169,12 @@ impl<'src> Analyzer<'src> {
             // too. The LENGTH is part of the type — `[i32; 3]` is not
             // `[i32; 4]` — so it is compared first, by value.
             (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
-                l_length == r_length && {
+                // The length compares as a type argument does (array-lengths.md
+                // §3): two numbers by value, a length parameter as the generic
+                // it is — a hole where the site infers it, rigid where the
+                // enclosing declaration owns it.
+                let (l_length, r_length) = (l_length.get_type(self), r_length.get_type(self));
+                self.compare_type_rigid(&l_length, &r_length, substitution_context, rigid) && {
                     let l = l_element.get_type(self);
                     let r = r_element.get_type(self);
                     self.compare_type_rigid(&l, &r, substitution_context, rigid)
@@ -49508,6 +50399,16 @@ impl<'src> Analyzer<'src> {
                     return type_.clone();
                 };
                 let resolved = type_id.get_type(self);
+                // B599: a generic bound to a value substitution cannot change
+                // IS that value — its argument slots, not copies of them. A
+                // copy re-minted every hole the value held: `Cell::new(None)`
+                // binds `T` to the `None`'s `Option<hole>`, and the call's
+                // `Cell<T>` answered `Cell<Option<fresh hole>>` on every ask,
+                // so a use that filled the binding's hole filled a slot no
+                // other reader held (fill-from-use, [`Self::fill_holes_from_use`]).
+                if self.substitution_fixed(type_id) {
+                    return resolved;
+                }
                 self.substitute_type(&resolved, substitution_context)
             }
             // A nominal type substitutes its arguments (`Option<T>` -> `Option<i32>`
@@ -49578,13 +50479,14 @@ impl<'src> Analyzer<'src> {
                     labels,
                 )
             }
-            // `[T; n]` substitutes its element (the length is a constant, carried
-            // through), so a generic `[T; 4]` monomorphizes to `[i32; 4]`.
+            // `[T; n]` substitutes its element and its length, so a generic
+            // `[T; 4]` monomorphizes to `[i32; 4]` and a `[T; N]` at `N = 3`
+            // to `[T; 3]` (array-lengths.md §3: a length binds like a type).
             Type::Array(element_id, length) => {
                 let (element_id, length) = (*element_id, *length);
                 Type::Array(
                     self.substitute_type_id(element_id, substitution_context),
-                    length,
+                    self.substitute_length(length, substitution_context),
                 )
             }
             // A mapped tuple substitutes its source; once that is a concrete tuple
@@ -51759,6 +52661,8 @@ impl<'src> Analyzer<'src> {
             // B583: who asks, for std's own reach (a field write; the source
             // is looked up only where two candidates disagree on it).
             self.lookup_asker = Some(constraint.anchor());
+            // M110 S5: the item this constraint mints for.
+            self.id_windows.set_anchor(constraint.anchor());
             // B401: the file whose admission this constraint's method lookups
             // read — asked only when some file restricts anything.
             if self.lookup_admission.is_some() {
@@ -51797,6 +52701,7 @@ impl<'src> Analyzer<'src> {
                 Resolution::Deferred => self.deferred.push((constraint, waiting_on)),
             }
         }
+        self.id_windows.clear_anchor();
         progress
     }
 
@@ -52172,8 +53077,8 @@ impl<'src> Analyzer<'src> {
         Some((
             span,
             format!(
-                "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` \
-                 of one, and `{written}` is `{type_label}`{steer}"
+                "a hole in element syntax takes a `View`, a `str`, a `List<View>`, an `Option` \
+                 of one, or a `Source` of one, and `{written}` is `{type_label}`{steer}"
             ),
         ))
     }
@@ -54092,6 +54997,12 @@ impl<'src> Analyzer<'src> {
                         argument_ids,
                         &substitution_context,
                     );
+                    // B599: the arguments whose types hold a hole, filled once
+                    // every argument has bound what it binds.
+                    let mut holed_arguments: Vec<(Id, Type, Type)> = Vec::new();
+                    // B600: the other arguments, for a callee generic the call
+                    // leaves open that an argument was typed in.
+                    let mut typed_arguments: Vec<Id> = Vec::new();
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
@@ -54246,6 +55157,15 @@ impl<'src> Analyzer<'src> {
                                         );
                                     }
                                 }
+                                if self.type_value_has_hole(&argument_type) {
+                                    holed_arguments.push((
+                                        argument_id,
+                                        argument_type.clone(),
+                                        parameter_type.clone(),
+                                    ));
+                                } else {
+                                    typed_arguments.push(argument_id);
+                                }
                             }
                             None => {
                                 let (msg, note) = match self.underdetermined_mapped_argument(
@@ -54309,6 +55229,21 @@ impl<'src> Analyzer<'src> {
                         &generic_parameter_constraint_ids,
                         &mut substitution_context,
                     );
+                    // B599: the parameter states what a hole in the argument
+                    // stands for — through the call's bindings, or, for a
+                    // bare-trait or bounded parameter nothing grounds, through
+                    // its bound.
+                    for (argument_id, argument_type, parameter_type) in holed_arguments {
+                        let declared = self.substitute_type(&parameter_type, &substitution_context);
+                        let stating = match parameter_type {
+                            Type::Generic(_) if self.type_value_has_hole(&declared) => {
+                                parameter_type
+                            }
+                            _ => declared,
+                        };
+                        self.fill_holes_from_use(&argument_type, &stating, argument_id);
+                        self.record_hole_operand(call_id, argument_id, &argument_type);
+                    }
                     self.wire_call(
                         call_id,
                         subject_id,
@@ -54324,6 +55259,48 @@ impl<'src> Analyzer<'src> {
                         argument_ids,
                         &mut substitution_context,
                     );
+                    // B600: an argument typed in a callee generic this call
+                    // never binds (`has(None)` against `value: Option<T>` is
+                    // `Option<T>`, `T` bound to nothing) holds the hole the
+                    // instance is made at; recorded as that hole.
+                    let bindable = self.callee_bindable_generics(target_id);
+                    let open: Vec<TypeId> = bindable
+                        .iter()
+                        .copied()
+                        .filter(|generic| match substitution_context.get(generic) {
+                            None => true,
+                            Some(bound) => self.binds_to_itself(*generic, *bound),
+                        })
+                        // A recursive call's own binder is a type in its body.
+                        .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+                        .collect();
+                    if !open.is_empty() && !typed_arguments.is_empty() {
+                        for argument_id in typed_arguments {
+                            if matches!(
+                                self.expr_id_to_expr_map.get(&argument_id),
+                                Some(Expr::Closure(_) | Expr::Async(_))
+                            ) {
+                                continue;
+                            }
+                            let argument_type =
+                                self.infer_type(argument_id, &Type::Unknown, &HashMap::default());
+                            if self.type_value_has_hole(&argument_type) {
+                                self.record_hole_operand(call_id, argument_id, &argument_type);
+                                continue;
+                            }
+                            let mut mentioned = Vec::new();
+                            self.collect_generics(&argument_type, 0, &mut mentioned);
+                            if !mentioned.iter().any(|generic| open.contains(generic)) {
+                                continue;
+                            }
+                            let holes: SubstitutionContext = open
+                                .iter()
+                                .map(|generic| (*generic, Type::Unknown.get_type_id(self)))
+                                .collect();
+                            let holed = self.substitute_type(&argument_type, &holes);
+                            self.record_hole_operand(call_id, argument_id, &holed);
+                        }
+                    }
                     // Keep the callee's own-generic bindings as ordered values
                     // too — a bound static (`T::rebuild(source)`) re-targets a
                     // concrete impl's method at emission, whose generic IDS
@@ -54355,7 +55332,6 @@ impl<'src> Analyzer<'src> {
                     // alone split `through`'s instance from the identical one the
                     // outer call emitted. Working context keeps it; the record
                     // does not.
-                    let bindable = self.callee_bindable_generics(target_id);
                     substitution_context
                         .retain(|constraint_id, _| bindable.contains(constraint_id));
                     if !substitution_context.is_empty() {
@@ -54755,6 +55731,14 @@ impl<'src> Analyzer<'src> {
                 if !object_declares_member =>
             {
                 let mut resolution = self.resolve_impl_member(&subject_type, member_name);
+                // B598: an ambiguity between traits the calling file does not
+                // all reach is decided among the ones it does.
+                if matches!(resolution, ImplMemberResolution::AmbiguousTraits(_)) {
+                    let candidates = self.method_member_candidates(&subject_type, member_name);
+                    if let Some(reached) = self.candidates_reached_at(id, candidates) {
+                        resolution = self.rank_member_candidates(reached);
+                    }
+                }
                 // R2: before reporting two argument-distinct homes, let the type
                 // the call site expects choose between them.
                 if let ImplMemberResolution::AmbiguousTraitArguments(homes) = &resolution {
@@ -55483,6 +56467,28 @@ impl<'src> Analyzer<'src> {
                         self.own_generic_call_bindings.insert(id, values);
                     }
                 }
+                // B599, the receiver channel: an argument that states what the
+                // receiver's hole stands for (`subject.set(Some("x"))` binds
+                // `T = Option<str>` over the receiver's `Option<unknown>`, the
+                // weaker binding) fills the receiver where it stands, through
+                // `self`'s declared type under the call's bindings.
+                // `push`/`run` on a container's open element slot are the
+                // slot's own channel (`SlotUnification`, which records the
+                // fill's site for B554's cross-file report).
+                let slot_channel = (member_name == "push" || member_name == "run")
+                    && self.list_element_slot(&subject_type).is_some();
+                if !slot_channel
+                    && self.type_value_has_hole(&subject_type)
+                    && let Some((parameter_ids, _)) = self.method_signature(member_id)
+                    && let Some(self_type) = parameter_ids
+                        .first()
+                        .and_then(|parameter_id| self.parameters.get(parameter_id))
+                        .map(|parameter| parameter.type_id.get_type(self))
+                {
+                    let stated = self.substitute_type(&self_type, &substitution);
+                    self.fill_holes_from_use(&subject_type, &stated, subject_id);
+                }
+                self.record_hole_operand(id, subject_id, &subject_type);
                 if !substitution.is_empty() {
                     self.method_call_substitution.insert(id, substitution);
                 }
@@ -56088,8 +57094,15 @@ impl<'src> Analyzer<'src> {
             }
             if self
                 .reconcile_type(&argument_type, &parameter_type, &HashMap::default())
-                .is_none()
+                .is_some()
             {
+                // B599: the parameter states what a hole in the argument
+                // stands for — `v` in `list.push(v)` takes the list's element
+                // (the receiver's holes are filled at the call's resolution,
+                // where its bindings are decided).
+                self.fill_holes_from_use(&argument_type, &parameter_type, argument_id);
+                self.record_hole_operand(call_id, argument_id, &argument_type);
+            } else {
                 let msg = self.type_mismatch_message(
                     &parameter_type,
                     &argument_type,
@@ -57197,6 +58210,35 @@ impl<'src> Analyzer<'src> {
             .then(|| self.primitive_struct_type("f64"))
     }
 
+    /// B602 — whether an operand beside a FLOAT takes the float's type
+    /// rather than standing as an integer: an expression of unsuffixed
+    /// literals with no fraction (`1`, `-2`, `3 * 4`), or a reference to a
+    /// literal binding of one (`let one = 1`). A fractional literal never
+    /// adapts to an integer (B405), so it is not one of these.
+    fn adapts_to_a_float_peer(&self, expr_id: Id) -> bool {
+        let mut shape = LiteralShape::default();
+        if self.literal_numeric_shape(expr_id, false, &mut shape) {
+            return shape.saw_literal && !shape.fractional;
+        }
+        let Some(Expr::Local(variable_id)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return false;
+        };
+        let Some(initial) = self
+            .variables
+            .get(variable_id)
+            .and_then(|variable| variable.initial)
+        else {
+            return false;
+        };
+        let mut shape = LiteralShape {
+            lets: vec![*variable_id],
+            ..LiteralShape::default()
+        };
+        self.is_literal_let(*variable_id)
+            && self.literal_numeric_shape(initial, true, &mut shape)
+            && !shape.fractional
+    }
+
     /// B389 — whether `variable_id` is a LITERAL binding: unannotated, not
     /// `lazy`, initialized by unsuffixed literals (through other literal
     /// bindings). See `literal_lets_wait`.
@@ -57512,6 +58554,109 @@ impl<'src> Analyzer<'src> {
         self.fill_holes_admitting(binding_type_id, value, Some(value_id));
     }
 
+    /// B599 — fill-from-use: a use that STATES the type a hole stands for
+    /// fills it where it stands. `let subject = Signal::new(None)` is
+    /// `SignalCell<Option<unknown>>` — a nullary variant names no payload — and
+    /// `take(subject)` at `subject: Signal<Option<str>>`, or `subject.set(Some(
+    /// "x"))` with `set(value: T)` under `T = Option<unknown>`, says what the
+    /// `unknown` is. The reconcile admitted the use (a hole reconciles with
+    /// anything) and bound nothing, so the binding stayed open to the end and
+    /// B580 refused it, over code that says the type.
+    ///
+    /// `held` is the side carrying the hole — an argument's type (the argument
+    /// channel) or a parameter's type through the receiver's substitution (the
+    /// receiver channel: its holes ARE the receiver's slots) — and `wanted` the
+    /// side that states it. A bare-trait or bounded-generic `wanted` states the
+    /// value's type through the ONE impl of the trait its head answers
+    /// ([`Self::type_expected_through_impl`]). Only a component with no hole
+    /// and no `any` is written — `any` is a coercion sink that tells a hole
+    /// nothing (B227) — and a generic in it only when it is a binder in scope
+    /// at `use_id` (B540's admission). Every reader of the slot sees the fill,
+    /// and a later use that disagrees is reported against it as a mismatch.
+    fn fill_holes_from_use(&mut self, held: &Type, wanted: &Type, use_id: Id) {
+        if !self.type_value_has_hole(held) {
+            return;
+        }
+        let wanted = match wanted {
+            Type::Trait(trait_id, arguments) => {
+                let (trait_id, arguments) = (*trait_id, arguments.clone());
+                match self.type_expected_through_impl(held, trait_id, &arguments) {
+                    Some(concrete) => concrete,
+                    None => return,
+                }
+            }
+            Type::Generic(constraint_id)
+                if !self.generic_is_enclosing_binder(*constraint_id, use_id) =>
+            {
+                let stated: Vec<Type> = self
+                    .generic_bound_traits(*constraint_id)
+                    .into_iter()
+                    .filter(|(_, arguments)| !arguments.is_empty())
+                    .filter_map(|(trait_id, arguments)| {
+                        self.type_expected_through_impl(held, trait_id, &arguments)
+                    })
+                    .collect();
+                match stated.as_slice() {
+                    [concrete] => concrete.clone(),
+                    _ => return,
+                }
+            }
+            other => other.clone(),
+        };
+        if self.type_value_mentions_any(&wanted) {
+            return;
+        }
+        match (held, &wanted) {
+            (Type::Struct(left, held_arguments), Type::Struct(right, wanted_arguments))
+            | (Type::Enum(left, held_arguments), Type::Enum(right, wanted_arguments))
+                if left == right && held_arguments.len() == wanted_arguments.len() =>
+            {
+                for (held_argument, wanted_argument) in held_arguments.iter().zip(wanted_arguments)
+                {
+                    let wanted_argument = wanted_argument.get_type(self);
+                    self.fill_holes_admitting(*held_argument, &wanted_argument, Some(use_id));
+                }
+            }
+            (Type::Tuple(held_elements, _), Type::Tuple(wanted_elements, _))
+                if held_elements.len() == wanted_elements.len() =>
+            {
+                for (held_element, wanted_element) in held_elements.iter().zip(wanted_elements) {
+                    let wanted_element = wanted_element.get_type(self);
+                    self.fill_holes_admitting(*held_element, &wanted_element, Some(use_id));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `any` appears anywhere in `type_` ([`Self::fill_holes_from_use`]).
+    fn type_value_mentions_any(&self, type_: &Type) -> bool {
+        let mentions = |type_id: &TypeId| self.type_value_mentions_any(type_id.borrow_type(self));
+        match type_ {
+            Type::Any => true,
+            Type::Closure(parameter_type_ids, return_type_id, _, _) => {
+                parameter_type_ids.iter().any(mentions) || mentions(return_type_id)
+            }
+            Type::Enum(_, argument_type_ids)
+            | Type::Struct(_, argument_type_ids)
+            | Type::Trait(_, argument_type_ids)
+            | Type::Dyn(_, argument_type_ids)
+            | Type::Tuple(argument_type_ids, _) => argument_type_ids.iter().any(mentions),
+            Type::Array(element_type_id, _) => mentions(element_type_id),
+            Type::Mapped(_, source_type_id, template_type_id) => {
+                mentions(source_type_id) || mentions(template_type_id)
+            }
+            Type::Generic(_)
+            | Type::Unknown
+            | Type::Unresolved
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Length(_)
+            | Type::Void => false,
+        }
+    }
+
     /// Writes `wanted`'s components into the `Unknown` slots of `held`, at
     /// matching positions of matching shapes (B489). Only a ground component
     /// is written; a slot that is already a type is left as it is.
@@ -57609,7 +58754,12 @@ impl<'src> Analyzer<'src> {
     fn type_is_ground(&self, type_id: TypeId) -> bool {
         match type_id.get_type(self) {
             Type::Generic(_) | Type::Unknown | Type::Unresolved => false,
-            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+            Type::Any
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void
+            | Type::Length(_) => true,
             Type::Closure(parameter_type_ids, return_type_id, _, _) => {
                 parameter_type_ids
                     .iter()
@@ -57623,7 +58773,9 @@ impl<'src> Analyzer<'src> {
             | Type::Tuple(argument_type_ids, _) => argument_type_ids
                 .iter()
                 .all(|argument_type_id| self.type_is_ground(*argument_type_id)),
-            Type::Array(element_type_id, _) => self.type_is_ground(element_type_id),
+            Type::Array(element_type_id, length_id) => {
+                self.type_is_ground(element_type_id) && self.type_is_ground(length_id)
+            }
             Type::Mapped(_, source_type_id, template_type_id) => {
                 self.type_is_ground(source_type_id) && self.type_is_ground(template_type_id)
             }
@@ -59496,10 +60648,16 @@ impl<'src> Analyzer<'src> {
             .find_map(|id| self.source_of_id(id))
     }
 
-    fn check_trait_method_scope(&mut self, global_scope_id: Id) {
-        // The files a user file REACHES: its own, and the declaring file of
-        // every name its module scope binds — its imports, what the prelude
-        // seeded, its own declarations — and of every module it imports whole.
+    /// The files each user file REACHES for B515's trait-scope rule: its
+    /// own, and the declaring file of every name its module scope binds — its
+    /// imports, what the prelude seeded, its own declarations — and of every
+    /// module it imports whole. `only` restricts the walk to one file's
+    /// scopes (B598 asks for the calling file alone, mid-solve).
+    fn trait_reach_by_file(
+        &self,
+        global_scope_id: Id,
+        only: Option<SourceId>,
+    ) -> HashMap<SourceId, HashSet<SourceId>> {
         let imported_modules: HashSet<(SourceId, Id)> = self
             .import_reaches
             .iter()
@@ -59517,7 +60675,8 @@ impl<'src> Analyzer<'src> {
             let Some(source) = source else {
                 continue;
             };
-            if self.std_sources.contains(&source)
+            if only.is_some_and(|only| only != source)
+                || self.std_sources.contains(&source)
                 || self.frozen_sources.contains(&source)
                 || self.dependency_sources.contains(&source)
             {
@@ -59546,6 +60705,98 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        reached
+    }
+
+    /// For an impl block's member, the trait it is (the declaring trait of
+    /// its home's member) and the files that bring it in scope (B515): the
+    /// block's (a derived block's is its attribute's file, B354), the home
+    /// trait's, the declaring trait's. `None` for an inherent member.
+    fn impl_member_providing_files(&mut self, member_id: Id) -> Option<(Id, Vec<SourceId>)> {
+        let implementation =
+            &self.implementations[*self.implementation_by_declaration.get(&member_id)?];
+        let member_name = implementation
+            .declarations
+            .iter()
+            .find(|(_, id)| **id == member_id)
+            .map(|(name, _)| *name)?;
+        let home = self.member_home_trait(implementation, member_name)?;
+        let mut providing = vec![
+            self.derived_origin_file(implementation.impl_id)
+                .unwrap_or(implementation.source),
+        ];
+        if let Some(home_source) = self
+            .traits
+            .get(&home)
+            .and_then(|trait_| self.source_of_id(trait_.id))
+        {
+            providing.push(home_source);
+        }
+        let declaring = self
+            .method_member_in_trait_at(home, &[], member_name)
+            .map_or(home, |(_, declaring, _)| declaring);
+        if let Some(declaring_source) = self
+            .traits
+            .get(&declaring)
+            .and_then(|trait_| self.source_of_id(trait_.id))
+        {
+            providing.push(declaring_source);
+        }
+        Some((declaring, providing))
+    }
+
+    /// B598: two traits providing a method name at a USER file's call, where
+    /// the file reaches only some of them, are not an ambiguity — a trait the
+    /// file does not bring in scope is no candidate there (B515's rule, and
+    /// Rust's). The candidates whose trait the calling file reaches, with the
+    /// inherent ones; `None` when the call is not in a user file, or when the
+    /// filter would leave no trait candidate (the ambiguity then stands, and
+    /// names the traits as before).
+    fn candidates_reached_at(
+        &mut self,
+        call_id: Id,
+        candidates: Vec<ImplMemberCandidate>,
+    ) -> Option<Vec<ImplMemberCandidate>> {
+        let source = self.source_of_id(call_id)?;
+        if source == DERIVED_SOURCE
+            || self.std_sources.contains(&source)
+            || self.frozen_sources.contains(&source)
+            || self.dependency_sources.contains(&source)
+            || self.derived_origin_file(call_id).is_some()
+        {
+            return None;
+        }
+        let files = self
+            .trait_reach_by_file(self.entry_scope_id?, Some(source))
+            .remove(&source)?;
+        let mut kept: Vec<ImplMemberCandidate> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(home) = candidate.home_trait else {
+                kept.push(candidate);
+                continue;
+            };
+            let mut providing: Vec<SourceId> = self
+                .impl_member_providing_files(candidate.member_id)
+                .map(|(_, files)| files)
+                .unwrap_or_default();
+            if let Some(home_source) = self
+                .traits
+                .get(&home)
+                .and_then(|trait_| self.source_of_id(trait_.id))
+            {
+                providing.push(home_source);
+            }
+            if providing.iter().any(|file| files.contains(file)) {
+                kept.push(candidate);
+            }
+        }
+        kept.iter()
+            .any(|candidate| candidate.home_trait.is_some())
+            .then_some(kept)
+    }
+
+    fn check_trait_method_scope(&mut self, global_scope_id: Id) {
+        let reached = self.trait_reach_by_file(global_scope_id, None);
         if reached.is_empty() {
             return;
         }
@@ -59575,34 +60826,13 @@ impl<'src> Analyzer<'src> {
             // scope: the trait's own, the impl clause's trait's, the block's.
             let mut providing: Vec<SourceId> = Vec::new();
             let trait_id = match self.implementation_by_declaration.get(member_id) {
-                Some(index) => {
-                    let implementation = &self.implementations[*index];
-                    let Some(member_name) = implementation
-                        .declarations
-                        .iter()
-                        .find(|(_, id)| *id == member_id)
-                        .map(|(name, _)| *name)
+                Some(_) => {
+                    let Some((trait_id, files)) = self.impl_member_providing_files(*member_id)
                     else {
                         continue;
                     };
-                    let Some(home) = self.member_home_trait(implementation, member_name) else {
-                        continue;
-                    };
-                    // A derived block belongs to the file whose attribute
-                    // generated it (B354's rule).
-                    providing.push(
-                        self.derived_origin_file(implementation.impl_id)
-                            .unwrap_or(implementation.source),
-                    );
-                    if let Some(home_source) = self
-                        .traits
-                        .get(&home)
-                        .and_then(|trait_| self.source_of_id(trait_.id))
-                    {
-                        providing.push(home_source);
-                    }
-                    self.method_member_in_trait_at(home, &[], member_name)
-                        .map_or(home, |(_, declaring, _)| declaring)
+                    providing = files;
+                    trait_id
                 }
                 None => match self.trait_by_declaration.get(member_id) {
                     // A default reached on a concrete receiver (Gap E's
@@ -63213,17 +64443,26 @@ impl<'src> Analyzer<'src> {
                     _ => None,
                 };
                 if let Some(literal_index) = literal_index
+                    && let Some(length) = self.type_id_to_type_map.array_length(length)
                     && literal_index >= length
                 {
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "index {literal_index} is out of range for an array of length {length} \
-                             (valid indices are 0 to {})",
-                            length.saturating_sub(1)
-                        ),
+                        // E287 (d): an empty array has no valid index, and
+                        // "0 to 0" named one.
+                        msg: match length {
+                            0 => format!(
+                                "index {literal_index} is out of range: the array is empty \
+                                 (its type is `[_; 0]`), so it has no valid index"
+                            ),
+                            _ => format!(
+                                "index {literal_index} is out of range for an array of length \
+                                 {length} (valid indices are 0 to {})",
+                                length - 1
+                            ),
+                        },
                     });
                     self.expr_id_to_expr_map.insert(id, Expr::Error);
                     return Resolution::Failed;
@@ -63249,6 +64488,20 @@ impl<'src> Analyzer<'src> {
                 Resolution::Failed
             }
         }
+    }
+
+    /// Whether `id` sits inside a `const` expression's span (same file).
+    fn inside_a_const_expression(&self, id: Id) -> bool {
+        let Some(span) = self.span_map.get(&id).copied() else {
+            return false;
+        };
+        let source = self.source_of_id(id);
+        self.const_exprs.iter().any(|root| {
+            self.span_map
+                .get(root)
+                .is_some_and(|root_span| root_span.start <= span.start && span.end <= root_span.end)
+                && self.source_of_id(*root) == source
+        })
     }
 
     /// The diagnostic to raise when the bare name `name`, resolving to
@@ -63293,6 +64546,8 @@ impl<'src> Analyzer<'src> {
     }
 
     fn build(&mut self) {
+        // M110 S5: the census's phase for everything `build()` mints.
+        self.id_windows.phase = id_windows::Phase::Build;
         self.resolve_world();
         self.finalize_build();
     }
@@ -63452,6 +64707,37 @@ impl<'src> Analyzer<'src> {
             });
         match resolved {
             Some(subject_id) => {
+                // array-lengths.md §5.3: a LENGTH parameter is a value — a
+                // `usize`, the number its instance binds it to.
+                if let Some(Expr::Generic(constraint_id)) =
+                    self.expr_id_to_expr_map.get(&subject_id)
+                    && self.length_parameters.contains(constraint_id)
+                {
+                    let constraint_id = *constraint_id;
+                    // A `const` expression evaluates once per SITE, and the
+                    // length differs per instance: it may not read one.
+                    if self.inside_a_const_expression(id) {
+                        let diagnostics_before = self.diagnostics.len();
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "`{name}` is a length parameter: it is fixed per instance, \
+                                 not at this site, so a `const` expression cannot read it"
+                            ),
+                        });
+                        if let Some(source) = self.source_of_id(id) {
+                            self.attribute_new_diagnostics(diagnostics_before, source);
+                        }
+                        self.expr_id_to_expr_map.insert(id, Expr::Error);
+                        return;
+                    }
+                    let length = Type::Generic(constraint_id).get_type_id(self);
+                    self.expr_id_to_expr_map
+                        .insert(id, Expr::LengthValue(length));
+                    return;
+                }
                 if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                     let diagnostics_before = self.diagnostics.len();
                     self.diagnostics.push(Error {
@@ -63747,6 +65033,10 @@ impl<'src> Analyzer<'src> {
     /// nothing is committed, defaulted, or diagnosed — constraints the
     /// entry may still bind stay open for the final build to finish.
     fn resolve_world(&mut self) {
+        // M110 S5: the census's phase — `build()` sets its own first.
+        if self.id_windows.phase != id_windows::Phase::Build {
+            self.id_windows.phase = id_windows::Phase::Resolve;
+        }
         // M73's instrument: the sub-split of this pass, printed on the
         // `[vilan phase]` line when `VILAN_PHASE_TIMING` asks — the same
         // treatment `const-lower`/`const-interp` give the const pass (N43),
@@ -63997,6 +65287,8 @@ impl<'src> Analyzer<'src> {
         // resolving it before the locals means an `Expr::Local` is already in
         // place when the ordinary pass walks the same chain.
         for (id, module, item) in std::mem::take(&mut self.prepped_std_items) {
+            // M110 S6: what the drain mints for a row belongs to the row's item.
+            self.id_windows.set_drain_anchor(id);
             self.resolve_prepped_std_item(id, module, item);
         }
         let mut guarded_locals = Vec::new();
@@ -64005,6 +65297,7 @@ impl<'src> Analyzer<'src> {
                 guarded_locals.push((id, name));
                 continue;
             }
+            self.id_windows.set_drain_anchor(id);
             self.resolve_prepped_local(id, name);
         }
 
@@ -64026,6 +65319,7 @@ impl<'src> Analyzer<'src> {
         // Those go into the second part, at the seam the guard pass uses.
         let mut guarded_assignments = Vec::new();
         for (target_id, value_id) in std::mem::take(&mut self.prepped_assignments) {
+            self.id_windows.set_drain_anchor(target_id);
             if guarded_locals.iter().any(|(id, _)| *id == target_id) {
                 guarded_assignments.push((target_id, value_id));
                 continue;
@@ -64041,6 +65335,9 @@ impl<'src> Analyzer<'src> {
         for (type_id, name, scope_id, span, argument_type_ids, source_id) in
             std::mem::take(&mut self.prepped_type_locals)
         {
+            // M110 S6: an annotation's drain mints for the item whose slot it
+            // fills.
+            self.id_windows.set_anchor_type(type_id);
             // The written spelling outlives the queue: conformance checking
             // reads it after build (the `= Self` disambiguation), so the
             // drain retains the projection it needs.
@@ -64051,9 +65348,53 @@ impl<'src> Analyzer<'src> {
                 .try_get_type_id_by_name(name, scope_id)
                 .or_else(|| self.try_get_expr_id_by_name(name, scope_id));
             match resolved {
+                // array-lengths.md §6 (S4): a length position naming a VALUE
+                // binding is a named length — resolved here, before the
+                // fixpoint, to the number its literal initializer holds.
+                Some(subject_id)
+                    if self.length_position_type_ids.contains(&type_id)
+                        && (self.variables.contains_key(&subject_id)
+                            || self.parameters.contains_key(&subject_id)) =>
+                {
+                    match self.named_length(subject_id, name) {
+                        Ok(length) => self.write_type_slot(type_id, Type::Length(length)),
+                        Err(message) => {
+                            self.push_at_written_type(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: message,
+                                },
+                                source_id,
+                                type_id,
+                            );
+                            self.refused_annotation_slots
+                                .insert(type_id, (source_id, span));
+                            self.write_type_slot(type_id, Type::Unresolved);
+                        }
+                    }
+                }
                 Some(subject_id) => {
                     let subject_type =
                         self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+                    // array-lengths.md §3: the two kind checks, at the name.
+                    if let Some(message) = self.length_kind_error(type_id, &subject_type, name) {
+                        self.push_at_written_type(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                            type_id,
+                        );
+                        self.refused_annotation_slots
+                            .insert(type_id, (source_id, span));
+                        self.write_type_slot(type_id, Type::Unknown);
+                        continue;
+                    }
                     // B245: a mention of a DEFAULTED parameter keeps the
                     // parameter's identity. Every written type mints its own
                     // slot, and this one resolves to the DEFAULT's type — for
@@ -64773,6 +66114,11 @@ impl<'src> Analyzer<'src> {
                              implements it — and that type has no name here. Say `Self`, or \
                              name it in the head: `impl type {name}: {trait_name}<..>`"
                         )
+                    } else if self.length_position_type_ids.contains(&type_id) {
+                        format!(
+                            "cannot find the length '{name}'; an array length is a number, a \
+                             length parameter (`<const N>`), or a name bound to a number"
+                        )
                     } else {
                         let steer = self.import_steer(name).unwrap_or_default();
                         format!("cannot find type '{}'{}", name, steer)
@@ -64819,6 +66165,7 @@ impl<'src> Analyzer<'src> {
         }
 
         for path in std::mem::take(&mut self.prepped_type_static_accessors) {
+            self.id_windows.set_anchor_type(path.type_id);
             let PreppedTypePath {
                 type_id,
                 subject_type_id,
@@ -65199,7 +66546,22 @@ impl<'src> Analyzer<'src> {
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()
                             );
-                            if has_concrete_args && let Some(impl_subject_id) = impl_subject {
+                            // B595: a BLANKET's member named on a concrete head
+                            // (`str::tag(1)` answered by `impl type T: Leaf with
+                            // Tag`) binds the blanket's subject binder to the
+                            // head, as method dispatch binds it to the receiver
+                            // — unbound, its bound "cannot be checked".
+                            let blanket_on_a_concrete_head =
+                                matches!(&subject_type, Type::Struct(..) | Type::Enum(..))
+                                    && impl_subject.is_some_and(|impl_subject_id| {
+                                        matches!(
+                                            impl_subject_id.borrow_type(self),
+                                            Type::Generic(_)
+                                        )
+                                    });
+                            if (has_concrete_args || blanket_on_a_concrete_head)
+                                && let Some(impl_subject_id) = impl_subject
+                            {
                                 let impl_subject_type = impl_subject_id.get_type(self);
                                 if let Some((_, bindings)) = self.reconcile_type(
                                     &impl_subject_type,
@@ -65611,6 +66973,9 @@ impl<'src> Analyzer<'src> {
         }
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
+            // M110 S6: the conformance check mints for the impl block's item
+            // (its scope is the block's).
+            self.id_windows.set_anchor_scope(check.scope_id);
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
                 Some(trait_id) => trait_id,
                 None => {
@@ -66316,6 +67681,9 @@ impl<'src> Analyzer<'src> {
     /// a pre-entry world would freeze std constraints the entry still binds
     /// (the chained-`map` failure that pinned this split).
     fn finalize_build(&mut self) {
+        // M110 S6: the drains' anchors end here; what `build()` mints past
+        // this point is counted unanchored (M134's territory).
+        self.id_windows.clear_anchor();
         // A67: the module-tree ambiguity. Here rather than in `resolve_world`
         // because that runs TWICE under the S3 two-phase shape — once over the
         // pre-entry world and once for the build — and a fact about the tree
@@ -67370,10 +68738,10 @@ impl<'src> Analyzer<'src> {
                 //
                 // So the carve-out is "the left operand is a number", never
                 // "the operator is not `+`". The numeric MIXING b148's SCOPE
-                // note deferred is a different question and stays deferred:
-                // `f64 * i32` computes a correct answer of the declared type,
-                // and refusing it is a numeric-strictness change with an
-                // `as_f64()` migration, not a miscompile fix.
+                // note deferred was a different question, answered later by
+                // B579 (two integer types) and B602 (a float beside an
+                // integer or another float): there are no implicit
+                // conversions, so `f64 * i32` is refused with an `as_*` steer.
                 //
                 // `+` keeps the block below rather than joining this one,
                 // because its admitted set is not this one: `str + x`
@@ -67518,11 +68886,9 @@ impl<'src> Analyzer<'src> {
                 // and the reason is now the block ABOVE, not the one this note
                 // used to give. It read: "the other native operators emit
                 // arithmetic on numbers, where `+` emits a rendering", which
-                // was half right. It is right about a NUMERIC left operand,
-                // and `f64 * i32` is still the deliberate carve-out on that
-                // half: two grounded numbers computing a correct answer of the
-                // declared type, whose refusal is a numeric-strictness change
-                // with an `as_f64()` migration. It was wrong about `str - str`
+                // was half right. It is right about a NUMERIC left operand
+                // (whose mixed pairs B579 and B602 refuse below, with the same
+                // sentence as this block's). It was wrong about `str - str`
                 // and its siblings, which had `+`'s own bug and no numbers
                 // anywhere — B196 closed them.
                 if native_left && matches!(op, BinaryOp::Add) {
@@ -67790,9 +69156,8 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                     // B531: and a grounded right operand that is not a NUMBER
-                    // at all. `f64 * i32` stays the carve-out the SCOPE note
-                    // above keeps (two numbers computing a correct answer of
-                    // the declared type), but `2 * true` emitted the host's
+                    // at all (two numbers of different types are B579's and
+                    // B602's, below): `2 * true` emitted the host's
                     // `2 * true` — `2`, typed `i32` — and `2 * "3"` computed
                     // `6`: a native left operand never dispatches, so nothing
                     // typed the right one unless it was a parameter.
@@ -67836,11 +69201,18 @@ impl<'src> Analyzer<'src> {
                     // DIFFERENT integer types are refused as `+`, `<` and `==`
                     // over the same pair already were — there are no implicit
                     // conversions. `usize - i32` checked, ran on JS and was
-                    // refused by rustc (no Rust spelling of the pair), so
-                    // `a[a.len() - 1]` and capture-clones.vl's `total +
-                    // cells.len() * weight` compiled on the hole. A float and
-                    // an integer (`f64 * i32`) stay the carve-out above.
-                    let integer = |analyzer: &Self, operand: &Type| {
+                    // refused by the native backend (no Rust spelling of the
+                    // pair), so `a[a.len() - 1]` and capture-clones.vl's
+                    // `total + cells.len() * weight` compiled on the hole.
+                    //
+                    // B602 (R-c, v0.48.0): and over a FLOAT and an integer
+                    // (`f64 * i32`, `usize / f64`) or two different floats
+                    // (`f64 - f32`), which B579 left as a carve-out: `+`, the
+                    // comparisons and `==` already refused the pair, JS
+                    // computed a float silently, and the native backend
+                    // refused the build. A literal is not in scope — it takes
+                    // the other operand's type (B389).
+                    let numeric = |analyzer: &Self, operand: &Type| {
                         matches!(
                             analyzer.numeric_primitive_name(operand),
                             Some(
@@ -67852,18 +69224,33 @@ impl<'src> Analyzer<'src> {
                                     | "u32"
                                     | "u53"
                                     | "usize"
+                                    | "f32"
+                                    | "f64"
                             )
                         )
                     };
+                    let float = |analyzer: &Self, operand: &Type| {
+                        matches!(
+                            analyzer.numeric_primitive_name(operand),
+                            Some("f32" | "f64")
+                        )
+                    };
                     // Two equal operand types (the usual case) settle it with
-                    // one comparison, before either is named.
+                    // one comparison, before either is named. Beside a float,
+                    // an INTEGER literal (or a binding of one) is the float's
+                    // too — `1 / 4.0` and `let one = 1; one / 4.0` divide as
+                    // floats on both backends — so only a typed integer, or a
+                    // fractional literal beside one (`2.5 * count`, which the
+                    // native build refused), meets the refusal.
                     if matches!(
                         op,
                         BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
                     ) && lhs_type != rhs_type
-                        && integer(self, &lhs_type)
-                        && integer(self, &rhs_type)
+                        && numeric(self, &lhs_type)
+                        && numeric(self, &rhs_type)
                         && !self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
+                        && !((float(self, &rhs_type) && self.adapts_to_a_float_peer(lhs_id))
+                            || (float(self, &lhs_type) && self.adapts_to_a_float_peer(rhs_id)))
                     {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
@@ -69061,9 +70448,257 @@ impl<'src> Analyzer<'src> {
                     variable_id,
                 );
             }
+            self.refuse_expression_holes();
         }
 
         // Clear processed constraints
+    }
+
+    /// B600: B580's refusal for a hole NO binding holds — `Option::None.
+    /// is_some()`, `has(None)` over `fun has<T>(value: Option<T>)`, `[].len()`.
+    /// The call instantiates its callee at the hole: JS ran it (the hole has
+    /// no runtime shape), the native backend refused the build ("does not
+    /// emit a value of an unbound generic type parameter"), and `vilan check`
+    /// said nothing. Asked of every call whose recorded bindings still hold a
+    /// hole once inference is done, at the operand (the receiver first) that
+    /// carries it; an operand that is a BINDING is B580's to report, at its
+    /// initializer. User files only, and only as the lone signal (the caller
+    /// runs it under B580's cascade guard).
+    fn refuse_expression_holes(&mut self) {
+        let mut operands = std::mem::take(&mut self.hole_operands);
+        if operands.is_empty() {
+            return;
+        }
+        // The receiver is recorded before the arguments, so a stable sort
+        // keeps it first within its call. The cheap questions first — is the
+        // hole still open, does the callee leave a generic open — so the
+        // maps below are built only for a program with a candidate.
+        operands.retain(|(call_id, _, holder_type_id)| {
+            self.type_has_hole(*holder_type_id) && self.call_leaves_a_generic_open(*call_id)
+        });
+        if operands.is_empty() {
+            return;
+        }
+        operands.sort_by_key(|(call_id, ..)| call_id.0);
+        // A call (or an operand) its position directs — an annotated `let`,
+        // a field, a parameter — was typed at the direction; `any` directs
+        // nothing.
+        let call_entities: HashMap<Id, Id> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(entity, expr)| match expr {
+                Expr::Call(call_id) => Some((*call_id, *entity)),
+                _ => None,
+            })
+            .collect();
+        // The value positions an annotation or a declared return directs —
+        // the initializer or the body's tail, and through a block's tail and
+        // an `if`'s arms the values that land there (B489/B539 read a
+        // bare-trait direction there, which no `expected_types` entry holds).
+        let mut directed_roots: Vec<Id> = self
+            .variables
+            .values()
+            .filter(|variable| variable.annotated)
+            .filter_map(|variable| variable.initial)
+            .collect();
+        directed_roots.extend(
+            self.functions
+                .values()
+                .filter(|function| function.return_type_id.is_some())
+                .map(|function| function.body.1),
+        );
+        // A bare-trait return (B460) keeps no declared type; its tails are
+        // B489's.
+        directed_roots.extend(self.opaque_return_tails.keys().copied());
+        // A struct literal's field values are directed by the field's
+        // declared type; a generic struct's open parameter is the binding's
+        // to report (B580), where the literal lands.
+        directed_roots.extend(
+            self.expr_id_to_expr_map
+                .values()
+                .flat_map(|expr| match expr {
+                    Expr::StructInitializer(_, fields) => {
+                        fields.values().copied().collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                }),
+        );
+        let mut directed_positions: HashSet<Id> = HashSet::default();
+        while let Some(position) = directed_roots.pop() {
+            if !directed_positions.insert(position) {
+                continue;
+            }
+            match self.expr_id_to_expr_map.get(&position) {
+                Some(Expr::Block((_, tail_id))) => directed_roots.push(*tail_id),
+                Some(Expr::If(branch)) => {
+                    let mut next = Some(branch);
+                    while let Some(branch) = next {
+                        match branch {
+                            ExprIfBranch::If(_, (_, trailing), rest) => {
+                                directed_roots.push(*trailing);
+                                next = rest.as_deref();
+                            }
+                            ExprIfBranch::Else((_, trailing)) => {
+                                directed_roots.push(*trailing);
+                                next = None;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let directed = |analyzer: &Self, id: Id| {
+            directed_positions.contains(&id)
+                || analyzer.expected_types.get(&id).is_some_and(|expected| {
+                    !matches!(expected.borrow_type(analyzer), Type::Any)
+                        && !analyzer.type_has_hole(*expected)
+                })
+        };
+        let mut reported_calls: HashSet<Id> = HashSet::default();
+        let mut reported_operands: HashSet<Id> = HashSet::default();
+        for (call_id, holder_id, holder_type_id) in operands {
+            if reported_calls.contains(&call_id) || !self.type_has_hole(holder_type_id) {
+                continue;
+            }
+            let Some(source) = self.source_of_id(call_id) else {
+                continue;
+            };
+            if source == DERIVED_SOURCE
+                || self.std_sources.contains(&source)
+                || self.frozen_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+                || self.derived_origin_file(call_id).is_some()
+                || directed(self, holder_id)
+                || (call_entities
+                    .get(&call_id)
+                    .is_some_and(|entity| directed(self, *entity))
+                    && self.call_result_carries_an_open_generic(call_id))
+            {
+                continue;
+            }
+            // A binding's hole is B580's (at its initializer); a closure's
+            // unannotated parameter is B131's.
+            if matches!(self.expr_id_to_expr_map.get(&holder_id), Some(Expr::Local(target))
+                if self.variables.contains_key(target) || self.parameters.contains_key(target))
+            {
+                continue;
+            }
+            let Some(function_call) = self.function_calls.get(&call_id) else {
+                continue;
+            };
+            let Some(Expr::Local(member_id)) = self
+                .expr_id_to_expr_map
+                .get(&function_call.subject_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if !reported_operands.insert(holder_id) {
+                continue;
+            }
+            reported_calls.insert(call_id);
+            let member = self.callable_name(member_id).unwrap_or("this call");
+            let holder_type = holder_type_id.get_type(self);
+            let written = self
+                .pretty_print_type(&holder_type, &HashMap::default())
+                .replace("unknown", "…");
+            let empty_list = matches!(
+                self.expr_id_to_expr_map.get(&holder_id),
+                Some(Expr::List(elements)) if elements.is_empty()
+            );
+            let msg = match empty_list {
+                true => format!(
+                    "cannot infer the element type of this empty list: nothing the program does \
+                     with it settles it, and `{member}` is instantiated at it. Bind it with its \
+                     type (`let values: {written} = [];`)"
+                ),
+                false => format!(
+                    "cannot infer the type of this value: it is `{written}`, and nothing the \
+                     program does with it settles the `…` that `{member}` is instantiated at. \
+                     Bind it with its type (`let value: {written} = …;`)"
+                ),
+            };
+            let span = **self
+                .span_map
+                .get(&holder_id)
+                .or_else(|| self.span_map.get(&call_id))
+                .unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg,
+                },
+                call_id,
+            );
+        }
+    }
+
+    /// B600: whether a call's callee has a generic its recorded bindings
+    /// leave OPEN — missing, bound to itself, or bound to a hole — which is
+    /// what makes an operand's hole the instance's.
+    fn call_leaves_a_generic_open(&self, call_id: Id) -> bool {
+        let Some(Expr::Local(member_id)) = self
+            .function_calls
+            .get(&call_id)
+            .and_then(|function_call| self.expr_id_to_expr_map.get(&function_call.subject_id))
+        else {
+            return false;
+        };
+        let substitution = self.method_call_substitution.get(&call_id);
+        self.callee_bindable_generics(*member_id)
+            .iter()
+            .any(|generic| {
+                !self.generic_is_enclosing_binder(*generic, call_id)
+                    && match substitution.and_then(|substitution| substitution.get(generic)) {
+                        None => true,
+                        Some(bound) => {
+                            self.binds_to_itself(*generic, *bound) || self.type_has_hole(*bound)
+                        }
+                    }
+            })
+    }
+
+    /// B600: whether a call's RESULT can carry its open generic — its declared
+    /// return mentions one (`Signal::new(None)`'s `SignalCell<T>`), or its
+    /// return is inferred — so a direction on the call can settle it. A call
+    /// whose result cannot (`None.is_some()` is a `bool`) is not settled by
+    /// any annotation on its result.
+    fn call_result_carries_an_open_generic(&self, call_id: Id) -> bool {
+        let Some(return_type_id) = self.call_declared_return_type_id(call_id) else {
+            return true;
+        };
+        let mut mentioned = Vec::new();
+        self.collect_generics(return_type_id.borrow_type(self), 0, &mut mentioned);
+        !mentioned.is_empty()
+    }
+
+    /// B600: an operand a call resolved over whose type still held a hole
+    /// after the call's fills (B599) — the receiver, then each argument —
+    /// for [`Self::refuse_expression_holes`] to ask again once inference is
+    /// done. Only a type that holds a hole is recorded.
+    fn record_hole_operand(&mut self, call_id: Id, operand_id: Id, operand_type: &Type) {
+        if matches!(
+            operand_type,
+            Type::Closure(..) | Type::Unknown | Type::Unresolved | Type::Any
+        ) || !self.type_value_has_hole(operand_type)
+        {
+            return;
+        }
+        // Only a user file's call is ever refused; std's (and a frozen or a
+        // dependency file's) are not recorded at all.
+        match self.source_of_id(call_id) {
+            Some(source)
+                if source != DERIVED_SOURCE
+                    && !self.std_sources.contains(&source)
+                    && !self.frozen_sources.contains(&source)
+                    && !self.dependency_sources.contains(&source) => {}
+            _ => return,
+        }
+        let type_id = operand_type.clone().get_type_id(self);
+        self.hole_operands.push((call_id, operand_id, type_id));
     }
 
     /// Pretty-prints a type for diagnostics, resolving generic names
@@ -69179,8 +70814,9 @@ impl<'src> Analyzer<'src> {
                     self.collect_generics(&item.get_type(self), depth + 1, out);
                 }
             }
-            Type::Array(element_id, _) => {
+            Type::Array(element_id, length_id) => {
                 self.collect_generics(&element_id.get_type(self), depth + 1, out);
+                self.collect_generics(&length_id.get_type(self), depth + 1, out);
             }
             _ => {}
         }
@@ -69476,12 +71112,17 @@ impl<'src> Analyzer<'src> {
                 }
                 buf.push(')');
             }
-            Type::Array(element_id, length) => {
+            Type::Array(element_id, length_id) => {
                 let element = element_id.get_type(self);
                 let element_str =
                     self.pretty_print_type_at(&element, substitution, depth + 1, visiting);
-                buf.push_str(&format!("[{element_str}; {length}]"));
+                let length = length_id.get_type(self);
+                let length_str =
+                    self.pretty_print_type_at(&length, substitution, depth + 1, visiting);
+                buf.push_str(&format!("[{element_str}; {length_str}]"));
             }
+            // A length prints as its number (array-lengths.md §3).
+            Type::Length(length) => buf.push_str(&length.to_string()),
             Type::Mapped(binder_id, source_id, template_id) => {
                 let binder = self
                     .generic_constraint_names
@@ -69932,6 +71573,14 @@ pub enum TryDispatch {
 /// source file. Since entity ids are minted monotonically and each file is
 /// walked by a single top-level pass, these ranges map an entity back to the
 /// file it came from (see `Program::source_of`).
+/// One body's `bumps` scan (`Analyzer::infer_bumps`): the parameter positions
+/// it bumps, and the callees whose verdict it read on the way — the
+/// dependency edges the worklist follows (M127).
+struct BumpScan {
+    positions: BTreeSet<u32>,
+    callees: Vec<Id>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceRange {
     pub start: u32,
@@ -71064,6 +72713,14 @@ pub struct Program<'src> {
     // pass) mint fresh entities — synthetic parameters and references — from
     // here without colliding with analyzed ones.
     pub next_entity_id: u32,
+    /// M110 S3 (Order 50): the reuse seam the post passes read — which
+    /// entities the STORED world minted (cold: identical on every analysis
+    /// served from it), the world's post-pass record, and where to file one.
+    /// `None` for an analysis no world key describes (a macro world, an
+    /// entry that is itself a module, a clean analysis).
+    pub(crate) seam: Option<Box<ReuseSeam>>,
+    /// M110 S5: the id-window spike's census, when `VILAN_ID_WINDOWS` is on.
+    pub id_windows: Option<id_windows::IdWindowsReport>,
     // Functions and closures that are async (declared `async`, or inferred — its
     // body awaits, directly or by calling an async function). Filled by the
     // async inference pass; the transformer emits these as `async` and awaits
@@ -74961,6 +76618,85 @@ fn interned_display_name(name: String) -> &'static str {
     leaked
 }
 
+/// M110 S3 (Order 50): what the post passes know about the world an analysis
+/// was served from — see [`Program::seam`].
+#[derive(Debug)]
+pub(crate) struct ReuseSeam {
+    /// Entity ids below this were minted by the stored world.
+    pub boundary: u32,
+    /// The entity ranges of the prefix sources this analysis does NOT treat
+    /// as cold (the entry dirtied them, or an alias of the entry reaches
+    /// them): sorted, disjoint. Their entities are recomputed with the hot
+    /// set's.
+    pub warm_ranges: Vec<(u32, u32)>,
+    /// The cold source set, fingerprinted: a record is replayed only for the
+    /// set it was computed over.
+    pub cold_fingerprint: u64,
+    pub key: BaseCacheKey,
+    pub prefix_hashes: Vec<u64>,
+    /// The world's post-pass record for this cold set, if one is filed.
+    pub record: Option<std::sync::Arc<PostRecord>>,
+    /// Whether the record describes the cold tree in THIS analysis's rewrite
+    /// state — its context log equals this analysis's (the context pass sets
+    /// it). A cold result that depends on the rewrite (the async set: a
+    /// lowered `run` is a call of its body) is read and written only then.
+    pub record_matches: bool,
+    /// Whether a front end seeded this analysis — the record is filed only
+    /// then, as the label tables are (S2b): a cold `vilan check` never reads
+    /// one back and must not pay for writing it.
+    pub seeded: bool,
+}
+
+/// M110 S3 (Order 50): the post passes' PREFIX results, recorded with the
+/// world ([`WorldChecks::post`]) and read back by every analysis served from
+/// it over the same cold set. Everything here is keyed by ids the stored
+/// world minted (§2.1: the same on every hit) or carries none.
+#[derive(Debug)]
+pub(crate) struct PostRecord {
+    /// The cold nodes' call graph BEFORE the context rewrite: a pure function
+    /// of the cold tree. A hit clones it and adds the hot nodes over it.
+    pub graph_before: crate::call_graph::CallGraph,
+    /// The cold nodes' call graph AFTER the context rewrite — `None` when the
+    /// recording analysis rewrote nothing, or when the rewritten cold graph
+    /// names an entity the rewrite minted (minted ids are this analysis's,
+    /// not the world's). Valid only while [`Self::context_log`] matches.
+    pub graph_after: Option<crate::call_graph::CallGraph>,
+    /// The context rewrite's cold edits — the mutation LOG: the plan's rows
+    /// over cold entities, canonically ordered. A hit whose own cold rows
+    /// differ rebuilds the graph after the rewrite rather than replaying
+    /// `graph_after`.
+    pub context_log: crate::context::ContextLog,
+    /// The entity counter the recording analysis's rewrite minted from; the
+    /// ids `graph_after` names at or past it are the cold rewrite's mints,
+    /// renumbered from the replaying analysis's own counter.
+    pub rewrite_base: u32,
+    /// S3b (M127): the async fixpoint's COLD result — the least fixpoint over
+    /// the cold nodes alone, every hot callee unknown — which the next
+    /// analysis's fixpoint starts from (`async_infer::infer`). Set once, by
+    /// the first analysis that reads the record after filing it; sorted.
+    pub async_cold: std::sync::OnceLock<Vec<Id>>,
+    /// What the record retains, in bytes (M46's currency).
+    pub bytes: usize,
+}
+
+impl Program<'_> {
+    /// M110 S3: whether `id` names an entity the STORED world minted and this
+    /// analysis treats as the prefix's — identical on every analysis served
+    /// from the world, so an answer about it can be read off the record.
+    pub(crate) fn cold_entity(&self, id: Id) -> bool {
+        let Some(seam) = &self.seam else {
+            return false;
+        };
+        if id.0 >= seam.boundary {
+            return false;
+        }
+        let index = seam
+            .warm_ranges
+            .partition_point(|(start, _)| *start <= id.0);
+        !(index > 0 && id.0 < seam.warm_ranges[index - 1].1)
+    }
+}
+
 /// What a resolved pre-entry world is a function of, apart from the loaded
 /// files' CONTENT — which the per-hit re-hash validates instead of keying on
 /// (the E12 rule). Two analyses agreeing on every field here discover, load,
@@ -74971,8 +76707,8 @@ fn interned_display_name(name: String) -> &'static str {
 /// `workspace.packages.is_empty()` gate could never satisfy even though every
 /// macro world in a process shares one `macro_std` — the gate was standing in
 /// for a key that did not describe the workspace, not for a real hazard.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct BaseCacheKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BaseCacheKey {
     platform: Platform,
     /// B422: the std package's ROOTS, canonical — its base root, then each
     /// layer's, in the spec's order. A world's std modules are loaded FROM
@@ -75581,7 +77317,7 @@ fn base_cache_world_bytes(world: &World<'_>) -> usize {
 /// The M41 half of [`base_cache_world_bytes`], alone: T0's dirty-bit census
 /// (`type_id_sources`), one [`SourceId`] per `TypeId` the world minted.
 fn base_cache_world_type_census_bytes(world: &World<'_>) -> usize {
-    world.analyzer.type_id_sources.len() * std::mem::size_of::<SourceId>()
+    world.analyzer.type_id_sources.bytes()
 }
 
 #[doc(hidden)]
@@ -75969,6 +77705,10 @@ struct WorldChecks {
     source_hashes: Vec<u64>,
     sources_fingerprint: u64,
     per_source: HashMap<u32, ModuleDiagnostics>,
+    /// M110 S3: the post passes' prefix record, with the cold-set fingerprint
+    /// it was computed over. One per world key: a session's keystrokes in one
+    /// file share a cold set, and a different set files its own.
+    post: Option<(u64, std::sync::Arc<PostRecord>)>,
     /// M46: what this record costs in BYTES — the input to the budget below,
     /// kept as a running total so enforcing it costs an addition rather than a
     /// walk. M19 T1b counted ROWS here, which priced a one-`Id` last-use row
@@ -75985,6 +77725,7 @@ impl WorldChecks {
     /// table slices.
     fn compute_bytes(&self) -> usize {
         let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
+        let post = self.post.as_ref().map_or(0, |(_, record)| record.bytes);
         let modules: usize = self
             .per_source
             .values()
@@ -75995,7 +77736,7 @@ impl WorldChecks {
                     + module.tables.as_ref().map_or(0, ModuleTables::bytes)
             })
             .sum();
-        hashes + modules
+        hashes + modules + post
     }
 }
 
@@ -76227,6 +77968,8 @@ fn checked_cache_store(
     let mut per_source = existing
         .map(|recorded| recorded.per_source.clone())
         .unwrap_or_default();
+    // M110 S3: a post record filed under the same content stays with it.
+    let post = existing.and_then(|recorded| recorded.post.clone());
     // A source this analysis found unrecordable loses whatever an EARLIER one
     // remembered about it: the merge above would otherwise keep serving a
     // record the current derivation has just declared unfit.
@@ -76243,6 +77986,7 @@ fn checked_cache_store(
         source_hashes: source_hashes.to_vec(),
         sources_fingerprint: fingerprint,
         per_source,
+        post,
         bytes: 0,
         last_used: tick,
     };
@@ -76305,6 +78049,69 @@ fn checked_cache_store_tables(
     // every one of them pays a full class D phase again; evicting means the
     // shapes a session keeps replaying survive. The record just written is
     // exempt, as M24's world is.
+    let bytes = recorded.bytes;
+    let tick = state.next_tick();
+    if let Some(recorded) = state.records.get_mut(key) {
+        recorded.last_used = tick;
+    }
+    state.bytes = state
+        .bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(bytes);
+    state.evict_to_budget(Some(key));
+}
+
+/// M110 S3: the post passes' prefix record for `key`, if one is filed for
+/// this content and this cold set.
+fn checked_cache_lookup_post(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    cold_fingerprint: u64,
+) -> Option<std::sync::Arc<PostRecord>> {
+    let cache = CHECKED_CACHE.get()?;
+    let state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let recorded = state.records.get(key)?;
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+    {
+        return None;
+    }
+    recorded
+        .post
+        .as_ref()
+        .filter(|(fingerprint, _)| *fingerprint == cold_fingerprint)
+        .map(|(_, record)| record.clone())
+}
+
+/// M110 S3: files the post passes' prefix record beside the checks record
+/// the diagnostics store wrote for this key — never creating one (the
+/// diagnostics store is what says the content was recorded at all).
+pub(crate) fn checked_cache_store_post(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    cold_fingerprint: u64,
+    record: std::sync::Arc<PostRecord>,
+) {
+    let Some(cache) = CHECKED_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_bytes = state.records.get(key).map_or(0, |record| record.bytes);
+    let Some(recorded) = state.records.get_mut(key) else {
+        return;
+    };
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+    {
+        return;
+    }
+    let was = recorded.post.as_ref().map_or(0, |(_, record)| record.bytes);
+    recorded.bytes = recorded.bytes.saturating_sub(was) + record.bytes;
+    recorded.post = Some((cold_fingerprint, record));
     let bytes = recorded.bytes;
     let tick = state.next_tick();
     if let Some(recorded) = state.records.get_mut(key) {
@@ -76991,6 +78798,10 @@ fn load_hot_modules<'src>(
             &module,
             source_id,
         );
+        analyzer
+            .id_windows
+            .source_keys
+            .push(crate::content_hash(&module_path.to_string_lossy()));
         world.sources.push(module_path);
         world.source_hashes.push(crate::content_hash(module.text));
         analyzer.source_texts.push((source_id, module.text));
@@ -77195,7 +79006,7 @@ fn load_hot_modules<'src>(
         analyzer.module_scope_ids.insert(*module_scope_id);
         analyzer.select_platform_twins(&ast.0, text);
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&ast.0, *module_scope_id);
+        analyzer.walk_module_items(&ast.0, *module_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -78241,6 +80052,13 @@ fn analyze_inner<'src>(
         // M19 T0/T1: from here every type-slot write is the ENTRY's, so
         // `write_type_slot` can attribute the ones that move a module's slots.
         // Set before the entry expansion, which is already entry work.
+        world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
+        // M110 S6: the stored world's windows are its own; this analysis
+        // lays out the hot set's and the entry's after them.
+        world
+            .analyzer
+            .id_windows
+            .inherit(crate::content_hash(&entry_path.to_string_lossy()));
         world.analyzer.entry_phase = true;
         // M110 S1: the hot set, over the served prefix — exactly what the miss
         // below does after its store, so a hit and a miss build one world.
@@ -78308,6 +80126,10 @@ fn analyze_inner<'src>(
     let mut sources: Vec<PathBuf> = vec![entry_path.to_path_buf()];
     let mut source_hashes: Vec<u64> = vec![crate::content_hash(entry_source)];
     let mut analyzer = Analyzer::new();
+    // M110 S6: the id windows are the editor's (a seeded analysis, or one
+    // asked for reading aids); a cold check runs without them.
+    analyzer.id_windows.mode =
+        id_windows::mode_for(workspace.reading_aids || !workspace.hot_seeds.is_empty());
     // B573: the platform BEFORE anything walks. The load drain below walks every
     // module and selects its `[platform(..)]` twins (`select_platform_twins`
     // reads `self.platform`), and so does a hot set's walk over the stored
@@ -78321,6 +80143,10 @@ fn analyze_inner<'src>(
     // The entry file's text, registered first so SourceId(0) always resolves
     // (element-syntax S4 — the source-inspecting diagnostics read it).
     analyzer.source_texts.push((SourceId(0), entry_source));
+    analyzer
+        .id_windows
+        .source_keys
+        .push(crate::content_hash(&entry_path.to_string_lossy()));
     // The std module inventory for the B4 import steer (module name, path) —
     // every layer's modules except the package surface itself, which is
     // integrated into the package name and is not a module a user imports
@@ -78359,6 +80185,7 @@ fn analyze_inner<'src>(
         .map(|path| path.to_string());
     let global_scope = analyzer.create_scope(None);
     let global_scope_id = analyzer.push_scope(global_scope);
+    analyzer.entry_scope_id = Some(global_scope_id);
     // Every primitive is now migrated to source and captured after its module
     // loads, reachable as the bare name (the prelude, here the global scope) and
     // — since the module scopes below are children of the global scope — as
@@ -79287,6 +81114,11 @@ fn analyze_inner<'src>(
                     )
                 };
             analyzer.source_texts.push((module_source_id, module_text));
+            analyzer.id_windows.source_keys.push(
+                sources
+                    .last()
+                    .map_or(0, |path| crate::content_hash(&path.to_string_lossy())),
+            );
             let module_scope = analyzer.create_scope(Some(global_scope_id));
             let module_scope_id = analyzer.push_scope(module_scope);
             // A65: a module already has an entity when a CHILD of it loaded
@@ -79870,7 +81702,7 @@ fn analyze_inner<'src>(
             analyzer.select_platform_twins(&ast.0, text);
         }
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&ast.0, *module_scope_id);
+        analyzer.walk_module_items(&ast.0, *module_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -79895,7 +81727,7 @@ fn analyze_inner<'src>(
         analyzer.set_current_source(lib_source_id);
         analyzer.module_scope_ids.insert(std_scope_id);
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&lib_ast.0, std_scope_id);
+        analyzer.walk_module_items(&lib_ast.0, std_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -79909,7 +81741,7 @@ fn analyze_inner<'src>(
         analyzer.set_current_source(*source_id);
         analyzer.module_scope_ids.insert(*namespace_scope_id);
         let start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&lib_ast.0, *namespace_scope_id);
+        analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start,
             end: analyzer.entity_id,
@@ -80510,6 +82342,9 @@ fn analyze_inner<'src>(
     }
     // After the store, so the world the cache holds is the pre-entry one it
     // has always been.
+    world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
+    // (S6: no `inherit` here — this analysis laid the prefix's windows out
+    // itself and records their demand; a HIT inherits them.)
     world.analyzer.entry_phase = true;
     // M110 S1: the hot set, over the prefix just stored — what a hit on that
     // world does too, so the two build one world.
@@ -80768,7 +82603,7 @@ fn analyze_over_world<'src>(
             analyzer.select_platform_twins(&nodes.0, entry_text);
         }
         let entry_walk_start = analyzer.entity_id;
-        analyzer.walk_expr_nodes(&nodes.0, global_scope_id);
+        analyzer.walk_module_items(&nodes.0, global_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start: entry_walk_start,
             end: analyzer.entity_id,
@@ -80839,6 +82674,10 @@ fn analyze_over_world<'src>(
             $( if !crate::cancel::cancelled() {
                 $call;
                 crate::phase_pass_mark(stringify!($call));
+                // M134: a pass's anchor ends with the pass, so the next one's
+                // mints are counted against its own anchoring, never the
+                // last pass's leftover.
+                analyzer.id_windows.clear_anchor();
             } )+
         };
     }
@@ -80848,6 +82687,8 @@ fn analyze_over_world<'src>(
         analyzer.build();
     }
     analyzer.types_settled = true;
+    analyzer.id_windows.phase = id_windows::Phase::Checks;
+    analyzer.id_windows.clear_anchor();
     // ------------------------------------------------------------------
     // M19 T1: which of this world's modules are reusable for THIS analysis
     // (`per-module-analysis-reuse.md` §4.1). Three terms, and all three have
@@ -81082,6 +82923,7 @@ fn analyze_over_world<'src>(
                 let warnings_before = analyzer.warnings.len();
                 $call;
                 crate::phase_pass_mark(stringify!($call));
+                analyzer.id_windows.clear_anchor();
                 analyzer.record_reusable_window(diagnostics_before, warnings_before);
             } )+
         };
@@ -81127,6 +82969,7 @@ fn analyze_over_world<'src>(
         // B251's twin of the bound check above, at the third binding channel:
         // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).
         analyzer.check_written_nominal_bounds();
+        analyzer.check_call_generic_argument_kinds();
         analyzer.check_tuple_spreads();
         analyzer.check_tuple_literal_labels();
         analyzer.check_named_arguments();
@@ -81617,10 +83460,13 @@ fn analyze_over_world<'src>(
     // records the move and view checks wrote (E281, E282) — AFTER every check
     // (they judged the program as written) and BEFORE the last-use dataflow,
     // so the reads count as uses for liveness, copy elision and drop extents.
+    crate::phase_pass_mark("the intrinsic table");
     analyzer.expand_dbg_stacks();
+    crate::phase_pass_mark("analyzer.expand_dbg_stacks()");
     // Transparent references (R5): rewrite bare assignments to a view into the
     // write-through deref form before codegen reads the targets.
     analyzer.rewrite_view_assignment_targets();
+    crate::phase_pass_mark("analyzer.rewrite_view_assignment_targets()");
     // The last-use dataflow (`analyzer/liveness.rs`, lifetimes.md §6/S2), run
     // once the tree is FINAL — the rewrite above moves reads, and a liveness
     // answer about a tree that no longer exists is worse than none. Every
@@ -81682,11 +83528,13 @@ fn analyze_over_world<'src>(
     // cheap type-level pass over the entry's module-level bindings); the transformer
     // consults it only under `BuildOptions.hmr`, so non-HMR output is unaffected.
     let hmr_bindings = analyzer.compute_hmr_bindings(global_scope_id);
+    crate::phase_pass_mark("the view, clone and hmr plans");
 
     // E227: the abbreviated inlay-hint labels, where they differ — asked
     // BEFORE the label loop below, which borrows the analyzer immutably, since
     // admission is the solver's `&mut` question.
     let hint_labels = analyzer.hint_labels();
+    crate::phase_pass_mark("analyzer.hint_labels()");
     // E278 / B570: the editor's reading aids, only for a front end that reads
     // them (`Workspace::reading_aids`); `auto_fills` still writes the `[check]
     // auto` warnings on the CLI, without the table.
@@ -81696,6 +83544,7 @@ fn analyze_over_world<'src>(
         Vec::new()
     };
     let auto_fills = analyzer.auto_fills(workspace.check.auto, workspace.reading_aids);
+    crate::phase_pass_mark("the stage hints and auto fills");
     let has_ascriptions = !analyzer.ascriptions.is_empty();
 
     // Pre-render a type label for every typed expression (for hover). Done here
@@ -82409,6 +84258,102 @@ fn analyze_over_world<'src>(
         );
     }
 
+    // M110 S3 (Order 50): the reuse seam for the post passes. The COLD sources
+    // are the stored world's modules this analysis treats as the prefix: every
+    // source below `prefix_len` that the entry neither dirtied (its slots are
+    // the stored world's) nor reaches through an alias of itself. A post pass
+    // may read a cold entity's answer off the world's record; a module outside
+    // the set is recomputed like the hot set's. The set is fingerprinted so a
+    // record filed for one cold set is never replayed for another.
+    let reuse_seam: Option<Box<ReuseSeam>> = match (&checks_key, analyzer.prefix_entity_end) {
+        (Some(key), Some(boundary))
+            if !entry_is_module
+                && !crate::cancel::cancelled()
+                && !crate::incremental::clean_requested() =>
+        {
+            let cold_sources: Vec<SourceId> = (1..prefix_len as u32)
+                .map(SourceId)
+                .filter(|source| {
+                    !analyzer.entry_dirty_sources.contains(source)
+                        && !alias_reaching.contains(source)
+                })
+                .collect();
+            let cold_fingerprint = {
+                let mut rendered = String::new();
+                for source in &cold_sources {
+                    rendered.push_str(&source.0.to_string());
+                    rendered.push('\u{0}');
+                }
+                rendered.push_str(&prefix_len.to_string());
+                crate::content_hash(&rendered)
+            };
+            let cold: HashSet<SourceId> = cold_sources.iter().copied().collect();
+            let mut warm_ranges: Vec<(u32, u32)> = analyzer
+                .source_ranges
+                .iter()
+                .filter(|range| {
+                    range.source.0 != 0
+                        && (range.source.0 as usize) < prefix_len
+                        && !cold.contains(&range.source)
+                })
+                .map(|range| (range.start, range.end))
+                .collect();
+            warm_ranges.sort_unstable();
+            let record =
+                checked_cache_lookup_post(key, &source_hashes[..prefix_len], cold_fingerprint);
+            Some(Box::new(ReuseSeam {
+                boundary,
+                warm_ranges,
+                cold_fingerprint,
+                key: key.clone(),
+                prefix_hashes: source_hashes[..prefix_len].to_vec(),
+                record,
+                record_matches: false,
+                seeded: !workspace.hot_seeds.is_empty(),
+            }))
+        }
+        _ => None,
+    };
+
+    // M110 S6: what every window this analysis laid out demanded, for the
+    // next analysis of the same items to size by.
+    analyzer.id_windows.record_demand();
+    // M110 S5: the spike's census over the final tables, printed per analysis.
+    let id_windows_report = analyzer.id_windows.on().then(|| {
+        let report = analyzer.id_windows.report(
+            analyzer.entity_id,
+            analyzer.type_id,
+            analyzer.scope_id,
+            analyzer
+                .expr_id_to_type_id_map
+                .iter()
+                .map(|(expression, type_id)| (*expression, *type_id)),
+        );
+        // Printed only where the counters line is (`VILAN_COUNTERS`): a
+        // compiled program's stderr is asserted on by the native
+        // differential, and an instrument must not be in it.
+        if !crate::macros::in_macro_world() && crate::counters::counters_enabled() {
+            eprintln!("{}", report.line());
+            report.dump();
+        }
+        report
+    });
+    // M110 S6: the windows' counters, on the census the pins read.
+    if let Some(report) = &id_windows_report
+        && !crate::macros::in_macro_world()
+    {
+        let census = &report.census;
+        let outside = census.entities.relocated_outside_anchor
+            + census.types.relocated_outside_anchor
+            + census.scopes.relocated_outside_anchor;
+        crate::incremental::update_census(|incremental| {
+            incremental.windows_laid_out = report.laid_out;
+            incremental.windows_inherited = report.inherited;
+            incremental.windows_overflowed = census.overflowed;
+            incremental.window_writes_other = census.writes_other;
+            incremental.window_outside_anchor = outside;
+        });
+    }
     Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -82603,6 +84548,8 @@ fn analyze_over_world<'src>(
         dyn_method_calls: std::mem::take(&mut analyzer.dyn_method_calls),
         dyn_dispatched_members: std::mem::take(&mut analyzer.dyn_dispatched_members),
         next_entity_id: analyzer.entity_id,
+        seam: reuse_seam,
+        id_windows: id_windows_report,
         async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
         view_suspension_checks: std::mem::take(&mut analyzer.view_suspension_checks),
@@ -84439,7 +86386,8 @@ mod walk_type_node_fence_tests {
             Vec::new(),
             Vec::new(),
         ));
-        let array = analyzer.type_id_for_type(Type::Array(tuple, 3));
+        let length = analyzer.length_type_id(3);
+        let array = analyzer.type_id_for_type(Type::Array(tuple, length));
         let slots = [unresolved, void, generic, tuple, closure, array];
         assert!(
             slots.iter().any(|slot| !matches!(

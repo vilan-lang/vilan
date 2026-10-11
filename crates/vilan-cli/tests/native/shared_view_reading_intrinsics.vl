@@ -5,7 +5,7 @@
 // count it. The receiver's cell is settled before the arguments, the borrow
 // taken after them (`touch` pushes first and the read sees the push, as JS's
 // does). `HashSet::contains` and `HashMap::get` are std calls, not
-// intrinsics: they still read a copy.
+// intrinsics; over a `str` key they read through the cell too (F123).
 import std::hash_map::HashMap;
 import std::hash_set::HashSet;
 import std::io::print;

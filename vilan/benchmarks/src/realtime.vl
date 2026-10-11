@@ -156,7 +156,7 @@ fun drive(port: i32, finished: || void) {
 	}
 	let settled = now_millis() - started;
 	print(i"per-session update frames: {alice.frames.read()} {bob.frames.read()} {carol.frames.read()} (subscribe + 1 per mutation)");
-	print(i"all sessions settled at {mutations} after {round(settled)} ms ({round(settled * 1000.0 / mutations)} us per mutation fan-out)");
+	print(i"all sessions settled at {mutations} after {round(settled)} ms ({round(settled * 1000.0 / mutations.as_f64())} us per mutation fan-out)");
 	// Done watching: release the three leases, which closes the channels.
 	alice.watching.read()?.dispose();
 	bob.watching.read()?.dispose();

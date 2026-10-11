@@ -155,6 +155,36 @@ impl List<type T> with Items<T> {
 	}
 }
 
+/// A fixed array is a run of its elements too (A161, array-lengths.md S5):
+/// `xs.push_many(fixed)` takes a `[T; n]` of any length.
+impl [type T; _] with Items<T> {
+	fun push_onto(own self, target: &mut List<T>) {
+		for item in self {
+			target.push(item);
+		}
+	}
+}
+
+/// A fixed array's conversions (array-lengths.md S5). Both copy: an array is a
+/// value, and the `List` it becomes grows apart from it.
+impl [type T; _] {
+	/// A new `List` holding the elements, in order — the explicit conversion (an
+	/// array never coerces to a `List`, fixed-arrays.md §7).
+	fun to_list(self): List<T> {
+		mut out = List::new();
+		for item in self {
+			out.push(item);
+		}
+		out
+	}
+
+	/// A lazy cursor over a snapshot of the elements, and the entry to the adapter
+	/// chain, as `List::iter` is: `fixed.iter().map(f).to_list()`.
+	fun iter(self): ListIterator<T> {
+		self.to_list().iter()
+	}
+}
+
 /// The empty list is a `List`'s default (I4). It is here rather than in
 /// `default.vl` for the reason that module's own comment gives: a type with a
 /// module of its own declares its default there, the way `Option` does. Without it

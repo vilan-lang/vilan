@@ -158,7 +158,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc.vl",
-        56,
+        58,
         "R + O + E: sessions, wiring, the mirrors' leases. FIVE fewer since \
          A112 S1: `KeyedCell`'s own log, version, base and cursors, and its \
          cursor's sequence, are `DeltaLog`'s now (see `delta.vl`). +4 at A134 \
@@ -174,20 +174,26 @@ const CENSUS: &[(&str, usize, &str)] = &[
          the client that enlisted it, run by its `rebind`). +1 at A143: a \
          client's wire demand (R: one per `ReactiveClient`, every mirror's \
          `Subscribe`/`Unsubscribe` registered in it, cleared by a reconnect \
-         and by `dispose`).",
+         and by `dispose`). +2 at A153 S4: a socket duplex's drop hooks (E: \
+         `dispose_on_close` registers the client's, `handle_drop` runs them) \
+         and a client's mirrored-store drop hooks (E: enlisted by a store \
+         mint while it holds a grant, run by `connection_lost`).",
     ),
     (
         "rpc/mirror.vl",
-        25,
-        "R + E: the open mirror channels and the client's views (two module \
-         bindings), and the cells every copy of a record reaches — on the server \
-         per channel the grants, the slots, the turn's dirty and seeding lists, \
-         its pending flush and the next base slot, and each grant's and slot's \
-         hold count (A153 S1); on the client per view its route cell, slots, \
-         retired readers, next slot, the turn's subscribe and unsubscribe lists \
-         and its pending flush, each slot's hold count, and per store mirror its \
-         binding, its call in flight, its holds, each hold's release and its \
-         retire list (A153 S2)",
+        31,
+        "R + E: the open mirror channels, the client's views and the failed \
+         mints' last errors (three module bindings), and the cells every copy of \
+         a record reaches — on the server per channel the grants, the slots, the \
+         turn's dirty and seeding lists, its pending flush, the next base \
+         slot and the released slots it owes a `Gone` (A169), and each grant's and slot's hold count (A153 S1); on the client \
+         per view its route cell, slots, retired readers, next slot, the turn's \
+         subscribe and unsubscribe lists and its pending flush, each slot's hold \
+         count, and per store mirror its binding, its call in flight, its holds, \
+         each hold's release, its retire list, the boundaries it has heard and \
+         the cells its handles' `states()` follow (A153 S2), and per view whether \
+         its connection dropped (A153 S4) and the released boundaries it parks \
+         while one inside them is held",
     ),
     (
         "rpc/server.vl",
@@ -318,7 +324,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 223,
+        total, 231,
         "the total number of `Shared` construction sites in std changed"
     );
 

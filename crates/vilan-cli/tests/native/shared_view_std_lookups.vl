@@ -1,0 +1,58 @@
+// F123: std's keyed lookups (`HashSet::contains`, `HashMap::get`,
+// `HashMap::contains_key`) over a field of a `Shared` view read the
+// collection through the cell, not a copy of it, when the key hashes by
+// std's impls (`str`, an integer, a tuple of those). A key argument that
+// writes the cell runs before the borrow; a user key type with a written
+// `hash` that reads the cell keeps the copy (its `hash` could reach it).
+import std::hash::Hash;
+import std::hash::Hashable;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::shared::Shared;
+
+struct Probe {
+	tag: i32,
+}
+
+struct Bag {
+	seen: HashSet<str>,
+	counts: HashMap<str, i32>,
+	by_id: HashMap<i32, str>,
+	pairs: HashSet<(i32, str)>,
+	probes: HashSet<Probe>,
+}
+
+impl Probe with Hashable {
+	fun hash(self): Hash {
+		self.tag.hash()
+	}
+}
+
+fun mark(cell: Shared<Bag>, name: str): str {
+	cell.write().seen.insert(name);
+	name
+}
+
+fun main() {
+	let cell = Shared::new(Bag {
+		seen = HashSet::new(),
+		counts = HashMap::new(),
+		by_id = HashMap::new(),
+		pairs = HashSet::new(),
+		probes = HashSet::new(),
+	});
+	cell.write().seen.insert("x");
+	cell.write().counts.insert("k", 4);
+	cell.write().by_id.insert(7, "seven");
+	cell.write().pairs.insert((1, "one"));
+	cell.write().probes.insert(Probe { tag = 3 });
+	print(cell.read().seen.contains("x"));
+	print(cell.read().seen.contains("y"));
+	print(cell.read().counts.get("k"));
+	print(cell.write().counts.contains_key("z"));
+	print(cell.read().by_id.get(7));
+	print(cell.read().pairs.contains((1, "one")));
+	print(cell.read().seen.contains(mark(cell, "late")));
+	print(cell.read().probes.contains(Probe { tag = 3 }));
+}

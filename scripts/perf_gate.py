@@ -513,11 +513,12 @@ def different_sources_note(sources):
 
 
 def refuse_unchecked_sources(options, sources):
-    """Across a breaking release each side checks its OWN source, so a ratio means something only when both
-    checks are clean: run each once, before anything is measured, and answer the refusals (empty: both
-    clean). A same-source seal keeps its old rule (a disagreement is noted, not refused)."""
-    if not sources["different"]:
-        return []
+    """Every side checks its source before anything is measured, and a check that fails is a REFUSAL, not a
+    ratio (N165: a program with errors stops the compiler early, so a measurement of it is a fraction of the
+    true cost - Order 49's seal read x1.2..x7 on a base archive that lacked kolt's gitignored `src/lucide`).
+    Run each side's compiler once in the copy it will measure and answer the refusals (empty: both clean).
+    Across a breaking release (`--tip-kolt`) the two sides check their OWN sources; on one shared source a
+    tip that rejects what the base accepts is refused the same way - the tip then needs its migrated tree."""
     env_base, env_tip = side_envs(options)
     refusals = []
     for side, binary, env in (("base", options.base, env_base), ("tip", options.tip, env_tip)):
@@ -558,13 +559,23 @@ def t3_compare(options, sources):
     loads = [loadavg()]
     for _ in range(options.runs):
         for name, binary, env, copy in sides:
-            runs[name].append(perf_count.measure([binary, "check", "."], cwd=copy, env=env, counter=counter))
+            sample = perf_count.measure([binary, "check", "."], cwd=copy, env=env, counter=counter)
+            if sample["peak_rss_kb"] is None:
+                # Under callgrind the rusage is valgrind's own: take the compiler's peak from a fresh run of its
+                # own (the instruction count is the one the counter gave).
+                sample["peak_rss_kb"] = perf_count.peak_rss([binary, "check", "."], cwd=copy, env=env)["peak_rss_kb"]
+            runs[name].append(sample)
         loads.append(loadavg())
+    rss_runs = {name: [sample["peak_rss_kb"] for sample in samples] for name, samples in runs.items()}
     summary = {}
     for name, samples in runs.items():
         summary[name] = {
             "cpu_s": statistics.median(s["cpu_s"] for s in samples),
-            "peak_rss_kb": max(s["peak_rss_kb"] or 0 for s in samples),
+            # Each run is a FRESH process (`perf_count.measure` forks and `wait4`s one), so its `ru_maxrss` is that
+            # run's alone; the figure is the MEDIAN of the runs (scripts/rss-probe.py's rule), not the max - one
+            # run under a stray load must not move a ratio the gate compares at 3%.
+            "peak_rss_kb": statistics.median(rss_runs[name]),
+            "peak_rss_runs_kb": sorted(rss_runs[name]),
             "instructions": statistics.median(s["instructions"] for s in samples),
             "exit": samples[-1]["exit"],
         }
@@ -714,8 +725,8 @@ def command_seal(options):
             if refusals:
                 for refusal in refusals:
                     print(f"  REFUSED  {refusal}")
-                print("PERF VERDICT: REFUSED — across a breaking release each side must check its own source "
-                      "with no errors; nothing was measured and no verdict was written")
+                print("PERF VERDICT: REFUSED — each side must check its source with no errors (a measurement of "
+                      "a broken program is not a measurement); nothing was measured and no verdict was written")
                 return 1
             if sources["different"]:
                 print(f"  NOTE  {different_sources_note(sources)}")
@@ -728,6 +739,10 @@ def command_seal(options):
             print(f"  T3 {label} @{t3['kolt']}: CPU x{t3['ratio']['cpu_s']:.3f}  "
                   f"RSS x{t3['ratio']['peak_rss_kb']:.3f}  instructions x{t3['ratio']['instructions']:.3f}  "
                   f"(load max {t3['load_max']:.1f})")
+            print("  T3 peak RSS, a fresh process per run, median of " + str(t3["runs"]) + ": "
+                  + "; ".join(f"{side} {t3[side]['peak_rss_kb'] / 1024:.1f} MB "
+                              f"[{' '.join(str(k // 1024) for k in t3[side]['peak_rss_runs_kb'])}]"
+                              for side in ("base", "tip")))
         lsp_rows, lsp_red, lsp_notes = ([], [], [])
         if options.lsp_json:
             lsp_rows, lsp_red = lsp_compare(options.lsp_json[0], options.lsp_json[1], options.threshold)

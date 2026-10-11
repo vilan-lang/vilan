@@ -1286,8 +1286,10 @@ pub fn post_analysis_passes(
         return;
     }
     let phase_contexts_start = PhaseClock::now();
-    let call_graph =
-        context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
+    // M110 S3 (Order 50): the graph comes back from the pass — the one it
+    // analyzed over when it rewrote nothing, the one built (or replayed from
+    // the world's record) over the rewritten tree when it did.
+    let call_graph = context::thread_contexts(program);
     let phase_contexts = phase_contexts_start.elapsed();
     // debugging.md S0: `[track_caller]`'s hidden locations, threaded over the
     // graph just built. It appends ARGUMENTS only (a location is a value, not
@@ -1748,6 +1750,7 @@ thread_local! {
         const { std::cell::Cell::new(std::time::Duration::ZERO) };
     /// [`counters::type_slots_minted`] at the previous [`phase_pass_mark`].
     static PHASE_PASS_SLOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PHASE_PASS_UNANCHORED: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
 }
 
 /// Starts a per-pass split: the next [`phase_pass_mark`] measures from here.
@@ -1755,6 +1758,7 @@ pub fn phase_pass_mark_start() {
     if phase_pass_split_enabled() {
         PHASE_PASS_LAST.with(|last| last.set(thread_cpu_now().unwrap_or_default()));
         PHASE_PASS_SLOTS.with(|last| last.set(counters::type_slots_minted()));
+        PHASE_PASS_UNANCHORED.with(|last| last.set(analyzer::id_windows::unanchored_check_mints()));
         if counters::heap_armed() {
             counters::reset_heap_peak();
         }
@@ -1771,11 +1775,26 @@ pub fn phase_pass_mark(pass: &str) {
     let spent = now.saturating_sub(PHASE_PASS_LAST.with(|last| last.replace(now)));
     let slots_now = counters::type_slots_minted();
     let slots = slots_now.saturating_sub(PHASE_PASS_SLOTS.with(|last| last.replace(slots_now)));
+    // M134: the ids a pass minted in the checks phase with no item anchor,
+    // per lane (entities/types/scopes).
+    let unanchored_now = analyzer::id_windows::unanchored_check_mints();
+    let unanchored_last = PHASE_PASS_UNANCHORED.with(|last| last.replace(unanchored_now));
+    let unanchored: Vec<u64> = unanchored_now
+        .iter()
+        .zip(unanchored_last)
+        .map(|(now, last)| now.saturating_sub(last))
+        .collect();
+    let unanchored_total: u64 = unanchored.iter().sum();
     // A pass that minted type slots prints however little CPU it took: the
     // slots are held until the program drops, so they are M108's measure.
-    if spent < std::time::Duration::from_millis(1) && slots < 1000 {
+    if spent < std::time::Duration::from_millis(1) && slots < 1000 && unanchored_total == 0 {
         return;
     }
+    let unanchored = if unanchored_total == 0 {
+        "0".to_string()
+    } else {
+        format!("e{}/t{}/s{}", unanchored[0], unanchored[1], unanchored[2])
+    };
     let world = if macros::in_macro_world() {
         " (macro world)"
     } else {
@@ -1789,7 +1808,7 @@ pub fn phase_pass_mark(pass: &str) {
         .map(|megabytes| format!(" rss={megabytes}MB"))
         .unwrap_or_default();
     eprintln!(
-        "[vilan pass]{world} {:.1}cpu{rss}{heap} slots+{slots} {pass}",
+        "[vilan pass]{world} {:.1}cpu{rss}{heap} slots+{slots} unanchored+{unanchored} {pass}",
         spent.as_secs_f64() * 1000.0
     );
 }

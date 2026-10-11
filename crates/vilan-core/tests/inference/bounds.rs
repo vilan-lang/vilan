@@ -11584,15 +11584,17 @@ fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
     );
 }
 
-/// B580 (R-c, v0.47.0) and B357's binding: a `let` holding such a variant is
-/// a BINDING whose type keeps a hole — its uses state the payload, but
-/// inference does not carry a use's type back into the binding — so it is
-/// refused at the initializer, once per binding (the write-the-type steer).
+/// B599 (was B580's refusal here): a `let` holding such a variant is a
+/// binding whose type keeps a hole, and its USES state the payload — an
+/// argument at `Slot<str>`, a receiver whose `unwrap_or("d")` binds `T = str`
+/// — so inference carries the use's type back into the binding (fill-from-
+/// use) and the program runs.
 #[test]
-fn b580_a_let_of_a_payload_less_variant_whose_uses_state_its_type_is_refused() {
-    let failures = failure_diagnostics(
+fn b599_a_let_of_a_payload_less_variant_whose_uses_state_its_type_takes_it() {
+    assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::option::Option::{ self, None, Some };
 
         enum Slot<T> { Filled(T), Bare }
 
@@ -11610,14 +11612,359 @@ fn b580_a_let_of_a_payload_less_variant_whose_uses_state_its_type_is_refused() {
             print(n.unwrap_or("d"));
         }
         "#,
+        "bare\nd\n",
+    );
+}
+
+// --- B599: fill-from-use — a use that states a hole's type fills it ---------
+//
+// The argument channel (a parameter states the argument's hole), the receiver
+// channel (a call's bindings state the receiver's hole), through a generic
+// call's initializer (`Cell::new(None)`: the call's `T` IS the `None`'s
+// `Option<hole>`, never a copy), a bare-trait or bounded parameter (through
+// the one impl its head answers), and a binder of the enclosing body. A hole
+// nothing states keeps B580's refusal (`b580_*`).
+
+#[test]
+fn b599_a_concrete_parameter_states_an_argument_bindings_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun take(value: Option<str>): bool {
+            value.is_some()
+        }
+
+        fun main() {
+            let value = None;
+            print(take(value));
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b599_a_generic_calls_initializer_takes_its_type_from_an_argument_use() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> {
+                Cell { value = value }
+            }
+        }
+
+        fun take(cell: Cell<Option<str>>) {
+            print(cell.value.unwrap_or("empty"));
+        }
+
+        fun main() {
+            let cell = Cell::new(None);
+            take(cell);
+        }
+        "#,
+        "empty\n",
+    );
+}
+
+/// The item's shape (kolt's `src/sidebar.vl:65`): a BARE-TRAIT parameter
+/// states the binding's hole through `impl SignalCell<type T> with Signal<T>`.
+#[test]
+fn b599_a_bare_trait_parameter_states_the_bindings_hole_through_its_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun take(subject: Signal<Option<str>>) {
+            print(subject.get().is_some());
+        }
+
+        fun main() {
+            let subject = Signal::new(None);
+            take(subject);
+            subject.set(Some("x"));
+            print(subject.get().unwrap_or("none"));
+        }
+        "#,
+        "false\nx\n",
+    );
+}
+
+#[test]
+fn b599_a_bounded_generic_parameter_states_the_bindings_hole_through_its_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun take<S: Signal<Option<str>>>(subject: S) {
+            print(subject.get().is_some());
+        }
+
+        fun main() {
+            let subject = Signal::new(None);
+            take(subject);
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b599_a_method_argument_states_the_receivers_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let subject = SignalCell::new(None);
+            subject.set(Some(3));
+            print(subject.get().unwrap_or(0));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b599_a_receivers_element_states_a_pushed_bindings_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun main() {
+            mut names: List<Option<str>> = [];
+            let missing = None;
+            names.push(missing);
+            print(names.len());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b599_an_empty_list_takes_its_element_from_an_argument_use() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun take(values: List<str>): usize {
+            values.len()
+        }
+
+        fun main() {
+            let values = [];
+            print(take(values));
+        }
+        "#,
+        "0\n",
+    );
+}
+
+/// A parameter the call binds from a LATER argument still states the hole:
+/// the fill waits for every argument, and the enclosing body's `T` is a type
+/// there (B540's admission).
+#[test]
+fn b599_a_hole_stated_through_a_binding_a_later_argument_makes_takes_the_enclosing_binder() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun pick<T>(first: Option<T>, fallback: T): T {
+            match first {
+                Some(let value) => value,
+                None => fallback,
+            }
+        }
+
+        fun either<T>(value: T): T {
+            let nothing = None;
+            pick(nothing, value)
+        }
+
+        fun main() {
+            print(either(4));
+            print(either("s"));
+        }
+        "#,
+        "4\ns\n",
+    );
+}
+
+/// The first use states the type; a later use that disagrees is refused at
+/// itself, as a mismatch against what the first stated.
+#[test]
+fn b599_a_second_use_that_disagrees_is_refused_at_it() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun take(value: Option<str>) {
+            print(value.is_some());
+        }
+
+        fun count(value: Option<i32>) {
+            print(value.is_some());
+        }
+
+        fun main() {
+            let value = None;
+            take(value);
+            count(value);
+        }
+        "#,
+        "Expected Option<i32>, but got Option<str> instead.",
+    );
+}
+
+// --- B600: a hole no binding holds is refused at the call it instantiates ---
+
+/// The item's repro: `Option::None.is_some()` checked clean and ran on JS
+/// while the native build refused `is_some`'s instance at the hole.
+#[test]
+fn b600_a_receiver_hole_no_binding_holds_is_refused_at_it() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option;
+
+        fun main() {
+            let present = Option::None.is_some();
+            print(present);
+        }
+        "#,
+        "cannot infer the type of this value: it is `Option<…>`, and nothing the program does \
+         with it settles the `…` that `is_some` is instantiated at",
+    );
+    // An annotation on a result that cannot carry the hole (`bool`) settles
+    // nothing.
+    assert_fails_once_with(
+        r#"
+        import std::option::Option;
+
+        fun main() {
+            let _present: bool = Option::None.is_some();
+        }
+        "#,
+        "that `is_some` is instantiated at",
+    );
+}
+
+/// The argument channel and an empty list, each reported at its operand,
+/// once, under an `any` parameter (`print`) that directs nothing.
+#[test]
+fn b600_an_argument_hole_and_an_empty_list_are_refused_at_their_operands() {
+    let failures = failure_diagnostics(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun has<T>(value: Option<T>): bool {
+            value.is_some()
+        }
+
+        fun main() {
+            print(has(None));
+            print([].len());
+        }
+        "#,
     );
     let messages: Vec<&str> = failures
         .iter()
         .map(|(message, _)| message.as_str())
         .collect();
     assert_eq!(messages.len(), 2, "{messages:#?}");
-    assert!(messages[0].starts_with("cannot infer the type of `s`: it is `Slot<…>`"));
-    assert!(messages[1].starts_with("cannot infer the type of `n`: it is `Option<…>`"));
+    assert!(
+        messages[0].contains("that `has` is instantiated at"),
+        "{messages:#?}"
+    );
+    assert!(
+        messages[1].starts_with("cannot infer the element type of this empty list"),
+        "{messages:#?}"
+    );
+}
+
+/// B600's boundary: a hole a position directs (an annotated `let`, a
+/// parameter, a field) or a use fills (B599) is no hole, and a binding's hole
+/// stays B580's single refusal at its initializer.
+#[test]
+fn b600_a_directed_or_filled_value_and_a_bindings_hole_are_not_refused_here() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        struct Holder { cell: SignalCell<Option<str>> }
+
+        fun has(value: Option<i32>): bool {
+            value.is_some()
+        }
+
+        fun main() {
+            let annotated: SignalCell<Option<i32>> = Signal::new(None);
+            let traited: Signal<List<str>> = Signal::new([]);
+            let holder = Holder { cell = Signal::new(None) };
+            print(has(None));
+            print(None.unwrap_or("d"));
+            print(annotated.get().is_some());
+            print(traited.get().len());
+            print(holder.cell.get().is_some());
+        }
+        "#,
+        "false\nd\nfalse\n0\nfalse\n",
+    );
+    let failures = failure_diagnostics(
+        r#"
+        import std::option::Option::{ self, None, Some };
+
+        fun main() {
+            let nothing = None;
+            let _present = nothing.is_some();
+        }
+        "#,
+    );
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0]
+            .0
+            .starts_with("cannot infer the type of `nothing`"),
+        "{failures:#?}"
+    );
+}
+
+/// `any` tells a hole nothing (B227): a binding whose only use is an `any`
+/// parameter keeps B580's refusal.
+#[test]
+fn b599_an_any_parameter_states_nothing() {
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, None, Some };
+
+        fun sink(values: List<any>) {}
+
+        fun main() {
+            let values = [];
+            sink(values);
+        }
+        "#,
+        "cannot infer the element type of this empty list",
+    );
 }
 
 // --- B370: an arithmetic expression's EMISSION VERDICT is a property of the
@@ -13734,18 +14081,29 @@ fn b405_a_fractional_literal_right_of_an_integer_is_refused_at_every_operator() 
     }
 }
 
-/// A fractional literal on the LEFT types the expression `f64` itself — the
-/// shape `vilan/benchmarks`' report writes (`1000.0 * count / elapsed_ms`) —
-/// so it is a float product, not this refusal (the numeric mixing B148
-/// deferred stays deferred).
+/// A fractional literal on the LEFT types the expression `f64` itself, and
+/// until B602 (v0.48.0) the product with a typed integer checked clean — a
+/// float on JS (`7.5`) and a native build rustc refused (E0277). It is a float
+/// beside a typed integer, B602's refusal; the shape `vilan/benchmarks`'
+/// report wrote (`1000.0 * count / elapsed_ms`) converts the integer.
 #[test]
-fn b405_a_fractional_literal_left_of_an_integer_stays_a_float_expression() {
-    assert_compiles_and_runs(
+fn b602_a_fractional_literal_left_of_an_integer_is_refused() {
+    assert_fails_with(
         concat!(
             "import std::io::print;\n",
             "fun main() {\n",
             "\tlet count: i32 = 3;\n",
             "\tprint(2.5 * count);\n",
+            "}\n",
+        ),
+        "`*` computes on two values of the same type, but the operands are `f64` and `i32`",
+    );
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet count: i32 = 3;\n",
+            "\tprint(2.5 * count.as_f64());\n",
             "}\n",
         ),
         "7.5\n",

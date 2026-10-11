@@ -187,15 +187,17 @@ fn may_hold_an_object(program: &Program, type_id: TypeId, seen: &mut Vec<TypeId>
 /// lines), a float inside it keeping its `.0`, a backed enum by its NAME. A
 /// number, a bool, a string and `()` keep `print`'s own rendering (`console.log`
 /// on JS: `3.0` prints `3`, a string raw), and so does a host or opaque value
-/// the printer could only name (`<Location>`), which `console.log` shows — a
-/// bare closure among them, which the native backend refuses to print (F25).
-/// A closure INSIDE an aggregate prints its type, as `dbg` prints it.
+/// the printer could only name (`<Location>`), which `console.log` shows. A
+/// closure prints its written type (`<closure |i32| i32>`), bare (E293: node's
+/// own `[Function: add]` names how the function was WRITTEN, which the
+/// language does not define, and the native backend refused it, F25) or inside
+/// an aggregate, the same text on both backends.
 pub fn print_uses_the_printer(shape: &Shape) -> bool {
     match shape {
         Shape::Integer | Shape::Float | Shape::BigInt | Shape::Bool | Shape::Str | Shape::Void => {
             false
         }
-        Shape::Text(text) => text.starts_with("<pipe "),
+        Shape::Text(text) => text.starts_with("<pipe ") || text.starts_with("<closure "),
         Shape::Struct { .. }
         | Shape::Enum { .. }
         | Shape::Backed { .. }
@@ -694,9 +696,12 @@ pub fn type_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) ->
                 .collect();
             format!("({})", parts.join(", "))
         }
-        Some(Type::Array(element, length)) => {
-            format!("[{}; {length}]", type_text(program, *element, resolve))
-        }
+        Some(Type::Array(element, length)) => format!(
+            "[{}; {}]",
+            type_text(program, *element, resolve),
+            type_text(program, *length, resolve)
+        ),
+        Some(Type::Length(length)) => length.to_string(),
         Some(Type::Closure(..)) | Some(Type::Function(_)) => {
             closure_text(program, type_id, resolve)
         }

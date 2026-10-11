@@ -1068,6 +1068,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
             Expr::Bool(_)
             | Expr::Null
             | Expr::Number(..)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)

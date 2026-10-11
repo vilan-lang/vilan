@@ -1058,6 +1058,154 @@ pub const BOUND_FIXTURES: &[Fixture] = &[Fixture {
     ],
 }];
 
+// --- M110 S3: the effect classes (incr-50, Order 50; pass map §6, §7.2) ----------
+//
+// A hot leaf whose EFFECTS the keystroke removes — a context read, a `sleep`,
+// a node-only call — beside the prefix module that owns the context. The
+// seeded async fixpoint (S3b) starts from the world's cold result with the
+// hot nodes unknown, never from last keystroke's settled set: a monotone
+// fixpoint cannot shrink from a seed that already holds the removed effect,
+// which is what `Plant::PostSeedFromSettled` plants and the sleep's removal
+// must catch (the emitted JS loses `wait`'s `async`). The second package is
+// broken on purpose — a node call on a browser entry, and a prefix function
+// made async by the awaiting body of a `run` it lowers, whose asyncness a hot
+// module binding's initializer refuses — so a keystroke that stands the
+// rewrite down (a context read with no `run`) changes the cold rewrite's LOG:
+// the recorded post-rewrite graph must then be rebuilt, not replayed
+// (`Plant::ContextLogUnguarded` replays it, and the initializer refusal
+// survives a tree that no longer lowers the `run`).
+
+pub const EFFECT_MAIN: &str = "import pkg::effects::{ read, wait };\nimport pkg::views::render;\n\nfun main() {\n\tprint(read());\n\tprint(wait());\n\tprint(render());\n}\n";
+
+/// The context, written with its value type (`Context<i32>::new()`, as kolt
+/// writes its own): a context whose value type only a `run` grounds is a
+/// use-inferred binding, and a hot module that imports one refuses the
+/// hot-set world (S1's early-commitment guard) — which these classes need.
+pub const EFFECT_CTX: &str = "import std::context::Context;\n\nexport let mood = Context<i32>::new();\n\nexport fun read_mood(): i32 {\n\tmood.get() + 1\n}\n";
+
+pub const EFFECT_EFFECTS: &str = "import std::time;\nimport pkg::ctx::{ mood, read_mood };\n\nexport fun read(): i32 {\n\tmut seen = 0;\n\tmood.run(5, || {\n\t\tseen = read_mood() + mood.get();\n\t});\n\tseen\n}\n\nexport fun wait(): i32 {\n\ttime::sleep(1);\n\t1\n}\n";
+
+pub const EFFECT_BROWSER_MAIN: &str = "import pkg::effects::{ count, host };\nimport pkg::ticker::ticked;\nimport pkg::views::render;\n\nfun main() {\n\tprint(host());\n\tprint(ticked());\n\tprint(count);\n\tprint(render());\n}\n";
+
+/// A prefix function made async by the awaiting body of a `run` it lowers.
+pub const EFFECT_TICKER: &str = "import std::time;\nimport pkg::ctx::mood;\n\nexport fun ticked(): i32 {\n\tmut seen = 0;\n\tmood.run(1, || {\n\t\ttime::sleep(1);\n\t\tseen = mood.get();\n\t});\n\tseen\n}\n";
+
+pub const EFFECT_BROWSER_EFFECTS: &str = "import std::process;\nimport pkg::ctx::mood;\nimport pkg::ticker::ticked;\n\nexport let count = ticked();\n\nexport fun host(): usize {\n\tprocess::args().len()\n}\n";
+
+pub const EFFECT_FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "effects",
+        platform: NODE,
+        files: &[
+            ("main.vl", EFFECT_MAIN),
+            ("ctx.vl", EFFECT_CTX),
+            ("effects.vl", EFFECT_EFFECTS),
+            ("views.vl", POST_PASS_VIEWS),
+        ],
+        edits: &[
+            Edit {
+                label: "a context read removed from the hot leaf, the need kept by its callee (S3)",
+                file: "effects.vl",
+                seed: None,
+                replacements: &[(
+                    "\t\tseen = read_mood() + mood.get();\n",
+                    "\t\tseen = read_mood();\n",
+                )],
+            },
+            Edit {
+                label: "the hot leaf's last context read removed: the need set must shrink (S3)",
+                file: "effects.vl",
+                seed: None,
+                replacements: &[("\t\tseen = read_mood() + mood.get();\n", "\t\tseen = 0;\n")],
+            },
+            Edit {
+                label: "a sleep removed from the hot leaf: the async set must shrink (S3)",
+                file: "effects.vl",
+                seed: None,
+                replacements: &[("\ttime::sleep(1);\n\t1\n", "\t1\n")],
+            },
+        ],
+    },
+    Fixture {
+        name: "effects_browser",
+        platform: Platform::Browser,
+        files: &[
+            ("main.vl", EFFECT_BROWSER_MAIN),
+            ("ctx.vl", EFFECT_CTX),
+            ("ticker.vl", EFFECT_TICKER),
+            ("effects.vl", EFFECT_BROWSER_EFFECTS),
+            ("views.vl", POST_PASS_VIEWS),
+        ],
+        edits: &[
+            Edit {
+                label: "a node call removed from the hot leaf on a browser entry: the refusal must go (S3)",
+                file: "effects.vl",
+                seed: None,
+                replacements: &[("\tprocess::args().len()\n", "\t1\n")],
+            },
+            Edit {
+                label: "a context read with no run typed into the hot leaf: the rewrite stands down and the graph must follow (S3)",
+                file: "effects.vl",
+                seed: None,
+                replacements: &[(
+                    "\tprocess::args().len()\n",
+                    "\tlet m = mood.get();\n\tprocess::args().len() + m.as_usize()\n",
+                )],
+            },
+        ],
+    },
+];
+
+// --- M110 S6: the id-window classes (incr-50, Order 50; spike-49's two predicted reds) ---
+//
+// Two shapes the spike named as classes to ADD. (1) A std item's resolve
+// mints entities (the desugars: `for .. in`, an interpolation) that the
+// windows relocate into the std item's window, where `frozen_entity` reads
+// them as std's — a definition-site check must not skip a verdict about the
+// USER's code because of it. (2) A generated expansion (`[derive]`) gets a
+// window of its own; a fixpoint type id relocated into a USER item's window
+// beside it must not land in the expansion's `derived_type_origins` range,
+// where B217 would re-anchor a diagnostic to the derive attribute. The prefix
+// module carries both a derived struct and a bound refusal that names it; the
+// leaf and the entry are typed into around them, and the derive is flipped.
+
+pub const WINDOW_MAIN: &str = "import pkg::shapes::{ Pair, refused, same, total };\nimport pkg::views::render;\n\nfun main() {\n\tprint(total([1, 2, 3]));\n\tprint(same(Pair { a = 1, b = 2 }));\n\tprint(refused());\n\tprint(render());\n}\n";
+
+pub const WINDOW_SHAPES: &str = "import std::compare::PartialEq;\n\n[derive(PartialEq)]\nexport struct Pair {\n\ta: i32,\n\tb: i32,\n}\n\nexport fun total(items: List<i32>): i32 {\n\tmut sum = 0;\n\tfor item in items {\n\t\tsum = sum + item;\n\t}\n\tsum\n}\n\nexport fun same(pair: Pair): bool {\n\tpair == Pair { a = pair.b, b = pair.a }\n}\n\nexport fun label(pair: Pair): str {\n\ti\"{pair.a}/{pair.b}\"\n}\n\nfun wants_eq<T: PartialEq>(value: T): bool {\n\tvalue == value\n}\n\nexport fun refused(): bool {\n\twants_eq(total)\n}\n";
+
+pub const WINDOW_FIXTURES: &[Fixture] = &[Fixture {
+    name: "id_windows",
+    platform: NODE,
+    files: &[
+        ("main.vl", WINDOW_MAIN),
+        ("shapes.vl", WINDOW_SHAPES),
+        ("views.vl", POST_PASS_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a statement typed into the leaf beside the derived prefix module (S6)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+        },
+        Edit {
+            label: "a statement typed into the entry beside the derived prefix module (S6)",
+            file: "main.vl",
+            seed: None,
+            replacements: &[(
+                "\tprint(render());\n",
+                "\tprint(render());\n\tlet extra = 1;\n",
+            )],
+        },
+        Edit {
+            label: "the prefix module's derive flipped off while the seed stays on the leaf (S6)",
+            file: "shapes.vl",
+            seed: Some("views.vl"),
+            replacements: &[("[derive(PartialEq)]\n", "")],
+        },
+    ],
+}];
+
 // --- B569: a labelled tuple in a reused module (lang-a-49, Order 49) -------------
 //
 // A PREFIX module whose declarations print labels — a labelled return, a

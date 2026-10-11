@@ -371,9 +371,11 @@ impl<'src> Analyzer<'src> {
                 format!("({})", rendered.join(", "))
             }
             Type::Array(element, length) => format!(
-                "[{}; {length}]",
-                self.binder_type_label(*element, introduced, depth + 1)
+                "[{}; {}]",
+                self.binder_type_label(*element, introduced, depth + 1),
+                self.binder_type_label(*length, introduced, depth + 1)
             ),
+            Type::Length(length) => length.to_string(),
             // A closure, a mapped type: no head writes a binder inside one
             // that the plain label would not already name.
             _ => self.declaration_type_label(type_id),

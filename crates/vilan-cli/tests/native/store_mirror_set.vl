@@ -1,0 +1,106 @@
+// A168 on both backends: a set crosses the wire as the list of its members, a
+// mirrored set's watched members are boundaries of their own, and a released
+// boundary stays in the replica while one inside it is held.
+
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Room {
+	name: str,
+	members: HashSet<str>,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut members: HashSet<str> = HashSet::new();
+	members.insert("amy");
+	members.insert("bob");
+	let room = Room { name = "lounge", members };
+	// The set's own `Wire`: the list of its members, in insertion order.
+	let (record, finish) = (codec.writer)();
+	mut writer = record;
+	room.describe(&mut writer);
+	let frame = finish();
+	print(i"wire {text(frame)}");
+	mut reader = (codec.reader)(frame);
+	let back = Room::rebuild(&mut reader);
+	print(i"back {back.name} amy={back.members.contains("amy")} zed={back.members.contains("zed")} n={back.members.len()}");
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(1, room);
+	let global = Store::new(Global { rooms });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	let watching = Owner::new();
+	run_with_owner(page, || {
+		g.rooms().at(1).some().name().effect(|name| print(i"name {name.unwrap_or("-")}"));
+	});
+	run_with_owner(watching, || {
+		let lounge = g.rooms().at(1).some();
+		lounge.members().contains("amy").effect(|present| print(i"amy {present.unwrap_or(false)}"));
+		lounge.members().contains("zed").effect(|present| print(i"zed {present.unwrap_or(false)}"));
+	});
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print("-- zed joins, amy leaves, bob stays: only the watched members cross");
+	let _zed = global.rooms().at(1).some().members().insert("zed");
+	let _amy = global.rooms().at(1).some().members().remove("amy");
+	let _cat = global.rooms().at(1).some().members().insert("cat");
+	sleep_for(Duration::millis(0));
+	print("-- the room's own hold goes; the members watched inside it keep it");
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	let _back = global.rooms().at(1).some().members().insert("amy");
+	sleep_for(Duration::millis(0));
+	print("-- the last hold inside it goes: the room leaves the replica");
+	watching.dispose();
+	sleep_for(Duration::millis(0));
+	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	print("done");
+}

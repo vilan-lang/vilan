@@ -204,6 +204,16 @@ pub enum Plant {
     /// S2b: the tail skips rendering a reused module's labels but drops the
     /// restored rows — the prefix's hovers and declaration labels vanish.
     LabelTablesUnrecorded,
+    /// S3a: the recorded post-rewrite cold graph is served to an analysis
+    /// that applied NO rewrite — the log replayed over a tree that was never
+    /// edited, so a prefix `run` reads as lowered to a call of its body while
+    /// the tree still calls `run`.
+    ContextLogUnguarded,
+    /// S3b: a fixpoint is seeded from the recording analysis's SETTLED set,
+    /// hot nodes included, instead of its cold-only result — an effect the
+    /// hot edit removed is then served from the seed (a monotone fixpoint
+    /// cannot shrink).
+    PostSeedFromSettled,
 }
 
 impl Plant {
@@ -219,6 +229,8 @@ impl Plant {
             Plant::BoundAuditUnrecorded => 9,
             Plant::BoundRecordUnguarded => 10,
             Plant::LabelTablesUnrecorded => 11,
+            Plant::ContextLogUnguarded => 12,
+            Plant::PostSeedFromSettled => 13,
         }
     }
 }
@@ -286,6 +298,28 @@ pub struct Census {
     /// it CHECKED.
     pub bound_sites_served: u64,
     pub bound_sites_checked: u64,
+    /// M110 S3 (Order 50): call graphs this analysis took from the world's
+    /// post-pass record and extended with the hot set instead of building —
+    /// the graph before the context rewrite, and the one after it (served
+    /// only while the rewrite's cold log matches the record's).
+    pub graphs_replayed: u64,
+    pub context_log_replayed: u64,
+    /// Post passes that iterated from a stored prefix seed (S3b).
+    pub seeded_passes: u64,
+    /// Post-pass records this analysis filed.
+    pub post_records_filed: u64,
+    /// M110 S6 (Order 50): the id windows this analysis laid out (the hot
+    /// set's and the entry's items on a served keystroke; every item on a
+    /// cold analysis) and the ones it took from the stored world.
+    pub windows_laid_out: u64,
+    pub windows_inherited: u64,
+    /// Windows a relocated mint found no room in (the item's demand grew).
+    pub windows_overflowed: u64,
+    /// The standing pins' counters: world-changing slot writes into another
+    /// item's window (the shared-slot hazard, B77/B95), and mints relocated
+    /// outside their anchor's window — both 0 by construction, both pinned.
+    pub window_writes_other: u64,
+    pub window_outside_anchor: u64,
 }
 
 thread_local! {
@@ -307,6 +341,15 @@ thread_local! {
             reach_questions: 0,
             bound_sites_served: 0,
             bound_sites_checked: 0,
+            graphs_replayed: 0,
+            context_log_replayed: 0,
+            seeded_passes: 0,
+            post_records_filed: 0,
+            windows_laid_out: 0,
+            windows_inherited: 0,
+            windows_overflowed: 0,
+            window_writes_other: 0,
+            window_outside_anchor: 0,
         })
     };
 }
@@ -661,7 +704,9 @@ pub fn report(program: &Program) {
             "[vilan counters] incremental base-hits={} base-misses={} base-stores={} \
              hot-world={} sources-walked={} records-replayed={} functions-checked={} \
              const-hits={} const-misses={} reach-questions={} bound-sites-served={} \
-             bound-sites-checked={}",
+             bound-sites-checked={} graphs-replayed={} context-log-replayed={} \
+             seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
+             windows-overflowed={} window-writes-other={} window-outside-anchor={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -674,6 +719,15 @@ pub fn report(program: &Program) {
             census.reach_questions,
             census.bound_sites_served,
             census.bound_sites_checked,
+            census.graphs_replayed,
+            census.context_log_replayed,
+            census.seeded_passes,
+            census.post_records_filed,
+            census.windows_laid_out,
+            census.windows_inherited,
+            census.windows_overflowed,
+            census.window_writes_other,
+            census.window_outside_anchor,
         );
     }
 }

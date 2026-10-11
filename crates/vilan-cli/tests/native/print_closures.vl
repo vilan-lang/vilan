@@ -1,0 +1,32 @@
+// E293: `print` of a bare closure writes its written type, `<closure |i32|
+// i32>`, as it does inside an aggregate - where node printed `[Function: add]`
+// (how the function was WRITTEN) and the native backend refused it. A named
+// function prints by its name; the same bytes on both backends.
+struct Handler {
+	name: str,
+	run: |i32| i32,
+}
+
+fun double(x: i32): i32 {
+	x * 2
+}
+
+fun show<T>(value: T) {
+	print(value);
+}
+
+fun main() {
+	let offset = 10;
+	let add = |x: i32| x + offset;
+	print(add);
+	print(|name: str, flag: bool| name);
+	print(|| 7);
+	print(|x: f64|: bool x > 0.5);
+	print(double);
+	show(add);
+	show(|text: str| text);
+	show(double);
+	print(Handler { name = "inc", run = add });
+	print(Some(add));
+	print(add(1));
+}

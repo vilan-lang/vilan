@@ -813,3 +813,92 @@ fn f108_an_empty_literal_at_a_bounded_generic_is_grounded_from_the_bound() {
         "1\n",
     );
 }
+
+// --- B592: a list literal of array literals under `List<[T; n]>` -----------
+
+/// B592: `let listed: List<[i32; 2]> = [[1, 2], [3, 4]]` was refused
+/// "Expected List<[i32; 2]>, but got List<List<i32>>": the element type did
+/// not reach the inner literals, which typed as `List`s. A fixed-array element
+/// type directs each inner list literal to elaborate as that array — at an
+/// annotated binding, at a parameter, nested a level deeper, and pushed after.
+#[test]
+fn b592_a_list_of_array_literals_takes_its_fixed_array_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun total(rows: List<[i32; 2]>): i32 {
+            mut sum = 0;
+            for row in rows {
+                sum += row[0] + row[1];
+            }
+            sum
+        }
+
+        fun main() {
+            mut listed: List<[i32; 2]> = [[1, 2], [3, 4]];
+            listed.push([5, 6]);
+            print(listed[2][1]);
+            print(total([[10, 20], [30, 40]]));
+            let grid: List<[[u8; 2]; 2]> = [[[1, 2], [3, 4]]];
+            print(grid[0][1][0]);
+        }
+        "#,
+        "6\n100\n3\n",
+    );
+}
+
+/// B592's boundary: an inner literal of the wrong length is the array arm's
+/// own refusal, once, at that literal.
+#[test]
+fn b592_an_inner_literal_of_the_wrong_length_is_refused_at_it() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let _listed: List<[i32; 2]> = [[1, 2], [3]];
+        }
+        "#,
+        "this array literal has 1 element, but its type is `[_; 2]`",
+    );
+}
+
+// --- E287: an array length's suffix, and an empty array's index -------------
+
+/// E287 (c): a length is a `usize` — an unsuffixed literal or a `usize` one.
+/// `[i32; 3f64]` and `[0; 2i8]` were taken as lengths 3 and 2, the suffix
+/// ignored; they get the length refusal, once each.
+#[test]
+fn e287_a_suffixed_length_other_than_usize_is_refused() {
+    for spelled in ["let _a: [i32; 3f64] = [1, 2, 3];", "let _a = [0; 2i8];"] {
+        assert_fails_with(
+            &format!("fun main() {{\n\t{spelled}\n}}\n"),
+            // array-lengths S4 rewords the refusal to say what it wants.
+            "an array length is a count: write it as a whole number, unsuffixed or `usize`",
+        );
+    }
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet a: [i32; 3usize] = [1, 2, 3];\n",
+            "\tlet b = [7; 2usize];\n",
+            "\tprint(a[2] + b[1]);\n",
+            "}\n",
+        ),
+        "10\n",
+    );
+}
+
+/// E287 (d): an empty array's literal index said "valid indices are 0 to 0",
+/// naming an index that does not exist.
+#[test]
+fn e287_an_index_into_an_empty_array_says_it_is_empty() {
+    assert_fails_once_with(
+        "fun main() {\n\tlet e: [i32; 0] = [];\n\tlet _x = e[0];\n}\n",
+        "index 0 is out of range: the array is empty (its type is `[_; 0]`), so it has no valid index",
+    );
+    assert_fails_once_with(
+        "fun main() {\n\tlet t: [i32; 2] = [1, 2];\n\tlet _x = t[2];\n}\n",
+        "index 2 is out of range for an array of length 2 (valid indices are 0 to 1)",
+    );
+}

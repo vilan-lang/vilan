@@ -356,6 +356,39 @@ length is known, `let [r, g, b] = rgb;` destructures one irrefutably,
 with the element count checked against the type (works in parameter
 position too).
 
+Arrays compare with `==`, key a `HashMap`, print through `Debug`, and
+convert with `to_list()` and `iter()` at any length. Code of your own can
+work over every length too: `const N` names a length parameter, read in the
+body as a `usize`, and an `impl` head can bind one (`_` when the body never
+names it):
+
+```vilan
+trait Count {
+	fun count(self): usize;
+}
+
+impl [type T; _] with Count {
+	fun count(self): usize {
+		self.len()
+	}
+}
+
+fun total<const N>(values: [i32; N]): i32 {
+	mut sum = 0;
+	for value in values {
+		sum = sum + value;
+	}
+	sum
+}
+
+fun main() {
+	let pair: [str; 2] = ["a", "b"];
+	print(pair.count());           // 2
+	print(total([1, 2, 3]));       // 6 — N is 3 here
+	print(pair == ["a", "b"]);     // true
+}
+```
+
 > **Going deeper.** `HashMap` and `HashSet` key **by value**. Scalar keys (`i32`,
 > `str`) and backed enums (`enum Align { Start = "flex-start" }` — the enum
 > *is* the string) work directly; a struct, an unbacked enum, or a `List`

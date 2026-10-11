@@ -1,0 +1,99 @@
+// A153 S2 on both backends: a patch's ops land in ONE client turn — the content
+// and the id a server writes in one turn reach a client observer together — and a
+// key the server does not hold is seeded `null` (`proposal/mirrored-store.md` §5).
+
+import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, batch, queue_microtask, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+	id: u53,
+	content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, Message>,
+	motd: str,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut messages: HashMap<u53, Message> = HashMap::new();
+	messages.insert(7, Message { id = 7, content = "hello" });
+	let global = Store::new(Global { messages, motd = "welcome" });
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		print(i"  up   {text(frame)}");
+		server_relay.send(frame);
+	});
+	// Down frames land a microtask later, each in its own turn, as a socket's do.
+	server_relay.on_frame(|frame| {
+		print(i"  down {text(frame)}");
+		queue_microtask(|| client_relay.send(frame));
+	});
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new().on("global", |request: RpcRequest| {
+		print("  rpc  global");
+		reply_store(request, global)
+	});
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let again = Owner::new();
+	run_with_owner(again, || {
+		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g
+			.messages()
+			.at(9)
+			.some()
+			.content()
+			.effect(|content| print(i"nine {content.unwrap_or("-")}"));
+		// The id is read PASSIVELY when the content wakes: a patch whose two ops
+		// landed in two turns would show the content beside the old id.
+		let seven = g.messages().at(7).some();
+		seven
+			.content()
+			.effect(|text| print(i"seven's pair {seven.id().get().unwrap_or(0)}:{text.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	print("-- two fields in one patch: one turn on the client");
+	batch(|| {
+		let _content = global.messages().at(7).some().content().patch("both");
+		let _id = global.messages().at(7).some().id().patch(70);
+	});
+	sleep_for(Duration::millis(0));
+	print("-- the key goes, then comes back");
+	global.messages().at(7).set(None);
+	sleep_for(Duration::millis(0));
+	global.messages().at(7).set(Some(Message { id = 7, content = "back" }));
+	sleep_for(Duration::millis(0));
+	again.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}

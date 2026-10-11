@@ -45,6 +45,17 @@ The type forms (grammar §3.9) denote:
   at the `1`, not at the `panic`. No `Never` value exists at run time —
   the expression that had the type leaves before anything can read it.
   Internal; not written in source.
+- **Fixed arrays**: `[T; n]`, `n` values of `T` with the length part of
+  the type, so `[i32; 3]` and `[i32; 4]` are distinct and neither resizes.
+  A length is a TYPE-LEVEL NUMBER: a literal, a name bound to one
+  (`const let SIZE = 4;` makes `[u8; SIZE]` a `[u8; 4]`), or a length
+  parameter (§5.6) that each instance binds to one; two lengths are the
+  same exactly when the numbers are, and diagnostics print the number. An array is a value aggregate (copied on
+  assignment), iterates at `T` (`for x in arr`), indexes like a `List`
+  (a literal index the length proves out of range is a compile error), and
+  `arr.len()` is a `usize` folded from the type. It is an impl subject like
+  any other (§5.4), and std implements `PartialEq`, `Hashable`, `Debug`
+  and `Items<T>` for every length.
 - **Generics**: a bound type parameter in scope (`T`) is a type; it is
   abstract within its binder's body.
 
@@ -720,6 +731,36 @@ itself, so an application may omit exactly the trailing arguments whose
 parameters default. Supplying too many is the same error. The head of a
 qualified path (`Option::None`, `List::new()`) names a namespace rather
 than a type and carries no arity of its own.
+
+### Length parameters (`const N`)
+
+A **length parameter** stands for an array length (grammar §3.3): `<const N>`
+in a generic list, or `_` / `const N` in an `impl` subject's length position
+(`impl [type T; _] with Count`, `impl [type T; const N]`). It is a generic like
+any other — it binds, substitutes and keys an instance as a type argument
+does — whose KIND is a length: it may stand only where a length does, and a
+length position holds only a number or a length parameter. `N` written as a
+type (`let x: N`) and a type written as a length (`[T; T]`) are refused, as
+are a type given to a `const` parameter (`zeros<i32>()`) and a number given
+to a type parameter (`List<4>`).
+
+A length binds wherever a type argument binds: from an ARGUMENT
+(`total(row)` with `row: [i32; 3]` binds `N = 3`), from a DIRECTED literal by
+its count (`total([1, 2, 3])` — the literal's type carries its own length),
+from the EXPECTED type (`let z: [i32; 4] = zeros();`), and EXPLICITLY
+(`zeros<4>()`). Two uses of one `N` must agree; two parameters are
+independent. A length nothing binds is refused at the call, the steer
+naming the numeric spelling.
+
+Inside a length-generic body `N` is a `usize` VALUE, and `self.len()` (any
+spelling of an array's length) is the same value, both folded per instance;
+`[value; N]` repeats it. The length is RIGID there, as a type parameter is:
+the body's `[T; N]` is no `[T; 3]`. A literal index keeps its runtime bounds
+check (there is no length to check it against), and two forms are refused:
+a destructuring `let [a, b] = self` (it needs the length), and a `const`
+expression reading `N` (it evaluates once per site, and `N` differs per
+instance). Each length a program uses is an instance of its own on both
+backends.
 
 For a call `f(a₁ … aₙ)` where `f` has generic parameters:
 
@@ -1563,8 +1604,16 @@ Normative rejection cases (each is a compile error):
 - A binding whose type still holds a part nothing determines once
   inference is done — `let xs = []` read only through `len()`, `let o =
   None` — is refused at its initializer, naming where to write the type
-  (`xs: List<…>`); a later use that states it (`xs.push(1)`) is what
-  inference reads, and only an annotation can stand in for one (B580).
+  (`xs: List<…>`); a later use that states it is what inference reads,
+  and only an annotation can stand in for one (B580). A use states the
+  missing part when it is an argument at a parameter that names it
+  (`take(o)` with `take(value: Option<str>)`, through a bare-trait or
+  bounded parameter by the one impl the value's type has, and after every
+  argument of the call has bound what it binds), a receiver whose call
+  binds it (`o.unwrap_or("d")`, `cell.set(Some(3))`, `xs.push(1)`), or a
+  reassignment; the FIRST such use decides, and a later one that
+  disagrees is a mismatch at that use. An `any` parameter states nothing
+  (fill-from-use, B599).
 - A value written into a struct field it does not match, through either
   door: the literal `S { field = v }` and the assignment `s.field = v`
   are governed by ONE rule, and a place chain of any depth (`a.b.c = v`,

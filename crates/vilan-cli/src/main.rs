@@ -3869,12 +3869,17 @@ fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
 /// directory as the package root, no dependencies, default options — and so does
 /// a file under a `[project]` root, which has no `[package]` to belong to. A file
 /// under a `[library]` root takes the library's layer root for `pkg::` (B586) and
-/// nothing else of it.
+/// its `[library.dependencies]` (B594), and nothing else of it.
 fn file_project(entry: PathBuf) -> Result<Project, String> {
-    // `library_root`: for a `[library]` file, the layer root `pkg::` resolves
-    // from (B586); `None` for a file no library owns, which resolves `pkg::` from
-    // its own directory and is the program it names.
-    let bare = |entry: PathBuf, library_root: Option<PathBuf>| {
+    // `library`: for a `[library]` file, the layer root `pkg::` resolves from
+    // (B586) and the library's own directory, whose `[library.dependencies]` the
+    // file's imports resolve against (B594); `None` for a file no library owns,
+    // which resolves `pkg::` from its own directory and is the program it names.
+    let bare = |entry: PathBuf, library: Option<(PathBuf, PathBuf)>| {
+        let (library_root, library_dir) = match library {
+            Some((root, directory)) => (Some(root), Some(directory)),
+            None => (None, None),
+        };
         // No project to colour it — but the file may say itself (F27 R1):
         // `[platform("browser")] mod self;`, or fences that admit one platform, is the
         // platform the editor analyzes it under, and the terminal must not
@@ -3913,7 +3918,10 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
                 name: String::new(),
                 pkg_root: library_root.clone().unwrap_or_else(|| pkg_root_of(&entry)),
                 entry,
-                package_dir: None,
+                // B594: a library file's dependency workspace is its library's
+                // (`resolve_workspace` reads `[library.dependencies]` as it does a
+                // package's); a file no manifest owns has none.
+                package_dir: library_dir,
                 split: false,
                 options: BuildOptions::default(),
                 platform_reasons,
@@ -3947,8 +3955,12 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
         // root - the rule the language server takes (vilan-lsp's document.rs),
         // not from the file's own directory: `src/deep/pair.vl` importing
         // `pkg::util::unit` found no `util` under `src/deep/`. Still no
-        // platform and no entries (a library declares neither), and no
-        // dependency workspace, as before.
+        // platform and no entries (a library declares neither). B594: it does
+        // take the library's `[library.dependencies]` (and its prelude), the
+        // workspace the language server's `[library]` arm resolves for the same
+        // file, so `import dep::d;` in a library module is not "cannot find
+        // module 'dep'" in the terminal while the editor and `vilan check <dir>`
+        // resolve it.
         let layer_root = manifest.library.is_some().then(|| {
             let spec = vilan_core::manifest::resolve_library(&directory);
             let within = |root: &Path| {
@@ -3962,7 +3974,10 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
                 .map(|layer| layer.root.clone())
                 .unwrap_or(spec.base_root)
         });
-        return Ok(bare(entry, layer_root));
+        return Ok(bare(
+            entry,
+            layer_root.map(|layer_root| (layer_root, directory)),
+        ));
     };
     let options = manifest
         .build_options()

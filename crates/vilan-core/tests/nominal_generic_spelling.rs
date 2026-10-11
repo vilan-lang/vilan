@@ -257,6 +257,7 @@ fn the_spelling_walk_finds_a_bare_constraint_id_and_passes_a_wrapped_one() {
     let tuple = TypeId(4);
     let element = TypeId(5);
     let array = TypeId(6);
+    let length = TypeId(7);
 
     let mut types = TypeTable::default();
     types.insert(constraint, Type::Any);
@@ -267,7 +268,8 @@ fn the_spelling_walk_finds_a_bare_constraint_id_and_passes_a_wrapped_one() {
         Type::Tuple(vec![wrapped, nominal], vilan_core::type_::TupleLabels::NONE),
     );
     types.insert(element, Type::Generic(constraint));
-    types.insert(array, Type::Array(element, 3));
+    types.insert(length, Type::Length(3));
+    types.insert(array, Type::Array(element, length));
     let parameters: HashSet<TypeId> = HashSet::from([constraint]);
 
     // The good spelling, through every container the walk descends: four

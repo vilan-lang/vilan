@@ -117,11 +117,14 @@ impl<'src> Analyzer<'src> {
                 Ok(format!("({})", parts.join(", ")))
             }
             Type::Array(element, length) => {
-                let (element, length) = (element.get_type(self), *length);
+                let (element, length) = (element.get_type(self), length.get_type(self));
                 let element =
                     self.written_spelling_at(&element, scope_id, abbreviate, admitted, depth + 1)?;
+                let length =
+                    self.written_spelling_at(&length, scope_id, abbreviate, admitted, depth + 1)?;
                 Ok(format!("[{element}; {length}]"))
             }
+            Type::Length(length) => Ok(length.to_string()),
             Type::Closure(parameters, return_id, contexts, modes) => {
                 if !contexts.is_empty() {
                     return Err(Unwritable(

@@ -1,0 +1,49 @@
+// F124 §2.1: a loan group whose members' live intervals NEST (no ancestor
+// touched while a member lives) lowers to Rust reborrows, free at run time:
+// an alias of a `&mut` view, an alias of an alias, an alias inside a loop,
+// and an alias of a shared view (a copy of the `&`).
+import std::io::print;
+
+fun add_ten(x: &mut i32) {
+	x += 10;
+}
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+fun main() {
+	mut a: i32 = 1;
+	let b: &mut i32 = &mut a;
+	let c: &mut i32 = b;
+	c = 5;
+	let d: &mut i32 = c;
+	add_ten(d);
+	print(*d);
+	print(*c);
+	b += 1;
+	print(*b);
+	print(a);
+
+	mut total: i32 = 0;
+	for step in [1, 2, 3] {
+		let view: &mut i32 = &mut total;
+		let again: &mut i32 = view;
+		again += step;
+		view += 100;
+	}
+	print(total);
+
+	mut p = Point { x = 1, y = 2 };
+	let whole: &mut Point = &mut p;
+	let same: &mut Point = whole;
+	same.x = 10;
+	whole.y = 20;
+	print(i"{p.x} {p.y}");
+
+	let n: i32 = 7;
+	let seen: &i32 = &n;
+	let also: &i32 = seen;
+	print(*seen + *also + n);
+}

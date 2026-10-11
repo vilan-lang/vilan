@@ -49,32 +49,35 @@ const TRACE_CAP: usize = 6;
 /// Entry point: thread every context in `program`, or record diagnostics if any
 /// context is read where its value can't be supplied.
 ///
-/// Returns the call graph it built — but ONLY on the paths where it applied no
-/// rewrite, in which case the graph still describes the program and the rest of
-/// the analysis tail can share it instead of building a second one (E35). When
-/// [`apply`] ran, the graph is stale by construction — the rewrite deletes call
+/// Returns the call graph that describes the program as it leaves: the one the
+/// pass analyzed over when it applied no rewrite (the tree is unchanged, so the
+/// rest of the tail shares it instead of building a second one, E35), and a
+/// graph of the REWRITTEN tree when [`apply`] ran — the rewrite deletes call
 /// edges (a threaded `get()` becomes an `Expr::Local` read, a consumed `run`
-/// becomes `Expr::Null`) and mints new ones (the hidden context argument) —
-/// and `None` says so. Returning it is unreachable on that path rather than
-/// merely discouraged, which is the point of spelling the answer as an
-/// `Option`: this is the one graph in the pipeline that cannot be shared, and
-/// a comment would not have stopped anyone.
-pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
+/// becomes `Expr::Null`) and mints new ones, so the graph it analyzed over is
+/// stale by construction and is dropped here, never handed on.
+///
+/// M110 S3 (Order 50): both graphs' COLD halves are recorded with the world
+/// ([`crate::analyzer::PostRecord`]) and replayed on a hit: the graph before
+/// the rewrite is a pure function of the cold tree; the one after it is valid
+/// while this analysis's cold rewrite rows — the mutation log — equal the
+/// record's ([`ContextLog`]), and is rebuilt otherwise.
+pub fn thread_contexts(program: &mut Program) -> CallGraph {
+    let graph = graph_before_rewrite(program);
     let (Some(get_fn), Some(run_fn), Some(new_fn)) = (
         program.context_get_fn_id,
         program.context_run_fn_id,
         program.context_new_fn_id,
     ) else {
-        // `context.vl` wasn't loaded — no contexts to thread, and no graph
-        // built to hand on.
-        return None;
+        // `context.vl` wasn't loaded — no contexts to thread; the graph
+        // stands and is filed as the record's.
+        return graph_without_rewrite(program, graph);
     };
     // Absent only against an older `context.vl` without `get_safe`.
     let get_safe_fn = program.context_get_safe_fn_id;
     // B458: likewise `clear`.
     let clear_fn = program.context_clear_fn_id;
 
-    let graph = CallGraph::build(program);
     let mut warnings: Vec<(Error, SourceId)> = Vec::new();
     let outcome = analyze(
         program,
@@ -155,13 +158,13 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
                     msg,
                 });
                 program.warning_sources.push(source);
-                return Some(graph);
+                return graph_without_rewrite(program, graph);
             }
             for (error, source) in errors {
                 program.push_diagnostic(error, source);
             }
             // Diagnostics only: the tables are untouched, so the graph stands.
-            return Some(graph);
+            return graph_without_rewrite(program, graph);
         }
     };
 
@@ -181,11 +184,305 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
     if plan.is_empty() {
         // Nothing to rewrite — the common case, since most programs create no
         // context at all. The graph is still the program's.
-        return Some(graph);
+        return graph_without_rewrite(program, graph);
     }
+    // The log, the canonical apply order and the record are a SEEDED
+    // analysis's: a cold `vilan check` neither files nor replays, so it pays
+    // for none of them (its rows are applied as listed).
+    let seeded = program.seam.as_ref().is_some_and(|seam| seam.seeded);
+    let log = seeded.then(|| ContextLog::of(program, &plan));
+    // The record's graph before the rewrite is cut here, from the graph the
+    // pass analyzed over, before the rewrite moves the tree under it.
+    let cold_before = log
+        .as_ref()
+        .is_some_and(|log| wants_record(program, log))
+        .then(|| graph.restricted(|id| program.cold_entity(id)));
     drop(graph);
-    apply(program, plan);
-    None
+    let rewrite_base = program.next_entity_id;
+    apply(program, plan, seeded);
+    match log {
+        Some(log) => graph_after_rewrite(program, log, cold_before, rewrite_base),
+        None => CallGraph::build(program),
+    }
+}
+
+/// M110 S3: whether this analysis files a record for `log` — a front end
+/// seeded it, it is not a clean analysis, and no record for this cold set
+/// carries the same log already.
+fn wants_record(program: &Program, log: &ContextLog) -> bool {
+    let Some(seam) = program.seam.as_ref() else {
+        return false;
+    };
+    if !seam.seeded || crate::incremental::clean_requested() {
+        return false;
+    }
+    seam.record
+        .as_ref()
+        .is_none_or(|record| record.context_log != *log)
+}
+
+/// M110 S3: the call graph of the program as analyzed — from the world's
+/// record (the cold half, extended with the hot set) when one is filed, built
+/// whole otherwise.
+fn graph_before_rewrite(program: &Program) -> CallGraph {
+    let recorded = program
+        .seam
+        .as_ref()
+        .and_then(|seam| seam.record.as_ref())
+        .map(|record| record.graph_before.clone());
+    match recorded {
+        Some(mut graph) => {
+            graph.extend(program, |id| !program.cold_entity(id));
+            crate::incremental::update_census(|census| census.graphs_replayed += 1);
+            graph
+        }
+        None => CallGraph::build(program),
+    }
+}
+
+/// M110 S3: the graph of a program this pass did NOT rewrite — the one it
+/// analyzed over, filed as the record's (with an empty log: nothing was
+/// edited). The plant serves the record's post-rewrite graph here instead —
+/// a log replayed over a tree that was never rewritten, which the effect
+/// classes' stand-down edit must catch.
+fn graph_without_rewrite(program: &mut Program, graph: CallGraph) -> CallGraph {
+    if crate::incremental::planted(crate::incremental::Plant::ContextLogUnguarded)
+        && let Some(stale) = program
+            .seam
+            .as_ref()
+            .and_then(|seam| seam.record.as_ref())
+            .and_then(|record| record.graph_after.clone())
+    {
+        let mut stale = stale;
+        stale.extend(program, |id| !program.cold_entity(id));
+        crate::incremental::update_census(|census| {
+            census.graphs_replayed += 1;
+            census.context_log_replayed += 1;
+        });
+        return stale;
+    }
+    file_post_record(program, &graph, None, ContextLog::default());
+    note_record_state(program, &ContextLog::default());
+    graph
+}
+
+/// M110 S3: marks the seam when the record (replayed or just filed) carries
+/// this analysis's cold rewrite log, for the passes after this one.
+fn note_record_state(program: &mut Program, log: &ContextLog) {
+    if let Some(seam) = program.seam.as_mut() {
+        seam.record_matches = seam
+            .record
+            .as_ref()
+            .is_some_and(|record| record.context_log == *log);
+    }
+}
+
+/// M110 S3: the call graph of the REWRITTEN program — the record's cold half
+/// after the rewrite, extended with the hot set, when the record's log equals
+/// `log` (the plant skips the comparison); built whole otherwise, and filed.
+fn graph_after_rewrite(
+    program: &mut Program,
+    log: ContextLog,
+    cold_before: Option<CallGraph>,
+    rewrite_base: u32,
+) -> CallGraph {
+    let record = program.seam.as_ref().and_then(|seam| seam.record.clone());
+    let replayable = record.as_ref().and_then(|record| {
+        if record.context_log != log {
+            return None;
+        }
+        // A rewrite with no cold row leaves the cold tree as it was: the graph
+        // before the rewrite is the graph after it, whatever the hot rows did.
+        let mut graph = record
+            .graph_after
+            .as_ref()
+            .or_else(|| log.rows.is_empty().then_some(&record.graph_before))
+            .cloned()?;
+        // The entities the cold rewrite minted, renumbered from this
+        // analysis's base.
+        graph.remap_minted(record.rewrite_base, rewrite_base);
+        Some(graph)
+    });
+    match replayable {
+        Some(mut graph) => {
+            graph.extend(program, |id| !program.cold_entity(id));
+            crate::incremental::update_census(|census| {
+                census.graphs_replayed += 1;
+                census.context_log_replayed += 1;
+            });
+            note_record_state(program, &log);
+            graph
+        }
+        None => {
+            let graph = CallGraph::build(program);
+            if let Some(cold_before) = cold_before {
+                file_post_record_cut(
+                    program,
+                    cold_before,
+                    Some(&graph),
+                    log.clone(),
+                    rewrite_base,
+                );
+            }
+            note_record_state(program, &log);
+            graph
+        }
+    }
+}
+
+/// M110 S3: files the world's post-pass record from this analysis's graphs,
+/// when a front end seeded it and no record for this cold set carries the
+/// same log. `before` is the graph the pass analyzed over; `after` the graph
+/// of the rewritten tree (`None` when nothing was rewritten: the before graph
+/// stands for the program as it leaves). The record's cold graph before the
+/// rewrite is a pure function of the cold tree, so an existing record's is
+/// reused rather than cut again.
+fn file_post_record(
+    program: &mut Program,
+    before: &CallGraph,
+    after: Option<&CallGraph>,
+    log: ContextLog,
+) {
+    // A record carrying this log already describes this analysis's cold
+    // rewrite; what it could not record then (a rewritten cold graph naming a
+    // minted id) it could not record now either.
+    if !wants_record(program, &log) {
+        return;
+    }
+    let cold_before = before.restricted(|id| program.cold_entity(id));
+    file_post_record_cut(program, cold_before, after, log, program.next_entity_id);
+}
+
+/// [`file_post_record`] with the cold graph before the rewrite already cut;
+/// `rewrite_base` is the entity counter the rewrite minted from.
+fn file_post_record_cut(
+    program: &mut Program,
+    cold_before: CallGraph,
+    after: Option<&CallGraph>,
+    log: ContextLog,
+    rewrite_base: u32,
+) {
+    let Some(seam) = program.seam.as_ref() else {
+        return;
+    };
+    let cold = |id: Id| program.cold_entity(id);
+    // The cold graph before the rewrite is a pure function of the cold tree:
+    // an existing record's is the same graph.
+    let graph_before = match &seam.record {
+        Some(record) => record.graph_before.clone(),
+        None => cold_before,
+    };
+    // The rewrite mints entities (a `Some(..)` wrapped around a threaded
+    // argument is a fresh call) from `rewrite_base`, cold rows first in the
+    // log's order, so the cold graph after it names them relative to that
+    // base and a replay renumbers them (`CallGraph::remap_minted`). An id
+    // between the world's boundary and the base would be this analysis's
+    // own (a hot walk's), which a cold node cannot name — recorded as None if
+    // it ever does.
+    let graph_after = after
+        .map(|graph| graph.restricted(cold))
+        .filter(|graph| !graph.names_entities_in(seam.boundary, rewrite_base));
+    let bytes =
+        graph_before.bytes() + graph_after.as_ref().map_or(0, CallGraph::bytes) + log.bytes();
+    let record = std::sync::Arc::new(crate::analyzer::PostRecord {
+        graph_before,
+        graph_after,
+        context_log: log,
+        rewrite_base,
+        async_cold: std::sync::OnceLock::new(),
+        bytes,
+    });
+    crate::analyzer::checked_cache_store_post(
+        &seam.key,
+        &seam.prefix_hashes,
+        seam.cold_fingerprint,
+        record.clone(),
+    );
+    crate::incremental::update_census(|census| census.post_records_filed += 1);
+    // The passes after this one read the record off the seam; the one just
+    // filed is theirs to fill (S3b's cold result).
+    if let Some(seam) = program.seam.as_mut() {
+        seam.record = Some(record);
+    }
+}
+
+/// M110 S3: the context rewrite's edits over COLD entities — the mutation
+/// log. One row per plan entry whose anchor the stored world minted, as
+/// `(kind, anchor, context, node, form)`, sorted, so two analyses that
+/// rewrite the cold tree the same way carry the same log whatever order
+/// their plans listed the rows in. Rows naming a `TypeId` (the cleared
+/// clause types) are not edits of the tree and are left out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextLog {
+    rows: Vec<(u8, Id, Id, Id, u8)>,
+}
+
+impl ContextLog {
+    fn of(program: &Program, plan: &Plan) -> ContextLog {
+        let cold = |id: Id| program.cold_entity(id);
+        let form_code = |form: &ThreadForm| -> (Id, u8) {
+            match form {
+                ThreadForm::Param { owner } => (owner.id(), 0),
+                ThreadForm::WrapSome { owner } => (owner.id(), 1),
+                ThreadForm::NoneLiteral => (Id(0), 2),
+            }
+        };
+        let mut rows: Vec<(u8, Id, Id, Id, u8)> = Vec::new();
+        for &(context, node, holds_bare) in &plan.param_nodes {
+            if cold(node) {
+                rows.push((0, node, context, Id(0), u8::from(holds_bare)));
+            }
+        }
+        for &(context, closure, provider) in &plan.captures {
+            if cold(closure) {
+                rows.push((1, closure, context, provider, 0));
+            }
+        }
+        for &(call_id, context, owner, wrap_some) in &plan.gets {
+            if cold(call_id) {
+                rows.push((2, call_id, context, owner.id(), u8::from(wrap_some)));
+            }
+        }
+        for &(call_id, context, ref form) in &plan.thread_calls {
+            if cold(call_id) {
+                let (owner, code) = form_code(form);
+                rows.push((3, call_id, context, owner, code));
+            }
+        }
+        for &call_id in &plan.none_gets {
+            if cold(call_id) {
+                rows.push((4, call_id, Id(0), Id(0), 0));
+            }
+        }
+        for site in &plan.runs {
+            if cold(site.call_id) {
+                rows.push((5, site.call_id, site.value_id, site.closure_entity, 0));
+            }
+        }
+        for &(call_id, closure_entity) in &plan.clears {
+            if cold(call_id) {
+                rows.push((6, call_id, Id(0), closure_entity, 0));
+            }
+        }
+        for &call_id in &plan.news {
+            if cold(call_id) {
+                rows.push((7, call_id, Id(0), Id(0), 0));
+            }
+        }
+        for &(spawn_entity, context, owner, bare) in &plan.spawns {
+            if cold(spawn_entity) {
+                rows.push((8, spawn_entity, context, owner.id(), u8::from(bare)));
+            }
+        }
+        rows.sort_unstable_by_key(|(kind, anchor, context, node, form)| {
+            (*kind, anchor.0, context.0, node.0, *form)
+        });
+        ContextLog { rows }
+    }
+
+    fn bytes(&self) -> usize {
+        self.rows.len() * std::mem::size_of::<(u8, Id, Id, Id, u8)>()
+    }
 }
 
 /// A `get()`/`get_safe()` call: the call entity, the context it reads, the
@@ -287,6 +584,41 @@ struct Plan {
 }
 
 impl Plan {
+    /// M110 S3: the minting rows (hidden parameters, spawn references, `get`
+    /// rewrites, threaded arguments) reordered so the rows over COLD entities
+    /// come first, sorted by their anchor and context; the hot rows keep the
+    /// order the analysis listed them in. See [`apply`].
+    fn cold_rows_first(mut self, program: &Program) -> Plan {
+        fn order<T>(rows: &mut Vec<T>, cold: impl Fn(&T) -> bool, key: impl Fn(&T) -> (u32, u32)) {
+            let (mut first, rest): (Vec<T>, Vec<T>) =
+                std::mem::take(rows).into_iter().partition(&cold);
+            first.sort_by_key(&key);
+            first.extend(rest);
+            *rows = first;
+        }
+        order(
+            &mut self.param_nodes,
+            |(_, node, _)| program.cold_entity(*node),
+            |(context, node, _)| (node.0, context.0),
+        );
+        order(
+            &mut self.spawns,
+            |(entity, ..)| program.cold_entity(*entity),
+            |(entity, context, ..)| (entity.0, context.0),
+        );
+        order(
+            &mut self.gets,
+            |(call_id, ..)| program.cold_entity(*call_id),
+            |(call_id, context, ..)| (call_id.0, context.0),
+        );
+        order(
+            &mut self.thread_calls,
+            |(call_id, ..)| program.cold_entity(*call_id),
+            |(call_id, context, _)| (call_id.0, context.0),
+        );
+        self
+    }
+
     fn is_empty(&self) -> bool {
         self.gets.is_empty()
             && self.runs.is_empty()
@@ -987,7 +1319,12 @@ fn analyze(
 
     // call id -> the function/closure it sits in.
     let mut owner_of: HashMap<Id, Node> = HashMap::default();
+    // node id -> the node (its kind): the plan below names owners by id, and
+    // a linear search of `graph.nodes()` per needy node was quadratic (6 ms of
+    // kolt's client leg; Order 50).
+    let mut node_of: HashMap<Id, Node> = HashMap::default();
     for node in graph.nodes() {
+        node_of.insert(node.id(), *node);
         for call in graph.calls_of(node.id()) {
             owner_of.insert(call.call_id, *node);
         }
@@ -1316,7 +1653,12 @@ fn analyze(
                 .map(|(_, subject_id, _)| *subject_id),
         )
         .collect();
-    let value_taken: HashSet<Id> = program
+    // Every function named as a VALUE, with the entity naming it: the
+    // dead-code exemption reads the set, and the per-context value-use
+    // refusal reads the sites — one scan of the entity map for both, where the
+    // refusal used to rescan it per context (6 ms of kolt's client leg per
+    // context; Order 50). Scan order is the map's, as the refusal's was.
+    let function_value_sites: Vec<(Id, Id)> = program
         .entity_map
         .iter()
         .filter_map(|(entity_id, expr)| match expr {
@@ -1324,10 +1666,14 @@ fn analyze(
                 if program.functions.contains_key(target)
                     && !call_subject_entities.contains(entity_id) =>
             {
-                Some(*target)
+                Some((*entity_id, *target))
             }
             _ => None,
         })
+        .collect();
+    let value_taken: HashSet<Id> = function_value_sites
+        .iter()
+        .map(|(_, target)| *target)
         .collect();
 
     // --- Coverage-only dispatch refinement (element-syntax H8 →
@@ -2121,7 +2467,7 @@ fn analyze(
             let Some(parent) = graph.closure_parent_of(*closure_id) else {
                 continue;
             };
-            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == parent) else {
+            let Some(&owner) = node_of.get(&parent) else {
                 continue;
             };
             spawn_sites.push((entity_id, owner));
@@ -3019,11 +3365,8 @@ fn analyze(
             .copied()
             .filter(|&id| is_function(id))
             .collect();
-        for (&entity_id, expr) in &program.entity_map {
-            if let Expr::Local(target) = expr
-                && needs_functions.contains(target)
-                && !call_subject_entities.contains(&entity_id)
-            {
+        for &(entity_id, target) in &function_value_sites {
+            if needs_functions.contains(&target) {
                 errors.push(anchored(
                     program,
                     entity_id,
@@ -3031,7 +3374,7 @@ fn analyze(
                         "`{}` reads context `{}`, so it can't be used as a value",
                         program
                             .functions
-                            .get(target)
+                            .get(&target)
                             .map(|function| function.name)
                             .unwrap_or("function"),
                         context_name(program, context)
@@ -3165,7 +3508,7 @@ fn analyze(
         // `Some`-wraps (the covered→safe boundary). Safe→strict cannot occur
         // (strictness propagated to the caller).
         for &node_id in &needs {
-            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == node_id) else {
+            let Some(&owner) = node_of.get(&node_id) else {
                 continue;
             };
             for call in graph.calls_of(node_id) {
@@ -3206,7 +3549,7 @@ fn analyze(
             if needy.is_empty() {
                 continue;
             }
-            let Some(&owner) = graph.nodes().iter().find(|node| node.id() == *caller) else {
+            let Some(&owner) = node_of.get(caller) else {
                 continue;
             };
             // Mixed flavors were promoted away: needy candidates are now all
@@ -3404,7 +3747,20 @@ fn analyze(
 }
 
 /// Applies a validated plan, mutating the IR in place.
-fn apply(program: &mut Program, plan: Plan) {
+fn apply(program: &mut Program, plan: Plan, canonical: bool) {
+    // M110 S3: on a seeded analysis the rows that MINT entities are applied
+    // cold first, in a canonical order — the order the mutation log lists
+    // them in — so the ids the cold rewrite mints are a sequence from
+    // `next_entity_id` that every analysis with the same log repeats, offset
+    // by its own base: the recorded post-rewrite cold graph names them
+    // relative to that base (`PostRecord::rewrite_base`). A call's arguments
+    // keep their order (a call's rows are one per context, and contexts are
+    // sorted), as does a node's hidden parameters.
+    let plan = if canonical {
+        plan.cold_rows_first(program)
+    } else {
+        plan
+    };
     // B482: the cleared clause positions, for a backend that writes the type.
     program
         .cleared_clause_contexts

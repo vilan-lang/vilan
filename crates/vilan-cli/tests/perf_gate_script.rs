@@ -270,14 +270,17 @@ fn an_e121_row_reports_until_green_at_two_consecutive_seals_and_then_blocks() {
 // source each side checks, the refusal, and what the verdict says.
 
 /// A fake `vilan`: `check` exits 1 (with an error line) in a directory that
-/// holds `BROKEN`, 0 elsewhere.
+/// holds `BROKEN`, and (N165) in one whose `src/uses-lucide` marker has no
+/// `src/lucide/` beside it - the shape of a kolt archive that lacks its
+/// gitignored generated icons (`cannot find 'lucide'`); 0 elsewhere.
 #[cfg(target_os = "linux")]
 fn fake_vilan(scratch: &Scratch) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = scratch.path("fake-vilan");
     fs::write(
         &path,
-        "#!/bin/sh\nif [ -e BROKEN ]; then echo \"error: this source does not check\" >&2; exit 1; fi\nexit 0\n",
+        "#!/bin/sh\nif [ -e BROKEN ]; then echo \"error: this source does not check\" >&2; exit 1; fi\n\
+         if [ -e src/uses-lucide ] && [ ! -d src/lucide ]; then echo \"error: cannot find 'lucide'\" >&2; exit 1; fi\nexit 0\n",
     )
     .expect("write the fake compiler");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("make it executable");
@@ -712,6 +715,8 @@ fn the_lsp_harness_refuses_a_source_its_edit_script_does_not_land_in() {
         .args([
             "--lsp",
             "true",
+            "--vilan",
+            fake_vilan(&scratch).to_str().expect("utf-8"),
             "--scenario",
             "leaf keystroke",
             "--scenario",
@@ -738,6 +743,337 @@ fn the_lsp_harness_refuses_a_source_its_edit_script_does_not_land_in() {
         "{text}"
     );
     assert!(text.contains("Nothing was run."), "{text}");
+}
+
+/// Runs `scripts/lsp-latency.py` with `arguments` (no server is ever started
+/// by these pins: every one stops at the harness's preflight).
+#[cfg(target_os = "linux")]
+fn lsp_harness(arguments: &[&str]) -> (bool, String) {
+    let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(repository_root().join("scripts/lsp-latency.py"))
+        .args(arguments)
+        .output()
+        .expect("run scripts/lsp-latency.py");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}
+
+/// N165: the harness's copy must CHECK CLEAN under the compiler it will drive
+/// before the first edit, else the run refuses and prints the errors. A server
+/// that analyzes a broken program stops early, so every row reads a fraction of
+/// its true cost: Order 49's seal read x2..x7 on a base archive that lacked
+/// kolt's gitignored `src/lucide`, and a human had to read the `errors` column
+/// to see it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lsp_harness_refuses_a_copy_that_does_not_check_clean_under_the_compiler_it_drives() {
+    let scratch = Scratch::new("lsp-unclean");
+    let vilan = fake_vilan(&scratch);
+    let broken = tip_kolt(&scratch, "broken", true);
+    let work = scratch.path("work");
+    let (ok, text) = lsp_harness(&[
+        "--source",
+        broken.to_str().expect("utf-8"),
+        "--scratch",
+        work.to_str().expect("utf-8"),
+        "--lsp",
+        "true",
+        "--vilan",
+        vilan.to_str().expect("utf-8"),
+    ]);
+    assert!(!ok, "a broken copy was measured:\n{text}");
+    assert!(
+        text.contains("does not check clean under") && text.contains("exits 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("error: this source does not check"),
+        "the compiler's own errors are printed:\n{text}"
+    );
+    assert!(text.contains("Nothing was run."), "{text}");
+    assert!(
+        !text.contains("server pid"),
+        "no server may start on a broken copy:\n{text}"
+    );
+
+    // Without a compiler beside the server and none named, the check cannot
+    // run, and the harness says so rather than skipping it.
+    let clean = tip_kolt(&scratch, "clean", false);
+    let (ok, text) = lsp_harness(&[
+        "--source",
+        clean.to_str().expect("utf-8"),
+        "--scratch",
+        work.to_str().expect("utf-8"),
+        "--lsp",
+        "true",
+    ]);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("cannot find the `vilan` compiler beside") && text.contains("pass --vilan"),
+        "{text}"
+    );
+}
+
+/// N165, the lucide shape itself: a kolt checkout whose `src/lucide/` is
+/// gitignored. The archive of its commit lacks the directory; `prepare_copy`
+/// carries it from the checkout (so the copy checks clean and the run goes on
+/// to the edit script's anchors), and a checkout that has none - an archive
+/// that lacks it - is refused by name, with the compiler's complaint.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lsp_harness_carries_lucide_and_an_archive_that_lacks_it_goes_red() {
+    let scratch = Scratch::new("lsp-lucide");
+    let vilan = fake_vilan(&scratch);
+    let repository = scratch.path("kolt");
+    fs::create_dir_all(repository.join("src")).expect("create the repository");
+    git(&repository, &["init", "--quiet", "."]);
+    fs::write(
+        repository.join("vilan.toml"),
+        "[package]\nname = \"kolt\"\n",
+    )
+    .expect("write");
+    fs::write(repository.join("src/uses-lucide"), "").expect("write the marker");
+    fs::write(repository.join(".gitignore"), "src/lucide/\n").expect("write");
+    git(&repository, &["add", "-A"]);
+    git(&repository, &["commit", "--quiet", "-m", "fixture"]);
+    let work = scratch.path("work");
+    let arguments = |work: &Path| -> Vec<String> {
+        [
+            "--kolt",
+            repository.to_str().expect("utf-8"),
+            "--commit",
+            "HEAD",
+            "--scratch",
+            work.to_str().expect("utf-8"),
+            "--lsp",
+            "true",
+            "--vilan",
+            vilan.to_str().expect("utf-8"),
+            "--scenario",
+            "css keystroke",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    };
+    let run = |work: &Path| {
+        let arguments = arguments(work);
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        lsp_harness(&arguments)
+    };
+
+    // The checkout has no generated icons: the archive lacks them too, and the
+    // copy is refused before anything is edited.
+    let (ok, text) = run(&work);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("does not check clean under") && text.contains("cannot find 'lucide'"),
+        "an archive without src/lucide must go red:\n{text}"
+    );
+
+    // The checkout carries them (gitignored, untracked): the copy does too,
+    // checks clean, and the run reaches the edit script - which this fixture
+    // does not satisfy, and which is where it stops.
+    fs::create_dir_all(repository.join("src/lucide")).expect("create src/lucide");
+    fs::write(repository.join("src/lucide/icon.vl"), "").expect("write an icon");
+    let (ok, text) = run(&scratch.path("work-with-lucide"));
+    assert!(!ok, "{text}");
+    assert!(
+        !text.contains("does not check clean"),
+        "the copy carries src/lucide and checks clean:\n{text}"
+    );
+    assert!(text.contains("the edit script does not land"), "{text}");
+}
+
+/// N165: with no `--tip-kolt` the two sides share ONE copy, and that copy must
+/// check clean under BOTH compilers before anything is measured. The old rule
+/// noted a disagreement and measured anyway - so a base archive that lacked a
+/// generated input (kolt's `src/lucide`) produced a broken program's ratios.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_seal_on_one_shared_source_refuses_when_either_compiler_rejects_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = Scratch::new("shared-source-refusal");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(&budgets, HEADER).expect("write the fixture budgets");
+    let vilan = fake_vilan(&scratch);
+    let rejecting = scratch.path("rejecting-vilan");
+    fs::write(
+        &rejecting,
+        "#!/bin/sh\necho \"error: the tip rejects this source\" >&2\nexit 1\n",
+    )
+    .expect("write the rejecting compiler");
+    fs::set_permissions(&rejecting, fs::Permissions::from_mode(0o755)).expect("executable");
+    let verdicts = scratch.path("verdicts");
+    let seal = |tip: &Path, base: &Path, kolt: &Path| {
+        perf_gate(
+            &budgets,
+            &scratch.0,
+            &[
+                "--scratch",
+                scratch.0.to_str().expect("utf-8"),
+                "seal",
+                "--tip",
+                tip.to_str().expect("utf-8"),
+                "--base",
+                base.to_str().expect("utf-8"),
+                "--kolt",
+                kolt.to_str().expect("utf-8"),
+                "--base-std",
+                scratch.0.to_str().expect("utf-8"),
+                "--verdict-dir",
+                verdicts.to_str().expect("utf-8"),
+                "--sha",
+                "0123456789abcdef",
+            ],
+        )
+    };
+    // The shared source is broken: the base is refused, by name, nothing measured.
+    let broken = base_kolt(&scratch, "shared-broken", true);
+    let (ok, report) = seal(&vilan, &vilan, &broken);
+    assert!(!ok, "a broken shared source was measured:\n{report}");
+    assert!(
+        report.contains("REFUSED  the base's source (kolt@")
+            && report.contains("does not check under the base compiler (exit 1)")
+            && report.contains("error: this source does not check"),
+        "{report}"
+    );
+    assert!(report.contains("PERF VERDICT: REFUSED"), "{report}");
+    // The source is clean for the base and rejected by the TIP's compiler.
+    let clean = base_kolt(&scratch, "shared-clean", false);
+    let (ok, report) = seal(&rejecting, &vilan, &clean);
+    assert!(!ok, "{report}");
+    assert!(
+        report.contains("REFUSED  the tip's source (kolt@")
+            && report.contains("does not check under the tip compiler (exit 1)")
+            && !report.contains("the base's source"),
+        "{report}"
+    );
+    assert!(
+        fs::read_dir(&verdicts).map_or(true, |mut entries| entries.next().is_none()),
+        "a refused seal writes no verdict"
+    );
+}
+
+/// The seal's T3 kolt row takes peak RSS the way `scripts/rss-probe.py` does:
+/// one FRESH process per run, the MEDIAN of the runs. `perf_count.measure` is
+/// stubbed with a base whose first run reads 500 MB (a stray load) and four at
+/// 100 MB: the max is the tip's ruin (x5.0), the median is the truth (x1.0).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_seals_kolt_row_reports_the_median_of_fresh_runs_peak_rss() {
+    let scratch = Scratch::new("t3-rss");
+    let vilan = fake_vilan(&scratch);
+    let kolt = tip_kolt(&scratch, "kolt", false);
+    let driver = format!(
+        r#"
+import argparse, sys
+sys.path.insert(0, {scripts:?})
+import perf_count, perf_gate
+calls = {{"base": 0, "tip": 0}}
+def measure(argv, cwd=None, env=None, counter="auto", log=None):
+    side = "base" if argv[0] == {base:?} else "tip"
+    calls[side] += 1
+    # call 1 is each side's warm-up; the base's first MEASURED run is the outlier
+    rss = 500000 if (side == "base" and calls[side] == 2) else 100000
+    return {{"counter": "instructions:u", "instructions": 1000, "peak_rss_kb": rss, "cpu_s": 1.0, "exit": 0}}
+perf_count.measure = measure
+perf_count.hardware_counter_available = lambda: True
+perf_gate.loadavg = lambda: 0.5
+options = argparse.Namespace(base={base:?}, tip={tip:?}, base_std=None, tip_std=None, runs=5, threshold=1.10,
+                             max_load=2.0)
+sources = {{"base": {{"copy": {kolt:?}, "label": "kolt@x"}}, "tip": {{"copy": {kolt:?}, "label": "kolt@x"}},
+           "kolt": "x", "different": False}}
+t3 = perf_gate.t3_compare(options, sources)
+print("RATIO", round(t3["ratio"]["peak_rss_kb"], 3), "RED", t3["red"])
+print("BASE_RUNS", t3["base"]["peak_rss_runs_kb"], "BASE", t3["base"]["peak_rss_kb"])
+"#,
+        scripts = repository_root().join("scripts").display().to_string(),
+        base = vilan.display().to_string(),
+        // a second path so `measure` can tell the sides apart
+        tip = scratch.path("tip-vilan").display().to_string(),
+        kolt = kolt.display().to_string(),
+    );
+    let output = Command::new("python3")
+        .args(["-c", &driver])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run the T3 driver");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("RATIO 1.0 RED []"), "{text}");
+    assert!(
+        text.contains("BASE_RUNS [100000, 100000, 100000, 100000, 500000] BASE 100000"),
+        "the runs are listed and the figure is their median:\n{text}"
+    );
+}
+
+/// N165: `scripts/rss-probe.py` (moved here from the Order 49 sweep) reads each
+/// run's OWN peak. The fake compiler allocates 150 MB on its first run and 30 MB
+/// on the others: the first form of the probe read `RUSAGE_CHILDREN`, the max
+/// over every child ever reaped, so every run after the first read 150 MB and
+/// "median" was the MAX (the +28% RSS that was never there, incr-49's bisect).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_rss_probe_reads_each_fresh_runs_own_peak_not_the_max_over_children() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = Scratch::new("rss-probe");
+    let fake = scratch.path("fake-vilan");
+    fs::write(
+        &fake,
+        "#!/usr/bin/env python3\n\
+         import os\n\
+         n = int(open('count').read()) if os.path.exists('count') else 0\n\
+         open('count', 'w').write(str(n + 1))\n\
+         block = bytearray((150 if n == 0 else 30) * 1024 * 1024)\n\
+         for i in range(0, len(block), 4096):\n    block[i] = 1\n",
+    )
+    .expect("write the fake compiler");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("executable");
+    let directory = scratch.path("package");
+    fs::create_dir_all(&directory).expect("create the package");
+    let output = Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(repository_root().join("scripts/rss-probe.py"))
+        .arg(&fake)
+        .arg(&directory)
+        .arg("3")
+        .output()
+        .expect("run scripts/rss-probe.py");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runs: Vec<u64> = text
+        .split("runs:")
+        .nth(1)
+        .and_then(|rest| rest.split('|').next())
+        .expect("a runs list")
+        .split_whitespace()
+        .map(|run| run.trim_end_matches("KB").parse().expect("a number of KB"))
+        .collect();
+    assert_eq!(runs.len(), 3, "{text}");
+    assert!(
+        runs[0] < 100 * 1024 && runs[1] < 100 * 1024,
+        "the two 30 MB runs read their own peaks, not the first run's 150 MB: {text}"
+    );
+    assert!(
+        runs[2] > 140 * 1024,
+        "the 150 MB run still reads as 150 MB: {text}"
+    );
+    let median: u64 = text
+        .split("median peakRSS=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("a median")
+        .parse()
+        .expect("KB");
+    assert_eq!(median, runs[1], "the median is the middle run: {text}");
 }
 
 /// N150: a hover or completion anchor is resolved in the EDITED buffer —
