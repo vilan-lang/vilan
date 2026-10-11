@@ -12660,6 +12660,27 @@ fn f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends() 
     );
 }
 
+/// array-lengths.md S2: one impl head over every array length — `[type T; _]`
+/// at lengths 1, 3 and 5, `[type T: Display; _]` walking its element, a
+/// literal `[i32; 3]` outranking the binder, and `Option<[type T; const N]>`
+/// reading `N` as a `usize` and repeating it. Each length is its own instance
+/// on both backends, and the length folds per instance.
+#[test]
+fn array_lengths_s2_an_any_length_impl_head_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_length_heads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_length_heads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an any-length impl head must answer the same natively"
+    );
+}
+
 /// N158: the four longest legs run under [`legs_in_parallel`], whose two
 /// claims are the serial loop's: answers come back in the ITEMS' order
 /// whatever order the workers finish in, and a leg's panic fails the test

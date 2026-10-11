@@ -458,7 +458,11 @@ fn collect_subject_binders(program: &Program, subject: TypeId, binders: &mut Vec
                 collect_subject_binders(program, item, binders);
             }
         }
-        Some(Type::Array(item, _)) => collect_subject_binders(program, *item, binders),
+        Some(Type::Array(item, length)) => {
+            let (item, length) = (*item, *length);
+            collect_subject_binders(program, item, binders);
+            collect_subject_binders(program, length, binders);
+        }
         _ => {}
     }
 }
@@ -652,9 +656,15 @@ pub fn bind_subject(
         (Type::Tuple(pattern_arguments, _), Type::Tuple(concrete_arguments, _)) => {
             zip_arguments(out, &pattern_arguments, &concrete_arguments);
         }
-        // `[T; n]` against `[i32; n]` binds `T = i32` through the element.
-        (Type::Array(pattern_element, _), Type::Array(concrete_element, _)) => {
+        // `[T; N]` against `[i32; 3]` binds `T = i32` through the element and
+        // `N = 3` through the length (array-lengths.md §3: a length binder is
+        // an ordinary generic).
+        (
+            Type::Array(pattern_element, pattern_length),
+            Type::Array(concrete_element, concrete_length),
+        ) => {
             bind_subject(program, pattern_element, concrete_element, out);
+            bind_subject(program, pattern_length, concrete_length, out);
         }
         // B309: a clause binds no generic — it names context BINDINGS, not
         // types — so impl-argument recovery walks the shape and ignores it.

@@ -730,3 +730,10 @@ row	flagship	key
 706	-	cannot infer the type of this value: it is `{written}`, and nothing the program does with it settles the `…` that `{member}` is instantiated at. Bind it with its type (`let value: {written} = …;`)
 707	-	cannot infer the element type of this empty list: nothing the program does with it settles it, and `{member}` is instantiated at it. Bind it with its type (`let values: {written} = [];`)
 708	-	index {literal_index} is out of range: the array is empty (its type is `[_; 0]`), so it has no valid index
+NEW	-	a destructuring needs the array's length, and this array's is the length parameter `{length}`; index it (`values[0]`) or walk it with `for`
+NEW	-	{written} introduces a length parameter, and only an `impl` subject introduces one this way (`impl [type T; _]`, `impl [type T; const N]`); write the length here as a number
+NEW	-	`{name}` is not a length; an array length is a number or a length parameter (`impl [type T; const N]`)
+NEW	-	`{name}` is a length, not a type; it may stand only where an array's length does (`[T; {name}]`)
+NEW	-	cannot find the length '{name}'; an array length is a number or a length parameter (`impl [type T; const N]`)
+NEW	-	`{name}` is a length parameter: it is fixed per instance, not at this site, so a `const` expression cannot read it
+NEW	-	internal: this array length did not resolve to a number in the instance being emitted; please report this program

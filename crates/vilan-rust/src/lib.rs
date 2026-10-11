@@ -5595,6 +5595,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.expecting_nothing(|emitter| emitter.expression(subject, depth))?;
                 format!("({subject}).len()")
             }
+            // array-lengths.md §5.3: a length parameter read as a value is the
+            // number this instance binds it to, a `usize`.
+            Expr::LengthValue(length) => format!("{}usize", self.array_length_at(length, span)?),
             // F100: `[value; n]` evaluates the value ONCE and copies it into
             // each slot — the JS backend's `__repeat`, which fills a scalar and
             // clones an aggregate per slot.
@@ -6290,6 +6293,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 | Expr::List(_)
                 | Expr::Repeat(..)
                 | Expr::ArrayLen(..)
+                | Expr::LengthValue(_)
                 | Expr::StructInitializer(..),
             ) => true,
             _ => false,

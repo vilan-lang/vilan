@@ -5794,12 +5794,25 @@ impl<'src> Printer<'src> {
                 self.out.push(')');
             }
             // `[T; n]` — a fixed-length array type (proposal/fixed-arrays.md): the
-            // element type and a length (an integer literal). Nests as `[[T; m]; n]`.
+            // element type and a length. Nests as `[[T; m]; n]`. The length is a
+            // number, a length parameter's name, or an impl subject's length
+            // binder — `_` or `const N` (array-lengths.md §4), which parse as a
+            // `TypeBinder` and print with the keyword the length position spells.
             Node::ArrayType(element, length) => {
                 self.out.push('[');
                 self.print_type(&element.0);
                 self.out.push_str("; ");
-                self.print_expr(length);
+                match &length.0 {
+                    Node::TypeBinder((name, _), _, _) if *name == ANONYMOUS_TYPE_BINDER => {
+                        self.out.push_str(ANONYMOUS_TYPE_BINDER);
+                    }
+                    Node::TypeBinder((name, _), _, _) => {
+                        self.out.push_str("const ");
+                        self.out.push_str(name);
+                    }
+                    Node::Number(..) => self.print_expr(length),
+                    _ => self.print_type(&length.0),
+                }
                 self.out.push(']');
             }
             // `(|| void) context turn_scope` / `T context (a, b)` — a type with the

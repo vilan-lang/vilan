@@ -17,6 +17,7 @@
 
 mod support;
 
+mod array_lengths;
 mod ascription;
 mod auto_annotations;
 mod backed_enums;

@@ -125,7 +125,10 @@ fn collect_selector_binders(node: &Spanned<Node<'_>>, into: &mut Vec<Span>) {
                 collect_selector_binders(item, into);
             }
         }
-        Node::ArrayType(element, _) => collect_selector_binders(element, into),
+        Node::ArrayType(element, length) => {
+            collect_selector_binders(element, into);
+            collect_selector_binders(length, into);
+        }
         Node::Reference(_, inner) | Node::TypeWithContexts(inner, _) => {
             collect_selector_binders(inner, into)
         }
@@ -8214,7 +8217,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((Node::DynType(Box::new(inner)), self.span_from(start)))
     }
 
-    /// `[T; length]` — a fixed-length array type; `length` is an integer literal.
+    /// `[T; length]` — a fixed-length array type (array-lengths.md §4).
     fn parse_array_type(&mut self) -> Option<Spanned<Node<'src>>> {
         self.attempt(|parser| {
             let start = parser.position;
@@ -8230,15 +8233,49 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// An array-type length: an integer (numeric) literal.
+    /// An array-type length (array-lengths.md §4):
+    ///
+    /// ```text
+    /// array-length = NUMBER | IDENT | "_" | "const" IDENT ;
+    /// ```
+    ///
+    /// A number is the length itself; an IDENT names a length parameter
+    /// (`[i32; N]` under `<const N>`), read as the type path it is spelled
+    /// as. `_` and `const N` are BINDERS — an impl subject's anonymous and
+    /// named length parameter (`impl [type T; _]`, `impl [type T; const N]`)
+    /// — and parse as the [`Node::TypeBinder`] the element position's `type T`
+    /// and `_` parse as, so one registration walk declares both. Like `_` in
+    /// any type position, the reading is unconditional: a binder written
+    /// where none may be introduced is refused by resolution (B294).
     fn parse_array_length(&mut self) -> Option<Spanned<Node<'src>>> {
-        if let Some(Token::Number(whole, fraction, suffix)) = self.peek() {
-            let node = Node::Number(whole, *fraction, *suffix);
-            let span = self.here_span();
-            self.bump();
-            Some((node, span))
-        } else {
-            None
+        match self.peek()? {
+            Token::Number(whole, fraction, suffix) => {
+                let node = Node::Number(whole, *fraction, *suffix);
+                let span = self.here_span();
+                self.bump();
+                Some((node, span))
+            }
+            Token::Const => {
+                let start = self.position;
+                self.bump();
+                let name_start = self.position;
+                let name = self.eat_ident()?;
+                let name_span = self.span_from(name_start);
+                Some((
+                    Node::TypeBinder((name, name_span), Vec::new(), None),
+                    self.span_from(start),
+                ))
+            }
+            Token::Ident(ANONYMOUS_TYPE_BINDER) => {
+                let span = self.here_span();
+                self.bump();
+                Some((
+                    Node::TypeBinder((ANONYMOUS_TYPE_BINDER, span), Vec::new(), None),
+                    span,
+                ))
+            }
+            Token::Ident(_) => self.parse_path_type(),
+            _ => None,
         }
     }
 

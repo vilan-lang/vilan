@@ -1,0 +1,74 @@
+// array-lengths.md S2: one impl over every array length, at three lengths and
+// through both binder spellings; a literal length outranks the binder; the
+// length parameter is a `usize` value and a repeat's length in the body.
+import std::display::Display;
+import std::io::print;
+
+trait Shape {
+	fun count(self): usize;
+	fun described(self): str;
+}
+
+impl [type T: Display; _] with Shape {
+	fun count(self): usize {
+		self.len()
+	}
+
+	fun described(self): str {
+		mut out = "";
+		for item in self {
+			out = out + item.to_string() + " ";
+		}
+		out
+	}
+}
+
+trait Name {
+	fun name(self): str;
+}
+
+impl [i32; 3] with Name {
+	fun name(self): str {
+		"three"
+	}
+}
+
+impl [type T; _] with Name {
+	fun name(self): str {
+		"any"
+	}
+}
+
+trait Width {
+	fun width(self): usize;
+	fun blanks(self): usize;
+}
+
+impl Option<[type T; const N]> with Width {
+	fun width(self): usize {
+		N * 100
+	}
+
+	fun blanks(self): usize {
+		let blanks = [0u8; N];
+		blanks.len()
+	}
+}
+
+fun main() {
+	let one: [i32; 1] = [7];
+	let three: [i32; 3] = [1, 2, 3];
+	let five: [str; 5] = ["a", "b", "c", "d", "e"];
+	print(one.count());
+	print(three.count());
+	print(five.count());
+	print(three.described());
+	print(five.described());
+	print(three.name());
+	print(one.name());
+	let some: Option<[bool; 4]> = Some([true, false, true, false]);
+	print(some.width());
+	print(some.blanks());
+}
+
+main();

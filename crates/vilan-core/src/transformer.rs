@@ -4512,6 +4512,7 @@ impl<'src> Transformer<'src> {
             | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::Parameter(_)
             | Expr::String(_)
             | Expr::Struct(_)
@@ -5631,6 +5632,12 @@ impl<'src> Transformer<'src> {
             Expr::Void => js::Node::Void,
             Expr::Null => js::Node::Null,
             Expr::Bool(x) => js::Node::Bool(*x),
+            // array-lengths.md §5.3: a length parameter read as a value is the
+            // number this instance binds it to.
+            Expr::LengthValue(length) => {
+                let length = self.array_length_or_report(*length, id);
+                js::Node::Number(length.to_string(), None)
+            }
             Expr::Number(whole, fraction, suffix) => {
                 // `n`-suffixed literals are JS BigInts (`5n`); other suffixes
                 // only affect typing and are dropped in the output. B404: an

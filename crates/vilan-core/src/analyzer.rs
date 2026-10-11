@@ -815,6 +815,11 @@ pub enum Expr<'src> {
     // still evaluates (fixed-arrays.md §10), and a length parameter folds per
     // instance.
     ArrayLen(Id, TypeId),
+    // A length parameter read as a value — `N` in the body of
+    // `impl [type T; const N]` (array-lengths.md §5.3) — by the id of its
+    // `Type::Generic`: a `usize`, folded per instance to the number the
+    // instance binds it to.
+    LengthValue(TypeId),
     Local(Id),
     // A match expression: the subject and the resolved legs.
     Match(Id, Vec<ExprMatchLeg>),
@@ -4829,6 +4834,21 @@ pub struct Analyzer<'src> {
     // (`check_generic_bound_satisfaction`); the element bound's type id is
     // stored unresolved like `generic_bounds` entries.
     tuple_bounds: HashMap<TypeId, TupleBoundRequirement>,
+    // array-lengths.md §3/§4: the LENGTH parameters — an impl subject's `_` or
+    // `const N` in an array's length position, by constraint id. A length
+    // parameter is an ordinary generic (it binds, substitutes and keys like a
+    // type argument); this set is its KIND, which the kind checks read: such a
+    // parameter may stand only in a length position, and a length position
+    // only holds one of these or a number.
+    length_parameters: HashSet<TypeId>,
+    // The length binders an impl subject registered, by the occurrence's
+    // `(source, name span)`: what tells a `const N` the head declared from one
+    // written where no binder may be introduced.
+    registered_length_binders: HashSet<(SourceId, Span)>,
+    // The slots of every length written as a NAME or a binder (`[T; N]`,
+    // `[T; const N]`): the `prepped_type_locals` drain refuses a type there and
+    // a length parameter anywhere else (§3's two kind checks).
+    length_position_type_ids: HashSet<TypeId>,
     // B399: a mapped type's binder (`U` in `(U in T: F<U>)`), keyed by its
     // constraint id, -> the SOURCE type id it ranges over. A binder is
     // registered with no bound of its own, but when its source is a parameter
@@ -7761,6 +7781,9 @@ impl<'src> Analyzer<'src> {
             defaulted_parameter_types: HashSet::default(),
             defaulted_parameter_mentions: HashMap::default(),
             tuple_bounds: HashMap::default(),
+            length_parameters: HashSet::default(),
+            registered_length_binders: HashSet::default(),
+            length_position_type_ids: HashSet::default(),
             mapped_binder_sources: HashMap::default(),
             tuple_walk_binders: HashMap::default(),
             tuple_walk_views: HashMap::default(),
@@ -8490,7 +8513,7 @@ impl<'src> Analyzer<'src> {
             }
             (Type::Tuple(lefts, _), Type::Tuple(rights, _)) => all(&lefts, &rights),
             (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
-                self.array_lengths_agree(left_length, right_length)
+                self.same_type_structure(left_length, right_length, depth + 1)
                     && self.same_type_structure(left_element, right_element, depth + 1)
             }
             (
@@ -11797,8 +11820,10 @@ impl<'src> Analyzer<'src> {
             (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.same_impl_types(left_items, right_items, comparing)
             }
+            // A length is one more argument (array-lengths.md §3): two length
+            // binders are one position as two type binders are.
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                self.array_lengths_agree(*left_length, *right_length)
+                self.same_impl_type(*left_length, *right_length, comparing)
                     && self.same_impl_type(*left_item, *right_item, comparing)
             }
             // B309: the `context` clause is deliberately NOT compared. Impl
@@ -15379,6 +15404,7 @@ impl<'src> Analyzer<'src> {
             | Expr::FunctionReturn(None)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::Null
@@ -16203,6 +16229,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Async(_)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -17283,6 +17310,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Async(_)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -20581,6 +20609,7 @@ impl<'src> Analyzer<'src> {
             Expr::FunctionReturn(None)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -22609,8 +22638,10 @@ impl<'src> Analyzer<'src> {
             (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.impl_subject_arguments_match(&left_items, &right_items)
             }
+            // A length binder is a hole like any other (array-lengths.md §5.4):
+            // `[type T; _]` matches `[i32; 3]`, and not the other way.
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                self.array_lengths_agree(left_length, right_length)
+                self.impl_subject_matches(left_length, right_length)
                     && self.impl_subject_matches(left_item, right_item)
             }
             (left, right) => left == right,
@@ -22649,7 +22680,10 @@ impl<'src> Analyzer<'src> {
                     self.collect_subject_binders(item, binders);
                 }
             }
-            Type::Array(item, _) => self.collect_subject_binders(item, binders),
+            Type::Array(item, length) => {
+                self.collect_subject_binders(item, binders);
+                self.collect_subject_binders(length, binders);
+            }
             _ => {}
         }
     }
@@ -23377,7 +23411,7 @@ impl<'src> Analyzer<'src> {
                         .all(|(left, right)| self.bound_argument_agrees(*left, *right, depth + 1))
             }
             (Type::Array(left, left_length), Type::Array(right, right_length)) => {
-                self.array_lengths_agree(*left_length, *right_length)
+                self.bound_argument_agrees(*left_length, *right_length, depth + 1)
                     && self.bound_argument_agrees(*left, *right, depth + 1)
             }
             _ => provided == required,
@@ -37552,11 +37586,28 @@ impl<'src> Analyzer<'src> {
             }
             // B582 (array-lengths.md §11, S0): a fixed array's ELEMENT binds
             // like a tuple's — `impl [type T; 3] with Count` declares `T`, and
-            // selection already binds through an array's element
-            // (`impl_select::bind_subject`'s `Type::Array` arm). The length is a
-            // literal; a length binder is the paper's S2.
-            Node::ArrayType(element, _) => {
+            // selection binds through an array's element
+            // (`impl_select::bind_subject`'s `Type::Array` arm).
+            //
+            // S2: so does its LENGTH. `_` and `const N` in the length position
+            // are binders (the parser reads them as the element position's
+            // `TypeBinder`), registered as an unbounded generic whose KIND is a
+            // length: `[type T; _]` is `[type T; const N]` with the name
+            // declined, as B294's `_` is `type T`'s.
+            Node::ArrayType(element, length) => {
                 self.register_subject_binders(element, scope_id);
+                if let Node::TypeBinder((name, name_span), _, _) = &length.0 {
+                    let constraint_type_id = self.register_binder(name, name_span, &[], scope_id);
+                    self.length_parameters.insert(constraint_type_id);
+                    self.registered_length_binders
+                        .insert((self.current_source_id, *name_span));
+                    self.withdraw_anonymous_binder_name(
+                        name,
+                        name_span,
+                        constraint_type_id,
+                        scope_id,
+                    );
+                }
             }
             _ => {}
         }
@@ -38323,11 +38374,86 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The type id of an array LENGTH as written in a `[T; n]` type or a
-    /// `[value; n]` literal: a `Type::Length` minted for the literal
-    /// (array-lengths.md §3, R2).
-    fn walk_array_length(&mut self, node: &Spanned<Node<'src>>, _scope_id: Id) -> TypeId {
-        let length = self.array_length_literal(node);
-        self.length_type_id(length)
+    /// `[value; n]` literal (array-lengths.md §3, R2, and §4's grammar):
+    ///
+    /// - a number mints a `Type::Length`;
+    /// - a binder (`_`, `const N`) is the generic its impl subject registered,
+    ///   walked as the element position's binder is — and refused where no
+    ///   subject registered it (B294's rule: a binder is introduced in an impl
+    ///   subject or a generic list, nowhere else);
+    /// - a name (`N`) is walked as a type name and resolves with the others;
+    ///   the `prepped_type_locals` drain holds it to the length kind.
+    fn walk_array_length(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        match &node.0 {
+            Node::TypeBinder((name, name_span), _, _) => {
+                let registered = if *name == ANONYMOUS_TYPE_BINDER {
+                    self.anonymous_binder_parameters
+                        .contains_key(&(self.current_source_id, *name_span))
+                } else {
+                    self.registered_length_binders
+                        .contains(&(self.current_source_id, *name_span))
+                };
+                if !registered {
+                    let written = match *name == ANONYMOUS_TYPE_BINDER {
+                        true => "`_`".to_string(),
+                        false => format!("`const {name}`"),
+                    };
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: format!(
+                            "{written} introduces a length parameter, and only an `impl` \
+                             subject introduces one this way (`impl [type T; _]`, \
+                             `impl [type T; const N]`); write the length here as a number"
+                        ),
+                    });
+                    return Type::Unresolved.get_type_id(self);
+                }
+                let length = self.walk_type_node(node, scope_id);
+                self.length_position_type_ids.insert(length);
+                length
+            }
+            Node::Accessor(_) => {
+                let length = self.walk_type_node(node, scope_id);
+                self.length_position_type_ids.insert(length);
+                length
+            }
+            _ => {
+                let length = self.array_length_literal(node);
+                self.length_type_id(length)
+            }
+        }
+    }
+
+    /// The kind check of a name the `prepped_type_locals` drain resolved
+    /// (array-lengths.md §3): a length parameter stands only in a length
+    /// position, and a length position holds only a length parameter (a
+    /// number never reaches the drain). `None` when the kinds agree.
+    fn length_kind_error(
+        &self,
+        type_id: TypeId,
+        subject_type: &Type,
+        name: &str,
+    ) -> Option<String> {
+        let names_a_length = matches!(
+            subject_type,
+            Type::Generic(constraint_id) if self.length_parameters.contains(constraint_id)
+        );
+        match (
+            self.length_position_type_ids.contains(&type_id),
+            names_a_length,
+        ) {
+            (true, false) => Some(format!(
+                "`{name}` is not a length; an array length is a number or a length \
+                 parameter (`impl [type T; const N]`)"
+            )),
+            (false, true) => Some(format!(
+                "`{name}` is a length, not a type; it may stand only where an array's \
+                 length does (`[T; {name}]`)"
+            )),
+            _ => None,
+        }
     }
 
     /// A fresh id holding the length `length`. Lengths are minted like every
@@ -38359,13 +38485,19 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Whether two array length ids are the same length, read without a
-    /// substitution: both numbers, and equal.
+    /// substitution: two equal numbers, or one length parameter on both
+    /// sides. (The comparators that read a parameter as a HOLE recurse into
+    /// the length as a type argument instead.)
     fn array_lengths_agree(&self, left: TypeId, right: TypeId) -> bool {
         left == right
-            || matches!(
-                (self.type_id_to_type_map.array_length(left), self.type_id_to_type_map.array_length(right)),
-                (Some(left), Some(right)) if left == right
-            )
+            || match (
+                self.type_id_to_type_map.get(&left),
+                self.type_id_to_type_map.get(&right),
+            ) {
+                (Some(Type::Length(left)), Some(Type::Length(right))) => left == right,
+                (Some(Type::Generic(left)), Some(Type::Generic(right))) => left == right,
+                _ => false,
+            }
     }
 
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
@@ -43410,8 +43542,9 @@ impl<'src> Analyzer<'src> {
                     self.collect_residual_generics(&item.get_type(self), out);
                 }
             }
-            Type::Array(element, _) => {
+            Type::Array(element, length) => {
                 self.collect_residual_generics(&element.get_type(self), out);
+                self.collect_residual_generics(&length.get_type(self), out);
             }
             _ => {}
         }
@@ -43438,7 +43571,10 @@ impl<'src> Analyzer<'src> {
             Type::Tuple(items, _) => items
                 .iter()
                 .all(|item| self.type_is_fully_determined(&item.get_type(self))),
-            Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
+            Type::Array(element_id, length_id) => {
+                self.type_is_fully_determined(&element_id.get_type(self))
+                    && self.type_is_fully_determined(&length_id.get_type(self))
+            }
             Type::Closure(parameter_ids, return_id, _, _) => {
                 parameter_ids
                     .iter()
@@ -46101,7 +46237,7 @@ impl<'src> Analyzer<'src> {
             // `arr.len()` — the length is a compile-time constant; the result is
             // a `usize`, as every length is (B590: fixed-arrays.md §10 typed it
             // `i32` "matching `List.len()`", and I5 S2 moved `List.len()`).
-            Expr::ArrayLen(_, _) => self.primitive_struct_type("usize"),
+            Expr::ArrayLen(_, _) | Expr::LengthValue(_) => self.primitive_struct_type("usize"),
             Expr::Tuple(item_ids) => {
                 // A construction that is EXACTLY one spread is the concatenation
                 // of one: its type is the operand's, unchanged. This is the only
@@ -49238,16 +49374,32 @@ impl<'src> Analyzer<'src> {
                 (Type::Tuple(result_items, labels), all_bindings)
             }
             // Two arrays unify only at the SAME length (the length is part of the
-            // type) — a mismatch falls through to the no-reconcile path, so
-            // `[i32; 3]` and `[i32; 4]` are distinct. Same length → reconcile the
-            // element (binding a generic element like `List<T>` does).
-            (Type::Array(l_element, l_length), Type::Array(r_element, r_length))
-                if self.array_lengths_agree(*l_length, *r_length) =>
-            {
+            // type), so `[i32; 3]` and `[i32; 4]` are distinct. The length
+            // reconciles as a type argument does (array-lengths.md §3): two
+            // numbers agree by value, and a length parameter the site infers
+            // BINDS — `[T; N]` against `[i32; 3]` records `N = 3` beside
+            // `T = i32`. Then the element reconciles.
+            (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
+                let (l_length, r_length) = (*l_length, *r_length);
+                let (left_length, right_length) =
+                    (l_length.get_type(self), r_length.get_type(self));
+                let (length, mut bindings) =
+                    self.reconcile_type(&left_length, &right_length, substitution_context)?;
+                // The reconciled length is one side's own (a number, or the
+                // parameter itself), so it keeps that side's id: nothing mints.
+                let length = if length == left_length {
+                    l_length
+                } else if length == right_length {
+                    r_length
+                } else {
+                    length.get_type_id(self)
+                };
                 let l = l_element.get_type(self);
                 let r = r_element.get_type(self);
-                let (element, bindings) = self.reconcile_type(&l, &r, substitution_context)?;
-                (Type::Array(element.get_type_id(self), *l_length), bindings)
+                let (element, element_bindings) =
+                    self.reconcile_type(&l, &r, substitution_context)?;
+                bindings.extend(element_bindings);
+                (Type::Array(element.get_type_id(self), length), bindings)
             }
             // Same nominal type: unify argument-wise, keeping the instantiated
             // side when the other is erased. Reconciling the arguments collects
@@ -49659,7 +49811,12 @@ impl<'src> Analyzer<'src> {
             // too. The LENGTH is part of the type — `[i32; 3]` is not
             // `[i32; 4]` — so it is compared first, by value.
             (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
-                self.array_lengths_agree(*l_length, *r_length) && {
+                // The length compares as a type argument does (array-lengths.md
+                // §3): two numbers by value, a length parameter as the generic
+                // it is — a hole where the site infers it, rigid where the
+                // enclosing declaration owns it.
+                let (l_length, r_length) = (l_length.get_type(self), r_length.get_type(self));
+                self.compare_type_rigid(&l_length, &r_length, substitution_context, rigid) && {
                     let l = l_element.get_type(self);
                     let r = r_element.get_type(self);
                     self.compare_type_rigid(&l, &r, substitution_context, rigid)
@@ -58258,7 +58415,9 @@ impl<'src> Analyzer<'src> {
             | Type::Tuple(argument_type_ids, _) => argument_type_ids
                 .iter()
                 .all(|argument_type_id| self.type_is_ground(*argument_type_id)),
-            Type::Array(element_type_id, _) => self.type_is_ground(element_type_id),
+            Type::Array(element_type_id, length_id) => {
+                self.type_is_ground(element_type_id) && self.type_is_ground(length_id)
+            }
             Type::Mapped(_, source_type_id, template_type_id) => {
                 self.type_is_ground(source_type_id) && self.type_is_ground(template_type_id)
             }
@@ -63973,6 +64132,20 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Whether `id` sits inside a `const` expression's span (same file).
+    fn inside_a_const_expression(&self, id: Id) -> bool {
+        let Some(span) = self.span_map.get(&id).copied() else {
+            return false;
+        };
+        let source = self.source_of_id(id);
+        self.const_exprs.iter().any(|root| {
+            self.span_map
+                .get(root)
+                .is_some_and(|root_span| root_span.start <= span.start && span.end <= root_span.end)
+                && self.source_of_id(*root) == source
+        })
+    }
+
     /// The diagnostic to raise when the bare name `name`, resolving to
     /// `subject_id`, is used in **value position** but names a non-value entity
     /// — a type (struct/enum, primitives included), a trait, a type parameter,
@@ -64176,6 +64349,37 @@ impl<'src> Analyzer<'src> {
             });
         match resolved {
             Some(subject_id) => {
+                // array-lengths.md §5.3: a LENGTH parameter is a value — a
+                // `usize`, the number its instance binds it to.
+                if let Some(Expr::Generic(constraint_id)) =
+                    self.expr_id_to_expr_map.get(&subject_id)
+                    && self.length_parameters.contains(constraint_id)
+                {
+                    let constraint_id = *constraint_id;
+                    // A `const` expression evaluates once per SITE, and the
+                    // length differs per instance: it may not read one.
+                    if self.inside_a_const_expression(id) {
+                        let diagnostics_before = self.diagnostics.len();
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "`{name}` is a length parameter: it is fixed per instance, \
+                                 not at this site, so a `const` expression cannot read it"
+                            ),
+                        });
+                        if let Some(source) = self.source_of_id(id) {
+                            self.attribute_new_diagnostics(diagnostics_before, source);
+                        }
+                        self.expr_id_to_expr_map.insert(id, Expr::Error);
+                        return;
+                    }
+                    let length = Type::Generic(constraint_id).get_type_id(self);
+                    self.expr_id_to_expr_map
+                        .insert(id, Expr::LengthValue(length));
+                    return;
+                }
                 if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                     let diagnostics_before = self.diagnostics.len();
                     self.diagnostics.push(Error {
@@ -64789,6 +64993,23 @@ impl<'src> Analyzer<'src> {
                 Some(subject_id) => {
                     let subject_type =
                         self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+                    // array-lengths.md §3: the two kind checks, at the name.
+                    if let Some(message) = self.length_kind_error(type_id, &subject_type, name) {
+                        self.push_at_written_type(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                            type_id,
+                        );
+                        self.refused_annotation_slots
+                            .insert(type_id, (source_id, span));
+                        self.write_type_slot(type_id, Type::Unknown);
+                        continue;
+                    }
                     // B245: a mention of a DEFAULTED parameter keeps the
                     // parameter's identity. Every written type mints its own
                     // slot, and this one resolves to the DEFAULT's type — for
@@ -65507,6 +65728,11 @@ impl<'src> Analyzer<'src> {
                              `{trait_name}` itself, so it is written for EVERY type that \
                              implements it — and that type has no name here. Say `Self`, or \
                              name it in the head: `impl type {name}: {trait_name}<..>`"
+                        )
+                    } else if self.length_position_type_ids.contains(&type_id) {
+                        format!(
+                            "cannot find the length '{name}'; an array length is a number or \
+                             a length parameter (`impl [type T; const N]`)"
                         )
                     } else {
                         let steer = self.import_steer(name).unwrap_or_default();
@@ -70203,8 +70429,9 @@ impl<'src> Analyzer<'src> {
                     self.collect_generics(&item.get_type(self), depth + 1, out);
                 }
             }
-            Type::Array(element_id, _) => {
+            Type::Array(element_id, length_id) => {
                 self.collect_generics(&element_id.get_type(self), depth + 1, out);
+                self.collect_generics(&length_id.get_type(self), depth + 1, out);
             }
             _ => {}
         }

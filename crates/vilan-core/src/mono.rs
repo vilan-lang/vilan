@@ -92,8 +92,12 @@ pub fn collect_type_generics(
             }
             collect_type_generics(program, return_type_id, depth + 1, out);
         }
-        Some(Type::Array(element_id, _)) => {
-            collect_type_generics(program, *element_id, depth + 1, out);
+        Some(Type::Array(element_id, length_id)) => {
+            let (element_id, length_id) = (*element_id, *length_id);
+            collect_type_generics(program, element_id, depth + 1, out);
+            // A length parameter is a binder like any other (array-lengths.md
+            // §8.1): an instance keys by the length it is bound to.
+            collect_type_generics(program, length_id, depth + 1, out);
         }
         _ => {}
     }
