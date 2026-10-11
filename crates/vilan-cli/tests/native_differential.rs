@@ -10142,6 +10142,23 @@ fn a_float_beside_a_converted_integer_is_identical_on_both_backends() {
     );
 }
 
+/// B592: a list of array literals under `List<[T; n]>` — the inner literals
+/// are the arrays, at a binding, a parameter, a push and a nested level.
+#[test]
+fn a_list_of_fixed_array_literals_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_list_of_fixed_arrays.vl"),
+        include_str!("native/list_of_fixed_arrays.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_list_of_fixed_arrays.vl"),
+        Verdict::Identical,
+        "a list of fixed-array literals must build and print the same on both backends"
+    );
+}
+
 /// F63: a closure's expression body is the value it hands back, a CONSUMING
 /// position like a function body's tail, so a place read there takes rule 1's
 /// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured

@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**B592: a list literal of array literals under `List<[T; n]>` elaborates its inner literals as the arrays — `let listed: List<[i32; 2]> = [[1, 2], [3, 4]]` was refused on both backends "Expected List<[i32; 2]>, but got List<List<i32>>"; it builds and runs (at an annotated binding, a parameter, a push, and a level deeper: `List<[[u8; 2]; 2]>`).** The list literal deliberately does not seed its expectation into its elements (it moves inference beyond the check), and B389/B447 carved out the numeric and the literal-tuple element; a fixed-array element is the third carve-out, and the narrowest kind: the one expectation that changes what a literal IS. An inner literal of the wrong length gets the array arm's own refusal at it. Pins: `collections::b592_*` (2), `native_differential::a_list_of_fixed_array_literals_is_identical_on_both_backends` (`native/list_of_fixed_arrays.vl`, new).
+
+---
+
 <!-- family: diagnostics -->
 **B601: a `dyn` value at an annotated `let` of its concrete type (`let square: Square = shape;`, and the ascription `shape as Square`) is refused ONCE with the narrowing message, where it was refused twice at one span.** A reference is typed by typing the binding it names under the same constraint, so the binding's entity met the narrowing seam as well as the reference; the readiness probe and the directed ask were not the cause (the item's guess). The reference is the site, so the binding's entity no longer reports (B5: one diagnostic per mistake). Pin: `dyn_objects::b601_a_narrowing_at_an_annotated_let_or_an_ascription_is_refused_once`.
 

@@ -813,3 +813,51 @@ fn f108_an_empty_literal_at_a_bounded_generic_is_grounded_from_the_bound() {
         "1\n",
     );
 }
+
+// --- B592: a list literal of array literals under `List<[T; n]>` -----------
+
+/// B592: `let listed: List<[i32; 2]> = [[1, 2], [3, 4]]` was refused
+/// "Expected List<[i32; 2]>, but got List<List<i32>>": the element type did
+/// not reach the inner literals, which typed as `List`s. A fixed-array element
+/// type directs each inner list literal to elaborate as that array — at an
+/// annotated binding, at a parameter, nested a level deeper, and pushed after.
+#[test]
+fn b592_a_list_of_array_literals_takes_its_fixed_array_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun total(rows: List<[i32; 2]>): i32 {
+            mut sum = 0;
+            for row in rows {
+                sum += row[0] + row[1];
+            }
+            sum
+        }
+
+        fun main() {
+            mut listed: List<[i32; 2]> = [[1, 2], [3, 4]];
+            listed.push([5, 6]);
+            print(listed[2][1]);
+            print(total([[10, 20], [30, 40]]));
+            let grid: List<[[u8; 2]; 2]> = [[[1, 2], [3, 4]]];
+            print(grid[0][1][0]);
+        }
+        "#,
+        "6\n100\n3\n",
+    );
+}
+
+/// B592's boundary: an inner literal of the wrong length is the array arm's
+/// own refusal, once, at that literal.
+#[test]
+fn b592_an_inner_literal_of_the_wrong_length_is_refused_at_it() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let _listed: List<[i32; 2]> = [[1, 2], [3]];
+        }
+        "#,
+        "this array literal has 1 element, but its type is `[_; 2]`",
+    );
+}

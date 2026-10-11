@@ -45784,6 +45784,15 @@ impl<'src> Analyzer<'src> {
                             && self.type_is_fully_determined(expected)
                     })
                     .cloned();
+                // B592: and a FIXED ARRAY element type directs a list literal
+                // element to elaborate as that array (`[[1, 2], [3, 4]]`
+                // against `List<[i32; 2]>`), as the array literal arm does one
+                // level down — the one expectation that changes what a literal
+                // IS, not merely how it is typed.
+                let array_literal_element = seeded_element
+                    .as_ref()
+                    .filter(|expected| matches!(expected, Type::Array(..)))
+                    .cloned();
                 let mut element_type = match seeded_element {
                     Some(expected @ Type::Dyn(..)) => expected,
                     _ => Type::Unknown,
@@ -45800,6 +45809,15 @@ impl<'src> Analyzer<'src> {
                                 && self.tuple_literal_holds_unsuffixed_numeric(*item_id) =>
                         {
                             tuple_literal_element.clone().unwrap_or(Type::Unknown)
+                        }
+                        (_, Type::Unknown)
+                            if array_literal_element.is_some()
+                                && matches!(
+                                    self.expr_id_to_expr_map.get(item_id),
+                                    Some(Expr::List(_))
+                                ) =>
+                        {
+                            array_literal_element.clone().unwrap_or(Type::Unknown)
                         }
                         _ => element_type.clone(),
                     };

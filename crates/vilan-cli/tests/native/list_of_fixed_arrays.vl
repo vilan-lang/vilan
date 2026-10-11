@@ -1,0 +1,21 @@
+// B592: a list literal of array literals under `List<[T; n]>` elaborates its
+// inner literals as the arrays, on both backends.
+import std::io::print;
+
+fun total(rows: List<[i32; 2]>): i32 {
+	mut sum = 0;
+	for row in rows {
+		sum += row[0] + row[1];
+	}
+	sum
+}
+
+fun main() {
+	mut listed: List<[i32; 2]> = [[1, 2], [3, 4]];
+	listed.push([5, 6]);
+	print(listed[2][1]);
+	print(total([[10, 20], [30, 40]]));
+	let grid: List<[[u8; 2]; 2]> = [[[1, 2], [3, 4]]];
+	print(grid[0][1][0]);
+	print(listed);
+}
