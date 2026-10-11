@@ -996,7 +996,7 @@ type = "&" [ "mut" ] type                       (* view type *)
      | "[" type ";" array-length "]"            (* fixed array, §5.1 *)
      ;
 array-length   = NUMBER                         (* unsuffixed or `usize` *)
-               | IDENT                          (* a length parameter *)
+               | IDENT                          (* a length parameter, or a named length *)
                | "_" | "const" IDENT ;          (* impl-subject binders *)
 tuple-slot     = [ MEMBER ":" ] type ;     (* labelled: every slot, or none (B569) *)
 type-path      = IDENT { "::" IDENT } [ generic-args ] ;
@@ -1025,13 +1025,17 @@ production above instead. Written after the return type it precedes a
 prints it where it was written.
 
 A **fixed array** `[T; n]` holds `n` values of `T`, the length part of the
-type (types §5.1). Its length is a number, the name of a length parameter in
-scope (`[i32; N]` under `<const N>`), or — in an `impl` subject only — a
-length binder, `_` or `const N`. A binder written anywhere else is refused,
-as `_` is in an annotation. The same `array-length` follows the `;` of a
-repeat literal `[value; n]` (§3.6). A length that needs evaluating (`2 * K`,
-a call) is refused: lengths are known before the program is typed, and
-`const` evaluation runs after.
+type (types §5.1). Its length is a whole number (unsuffixed or `usize`), the
+name of a length parameter in scope (`[i32; N]` under `<const N>`), a NAMED
+length — an immutable binding, `let` or `const let`, at any scope the name
+resolves in (imports included), whose initializer is such a number or another
+named length (`const let SIZE = 16;`, `[u8; SIZE]`) — or, in an `impl`
+subject only, a length binder, `_` or `const N`. A binder written anywhere
+else is refused, as `_` is in an annotation. The same `array-length` follows
+the `;` of a repeat literal `[value; n]` (§3.6). A length that needs
+evaluating (`2 * K`, a call, a `mut`, a parameter) is refused, and the
+message says why: lengths are known before the program is typed, and `const`
+evaluation runs after.
 
 A tuple type's slots may carry **labels** (B569): `(x: f64, y: f64)`.
 `MEMBER ":"` at a slot's head is a label (decided at the second token, so

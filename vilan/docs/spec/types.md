@@ -47,9 +47,10 @@ The type forms (grammar §3.9) denote:
   Internal; not written in source.
 - **Fixed arrays**: `[T; n]`, `n` values of `T` with the length part of
   the type, so `[i32; 3]` and `[i32; 4]` are distinct and neither resizes.
-  A length is a TYPE-LEVEL NUMBER: a literal, or a length parameter (§5.6)
-  that each instance binds to one, and two lengths are the same exactly
-  when the numbers are. An array is a value aggregate (copied on
+  A length is a TYPE-LEVEL NUMBER: a literal, a name bound to one
+  (`const let SIZE = 4;` makes `[u8; SIZE]` a `[u8; 4]`), or a length
+  parameter (§5.6) that each instance binds to one; two lengths are the
+  same exactly when the numbers are, and diagnostics print the number. An array is a value aggregate (copied on
   assignment), iterates at `T` (`for x in arr`), indexes like a `List`
   (a literal index the length proves out of range is a compile error), and
   `arr.len()` is a `usize` folded from the type. It is an impl subject like

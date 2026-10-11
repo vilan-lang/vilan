@@ -54,7 +54,7 @@ row	flagship	key
 17	-	view binding '{name}' cannot be `mut`: a view cannot be rebo
 18	-	'{name}' is annotated as a value but its initializer is a v
 19	-	a `{kind}` parameter takes a view; pass `{kind} <place>` (th
-20	-	an array length must be a non-negative integer literal 
+20	-	an array length is a number, a length parameter (`<const N>`), or a name bound to a number (`const let SIZE = 4;`); this one needs evaluating, and const evaluation runs after the program is typed
 21	-	the `?` lifts this condition to an `Option`/`Result`, which 
 22	-	`const x = …` is not a declaration: a compile-time binding is `const let x = …`
 23	-	a triple-quoted string spans lines: the opening """ must be
@@ -732,12 +732,21 @@ row	flagship	key
 708	-	index {literal_index} is out of range: the array is empty (its type is `[_; 0]`), so it has no valid index
 NEW	-	a destructuring needs the array's length, and this array's is the length parameter `{length}`; index it (`values[0]`) or walk it with `for`
 NEW	-	{written} introduces a length parameter, and only an `impl` subject introduces one this way (`impl [type T; _]`, `impl [type T; const N]`); write the length here as a number
-NEW	-	`{name}` is not a length; an array length is a number or a length parameter (`impl [type T; const N]`)
+NEW	-	`{name}` is not a length; an array length is a number, a length parameter (`<const N>`), or a name bound to a number
 NEW	-	`{name}` is a length, not a type; it may stand only where an array's length does (`[T; {name}]`)
-NEW	-	cannot find the length '{name}'; an array length is a number or a length parameter (`impl [type T; const N]`)
+NEW	-	cannot find the length '{name}'; an array length is a number, a length parameter (`<const N>`), or a name bound to a number
 NEW	-	`{name}` is a length parameter: it is fixed per instance, not at this site, so a `const` expression cannot read it
 NEW	-	internal: this array length did not resolve to a number in the instance being emitted; please report this program
 NEW	-	this position is a length parameter, so its binder is `const {binder_name}`, not `type {binder_name}`
 NEW	-	`{parameter_name}` is a length parameter: give it a number (`<4>`) or another length parameter, not the type `{rendered}`
 NEW	-	`{rendered}` is a length, and `{parameter_name}` takes a type
 NEW	-	cannot infer the length '{generic_label}' for this call: {why}. Write it — on the binding the result lands in (`let value: [_; 4] = …`), as the call's argument (`{member}<4>(…)`), or ascribe the call
+NEW	-	`{whole}` is too large for an array length
+NEW	-	an array length is a count: write it as a whole number, unsuffixed or `usize` (`3`, `3usize`), not `{whole}{fraction}{suffix}`
+NEW	-	`{current_name}` is a parameter, a value known only when the function runs; an array length is a number, a length parameter (`<const N>`), or a name bound to a number
+NEW	-	`{current_name}` is not a length; an array length is a number, a length parameter (`<const N>`), or a name bound to a number
+NEW	-	`{current_name}` is `mut`, so its value can change; a length is fixed — bind it with `let` or `const let` to a number
+NEW	-	`{name}`'s length refers back to itself
+NEW	-	`{current_name}` has no value to be a length
+NEW	-	`{current_name}` is `{whole}{fraction}{suffix}`, and an array length is a count: bind it to a whole number, unsuffixed or `usize`
+NEW	-	an array length is a number, a length parameter (`<const N>`), or a name bound to a number; `{current_name}`'s initializer needs evaluating, and const evaluation runs after the program is typed — bind it to a literal (`const let` keeps it compile-time)

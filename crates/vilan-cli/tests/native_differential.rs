@@ -12722,6 +12722,25 @@ fn array_lengths_s5_std_array_impls_answer_on_both_backends() {
     );
 }
 
+/// array-lengths.md S4: a named length — a top-level `const let`, a `let`
+/// chained through it, a local `let` — in a type and in a repeat literal,
+/// resolved to its number before the fixpoint, the same on both backends.
+#[test]
+fn array_lengths_s4_named_lengths_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_named_lengths.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_named_lengths.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a named length must answer the same natively"
+    );
+}
+
 /// N158: the four longest legs run under [`legs_in_parallel`], whose two
 /// claims are the serial loop's: answers come back in the ITEMS' order
 /// whatever order the workers finish in, and a leg's panic fails the test

@@ -7936,3 +7936,24 @@ fn b584_an_entry_run_types_a_modules_context_calls() {
         assert_eq!(stdout, "6\n");
     }
 }
+
+/// array-lengths.md S4: a named length crosses an import — `import
+/// pkg::config::SIZE;` names a `const let` another module exports, and the length
+/// resolves to its number before the fixpoint.
+#[test]
+fn s4_a_named_length_crosses_an_import() {
+    let emitted = compile_package(
+        &[
+            ("config.vl", "export const let SIZE = 3;\n"),
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::config::SIZE;\n\nfun main() {\n\tlet values: [i32; SIZE] = [1, 2, 3];\n\tprint(values.len());\n}\n",
+            ),
+        ],
+        "main.vl",
+    );
+    assert!(
+        emitted.is_ok(),
+        "a named length must cross an import: {emitted:?}"
+    );
+}

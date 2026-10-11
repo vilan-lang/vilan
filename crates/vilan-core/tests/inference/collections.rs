@@ -872,7 +872,8 @@ fn e287_a_suffixed_length_other_than_usize_is_refused() {
     for spelled in ["let _a: [i32; 3f64] = [1, 2, 3];", "let _a = [0; 2i8];"] {
         assert_fails_with(
             &format!("fun main() {{\n\t{spelled}\n}}\n"),
-            "an array length must be a non-negative integer literal",
+            // array-lengths S4 rewords the refusal to say what it wants.
+            "an array length is a count: write it as a whole number, unsuffixed or `usize`",
         );
     }
     assert_compiles_and_runs(

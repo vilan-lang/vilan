@@ -903,3 +903,106 @@ fn s5_a_fixed_array_converts_to_a_list_and_iterates() {
         "4\n3\n6\n0\n",
     );
 }
+
+// --- S4: named lengths ----------------------------------------------------------
+
+/// §6: a length may be a NAME bound to a number — a `const let` or a `let`,
+/// local or top-level, chained through another such name — in a type and in
+/// a repeat literal.
+#[test]
+fn s4_a_length_may_be_a_name_bound_to_a_number() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        const let SIZE = 4;
+        let ROW = SIZE;
+        fun main() {
+            let header: [u8; SIZE] = [0u8; SIZE];
+            print(header.len());
+            let width = 3usize;
+            let row: [i32; width] = [1, 2, 3];
+            print(row.len());
+            let chained: [bool; ROW] = [true; ROW];
+            print(chained.len());
+            print(header == [0, 0, 0, 0]);
+        }
+        "#,
+        "4\n3\n4\ntrue\n",
+    );
+}
+
+/// §6's refusals, each with its reason: a `mut`, a parameter, an initializer
+/// that needs evaluating, and a cycle; and §5.6's literal rule.
+#[test]
+fn s4_a_name_that_is_not_a_literal_length_is_refused_with_why() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut size = 3;
+            let _values: [i32; size] = [1, 2, 3];
+        }
+        "#,
+        "`size` is `mut`, so its value can change",
+    );
+    assert_fails_with(
+        r#"
+        fun make(size: usize): usize {
+            let values = [0; size];
+            values.len()
+        }
+        fun main() {}
+        "#,
+        "`size` is a parameter, a value known only when the function runs",
+    );
+    assert_fails_with(
+        r#"
+        const let K = 2;
+        const let SIZE = 2 * K;
+        fun main() {
+            let _values: [i32; SIZE] = [1, 2, 3, 4];
+        }
+        "#,
+        "`SIZE`'s initializer needs evaluating",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _values: [i32; 3u8] = [1, 2, 3];
+        }
+        "#,
+        "an array length is a count: write it as a whole number, unsuffixed or `usize`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _values = [0; 2.5];
+        }
+        "#,
+        "not `2.5`",
+    );
+}
+
+/// E?1's cascades are gone: a refused length says one thing, and an empty
+/// array's out-of-range index says it is empty.
+#[test]
+fn s4_a_refused_length_reports_once_and_an_empty_array_says_so() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let n = 3 + 1;
+            let values = [0; n];
+            print(values[0]);
+        }
+        "#,
+        "`n`'s initializer needs evaluating",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let empty: [i32; 0] = [];
+            print(empty[0]);
+        }
+        "#,
+        "index 0 is out of range: the array is empty",
+    );
+}
