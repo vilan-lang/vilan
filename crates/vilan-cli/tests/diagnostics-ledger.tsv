@@ -727,3 +727,5 @@ row	flagship	key
 703	-	`auto` marks a type annotation, not a value (expected an expression here)
 704	-	{covered} is inferred, and this package asks for its `auto` (`[check] auto = "{setting}"`){fix}
 705	-	{message} — `{callee} < {inner} > {arguments}` is read as the generic call `{callee}<{inner}>{arguments}`; if you meant two comparisons, parenthesize: `({callee} < {inner}) > {arguments}`
+NEW	-	cannot infer the type of this value: it is `{written}`, and nothing the program does with it settles the `…` that `{member}` is instantiated at. Bind it with its type (`let value: {written} = …;`)
+NEW	-	cannot infer the element type of this empty list: nothing the program does with it settles it, and `{member}` is instantiated at it. Bind it with its type (`let values: {written} = [];`)

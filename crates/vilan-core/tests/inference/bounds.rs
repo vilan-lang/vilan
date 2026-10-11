@@ -11832,6 +11832,122 @@ fn b599_a_second_use_that_disagrees_is_refused_at_it() {
     );
 }
 
+// --- B600: a hole no binding holds is refused at the call it instantiates ---
+
+/// The item's repro: `Option::None.is_some()` checked clean and ran on JS
+/// while the native build refused `is_some`'s instance at the hole.
+#[test]
+fn b600_a_receiver_hole_no_binding_holds_is_refused_at_it() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option;
+
+        fun main() {
+            let present = Option::None.is_some();
+            print(present);
+        }
+        "#,
+        "cannot infer the type of this value: it is `Option<…>`, and nothing the program does \
+         with it settles the `…` that `is_some` is instantiated at",
+    );
+    // An annotation on a result that cannot carry the hole (`bool`) settles
+    // nothing.
+    assert_fails_once_with(
+        r#"
+        import std::option::Option;
+
+        fun main() {
+            let _present: bool = Option::None.is_some();
+        }
+        "#,
+        "that `is_some` is instantiated at",
+    );
+}
+
+/// The argument channel and an empty list, each reported at its operand,
+/// once, under an `any` parameter (`print`) that directs nothing.
+#[test]
+fn b600_an_argument_hole_and_an_empty_list_are_refused_at_their_operands() {
+    let failures = failure_diagnostics(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun has<T>(value: Option<T>): bool {
+            value.is_some()
+        }
+
+        fun main() {
+            print(has(None));
+            print([].len());
+        }
+        "#,
+    );
+    let messages: Vec<&str> = failures
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert!(
+        messages[0].contains("that `has` is instantiated at"),
+        "{messages:#?}"
+    );
+    assert!(
+        messages[1].starts_with("cannot infer the element type of this empty list"),
+        "{messages:#?}"
+    );
+}
+
+/// B600's boundary: a hole a position directs (an annotated `let`, a
+/// parameter, a field) or a use fills (B599) is no hole, and a binding's hole
+/// stays B580's single refusal at its initializer.
+#[test]
+fn b600_a_directed_or_filled_value_and_a_bindings_hole_are_not_refused_here() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell };
+
+        struct Holder { cell: SignalCell<Option<str>> }
+
+        fun has(value: Option<i32>): bool {
+            value.is_some()
+        }
+
+        fun main() {
+            let annotated: SignalCell<Option<i32>> = Signal::new(None);
+            let traited: Signal<List<str>> = Signal::new([]);
+            let holder = Holder { cell = Signal::new(None) };
+            print(has(None));
+            print(None.unwrap_or("d"));
+            print(annotated.get().is_some());
+            print(traited.get().len());
+            print(holder.cell.get().is_some());
+        }
+        "#,
+        "false\nd\nfalse\n0\nfalse\n",
+    );
+    let failures = failure_diagnostics(
+        r#"
+        import std::option::Option::{ self, None, Some };
+
+        fun main() {
+            let nothing = None;
+            let _present = nothing.is_some();
+        }
+        "#,
+    );
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0]
+            .0
+            .starts_with("cannot infer the type of `nothing`"),
+        "{failures:#?}"
+    );
+}
+
 /// `any` tells a hole nothing (B227): a binding whose only use is an `any`
 /// parameter keeps B580's refusal.
 #[test]

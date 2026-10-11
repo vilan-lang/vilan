@@ -9488,8 +9488,11 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// was drawn over the entry's `import` line. A library body's refusal is now
 /// anchored at the user's call that instantiated it, naming the body and its
 /// file; a user module's is drawn in that module. (F108's solver half grounds
-/// `push_many([])` now, so the library-body probe is an `Option::None` whose
-/// payload nothing states, instantiating `is_some`'s body open.)
+/// `push_many([])`, and B600 refuses the `Option::None.is_some()` that
+/// replaced it at `vilan check` — "cannot infer the type of this value" at the
+/// user's call — so the library-body probe now proves that the refusal comes
+/// from the CHECK, at the call, before any body is instantiated; the
+/// in-body note has no reachable std probe left, filed with B600's report.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
@@ -9514,8 +9517,9 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         "the refusal is drawn at the user's call:\n{stderr}"
     );
     assert!(
-        stderr.contains("The construct is in `is_some`'s body (`option.vl`)"),
-        "the refusal names the body and its file:\n{stderr}"
+        stderr.contains("cannot infer the type of this value: it is `Option<…>`")
+            && stderr.contains("that `is_some` is instantiated at"),
+        "B600 refuses the open instance at the check, naming the callee:\n{stderr}"
     );
     let module = staged.join("native_probe_f108_module");
     std::fs::create_dir_all(&module).expect("make the package");

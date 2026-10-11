@@ -5074,6 +5074,9 @@ pub struct Analyzer<'src> {
     /// Minted per inference, `Cell::new(None)` answered a fresh hole each time
     /// it was asked, and its binding's slot was not the one a later use filled.
     variant_use_holes: HashMap<Id, Vec<TypeId>>,
+    /// B600: `(call, operand, the operand's type)` for each operand a call
+    /// resolved over while its type held a hole ([`Self::record_hole_operand`]).
+    hole_operands: Vec<(Id, Id, TypeId)>,
     /// B554: the argument whose `push`/`run` FILLED each element slot — the
     /// first use in walk order — so a later use that contradicts it can tell
     /// whether the two sit in different files (where walk order is the
@@ -7794,6 +7797,7 @@ impl<'src> Analyzer<'src> {
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
             variant_use_holes: HashMap::default(),
+            hole_operands: Vec::new(),
             slot_fill_sites: HashMap::default(),
             lenient_subscript_indexes: Vec::new(),
             pinned_diagnostic_anchors: Vec::new(),
@@ -54280,6 +54284,9 @@ impl<'src> Analyzer<'src> {
                     // B599: the arguments whose types hold a hole, filled once
                     // every argument has bound what it binds.
                     let mut holed_arguments: Vec<(Id, Type, Type)> = Vec::new();
+                    // B600: the other arguments, for a callee generic the call
+                    // leaves open that an argument was typed in.
+                    let mut typed_arguments: Vec<Id> = Vec::new();
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
@@ -54440,6 +54447,8 @@ impl<'src> Analyzer<'src> {
                                         argument_type.clone(),
                                         parameter_type.clone(),
                                     ));
+                                } else {
+                                    typed_arguments.push(argument_id);
                                 }
                             }
                             None => {
@@ -54517,6 +54526,7 @@ impl<'src> Analyzer<'src> {
                             _ => declared,
                         };
                         self.fill_holes_from_use(&argument_type, &stating, argument_id);
+                        self.record_hole_operand(call_id, argument_id, &argument_type);
                     }
                     self.wire_call(
                         call_id,
@@ -54533,6 +54543,48 @@ impl<'src> Analyzer<'src> {
                         argument_ids,
                         &mut substitution_context,
                     );
+                    // B600: an argument typed in a callee generic this call
+                    // never binds (`has(None)` against `value: Option<T>` is
+                    // `Option<T>`, `T` bound to nothing) holds the hole the
+                    // instance is made at; recorded as that hole.
+                    let bindable = self.callee_bindable_generics(target_id);
+                    let open: Vec<TypeId> = bindable
+                        .iter()
+                        .copied()
+                        .filter(|generic| match substitution_context.get(generic) {
+                            None => true,
+                            Some(bound) => self.binds_to_itself(*generic, *bound),
+                        })
+                        // A recursive call's own binder is a type in its body.
+                        .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+                        .collect();
+                    if !open.is_empty() && !typed_arguments.is_empty() {
+                        for argument_id in typed_arguments {
+                            if matches!(
+                                self.expr_id_to_expr_map.get(&argument_id),
+                                Some(Expr::Closure(_) | Expr::Async(_))
+                            ) {
+                                continue;
+                            }
+                            let argument_type =
+                                self.infer_type(argument_id, &Type::Unknown, &HashMap::default());
+                            if self.type_value_has_hole(&argument_type) {
+                                self.record_hole_operand(call_id, argument_id, &argument_type);
+                                continue;
+                            }
+                            let mut mentioned = Vec::new();
+                            self.collect_generics(&argument_type, 0, &mut mentioned);
+                            if !mentioned.iter().any(|generic| open.contains(generic)) {
+                                continue;
+                            }
+                            let holes: SubstitutionContext = open
+                                .iter()
+                                .map(|generic| (*generic, Type::Unknown.get_type_id(self)))
+                                .collect();
+                            let holed = self.substitute_type(&argument_type, &holes);
+                            self.record_hole_operand(call_id, argument_id, &holed);
+                        }
+                    }
                     // Keep the callee's own-generic bindings as ordered values
                     // too — a bound static (`T::rebuild(source)`) re-targets a
                     // concrete impl's method at emission, whose generic IDS
@@ -54564,7 +54616,6 @@ impl<'src> Analyzer<'src> {
                     // alone split `through`'s instance from the identical one the
                     // outer call emitted. Working context keeps it; the record
                     // does not.
-                    let bindable = self.callee_bindable_generics(target_id);
                     substitution_context
                         .retain(|constraint_id, _| bindable.contains(constraint_id));
                     if !substitution_context.is_empty() {
@@ -55721,6 +55772,7 @@ impl<'src> Analyzer<'src> {
                     let stated = self.substitute_type(&self_type, &substitution);
                     self.fill_holes_from_use(&subject_type, &stated, subject_id);
                 }
+                self.record_hole_operand(id, subject_id, &subject_type);
                 if !substitution.is_empty() {
                     self.method_call_substitution.insert(id, substitution);
                 }
@@ -56333,6 +56385,7 @@ impl<'src> Analyzer<'src> {
                 // (the receiver's holes are filled at the call's resolution,
                 // where its bindings are decided).
                 self.fill_holes_from_use(&argument_type, &parameter_type, argument_id);
+                self.record_hole_operand(call_id, argument_id, &argument_type);
             } else {
                 let msg = self.type_mismatch_message(
                     &parameter_type,
@@ -69553,9 +69606,257 @@ impl<'src> Analyzer<'src> {
                     variable_id,
                 );
             }
+            self.refuse_expression_holes();
         }
 
         // Clear processed constraints
+    }
+
+    /// B600: B580's refusal for a hole NO binding holds — `Option::None.
+    /// is_some()`, `has(None)` over `fun has<T>(value: Option<T>)`, `[].len()`.
+    /// The call instantiates its callee at the hole: JS ran it (the hole has
+    /// no runtime shape), the native backend refused the build ("does not
+    /// emit a value of an unbound generic type parameter"), and `vilan check`
+    /// said nothing. Asked of every call whose recorded bindings still hold a
+    /// hole once inference is done, at the operand (the receiver first) that
+    /// carries it; an operand that is a BINDING is B580's to report, at its
+    /// initializer. User files only, and only as the lone signal (the caller
+    /// runs it under B580's cascade guard).
+    fn refuse_expression_holes(&mut self) {
+        let mut operands = std::mem::take(&mut self.hole_operands);
+        if operands.is_empty() {
+            return;
+        }
+        // The receiver is recorded before the arguments, so a stable sort
+        // keeps it first within its call. The cheap questions first — is the
+        // hole still open, does the callee leave a generic open — so the
+        // maps below are built only for a program with a candidate.
+        operands.retain(|(call_id, _, holder_type_id)| {
+            self.type_has_hole(*holder_type_id) && self.call_leaves_a_generic_open(*call_id)
+        });
+        if operands.is_empty() {
+            return;
+        }
+        operands.sort_by_key(|(call_id, ..)| call_id.0);
+        // A call (or an operand) its position directs — an annotated `let`,
+        // a field, a parameter — was typed at the direction; `any` directs
+        // nothing.
+        let call_entities: HashMap<Id, Id> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(entity, expr)| match expr {
+                Expr::Call(call_id) => Some((*call_id, *entity)),
+                _ => None,
+            })
+            .collect();
+        // The value positions an annotation or a declared return directs —
+        // the initializer or the body's tail, and through a block's tail and
+        // an `if`'s arms the values that land there (B489/B539 read a
+        // bare-trait direction there, which no `expected_types` entry holds).
+        let mut directed_roots: Vec<Id> = self
+            .variables
+            .values()
+            .filter(|variable| variable.annotated)
+            .filter_map(|variable| variable.initial)
+            .collect();
+        directed_roots.extend(
+            self.functions
+                .values()
+                .filter(|function| function.return_type_id.is_some())
+                .map(|function| function.body.1),
+        );
+        // A bare-trait return (B460) keeps no declared type; its tails are
+        // B489's.
+        directed_roots.extend(self.opaque_return_tails.keys().copied());
+        // A struct literal's field values are directed by the field's
+        // declared type; a generic struct's open parameter is the binding's
+        // to report (B580), where the literal lands.
+        directed_roots.extend(
+            self.expr_id_to_expr_map
+                .values()
+                .flat_map(|expr| match expr {
+                    Expr::StructInitializer(_, fields) => {
+                        fields.values().copied().collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                }),
+        );
+        let mut directed_positions: HashSet<Id> = HashSet::default();
+        while let Some(position) = directed_roots.pop() {
+            if !directed_positions.insert(position) {
+                continue;
+            }
+            match self.expr_id_to_expr_map.get(&position) {
+                Some(Expr::Block((_, tail_id))) => directed_roots.push(*tail_id),
+                Some(Expr::If(branch)) => {
+                    let mut next = Some(branch);
+                    while let Some(branch) = next {
+                        match branch {
+                            ExprIfBranch::If(_, (_, trailing), rest) => {
+                                directed_roots.push(*trailing);
+                                next = rest.as_deref();
+                            }
+                            ExprIfBranch::Else((_, trailing)) => {
+                                directed_roots.push(*trailing);
+                                next = None;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let directed = |analyzer: &Self, id: Id| {
+            directed_positions.contains(&id)
+                || analyzer.expected_types.get(&id).is_some_and(|expected| {
+                    !matches!(expected.borrow_type(analyzer), Type::Any)
+                        && !analyzer.type_has_hole(*expected)
+                })
+        };
+        let mut reported_calls: HashSet<Id> = HashSet::default();
+        let mut reported_operands: HashSet<Id> = HashSet::default();
+        for (call_id, holder_id, holder_type_id) in operands {
+            if reported_calls.contains(&call_id) || !self.type_has_hole(holder_type_id) {
+                continue;
+            }
+            let Some(source) = self.source_of_id(call_id) else {
+                continue;
+            };
+            if source == DERIVED_SOURCE
+                || self.std_sources.contains(&source)
+                || self.frozen_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+                || self.derived_origin_file(call_id).is_some()
+                || directed(self, holder_id)
+                || (call_entities
+                    .get(&call_id)
+                    .is_some_and(|entity| directed(self, *entity))
+                    && self.call_result_carries_an_open_generic(call_id))
+            {
+                continue;
+            }
+            // A binding's hole is B580's (at its initializer); a closure's
+            // unannotated parameter is B131's.
+            if matches!(self.expr_id_to_expr_map.get(&holder_id), Some(Expr::Local(target))
+                if self.variables.contains_key(target) || self.parameters.contains_key(target))
+            {
+                continue;
+            }
+            let Some(function_call) = self.function_calls.get(&call_id) else {
+                continue;
+            };
+            let Some(Expr::Local(member_id)) = self
+                .expr_id_to_expr_map
+                .get(&function_call.subject_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if !reported_operands.insert(holder_id) {
+                continue;
+            }
+            reported_calls.insert(call_id);
+            let member = self.callable_name(member_id).unwrap_or("this call");
+            let holder_type = holder_type_id.get_type(self);
+            let written = self
+                .pretty_print_type(&holder_type, &HashMap::default())
+                .replace("unknown", "…");
+            let empty_list = matches!(
+                self.expr_id_to_expr_map.get(&holder_id),
+                Some(Expr::List(elements)) if elements.is_empty()
+            );
+            let msg = match empty_list {
+                true => format!(
+                    "cannot infer the element type of this empty list: nothing the program does \
+                     with it settles it, and `{member}` is instantiated at it. Bind it with its \
+                     type (`let values: {written} = [];`)"
+                ),
+                false => format!(
+                    "cannot infer the type of this value: it is `{written}`, and nothing the \
+                     program does with it settles the `…` that `{member}` is instantiated at. \
+                     Bind it with its type (`let value: {written} = …;`)"
+                ),
+            };
+            let span = **self
+                .span_map
+                .get(&holder_id)
+                .or_else(|| self.span_map.get(&call_id))
+                .unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg,
+                },
+                call_id,
+            );
+        }
+    }
+
+    /// B600: whether a call's callee has a generic its recorded bindings
+    /// leave OPEN — missing, bound to itself, or bound to a hole — which is
+    /// what makes an operand's hole the instance's.
+    fn call_leaves_a_generic_open(&self, call_id: Id) -> bool {
+        let Some(Expr::Local(member_id)) = self
+            .function_calls
+            .get(&call_id)
+            .and_then(|function_call| self.expr_id_to_expr_map.get(&function_call.subject_id))
+        else {
+            return false;
+        };
+        let substitution = self.method_call_substitution.get(&call_id);
+        self.callee_bindable_generics(*member_id)
+            .iter()
+            .any(|generic| {
+                !self.generic_is_enclosing_binder(*generic, call_id)
+                    && match substitution.and_then(|substitution| substitution.get(generic)) {
+                        None => true,
+                        Some(bound) => {
+                            self.binds_to_itself(*generic, *bound) || self.type_has_hole(*bound)
+                        }
+                    }
+            })
+    }
+
+    /// B600: whether a call's RESULT can carry its open generic — its declared
+    /// return mentions one (`Signal::new(None)`'s `SignalCell<T>`), or its
+    /// return is inferred — so a direction on the call can settle it. A call
+    /// whose result cannot (`None.is_some()` is a `bool`) is not settled by
+    /// any annotation on its result.
+    fn call_result_carries_an_open_generic(&self, call_id: Id) -> bool {
+        let Some(return_type_id) = self.call_declared_return_type_id(call_id) else {
+            return true;
+        };
+        let mut mentioned = Vec::new();
+        self.collect_generics(return_type_id.borrow_type(self), 0, &mut mentioned);
+        !mentioned.is_empty()
+    }
+
+    /// B600: an operand a call resolved over whose type still held a hole
+    /// after the call's fills (B599) — the receiver, then each argument —
+    /// for [`Self::refuse_expression_holes`] to ask again once inference is
+    /// done. Only a type that holds a hole is recorded.
+    fn record_hole_operand(&mut self, call_id: Id, operand_id: Id, operand_type: &Type) {
+        if matches!(
+            operand_type,
+            Type::Closure(..) | Type::Unknown | Type::Unresolved | Type::Any
+        ) || !self.type_value_has_hole(operand_type)
+        {
+            return;
+        }
+        // Only a user file's call is ever refused; std's (and a frozen or a
+        // dependency file's) are not recorded at all.
+        match self.source_of_id(call_id) {
+            Some(source)
+                if source != DERIVED_SOURCE
+                    && !self.std_sources.contains(&source)
+                    && !self.frozen_sources.contains(&source)
+                    && !self.dependency_sources.contains(&source) => {}
+            _ => return,
+        }
+        let type_id = operand_type.clone().get_type_id(self);
+        self.hole_operands.push((call_id, operand_id, type_id));
     }
 
     /// Pretty-prints a type for diagnostics, resolving generic names
