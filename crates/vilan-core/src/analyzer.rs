@@ -36831,6 +36831,16 @@ impl<'src> Analyzer<'src> {
     /// one site as constraints settle, and a refusal pushed on every pass
     /// would tell the reader the same thing a dozen times.
     fn refuse_dyn_narrowing(&mut self, expr_id: Id, constraint: &Type, inferred: &Type) {
+        // B601: a reference (`let square: Square = shape`) is typed by typing
+        // what it names under the same constraint, so the BINDING's entity
+        // met this seam too and the one mistake was refused twice at one
+        // span. The reference is the site (B5: one diagnostic per mistake).
+        if matches!(
+            self.expr_id_to_expr_map.get(&expr_id),
+            Some(Expr::Variable(_))
+        ) {
+            return;
+        }
         if !self.dyn_refusals_reported.insert(expr_id) {
             return;
         }
@@ -36839,16 +36849,17 @@ impl<'src> Analyzer<'src> {
         };
         let object = self.pretty_print_type(inferred, &HashMap::default());
         let expected = self.pretty_print_type(constraint, &HashMap::default());
+        let msg = format!(
+            "Expected {expected}, but got {object} instead: an object does not narrow back \
+             to the type it erased. `dyn` is where the concrete type went — the program \
+             cannot ask for it again — so a value that must stay a {expected} is held as \
+             one, or taken through a generic bound"
+        );
         self.diagnostics.push(Error {
             trace: Vec::new(),
             note: None,
             span,
-            msg: format!(
-                "Expected {expected}, but got {object} instead: an object does not narrow back \
-                 to the type it erased. `dyn` is where the concrete type went — the program \
-                 cannot ask for it again — so a value that must stay a {expected} is held as \
-                 one, or taken through a generic bound"
-            ),
+            msg,
         });
     }
 

@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**B601: a `dyn` value at an annotated `let` of its concrete type (`let square: Square = shape;`, and the ascription `shape as Square`) is refused ONCE with the narrowing message, where it was refused twice at one span.** A reference is typed by typing the binding it names under the same constraint, so the binding's entity met the narrowing seam as well as the reference; the readiness probe and the directed ask were not the cause (the item's guess). The reference is the site, so the binding's entity no longer reports (B5: one diagnostic per mistake). Pin: `dyn_objects::b601_a_narrowing_at_an_annotated_let_or_an_ascription_is_refused_once`.
+
+---
+
+<!-- family: diagnostics -->
 **B600: a hole NO binding holds is refused at the call it instantiates — `Option::None.is_some()`, `has(None)` over `fun has<T>(value: Option<T>)` and `[].len()` checked clean and ran on JS, while the native build refused the instance ("does not emit a value of an unbound generic type parameter"); now "cannot infer the type of this value: it is `Option<…>`, and nothing the program does with it settles the `…` that `is_some` is instantiated at. Bind it with its type (`let value: Option<…> = …;`)" (an empty list: "cannot infer the element type of this empty list …").** B580 refused the hole only where a `let` held it. The check runs with B580's (once inference is done, as the lone signal, user files only): a call whose callee has a generic its bindings leave open — missing, bound to itself, or to a hole — is refused at the first operand (the receiver first) whose type holds one. A call or an operand its position directs (an annotated `let`, a field, a parameter; an `any` parameter directs nothing) is not, nor a hole a use fills (B599), and an operand that is a binding stays B580's one refusal at its initializer. Estate: kolt 0, the website 0, the examples 0. Ledger: two rows (NEW). Pins: `bounds::b600_*` (3).
 
 ---
