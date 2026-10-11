@@ -806,13 +806,15 @@ pub enum Expr<'src> {
     Is(Id, ExprPattern),
     List(Vec<Id>),
     // `[value; n]` — a fixed-length array literal: the value expr and the
-    // compile-time length `n` (an integer literal in v1). `value` copied per slot.
-    Repeat(Id, usize),
-    // `arr.len()` on a `[T; n]` subject — the subject and the compile-time
-    // length `n` read off its type. There is no member to dispatch to (`[T; n]`
-    // is structural); a pure subject folds to the literal, a side-effectful one
-    // still evaluates (fixed-arrays.md §10).
-    ArrayLen(Id, usize),
+    // LENGTH's type id (a `Type::Length`, or a length parameter the instance
+    // substitutes — array-lengths.md §5.3). `value` copied per slot.
+    Repeat(Id, TypeId),
+    // `arr.len()` on a `[T; n]` subject — the subject and the length's type id
+    // read off its type. There is no member to dispatch to (`[T; n]` is
+    // structural); a pure subject folds to the number, a side-effectful one
+    // still evaluates (fixed-arrays.md §10), and a length parameter folds per
+    // instance.
+    ArrayLen(Id, TypeId),
     Local(Id),
     // A match expression: the subject and the resolved legs.
     Match(Id, Vec<ExprMatchLeg>),
@@ -8488,7 +8490,7 @@ impl<'src> Analyzer<'src> {
             }
             (Type::Tuple(lefts, _), Type::Tuple(rights, _)) => all(&lefts, &rights),
             (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
-                left_length == right_length
+                self.array_lengths_agree(left_length, right_length)
                     && self.same_type_structure(left_element, right_element, depth + 1)
             }
             (
@@ -11796,7 +11798,7 @@ impl<'src> Analyzer<'src> {
                 self.same_impl_types(left_items, right_items, comparing)
             }
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                left_length == right_length
+                self.array_lengths_agree(*left_length, *right_length)
                     && self.same_impl_type(*left_item, *right_item, comparing)
             }
             // B309: the `context` clause is deliberately NOT compared. Impl
@@ -12628,10 +12630,11 @@ impl<'src> Analyzer<'src> {
                 )
             }
             Type::Array(element_id, length) => {
+                let length = self.substitute_length(*length, context);
                 let element = element_id.get_type(self);
                 let substituted =
                     self.substitute_member_type(&element, self_trait, subject, context);
-                Type::Array(substituted.get_type_id(self), *length)
+                Type::Array(substituted.get_type_id(self), length)
             }
             Type::Closure(parameter_ids, return_type_id, contexts, modes) => {
                 let parameter_ids = parameter_ids.clone();
@@ -12855,6 +12858,7 @@ impl<'src> Analyzer<'src> {
                 | Type::Closure(..)
                 | Type::Function(_)
                 | Type::Module(_)
+                | Type::Length(_)
                 | Type::Mapped(_, _, _) => Members::Answer(false, true),
                 // A trait default body's `Self` (B463): a resource iff THIS
                 // instantiation says so, exactly as a `Generic` above — R11
@@ -12994,14 +12998,17 @@ impl<'src> Analyzer<'src> {
                     .all(|parameter| self.substitution_fixed(*parameter))
                     && self.substitution_fixed(*return_type)
             }
-            Type::Array(element, _) => self.substitution_fixed(*element),
+            Type::Array(element, length) => {
+                self.substitution_fixed(*element) && self.substitution_fixed(*length)
+            }
             Type::Any
             | Type::Never
             | Type::Void
             | Type::Unknown
             | Type::Unresolved
             | Type::Function(_)
-            | Type::Module(_) => true,
+            | Type::Module(_)
+            | Type::Length(_) => true,
         }
     }
 
@@ -13297,6 +13304,7 @@ impl<'src> Analyzer<'src> {
             | Type::Closure(..)
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Trait(_, _)
             | Type::Generic(_)
             | Type::Mapped(_, _, _) => (false, true),
@@ -13422,8 +13430,11 @@ impl<'src> Analyzer<'src> {
             Type::Array(element, length) => {
                 buf.push('[');
                 self.render_type_canonical(element, depth + 1, visiting, buf);
-                buf.push_str(&format!("; {length}]"));
+                buf.push_str("; ");
+                self.render_type_canonical(length, depth + 1, visiting, buf);
+                buf.push(']');
             }
+            Type::Length(length) => buf.push_str(&length.to_string()),
             // B309: the clause is not rendered into the CANONICAL key — the
             // key is a structural identity (same shape = same entry), and the
             // clause is a discipline over the shape.
@@ -14908,7 +14919,8 @@ impl<'src> Analyzer<'src> {
             | Type::Unknown
             | Type::Unresolved
             | Type::Function(_)
-            | Type::Module(_) => false,
+            | Type::Module(_)
+            | Type::Length(_) => false,
         }
     }
 
@@ -16765,6 +16777,10 @@ impl<'src> Analyzer<'src> {
             }
             Type::Array(element, length) => {
                 let mut fields = Vec::new();
+                // Glue is built per concrete instantiation, so the length is a
+                // number here; a length parameter (which no instance carries)
+                // has no slots to name.
+                let length = self.type_id_to_type_map.array_length(length).unwrap_or(0);
                 if self.type_is_resource(element) {
                     for index in 0..length {
                         fields.push((index, element));
@@ -22594,7 +22610,8 @@ impl<'src> Analyzer<'src> {
                 self.impl_subject_arguments_match(&left_items, &right_items)
             }
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                left_length == right_length && self.impl_subject_matches(left_item, right_item)
+                self.array_lengths_agree(left_length, right_length)
+                    && self.impl_subject_matches(left_item, right_item)
             }
             (left, right) => left == right,
         }
@@ -23360,7 +23377,8 @@ impl<'src> Analyzer<'src> {
                         .all(|(left, right)| self.bound_argument_agrees(*left, *right, depth + 1))
             }
             (Type::Array(left, left_length), Type::Array(right, right_length)) => {
-                left_length == right_length && self.bound_argument_agrees(*left, *right, depth + 1)
+                self.array_lengths_agree(*left_length, *right_length)
+                    && self.bound_argument_agrees(*left, *right, depth + 1)
             }
             _ => provided == required,
         }
@@ -36669,7 +36687,7 @@ impl<'src> Analyzer<'src> {
                 })
             }
             (Type::Array(wanted, wanted_length), Type::Array(got, got_length))
-                if wanted_length == got_length =>
+                if self.array_lengths_agree(*wanted_length, *got_length) =>
             {
                 let got = got.get_type(self);
                 self.annotation_admits(*wanted, &got, depth + 1)
@@ -37180,6 +37198,7 @@ impl<'src> Analyzer<'src> {
             | Type::Void
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Unknown
             | Type::Unresolved => false,
         }
@@ -38303,6 +38322,52 @@ impl<'src> Analyzer<'src> {
         0
     }
 
+    /// The type id of an array LENGTH as written in a `[T; n]` type or a
+    /// `[value; n]` literal: a `Type::Length` minted for the literal
+    /// (array-lengths.md §3, R2).
+    fn walk_array_length(&mut self, node: &Spanned<Node<'src>>, _scope_id: Id) -> TypeId {
+        let length = self.array_length_literal(node);
+        self.length_type_id(length)
+    }
+
+    /// A fresh id holding the length `length`. Lengths are minted like every
+    /// other type (never interned, see `type_id_for_type`); the derived
+    /// equality of `Type::Length` is what makes two of them the same length.
+    fn length_type_id(&mut self, length: usize) -> TypeId {
+        self.type_id_for_type(Type::Length(length))
+    }
+
+    /// An array length id through `substitution`: a length parameter the
+    /// substitution binds is what it is bound to, and every other length is
+    /// handed back AS IS — a `Type::Length` never changes under substitution,
+    /// so it is never re-minted (the element's walk mints; the length's does
+    /// not, which keeps a substituted array's ids where they were).
+    fn substitute_length(&self, length: TypeId, substitution: &SubstitutionContext) -> TypeId {
+        let mut current = length;
+        // A chain of length parameters bound to one another is short; the
+        // bound guards a self-binding (`N -> N`) the way `resolve_type_id` does.
+        for _ in 0..8 {
+            let Some(Type::Generic(constraint)) = self.type_id_to_type_map.get(&current) else {
+                return current;
+            };
+            match substitution.get(constraint) {
+                Some(bound) if *bound != current => current = *bound,
+                _ => return current,
+            }
+        }
+        current
+    }
+
+    /// Whether two array length ids are the same length, read without a
+    /// substitution: both numbers, and equal.
+    fn array_lengths_agree(&self, left: TypeId, right: TypeId) -> bool {
+        left == right
+            || matches!(
+                (self.type_id_to_type_map.array_length(left), self.type_id_to_type_map.array_length(right)),
+                (Some(left), Some(right)) if left == right
+            )
+    }
+
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
         list.iter()
             .map(|child| self.walk_expr_node(child, scope_id))
@@ -38819,7 +38884,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::Repeat(value, length_node) => {
                 let value_id = self.walk_expr_node(value, scope_id);
-                let length = self.array_length_literal(length_node);
+                let length = self.walk_array_length(length_node, scope_id);
                 Some(Expr::Repeat(value_id, length))
             }
             Node::ArrayType(..) => {
@@ -42344,6 +42409,21 @@ impl<'src> Analyzer<'src> {
                 let expected = expected_type_id.get_type(self);
                 let element_type_id = match expected {
                     Type::Array(element_id, length) => {
+                        let Some(length) = self.type_id_to_type_map.array_length(length) else {
+                            let length =
+                                self.pretty_print_type(&length.get_type(self), &HashMap::default());
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: *span,
+                                msg: format!(
+                                    "a destructuring needs the array's length, and this \
+                                     array's is the length parameter `{length}`; index it \
+                                     (`values[0]`) or walk it with `for`"
+                                ),
+                            });
+                            return None;
+                        };
                         if length != patterns.len() {
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
@@ -42788,7 +42868,7 @@ impl<'src> Analyzer<'src> {
             // is an integer literal (v1) resolved to a `usize`.
             Node::ArrayType(element, length) => {
                 let element_type_id = self.walk_type_node(element, scope_id);
-                let length = self.array_length_literal(length);
+                let length = self.walk_array_length(length, scope_id);
                 Some(Type::Array(element_type_id, length))
             }
             // A parse-recovery hole (B142's depth stand-in is the one
@@ -43365,7 +43445,12 @@ impl<'src> Analyzer<'src> {
                     .all(|parameter| self.type_is_fully_determined(&parameter.get_type(self)))
                     && self.type_is_fully_determined(&return_id.get_type(self))
             }
-            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+            Type::Any
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void
+            | Type::Length(_) => true,
         }
     }
 
@@ -43963,7 +44048,8 @@ impl<'src> Analyzer<'src> {
             | Type::Mapped(..)
             | Type::Function(_)
             | Type::Module(_)
-            | Type::Void => false,
+            | Type::Void
+            | Type::Length(_) => false,
         }
     }
 
@@ -45667,7 +45753,10 @@ impl<'src> Analyzer<'src> {
                 // is inferred against `T`. (`[a, b, c]` is otherwise a `List`.)
                 if let Type::Array(element_type_id, length) = constraint.as_ref() {
                     let element_type = element_type_id.get_type(self);
-                    if item_ids.len() != *length && self.reported_literal_errors.insert(expr_id) {
+                    if let Some(length) = self.type_id_to_type_map.array_length(*length)
+                        && item_ids.len() != length
+                        && self.reported_literal_errors.insert(expr_id)
+                    {
                         self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -49153,7 +49242,7 @@ impl<'src> Analyzer<'src> {
             // `[i32; 3]` and `[i32; 4]` are distinct. Same length → reconcile the
             // element (binding a generic element like `List<T>` does).
             (Type::Array(l_element, l_length), Type::Array(r_element, r_length))
-                if l_length == r_length =>
+                if self.array_lengths_agree(*l_length, *r_length) =>
             {
                 let l = l_element.get_type(self);
                 let r = r_element.get_type(self);
@@ -49570,7 +49659,7 @@ impl<'src> Analyzer<'src> {
             // too. The LENGTH is part of the type — `[i32; 3]` is not
             // `[i32; 4]` — so it is compared first, by value.
             (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
-                l_length == r_length && {
+                self.array_lengths_agree(*l_length, *r_length) && {
                     let l = l_element.get_type(self);
                     let r = r_element.get_type(self);
                     self.compare_type_rigid(&l, &r, substitution_context, rigid)
@@ -49875,13 +49964,14 @@ impl<'src> Analyzer<'src> {
                     labels,
                 )
             }
-            // `[T; n]` substitutes its element (the length is a constant, carried
-            // through), so a generic `[T; 4]` monomorphizes to `[i32; 4]`.
+            // `[T; n]` substitutes its element and its length, so a generic
+            // `[T; 4]` monomorphizes to `[i32; 4]` and a `[T; N]` at `N = 3`
+            // to `[T; 3]` (array-lengths.md §3: a length binds like a type).
             Type::Array(element_id, length) => {
                 let (element_id, length) = (*element_id, *length);
                 Type::Array(
                     self.substitute_type_id(element_id, substitution_context),
-                    length,
+                    self.substitute_length(length, substitution_context),
                 )
             }
             // A mapped tuple substitutes its source; once that is a concrete tuple
@@ -58047,6 +58137,7 @@ impl<'src> Analyzer<'src> {
             | Type::Never
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Void => false,
         }
     }
@@ -58148,7 +58239,12 @@ impl<'src> Analyzer<'src> {
     fn type_is_ground(&self, type_id: TypeId) -> bool {
         match type_id.get_type(self) {
             Type::Generic(_) | Type::Unknown | Type::Unresolved => false,
-            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+            Type::Any
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void
+            | Type::Length(_) => true,
             Type::Closure(parameter_type_ids, return_type_id, _, _) => {
                 parameter_type_ids
                     .iter()
@@ -63830,6 +63926,7 @@ impl<'src> Analyzer<'src> {
                     _ => None,
                 };
                 if let Some(literal_index) = literal_index
+                    && let Some(length) = self.type_id_to_type_map.array_length(length)
                     && literal_index >= length
                 {
                     self.diagnostics.push(Error {
@@ -70403,12 +70500,17 @@ impl<'src> Analyzer<'src> {
                 }
                 buf.push(')');
             }
-            Type::Array(element_id, length) => {
+            Type::Array(element_id, length_id) => {
                 let element = element_id.get_type(self);
                 let element_str =
                     self.pretty_print_type_at(&element, substitution, depth + 1, visiting);
-                buf.push_str(&format!("[{element_str}; {length}]"));
+                let length = length_id.get_type(self);
+                let length_str =
+                    self.pretty_print_type_at(&length, substitution, depth + 1, visiting);
+                buf.push_str(&format!("[{element_str}; {length_str}]"));
             }
+            // A length prints as its number (array-lengths.md §3).
+            Type::Length(length) => buf.push_str(&length.to_string()),
             Type::Mapped(binder_id, source_id, template_id) => {
                 let binder = self
                     .generic_constraint_names
@@ -85671,7 +85773,8 @@ mod walk_type_node_fence_tests {
             Vec::new(),
             Vec::new(),
         ));
-        let array = analyzer.type_id_for_type(Type::Array(tuple, 3));
+        let length = analyzer.length_type_id(3);
+        let array = analyzer.type_id_for_type(Type::Array(tuple, length));
         let slots = [unresolved, void, generic, tuple, closure, array];
         assert!(
             slots.iter().any(|slot| !matches!(

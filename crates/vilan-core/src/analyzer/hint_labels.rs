@@ -461,10 +461,12 @@ impl<'src> Analyzer<'src> {
                 format!("({})", parts.join(", "))
             }
             Type::Array(element, length) => {
-                let (element, length) = (element.get_type(self), *length);
+                let (element, length) = (element.get_type(self), length.get_type(self));
                 let element = self.render_hint_label(&element, admitted, hosts, depth + 1);
+                let length = self.render_hint_label(&length, admitted, hosts, depth + 1);
                 format!("[{element}; {length}]")
             }
+            Type::Length(length) => length.to_string(),
             Type::Closure(parameters, return_id, _, modes) => {
                 let (parameters, return_id, modes) =
                     (parameters.clone(), *return_id, modes.clone());

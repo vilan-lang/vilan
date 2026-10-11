@@ -160,7 +160,7 @@ impl<'src> Analyzer<'src> {
                     && pairwise(self, &written.clone(), &inferred.clone())
             }
             (Type::Array(written, n), Type::Array(inferred, m)) => {
-                n == m && pairwise(self, &[*written], &[*inferred])
+                self.array_lengths_agree(*n, *m) && pairwise(self, &[*written], &[*inferred])
             }
             (
                 Type::Closure(written_parameters, written_return, _, written_modes),

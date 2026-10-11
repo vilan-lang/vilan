@@ -107,8 +107,12 @@ pub fn subject_shape_matches(program: &Program, subject: TypeId, target: TypeId)
         (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
             subject_argument_shapes_match(program, left_items, right_items)
         }
+        // The length is a type-level number (array-lengths.md §3), so it is
+        // one more argument: a length binder is a hole like any other, and two
+        // `Type::Length`s match by value in the last arm.
         (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-            left_length == right_length && subject_shape_matches(program, *left_item, *right_item)
+            subject_shape_matches(program, *left_length, *right_length)
+                && subject_shape_matches(program, *left_item, *right_item)
         }
         (left, right) => left == right,
     }
@@ -728,7 +732,7 @@ fn instantiation_agrees(program: &Program, wanted: &Type, provided: &Type) -> bo
             elements_agree(left_elements, right_elements)
         }
         (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
-            left_length == right_length
+            elements_agree(&[*left_length], &[*right_length])
                 && elements_agree(
                     std::slice::from_ref(left_element),
                     std::slice::from_ref(right_element),
