@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**E290: under a TUPLE view subject (`match &mut pair`, B587) the inherited refusals say what the capture views — "`mut a` would bind a COPY of the tuple's slot, but this matches a view (`&mut pair`), whose captures are views into the tuple's slots: bind `let a` to write the tuple's slot in place …", "… readonly views into the tuple's slots — match `&mut pair` to write the tuple's slots in place" — where they said "the payload"; a sub-tuple leaf's steer reads "bind the tuple whole (`let pair`), which is a view, and write `pair.0`".** A variant payload's capture keeps its sentence. Ledger rows 633, 634, 658 and 659 follow (the noun is a slot now). Pins: `borrows::e290_a_tuple_view_subjects_refusals_name_the_slot_not_a_payload`; B545's and B587's pins read the new noun.
+
+---
+
+<!-- family: diagnostics -->
 **E289: an element-syntax hole's refusal names the whole child contract — "a hole in element syntax takes a `View`, a `str`, a `List<View>`, an `Option` of one, or a `Source` of one, and `count` is `SignalCell<i32>` …"; since A165 an `Option` of a child is a child (and a `Source<Option<View>>`), which the sentence left out.** Ledger row 669's key follows. Pins: `modules::e271_*` (their shared sentence).
 
 ---

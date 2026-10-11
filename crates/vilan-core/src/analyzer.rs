@@ -875,6 +875,16 @@ pub enum Expr<'src> {
     Macro,
 }
 
+/// What a `mut` capture under a view subject would copy (B509, B545): a
+/// variant's PAYLOAD, one SLOT of a tuple, or a SUB-TUPLE spanning several
+/// slots — E290 words the refusal by which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TupleLeaf {
+    Payload,
+    Slot,
+    SubTuple,
+}
+
 #[derive(Clone, Debug)]
 pub enum ExprIfBranch {
     If(Id, (Vec<Id>, Id), Option<Box<ExprIfBranch>>),
@@ -29563,7 +29573,7 @@ impl<'src> Analyzer<'src> {
                     _ => "place",
                 };
                 return Some(format!(
-                    "cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                    "cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view, and write `pair.0`"
                 ));
             }
             if !captures.contains(&capture_id) {
@@ -29576,8 +29586,13 @@ impl<'src> Analyzer<'src> {
                         _ => return None,
                     };
                     let place = self.receiver_spelling(operand).unwrap_or("place");
+                    // E290: a tuple's slot is not a payload.
+                    let held = match tuple_leaves.contains(&capture_id) {
+                        true => "the tuple's slots",
+                        false => "the payload",
+                    };
                     Some(format!(
-                        "cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into the payload — match `&mut {place}` to write the payload in place"
+                        "cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into {held} — match `&mut {place}` to write {held} in place"
                     ))
                 }
                 Some(true) => None,
@@ -29601,7 +29616,7 @@ impl<'src> Analyzer<'src> {
     /// was written to make (B528's trap: the old steer led there, and the
     /// write silently did not land).
     fn check_mut_captures_under_view_subjects(&mut self) {
-        let mut refusals: Vec<(Id, &'src str, Option<&'src str>, bool, bool)> = Vec::new();
+        let mut refusals: Vec<(Id, &'src str, Option<&'src str>, bool, TupleLeaf)> = Vec::new();
         for expr in self.expr_id_to_expr_map.values() {
             let (subject_id, patterns): (Id, Vec<&ExprPattern>) = match expr {
                 Expr::Match(subject_id, legs) => {
@@ -29626,29 +29641,36 @@ impl<'src> Analyzer<'src> {
                 Self::collect_payload_captures(pattern, &mut captures);
                 Self::collect_tuple_leaf_captures(pattern, &mut tuple_leaves);
             }
-            // B545: a one-slot tuple leaf is a payload view like any capture;
+            // B545: a one-slot tuple leaf is a view like a payload capture;
             // only a multi-slot one (a reslice, a copy) keeps the tuple steer.
-            let tuple_leaves: Vec<(Id, bool)> = tuple_leaves
+            // E290: and it is a view into a SLOT, which the sentence says.
+            let tuple_leaves: Vec<(Id, TupleLeaf)> = tuple_leaves
                 .into_iter()
-                .map(|capture_id| (capture_id, !self.tuple_leaf_is_one_slot(capture_id)))
+                .map(|capture_id| {
+                    let leaf = match self.tuple_leaf_is_one_slot(capture_id) {
+                        true => TupleLeaf::Slot,
+                        false => TupleLeaf::SubTuple,
+                    };
+                    (capture_id, leaf)
+                })
                 .collect();
-            for (capture_id, in_tuple) in captures
+            for (capture_id, leaf) in captures
                 .into_iter()
-                .map(|capture_id| (capture_id, false))
+                .map(|capture_id| (capture_id, TupleLeaf::Payload))
                 .chain(tuple_leaves)
             {
                 if let Some(variable) = self.variables.get(&capture_id)
                     && variable.mutable
                 {
                     let place = operand.and_then(|operand| self.receiver_spelling(operand));
-                    refusals.push((capture_id, variable.name, place, mutable, in_tuple));
+                    refusals.push((capture_id, variable.name, place, mutable, leaf));
                 }
             }
         }
         refusals.sort_unstable_by_key(|(capture_id, ..)| capture_id.0);
-        for (capture_id, name, place, mutable, in_tuple) in refusals {
+        for (capture_id, name, place, mutable, leaf) in refusals {
             let place = place.unwrap_or("place");
-            if in_tuple {
+            if leaf == TupleLeaf::SubTuple {
                 // B545: a multi-slot tuple leaf is a copy under any subject;
                 // `mut` on it under a view subject reads as the in-place write
                 // it is not.
@@ -29658,17 +29680,21 @@ impl<'src> Analyzer<'src> {
                         note: None,
                         span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`"
+                            "`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view, and write `pair.0`"
                         ),
                     },
                     capture_id,
                 );
                 continue;
             }
+            let (held, holds) = match leaf {
+                TupleLeaf::Slot => ("the tuple's slot", "the tuple's slots"),
+                _ => ("the payload", "the payload"),
+            };
             let (subject, steer) = if mutable {
                 (
                     format!("&mut {place}"),
-                    format!("bind `let {name}` to write the payload in place"),
+                    format!("bind `let {name}` to write {held} in place"),
                 )
             } else {
                 (
@@ -29682,7 +29708,7 @@ impl<'src> Analyzer<'src> {
                     note: None,
                     span: **self.span_map.get(&capture_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
-                        "`mut {name}` would bind a COPY of the payload, but this matches a view (`{subject}`), whose captures are views into the payload: {steer}, and write `*{name}` where a copy is wanted"
+                        "`mut {name}` would bind a COPY of {held}, but this matches a view (`{subject}`), whose captures are views into {holds}: {steer}, and write `*{name}` where a copy is wanted"
                     ),
                 },
                 capture_id,
