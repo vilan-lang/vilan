@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**E289: an element-syntax hole's refusal names the whole child contract — "a hole in element syntax takes a `View`, a `str`, a `List<View>`, an `Option` of one, or a `Source` of one, and `count` is `SignalCell<i32>` …"; since A165 an `Option` of a child is a child (and a `Source<Option<View>>`), which the sentence left out.** Ledger row 669's key follows. Pins: `modules::e271_*` (their shared sentence).
+
+---
+
 <!-- family: fix -->
 **B595: a blanket impl's static named on a concrete type resolves — `str::tag(1)` over `impl type T: Leaf with Tag` was refused "cannot infer 'T' for this call; its bound ': Leaf' cannot be checked", while the same call through a generic helper (`tag_of<str>(1)`) ran; it runs on both backends, the blanket's `T` bound to the written head (`T::leaf_name()` in the body reads `str`'s).** A static on a concrete head bound the matched impl's binders only when the head carried written arguments (`Boxy<i32>::make`); a blanket's subject binder is bound to the head now too, as method dispatch binds it to the receiver. A head the blanket's bound does not admit still has no such static. Pins: `traits::b595_*` (2), `native_differential::a_blankets_static_on_a_concrete_head_is_identical_on_both_backends` (`native/blanket_static_heads.vl`, new).
 

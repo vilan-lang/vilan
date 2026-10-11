@@ -52401,8 +52401,8 @@ impl<'src> Analyzer<'src> {
         Some((
             span,
             format!(
-                "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` \
-                 of one, and `{written}` is `{type_label}`{steer}"
+                "a hole in element syntax takes a `View`, a `str`, a `List<View>`, an `Option` \
+                 of one, or a `Source` of one, and `{written}` is `{type_label}`{steer}"
             ),
         ))
     }

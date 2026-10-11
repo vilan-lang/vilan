@@ -2540,8 +2540,7 @@ const E271_HEAD: &str = concat!(
     "\n",
 );
 
-const E271_SENTENCE: &str =
-    "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one";
+const E271_SENTENCE: &str = "a hole in element syntax takes a `View`, a `str`, a `List<View>`, an `Option` of one, or a `Source` of one";
 
 #[test]
 fn e271_a_hole_holding_no_text_is_refused_at_the_hole_with_the_text_form() {
