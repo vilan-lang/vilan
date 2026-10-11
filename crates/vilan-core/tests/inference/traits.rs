@@ -9917,3 +9917,75 @@ fn b565_a_blanket_reaches_an_unannotated_function_item() {
         "leaf\nleaf\nshape over leaf\n14\n",
     );
 }
+
+// --- B595: a blanket's static named on a concrete head -----------------------
+
+/// B595: `str::tag(1)` over `impl type T: Leaf with Tag` was refused "cannot
+/// infer 'T' for this call; its bound ': Leaf' cannot be checked" — the
+/// blanket's binder was never bound to the written head — while the same call
+/// through a generic helper ran. The head binds it, as a receiver does for a
+/// method: two heads, and the binder read inside the body (`T::leaf_name()`).
+#[test]
+fn b595_a_blankets_static_on_a_concrete_head_binds_its_subject() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Leaf {
+            fun leaf_name(): str;
+        }
+
+        trait Tag {
+            fun tag(value: i32): str;
+        }
+
+        struct Point { x: i32 }
+
+        impl str with Leaf {
+            fun leaf_name(): str { "str" }
+        }
+
+        impl Point with Leaf {
+            fun leaf_name(): str { "point" }
+        }
+
+        impl type T: Leaf with Tag {
+            fun tag(value: i32): str {
+                i"{T::leaf_name()} {value}"
+            }
+        }
+
+        fun tag_of<T: Tag>(value: i32): str {
+            T::tag(value)
+        }
+
+        fun main() {
+            print(str::tag(1));
+            print(Point::tag(2));
+            print(tag_of<str>(3));
+        }
+        "#,
+        "str 1\npoint 2\nstr 3\n",
+    );
+}
+
+/// B595's boundary: a head the blanket's bound does not admit has no such
+/// static.
+#[test]
+fn b595_a_head_outside_the_blankets_bound_has_no_such_static() {
+    assert_fails_with(
+        r#"
+        trait Leaf {}
+        trait Tag {
+            fun tag(value: i32): str;
+        }
+        impl type T: Leaf with Tag {
+            fun tag(value: i32): str { "tag" }
+        }
+        fun main() {
+            let _t = i32::tag(1);
+        }
+        "#,
+        "cannot find 'tag' in i32",
+    );
+}

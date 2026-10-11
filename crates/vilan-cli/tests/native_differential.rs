@@ -9488,8 +9488,11 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// was drawn over the entry's `import` line. A library body's refusal is now
 /// anchored at the user's call that instantiated it, naming the body and its
 /// file; a user module's is drawn in that module. (F108's solver half grounds
-/// `push_many([])` now, so the library-body probe is an `Option::None` whose
-/// payload nothing states, instantiating `is_some`'s body open.)
+/// `push_many([])`, and B600 refuses the `Option::None.is_some()` that
+/// replaced it at `vilan check` — "cannot infer the type of this value" at the
+/// user's call — so the library-body probe now proves that the refusal comes
+/// from the CHECK, at the call, before any body is instantiated; the
+/// in-body note has no reachable std probe left, filed with B600's report.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
@@ -9514,8 +9517,9 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         "the refusal is drawn at the user's call:\n{stderr}"
     );
     assert!(
-        stderr.contains("The construct is in `is_some`'s body (`option.vl`)"),
-        "the refusal names the body and its file:\n{stderr}"
+        stderr.contains("cannot infer the type of this value: it is `Option<…>`")
+            && stderr.contains("that `is_some` is instantiated at"),
+        "B600 refuses the open instance at the check, naming the callee:\n{stderr}"
     );
     let module = staged.join("native_probe_f108_module");
     std::fs::create_dir_all(&module).expect("make the package");
@@ -10077,6 +10081,116 @@ fn an_injected_clause_written_out_of_order_is_identical_on_both_backends() {
         compare(&staged, "native_probe_clause_order.vl"),
         Verdict::Identical,
         "a `context` clause in any written order must build and thread the same values"
+    );
+}
+
+/// B596: a struct literal runs its initializers in the order it WRITES them.
+/// The JS array lays the struct out in declaration order, and two plain calls
+/// written the other way round ran in layout order; a Rust struct literal runs
+/// them as written. Two fields swapped, four rotated around a literal, a `mut`
+/// read ahead of the call that writes it, and a nested generic literal.
+#[test]
+fn a_struct_literal_written_out_of_declaration_order_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_struct_literal_written_order.vl"),
+        include_str!("native/struct_literal_written_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_struct_literal_written_order.vl"),
+        Verdict::Identical,
+        "a struct literal must run its initializers as written on both backends"
+    );
+}
+
+/// B599: fill-from-use — a binding whose hole a later use states (an
+/// argument at a concrete, bare-trait or bounded parameter, a receiver's
+/// call, a push, a binder of the enclosing body) takes the stated type, and
+/// both backends build it there: before, `vilan check` refused every one of
+/// these (B580), and on JS alone the binding kept the hole.
+#[test]
+fn a_binding_filled_from_its_use_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_fill_from_use.vl"),
+        include_str!("native/fill_from_use.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_fill_from_use.vl"),
+        Verdict::Identical,
+        "a binding filled from its use must build and print the same on both backends"
+    );
+}
+
+/// B602: a float beside an integer, or two float types, compute through a
+/// conversion (a literal takes the float's type) — the forms the refusal
+/// leaves, the same answer on both backends.
+#[test]
+fn a_float_beside_a_converted_integer_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_float_integer_operands.vl"),
+        include_str!("native/float_integer_operands.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_float_integer_operands.vl"),
+        Verdict::Identical,
+        "a float beside a converted integer must compute the same on both backends"
+    );
+}
+
+/// B592: a list of array literals under `List<[T; n]>` — the inner literals
+/// are the arrays, at a binding, a parameter, a push and a nested level.
+#[test]
+fn a_list_of_fixed_array_literals_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_list_of_fixed_arrays.vl"),
+        include_str!("native/list_of_fixed_arrays.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_list_of_fixed_arrays.vl"),
+        Verdict::Identical,
+        "a list of fixed-array literals must build and print the same on both backends"
+    );
+}
+
+/// B593: function items in a list are their closure type — `[double,
+/// triple]` has an element type, and an element calls by index, in a loop,
+/// beside a closure literal and after a push.
+#[test]
+fn a_list_of_function_items_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_listed_function_items.vl"),
+        include_str!("native/listed_function_items.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_listed_function_items.vl"),
+        Verdict::Identical,
+        "a list of function items must build and call the same on both backends"
+    );
+}
+
+/// B595: a blanket's static on a concrete head (`str::tag(1)` over `impl
+/// type T: Leaf with Tag`) binds the blanket's binder to the head.
+#[test]
+fn a_blankets_static_on_a_concrete_head_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_blanket_static_heads.vl"),
+        include_str!("native/blanket_static_heads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_blanket_static_heads.vl"),
+        Verdict::Identical,
+        "a blanket's static on a concrete head must resolve the same on both backends"
     );
 }
 

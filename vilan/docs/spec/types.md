@@ -1563,8 +1563,16 @@ Normative rejection cases (each is a compile error):
 - A binding whose type still holds a part nothing determines once
   inference is done — `let xs = []` read only through `len()`, `let o =
   None` — is refused at its initializer, naming where to write the type
-  (`xs: List<…>`); a later use that states it (`xs.push(1)`) is what
-  inference reads, and only an annotation can stand in for one (B580).
+  (`xs: List<…>`); a later use that states it is what inference reads,
+  and only an annotation can stand in for one (B580). A use states the
+  missing part when it is an argument at a parameter that names it
+  (`take(o)` with `take(value: Option<str>)`, through a bare-trait or
+  bounded parameter by the one impl the value's type has, and after every
+  argument of the call has bound what it binds), a receiver whose call
+  binds it (`o.unwrap_or("d")`, `cell.set(Some(3))`, `xs.push(1)`), or a
+  reassignment; the FIRST such use decides, and a later one that
+  disagrees is a mismatch at that use. An `any` parameter states nothing
+  (fill-from-use, B599).
 - A value written into a struct field it does not match, through either
   door: the literal `S { field = v }` and the assignment `s.field = v`
   are governed by ONE rule, and a place chain of any depth (`a.b.c = v`,

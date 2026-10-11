@@ -17,5 +17,5 @@ fun rate(count: i32, elapsed_ms: f64): i32 {
 	if elapsed_ms <= 0.0 {
 		ret 0;
 	}
-	round(1000.0 * count / elapsed_ms)
+	round(1000.0 * count.as_f64() / elapsed_ms)
 }

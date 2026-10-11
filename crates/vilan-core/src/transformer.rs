@@ -8023,16 +8023,38 @@ impl<'src> Transformer<'src> {
                 js::Node::Array(items)
             }
             Expr::StructInitializer(_struct_id, assignments) => {
-                // let struct_ = self.program.structs.get(struct_id).unwrap();
-                // let mut properties_ng = NameGenerator::simple(debug_names);
                 // Walked in the order the literal WROTE its fields (B452: an
                 // initializer that needs statements spills the ones before
                 // it), then laid out in declaration order.
                 let field_ids: Vec<Id> = assignments.values().copied().collect();
-                let walked = self.walk_siblings_in_order(&field_ids, block, |this, id, block| {
-                    this.walk_entity(id, block)
-                        .map(|node| this.maybe_clone(id, node))
-                });
+                let mut walked =
+                    self.walk_siblings_in_order(&field_ids, block, |this, id, block| {
+                        this.walk_entity(id, block)
+                            .map(|node| this.maybe_clone(id, node))
+                    });
+                // B596: the array evaluates its items in DECLARATION order, so
+                // a literal written in another order (`Point { y = f(), x =
+                // g() }`) would run `g` before `f` — natively a Rust struct
+                // literal runs them as written. As B569 §4.1 does for a tuple
+                // matched by name, every initializer whose value a later one
+                // could change is bound to a `const` first, in written order,
+                // and the array reads the bindings in declaration order.
+                let written_in_declaration_order = assignments
+                    .keys()
+                    .is_sorted_by(|earlier, later| earlier < later);
+                if !written_in_declaration_order {
+                    for (field_id, value) in walked.iter_mut() {
+                        if self.sibling_value_is_settled(*field_id, value) {
+                            continue;
+                        }
+                        let temp = self.ng.next_name();
+                        let evaluated = std::mem::replace(value, js::Node::Local(temp.clone()));
+                        block.push(js::Node::ConstVariable(js::Variable {
+                            name: temp,
+                            value: Box::new(evaluated),
+                        }));
+                    }
+                }
                 let mut properties = walked
                     .into_iter()
                     .filter_map(|(id, node)| {

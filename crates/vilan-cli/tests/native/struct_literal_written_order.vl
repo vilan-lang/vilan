@@ -1,0 +1,51 @@
+// B596: a struct literal runs its initializers in the order it WRITES them,
+// on both backends. The JS array lays the struct out in declaration order and
+// ran plain calls in that order; a Rust struct literal runs them as written.
+import std::io::print;
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+struct Triple {
+	a: i32,
+	b: i32,
+	c: i32,
+	d: i32,
+}
+
+struct Pair {
+	a: i32,
+	b: i32,
+}
+
+struct Wrap<T> {
+	first: T,
+	second: T,
+}
+
+fun say(label: str, value: i32): i32 {
+	print(label);
+	value
+}
+
+fun bump(counter: &mut i32): i32 {
+	counter += 1;
+	counter
+}
+
+fun main() {
+	let p = Point { y = say("y", 2), x = say("x", 1) };
+	print(p.x * 10 + p.y);
+	let t = Triple { c = say("c", 3), d = 4, a = say("a", 1), b = say("b", 2) };
+	print(t.a * 1000 + t.b * 100 + t.c * 10 + t.d);
+	mut count = 0;
+	let q = Pair { b = count, a = bump(&mut count) };
+	print(q.a * 10 + q.b);
+	let w = Wrap {
+		second = Wrap { second = say("s.s", 4), first = say("s.f", 3) },
+		first = Wrap { second = say("f.s", 2), first = say("f.f", 1) },
+	};
+	print(w.first.first * 1000 + w.first.second * 100 + w.second.first * 10 + w.second.second);
+}
