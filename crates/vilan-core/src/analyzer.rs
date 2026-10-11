@@ -9049,6 +9049,8 @@ impl<'src> Analyzer<'src> {
         let mut satisfaction_memo: SatisfactionMemo = HashMap::default();
         let mut unrankable_memo: UnrankableMemo = HashMap::default();
         for (call_id, substitution) in recorded {
+            // M134: the audit's mints at this site belong to the site's item.
+            self.id_windows.set_anchor(call_id);
             // M26's per-site checkpoint (`editor-latency.md` §4.2). This is the
             // loop the `checks` phase is mostly made of — every recorded call
             // site of the whole program, 63% of the phase before M19's memo and
@@ -9309,6 +9311,8 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (call_id, member_id) in wired_calls {
+            // M134: the declaration walk's mints belong to the call's item.
+            self.id_windows.set_anchor(call_id);
             let Some((_, own_generics)) = self.method_signature(member_id) else {
                 continue;
             };
@@ -9453,6 +9457,7 @@ impl<'src> Analyzer<'src> {
         // --- Greet>` is wrong at the literal).                          ---
         let mut constructions: Vec<(Id, &'src str, Vec<TypeId>, Vec<TypeId>)> = Vec::new();
         for (&initializer_id, &struct_def_id) in &self.struct_initializer_to_def {
+            self.id_windows.set_anchor(initializer_id);
             let Some(struct_) = self.structs.get(&struct_def_id) else {
                 continue;
             };
@@ -9496,6 +9501,7 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (call_id, enum_id, variant_index, argument_ids) in variant_calls {
+            self.id_windows.set_anchor(call_id);
             let Some(enum_) = self.enums.get(&enum_id) else {
                 continue;
             };
@@ -9546,6 +9552,7 @@ impl<'src> Analyzer<'src> {
             constructions.push((call_id, enum_name, bound_constraints, bound_arguments));
         }
         for (site_id, owner_name, declared_constraints, arguments) in constructions {
+            self.id_windows.set_anchor(site_id);
             // A declared bound's arguments may name SIBLING parameters
             // (`struct S<A, B: Feed<A>>`) — ground them in this
             // construction's own bindings.
@@ -10017,6 +10024,9 @@ impl<'src> Analyzer<'src> {
         for (owner_id, written_arguments, span, source_id, type_id, generics_exempt) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
+            // M134: the site's own slot is the anchor (the owner is declared
+            // elsewhere); a written type that lives in no window stays unanchored.
+            self.id_windows.set_check_anchor_type(type_id);
             let Some((owner_name, declared, _)) = self.nominal_bound_owner(owner_id) else {
                 continue;
             };
@@ -10940,6 +10950,7 @@ impl<'src> Analyzer<'src> {
             if self.frozen_entity(check.impl_function_id) {
                 continue;
             }
+            self.id_windows.set_anchor(check.impl_function_id);
             self.check_one_conformance(check, &written_type_names);
         }
     }
@@ -13527,6 +13538,8 @@ impl<'src> Analyzer<'src> {
         let mut reported_instantiations: HashSet<TypeId> = HashSet::default();
         let mut reported_structures: HashSet<String> = restored_structures;
         for (type_id, span, source) in applications {
+            // M134: the mints this tier makes about a type belong to its item.
+            self.id_windows.set_check_anchor_type(type_id);
             // M19 T1d: a reused module's written applications are not visited.
             // Its diagnostics are replayed and the keys it contributed above
             // are already in `reported_structures`, so both halves of what this
@@ -13560,6 +13573,7 @@ impl<'src> Analyzer<'src> {
         // site of a type could ever be the earliest.
         let mut examined: HashSet<TypeId> = HashSet::default();
         for (_, type_id, span, source) in sites {
+            self.id_windows.set_check_anchor_type(type_id);
             if !examined.insert(type_id) {
                 continue;
             }
@@ -13582,6 +13596,9 @@ impl<'src> Analyzer<'src> {
         // `List`'s own parameter, which IS the receiver's type, spelled by the
         // solver instead of by the program.
         for (container_id, arguments, span, source) in self.container_receiver_sites(&containers) {
+            // M134: the receiver site's container (the argument types were
+            // minted in its item's window).
+            self.id_windows.set_anchor(container_id);
             let container_type = Type::Struct(container_id, arguments).get_type_id(self);
             let Some(found) = self.container_resource_at(
                 container_type,
@@ -13616,6 +13633,7 @@ impl<'src> Analyzer<'src> {
             let Some(span) = self.span_map.get(call_id) else {
                 continue;
             };
+            self.id_windows.set_anchor(*call_id);
             // M19 T1d: a reused module's native receiver sites are its own — the
             // call is in its body and the diagnostic publishes to its file — so
             // they are skipped with the rest of its tier.
@@ -14428,6 +14446,8 @@ impl<'src> Analyzer<'src> {
         let variables: Vec<(Id, TypeId)> =
             self.variables.values().map(|v| (v.id, v.type_id)).collect();
         for (id, type_id) in variables {
+            // M134: the planner's mints for a binding belong to its item.
+            self.id_windows.set_anchor(id);
             if self.type_is_resource(type_id) {
                 bindings.insert(id);
             }
@@ -14438,6 +14458,7 @@ impl<'src> Analyzer<'src> {
             .map(|p| (p.id, p.type_id))
             .collect();
         for (id, type_id) in parameters {
+            self.id_windows.set_anchor(id);
             if self.type_is_resource(type_id) {
                 bindings.insert(id);
             }
@@ -14757,6 +14778,8 @@ impl<'src> Analyzer<'src> {
             if !function.has_body || function.returns_view {
                 continue;
             }
+            // M134: a crossing's mints belong to the function's item.
+            self.id_windows.set_anchor(function.id);
             let mut leaves = Vec::new();
             self.collect_tail_leaves(seam, &mut leaves);
             for leaf in leaves {
@@ -16812,7 +16835,7 @@ impl<'src> Analyzer<'src> {
 
         // Function bodies: the body tail is returned, so it is consuming AND
         // terminal (R4 — a returned `if`/`match` tail moves out per branch).
-        let bodies: Vec<(Vec<Id>, Id, Vec<Id>)> = self
+        let bodies: Vec<(Vec<Id>, Id, Vec<Id>, Id)> = self
             .functions
             .values()
             .filter(|function| function.has_body)
@@ -16827,16 +16850,19 @@ impl<'src> Analyzer<'src> {
                     function.body.0.clone(),
                     function.body.1,
                     function.parameters.clone(),
+                    function.id,
                 )
             })
             .collect();
-        for (statements, tail, parameters) in &bodies {
+        for (statements, tail, parameters, function_id) in &bodies {
             // M26's per-FUNCTION checkpoint: `bodies` is one entry per function
             // with a body, so a cancel lands within one function's move scan.
             // The violations collected so far go with the frame.
             if crate::cancel::cancelled() {
                 return violations;
             }
+            // M134: the scan's mints for this body belong to its item.
+            self.id_windows.set_anchor(*function_id);
             let mut flow = MoveFlow::new();
             for parameter in parameters {
                 if scan.resource_bindings.contains(parameter) {
@@ -16858,21 +16884,23 @@ impl<'src> Analyzer<'src> {
         // Closure bodies are their own roots (a fresh function-like boundary — an
         // enclosing loop does not repeat a closure invocation, so loop depth
         // resets to 0). Captures of OUTER resources are R9's business, below.
-        let closures: Vec<(Vec<Id>, Vec<Id>, Id)> = self
+        let closures: Vec<(Vec<Id>, Vec<Id>, Id, Id)> = self
             .closures
             .iter()
             // M19 T1: a closure is its own root and lives in exactly one body,
             // so it reuses with the source that wrote it.
             .filter(|(closure_id, _)| !self.reusable_entity(**closure_id))
-            .map(|(_, closure)| {
+            .map(|(closure_id, closure)| {
                 (
                     closure.parameters.clone(),
                     closure.parameter_destructures.clone(),
                     closure.return_,
+                    *closure_id,
                 )
             })
             .collect();
-        for (parameters, destructures, return_id) in &closures {
+        for (parameters, destructures, return_id, closure_id) in &closures {
+            self.id_windows.set_anchor(*closure_id);
             let mut flow = MoveFlow::new();
             for binding in parameters.iter().chain(destructures) {
                 if scan.resource_bindings.contains(binding) {
@@ -18929,6 +18957,8 @@ impl<'src> Analyzer<'src> {
         let mut seed_memo: HashMap<TypeId, bool> = HashMap::default();
         let all_calls: Vec<Id> = self.function_calls.keys().copied().collect();
         for call_id in all_calls {
+            // M134: R11's mints at this instantiation belong to the call's item.
+            self.id_windows.set_anchor(call_id);
             self.r11_discover(
                 call_id,
                 &empty,
@@ -20274,6 +20304,8 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (subject, impl_id, trait_ids) in implementations {
+            // M134: the admission's mints belong to the impl.
+            self.id_windows.set_anchor(impl_id);
             if !self.type_is_resource(subject) {
                 continue;
             }
@@ -20795,6 +20827,8 @@ impl<'src> Analyzer<'src> {
     fn check_rpc_signatures(&mut self) {
         let checks = std::mem::take(&mut self.rpc_signatures_to_check);
         for (method_name, subject_name, method_id, members) in checks {
+            // M134: the signature check's mints belong to the method's item.
+            self.id_windows.set_anchor(method_id);
             // §9.3/R4: on a `[client_service]` struct every `[rpc]` method is a
             // NOTIFICATION, so the two return-type rules invert — a declared
             // return is refused, and its absence is the only legal spelling.
@@ -26934,6 +26968,8 @@ impl<'src> Analyzer<'src> {
         // are themselves walk order, so this is source order.
         assignments.sort_unstable_by_key(|(assignment_id, _, _)| assignment_id.0);
         for (assignment_id, target_id, value_id) in assignments {
+            // M134: the synthetic derefs are the assignment's item's (S6 anchor).
+            self.id_windows.set_anchor(assignment_id);
             // The target: a bare view writes *through*, so deref it.
             if !matches!(
                 self.expr_id_to_expr_map.get(&target_id),
@@ -26965,6 +27001,7 @@ impl<'src> Analyzer<'src> {
                     .insert(value_id, Expr::Binary(op, deref_id, rhs_id));
             }
         }
+        self.id_windows.clear_anchor();
     }
 
     /// Mint a synthetic `Dereference` of `operand_id`, carrying its span / scope /
@@ -34029,7 +34066,11 @@ impl<'src> Analyzer<'src> {
         let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().collect();
         type_ids
             .into_iter()
-            .filter(|type_id| self.type_is_resource(*type_id))
+            .filter(|type_id| {
+                // M134: a classification's mints belong to the type's item.
+                self.id_windows.set_check_anchor_type(*type_id);
+                self.type_is_resource(*type_id)
+            })
             .collect()
     }
 
@@ -34101,6 +34142,7 @@ impl<'src> Analyzer<'src> {
             .map(|(parameter_id, parameter)| (*parameter_id, parameter.name, parameter.type_id))
             .collect();
         for (parameter_id, name, type_id) in mutable_parameters {
+            self.id_windows.set_anchor(parameter_id);
             if self.type_is_resource(type_id) {
                 resource_rejections.push((parameter_id, name));
                 continue;
@@ -81918,6 +81960,10 @@ fn analyze_over_world<'src>(
             $( if !crate::cancel::cancelled() {
                 $call;
                 crate::phase_pass_mark(stringify!($call));
+                // M134: a pass's anchor ends with the pass, so the next one's
+                // mints are counted against its own anchoring, never the
+                // last pass's leftover.
+                analyzer.id_windows.clear_anchor();
             } )+
         };
     }
@@ -81928,6 +81974,7 @@ fn analyze_over_world<'src>(
     }
     analyzer.types_settled = true;
     analyzer.id_windows.phase = id_windows::Phase::Checks;
+    analyzer.id_windows.clear_anchor();
     // ------------------------------------------------------------------
     // M19 T1: which of this world's modules are reusable for THIS analysis
     // (`per-module-analysis-reuse.md` §4.1). Three terms, and all three have
@@ -82162,6 +82209,7 @@ fn analyze_over_world<'src>(
                 let warnings_before = analyzer.warnings.len();
                 $call;
                 crate::phase_pass_mark(stringify!($call));
+                analyzer.id_windows.clear_anchor();
                 analyzer.record_reusable_window(diagnostics_before, warnings_before);
             } )+
         };
@@ -82697,10 +82745,13 @@ fn analyze_over_world<'src>(
     // records the move and view checks wrote (E281, E282) — AFTER every check
     // (they judged the program as written) and BEFORE the last-use dataflow,
     // so the reads count as uses for liveness, copy elision and drop extents.
+    crate::phase_pass_mark("the intrinsic table");
     analyzer.expand_dbg_stacks();
+    crate::phase_pass_mark("analyzer.expand_dbg_stacks()");
     // Transparent references (R5): rewrite bare assignments to a view into the
     // write-through deref form before codegen reads the targets.
     analyzer.rewrite_view_assignment_targets();
+    crate::phase_pass_mark("analyzer.rewrite_view_assignment_targets()");
     // The last-use dataflow (`analyzer/liveness.rs`, lifetimes.md §6/S2), run
     // once the tree is FINAL — the rewrite above moves reads, and a liveness
     // answer about a tree that no longer exists is worse than none. Every
@@ -82762,11 +82813,13 @@ fn analyze_over_world<'src>(
     // cheap type-level pass over the entry's module-level bindings); the transformer
     // consults it only under `BuildOptions.hmr`, so non-HMR output is unaffected.
     let hmr_bindings = analyzer.compute_hmr_bindings(global_scope_id);
+    crate::phase_pass_mark("the view, clone and hmr plans");
 
     // E227: the abbreviated inlay-hint labels, where they differ — asked
     // BEFORE the label loop below, which borrows the analyzer immutably, since
     // admission is the solver's `&mut` question.
     let hint_labels = analyzer.hint_labels();
+    crate::phase_pass_mark("analyzer.hint_labels()");
     // E278 / B570: the editor's reading aids, only for a front end that reads
     // them (`Workspace::reading_aids`); `auto_fills` still writes the `[check]
     // auto` warnings on the CLI, without the table.
@@ -82776,6 +82829,7 @@ fn analyze_over_world<'src>(
         Vec::new()
     };
     let auto_fills = analyzer.auto_fills(workspace.check.auto, workspace.reading_aids);
+    crate::phase_pass_mark("the stage hints and auto fills");
     let has_ascriptions = !analyzer.ascriptions.is_empty();
 
     // Pre-render a type label for every typed expression (for hover). Done here

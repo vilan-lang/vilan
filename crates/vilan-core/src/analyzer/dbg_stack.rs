@@ -445,10 +445,13 @@ impl<'src> Analyzer<'src> {
             closure_scopes,
         };
         for call_id in calls {
+            // M134: the synthetic read is the call's item's (S6 anchor).
+            self.id_windows.set_anchor(call_id);
             if let Some(site) = self.expand_dbg_stack(call_id, &context) {
                 self.dbg_stack_sites.insert(call_id, site);
             }
         }
+        self.id_windows.clear_anchor();
     }
 
     fn expand_dbg_stack(

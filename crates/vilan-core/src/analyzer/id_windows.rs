@@ -141,6 +141,20 @@ fn demand_table() -> &'static std::sync::Mutex<crate::fx::FxHashMap<(u64, u32), 
     WINDOW_DEMAND.get_or_init(|| std::sync::Mutex::new(crate::fx::FxHashMap::default()))
 }
 
+thread_local! {
+    /// M134: the mints made in the CHECKS phase with no anchor, on this
+    /// thread, per lane (entities, types, scopes) — the per-pass line
+    /// (`VILAN_PHASE_TIMING=passes`) prints each pass's share, which is how a
+    /// pass that still mints unanchored is found.
+    static UNANCHORED_CHECK_MINTS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+/// The mints made in the checks phase with no anchor so far on this thread,
+/// as `[entities, types, scopes]` (M134's census, the per-pass line's column).
+pub fn unanchored_check_mints() -> [u64; 3] {
+    UNANCHORED_CHECK_MINTS.with(std::cell::Cell::get)
+}
+
 /// The first analysis's type-window ratio over the walk's mints. The spike
 /// measured the ratio's overflow on kolt's client leg — ×4: 2,110 of 4,602
 /// windows, ×8: 1,860, ×16: 1,213 — and every slack slot of the type lane
@@ -265,7 +279,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         match self {
             Phase::Walk => 0,
             Phase::Resolve => 1,
@@ -351,6 +365,12 @@ pub struct LaneCensus {
     pub anchored_tail: u64,
     /// Minted later with no anchor, by phase (`Phase::index`).
     pub unanchored: [u64; 4],
+    /// M134: minted in the CHECKS phase with no anchor ASKED at all — a
+    /// post-settle pass that mints without saying which body it works on.
+    /// Zero is the invariant (the standing pin); the checks-phase row of
+    /// `unanchored` above also counts the anchors that were asked of a slot
+    /// in no window (`Census::check_anchor_misses`), which have no item.
+    pub checks_unasked: u64,
     /// A relocated mint that landed OUTSIDE its anchor's window — zero by
     /// construction, nonzero under the `cross` plant.
     pub relocated_outside_anchor: u64,
@@ -391,6 +411,11 @@ pub struct Census {
     pub writes_unanchored: u64,
     /// Windows whose relocated mints spilled.
     pub overflowed: u64,
+    /// M134: checks-phase anchors asked of an entity or type slot that lives
+    /// in NO window — minted unanchored in the resolve or base phase (the
+    /// `r`/`b` columns) — so the check's mints for it have no item to join
+    /// and go to the tail by construction. The residual the `c` column keeps.
+    pub check_anchor_misses: u64,
 }
 
 impl Census {
@@ -485,7 +510,7 @@ impl IdWindowsReport {
         let lane = |name: &str, lane: &LaneCensus| {
             format!(
                 "{name}: walk={} unwindowed={} anchored-in={} spilled={} anchored-tail={} \
-                 unanchored=w{}/r{}/b{}/c{} outside-anchor={}",
+                 unanchored=w{}/r{}/b{}/c{} unasked={} outside-anchor={}",
                 lane.walk_in_window,
                 lane.walk_unwindowed,
                 lane.anchored_in_window,
@@ -495,13 +520,15 @@ impl IdWindowsReport {
                 lane.unanchored[1],
                 lane.unanchored[2],
                 lane.unanchored[3],
+                lane.checks_unasked,
                 lane.relocated_outside_anchor,
             )
         };
         format!(
             "[vilan windows] mode={} windows={} overflowed={} | {} | {} | {} | writes own={} \
-             other={} drain-other={} tail={} unanchored={} | expr-types own={} foreign={} tail={} \
-             unwindowed-expr={} | span entity={}/{} type={}/{} scope={}/{}",
+             other={} drain-other={} tail={} unanchored={} | check-anchor-misses={} | expr-types \
+             own={} foreign={} tail={} unwindowed-expr={} | span entity={}/{} type={}/{} \
+             scope={}/{}",
             self.mode.name(),
             self.windows,
             self.census.overflowed,
@@ -513,6 +540,7 @@ impl IdWindowsReport {
             self.census.writes_drain_other,
             self.census.writes_tail,
             self.census.writes_unanchored,
+            self.census.check_anchor_misses,
             self.containment.own,
             self.containment.foreign,
             self.containment.tail,
@@ -534,13 +562,21 @@ pub struct IdWindows {
     /// The window being laid out (a top-level item's walk is running).
     pub laying_out: Option<usize>,
     /// The anchor window for mints outside the walk (the constraint's).
-    pub anchor: Option<usize>,
+    /// `Cell`s: the post-settle passes that scan bodies through `&self`
+    /// (M134, Order 50) set the anchor per body too.
+    pub anchor: std::cell::Cell<Option<usize>>,
     /// The entity the anchor was last resolved from, to skip the search when
     /// consecutive constraints share it.
-    anchor_entity: Option<Id>,
+    anchor_entity: std::cell::Cell<Option<Id>>,
     /// Whether the anchor was set by a prepped drain's row rather than a
     /// constraint of the fixpoint (the write census keeps the two apart).
-    anchor_is_drain: bool,
+    anchor_is_drain: std::cell::Cell<bool>,
+    /// M134's residual census (`Census::check_anchor_misses`), counted
+    /// through the `&self` anchor setters and copied into the report.
+    check_anchor_misses: std::cell::Cell<u64>,
+    /// Whether the anchor in force was asked of a slot in no window (so the
+    /// mints under it are the residual, not an unanchored pass's).
+    anchor_missed: std::cell::Cell<bool>,
     pub phase: Phase,
     pub census: Census,
     /// Per source (by its id), a key of its PATH — the demand table's key.
@@ -552,6 +588,13 @@ pub struct IdWindows {
     /// How many windows the stored world carried when this analysis took it
     /// — the ones below were not laid out by this analysis.
     pub inherited: usize,
+    /// M134: the mints that found no room in their anchor's window and went
+    /// to the tail, with the window they were anchored to — ids ascending (the
+    /// tail counter only grows), one vector per relocating lane — so a tail
+    /// slot still names its item (`window_of`) and a check that classifies it
+    /// anchors where the slot belongs.
+    spilled_types: Vec<(u32, u32)>,
+    spilled_entities: Vec<(u32, u32)>,
 }
 
 impl IdWindows {
@@ -695,13 +738,23 @@ impl IdWindows {
             *global += 1;
             return (id, true);
         }
-        match self.anchor {
+        match self.anchor.get() {
             None => {
                 let census = self.census.lane_mut(lane);
                 if phase == Phase::Walk {
                     census.walk_unwindowed += 1;
                 } else {
                     census.unanchored[phase.index()] += 1;
+                    if phase == Phase::Checks && !self.anchor_missed.get() {
+                        census.checks_unasked += 1;
+                    }
+                    if phase == Phase::Checks {
+                        UNANCHORED_CHECK_MINTS.with(|count| {
+                            let mut lanes = count.get();
+                            lanes[lane as usize] += 1;
+                            count.set(lanes);
+                        });
+                    }
                 }
                 let id = *global;
                 *global += 1;
@@ -743,6 +796,11 @@ impl IdWindows {
                     self.census.lane_mut(lane).anchored_spilled += 1;
                     let id = *global;
                     *global += 1;
+                    match lane {
+                        Lane::Type => self.spilled_types.push((id, anchor as u32)),
+                        Lane::Entity => self.spilled_entities.push((id, anchor as u32)),
+                        Lane::Scope => {}
+                    }
                     (id, true)
                 }
             }
@@ -756,11 +814,22 @@ impl IdWindows {
         let index = self
             .windows
             .partition_point(|window| window.lane(lane).start <= id);
-        let candidate = index.checked_sub(1)?;
-        self.windows[candidate]
-            .lane(lane)
-            .contains(id)
-            .then_some(candidate)
+        if let Some(candidate) = index.checked_sub(1)
+            && self.windows[candidate].lane(lane).contains(id)
+        {
+            return Some(candidate);
+        }
+        // A tail slot: the item it was anchored to when it spilled, if any.
+        let spilled = match lane {
+            Lane::Type => &self.spilled_types,
+            Lane::Entity => &self.spilled_entities,
+            Lane::Scope => return None,
+        };
+        let at = spilled.partition_point(|(spilled_id, _)| *spilled_id < id);
+        spilled
+            .get(at)
+            .filter(|(spilled_id, _)| *spilled_id == id)
+            .map(|(_, window)| *window as usize)
     }
 
     pub fn window_of_entity(&self, id: Id) -> Option<usize> {
@@ -773,28 +842,41 @@ impl IdWindows {
 
     /// The fixpoint's hook: the constraint about to resolve is anchored at
     /// `anchor`, so its mints belong to that item's window.
-    pub fn set_anchor(&mut self, anchor: Id) {
+    pub fn set_anchor(&self, anchor: Id) {
         if !self.on() || plant() == Some(Plant::AnchorOff) {
             return;
         }
-        self.anchor_is_drain = false;
-        if self.anchor_entity == Some(anchor) {
+        self.anchor_is_drain.set(false);
+        if self.anchor_entity.get() == Some(anchor) {
             return;
         }
-        self.anchor_entity = Some(anchor);
-        self.anchor = self.window_of_entity(anchor);
+        self.anchor_entity.set(Some(anchor));
+        let window = self.window_of_entity(anchor);
+        self.note_check_anchor(window);
+        self.anchor.set(window);
+    }
+
+    /// M134's residual census: a checks-phase anchor that found no window.
+    fn note_check_anchor(&self, window: Option<usize>) {
+        let missed = window.is_none() && self.phase == Phase::Checks;
+        self.anchor_missed.set(missed);
+        if missed {
+            self.check_anchor_misses
+                .set(self.check_anchor_misses.get() + 1);
+        }
     }
 
     /// A prepped drain's row anchor (S6): the row's item, by its entity.
-    pub fn set_drain_anchor(&mut self, anchor: Id) {
+    pub fn set_drain_anchor(&self, anchor: Id) {
         self.set_anchor(anchor);
-        self.anchor_is_drain = true;
+        self.anchor_is_drain.set(true);
     }
 
-    pub fn clear_anchor(&mut self) {
-        self.anchor = None;
-        self.anchor_entity = None;
-        self.anchor_is_drain = false;
+    pub fn clear_anchor(&self) {
+        self.anchor.set(None);
+        self.anchor_entity.set(None);
+        self.anchor_is_drain.set(false);
+        self.anchor_missed.set(false);
     }
 
     /// A pre-settle world-changing write to `slot`, classified by the anchor.
@@ -816,24 +898,41 @@ impl IdWindows {
 
     /// The anchor set from a TYPE slot's window (the resolve's annotation
     /// drains carry a type id, not an entity).
-    pub fn set_anchor_type(&mut self, slot: TypeId) {
+    pub fn set_anchor_type(&self, slot: TypeId) {
         if !self.on() || plant() == Some(Plant::AnchorOff) {
             return;
         }
-        self.anchor_entity = None;
-        self.anchor_is_drain = true;
-        self.anchor = self.window_of_type(slot);
+        self.anchor_entity.set(None);
+        self.anchor_is_drain.set(true);
+        let window = self.window_of_type(slot);
+        self.note_check_anchor(window);
+        self.anchor.set(window);
+    }
+
+    /// M134: a check's anchor by the type slot it is judging — the mints a
+    /// classification makes for a type belong to the item that minted it.
+    pub fn set_check_anchor_type(&self, slot: TypeId) {
+        if !self.on() || plant() == Some(Plant::AnchorOff) {
+            return;
+        }
+        self.anchor_entity.set(None);
+        self.anchor_is_drain.set(false);
+        let window = self.window_of_type(slot);
+        self.note_check_anchor(window);
+        self.anchor.set(window);
     }
 
     /// The anchor set from a SCOPE's window (an impl block's conformance
     /// check carries its scope).
-    pub fn set_anchor_scope(&mut self, scope: Id) {
+    pub fn set_anchor_scope(&self, scope: Id) {
         if !self.on() || plant() == Some(Plant::AnchorOff) {
             return;
         }
-        self.anchor_entity = None;
-        self.anchor_is_drain = true;
-        self.anchor = self.window_of(Lane::Scope, scope.0);
+        self.anchor_entity.set(None);
+        self.anchor_is_drain.set(true);
+        let window = self.window_of(Lane::Scope, scope.0);
+        self.note_check_anchor(window);
+        self.anchor.set(window);
     }
 
     /// The census of world-changing slot writes by window — a binary search
@@ -843,13 +942,13 @@ impl IdWindows {
         if !self.on() || !(cfg!(debug_assertions) || crate::counters::counters_enabled()) {
             return;
         }
-        let Some(anchor) = self.anchor else {
+        let Some(anchor) = self.anchor.get() else {
             self.census.writes_unanchored += 1;
             return;
         };
         match self.window_of_type(slot) {
             Some(window) if window == anchor => self.census.writes_own += 1,
-            Some(_) if self.anchor_is_drain => self.census.writes_drain_other += 1,
+            Some(_) if self.anchor_is_drain.get() => self.census.writes_drain_other += 1,
             Some(_) => self.census.writes_other += 1,
             None => self.census.writes_tail += 1,
         }
@@ -894,7 +993,10 @@ impl IdWindows {
             windows: self.windows.len() as u64,
             laid_out: (self.windows.len() - self.inherited) as u64,
             inherited: self.inherited as u64,
-            census: self.census.clone(),
+            census: Census {
+                check_anchor_misses: self.check_anchor_misses.get(),
+                ..self.census.clone()
+            },
             containment,
             entity_span: span(Lane::Entity),
             entity_high_water: u64::from(entity_high_water),
