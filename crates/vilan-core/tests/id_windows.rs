@@ -1,4 +1,5 @@
-//! M110 S5 — the id-window spike's pins (`analyzer/id_windows.rs`).
+//! M110 S6 — the id windows' pins (`analyzer/id_windows.rs`), the spike's
+//! (S5, Order 49) carried over and S6's added.
 //!
 //! The spike's assertions (`analyzer-pass-map.md` §7.3, Q3): every walk-minted
 //! id inside its item's window, the windows laid out in load order and
@@ -14,7 +15,7 @@ mod scratch;
 
 use replay_harness::packages::*;
 use replay_harness::std_spec;
-use vilan_core::analyzer::id_windows::{self, IdWindowsReport, Lane, Mode, Plant};
+use vilan_core::analyzer::id_windows::{self, IdWindowsReport, Lane, Mode, Phase, Plant};
 use vilan_core::{Workspace, analyze_source};
 
 /// Analyzes the classes package on its own thread under `mode` (and `plant`),
@@ -197,6 +198,47 @@ fn the_census_mode_mints_todays_ids() {
         walk_entities > dense_entities,
         "the walk mode lays out room: {walk_entities} vs {dense_entities}"
     );
+}
+
+/// M134's pin (Order 50): every post-settle pass says which body it mints
+/// for — no checks-phase mint is made with no anchor ASKED (`checks_unasked`
+/// is 0 in every lane). What the checks-phase `unanchored` row still counts
+/// is the anchors asked of a slot that lives in NO window (the resolve's and
+/// the base's own unanchored mints; `check_anchor_misses`) — 13 / 72 of the
+/// 11,877 / 18,818 type mints per kolt leg that read unanchored before M134,
+/// 53 on the leaf package — which have no item to join by construction.
+#[test]
+fn the_checks_phase_mints_nothing_unanchored() {
+    let checks = Phase::Checks.index();
+    for (name, package) in [("leaf", leaf_package()), ("classes", classes_package())] {
+        let report = report_under(&package, Mode::All, None);
+        assert_eq!(report.mode, Mode::All);
+        for (lane, census) in [
+            (Lane::Entity, &report.census.entities),
+            (Lane::Type, &report.census.types),
+            (Lane::Scope, &report.census.scopes),
+        ] {
+            assert_eq!(census.checks_unasked, 0, "{name} {lane:?}: {census:?}");
+            assert!(
+                census.unanchored[checks] <= report.census.check_anchor_misses,
+                "{name} {lane:?}: {census:?} misses {}",
+                report.census.check_anchor_misses
+            );
+        }
+        assert_eq!(
+            report.census.entities.unanchored[checks], 0,
+            "{name}: {:?}",
+            report.census.entities
+        );
+        eprintln!(
+            "{name}: checks-phase unanchored entities {} types {} scopes {}; check-anchor-misses {}",
+            report.census.entities.unanchored[checks],
+            report.census.types.unanchored[checks],
+            report.census.scopes.unanchored[checks],
+            report.census.check_anchor_misses
+        );
+        package.remove();
+    }
 }
 
 /// S6's standing pins, on the DEFAULT (every lane relocated): no constraint

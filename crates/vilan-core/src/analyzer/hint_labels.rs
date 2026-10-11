@@ -104,6 +104,8 @@ impl<'src> Analyzer<'src> {
         }
         let mut refused_twice: HashSet<Id> = HashSet::default();
         for hint in pending {
+            // M134: a hint's mints belong to the declaration that carries it.
+            self.id_windows.set_anchor(hint.declaration);
             let Some((host_name, host_type)) = self.hint_host(hint.declaration) else {
                 continue;
             };
