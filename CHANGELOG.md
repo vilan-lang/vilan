@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**E287 (c, d): an array length's suffix is read — `[i32; 3f64]` and `[0; 2i8]` were taken as lengths 3 and 2, the suffix ignored, and are refused with the length sentence (an unsuffixed or a `usize` literal is a length) — and an index into an empty array says so ("index 0 is out of range: the array is empty (its type is `[_; 0]`), so it has no valid index") where it said "valid indices are 0 to 0".** E287's other two halves — a name in the length position (the parser refuses `[u8; SIZE]` as "expected a type", with a cascade at its uses) and the substituted length 0 a refused length leaves behind — are the array-lengths paper's S1/S4 ground (`Type::Array`'s length becomes a type, which gives the error length), so they ride lang-50. Ledger: one row (NEW). Pins: `collections::e287_*` (2).
+
+---
+
+<!-- family: diagnostics -->
 **E290: under a TUPLE view subject (`match &mut pair`, B587) the inherited refusals say what the capture views — "`mut a` would bind a COPY of the tuple's slot, but this matches a view (`&mut pair`), whose captures are views into the tuple's slots: bind `let a` to write the tuple's slot in place …", "… readonly views into the tuple's slots — match `&mut pair` to write the tuple's slots in place" — where they said "the payload"; a sub-tuple leaf's steer reads "bind the tuple whole (`let pair`), which is a view, and write `pair.0`".** A variant payload's capture keeps its sentence. Ledger rows 633, 634, 658 and 659 follow (the noun is a slot now). Pins: `borrows::e290_a_tuple_view_subjects_refusals_name_the_slot_not_a_payload`; B545's and B587's pins read the new noun.
 
 ---

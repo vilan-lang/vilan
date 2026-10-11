@@ -729,3 +729,4 @@ row	flagship	key
 705	-	{message} — `{callee} < {inner} > {arguments}` is read as the generic call `{callee}<{inner}>{arguments}`; if you meant two comparisons, parenthesize: `({callee} < {inner}) > {arguments}`
 NEW	-	cannot infer the type of this value: it is `{written}`, and nothing the program does with it settles the `…` that `{member}` is instantiated at. Bind it with its type (`let value: {written} = …;`)
 NEW	-	cannot infer the element type of this empty list: nothing the program does with it settles it, and `{member}` is instantiated at it. Bind it with its type (`let values: {written} = [];`)
+NEW	-	index {literal_index} is out of range: the array is empty (its type is `[_; 0]`), so it has no valid index

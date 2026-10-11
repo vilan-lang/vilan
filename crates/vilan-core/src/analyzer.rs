@@ -38242,7 +38242,10 @@ impl<'src> Analyzer<'src> {
     /// non-negative integer literal in v1 (a `const`-named length is deferred).
     /// Emits an error and returns 0 (harmlessly failing the compile) otherwise.
     fn array_length_literal(&mut self, node: &Spanned<Node<'src>>) -> usize {
-        if let Node::Number(whole, None, _) = &node.0
+        // E287 (c): a length is a `usize`, so an unsuffixed literal or a
+        // `usize` one — `[i32; 3f64]` and `[0; 2i8]` were lengths 3 and 2,
+        // the suffix ignored.
+        if let Node::Number(whole, None, None | Some("usize")) = &node.0
             && let Ok(length) = whole.parse::<usize>()
         {
             return length;
@@ -63791,11 +63794,19 @@ impl<'src> Analyzer<'src> {
                         trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "index {literal_index} is out of range for an array of length {length} \
-                             (valid indices are 0 to {})",
-                            length.saturating_sub(1)
-                        ),
+                        // E287 (d): an empty array has no valid index, and
+                        // "0 to 0" named one.
+                        msg: match length {
+                            0 => format!(
+                                "index {literal_index} is out of range: the array is empty \
+                                 (its type is `[_; 0]`), so it has no valid index"
+                            ),
+                            _ => format!(
+                                "index {literal_index} is out of range for an array of length \
+                                 {length} (valid indices are 0 to {})",
+                                length - 1
+                            ),
+                        },
                     });
                     self.expr_id_to_expr_map.insert(id, Expr::Error);
                     return Resolution::Failed;
