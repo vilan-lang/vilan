@@ -5792,10 +5792,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         Type::Array(element, length) => Some((*element, *length)),
                         _ => None,
                     });
-                if let Some((element, length_id)) = fixed {
-                    let length = self.array_length_at(length_id, span)?;
+                if let Some((element, _)) = fixed {
+                    // A literal's length is its count — also where the position's
+                    // length is a parameter this instance reads through another
+                    // call's signature (`fixed == [1, 2, 3]` lowers to an `eq`
+                    // whose `b: [T; N]` is the impl's).
+                    let length = elements.len();
                     // F122: a literal past the threshold is built on the heap.
-                    if self.array_lives_on_the_heap(element, length_id) {
+                    if self.heap_array_at(element, length) {
                         format!(
                             "vilan_rt::HeapArray::<_, {length}>::from_vec(vec![{}])",
                             parts.join(", ")
@@ -8322,9 +8326,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// in force, so an instance and its call site, which see the same
     /// concrete element, always agree on the rendering.
     fn array_lives_on_the_heap(&mut self, element: TypeId, length: TypeId) -> bool {
-        let Some(length) = self.array_length(length) else {
-            return false;
-        };
+        match self.array_length(length) {
+            Some(length) => self.heap_array_at(element, length),
+            None => false,
+        }
+    }
+
+    /// [`Self::array_lives_on_the_heap`] at a length already known.
+    fn heap_array_at(&mut self, element: TypeId, length: usize) -> bool {
         let element = self.estimated_size(element, &mut Vec::new());
         element.saturating_mul(length) > HEAP_ARRAY_BYTES
     }

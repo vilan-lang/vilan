@@ -7963,6 +7963,36 @@ fn a158_push_many_of_an_empty_run_appends_nothing() {
     );
 }
 
+/// A161 (array-lengths.md S5): a fixed array is `Items<T>` at every length, so
+/// `push_many` takes one — whole, in order, of any length (zero included).
+/// Refused before: "'[i32; 3]' does not implement trait 'Items<i32>'".
+#[test]
+fn a161_push_many_takes_a_fixed_array_of_any_length() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs = [1];
+            let three: [i32; 3] = [2, 3, 4];
+            let one: [i32; 1] = [5];
+            let none: [i32; 0] = [];
+            xs.push_many(three);
+            xs.push_many(one);
+            xs.push_many(none);
+            mut out = "";
+            for x in xs {
+                out = out + i"{x} ";
+            }
+            print(out);
+            print(three.len());
+        }
+
+        main();
+        "#,
+        "1 2 3 4 5 \n3\n",
+    );
+}
 /// B559: a WRITTEN nested handle assimilates as a formed one does. A task of a
 /// task does not exist at run time (the host adopts a task's result), and
 /// `assimilated_task_payload` normalized every handle the solver FORMS; the

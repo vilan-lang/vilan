@@ -1,0 +1,50 @@
+// array-lengths.md S5: std's first wave over every array length — `==` (A166),
+// `Hashable`, `Debug` (E283's array half), `Items` (A161), `to_list`, `iter`.
+import std::compare::PartialEq;
+import std::debug::Debug;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::iterator::Iterator;
+
+[derive(PartialEq)]
+struct Pixel {
+	rgba: [u8; 4],
+}
+
+fun shown<T: Debug>(value: T): str {
+	value.debug()
+}
+
+fun main() {
+	let fixed: [i32; 3] = [1, 2, 3];
+	print(fixed == [1, 2, 3]);
+	print(fixed != [1, 2, 4]);
+	let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+	let same_grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+	print(grid == same_grid);
+	print(Pixel { rgba = [1, 2, 3, 4] } == Pixel { rgba = [1, 2, 3, 5] });
+	mut colors: HashMap<[u8; 3], str> = HashMap::new();
+	colors.insert([255, 0, 0], "red");
+	print(colors.get([255, 0, 0]).unwrap_or("none"));
+	print(colors.get([0, 0, 255]).unwrap_or("none"));
+	mut seen: HashSet<[i32; 2]> = HashSet::new();
+	seen.insert([1, 2]);
+	seen.insert([1, 2]);
+	seen.insert([2, 1]);
+	print(seen.len());
+	print(shown(fixed));
+	print(shown(grid));
+	let words: [str; 2] = ["a", "b"];
+	print(shown(words));
+	mut xs = [0];
+	xs.push_many(fixed);
+	print(xs.len());
+	mut list = fixed.to_list();
+	list.push(4);
+	print(list.len());
+	let doubled = fixed.iter().map(|x| x * 2).to_list();
+	print(doubled[2]);
+}
+
+main();

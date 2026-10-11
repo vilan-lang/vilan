@@ -12702,6 +12702,26 @@ fn array_lengths_s3_const_length_parameters_answer_on_both_backends() {
     );
 }
 
+/// array-lengths.md S5: std's first wave over every array length — `==` and
+/// `!=` (A166) including a derived struct with an array field, an array as a
+/// `HashMap` key and a `HashSet` member, `T: Debug` (E283's array half),
+/// `push_many` (A161), `to_list` and `iter`.
+#[test]
+fn array_lengths_s5_std_array_impls_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_std_surface.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_std_surface.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "std's array impls must answer the same natively"
+    );
+}
+
 /// N158: the four longest legs run under [`legs_in_parallel`], whose two
 /// claims are the serial loop's: answers come back in the ITEMS' order
 /// whatever order the workers finish in, and a leg's panic fails the test

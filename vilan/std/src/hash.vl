@@ -137,6 +137,15 @@ export impl List<type T: Hashable> with Hashable {
 	}
 }
 
+/// A fixed array of `Hashable` elements is `Hashable` at every length — the
+/// canonical hash of the whole value, as a `List`'s is (array-lengths.md S5), so a
+/// `[u8; 4]` keys a `HashMap`.
+export impl [type T: Hashable; _] with Hashable {
+	fun hash(self): Hash {
+		canonical_hash(self)
+	}
+}
+
 /// B443: a tuple of `Hashable` elements is `Hashable`, at any arity — the canonical
 /// hash of the whole value, as a `List`'s is.
 export impl type T: (2..: Hashable) with Hashable {

@@ -780,3 +780,126 @@ fn a_directed_literal_at_an_open_element_types_by_its_items() {
         "a\n2\n8\n",
     );
 }
+
+// --- S5: std's first wave over every length ------------------------------------
+
+/// A166: `==` and `!=` over two fixed arrays, at any length and element; a
+/// `[derive(PartialEq)]` struct with an array field derives; an element that
+/// is not `PartialEq` keeps the refusal.
+#[test]
+fn s5_fixed_arrays_compare_with_equality_at_every_length() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+        [derive(PartialEq)]
+        struct Pixel {
+            rgba: [u8; 4],
+        }
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+        fun main() {
+            let fixed: [i32; 3] = [1, 2, 3];
+            print(fixed == [1, 2, 3]);
+            print(fixed != [1, 2, 4]);
+            let words: [str; 2] = ["a", "b"];
+            print(words == ["a", "b"]);
+            let empty: [i32; 0] = [];
+            print(empty == []);
+            let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+            print(grid == [[1, 2], [3, 4]]);
+            print(same(fixed, [1, 2, 3]));
+            print(Pixel { rgba = [1, 2, 3, 4] } == Pixel { rgba = [1, 2, 3, 4] });
+            print(Pixel { rgba = [1, 2, 3, 4] } == Pixel { rgba = [1, 2, 3, 5] });
+        }
+        "#,
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\n",
+    );
+    assert_fails_with(
+        r#"
+        struct Opaque {
+            value: i32,
+        }
+        fun main() {
+            let a: [Opaque; 1] = [Opaque { value = 1 }];
+            let b: [Opaque; 1] = [Opaque { value = 1 }];
+            let _same = a == b;
+        }
+        "#,
+        "does not implement the `PartialEq` operator",
+    );
+}
+
+/// `Hashable`: a fixed array keys a `HashMap` and joins a `HashSet`.
+#[test]
+fn s5_a_fixed_array_is_hashable() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+        fun main() {
+            mut colors: HashMap<[u8; 3], str> = HashMap::new();
+            colors.insert([255, 0, 0], "red");
+            colors.insert([0, 255, 0], "green");
+            print(colors.get([255, 0, 0]).unwrap_or("none"));
+            print(colors.get([0, 0, 255]).unwrap_or("none"));
+            mut seen: HashSet<[i32; 2]> = HashSet::new();
+            seen.insert([1, 2]);
+            seen.insert([1, 2]);
+            seen.insert([2, 1]);
+            print(seen.len());
+        }
+        "#,
+        "red\nnone\n2\n",
+    );
+}
+
+/// E283's array half: `T: Debug` takes a fixed array of any length.
+#[test]
+fn s5_a_fixed_array_is_debug_at_every_length() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::debug::Debug;
+        fun shown<T: Debug>(value: T): str {
+            value.debug()
+        }
+        fun main() {
+            let numbers: [i32; 3] = [1, 2, 3];
+            let words: [str; 2] = ["a", "b"];
+            let empty: [i32; 0] = [];
+            let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+            print(shown(numbers));
+            print(shown(words));
+            print(shown(empty));
+            print(shown(grid));
+        }
+        "#,
+        "[1, 2, 3]\n[\"a\", \"b\"]\n[]\n[[1, 2], [3, 4]]\n",
+    );
+}
+
+/// `to_list` and `iter`: the explicit conversions, each a copy.
+#[test]
+fn s5_a_fixed_array_converts_to_a_list_and_iterates() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+        fun main() {
+            let fixed: [i32; 3] = [1, 2, 3];
+            mut list = fixed.to_list();
+            list.push(4);
+            print(list.len());
+            print(fixed.len());
+            let doubled = fixed.iter().map(|x| x * 2).to_list();
+            print(doubled[2]);
+            let empty: [str; 0] = [];
+            print(empty.to_list().len());
+        }
+        "#,
+        "4\n3\n6\n0\n",
+    );
+}
