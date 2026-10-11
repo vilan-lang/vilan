@@ -20,7 +20,9 @@ line, the same bytes on both backends: `Point { x = 1, y = 2.0 }`,
 `Shape::Circle(1.5)`, `Some(5)`, `(1, "two")`, `[1, 2, 3]`,
 `HashMap { "ada" => 36 }`, `dyn Area(Square { side = 2 })`. Inside a value a
 float keeps its `.0` and a string is quoted; a backed enum prints its name
-(`Color::Red`), not the value it is backed by. A host value the printer could
+(`Color::Red`), not the value it is backed by. A closure or a function, bare
+or inside a value, prints its written type, `<closure |i32| i32>` (a named
+function `<closure fun double>`). A host value the printer could
 only name (a `Location`, a DOM node) is handed to the host's console as it is.
 
 `panic` is for unreachable states (expected failures are `Result`). A

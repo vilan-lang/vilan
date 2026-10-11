@@ -1416,6 +1416,35 @@ fn s3_print_writes_an_aggregate_through_the_printer_on_one_line() {
     );
 }
 
+/// E293: `print` of a bare closure, a named function and a generic `T` bound
+/// to a closure writes the written type where node printed `[Function: add]`.
+#[test]
+fn e293_print_of_a_bare_closure_writes_its_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun double(x: i32): i32 { x * 2 }\n",
+            "fun show<T>(value: T) {\n",
+            "\tprint(value);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet add = |x: i32| x + 1;\n",
+            "\tprint(add);\n",
+            "\tprint(|name: str, flag: bool| name);\n",
+            "\tprint(double);\n",
+            "\tshow(add);\n",
+            "\tprint(Some(add));\n",
+            "}\n",
+        ),
+        concat!(
+            "<closure |i32| i32>\n",
+            "<closure |str, bool| str>\n",
+            "<closure fun double>\n",
+            "<closure |i32| i32>\n",
+            "Some(<closure |i32| i32>)\n",
+        ),
+    );
+}
+
 /// S3: a generic `print(value)` prints each instance's type through the
 /// printer — a struct as a struct, a number as a number — and a `dyn` value
 /// prints what it holds (its table carries the `show` slot with no `dbg` in
