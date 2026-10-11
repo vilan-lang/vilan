@@ -54,8 +54,12 @@ fun main() {
 	print(zeros<2>().len());
 	let five: [str; 5] = ["a", "b", "c", "d", "e"];
 	print(count(five));
+	print(count([true, false]));
 	let slots: [i32; 3] = [7, 8, 9];
 	let ring = Ring { slots, at = 1 };
+	let literal_ring = Ring { slots = ["p", "q", "r", "s"], at = 3 };
+	print(literal_ring.capacity());
+	print(literal_ring.current());
 	print(ring.capacity());
 	print(ring.current());
 	let words: Ring<str, 2> = Ring { slots = ["x", "y"], at = 0 };

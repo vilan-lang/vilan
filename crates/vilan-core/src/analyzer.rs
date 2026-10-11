@@ -46140,6 +46140,16 @@ impl<'src> Analyzer<'src> {
                             ),
                         });
                     }
+                    // A literal at an OPEN element (`first(["a", "b", "c"])`
+                    // against `fun first<T>(values: [T; 3])`) types by its
+                    // items, the way it takes its own count at an open length:
+                    // answered with the constraint's own `T`, the call bound
+                    // `T` to itself and nothing grounded it (natively an
+                    // "unbound generic type parameter"; JS never asked).
+                    let substituted_element =
+                        self.substitute_type(&element_type, substitution_context);
+                    let element_is_open = !self.type_is_fully_determined(&substituted_element);
+                    let mut literal_element: Option<Type> = None;
                     for item_id in &item_ids {
                         let item_type = self.infer_type_inner(
                             *item_id,
@@ -46149,6 +46159,14 @@ impl<'src> Analyzer<'src> {
                         );
                         if matches!(item_type, Type::Unresolved) {
                             return Type::Unresolved;
+                        }
+                        if element_is_open {
+                            literal_element = Some(match literal_element.take() {
+                                None => item_type.clone(),
+                                Some(previous) => self
+                                    .reconcile_type(&previous, &item_type, substitution_context)
+                                    .map_or(previous, |(unified, _)| unified),
+                            });
                         }
                         // Each element must actually BE a `T` — the constraint
                         // directs inference but doesn't enforce, and this arm
@@ -46170,7 +46188,13 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                     }
-                    return Type::Array(*element_type_id, length);
+                    let element_type_id = match literal_element {
+                        Some(element) if self.type_is_fully_determined(&element) => {
+                            element.get_type_id(self)
+                        }
+                        _ => *element_type_id,
+                    };
+                    return Type::Array(element_type_id, length);
                 }
                 if item_ids.is_empty() {
                     return match self.primitive_struct_ids.get("List").copied() {

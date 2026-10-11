@@ -751,3 +751,32 @@ fn s3_a_trait_may_be_generic_over_a_length() {
         "3\n7\n",
     );
 }
+
+/// A directed literal at an OPEN element types by its items, as it takes its
+/// own count at an open length — the call grounds `T` from it (natively the
+/// element went unbound before; JS never asked). The native half is the
+/// differential's `array_length_generics.vl`.
+#[test]
+fn a_directed_literal_at_an_open_element_types_by_its_items() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun first<T>(values: [T; 3]): T {
+            values[0]
+        }
+        fun count<T, const N>(values: [T; N]): usize {
+            N
+        }
+        struct Trio<T> {
+            slots: [T; 3],
+        }
+        fun main() {
+            print(first(["a", "b", "c"]));
+            print(count([true, false]));
+            let trio = Trio { slots = [7, 8, 9] };
+            print(trio.slots[1]);
+        }
+        "#,
+        "a\n2\n8\n",
+    );
+}
