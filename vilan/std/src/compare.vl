@@ -153,6 +153,23 @@ impl List<type T: PartialEq> with PartialEq {
 	}
 }
 
+/// A fixed array of `PartialEq` elements is `PartialEq` at every length
+/// (array-lengths.md S5, A166): equal when every position is, compared with
+/// `==` as `List`'s are. Two arrays of different lengths are different types,
+/// so `==` never meets them.
+impl [type T: PartialEq; const N] with PartialEq {
+	fun eq(self, b: [T; N]): bool {
+		mut index = 0;
+		for item in self {
+			if !(item == b[index]) {
+				ret false;
+			}
+			index += 1;
+		}
+		true
+	}
+}
+
 // `str` carries the full ordering family (lexicographic, the native `<`), so
 // generic `T: Ord` code (sorting, `math::min`/`max`, `clamp`) accepts it. The
 // numeric primitives' ordering impls live with their other trait impls in

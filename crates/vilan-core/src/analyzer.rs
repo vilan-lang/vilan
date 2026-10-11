@@ -806,13 +806,20 @@ pub enum Expr<'src> {
     Is(Id, ExprPattern),
     List(Vec<Id>),
     // `[value; n]` — a fixed-length array literal: the value expr and the
-    // compile-time length `n` (an integer literal in v1). `value` copied per slot.
-    Repeat(Id, usize),
-    // `arr.len()` on a `[T; n]` subject — the subject and the compile-time
-    // length `n` read off its type. There is no member to dispatch to (`[T; n]`
-    // is structural); a pure subject folds to the literal, a side-effectful one
-    // still evaluates (fixed-arrays.md §10).
-    ArrayLen(Id, usize),
+    // LENGTH's type id (a `Type::Length`, or a length parameter the instance
+    // substitutes — array-lengths.md §5.3). `value` copied per slot.
+    Repeat(Id, TypeId),
+    // `arr.len()` on a `[T; n]` subject — the subject and the length's type id
+    // read off its type. There is no member to dispatch to (`[T; n]` is
+    // structural); a pure subject folds to the number, a side-effectful one
+    // still evaluates (fixed-arrays.md §10), and a length parameter folds per
+    // instance.
+    ArrayLen(Id, TypeId),
+    // A length parameter read as a value — `N` in the body of
+    // `impl [type T; const N]` (array-lengths.md §5.3) — by the id of its
+    // `Type::Generic`: a `usize`, folded per instance to the number the
+    // instance binds it to.
+    LengthValue(TypeId),
     Local(Id),
     // A match expression: the subject and the resolved legs.
     Match(Id, Vec<ExprMatchLeg>),
@@ -4827,6 +4834,28 @@ pub struct Analyzer<'src> {
     // (`check_generic_bound_satisfaction`); the element bound's type id is
     // stored unresolved like `generic_bounds` entries.
     tuple_bounds: HashMap<TypeId, TupleBoundRequirement>,
+    // array-lengths.md §3/§4: the LENGTH parameters — an impl subject's `_` or
+    // `const N` in an array's length position, by constraint id. A length
+    // parameter is an ordinary generic (it binds, substitutes and keys like a
+    // type argument); this set is its KIND, which the kind checks read: such a
+    // parameter may stand only in a length position, and a length position
+    // only holds one of these or a number.
+    length_parameters: HashSet<TypeId>,
+    // The length binders an impl subject registered, by the occurrence's
+    // `(source, name span)`: what tells a `const N` the head declared from one
+    // written where no binder may be introduced.
+    registered_length_binders: HashSet<(SourceId, Span)>,
+    // The slots of every length written as a NAME or a binder (`[T; N]`,
+    // `[T; const N]`): the `prepped_type_locals` drain refuses a type there and
+    // a length parameter anywhere else (§3's two kind checks).
+    length_position_type_ids: HashSet<TypeId>,
+    // The slots of the generic arguments written as a bare NAME — where a
+    // length parameter may stand (`Slots<N>`), held to the parameter's kind by
+    // the application's check instead of the drain's.
+    generic_argument_type_ids: HashSet<TypeId>,
+    // The calls that WROTE generic arguments (`zeros<4>()`, `f<i32>(..)`), the
+    // only ones the call-site kind check has anything to read.
+    calls_writing_generics: Vec<Id>,
     // B399: a mapped type's binder (`U` in `(U in T: F<U>)`), keyed by its
     // constraint id, -> the SOURCE type id it ranges over. A binder is
     // registered with no bound of its own, but when its source is a parameter
@@ -7759,6 +7788,11 @@ impl<'src> Analyzer<'src> {
             defaulted_parameter_types: HashSet::default(),
             defaulted_parameter_mentions: HashMap::default(),
             tuple_bounds: HashMap::default(),
+            length_parameters: HashSet::default(),
+            registered_length_binders: HashSet::default(),
+            length_position_type_ids: HashSet::default(),
+            calls_writing_generics: Vec::new(),
+            generic_argument_type_ids: HashSet::default(),
             mapped_binder_sources: HashMap::default(),
             tuple_walk_binders: HashMap::default(),
             tuple_walk_views: HashMap::default(),
@@ -8488,7 +8522,7 @@ impl<'src> Analyzer<'src> {
             }
             (Type::Tuple(lefts, _), Type::Tuple(rights, _)) => all(&lefts, &rights),
             (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
-                left_length == right_length
+                self.same_type_structure(left_length, right_length, depth + 1)
                     && self.same_type_structure(left_element, right_element, depth + 1)
             }
             (
@@ -9401,15 +9435,25 @@ impl<'src> Analyzer<'src> {
                         None => "nothing it is passed binds it, and its result is typed by it"
                             .to_string(),
                     };
-                errors.push((
-                    call_id,
-                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
-                    format!(
+                // array-lengths.md §5.2: a LENGTH nothing binds is the same
+                // refusal, and its explicit form is a number (`zeros<4>()`).
+                let message = match self.length_parameters.contains(&constraint_id) {
+                    true => format!(
+                        "cannot infer the length '{generic_label}' for this call: {why}. Write \
+                         it — on the binding the result lands in (`let value: [_; 4] = …`), \
+                         as the call's argument (`{member}<4>(…)`), or ascribe the call"
+                    ),
+                    false => format!(
                         "cannot infer '{generic_label}' for this call: {why}. Write the type — on \
                          the binding the result lands in (`let value: … = …`), as the call's \
                          type argument (`{member}<…>(…)`), or ascribe the call \
                          (`{member}(…) as …`)"
                     ),
+                };
+                errors.push((
+                    call_id,
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    message,
                     constraint_id,
                 ));
             }
@@ -10046,6 +10090,26 @@ impl<'src> Analyzer<'src> {
             for (index, (constraint_id, argument_type_id)) in
                 declared.iter().zip(&written_arguments).enumerate()
             {
+                // array-lengths.md §4: the argument's KIND first — a length
+                // where a type belongs, or the other way, is refused here.
+                let parameter_name = parameter_names.get(index).copied().unwrap_or("_");
+                if let Some(message) = self.generic_argument_kind_error(
+                    *constraint_id,
+                    parameter_name,
+                    *argument_type_id,
+                ) {
+                    self.push_at_written_type(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: message,
+                        },
+                        source_id,
+                        type_id,
+                    );
+                    continue;
+                }
                 let bound_traits = self.generic_bound_traits(*constraint_id);
                 if bound_traits.is_empty() {
                     continue;
@@ -11795,8 +11859,10 @@ impl<'src> Analyzer<'src> {
             (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.same_impl_types(left_items, right_items, comparing)
             }
+            // A length is one more argument (array-lengths.md §3): two length
+            // binders are one position as two type binders are.
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                left_length == right_length
+                self.same_impl_type(*left_length, *right_length, comparing)
                     && self.same_impl_type(*left_item, *right_item, comparing)
             }
             // B309: the `context` clause is deliberately NOT compared. Impl
@@ -12628,10 +12694,11 @@ impl<'src> Analyzer<'src> {
                 )
             }
             Type::Array(element_id, length) => {
+                let length = self.substitute_length(*length, context);
                 let element = element_id.get_type(self);
                 let substituted =
                     self.substitute_member_type(&element, self_trait, subject, context);
-                Type::Array(substituted.get_type_id(self), *length)
+                Type::Array(substituted.get_type_id(self), length)
             }
             Type::Closure(parameter_ids, return_type_id, contexts, modes) => {
                 let parameter_ids = parameter_ids.clone();
@@ -12855,6 +12922,7 @@ impl<'src> Analyzer<'src> {
                 | Type::Closure(..)
                 | Type::Function(_)
                 | Type::Module(_)
+                | Type::Length(_)
                 | Type::Mapped(_, _, _) => Members::Answer(false, true),
                 // A trait default body's `Self` (B463): a resource iff THIS
                 // instantiation says so, exactly as a `Generic` above — R11
@@ -12994,14 +13062,17 @@ impl<'src> Analyzer<'src> {
                     .all(|parameter| self.substitution_fixed(*parameter))
                     && self.substitution_fixed(*return_type)
             }
-            Type::Array(element, _) => self.substitution_fixed(*element),
+            Type::Array(element, length) => {
+                self.substitution_fixed(*element) && self.substitution_fixed(*length)
+            }
             Type::Any
             | Type::Never
             | Type::Void
             | Type::Unknown
             | Type::Unresolved
             | Type::Function(_)
-            | Type::Module(_) => true,
+            | Type::Module(_)
+            | Type::Length(_) => true,
         }
     }
 
@@ -13297,6 +13368,7 @@ impl<'src> Analyzer<'src> {
             | Type::Closure(..)
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Trait(_, _)
             | Type::Generic(_)
             | Type::Mapped(_, _, _) => (false, true),
@@ -13422,8 +13494,11 @@ impl<'src> Analyzer<'src> {
             Type::Array(element, length) => {
                 buf.push('[');
                 self.render_type_canonical(element, depth + 1, visiting, buf);
-                buf.push_str(&format!("; {length}]"));
+                buf.push_str("; ");
+                self.render_type_canonical(length, depth + 1, visiting, buf);
+                buf.push(']');
             }
+            Type::Length(length) => buf.push_str(&length.to_string()),
             // B309: the clause is not rendered into the CANONICAL key — the
             // key is a structural identity (same shape = same entry), and the
             // clause is a discipline over the shape.
@@ -14908,7 +14983,8 @@ impl<'src> Analyzer<'src> {
             | Type::Unknown
             | Type::Unresolved
             | Type::Function(_)
-            | Type::Module(_) => false,
+            | Type::Module(_)
+            | Type::Length(_) => false,
         }
     }
 
@@ -15367,6 +15443,7 @@ impl<'src> Analyzer<'src> {
             | Expr::FunctionReturn(None)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::Null
@@ -16191,6 +16268,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Async(_)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -16765,6 +16843,10 @@ impl<'src> Analyzer<'src> {
             }
             Type::Array(element, length) => {
                 let mut fields = Vec::new();
+                // Glue is built per concrete instantiation, so the length is a
+                // number here; a length parameter (which no instance carries)
+                // has no slots to name.
+                let length = self.type_id_to_type_map.array_length(length).unwrap_or(0);
                 if self.type_is_resource(element) {
                     for index in 0..length {
                         fields.push((index, element));
@@ -17267,6 +17349,7 @@ impl<'src> Analyzer<'src> {
             | Expr::Async(_)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -20565,6 +20648,7 @@ impl<'src> Analyzer<'src> {
             Expr::FunctionReturn(None)
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
@@ -22593,8 +22677,11 @@ impl<'src> Analyzer<'src> {
             (Type::Tuple(left_items, _), Type::Tuple(right_items, _)) => {
                 self.impl_subject_arguments_match(&left_items, &right_items)
             }
+            // A length binder is a hole like any other (array-lengths.md §5.4):
+            // `[type T; _]` matches `[i32; 3]`, and not the other way.
             (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
-                left_length == right_length && self.impl_subject_matches(left_item, right_item)
+                self.impl_subject_matches(left_length, right_length)
+                    && self.impl_subject_matches(left_item, right_item)
             }
             (left, right) => left == right,
         }
@@ -22632,7 +22719,10 @@ impl<'src> Analyzer<'src> {
                     self.collect_subject_binders(item, binders);
                 }
             }
-            Type::Array(item, _) => self.collect_subject_binders(item, binders),
+            Type::Array(item, length) => {
+                self.collect_subject_binders(item, binders);
+                self.collect_subject_binders(length, binders);
+            }
             _ => {}
         }
     }
@@ -23360,7 +23450,8 @@ impl<'src> Analyzer<'src> {
                         .all(|(left, right)| self.bound_argument_agrees(*left, *right, depth + 1))
             }
             (Type::Array(left, left_length), Type::Array(right, right_length)) => {
-                left_length == right_length && self.bound_argument_agrees(*left, *right, depth + 1)
+                self.bound_argument_agrees(*left_length, *right_length, depth + 1)
+                    && self.bound_argument_agrees(*left, *right, depth + 1)
             }
             _ => provided == required,
         }
@@ -35918,6 +36009,11 @@ impl<'src> Analyzer<'src> {
                     &parameter.bounds,
                     scope_id,
                 );
+                // array-lengths.md §5.1: `<const N>` is a LENGTH parameter — an
+                // ordinary generic whose kind is a length.
+                if parameter.is_const {
+                    self.length_parameters.insert(constraint_type_id);
+                }
                 // A tuple bound (`T: (2..: Display)`) records against the same
                 // constraint id; the element bound walks now and resolves at
                 // check time, like trait bounds.
@@ -36669,7 +36765,7 @@ impl<'src> Analyzer<'src> {
                 })
             }
             (Type::Array(wanted, wanted_length), Type::Array(got, got_length))
-                if wanted_length == got_length =>
+                if self.array_lengths_agree(*wanted_length, *got_length) =>
             {
                 let got = got.get_type(self);
                 self.annotation_admits(*wanted, &got, depth + 1)
@@ -37180,6 +37276,7 @@ impl<'src> Analyzer<'src> {
             | Type::Void
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Unknown
             | Type::Unresolved => false,
         }
@@ -37472,6 +37569,30 @@ impl<'src> Analyzer<'src> {
                     false => self.declared_generic_constraint_ids(subject_name, scope_id),
                 };
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
+                    // array-lengths.md §4: `const N` at a `const` parameter's
+                    // position binds the length, aliasing the declaration's own
+                    // parameter as a bare `type T` does (B77).
+                    if let Node::LengthBinder((binder_name, binder_span)) = &argument.0 {
+                        let inherited_constraint = inherited
+                            .as_ref()
+                            .and_then(|ids| ids.get(position).copied());
+                        let constraint_id = match inherited_constraint {
+                            Some(constraint_id) => {
+                                self.register_generic_parameter(
+                                    binder_name,
+                                    binder_span,
+                                    constraint_id,
+                                    scope_id,
+                                );
+                                constraint_id
+                            }
+                            None => self.register_binder(binder_name, binder_span, &[], scope_id),
+                        };
+                        self.length_parameters.insert(constraint_id);
+                        self.registered_length_binders
+                            .insert((self.current_source_id, *binder_span));
+                        continue;
+                    }
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.
                     if let Node::TypeBinder((binder_name, binder_span), bounds, None) = &argument.0
@@ -37481,6 +37602,21 @@ impl<'src> Analyzer<'src> {
                             .as_ref()
                             .and_then(|ids| ids.get(position).copied())
                         {
+                            // array-lengths.md §4: a `const` parameter's position
+                            // takes `const N` or `_`, never a TYPE binder.
+                            if *binder_name != ANONYMOUS_TYPE_BINDER
+                                && self.length_parameters.contains(&constraint_id)
+                            {
+                                self.diagnostics.push(Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: argument.1,
+                                    msg: format!(
+                                        "this position is a length parameter, so its binder is \
+                                         `const {binder_name}`, not `type {binder_name}`"
+                                    ),
+                                });
+                            }
                             self.register_generic_parameter(
                                 binder_name,
                                 binder_span,
@@ -37533,11 +37669,30 @@ impl<'src> Analyzer<'src> {
             }
             // B582 (array-lengths.md §11, S0): a fixed array's ELEMENT binds
             // like a tuple's — `impl [type T; 3] with Count` declares `T`, and
-            // selection already binds through an array's element
-            // (`impl_select::bind_subject`'s `Type::Array` arm). The length is a
-            // literal; a length binder is the paper's S2.
-            Node::ArrayType(element, _) => {
+            // selection binds through an array's element
+            // (`impl_select::bind_subject`'s `Type::Array` arm).
+            //
+            // S2: so does its LENGTH. `_` and `const N` in the length position
+            // are binders (the parser reads them as the element position's
+            // `TypeBinder`), registered as an unbounded generic whose KIND is a
+            // length: `[type T; _]` is `[type T; const N]` with the name
+            // declined, as B294's `_` is `type T`'s.
+            Node::ArrayType(element, length) => {
                 self.register_subject_binders(element, scope_id);
+                if let Node::TypeBinder((name, name_span), _, _)
+                | Node::LengthBinder((name, name_span)) = &length.0
+                {
+                    let constraint_type_id = self.register_binder(name, name_span, &[], scope_id);
+                    self.length_parameters.insert(constraint_type_id);
+                    self.registered_length_binders
+                        .insert((self.current_source_id, *name_span));
+                    self.withdraw_anonymous_binder_name(
+                        name,
+                        name_span,
+                        constraint_type_id,
+                        scope_id,
+                    );
+                }
             }
             _ => {}
         }
@@ -38280,27 +38435,339 @@ impl<'src> Analyzer<'src> {
         scope.name_to_id_map.insert("Self", self_id);
     }
 
-    /// The compile-time length of a `[T; n]` type or `[value; n]` literal — a
-    /// non-negative integer literal in v1 (a `const`-named length is deferred).
-    /// Emits an error and returns 0 (harmlessly failing the compile) otherwise.
-    fn array_length_literal(&mut self, node: &Spanned<Node<'src>>) -> usize {
-        // E287 (c): a length is a `usize`, so an unsuffixed literal or a
-        // `usize` one — `[i32; 3f64]` and `[0; 2i8]` were lengths 3 and 2,
-        // the suffix ignored.
-        if let Node::Number(whole, None, None | Some("usize")) = &node.0
-            && let Ok(length) = whole.parse::<usize>()
-        {
-            return length;
-        }
+    /// The compile-time length of a `[T; n]` type, a `[value; n]` literal or a
+    /// number written as a generic argument: a non-negative integer literal,
+    /// unsuffixed or `usize` (array-lengths.md §5.6 — a length is a count).
+    /// Anything else is refused with what a length may be, and answers `None`:
+    /// the caller types the length `Unresolved`, so no second error follows
+    /// from a stand-in number.
+    fn array_length_literal(&mut self, node: &Spanned<Node<'src>>) -> Option<usize> {
+        let message = match &node.0 {
+            Node::Number(whole, None, None | Some("usize")) => match whole.parse::<usize>() {
+                Ok(length) => return Some(length),
+                Err(_) => format!("`{whole}` is too large for an array length"),
+            },
+            Node::Number(whole, fraction, suffix) => {
+                let fraction = fraction
+                    .map(|fraction| format!(".{fraction}"))
+                    .unwrap_or_default();
+                let suffix = suffix.unwrap_or_default();
+                format!(
+                    "an array length is a count: write it as a whole number, unsuffixed or \
+                     `usize` (`3`, `3usize`), not `{whole}{fraction}{suffix}`"
+                )
+            }
+            _ => "an array length is a number, a length parameter (`<const N>`), or a name \
+                  bound to a number (`const let SIZE = 4;`); this one needs evaluating, and \
+                  const evaluation runs after the program is typed"
+                .to_string(),
+        };
         self.diagnostics.push(Error {
             trace: Vec::new(),
             note: None,
             span: node.1,
-            msg: "an array length must be a non-negative integer literal \
-                  (a `const` length is not supported yet)"
-                .to_string(),
+            msg: message,
         });
-        0
+        None
+    }
+
+    /// The number a NAMED length stands for (array-lengths.md §6, S4): an
+    /// immutable binding — `let` or `const let`, at any scope the name
+    /// resolves in, imported included — whose initializer is an integer
+    /// literal (unsuffixed or `usize`) or another such name. Read
+    /// syntactically, the way `const_eval::classify` draws its literal line,
+    /// so a length is known before the fixpoint. A chain that comes back to
+    /// itself is refused, and so is anything that would need evaluating.
+    fn named_length(&self, binding: Id, name: &str) -> Result<usize, String> {
+        let mut current = binding;
+        let mut current_name = name;
+        let mut seen: Vec<Id> = Vec::new();
+        loop {
+            if self.parameters.contains_key(&current) {
+                return Err(format!(
+                    "`{current_name}` is a parameter, a value known only when the function \
+                     runs; an array length is a number, a length parameter (`<const N>`), or \
+                     a name bound to a number"
+                ));
+            }
+            let Some(variable) = self.variables.get(&current) else {
+                return Err(format!(
+                    "`{current_name}` is not a length; an array length is a number, a length \
+                     parameter (`<const N>`), or a name bound to a number"
+                ));
+            };
+            if variable.mutable {
+                return Err(format!(
+                    "`{current_name}` is `mut`, so its value can change; a length is fixed — \
+                     bind it with `let` or `const let` to a number"
+                ));
+            }
+            if seen.contains(&current) {
+                return Err(format!("`{name}`'s length refers back to itself"));
+            }
+            seen.push(current);
+            let Some(initial) = variable.initial else {
+                return Err(format!("`{current_name}` has no value to be a length"));
+            };
+            match self.expr_id_to_expr_map.get(&initial) {
+                Some(Expr::Number(whole, None, None | Some("usize"))) => {
+                    return whole
+                        .parse::<usize>()
+                        .map_err(|_| format!("`{whole}` is too large for an array length"));
+                }
+                Some(Expr::Number(whole, fraction, suffix)) => {
+                    let fraction = fraction
+                        .map(|fraction| format!(".{fraction}"))
+                        .unwrap_or_default();
+                    let suffix = suffix.unwrap_or_default();
+                    return Err(format!(
+                        "`{current_name}` is `{whole}{fraction}{suffix}`, and an array length is \
+                         a count: bind it to a whole number, unsuffixed or `usize`"
+                    ));
+                }
+                Some(Expr::Local(next)) => {
+                    current = *next;
+                    current_name = self
+                        .variables
+                        .get(next)
+                        .map(|next| next.name)
+                        .or_else(|| self.parameters.get(next).map(|next| next.name))
+                        .unwrap_or(current_name);
+                }
+                _ => {
+                    return Err(format!(
+                        "an array length is a number, a length parameter (`<const N>`), or a \
+                         name bound to a number; `{current_name}`'s initializer needs \
+                         evaluating, and const evaluation runs after the program is typed — \
+                         bind it to a literal (`const let` keeps it compile-time)"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The type id of an array LENGTH as written in a `[T; n]` type or a
+    /// `[value; n]` literal (array-lengths.md §3, R2, and §4's grammar):
+    ///
+    /// - a number mints a `Type::Length`;
+    /// - a binder (`_`, `const N`) is the generic its impl subject registered,
+    ///   walked as the element position's binder is — and refused where no
+    ///   subject registered it (B294's rule: a binder is introduced in an impl
+    ///   subject or a generic list, nowhere else);
+    /// - a name (`N`) is walked as a type name and resolves with the others;
+    ///   the `prepped_type_locals` drain holds it to the length kind.
+    fn walk_array_length(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        match &node.0 {
+            Node::TypeBinder((name, name_span), _, _) | Node::LengthBinder((name, name_span)) => {
+                let registered = if *name == ANONYMOUS_TYPE_BINDER {
+                    self.anonymous_binder_parameters
+                        .contains_key(&(self.current_source_id, *name_span))
+                } else {
+                    self.registered_length_binders
+                        .contains(&(self.current_source_id, *name_span))
+                };
+                if !registered {
+                    let written = match *name == ANONYMOUS_TYPE_BINDER {
+                        true => "`_`".to_string(),
+                        false => format!("`const {name}`"),
+                    };
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: format!(
+                            "{written} introduces a length parameter, and only an `impl` \
+                             subject introduces one this way (`impl [type T; _]`, \
+                             `impl [type T; const N]`); write the length here as a number"
+                        ),
+                    });
+                    return Type::Unresolved.get_type_id(self);
+                }
+                let length = self.walk_type_node(node, scope_id);
+                self.length_position_type_ids.insert(length);
+                length
+            }
+            Node::Accessor(_) => {
+                let length = self.walk_type_node(node, scope_id);
+                self.length_position_type_ids.insert(length);
+                length
+            }
+            _ => match self.array_length_literal(node) {
+                Some(length) => self.length_type_id(length),
+                None => Type::Unresolved.get_type_id(self),
+            },
+        }
+    }
+
+    /// The kind check of one GENERIC ARGUMENT against the parameter it binds
+    /// (array-lengths.md §4): a `const` parameter takes a number or a length
+    /// parameter, and a type parameter takes no length. `None` when they agree,
+    /// or when the argument is still indeterminate (another diagnostic's).
+    fn generic_argument_kind_error(
+        &self,
+        parameter: TypeId,
+        parameter_name: &str,
+        argument: TypeId,
+    ) -> Option<String> {
+        let argument_type = self.type_id_to_type_map.get(&argument)?;
+        let argument_is_a_length = match argument_type {
+            Type::Length(_) => true,
+            Type::Generic(constraint_id) => self.length_parameters.contains(constraint_id),
+            Type::Any | Type::Unknown | Type::Unresolved => return None,
+            _ => false,
+        };
+        let rendered = self.pretty_print_type(argument_type, &HashMap::default());
+        match (
+            self.length_parameters.contains(&parameter),
+            argument_is_a_length,
+        ) {
+            (true, false) => Some(format!(
+                "`{parameter_name}` is a length parameter: give it a number (`<4>`) or another \
+                 length parameter, not the type `{rendered}`"
+            )),
+            (false, true) => Some(format!(
+                "`{rendered}` is a length, and `{parameter_name}` takes a type"
+            )),
+            _ => None,
+        }
+    }
+
+    /// The call-site half of [`Self::generic_argument_kind_error`]: every
+    /// call that WROTE generic arguments (recorded by the walk — a handful in
+    /// any program), against its callee's parameters.
+    fn check_call_generic_argument_kinds(&mut self) {
+        let mut refusals = Vec::new();
+        for call_id in &self.calls_writing_generics {
+            let Some(function_call) = self.function_calls.get(call_id) else {
+                continue;
+            };
+            let Some(Expr::Local(callee)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let Some(function) = self.functions.get(callee) else {
+                continue;
+            };
+            let names: Vec<&str> = self
+                .declared_generic_parameters
+                .get(callee)
+                .map(|declared| declared.iter().map(|parameter| parameter.name).collect())
+                .unwrap_or_default();
+            for (index, (parameter, argument)) in function
+                .generic_parameter_constraint_ids
+                .iter()
+                .zip(&function_call.generic_argument_ids)
+                .enumerate()
+            {
+                let name = names.get(index).copied().unwrap_or("_");
+                if let Some(message) = self.generic_argument_kind_error(*parameter, name, *argument)
+                {
+                    refusals.push((function_call.id, function_call.arguments_span, message));
+                }
+            }
+        }
+        for (call_id, arguments_span, message) in refusals {
+            let diagnostics_before = self.diagnostics.len();
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: self.clamp_span_to_first_line(arguments_span, call_id),
+                msg: message,
+            });
+            if let Some(source) = self.source_of_id(call_id) {
+                self.attribute_new_diagnostics(diagnostics_before, source);
+            }
+        }
+    }
+
+    /// One written GENERIC ARGUMENT, walked as a type. A bare name there may
+    /// name a length parameter (`Slots<N>`, `zeros<N>()`, array-lengths.md
+    /// §4) — whether it may is the PARAMETER's kind, which the application's
+    /// own check reads — so its slot is recorded and the drain's "a length is
+    /// not a type" refusal passes it by.
+    fn walk_generic_argument(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        let type_id = self.walk_type_node(node, scope_id);
+        if matches!(node.0, Node::Accessor(_)) {
+            self.generic_argument_type_ids.insert(type_id);
+        }
+        type_id
+    }
+
+    /// The kind check of a name the `prepped_type_locals` drain resolved
+    /// (array-lengths.md §3): a length parameter stands only in a length
+    /// position, and a length position holds only a length parameter (a
+    /// number never reaches the drain). `None` when the kinds agree.
+    fn length_kind_error(
+        &self,
+        type_id: TypeId,
+        subject_type: &Type,
+        name: &str,
+    ) -> Option<String> {
+        let names_a_length = matches!(
+            subject_type,
+            Type::Generic(constraint_id) if self.length_parameters.contains(constraint_id)
+        );
+        if names_a_length && self.generic_argument_type_ids.contains(&type_id) {
+            return None;
+        }
+        match (
+            self.length_position_type_ids.contains(&type_id),
+            names_a_length,
+        ) {
+            (true, false) => Some(format!(
+                "`{name}` is not a length; an array length is a number, a length parameter \
+                 (`<const N>`), or a name bound to a number"
+            )),
+            (false, true) => Some(format!(
+                "`{name}` is a length, not a type; it may stand only where an array's \
+                 length does (`[T; {name}]`)"
+            )),
+            _ => None,
+        }
+    }
+
+    /// A fresh id holding the length `length`. Lengths are minted like every
+    /// other type (never interned, see `type_id_for_type`); the derived
+    /// equality of `Type::Length` is what makes two of them the same length.
+    fn length_type_id(&mut self, length: usize) -> TypeId {
+        self.type_id_for_type(Type::Length(length))
+    }
+
+    /// An array length id through `substitution`: a length parameter the
+    /// substitution binds is what it is bound to, and every other length is
+    /// handed back AS IS — a `Type::Length` never changes under substitution,
+    /// so it is never re-minted (the element's walk mints; the length's does
+    /// not, which keeps a substituted array's ids where they were).
+    fn substitute_length(&self, length: TypeId, substitution: &SubstitutionContext) -> TypeId {
+        let mut current = length;
+        // A chain of length parameters bound to one another is short; the
+        // bound guards a self-binding (`N -> N`) the way `resolve_type_id` does.
+        for _ in 0..8 {
+            let Some(Type::Generic(constraint)) = self.type_id_to_type_map.get(&current) else {
+                return current;
+            };
+            match substitution.get(constraint) {
+                Some(bound) if *bound != current => current = *bound,
+                _ => return current,
+            }
+        }
+        current
+    }
+
+    /// Whether two array length ids are the same length, read without a
+    /// substitution: two equal numbers, or one length parameter on both
+    /// sides. (The comparators that read a parameter as a HOLE recurse into
+    /// the length as a type argument instead.)
+    fn array_lengths_agree(&self, left: TypeId, right: TypeId) -> bool {
+        left == right
+            || match (
+                self.type_id_to_type_map.get(&left),
+                self.type_id_to_type_map.get(&right),
+            ) {
+                (Some(Type::Length(left)), Some(Type::Length(right))) => left == right,
+                (Some(Type::Generic(left)), Some(Type::Generic(right))) => left == right,
+                _ => false,
+            }
     }
 
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
@@ -38614,7 +39081,7 @@ impl<'src> Analyzer<'src> {
                 None
             }
             // `type X` binders only appear in type position (impl subjects).
-            Node::TypeBinder(..) => Some(Expr::Error),
+            Node::TypeBinder(..) | Node::LengthBinder(_) => Some(Expr::Error),
             Node::Index(subject, index) => {
                 let subject_id = self.walk_expr_node(subject, scope_id);
                 let index_id = self.walk_expr_node(index, scope_id);
@@ -38701,10 +39168,13 @@ impl<'src> Analyzer<'src> {
                                     .as_ref()
                                     .map(|x| {
                                         x.0.iter()
-                                            .map(|y| self.walk_type_node(y, scope_id))
+                                            .map(|y| self.walk_generic_argument(y, scope_id))
                                             .collect()
                                     })
                                     .unwrap_or_else(Vec::new);
+                                if !generic_argument_ids.is_empty() {
+                                    self.calls_writing_generics.push(id);
+                                }
                                 self.written_call_arguments.push((
                                     id,
                                     subject_id,
@@ -38819,7 +39289,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::Repeat(value, length_node) => {
                 let value_id = self.walk_expr_node(value, scope_id);
-                let length = self.array_length_literal(length_node);
+                let length = self.walk_array_length(length_node, scope_id);
                 Some(Expr::Repeat(value_id, length))
             }
             Node::ArrayType(..) => {
@@ -39483,10 +39953,13 @@ impl<'src> Analyzer<'src> {
                     .as_ref()
                     .map(|x| {
                         x.0.iter()
-                            .map(|y| self.walk_type_node(y, scope_id))
+                            .map(|y| self.walk_generic_argument(y, scope_id))
                             .collect()
                     })
                     .unwrap_or_else(Vec::new);
+                if !generic_argument_ids.is_empty() {
+                    self.calls_writing_generics.push(id);
+                }
                 // E189: bank the argument entities as the WALK saw them,
                 // beside the subject above. `function_calls` records the same
                 // list, but only for a call that RESOLVED, so a closure
@@ -40051,7 +40524,7 @@ impl<'src> Analyzer<'src> {
                     .as_ref()
                     .map(|x| {
                         x.0.iter()
-                            .map(|y| self.walk_type_node(y, scope_id))
+                            .map(|y| self.walk_generic_argument(y, scope_id))
                             .collect()
                     })
                     .unwrap_or_else(Vec::new);
@@ -41065,7 +41538,7 @@ impl<'src> Analyzer<'src> {
                     let argument_type_ids = generic_arguments
                         .0
                         .iter()
-                        .map(|argument| self.walk_type_node(argument, body_scope_id))
+                        .map(|argument| self.walk_generic_argument(argument, body_scope_id))
                         .collect();
                     (Some(*name), argument_type_ids)
                 }
@@ -42344,6 +42817,28 @@ impl<'src> Analyzer<'src> {
                 let expected = expected_type_id.get_type(self);
                 let element_type_id = match expected {
                     Type::Array(element_id, length) => {
+                        // A length that was already refused says nothing more.
+                        if matches!(
+                            self.type_id_to_type_map.get(&length),
+                            Some(Type::Unresolved)
+                        ) {
+                            return None;
+                        }
+                        let Some(length) = self.type_id_to_type_map.array_length(length) else {
+                            let length =
+                                self.pretty_print_type(&length.get_type(self), &HashMap::default());
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: *span,
+                                msg: format!(
+                                    "a destructuring needs the array's length, and this \
+                                     array's is the length parameter `{length}`; index it \
+                                     (`values[0]`) or walk it with `for`"
+                                ),
+                            });
+                            return None;
+                        };
                         if length != patterns.len() {
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
@@ -42495,7 +42990,7 @@ impl<'src> Analyzer<'src> {
                 let argument_type_ids: Vec<TypeId> = generic_arguments
                     .0
                     .iter()
-                    .map(|argument| self.walk_type_node(argument, scope_id))
+                    .map(|argument| self.walk_generic_argument(argument, scope_id))
                     .collect();
                 // R10 (destruction.md §4): a written generic type application is a
                 // candidate for the native-container / external-generic resource
@@ -42542,6 +43037,38 @@ impl<'src> Analyzer<'src> {
             // annotation, a field, a parameter): it falls through to the same
             // name resolution every other type spelling takes, which refuses it
             // and says what `_` is for.
+            // `const N` (array-lengths.md §4): the length binder an impl
+            // subject registered, resolved by name as a named `type T` is; one
+            // written where no subject declared it is refused (B294's rule).
+            Node::LengthBinder((name, name_span)) => {
+                if self
+                    .registered_length_binders
+                    .contains(&(self.current_source_id, *name_span))
+                {
+                    self.length_position_type_ids.insert(type_id);
+                    self.prepped_type_locals.push((
+                        type_id,
+                        name,
+                        scope_id,
+                        *name_span,
+                        Vec::new(),
+                        self.current_source_id,
+                    ));
+                    None
+                } else {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: format!(
+                            "`const {name}` introduces a length parameter, and only an `impl` \
+                             subject introduces one this way (`impl [type T; _]`, \
+                             `impl [type T; const N]`); write the length here as a number"
+                        ),
+                    });
+                    Some(Type::Unresolved)
+                }
+            }
             Node::TypeBinder((name, name_span), _bounds, _) => {
                 match self
                     .anonymous_binder_parameters
@@ -42577,7 +43104,7 @@ impl<'src> Analyzer<'src> {
                 let argument_type_ids: Vec<TypeId> = generic_arguments
                     .iter()
                     .flat_map(|arguments| &arguments.0)
-                    .map(|argument| self.walk_type_node(argument, scope_id))
+                    .map(|argument| self.walk_generic_argument(argument, scope_id))
                     .collect();
                 if generic_arguments.is_some() {
                     // R10 (destruction.md §4), as on the unqualified form: a
@@ -42788,9 +43315,16 @@ impl<'src> Analyzer<'src> {
             // is an integer literal (v1) resolved to a `usize`.
             Node::ArrayType(element, length) => {
                 let element_type_id = self.walk_type_node(element, scope_id);
-                let length = self.array_length_literal(length);
+                let length = self.walk_array_length(length, scope_id);
                 Some(Type::Array(element_type_id, length))
             }
+            // array-lengths.md §4: a NUMBER as a generic argument is a length
+            // (`zeros<4>()`, `Ring<i32, 4>`); the parameter it lands on must be
+            // a `const` one, which the kind checks hold it to.
+            Node::Number(..) => Some(
+                self.array_length_literal(node)
+                    .map_or(Type::Unresolved, Type::Length),
+            ),
             // A parse-recovery hole (B142's depth stand-in is the one
             // type-position producer): the parser already reported it, so the
             // type degrades to the non-cascading `Unresolved` without a second
@@ -43330,8 +43864,9 @@ impl<'src> Analyzer<'src> {
                     self.collect_residual_generics(&item.get_type(self), out);
                 }
             }
-            Type::Array(element, _) => {
+            Type::Array(element, length) => {
                 self.collect_residual_generics(&element.get_type(self), out);
+                self.collect_residual_generics(&length.get_type(self), out);
             }
             _ => {}
         }
@@ -43358,14 +43893,22 @@ impl<'src> Analyzer<'src> {
             Type::Tuple(items, _) => items
                 .iter()
                 .all(|item| self.type_is_fully_determined(&item.get_type(self))),
-            Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
+            Type::Array(element_id, length_id) => {
+                self.type_is_fully_determined(&element_id.get_type(self))
+                    && self.type_is_fully_determined(&length_id.get_type(self))
+            }
             Type::Closure(parameter_ids, return_id, _, _) => {
                 parameter_ids
                     .iter()
                     .all(|parameter| self.type_is_fully_determined(&parameter.get_type(self)))
                     && self.type_is_fully_determined(&return_id.get_type(self))
             }
-            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+            Type::Any
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void
+            | Type::Length(_) => true,
         }
     }
 
@@ -43963,7 +44506,8 @@ impl<'src> Analyzer<'src> {
             | Type::Mapped(..)
             | Type::Function(_)
             | Type::Module(_)
-            | Type::Void => false,
+            | Type::Void
+            | Type::Length(_) => false,
         }
     }
 
@@ -45667,7 +46211,22 @@ impl<'src> Analyzer<'src> {
                 // is inferred against `T`. (`[a, b, c]` is otherwise a `List`.)
                 if let Type::Array(element_type_id, length) = constraint.as_ref() {
                     let element_type = element_type_id.get_type(self);
-                    if item_ids.len() != *length && self.reported_literal_errors.insert(expr_id) {
+                    // A length parameter the site is still inferring
+                    // (array-lengths.md §5.2: `total([1, 2, 3])` against
+                    // `[i32; N]`) takes the literal's COUNT — the literal's type
+                    // carries its own length, and the call binds `N` from it. A
+                    // bound one (or a number) is checked against the count.
+                    let expected_length = self
+                        .type_id_to_type_map
+                        .array_length(self.substitute_length(*length, substitution_context));
+                    let length = match expected_length {
+                        Some(_) => *length,
+                        None => self.length_type_id(item_ids.len()),
+                    };
+                    if let Some(length) = expected_length
+                        && item_ids.len() != length
+                        && self.reported_literal_errors.insert(expr_id)
+                    {
                         self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -45677,6 +46236,16 @@ impl<'src> Analyzer<'src> {
                             ),
                         });
                     }
+                    // A literal at an OPEN element (`first(["a", "b", "c"])`
+                    // against `fun first<T>(values: [T; 3])`) types by its
+                    // items, the way it takes its own count at an open length:
+                    // answered with the constraint's own `T`, the call bound
+                    // `T` to itself and nothing grounded it (natively an
+                    // "unbound generic type parameter"; JS never asked).
+                    let substituted_element =
+                        self.substitute_type(&element_type, substitution_context);
+                    let element_is_open = !self.type_is_fully_determined(&substituted_element);
+                    let mut literal_element: Option<Type> = None;
                     for item_id in &item_ids {
                         let item_type = self.infer_type_inner(
                             *item_id,
@@ -45686,6 +46255,14 @@ impl<'src> Analyzer<'src> {
                         );
                         if matches!(item_type, Type::Unresolved) {
                             return Type::Unresolved;
+                        }
+                        if element_is_open {
+                            literal_element = Some(match literal_element.take() {
+                                None => item_type.clone(),
+                                Some(previous) => self
+                                    .reconcile_type(&previous, &item_type, substitution_context)
+                                    .map_or(previous, |(unified, _)| unified),
+                            });
                         }
                         // Each element must actually BE a `T` — the constraint
                         // directs inference but doesn't enforce, and this arm
@@ -45707,7 +46284,13 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                     }
-                    return Type::Array(*element_type_id, *length);
+                    let element_type_id = match literal_element {
+                        Some(element) if self.type_is_fully_determined(&element) => {
+                            element.get_type_id(self)
+                        }
+                        _ => *element_type_id,
+                    };
+                    return Type::Array(element_type_id, length);
                 }
                 if item_ids.is_empty() {
                     return match self.primitive_struct_ids.get("List").copied() {
@@ -46012,7 +46595,7 @@ impl<'src> Analyzer<'src> {
             // `arr.len()` — the length is a compile-time constant; the result is
             // a `usize`, as every length is (B590: fixed-arrays.md §10 typed it
             // `i32` "matching `List.len()`", and I5 S2 moved `List.len()`).
-            Expr::ArrayLen(_, _) => self.primitive_struct_type("usize"),
+            Expr::ArrayLen(_, _) | Expr::LengthValue(_) => self.primitive_struct_type("usize"),
             Expr::Tuple(item_ids) => {
                 // A construction that is EXACTLY one spread is the concatenation
                 // of one: its type is the operand's, unchanged. This is the only
@@ -49149,16 +49732,32 @@ impl<'src> Analyzer<'src> {
                 (Type::Tuple(result_items, labels), all_bindings)
             }
             // Two arrays unify only at the SAME length (the length is part of the
-            // type) — a mismatch falls through to the no-reconcile path, so
-            // `[i32; 3]` and `[i32; 4]` are distinct. Same length → reconcile the
-            // element (binding a generic element like `List<T>` does).
-            (Type::Array(l_element, l_length), Type::Array(r_element, r_length))
-                if l_length == r_length =>
-            {
+            // type), so `[i32; 3]` and `[i32; 4]` are distinct. The length
+            // reconciles as a type argument does (array-lengths.md §3): two
+            // numbers agree by value, and a length parameter the site infers
+            // BINDS — `[T; N]` against `[i32; 3]` records `N = 3` beside
+            // `T = i32`. Then the element reconciles.
+            (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
+                let (l_length, r_length) = (*l_length, *r_length);
+                let (left_length, right_length) =
+                    (l_length.get_type(self), r_length.get_type(self));
+                let (length, mut bindings) =
+                    self.reconcile_type(&left_length, &right_length, substitution_context)?;
+                // The reconciled length is one side's own (a number, or the
+                // parameter itself), so it keeps that side's id: nothing mints.
+                let length = if length == left_length {
+                    l_length
+                } else if length == right_length {
+                    r_length
+                } else {
+                    length.get_type_id(self)
+                };
                 let l = l_element.get_type(self);
                 let r = r_element.get_type(self);
-                let (element, bindings) = self.reconcile_type(&l, &r, substitution_context)?;
-                (Type::Array(element.get_type_id(self), *l_length), bindings)
+                let (element, element_bindings) =
+                    self.reconcile_type(&l, &r, substitution_context)?;
+                bindings.extend(element_bindings);
+                (Type::Array(element.get_type_id(self), length), bindings)
             }
             // Same nominal type: unify argument-wise, keeping the instantiated
             // side when the other is erased. Reconciling the arguments collects
@@ -49570,7 +50169,12 @@ impl<'src> Analyzer<'src> {
             // too. The LENGTH is part of the type — `[i32; 3]` is not
             // `[i32; 4]` — so it is compared first, by value.
             (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
-                l_length == r_length && {
+                // The length compares as a type argument does (array-lengths.md
+                // §3): two numbers by value, a length parameter as the generic
+                // it is — a hole where the site infers it, rigid where the
+                // enclosing declaration owns it.
+                let (l_length, r_length) = (l_length.get_type(self), r_length.get_type(self));
+                self.compare_type_rigid(&l_length, &r_length, substitution_context, rigid) && {
                     let l = l_element.get_type(self);
                     let r = r_element.get_type(self);
                     self.compare_type_rigid(&l, &r, substitution_context, rigid)
@@ -49875,13 +50479,14 @@ impl<'src> Analyzer<'src> {
                     labels,
                 )
             }
-            // `[T; n]` substitutes its element (the length is a constant, carried
-            // through), so a generic `[T; 4]` monomorphizes to `[i32; 4]`.
+            // `[T; n]` substitutes its element and its length, so a generic
+            // `[T; 4]` monomorphizes to `[i32; 4]` and a `[T; N]` at `N = 3`
+            // to `[T; 3]` (array-lengths.md §3: a length binds like a type).
             Type::Array(element_id, length) => {
                 let (element_id, length) = (*element_id, *length);
                 Type::Array(
                     self.substitute_type_id(element_id, substitution_context),
-                    length,
+                    self.substitute_length(length, substitution_context),
                 )
             }
             // A mapped tuple substitutes its source; once that is a concrete tuple
@@ -58047,6 +58652,7 @@ impl<'src> Analyzer<'src> {
             | Type::Never
             | Type::Function(_)
             | Type::Module(_)
+            | Type::Length(_)
             | Type::Void => false,
         }
     }
@@ -58148,7 +58754,12 @@ impl<'src> Analyzer<'src> {
     fn type_is_ground(&self, type_id: TypeId) -> bool {
         match type_id.get_type(self) {
             Type::Generic(_) | Type::Unknown | Type::Unresolved => false,
-            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+            Type::Any
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void
+            | Type::Length(_) => true,
             Type::Closure(parameter_type_ids, return_type_id, _, _) => {
                 parameter_type_ids
                     .iter()
@@ -58162,7 +58773,9 @@ impl<'src> Analyzer<'src> {
             | Type::Tuple(argument_type_ids, _) => argument_type_ids
                 .iter()
                 .all(|argument_type_id| self.type_is_ground(*argument_type_id)),
-            Type::Array(element_type_id, _) => self.type_is_ground(element_type_id),
+            Type::Array(element_type_id, length_id) => {
+                self.type_is_ground(element_type_id) && self.type_is_ground(length_id)
+            }
             Type::Mapped(_, source_type_id, template_type_id) => {
                 self.type_is_ground(source_type_id) && self.type_is_ground(template_type_id)
             }
@@ -63830,6 +64443,7 @@ impl<'src> Analyzer<'src> {
                     _ => None,
                 };
                 if let Some(literal_index) = literal_index
+                    && let Some(length) = self.type_id_to_type_map.array_length(length)
                     && literal_index >= length
                 {
                     self.diagnostics.push(Error {
@@ -63874,6 +64488,20 @@ impl<'src> Analyzer<'src> {
                 Resolution::Failed
             }
         }
+    }
+
+    /// Whether `id` sits inside a `const` expression's span (same file).
+    fn inside_a_const_expression(&self, id: Id) -> bool {
+        let Some(span) = self.span_map.get(&id).copied() else {
+            return false;
+        };
+        let source = self.source_of_id(id);
+        self.const_exprs.iter().any(|root| {
+            self.span_map
+                .get(root)
+                .is_some_and(|root_span| root_span.start <= span.start && span.end <= root_span.end)
+                && self.source_of_id(*root) == source
+        })
     }
 
     /// The diagnostic to raise when the bare name `name`, resolving to
@@ -64079,6 +64707,37 @@ impl<'src> Analyzer<'src> {
             });
         match resolved {
             Some(subject_id) => {
+                // array-lengths.md §5.3: a LENGTH parameter is a value — a
+                // `usize`, the number its instance binds it to.
+                if let Some(Expr::Generic(constraint_id)) =
+                    self.expr_id_to_expr_map.get(&subject_id)
+                    && self.length_parameters.contains(constraint_id)
+                {
+                    let constraint_id = *constraint_id;
+                    // A `const` expression evaluates once per SITE, and the
+                    // length differs per instance: it may not read one.
+                    if self.inside_a_const_expression(id) {
+                        let diagnostics_before = self.diagnostics.len();
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "`{name}` is a length parameter: it is fixed per instance, \
+                                 not at this site, so a `const` expression cannot read it"
+                            ),
+                        });
+                        if let Some(source) = self.source_of_id(id) {
+                            self.attribute_new_diagnostics(diagnostics_before, source);
+                        }
+                        self.expr_id_to_expr_map.insert(id, Expr::Error);
+                        return;
+                    }
+                    let length = Type::Generic(constraint_id).get_type_id(self);
+                    self.expr_id_to_expr_map
+                        .insert(id, Expr::LengthValue(length));
+                    return;
+                }
                 if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                     let diagnostics_before = self.diagnostics.len();
                     self.diagnostics.push(Error {
@@ -64689,9 +65348,53 @@ impl<'src> Analyzer<'src> {
                 .try_get_type_id_by_name(name, scope_id)
                 .or_else(|| self.try_get_expr_id_by_name(name, scope_id));
             match resolved {
+                // array-lengths.md §6 (S4): a length position naming a VALUE
+                // binding is a named length — resolved here, before the
+                // fixpoint, to the number its literal initializer holds.
+                Some(subject_id)
+                    if self.length_position_type_ids.contains(&type_id)
+                        && (self.variables.contains_key(&subject_id)
+                            || self.parameters.contains_key(&subject_id)) =>
+                {
+                    match self.named_length(subject_id, name) {
+                        Ok(length) => self.write_type_slot(type_id, Type::Length(length)),
+                        Err(message) => {
+                            self.push_at_written_type(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: message,
+                                },
+                                source_id,
+                                type_id,
+                            );
+                            self.refused_annotation_slots
+                                .insert(type_id, (source_id, span));
+                            self.write_type_slot(type_id, Type::Unresolved);
+                        }
+                    }
+                }
                 Some(subject_id) => {
                     let subject_type =
                         self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+                    // array-lengths.md §3: the two kind checks, at the name.
+                    if let Some(message) = self.length_kind_error(type_id, &subject_type, name) {
+                        self.push_at_written_type(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                            type_id,
+                        );
+                        self.refused_annotation_slots
+                            .insert(type_id, (source_id, span));
+                        self.write_type_slot(type_id, Type::Unknown);
+                        continue;
+                    }
                     // B245: a mention of a DEFAULTED parameter keeps the
                     // parameter's identity. Every written type mints its own
                     // slot, and this one resolves to the DEFAULT's type — for
@@ -65410,6 +66113,11 @@ impl<'src> Analyzer<'src> {
                              `{trait_name}` itself, so it is written for EVERY type that \
                              implements it — and that type has no name here. Say `Self`, or \
                              name it in the head: `impl type {name}: {trait_name}<..>`"
+                        )
+                    } else if self.length_position_type_ids.contains(&type_id) {
+                        format!(
+                            "cannot find the length '{name}'; an array length is a number, a \
+                             length parameter (`<const N>`), or a name bound to a number"
                         )
                     } else {
                         let steer = self.import_steer(name).unwrap_or_default();
@@ -70106,8 +70814,9 @@ impl<'src> Analyzer<'src> {
                     self.collect_generics(&item.get_type(self), depth + 1, out);
                 }
             }
-            Type::Array(element_id, _) => {
+            Type::Array(element_id, length_id) => {
                 self.collect_generics(&element_id.get_type(self), depth + 1, out);
+                self.collect_generics(&length_id.get_type(self), depth + 1, out);
             }
             _ => {}
         }
@@ -70403,12 +71112,17 @@ impl<'src> Analyzer<'src> {
                 }
                 buf.push(')');
             }
-            Type::Array(element_id, length) => {
+            Type::Array(element_id, length_id) => {
                 let element = element_id.get_type(self);
                 let element_str =
                     self.pretty_print_type_at(&element, substitution, depth + 1, visiting);
-                buf.push_str(&format!("[{element_str}; {length}]"));
+                let length = length_id.get_type(self);
+                let length_str =
+                    self.pretty_print_type_at(&length, substitution, depth + 1, visiting);
+                buf.push_str(&format!("[{element_str}; {length_str}]"));
             }
+            // A length prints as its number (array-lengths.md §3).
+            Type::Length(length) => buf.push_str(&length.to_string()),
             Type::Mapped(binder_id, source_id, template_id) => {
                 let binder = self
                     .generic_constraint_names
@@ -82255,6 +82969,7 @@ fn analyze_over_world<'src>(
         // B251's twin of the bound check above, at the third binding channel:
         // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).
         analyzer.check_written_nominal_bounds();
+        analyzer.check_call_generic_argument_kinds();
         analyzer.check_tuple_spreads();
         analyzer.check_tuple_literal_labels();
         analyzer.check_named_arguments();
@@ -85671,7 +86386,8 @@ mod walk_type_node_fence_tests {
             Vec::new(),
             Vec::new(),
         ));
-        let array = analyzer.type_id_for_type(Type::Array(tuple, 3));
+        let length = analyzer.length_type_id(3);
+        let array = analyzer.type_id_for_type(Type::Array(tuple, length));
         let slots = [unresolved, void, generic, tuple, closure, array];
         assert!(
             slots.iter().any(|slot| !matches!(

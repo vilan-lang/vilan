@@ -2130,7 +2130,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Type::Tuple(elements, _) => {
                 Type::Tuple(self.substituted_all(&elements, entries), TupleLabels::NONE)
             }
-            Type::Array(element, length) => Type::Array(self.substituted(element, entries), length),
+            Type::Array(element, length) => Type::Array(
+                self.substituted(element, entries),
+                self.substituted(length, entries),
+            ),
             Type::Closure(parameters, returns, contexts, modes) => Type::Closure(
                 self.substituted_all(&parameters, entries),
                 self.substituted(returns, entries),
@@ -2372,10 +2375,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 out.push_str("->");
                 self.write_type_key(*return_type_id, out);
             }
+            // The length keys through the same walk (array-lengths.md §8.1):
+            // `Arr[i32;3]` for every `[i32; 3]`, whatever spelled the 3.
             Type::Array(element_type_id, length) => {
                 out.push_str("Arr[");
                 self.write_type_key(*element_type_id, out);
-                let _ = write!(out, ";{length}]");
+                out.push(';');
+                self.write_type_key(*length, out);
+                out.push(']');
+            }
+            Type::Length(length) => {
+                let _ = write!(out, "{length}");
             }
             // A generic the substitution did not reach is an ABSTRACT type, and
             // two distinct binders are two distinct abstract types — so this one
@@ -2894,6 +2904,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Type::Array(element, length) => {
                 let on_the_heap = self.array_lives_on_the_heap(element, length);
+                let length = self.array_length_at(length, span)?;
                 let element = self.rust_type(element, span)?;
                 if on_the_heap {
                     return Ok(format!("vilan_rt::HeapArray<{element}, {length}>"));
@@ -3123,6 +3134,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let external = declaration.external;
         let mut rendered = Vec::new();
         for argument in arguments {
+            // A LENGTH argument (`struct Ring<T, const N>` at `Ring<i32, 3>`,
+            // array-lengths.md S3) is no Rust type: the instance minted below
+            // is keyed by it and renders its fields' `[T; 3]` from it.
+            if matches!(self.resolve(*argument), Some(Type::Length(_))) {
+                continue;
+            }
             rendered.push(self.rust_type(*argument, span)?);
         }
         // A name is only a RUNTIME type when std declared it `external`. The
@@ -3246,6 +3263,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = declaration.name;
         let mut rendered = Vec::new();
         for argument in arguments {
+            // A LENGTH argument keys the minted instance; it is no Rust type
+            // (see `nominal_struct`).
+            if matches!(self.resolve(*argument), Some(Type::Length(_))) {
+                continue;
+            }
             rendered.push(self.rust_type(*argument, span)?);
         }
         // F20: a BACKED enum IS its backing value at runtime — a number or a
@@ -3331,7 +3353,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Type::Tuple(ref elements, _) => {
                 Type::Tuple(self.deeply_resolved_all(elements), TupleLabels::NONE)
             }
-            Type::Array(element, length) => Type::Array(self.deeply_resolved(element), length),
+            Type::Array(element, length) => {
+                Type::Array(self.deeply_resolved(element), self.deeply_resolved(length))
+            }
             Type::Closure(ref parameters, returns, ref contexts, ref modes) => Type::Closure(
                 self.deeply_resolved_all(parameters),
                 self.deeply_resolved(returns),
@@ -5355,7 +5379,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
             }
             Some(Type::Array(element, length)) => {
-                if length > 1 {
+                if self.array_length(length).is_none_or(|length| length > 1) {
                     self.refuse_an_unordered_teardown(&[element, element], "a fixed array", span)?;
                 }
                 self.refuse_an_unordered_drop(element, span, visiting)?;
@@ -5582,6 +5606,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.expecting_nothing(|emitter| emitter.expression(subject, depth))?;
                 format!("({subject}).len()")
             }
+            // array-lengths.md §5.3: a length parameter read as a value is the
+            // number this instance binds it to, a `usize`.
+            Expr::LengthValue(length) => format!("{}usize", self.array_length_at(length, span)?),
             // F100: `[value; n]` evaluates the value ONCE and copies it into
             // each slot — the JS backend's `__repeat`, which fills a scalar and
             // clones an aggregate per slot.
@@ -5595,8 +5622,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         _ => None,
                     });
                 let value = self.consumed_value_of_expecting(value, element, depth)?;
+                let length_id = length;
+                let length = self.array_length_at(length_id, span)?;
                 // F122: past the threshold the slots are filled on the heap.
-                if element.is_some_and(|element| self.array_lives_on_the_heap(element, length)) {
+                if element.is_some_and(|element| self.array_lives_on_the_heap(element, length_id)) {
                     format!("vilan_rt::heap_repeat::<_, {length}>({value})")
                 } else {
                     format!(
@@ -5763,9 +5792,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         Type::Array(element, length) => Some((*element, *length)),
                         _ => None,
                     });
-                if let Some((element, length)) = fixed {
+                if let Some((element, _)) = fixed {
+                    // A literal's length is its count — also where the position's
+                    // length is a parameter this instance reads through another
+                    // call's signature (`fixed == [1, 2, 3]` lowers to an `eq`
+                    // whose `b: [T; N]` is the impl's).
+                    let length = elements.len();
                     // F122: a literal past the threshold is built on the heap.
-                    if self.array_lives_on_the_heap(element, length) {
+                    if self.heap_array_at(element, length) {
                         format!(
                             "vilan_rt::HeapArray::<_, {length}>::from_vec(vec![{}])",
                             parts.join(", ")
@@ -6274,6 +6308,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 | Expr::List(_)
                 | Expr::Repeat(..)
                 | Expr::ArrayLen(..)
+                | Expr::LengthValue(_)
                 | Expr::StructInitializer(..),
             ) => true,
             _ => false,
@@ -8052,12 +8087,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let rendered = self.const_tuple(items, &mut cursor, &elements, span)?;
                 Ok(rendered)
             }
-            (ConstValue::Array(items), Some(Type::Array(element, length))) => {
+            (ConstValue::Array(items), Some(Type::Array(element, length_id))) => {
                 let mut parts = Vec::new();
                 for item in items {
                     parts.push(self.const_value(item, Some(element), span)?);
                 }
-                if self.array_lives_on_the_heap(element, length) {
+                let length = self.array_length_at(length_id, span)?;
+                if self.array_lives_on_the_heap(element, length_id) {
                     return Ok(format!(
                         "vilan_rt::HeapArray::<_, {length}>::from_vec(vec![{}])",
                         parts.join(", ")
@@ -8289,9 +8325,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// estimated size past [`HEAP_ARRAY_BYTES`]. Read under the substitution
     /// in force, so an instance and its call site, which see the same
     /// concrete element, always agree on the rendering.
-    fn array_lives_on_the_heap(&mut self, element: TypeId, length: usize) -> bool {
+    fn array_lives_on_the_heap(&mut self, element: TypeId, length: TypeId) -> bool {
+        match self.array_length(length) {
+            Some(length) => self.heap_array_at(element, length),
+            None => false,
+        }
+    }
+
+    /// [`Self::array_lives_on_the_heap`] at a length already known.
+    fn heap_array_at(&mut self, element: TypeId, length: usize) -> bool {
         let element = self.estimated_size(element, &mut Vec::new());
         element.saturating_mul(length) > HEAP_ARRAY_BYTES
+    }
+
+    /// The number an array length id holds under the instance's substitution
+    /// (array-lengths.md §3: a `Type::Length`, or a length parameter the
+    /// instance binds to one); `None` while it is still a parameter.
+    fn array_length(&self, length: TypeId) -> Option<usize> {
+        match self.resolve(length) {
+            Some(Type::Length(length)) => Some(*length),
+            _ => None,
+        }
+    }
+
+    /// [`Self::array_length`] where the emission needs the number: a length no
+    /// substitution reached is refused by name rather than guessed.
+    fn array_length_at(&self, length: TypeId, span: Span) -> Result<usize, Error> {
+        self.array_length(length)
+            .ok_or_else(|| unsupported("an array whose length did not resolve to a number", span))
     }
 
     /// F122: the bytes a value of `type_id` takes inline natively, ESTIMATED
@@ -8372,6 +8433,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if self.array_lives_on_the_heap(element, length) {
                     8
                 } else {
+                    let length = self.array_length(length).unwrap_or(0);
                     self.estimated_size(element, visiting)
                         .saturating_mul(length)
                 }
@@ -8890,13 +8952,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ExprPattern::Array(elements) => {
                 let (element_type, length) =
                     match subject_type.and_then(|type_id| self.resolve(type_id)) {
-                        Some(Type::Array(element, length)) => (Some(*element), *length),
-                        _ => (None, 0),
+                        Some(Type::Array(element, length)) => (Some(*element), Some(*length)),
+                        _ => (None, None),
                     };
                 // F122: an array past the threshold is a pointer natively,
                 // and a slot-by-slot pattern over one that large is not a
                 // shape a program writes; named rather than mis-emitted.
-                if let Some(element) = element_type
+                if let (Some(element), Some(length)) = (element_type, length)
                     && self.array_lives_on_the_heap(element, length)
                 {
                     return Err(unsupported(
@@ -9221,6 +9283,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.bind_parameters(parameters, *inner_pattern, *inner_concrete, out);
                 }
             }
+            // An array binds through its element AND its length (array-lengths.md
+            // §3: a length parameter is an ordinary generic) — `fun zeros<const
+            // N>(): [i32; N]` learns `N` from the position `[i32; 4]`.
+            Some(Type::Array(pattern_element, pattern_length)) => {
+                let (pattern_element, pattern_length) = (*pattern_element, *pattern_length);
+                let Some(Type::Array(concrete_element, concrete_length)) =
+                    self.type_entry(&concrete).cloned()
+                else {
+                    return;
+                };
+                self.bind_parameters(parameters, pattern_element, concrete_element, out);
+                self.bind_parameters(parameters, pattern_length, concrete_length, out);
+            }
             // F38: a closure type binds through its parameters and its return —
             // `and_then<U>(self, fn: |T| Result<U, E>)` learns `U` from the
             // closure it is handed.
@@ -9263,7 +9338,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ) => arguments
                 .iter()
                 .all(|inner| self.is_closed_in_itself(*inner)),
-            Some(Type::Array(element, _)) => self.is_closed_in_itself(*element),
+            Some(Type::Array(element, length)) => {
+                let (element, length) = (*element, *length);
+                self.is_closed_in_itself(element) && self.is_closed_in_itself(length)
+            }
             Some(Type::Mapped(..)) => false,
             Some(Type::Closure(parameters, returns, _, _)) => {
                 parameters
@@ -9298,6 +9376,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .clone()
                 .iter()
                 .all(|inner| self.is_grounded(*inner)),
+            Some(Type::Array(element, length)) => {
+                let (element, length) = (*element, *length);
+                self.is_grounded(element) && self.is_grounded(length)
+            }
             Some(_) => true,
         }
     }

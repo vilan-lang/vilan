@@ -865,6 +865,7 @@ impl Liveness<'_, '_> {
             // Declarations and non-value leaves.
             | Expr::Bool(_)
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)

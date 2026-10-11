@@ -1143,6 +1143,7 @@ impl<'a, 'src> Collector<'a, 'src> {
             | Expr::Module(_)
             | Expr::Null
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)

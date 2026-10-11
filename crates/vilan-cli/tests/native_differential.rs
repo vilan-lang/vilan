@@ -12660,6 +12660,87 @@ fn f121_a_fixed_array_prints_and_a_struct_holding_one_builds_on_both_backends() 
     );
 }
 
+/// array-lengths.md S2: one impl head over every array length — `[type T; _]`
+/// at lengths 1, 3 and 5, `[type T: Display; _]` walking its element, a
+/// literal `[i32; 3]` outranking the binder, and `Option<[type T; const N]>`
+/// reading `N` as a `usize` and repeating it. Each length is its own instance
+/// on both backends, and the length folds per instance.
+#[test]
+fn array_lengths_s2_an_any_length_impl_head_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_length_heads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_length_heads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an any-length impl head must answer the same natively"
+    );
+}
+
+/// array-lengths.md S3: `<const N>` on functions, a struct and an enum — the
+/// length bound from an argument, a directed literal, the expected type and
+/// an explicit `zeros<2>()`; `N` read as a value; a length parameter passed on
+/// as a generic argument (`Slots<N>`). Each length is its own instance on both
+/// backends.
+#[test]
+fn array_lengths_s3_const_length_parameters_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_length_generics.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_length_generics.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a length-generic function, struct and enum must answer the same natively"
+    );
+}
+
+/// array-lengths.md S5: std's first wave over every array length — `==` and
+/// `!=` (A166) including a derived struct with an array field, an array as a
+/// `HashMap` key and a `HashSet` member, `T: Debug` (E283's array half),
+/// `push_many` (A161), `to_list` and `iter`.
+#[test]
+fn array_lengths_s5_std_array_impls_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_std_surface.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_std_surface.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "std's array impls must answer the same natively"
+    );
+}
+
+/// array-lengths.md S4: a named length — a top-level `const let`, a `let`
+/// chained through it, a local `let` — in a type and in a repeat literal,
+/// resolved to its number before the fixpoint, the same on both backends.
+#[test]
+fn array_lengths_s4_named_lengths_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_named_lengths.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_named_lengths.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a named length must answer the same natively"
+    );
+}
+
 /// N158: the four longest legs run under [`legs_in_parallel`], whose two
 /// claims are the serial loop's: answers come back in the ITEMS' order
 /// whatever order the workers finish in, and a leg's panic fails the test

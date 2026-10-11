@@ -696,9 +696,12 @@ pub fn type_text(program: &Program, type_id: TypeId, resolve: &dyn Fn(TypeId) ->
                 .collect();
             format!("({})", parts.join(", "))
         }
-        Some(Type::Array(element, length)) => {
-            format!("[{}; {length}]", type_text(program, *element, resolve))
-        }
+        Some(Type::Array(element, length)) => format!(
+            "[{}; {}]",
+            type_text(program, *element, resolve),
+            type_text(program, *length, resolve)
+        ),
+        Some(Type::Length(length)) => length.to_string(),
         Some(Type::Closure(..)) | Some(Type::Function(_)) => {
             closure_text(program, type_id, resolve)
         }

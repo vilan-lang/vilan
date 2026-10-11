@@ -2795,6 +2795,10 @@ struct Transformer<'src> {
     // nothing. Collected here and turned into a hard compile error at assembly,
     // so the class cannot recur silently.
     unresolved_drop_sinks: Vec<Id>,
+    /// Array-length folds (`[value; n]`, `arr.len()`) whose length id did not
+    /// resolve to a number in the instance being emitted — a length parameter
+    /// no substitution reached. Never-silent, as `unresolved_drop_sinks` is.
+    unresolved_array_lengths: Vec<Id>,
     // Never-silent guard (B176): `str + value` sites the analyzer admitted on a
     // generic parameter's render bound, whose `to_string` could not be resolved
     // at this monomorphization. Falling through emits the raw host `+` — the
@@ -3224,6 +3228,7 @@ impl<'src> Transformer<'src> {
             emitting_stack: Vec::new(),
             bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
+            unresolved_array_lengths: Vec::new(),
             unrendered_concatenations: Vec::new(),
             pending_temporaries: Vec::new(),
             chunk_members: HashMap::default(),
@@ -3763,6 +3768,22 @@ impl<'src> Transformer<'src> {
                 msg: "internal: the type of this `drop` argument could not be \
                       resolved, so the sink cannot tell a resource from data and \
                       would tear nothing down; please report this program"
+                    .to_string(),
+            });
+        }
+
+        if let Some(&expr_id) = self.unresolved_array_lengths.first() {
+            return Err(Error {
+                trace: Vec::new(),
+                note: None,
+                span: self
+                    .program
+                    .span_map
+                    .get(&expr_id)
+                    .map(|span| **span)
+                    .unwrap_or_default(),
+                msg: "internal: this array length did not resolve to a number in the \
+                      instance being emitted; please report this program"
                     .to_string(),
             });
         }
@@ -4491,6 +4512,7 @@ impl<'src> Transformer<'src> {
             | Expr::CallerLocation(_)
             | Expr::Null
             | Expr::Number(_, _, _)
+            | Expr::LengthValue(_)
             | Expr::Parameter(_)
             | Expr::String(_)
             | Expr::Struct(_)
@@ -5610,6 +5632,12 @@ impl<'src> Transformer<'src> {
             Expr::Void => js::Node::Void,
             Expr::Null => js::Node::Null,
             Expr::Bool(x) => js::Node::Bool(*x),
+            // array-lengths.md §5.3: a length parameter read as a value is the
+            // number this instance binds it to.
+            Expr::LengthValue(length) => {
+                let length = self.array_length_or_report(*length, id);
+                js::Node::Number(length.to_string(), None)
+            }
             Expr::Number(whole, fraction, suffix) => {
                 // `n`-suffixed literals are JS BigInts (`5n`); other suffixes
                 // only affect typing and are dropped in the output. B404: an
@@ -7949,6 +7977,7 @@ impl<'src> Transformer<'src> {
                 self.used_helpers.insert("__repeat");
                 self.used_helpers.insert("__clone");
                 let value = self.walk_entity(*value_id, block).unwrap_or(js::Node::Void);
+                let length = self.array_length_or_report(*length, id);
                 js::Node::Call(
                     Box::new(js::Node::Local("__repeat".to_string())),
                     vec![value, js::Node::Number(length.to_string(), None)],
@@ -7959,13 +7988,19 @@ impl<'src> Transformer<'src> {
                 // the literal; a side-effectful one (`make().len()`, `grid[i].len()`)
                 // reads `subject.length` in place instead — same value (the array is
                 // a plain JS array), evaluated exactly once in source order.
-                if self.expr_has_side_effects(*subject_id) {
-                    let subject = self
-                        .walk_entity(*subject_id, block)
-                        .unwrap_or(js::Node::Void);
-                    js::Node::Property(Box::new(subject), "length".to_string())
-                } else {
-                    js::Node::Number(length.to_string(), None)
+                match self.array_length(*length) {
+                    Some(length) if !self.expr_has_side_effects(*subject_id) => {
+                        js::Node::Number(length.to_string(), None)
+                    }
+                    // A side-effectful subject, or a length this instance did
+                    // not resolve: the array is a plain JS array, so its
+                    // `.length` is the same value.
+                    _ => {
+                        let subject = self
+                            .walk_entity(*subject_id, block)
+                            .unwrap_or(js::Node::Void);
+                        js::Node::Property(Box::new(subject), "length".to_string())
+                    }
                 }
             }
             Expr::Tuple(ids) => {
@@ -12637,6 +12672,24 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// The number an array length id holds in the instance being emitted
+    /// (a length parameter reads through `current_substitution`).
+    fn array_length(&self, length: TypeId) -> Option<usize> {
+        self.program
+            .type_id_to_type_map
+            .array_length(self.resolve_type_id(length))
+    }
+
+    /// [`Self::array_length`], for a fold that has no JS fallback: an
+    /// unresolved length is recorded against `expr_id` (the never-silent
+    /// `unresolved_array_lengths`) and `0` stands in.
+    fn array_length_or_report(&mut self, length: TypeId, expr_id: Id) -> usize {
+        self.array_length(length).unwrap_or_else(|| {
+            self.unresolved_array_lengths.push(expr_id);
+            0
+        })
+    }
+
     fn resolve_type_id(&self, type_id: TypeId) -> TypeId {
         let Some(_guard) = crate::util::RecursionGuard::enter() else {
             return type_id;
@@ -12864,10 +12917,19 @@ impl<'src> Transformer<'src> {
                 out.push_str("->");
                 self.write_type_key(*return_type_id, out);
             }
+            // The length keys through the same walk as the element, so a
+            // length parameter the substitution binds writes the number it
+            // stands for and `Arr[i32;3]` stays the spelling of every
+            // `[i32; 3]` (array-lengths.md §8.1).
             Type::Array(element_type_id, length) => {
                 out.push_str("Arr[");
                 self.write_type_key(*element_type_id, out);
-                let _ = write!(out, ";{length}]");
+                out.push(';');
+                self.write_type_key(*length, out);
+                out.push(']');
+            }
+            Type::Length(length) => {
+                let _ = write!(out, "{length}");
             }
             Type::Mapped(binder_id, source_type_id, template_type_id) => {
                 let _ = write!(out, "Map(G{},", binder_id.0);

@@ -145,7 +145,8 @@ fun main() {
 ### Appending a run
 
 `push_many(items)` appends every item of a run, in order: another list, a
-`HashSet` (its members in insertion order) or any iterator — whatever is
+fixed array `[T; n]`, a `HashSet` (its members in insertion order) or any
+iterator — whatever is
 `Items<T>` (`std::iterator`). The run is taken whole first, so a list pushed
 onto itself appends a copy of itself as it stood.
 
@@ -178,6 +179,50 @@ fun main() {
 	print([1, 2, 3].join("-"));                    // 1-2-3
 }
 ```
+
+## Fixed arrays `[T; n]`
+
+A fixed array (the [tour](../tour/values-and-types.md) introduces it) is a
+value whose length is part of its type. std implements its traits once for
+every length, so `[u8; 4]` and `[str; 100]` get the same surface:
+
+- **`==` / `!=`** when the element is `PartialEq` — equal when every position
+  is. Two arrays of different lengths are different types, so `==` never
+  meets them; a `[derive(PartialEq)]` struct with an array field derives.
+- **`Hashable`** when the element is — an array keys a `HashMap` or joins a
+  `HashSet`.
+- **`Debug`** when the element is — `T: Debug` takes an array, and it prints
+  as a `List` does.
+- **`Items<T>`** — `xs.push_many(fixed)` appends one.
+- **`to_list()`**, a `List` copy of the elements, and **`iter()`**, a cursor
+  over a snapshot of them that opens the [adapter chain](#adapters). An
+  array never coerces to a `List`; these are the conversions.
+
+```vilan
+import std::{ hash_map::HashMap, iterator::Iterator };
+
+fun main() {
+	let rgb: [u8; 3] = [255, 128, 0];
+	print(rgb == [255, 128, 0]);             // true
+
+	mut names: HashMap<[u8; 3], str> = HashMap::new();
+	names.insert(rgb, "orange");
+	print(names.get([255, 128, 0]).unwrap_or("?"));  // orange
+
+	mut xs = [1];
+	let more: [i32; 2] = [2, 3];
+	xs.push_many(more);
+	print(xs.len());                           // 3
+	let doubled = rgb.iter().map(|c| c.as_i32() * 2).to_list();
+	print(doubled[0]);                         // 510
+	print(rgb.to_list().len());                // 3
+}
+```
+
+The same door is open to your own traits: an impl head may bind the length
+(`impl [type T; _] with Count`, or `impl [type T; const N]` to read it as `N`),
+and a function may take one (`fun total<const N>(values: [i32; N])`). The
+[types chapter](../spec/types.md) states the rules.
 
 ## `HashMap<K, V>`
 
@@ -422,8 +467,8 @@ unshared form is `HashMap::get_or_insert(key, make)` on a map you hold `mut`.
 A key's value is turned into a `Hash` (a canonical key) by `key.hash()`. Three
 routes reach it:
 
-- **Scalars** (`str`, `bool`, every sized numeric) and `List`/`Option` of a
-  `Hashable` — implemented by std.
+- **Scalars** (`str`, `bool`, every sized numeric), a fixed array `[T; n]`
+  and `List`/`Option` of a `Hashable` — implemented by std.
 - **A backed enum** — implemented by the compiler beside its `value()`/`parse()`
   (see the types chapter), off the same opt-in: writing `= "flex-start"` is what
   makes the enum that value, and the value is the key. So `Align::Start.hash()`

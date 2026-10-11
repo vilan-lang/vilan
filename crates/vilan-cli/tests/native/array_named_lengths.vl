@@ -1,0 +1,20 @@
+// array-lengths.md S4: a length may be a name bound to a number — a top-level
+// `const let`, a `let` chained through it, a local `let` — in a type and in a
+// repeat literal.
+import std::io::print;
+
+const let SIZE = 4;
+let ROW = SIZE;
+
+fun main() {
+	let header: [u8; SIZE] = [0u8; SIZE];
+	print(header.len());
+	let width = 3usize;
+	let row: [i32; width] = [1, 2, 3];
+	print(row.len());
+	let chained: [bool; ROW] = [true; ROW];
+	print(chained.len());
+	print(header == [0, 0, 0, 0]);
+}
+
+main();

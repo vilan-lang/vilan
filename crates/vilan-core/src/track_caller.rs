@@ -383,6 +383,7 @@ fn own_body_children(program: &Program, id: Id, out: &mut Vec<Id>) {
         | Expr::FunctionReturn(None)
         | Expr::Bool(_)
         | Expr::Number(_, _, _)
+        | Expr::LengthValue(_)
         | Expr::String(_)
         | Expr::MultilineString(_)
         | Expr::Null

@@ -88,6 +88,23 @@ impl List<type T: Debug> with Debug {
 	}
 }
 
+/// A fixed array prints as a `List` does (array-lengths.md S5, E283's array half),
+/// at every length.
+impl [type T: Debug; _] with Debug {
+	fun debug(self): str {
+		mut out = "[";
+		mut first = true;
+		for item in self {
+			if !first {
+				out = out + ", ";
+			}
+			first = false;
+			out = out + item.debug();
+		}
+		out + "]"
+	}
+}
+
 impl Option<type T: Debug> with Debug {
 	fun debug(self): str {
 		match self {
