@@ -65759,7 +65759,22 @@ impl<'src> Analyzer<'src> {
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()
                             );
-                            if has_concrete_args && let Some(impl_subject_id) = impl_subject {
+                            // B595: a BLANKET's member named on a concrete head
+                            // (`str::tag(1)` answered by `impl type T: Leaf with
+                            // Tag`) binds the blanket's subject binder to the
+                            // head, as method dispatch binds it to the receiver
+                            // — unbound, its bound "cannot be checked".
+                            let blanket_on_a_concrete_head =
+                                matches!(&subject_type, Type::Struct(..) | Type::Enum(..))
+                                    && impl_subject.is_some_and(|impl_subject_id| {
+                                        matches!(
+                                            impl_subject_id.borrow_type(self),
+                                            Type::Generic(_)
+                                        )
+                                    });
+                            if (has_concrete_args || blanket_on_a_concrete_head)
+                                && let Some(impl_subject_id) = impl_subject
+                            {
                                 let impl_subject_type = impl_subject_id.get_type(self);
                                 if let Some((_, bindings)) = self.reconcile_type(
                                     &impl_subject_type,

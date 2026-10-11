@@ -10177,6 +10177,23 @@ fn a_list_of_function_items_is_identical_on_both_backends() {
     );
 }
 
+/// B595: a blanket's static on a concrete head (`str::tag(1)` over `impl
+/// type T: Leaf with Tag`) binds the blanket's binder to the head.
+#[test]
+fn a_blankets_static_on_a_concrete_head_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_blanket_static_heads.vl"),
+        include_str!("native/blanket_static_heads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_blanket_static_heads.vl"),
+        Verdict::Identical,
+        "a blanket's static on a concrete head must resolve the same on both backends"
+    );
+}
+
 /// F63: a closure's expression body is the value it hands back, a CONSUMING
 /// position like a function body's tail, so a place read there takes rule 1's
 /// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured

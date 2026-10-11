@@ -1,0 +1,38 @@
+// B595: a blanket impl's static named on a concrete head binds the blanket's
+// subject binder to the head, on both backends.
+import std::io::print;
+
+trait Leaf {
+	fun leaf_name(): str;
+}
+
+trait Tag {
+	fun tag(value: i32): str;
+}
+
+struct Point {
+	x: i32,
+}
+
+impl str with Leaf {
+	fun leaf_name(): str {
+		"str"
+	}
+}
+
+impl Point with Leaf {
+	fun leaf_name(): str {
+		"point"
+	}
+}
+
+impl type T: Leaf with Tag {
+	fun tag(value: i32): str {
+		i"{T::leaf_name()} {value}"
+	}
+}
+
+fun main() {
+	print(str::tag(1));
+	print(Point::tag(2));
+}

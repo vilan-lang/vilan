@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B595: a blanket impl's static named on a concrete type resolves — `str::tag(1)` over `impl type T: Leaf with Tag` was refused "cannot infer 'T' for this call; its bound ': Leaf' cannot be checked", while the same call through a generic helper (`tag_of<str>(1)`) ran; it runs on both backends, the blanket's `T` bound to the written head (`T::leaf_name()` in the body reads `str`'s).** A static on a concrete head bound the matched impl's binders only when the head carried written arguments (`Boxy<i32>::make`); a blanket's subject binder is bound to the head now too, as method dispatch binds it to the receiver. A head the blanket's bound does not admit still has no such static. Pins: `traits::b595_*` (2), `native_differential::a_blankets_static_on_a_concrete_head_is_identical_on_both_backends` (`native/blanket_static_heads.vl`, new).
+
+---
+
+<!-- family: fix -->
 **B593: a function item in a list literal is its closure type — `let fs = [double, double]; fs[1](3)` was refused "cannot call this as a function: it is fn double(i32): i32" on both backends, and `[double, triple]` had no element type at all ("Expected fn double(i32): i32 … but got fn triple(i32): i32"); both build and run, beside a closure literal (`[double, |v| v + 1]`), by index, in a loop and after a push.** Every function item has its own type, as in Rust, so a list of two had none to unify; the list literal now coerces an item element to its closure type (`function_closure_type`, the coercion an annotated `let g: |i32| i32 = double` already makes), so the list is `List<|i32| i32>`. Items of different signatures still have no common type. Pins: `callable::b593_*` (2), `native_differential::a_list_of_function_items_is_identical_on_both_backends` (`native/listed_function_items.vl`, new).
 
 ---
