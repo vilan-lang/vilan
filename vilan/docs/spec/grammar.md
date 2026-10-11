@@ -487,6 +487,12 @@ Tuple { … }` is a blanket over every tuple of two or more elements, and
 impl selection admits a receiver the way a tuple-bounded parameter admits
 an argument — arity inside the range, every element satisfying the element
 bound.
+An array's LENGTH binds the same way (types §5.1, *Fixed arrays*): `_` or
+`const N` in a subject's length position (`impl [type T; _]`, `impl [type
+T; const N]`) is a length parameter, `_` the one the head declines to name;
+at a `const` parameter's argument position (`impl Ring<type T, const N>`)
+the binder is `const N` or `_`. A literal length outranks a length binder by
+the specificity order (`impl [i32; 3]` over `impl [type T; _]`).
 `with` lists the implemented trait(s). An impl without `with` provides
 inherent members. A trait's `with` lists supertraits.
 
@@ -495,14 +501,24 @@ inherent members. A trait's `with` lists supertraits.
 ```text
 generic-params = "<" generic-param { "," generic-param } [ "," ] ">" ;
 generic-param  = [ "type" ] IDENT [ ":" ( bound-list | tuple-bound ) ]
-                 [ "=" type ] ;
+                 [ "=" type ]
+               | "const" IDENT ;                (* a length parameter *)
 bound-list  = type { "+" type } ;
 tuple-bound = "(" [ NUMBER ] ".." [ NUMBER ] [ ":" type ] ")" ;
-generic-args = "<" type { "," type } [ "," ] ">" ;
+generic-args = "<" generic-arg { "," generic-arg } [ "," ] ">" ;
+generic-arg  = type | NUMBER | "const" IDENT ;  (* a length; a binder in an impl subject *)
 ```
 
 A tuple bound constrains a variadic tuple parameter's arity and,
 optionally, each element (`T: (2..)`, `T: (..: Display)`); see §5.9.
+
+`const N` declares a **length parameter** (types §5.6, *Length
+parameters*): `fun total<const N>(values: [i32; N])`, `struct Ring<T,
+const N> { slots: [T; N] }`. It takes no bound and no default. A NUMBER as a
+generic argument is the length a `const` parameter takes (`zeros<4>()`,
+`Ring<i32, 4>`); a name there is read as the type path it is spelled as, and
+the parameter's kind decides what it must name — a length parameter at a
+`const` position, a type at any other.
 
 ### Attributes and macro items
 
@@ -660,7 +676,8 @@ tuple   = "(" ( spread | entry "," entry { "," entry } [ "," ] ) ")"
 entry   = spread | labelled-entry | expression ;
 labelled-entry = MEMBER "=" expression ;  (* a label / a named argument, B569 *)
 spread  = ".." expression ;
-list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
+list    = "[" [ expression { "," expression } [ "," ] ] "]"
+        | "[" expression ";" array-length "]" ;   (* repeat: the value per slot *)
 tuple-comprehension = "(" comprehension-binding { "," comprehension-binding }
                       "=>" expression ")" ;
 comprehension-binding = IDENT "in" secondary-expr ;
@@ -976,7 +993,11 @@ type = "&" [ "mut" ] type                       (* view type *)
      | type-path                                 (* nominal *)
      | "(" IDENT "in" type ":" type ")"          (* mapped tuple, §5.9 *)
      | "(" [ tuple-slot { "," tuple-slot } [ "," ] ] ")"  (* tuple type *)
+     | "[" type ";" array-length "]"            (* fixed array, §5.1 *)
      ;
+array-length   = NUMBER                         (* unsuffixed or `usize` *)
+               | IDENT                          (* a length parameter *)
+               | "_" | "const" IDENT ;          (* impl-subject binders *)
 tuple-slot     = [ MEMBER ":" ] type ;     (* labelled: every slot, or none (B569) *)
 type-path      = IDENT { "::" IDENT } [ generic-args ] ;
 closure-type   = ( "||" | "|" [ [IDENT ":"] type { "," [IDENT ":"] type } "|" )
@@ -1002,6 +1023,15 @@ With no return type at all the clause is read by the function
 production above instead. Written after the return type it precedes a
 `borrows` clause, and written without one it follows it; the formatter
 prints it where it was written.
+
+A **fixed array** `[T; n]` holds `n` values of `T`, the length part of the
+type (types §5.1). Its length is a number, the name of a length parameter in
+scope (`[i32; N]` under `<const N>`), or — in an `impl` subject only — a
+length binder, `_` or `const N`. A binder written anywhere else is refused,
+as `_` is in an annotation. The same `array-length` follows the `;` of a
+repeat literal `[value; n]` (§3.6). A length that needs evaluating (`2 * K`,
+a call) is refused: lengths are known before the program is typed, and
+`const` evaluation runs after.
 
 A tuple type's slots may carry **labels** (B569): `(x: f64, y: f64)`.
 `MEMBER ":"` at a slot's head is a label (decided at the second token, so
