@@ -1445,6 +1445,49 @@ fn e293_print_of_a_bare_closure_writes_its_type() {
     );
 }
 
+/// E283's array half: `T: Debug` takes a `[T; n]` of any length through std's
+/// `impl [type T: Debug; _]`, the derive reaches an array field of any length
+/// and element (nested, empty, a generic `T`) through it, and an array of
+/// closures still prints each closure by its written type (no impl to call).
+#[test]
+fn e283_debug_takes_a_fixed_array_of_every_length() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "[derive(Debug)]\n",
+            "struct Holder<T> { grid: [[i32; 2]; 2], items: [T; 3], none: [str; 0], maybe: Option<[bool; 1]> }\n",
+            "[derive(Debug)]\n",
+            "struct Callbacks { fns: [|i32| i32; 2], bytes: [u8; 2] }\n",
+            "fun show<T: Debug>(value: T) {\n",
+            "\tprint(value.debug());\n",
+            "}\n",
+            "fun total<const N>(items: [i32; N]): str {\n",
+            "\titems.debug()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tshow([1, 2, 3]);\n",
+            "\tshow([[1.5; 2]; 2]);\n",
+            "\tshow([Some(\"a\"), None]);\n",
+            "\tlet empty: [i32; 0] = [];\n",
+            "\tshow(empty);\n",
+            "\tprint(total([9, 8]));\n",
+            "\tprint(Holder { grid = [[1, 2], [3, 4]], items = [1.0, 2.0, 3.0], none = [], maybe = Some([true]) }.debug());\n",
+            "\tlet f = |x: i32| x;\n",
+            "\tprint(Callbacks { fns = [f, f], bytes = [1, 2] }.debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "[1, 2, 3]\n",
+            "[[1.5, 1.5], [1.5, 1.5]]\n",
+            "[Some(\"a\"), None]\n",
+            "[]\n",
+            "[9, 8]\n",
+            "Holder { grid = [[1, 2], [3, 4]], items = [1.0, 2.0, 3.0], none = [], maybe = Some([true]) }\n",
+            "Callbacks { fns = [<closure |i32| i32>, <closure |i32| i32>], bytes = [1, 2] }\n",
+        ),
+    );
+}
+
 /// S3: a generic `print(value)` prints each instance's type through the
 /// printer — a struct as a struct, a number as a number — and a `dyn` value
 /// prints what it holds (its table carries the `show` slot with no `dbg` in

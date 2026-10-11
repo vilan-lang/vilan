@@ -12037,6 +12037,22 @@ fn e293_print_of_a_bare_closure_writes_its_type_on_both_backends() {
     );
 }
 
+/// E283's array half: `T: Debug` and `[derive(Debug)]` take a fixed array of
+/// every length (std's `impl [type T: Debug; _] with Debug`) - nested, empty,
+/// of structs and options, as a struct field, an enum payload, an option's
+/// payload, a tuple slot, a list element, a map value and through a generic
+/// `T: Debug` and a `const N` function - printing as a `List` does; the same
+/// bytes on both backends (`native/debug_arrays.*`).
+#[test]
+fn e283_debug_takes_a_fixed_array_of_every_length_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_debug_arrays.vl",
+        include_str!("native/debug_arrays.vl"),
+        include_str!("native/debug_arrays.stdout"),
+        "",
+    );
+}
+
 /// E276: `dbg` shows negative zero as `-0.0` — a literal, a computed one, an
 /// `f32`, one inside a list — and `.debug()` agrees, while `print` keeps
 /// N136's `0`; the same bytes on both backends.

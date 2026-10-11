@@ -1,0 +1,25 @@
+[1, 2, 3]
+[[1, 2], [3, 4]]
+[Point { x = 1, y = 2.0 }, Point { x = 3, y = 4.5 }]
+["a\"b", "c"]
+[1.0, 2.5]
+[Some(1), None]
+[]
+[7, 8]
+[true, true, true, true]
+[[1.5, 1.5], [1.5, 1.5]]
+[]
+[9, 8, 7]
+[]
+Holder { grid = [[1, 2], [3, 4]], points = [Point { x = 1, y = 2.0 }, Point { x = 3, y = 4.5 }], maybe = Some(["p", "q"]), none = [] }
+Fixed { items = [1.5, 2.0, 3.0] }
+Frame::Bytes([1, 2, 3, 4])
+Frame::Pair([1, 2], ["s"])
+Frame::Empty
+[[1, 2], [3, 4]]
+Some([1, 2])
+([1, 2], [3])
+HashMap { "k" => [1, 2] }
+[[[1], [2]], [[3], [4]]]
+[[[1], [2]], [[3], [4]]]
+Holder { grid = [[1, 2], [3, 4]], points = [Point { x = 1, y = 2.0 }, Point { x = 3, y = 4.5 }], maybe = Some(["p", "q"]), none = [] }
