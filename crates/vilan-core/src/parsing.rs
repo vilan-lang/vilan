@@ -129,6 +129,7 @@ fn collect_selector_binders(node: &Spanned<Node<'_>>, into: &mut Vec<Span>) {
             collect_selector_binders(element, into);
             collect_selector_binders(length, into);
         }
+        Node::LengthBinder(_) => into.push(node.1),
         Node::Reference(_, inner) | Node::TypeWithContexts(inner, _) => {
             collect_selector_binders(inner, into)
         }
@@ -7149,8 +7150,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             let start = parser.position;
             parser.expect_ctrl('<')?;
-            let arguments =
-                parser.comma_list(Self::parse_type, |parser| parser.peek_is_ctrl('>'))?;
+            let arguments = parser.comma_list(Self::parse_generic_argument, |parser| {
+                parser.peek_is_ctrl('>')
+            })?;
             parser.expect_ctrl('>')?;
             Some((arguments, parser.span_from(start)))
         }) {
@@ -7163,6 +7165,34 @@ impl<'a, 'src> Parser<'a, 'src> {
             &[('(', ')'), ('[', ']'), ('{', '}')],
         )
         .map(|span| (Vec::new(), span))
+    }
+
+    /// One generic argument (array-lengths.md §4): a type, a NUMBER — the
+    /// length a `const` parameter takes (`zeros<4>()`, `Ring<i32, 4>`) — or,
+    /// in an impl subject, a length binder (`impl Ring<type T, const N>`). A
+    /// name reads as the type path it is spelled as; the parameter's kind
+    /// decides what it must name.
+    fn parse_generic_argument(&mut self) -> Option<Spanned<Node<'src>>> {
+        match self.peek() {
+            Some(Token::Number(whole, None, suffix)) => {
+                let node = Node::Number(whole, None, *suffix);
+                let span = self.here_span();
+                self.bump();
+                Some((node, span))
+            }
+            Some(Token::Const) => self.parse_length_binder(),
+            _ => self.parse_type(),
+        }
+    }
+
+    /// `const N` — a length binder ([`Node::LengthBinder`]).
+    fn parse_length_binder(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        self.expect(&Token::Const)?;
+        let name_start = self.position;
+        let name = self.eat_ident()?;
+        let name_span = self.span_from(name_start);
+        Some((Node::LengthBinder((name, name_span)), self.span_from(start)))
     }
 
     // --- Block-bearing forms -------------------------------------------------
@@ -8255,17 +8285,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.bump();
                 Some((node, span))
             }
-            Token::Const => {
-                let start = self.position;
-                self.bump();
-                let name_start = self.position;
-                let name = self.eat_ident()?;
-                let name_span = self.span_from(name_start);
-                Some((
-                    Node::TypeBinder((name, name_span), Vec::new(), None),
-                    self.span_from(start),
-                ))
-            }
+            Token::Const => self.parse_length_binder(),
             Token::Ident(ANONYMOUS_TYPE_BINDER) => {
                 let span = self.here_span();
                 self.bump();
@@ -8727,10 +8747,26 @@ impl<'a, 'src> Parser<'a, 'src> {
         .map(|span| (Vec::new(), span))
     }
 
-    /// One generic parameter: `type? name (: (tuple_bound | A + B))? (= default)?`.
-    /// The `type` marker makes it a binder (impl subject patterns); the bound is a
-    /// tuple bound (`(2..)`) tried before the `+`-separated trait-bound list.
+    /// One generic parameter: `type? name (: (tuple_bound | A + B))? (= default)?`,
+    /// or `const name` — a LENGTH parameter (array-lengths.md §5.1), which takes
+    /// no bound and no default in v1. The `type` marker makes it a binder (impl
+    /// subject patterns); the bound is a tuple bound (`(2..)`) tried before the
+    /// `+`-separated trait-bound list.
     fn parse_generic_parameter(&mut self) -> Option<GenericParameter<'src>> {
+        if self.eat(&Token::Const) {
+            let name_start = self.position;
+            let name = self.eat_ident()?;
+            let name_span = self.span_from(name_start);
+            return Some(GenericParameter {
+                name,
+                name_span,
+                is_type: false,
+                is_const: true,
+                bounds: Vec::new(),
+                tuple_bound: None,
+                default: None,
+            });
+        }
         let is_type = self.eat(&Token::Type);
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -8752,6 +8788,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             name,
             name_span,
             is_type,
+            is_const: false,
             bounds,
             tuple_bound,
             default,

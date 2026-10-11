@@ -3134,6 +3134,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let external = declaration.external;
         let mut rendered = Vec::new();
         for argument in arguments {
+            // A LENGTH argument (`struct Ring<T, const N>` at `Ring<i32, 3>`,
+            // array-lengths.md S3) is no Rust type: the instance minted below
+            // is keyed by it and renders its fields' `[T; 3]` from it.
+            if matches!(self.resolve(*argument), Some(Type::Length(_))) {
+                continue;
+            }
             rendered.push(self.rust_type(*argument, span)?);
         }
         // A name is only a RUNTIME type when std declared it `external`. The
@@ -3257,6 +3263,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = declaration.name;
         let mut rendered = Vec::new();
         for argument in arguments {
+            // A LENGTH argument keys the minted instance; it is no Rust type
+            // (see `nominal_struct`).
+            if matches!(self.resolve(*argument), Some(Type::Length(_))) {
+                continue;
+            }
             rendered.push(self.rust_type(*argument, span)?);
         }
         // F20: a BACKED enum IS its backing value at runtime — a number or a
@@ -9263,6 +9274,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.bind_parameters(parameters, *inner_pattern, *inner_concrete, out);
                 }
             }
+            // An array binds through its element AND its length (array-lengths.md
+            // §3: a length parameter is an ordinary generic) — `fun zeros<const
+            // N>(): [i32; N]` learns `N` from the position `[i32; 4]`.
+            Some(Type::Array(pattern_element, pattern_length)) => {
+                let (pattern_element, pattern_length) = (*pattern_element, *pattern_length);
+                let Some(Type::Array(concrete_element, concrete_length)) =
+                    self.type_entry(&concrete).cloned()
+                else {
+                    return;
+                };
+                self.bind_parameters(parameters, pattern_element, concrete_element, out);
+                self.bind_parameters(parameters, pattern_length, concrete_length, out);
+            }
             // F38: a closure type binds through its parameters and its return —
             // `and_then<U>(self, fn: |T| Result<U, E>)` learns `U` from the
             // closure it is handed.
@@ -9305,7 +9329,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ) => arguments
                 .iter()
                 .all(|inner| self.is_closed_in_itself(*inner)),
-            Some(Type::Array(element, _)) => self.is_closed_in_itself(*element),
+            Some(Type::Array(element, length)) => {
+                let (element, length) = (*element, *length);
+                self.is_closed_in_itself(element) && self.is_closed_in_itself(length)
+            }
             Some(Type::Mapped(..)) => false,
             Some(Type::Closure(parameters, returns, _, _)) => {
                 parameters
@@ -9340,6 +9367,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .clone()
                 .iter()
                 .all(|inner| self.is_grounded(*inner)),
+            Some(Type::Array(element, length)) => {
+                let (element, length) = (*element, *length);
+                self.is_grounded(element) && self.is_grounded(length)
+            }
             Some(_) => true,
         }
     }

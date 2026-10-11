@@ -737,3 +737,7 @@ NEW	-	`{name}` is a length, not a type; it may stand only where an array's lengt
 NEW	-	cannot find the length '{name}'; an array length is a number or a length parameter (`impl [type T; const N]`)
 NEW	-	`{name}` is a length parameter: it is fixed per instance, not at this site, so a `const` expression cannot read it
 NEW	-	internal: this array length did not resolve to a number in the instance being emitted; please report this program
+NEW	-	this position is a length parameter, so its binder is `const {binder_name}`, not `type {binder_name}`
+NEW	-	`{parameter_name}` is a length parameter: give it a number (`<4>`) or another length parameter, not the type `{rendered}`
+NEW	-	`{rendered}` is a length, and `{parameter_name}` takes a type
+NEW	-	cannot infer the length '{generic_label}' for this call: {why}. Write it — on the binding the result lands in (`let value: [_; 4] = …`), as the call's argument (`{member}<4>(…)`), or ascribe the call

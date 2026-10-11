@@ -461,3 +461,293 @@ fn s2_a_binding_over_a_length_parameter_is_read_per_instance() {
         "7\n3\n",
     );
 }
+
+// --- S3: `<const N>` in generic lists ----------------------------------------
+
+/// §5.2's first door: a length binds from an ARGUMENT, and each length is its
+/// own instance; `N` reads as a `usize` in the body.
+#[test]
+fn s3_a_length_parameter_binds_from_an_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun total<const N>(values: [i32; N]): i32 {
+            mut sum = 0;
+            for value in values {
+                sum = sum + value;
+            }
+            sum
+        }
+        fun size<T, const N>(values: [T; N]): usize {
+            N
+        }
+        fun main() {
+            let row: [i32; 3] = [1, 2, 3];
+            let pair: [i32; 2] = [10, 20];
+            print(total(row));
+            print(total(pair));
+            print(size(["a", "b", "c", "d"]));
+        }
+        "#,
+        "6\n30\n4\n",
+    );
+}
+
+/// §5.2's second door: a DIRECTED literal binds the length by its count.
+#[test]
+fn s3_a_directed_literal_binds_the_length_by_its_count() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun total<const N>(values: [i32; N]): i32 {
+            mut sum = 0;
+            for value in values {
+                sum = sum + value;
+            }
+            sum
+        }
+        fun count<const N>(values: [str; N]): usize {
+            N
+        }
+        fun main() {
+            print(total([1, 2, 3]));
+            print(total([5]));
+            print(count(["a", "b", "c"]));
+        }
+        "#,
+        "6\n5\n3\n",
+    );
+}
+
+/// §5.2's third and fourth doors: the EXPECTED type and an explicit numeric
+/// argument; a length nothing binds is refused by B580's rule, with the
+/// numeric spelling in the steer.
+#[test]
+fn s3_a_length_binds_from_the_expected_type_or_an_explicit_number() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun zeros<const N>(): [i32; N] {
+            [0; N]
+        }
+        fun main() {
+            let four: [i32; 4] = zeros();
+            print(four.len());
+            print(zeros<2>().len());
+        }
+        "#,
+        "4\n2\n",
+    );
+    assert_fails_with(
+        r#"
+        fun zeros<const N>(): [i32; N] {
+            [0; N]
+        }
+        fun main() {
+            let unknown = zeros();
+        }
+        "#,
+        "cannot infer the length 'N' for this call",
+    );
+}
+
+/// Two uses of one `N` must agree; two parameters are independent.
+#[test]
+fn s3_two_uses_of_one_length_must_agree() {
+    assert_fails_with(
+        r#"
+        fun zip_count<T, U, const N>(left: [T; N], right: [U; N]): usize {
+            N
+        }
+        fun main() {
+            let left: [i32; 2] = [1, 2];
+            let right: [str; 1] = ["a"];
+            let _n = zip_count(left, right);
+        }
+        "#,
+        "Expected [U; 2], but got [str; 1]",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun sizes<const A, const B>(left: [i32; A], right: [i32; B]): usize {
+            A * 10 + B
+        }
+        fun main() {
+            print(sizes([1, 2], [1, 2, 3]));
+        }
+        "#,
+        "23\n",
+    );
+}
+
+/// Q8: a struct generic over a length — the field's length is the
+/// parameter, a literal binds it, an annotation writes it as a number.
+#[test]
+fn s3_a_struct_may_be_generic_over_a_length() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Ring<T, const N> {
+            slots: [T; N],
+            at: usize,
+        }
+        impl Ring<type T, const N> {
+            fun capacity(self): usize {
+                N
+            }
+        }
+        fun main() {
+            let ring = Ring { slots = [1, 2, 3], at = 0 };
+            print(ring.capacity());
+            let written: Ring<str, 2> = Ring { slots = ["a", "b"], at = 1 };
+            print(written.capacity());
+            print(written.slots.len());
+        }
+        "#,
+        "3\n2\n2\n",
+    );
+}
+
+/// The kinds hold at an application: a number where a type belongs, and a
+/// type where a length belongs, are both refused — at a call and at a written
+/// type.
+#[test]
+fn s3_a_generic_argument_keeps_its_kind() {
+    assert_fails_with(
+        r#"
+        fun zeros<const N>(): [i32; N] {
+            [0; N]
+        }
+        fun main() {
+            let _z = zeros<i32>();
+        }
+        "#,
+        "`N` is a length parameter: give it a number",
+    );
+    assert_fails_with(
+        r#"
+        import std::list::List;
+        fun main() {
+            let _xs: List<4> = [];
+        }
+        "#,
+        "`4` is a length, and `T` takes a type",
+    );
+    assert_fails_with(
+        r#"
+        struct Ring<T, const N> {
+            slots: [T; N],
+        }
+        fun main() {
+            let _ring: Ring<i32, str> = Ring { slots = [1] };
+        }
+        "#,
+        "`N` is a length parameter: give it a number",
+    );
+}
+
+/// The formatter writes `<const N>` and a numeric argument back.
+#[test]
+fn s3_const_parameters_and_numeric_arguments_survive_the_formatter() {
+    let source = "fun zeros<const N>(): [i32; N] {\n\t[0; N]\n}\n\nstruct Ring<T, const N> {\n\tslots: [T; N],\n}\n\nfun main() {\n\tlet _z = zeros<4>();\n\tlet _r: Ring<i32, 2> = Ring { slots = [1, 2] };\n}\n";
+    assert_eq!(
+        vilan_core::formatter::reprint(source).as_deref(),
+        Ok(source)
+    );
+}
+
+/// An impl head over a length-generic struct binds the length with
+/// `const N` (or `_`); a TYPE binder at that position is refused.
+#[test]
+fn s3_an_impl_head_binds_a_structs_length_with_const() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Ring<T, const N> {
+            slots: [T; N],
+        }
+        trait Size {
+            fun size(self): usize;
+        }
+        impl Ring<type T, _> with Size {
+            fun size(self): usize {
+                self.slots.len()
+            }
+        }
+        fun main() {
+            print(Ring { slots = [true, false] }.size());
+        }
+        "#,
+        "2\n",
+    );
+    assert_fails_with(
+        r#"
+        struct Ring<T, const N> {
+            slots: [T; N],
+        }
+        impl Ring<type T, type N> {
+            fun size(self): usize {
+                0
+            }
+        }
+        fun main() {}
+        "#,
+        "this position is a length parameter, so its binder is `const N`, not `type N`",
+    );
+}
+
+/// A length parameter passes on as a generic ARGUMENT (`Slots<N>`), where the
+/// parameter's kind admits it; an enum may be generic over a length.
+#[test]
+fn s3_a_length_parameter_passes_on_as_a_generic_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        enum Slots<const N> {
+            Full([i32; N]),
+            Empty,
+        }
+        fun filled<const N>(slots: Slots<N>): usize {
+            match slots {
+                Slots::Full(let values) => values.len() + N,
+                Slots::Empty => 0,
+            }
+        }
+        fun main() {
+            let full: Slots<3> = Slots::Full([4, 5, 6]);
+            let empty: Slots<2> = Slots::Empty;
+            print(filled(full));
+            print(filled(empty));
+        }
+        "#,
+        "6\n0\n",
+    );
+}
+
+/// A trait may be generic over a length, and an impl provides it at a number.
+#[test]
+fn s3_a_trait_may_be_generic_over_a_length() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Fill<const N> {
+            fun fill(self): [i32; N];
+        }
+        struct Seed {
+            value: i32,
+        }
+        impl Seed with Fill<3> {
+            fun fill(self): [i32; 3] {
+                [self.value; 3]
+            }
+        }
+        fun main() {
+            let seed = Seed { value = 7 };
+            print(seed.fill().len());
+            print(seed.fill()[2]);
+        }
+        "#,
+        "3\n7\n",
+    );
+}

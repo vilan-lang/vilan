@@ -5687,6 +5687,19 @@ impl<'src> Printer<'src> {
     fn print_type(&mut self, node: &Node<'src>) {
         match node {
             Node::Accessor(name) => self.out.push_str(name),
+            // `const N` — an impl subject's length binder (array-lengths.md §4).
+            Node::LengthBinder((name, _)) => {
+                self.out.push_str("const ");
+                self.out.push_str(name);
+            }
+            // A length given as a generic argument (`zeros<4>()`, array-lengths.md
+            // §4) — the one value a type position holds.
+            Node::Number(whole, None, suffix) => {
+                self.out.push_str(whole);
+                if let Some(suffix) = suffix {
+                    self.out.push_str(suffix);
+                }
+            }
             Node::AccessorWithGenerics(name, arguments) => {
                 self.out.push_str(name);
                 self.print_type_arguments(arguments);
@@ -5803,13 +5816,6 @@ impl<'src> Printer<'src> {
                 self.print_type(&element.0);
                 self.out.push_str("; ");
                 match &length.0 {
-                    Node::TypeBinder((name, _), _, _) if *name == ANONYMOUS_TYPE_BINDER => {
-                        self.out.push_str(ANONYMOUS_TYPE_BINDER);
-                    }
-                    Node::TypeBinder((name, _), _, _) => {
-                        self.out.push_str("const ");
-                        self.out.push_str(name);
-                    }
                     Node::Number(..) => self.print_expr(length),
                     _ => self.print_type(&length.0),
                 }
@@ -6012,6 +6018,9 @@ impl<'src> Printer<'src> {
             }
             if parameter.is_type {
                 self.out.push_str("type ");
+            }
+            if parameter.is_const {
+                self.out.push_str("const ");
             }
             self.out.push_str(parameter.name);
             self.print_bounds(&parameter.bounds);
