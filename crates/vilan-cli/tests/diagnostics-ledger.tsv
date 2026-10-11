@@ -654,8 +654,8 @@ row	flagship	key
 630	-	`{part}` was renamed `{new}`: write `import std::{module}::{new};`
 631	-	a written `autofocus` attribute is the browser's native one, which acts only while the page is first parsed: on an element inserted later the document refuses it once something has focus, and Chromium logs "Autofocus processing was blocked because a document already has a focused element". Write `.autofocus()` — it focuses the element once it is in the document, an enclosing focus scope starts on it, and a server render still writes the native attribute (for a `<dialog>` or a popover that wants the native one, write `.attr("autofocus", "")`)
 632	-	{which} {got} where its type takes {expected}: a value closure and a view closure are different types, and no adapter is inserted; {adapt}.
-633	-	`mut {name}` would bind a COPY of the payload, but this matches a view (`{subject}`), whose captures are views into the payload: {steer}, and write `*{name}` where a copy is wanted
-634	-	cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into the payload — match `&mut {place}` to write the payload in place
+633	-	`mut {name}` would bind a COPY of {held}, but this matches a view (`{subject}`), whose captures are views into {holds}: {steer}, and write `*{name}` where a copy is wanted
+634	-	cannot write through '{name}': this matches `&{place}`, a readonly view, so its captures are readonly views into {held} — match `&mut {place}` to write {held} in place
 635	-	cannot mutate '{name}': it is a COPY of the payload the pattern takes out of `{place}`, so a write to it (or to `mut {name}`) would not reach `{place}` — to write the payload in place, match a view of it, `match &mut {place}` (or `&mut {place} is ..`), whose `let` captures are writable views
 636	-	`std::{old}` moved to `std::{new}`: std's modules are grouped under namespaces since v0.44.0, and the old path is gone — write `std::{new}`
 637	-	`{section} prelude = "{path}"` names the old path of a std module: `std::{old}` moved to `std::{new}` — write `prelude = "{rewritten}"`
@@ -679,8 +679,8 @@ row	flagship	key
 655	-	a hard line break (two trailing spaces) — outside the census grammar
 656	-	a backslash line break — outside the census grammar
 657	-	cannot infer `{family_label}`'s element {}: {written} is `{element}` and names no type for it, and nothing else at this call binds `{family_label}` — annotate the argument, or bind `{family_label}` through another parameter
-658	-	`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
-659	-	cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view into the payload, and write `pair.0`
+658	-	`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view, and write `pair.0`
+659	-	cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view, and write `pair.0`
 660	-	`{member_name}` is an `[internal]` field of std's `{struct_name}`, and an internal std field is not a member outside std: {reason}
 661	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed
 662	-	`[track_caller]` is not supported on a trait method: a call through a trait is dispatched, so no call site knows to pass its location
@@ -690,7 +690,7 @@ row	flagship	key
 666	-	Both are pipe stages, and two stages of different types meet only as one erased flow: annotate where the value lands, `let state: dyn Flow<T> = ..` (or the function's return), or ascribe the form, `match .. { .. } as dyn Flow<T>`, with `T` the value they carry, and each erases to it
 667	-	this element's class is written twice — `{earlier}` and then `{later}` — and `{earlier}` is a binding, so the two take turns: `{later}` writes last when the element is built, `{earlier}` writes again whenever its source changes, and the element shows whichever wrote last. Compose them into one writer (two styles add: `.styled(a + b)`), or drop one
 668	-	`{field_name}` is an `[internal]` field of std's `{struct_name}`, and a struct literal outside std cannot write an internal std field: {reason}
-669	-	a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one, and `{written}` is `{type_label}`{steer}
+669	-	a hole in element syntax takes a `View`, a `str`, a `List<View>`, an `Option` of one, or a `Source` of one, and `{written}` is `{type_label}`{steer}
 670	-	A fragment `<>…</>` is a `List<View>`, not one `View`: wrap its children in one element (`<div>…</div>`), or make this position a `List<View>`
 671	-	Expected {expected}, but got {got} instead: inside the impl that declares it, a bare `{path}::{member}(..)` is `Self::{member}(..)`, whose `{expected}` is this block's own. Write `{suggested}::{member}(..)` to call it at another instantiation
 672	-	`dbg_stack()` takes no arguments: it prints every binding in scope at the call. To print chosen values, use `dbg(..)`
@@ -727,3 +727,6 @@ row	flagship	key
 703	-	`auto` marks a type annotation, not a value (expected an expression here)
 704	-	{covered} is inferred, and this package asks for its `auto` (`[check] auto = "{setting}"`){fix}
 705	-	{message} — `{callee} < {inner} > {arguments}` is read as the generic call `{callee}<{inner}>{arguments}`; if you meant two comparisons, parenthesize: `({callee} < {inner}) > {arguments}`
+706	-	cannot infer the type of this value: it is `{written}`, and nothing the program does with it settles the `…` that `{member}` is instantiated at. Bind it with its type (`let value: {written} = …;`)
+707	-	cannot infer the element type of this empty list: nothing the program does with it settles it, and `{member}` is instantiated at it. Bind it with its type (`let values: {written} = [];`)
+708	-	index {literal_index} is out of range: the array is empty (its type is `[_; 0]`), so it has no valid index

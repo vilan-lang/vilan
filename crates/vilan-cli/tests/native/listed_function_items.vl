@@ -1,0 +1,24 @@
+// B593: function items in a list are their closure type, callable by index
+// and in a loop, beside a closure literal, on both backends.
+import std::io::print;
+
+fun double(value: i32): i32 {
+	value * 2
+}
+
+fun triple(value: i32): i32 {
+	value * 3
+}
+
+fun main() {
+	let same = [double, double];
+	print(same[1](3));
+	let steps = [double, triple, |value| value + 1];
+	for step in steps {
+		print(step(5));
+	}
+	print(steps[1](2));
+	mut later = [triple];
+	later.push(double);
+	print(later[1](7));
+}

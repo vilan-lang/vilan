@@ -2540,8 +2540,7 @@ const E271_HEAD: &str = concat!(
     "\n",
 );
 
-const E271_SENTENCE: &str =
-    "a hole in element syntax takes a `View`, a `str`, a `List<View>` or a `Source` of one";
+const E271_SENTENCE: &str = "a hole in element syntax takes a `View`, a `str`, a `List<View>`, an `Option` of one, or a `Source` of one";
 
 #[test]
 fn e271_a_hole_holding_no_text_is_refused_at_the_hole_with_the_text_form() {
@@ -7646,6 +7645,75 @@ fn b583_a_modules_list_headed_impl_and_default_leave_stds_calls_alone() {
         .unwrap_or_else(|errors| panic!("std's calls stay std's: {errors:?}\n{describe}"));
         assert_eq!(stdout, "mine\n");
     }
+}
+
+// --- B598: a trait the calling file does not reach is no candidate there --
+
+const B598_DESCRIBE: &str = "export trait Describe {\n\tfun describe(self): str;\n}\n\nexport impl List<type T> with Describe {\n\tfun describe(self): str {\n\t\t\"mine\"\n\t}\n}\n";
+
+/// B598: `[1, 2].describe()` in a file that imports only `pkg::describe::
+/// Describe` was refused "ambiguous: both 'Wire' and 'Describe' provide it"
+/// — std's `Wire` (loaded program-wide) competed though B515/B535 would refuse
+/// `Wire`'s member in that file anyway. Only the traits a file reaches are its
+/// candidates, so the call is `Describe`'s.
+#[test]
+fn b598_a_trait_the_file_does_not_import_does_not_compete_at_its_call() {
+    let main = "import std::io::print;\nimport pkg::describe::Describe;\n\nfun main() {\n\tprint([1, 2].describe());\n}\n";
+    let (_, stdout) = compile_and_run_package(
+        &[("describe.vl", B598_DESCRIBE), ("main.vl", main)],
+        "main.vl",
+    )
+    .unwrap_or_else(|errors| panic!("the reached trait answers: {errors:?}"));
+    assert_eq!(stdout, "mine\n");
+}
+
+/// B598: two of the PACKAGE's traits, the file importing one of them — the
+/// same rule between user traits, in either module order.
+#[test]
+fn b598_of_two_user_traits_the_imported_one_answers_in_every_load_order() {
+    let other = "export trait Shown {\n\tfun describe(self): str;\n}\n\nexport impl List<type T> with Shown {\n\tfun describe(self): str {\n\t\t\"shown\"\n\t}\n}\n";
+    for (first, second) in [("a_other.vl", "describe.vl"), ("z_other.vl", "describe.vl")] {
+        let other_module = first.trim_end_matches(".vl");
+        let main = format!(
+            "import std::io::print;\nimport pkg::describe::Describe;\nimport pkg::{other_module}::Shown;\n\nfun main() {{\n\tprint(Describe::describe([1]));\n}}\n"
+        );
+        // Both imported: the qualified call names one, as before.
+        let (_, stdout) = compile_and_run_package(
+            &[(first, other), (second, B598_DESCRIBE), ("main.vl", &main)],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("{first}: {errors:?}"));
+        assert_eq!(stdout, "mine\n");
+        // Only `Shown` imported: the method call is `Shown`'s.
+        let main = format!(
+            "import std::io::print;\nimport pkg::{other_module}::Shown;\n\nfun main() {{\n\tprint([1].describe());\n}}\n"
+        );
+        let (_, stdout) = compile_and_run_package(
+            &[(first, other), (second, B598_DESCRIBE), ("main.vl", &main)],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("{first}: {errors:?}"));
+        assert_eq!(stdout, "shown\n");
+    }
+}
+
+/// B598's boundary: a file that reaches BOTH traits keeps the ambiguity and
+/// its `Trait::member` steer.
+#[test]
+fn b598_a_file_reaching_both_traits_keeps_the_ambiguity() {
+    let main = "import std::io::print;\nimport std::wire::Wire;\nimport pkg::describe::Describe;\n\nfun main() {\n\tprint([1, 2].describe());\n}\n";
+    let outcome = analyze_package(
+        &[("describe.vl", B598_DESCRIBE), ("main.vl", main)],
+        "main.vl",
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|(message, ..)| message.starts_with("'describe' is ambiguous on 'List<i32>'")),
+        "{:?}",
+        outcome.diagnostics
+    );
 }
 
 // --- B554: a module binding's cross-file element conflict blames the declaration

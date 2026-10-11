@@ -2147,3 +2147,36 @@ fn m89_two_pairs_with_one_slot_set_share_one_table() {
     );
     assert_compiles_and_runs(source, "5\n");
 }
+
+/// B601: a `dyn` value at an annotated `let` of its concrete type was refused
+/// TWICE at one span — the reference and the binding it names each met the
+/// narrowing seam. Once, at the reference; and an ascription the same.
+#[test]
+fn b601_a_narrowing_at_an_annotated_let_or_an_ascription_is_refused_once() {
+    for narrowing in [
+        "let square: Square = shape;",
+        "let square = shape as Square;",
+    ] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            trait Shape {{
+                fun area(self): i32;
+            }}
+            struct Square {{ side: i32 }}
+            impl Square with Shape {{
+                fun area(self): i32 {{ self.side * self.side }}
+            }}
+            fun main() {{
+                let shape: dyn Shape = Square {{ side = 2 }};
+                {narrowing}
+                print(square.side);
+            }}
+            "#
+        );
+        assert_fails_once_with(
+            &source,
+            "Expected Square, but got dyn Shape instead: an object does not narrow back",
+        );
+    }
+}

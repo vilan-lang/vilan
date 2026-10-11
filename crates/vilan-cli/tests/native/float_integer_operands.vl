@@ -1,0 +1,24 @@
+// B602: a float beside an integer computes only through a conversion (or a
+// literal, which takes the float's type), and both backends give the same
+// answer: `f64 * i32` itself is refused by the checker, where it computed a
+// float silently on JS and failed the native build.
+import std::io::print;
+
+fun main() {
+	let x: f64 = 1.5;
+	let count: i32 = 3;
+	let index: usize = 2;
+	let narrow: f32 = 0.5;
+	print(x * 2);
+	print(10 - x);
+	let n = 4;
+	print(x * n);
+	print(x * count.as_f64());
+	print(count.as_f64() / x);
+	print(x - index.as_f64());
+	print(x % narrow.as_f64());
+	mut total: f64 = 0.0;
+	total += count.as_f64();
+	total /= index.as_f64();
+	print(total);
+}

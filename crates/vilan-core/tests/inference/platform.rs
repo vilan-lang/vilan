@@ -9580,11 +9580,11 @@ fn b196_the_steers_the_refusals_name_all_compile() {
 }
 
 #[test]
-fn b196_the_numeric_carve_out_is_untouched() {
-    // b148's SCOPE note deferred `f64 * i32` — two GROUNDED numbers computing
-    // a correct answer of the declared type — and B196 is not that change.
-    // The whole nine-operator family stays admitted on a numeric left operand,
-    // mixed widths included.
+fn b196_the_numeric_family_still_computes_on_a_numeric_left_operand() {
+    // B196 is not the numeric-mixing change b148's SCOPE note deferred: the
+    // whole nine-operator family stays admitted on a numeric left operand.
+    // (The mixed pair itself, `f64 * i32`, is refused since B602, v0.48.0;
+    // the converted spelling computes.)
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -9592,8 +9592,8 @@ fn b196_the_numeric_carve_out_is_untouched() {
         fun main() {
             let scale: f64 = 2.5;
             let count: i32 = 2;
-            print(scale * count);
-            print(scale - count);
+            print(scale * count.as_f64());
+            print(scale - count.as_f64());
             print(7 % 4);
             print(6 & 3);
             print(1 << 3);
@@ -9606,7 +9606,7 @@ fn b196_the_numeric_carve_out_is_untouched() {
 /// B531: the right operand of a native number's `-` `*` `/` `%` and bitwise
 /// family must be a number too. `let x: i32 = 2 * true;` checked clean and
 /// printed `2` (the host coerces `true` to `1`); a `str`, a struct and an
-/// enum on the right were as quiet. The numeric carve-out above stands.
+/// enum on the right were as quiet. (Two numbers of different types are B579's and B602's.)
 #[test]
 fn b531_a_non_numeric_right_operand_of_a_numbers_arithmetic_is_refused() {
     for (expression, right) in [

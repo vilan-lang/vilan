@@ -650,3 +650,55 @@ fn b462_a_unit_variant_does_not_coerce() {
         "#,
     );
 }
+
+// --- B593: a list of function items ------------------------------------------
+
+/// B593: `let fs = [double, double]; fs[1](3)` was refused "cannot call this
+/// as a function: it is fn double(i32): i32", and `[double, triple]` had no
+/// element type ("Expected fn double(i32): i32 … but got fn triple"). A
+/// function item in a list literal is its closure type, as at an annotated
+/// binding: the list is `List<|i32| i32>`, it mixes items and closures, and an
+/// element calls by index and in a loop.
+#[test]
+fn b593_a_list_of_function_items_is_a_list_of_their_closure_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun double(value: i32): i32 {
+            value * 2
+        }
+
+        fun triple(value: i32): i32 {
+            value * 3
+        }
+
+        fun main() {
+            let same = [double, double];
+            print(same[1](3));
+            let steps = [double, triple, |value| value + 1];
+            for step in steps {
+                print(step(5));
+            }
+            let typed: List<|i32| i32> = steps;
+            print(typed[1](2));
+        }
+        "#,
+        "6\n10\n15\n6\n6\n",
+    );
+}
+
+/// B593's boundary: items of different signatures still have no common type.
+#[test]
+fn b593_items_of_different_signatures_are_refused() {
+    assert_fails_with(
+        r#"
+        fun double(value: i32): i32 { value * 2 }
+        fun name(value: i32): str { "n" }
+        fun main() {
+            let _mixed = [double, name];
+        }
+        "#,
+        "(this literal's element type), but got",
+    );
+}
