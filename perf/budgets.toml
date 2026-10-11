@@ -58,8 +58,8 @@ measured_at = "v0.47.0's seal"
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_401_397_525
-measured_at = "v0.47.0's seal"
+ceiling = 1_371_583_124
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:fullstack"
@@ -72,80 +72,80 @@ measured_at = "v0.47.0's seal"
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_618_079_748
-measured_at = "v0.47.0's seal"
+ceiling = 1_532_276_405
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_754_915_302
-measured_at = "v0.47.0's seal"
+ceiling = 1_660_268_336
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_624_023_661
-measured_at = "v0.47.0's seal"
+ceiling = 3_448_815_594
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_409_226_385
-measured_at = "v0.47.0's seal"
+ceiling = 1_378_211_823
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_838_173_993
-measured_at = "v0.47.0's seal"
+ceiling = 1_766_105_821
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_623_601_746
-measured_at = "v0.47.0's seal"
+ceiling = 4_377_861_323
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_724_277_314
-measured_at = "v0.47.0's seal"
+ceiling = 4_475_305_348
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 8_301_520_925
-measured_at = "v0.47.0's seal"
+ceiling = 7_759_098_337
+measured_at = "v0.48.0's seal"
 
 [[row]]
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 263_350_377
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 262_065_107
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 331_341_576
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 329_529_096
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_462_043_834
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 1_431_983_790
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
@@ -160,64 +160,64 @@ tolerance = 0.005
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_689_683_219
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 1_597_123_616
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_828_817_217
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 1_730_363_917
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_777_130_688
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 3_591_690_202
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_472_645_016
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 1_437_544_701
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_911_572_862
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 1_837_079_174
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_804_246_863
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 4_554_363_209
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_906_794_890
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 4_655_257_689
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 8_604_423_549
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 8_056_352_548
+measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
 [[growth]]
@@ -236,15 +236,15 @@ blocking = false
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 1
-blocking = false
+green_seals = 2
+blocking = true
 
 [[e121]]
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 1
-blocking = false
+green_seals = 2
+blocking = true
 
 [[e121]]
 scenario = "model.vl keystroke, importers open"
@@ -266,59 +266,3 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
-
-[[bump]]
-subject = "example:rpc"
-class = "ci"
-ratio = 1.012
-reason = "store-50's std::rpc growth, M120's class: A153 S3's `WireWrite` splice record and `RemoteStoreKeys`, A169's `Gone` acknowledgement and the reconnect hooks (A153 S4) live in std::rpc, which the three rpc-bearing examples load; x1.0103 callgrind on CI run 38084320109 against the v0.47.0 ceiling (the lane measured ±0.07% instructions:u on 5fe24f86's binary, which did not reproduce). The mirror module itself loads only once a service returns a Store. Re-taken at the Order 50 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.01
-reason = "store-50's std::rpc growth, M120's class: A153 S3's `WireWrite` splice record and `RemoteStoreKeys`, A169's `Gone` acknowledgement and the reconnect hooks (A153 S4) live in std::rpc, which the three rpc-bearing examples load; x1.0082 callgrind on CI run 38084320109 against the v0.47.0 ceiling (the lane measured ±0.07% instructions:u on 5fe24f86's binary, which did not reproduce). The mirror module itself loads only once a service returns a Store. Re-taken at the Order 50 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.01
-reason = "store-50's std::rpc growth, M120's class: A153 S3's `WireWrite` splice record and `RemoteStoreKeys`, A169's `Gone` acknowledgement and the reconnect hooks (A153 S4) live in std::rpc, which the three rpc-bearing examples load; x1.0078 callgrind on CI run 38084320109 against the v0.47.0 ceiling (the lane measured ±0.07% instructions:u on 5fe24f86's binary, which did not reproduce). The mirror module itself loads only once a service returns a Store. Re-taken at the Order 50 seal."
-item = "M120"
-
-[[bump]]
-subject = "example:math"
-class = "ci"
-ratio = 1.01
-reason = "lang-50's std growth (array-lengths S5): the any-length array impls of PartialEq, Hashable, Debug and Items, and the inherent to_list/iter, live in compare.vl, hash.vl, debug.vl and list.vl, which every program loads; x1.0091 instructions:u on a release build of the lane's tip against next @ff35bf64's (re-measured after the C3 rebase), measured from each tree's own std (a constant ~2-14M instructions per program). Re-taken at the Order 50 seal."
-item = "A161"
-
-[[bump]]
-subject = "example:watch"
-class = "ci"
-ratio = 1.009
-reason = "lang-50's std growth (array-lengths S5): the any-length array impls of PartialEq, Hashable, Debug and Items, and the inherent to_list/iter, live in compare.vl, hash.vl, debug.vl and list.vl, which every program loads; x1.0082 instructions:u on a release build of the lane's tip against next @ff35bf64's, measured from each tree's own std (a constant ~2-14M instructions per program). Re-taken at the Order 50 seal."
-item = "A161"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.005
-reason = "lang-50's std growth (array-lengths S5): the any-length array impls of PartialEq, Hashable, Debug and Items, and the inherent to_list/iter, live in compare.vl, hash.vl, debug.vl and list.vl, which every program loads; x1.0042 instructions:u on a release build of the lane's tip against next @ff35bf64's (re-measured after the C3 rebase), measured from each tree's own std (a constant ~2-14M instructions per program). Re-taken at the Order 50 seal."
-item = "A161"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "ci"
-ratio = 1.005
-reason = "lang-50's std growth (array-lengths S5): the any-length array impls of PartialEq, Hashable, Debug and Items, and the inherent to_list/iter, live in compare.vl, hash.vl, debug.vl and list.vl, which every program loads; x1.0043 instructions:u on a release build of the lane's tip against next @ff35bf64's (re-measured after the C3 rebase), measured from each tree's own std (a constant ~2-14M instructions per program). Re-taken at the Order 50 seal."
-item = "A161"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.005
-reason = "lang-50's std growth (array-lengths S5): the any-length array impls of PartialEq, Hashable, Debug and Items, and the inherent to_list/iter, live in compare.vl, hash.vl, debug.vl and list.vl, which every program loads; x1.0041 instructions:u on a release build of the lane's tip against next @ff35bf64's (re-measured after the C3 rebase), measured from each tree's own std (a constant ~2-14M instructions per program). Re-taken at the Order 50 seal."
-item = "A161"
