@@ -1,0 +1,11 @@
+<closure |i32| i32>
+<closure |str, bool| str>
+<closure || i32>
+<closure |f64| bool>
+<closure fun double>
+<closure |i32| i32>
+<closure |str| str>
+<closure fun double>
+Handler { name = "inc", run = <closure |i32| i32> }
+Some(<closure |i32| i32>)
+11

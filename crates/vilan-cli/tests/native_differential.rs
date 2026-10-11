@@ -7301,54 +7301,46 @@ const ASYNC_PANIC_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F25: printing a host handle or a value holding a function is refused where
-/// it is WRITTEN.
+/// F25: printing a host handle is refused where it is WRITTEN (a function
+/// prints its type on both backends since E293).
 ///
 /// Order 38 answered both with a runtime panic carrying the reason, which is
 /// honest and one release too late — what node prints there is its own object
 /// inspection (`Promise { <pending> }`, `[Function (anonymous)]`), so the
 /// program cannot work and nothing is gained by letting it build.
 #[test]
-fn printing_a_host_handle_or_a_function_is_refused_at_compile_time() {
+fn printing_a_host_handle_is_refused_at_compile_time() {
     let staged = stage();
-    for (file, source, needle) in [
-        (
-            "native_probe_print_task.vl",
-            PRINT_HANDLE_PROBE,
-            "`print` of the host handle `Task`",
-        ),
-        (
-            "native_probe_print_fn.vl",
-            PRINT_FUNCTION_PROBE,
-            "`print` of a value holding a function",
-        ),
-    ] {
-        std::fs::write(staged.join(file), source).expect("write the probe program");
-        let output = vilan(&staged)
-            .args(["build", "--backend", "rust", "--stdout", file])
-            .output()
-            .expect("build the probe");
-        let message = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !output.status.success(),
-            "{file} must be refused rather than built"
-        );
-        assert!(
-            message.contains(needle),
-            "{file} must be refused by name (`{needle}`); it said:\n{message}"
-        );
-        // Non-vacuous: the JS backend BUILDS the same program, so the refusal
-        // is the native backend's answer and not a defect in the probe.
-        let javascript = vilan(&staged)
-            .args(["build", file])
-            .output()
-            .expect("build the probe on the JS backend");
-        assert!(
-            javascript.status.success(),
-            "{file} must be a program the JS backend accepts:\n{}",
-            String::from_utf8_lossy(&javascript.stderr)
-        );
-    }
+    let (file, source, needle) = (
+        "native_probe_print_task.vl",
+        PRINT_HANDLE_PROBE,
+        "`print` of the host handle `Task`",
+    );
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    let output = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "{file} must be refused rather than built"
+    );
+    assert!(
+        message.contains(needle),
+        "{file} must be refused by name (`{needle}`); it said:\n{message}"
+    );
+    // Non-vacuous: the JS backend BUILDS the same program, so the refusal
+    // is the native backend's answer and not a defect in the probe.
+    let javascript = vilan(&staged)
+        .args(["build", file])
+        .output()
+        .expect("build the probe on the JS backend");
+    assert!(
+        javascript.status.success(),
+        "{file} must be a program the JS backend accepts:\n{}",
+        String::from_utf8_lossy(&javascript.stderr)
+    );
 }
 
 const PRINT_HANDLE_PROBE: &str = concat!(
@@ -7363,15 +7355,6 @@ const PRINT_HANDLE_PROBE: &str = concat!(
     "async fun main() {\n",
     "\tlet task = async work();\n",
     "\tprint(task);\n",
-    "}\n",
-);
-
-const PRINT_FUNCTION_PROBE: &str = concat!(
-    "import std::io::print;\n",
-    "\n",
-    "fun main() {\n",
-    "\tlet f = |x: i32| x + 1;\n",
-    "\tprint(f);\n",
     "}\n",
 );
 
@@ -9537,15 +9520,15 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
     let module = staged.join("native_probe_f108_module");
     std::fs::create_dir_all(&module).expect("make the package");
     // The module's refusal is F25's, which is by design and stays: `print`
-    // of a value holding a function.
+    // of a host handle (a bare closure printed natively since E293).
     std::fs::write(
         module.join("util.vl"),
-        "import std::io::print;\n\nexport fun banner() {\n\tlet shown = || 1;\n\tprint(shown);\n}\n",
+        "import std::io::print;\nimport std::time::sleep;\n\nasync fun work(): i32 {\n\tsleep(1);\n\t7\n}\n\nexport async fun banner() {\n\tlet task = async work();\n\tprint(task);\n}\n",
     )
     .expect("write the module");
     std::fs::write(
         module.join("main.vl"),
-        "import pkg::util::banner;\n\nfun main() {\n\tbanner();\n}\n",
+        "import pkg::util::banner;\n\nasync fun main() {\n\tbanner();\n}\n",
     )
     .expect("write the entry");
     let output = vilan(&module)
@@ -9554,7 +9537,7 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
         .expect("build the package");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("util.vl:5:2") && stderr.contains("print(shown)"),
+        stderr.contains("util.vl:11:2") && stderr.contains("print(task)"),
         "a user module's refusal is drawn in that module:\n{stderr}"
     );
 }
@@ -11921,6 +11904,21 @@ fn s3_print_writes_aggregates_through_the_printer_on_both_backends() {
         "native_probe_print_aggregates.vl",
         include_str!("native/print_aggregates.vl"),
         include_str!("native/print_aggregates.stdout"),
+        "",
+    );
+}
+
+/// E293: `print` of a bare closure writes its written type (`<closure |i32|
+/// i32>`) where node printed `[Function: add]` and the native backend refused
+/// it (F25) - a closure with captures, a literal, a nullary one, a named
+/// function, a generic `T` per instance, a closure inside a struct and an
+/// option; the same bytes on both backends (`native/print_closures.*`).
+#[test]
+fn e293_print_of_a_bare_closure_writes_its_type_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_print_closures.vl",
+        include_str!("native/print_closures.vl"),
+        include_str!("native/print_closures.stdout"),
         "",
     );
 }
