@@ -214,9 +214,10 @@ macro fun Debug(item: Item): Source {
 
 /// The `Debug` derive's rendering of one member at `place`, an expression of
 /// type `str`. A closure has no `Debug` to call, so it prints its written type
-/// as `dbg` does (`<closure |i32| i32>`); a fixed array of a LITERAL length
-/// prints element by element (`[1, 2]`) until arrays of every length take an
-/// impl (array-lengths.md S2); anything else calls its `debug` (E283).
+/// as `dbg` does (`<closure |i32| i32>`); a fixed array of closures of a LITERAL
+/// length prints element by element (a closure has no impl to call); any other
+/// array, of any length, takes std's `impl [type T: Debug; _] with Debug`
+/// (array-lengths.md S5); anything else calls its `debug` (E283).
 macro fun debug_member(place: str, written: str): str {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ quote, join };
@@ -224,7 +225,10 @@ macro fun debug_member(place: str, written: str): str {
 	if written.starts_with("|") {
 		ret quote("<closure " + written + ">");
 	}
-	if written.starts_with("[") && written.ends_with("]") && written.contains(";") {
+	if written.starts_with("[")
+		&& written.ends_with("]")
+		&& written.contains(";")
+		&& written.contains("|") {
 		let inner = written.substring(1, written.len() - 1);
 		let parts = inner.split(";");
 		let length = parts[parts.len() - 1].trim().parse_i32();
