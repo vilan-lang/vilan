@@ -45830,6 +45830,17 @@ impl<'src> Analyzer<'src> {
                     if matches!(item_type, Type::Unresolved) {
                         return Type::Unresolved;
                     }
+                    // B593: a function ITEM in a list is its closure type, as
+                    // at an annotated binding (`let g: |i32| i32 = double`):
+                    // every item has its own type, so `[double, triple]` had
+                    // no element type at all, and `[double, double]`'s
+                    // element (`fn double`) was no callable value type.
+                    let item_type = match item_type {
+                        Type::Function(function_id) => self
+                            .function_closure_type(function_id)
+                            .unwrap_or(Type::Function(function_id)),
+                        other => other,
+                    };
                     element_type = match self.reconcile_type(
                         &element_type,
                         &item_type,

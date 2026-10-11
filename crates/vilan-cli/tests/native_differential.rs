@@ -10159,6 +10159,24 @@ fn a_list_of_fixed_array_literals_is_identical_on_both_backends() {
     );
 }
 
+/// B593: function items in a list are their closure type — `[double,
+/// triple]` has an element type, and an element calls by index, in a loop,
+/// beside a closure literal and after a push.
+#[test]
+fn a_list_of_function_items_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_listed_function_items.vl"),
+        include_str!("native/listed_function_items.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_listed_function_items.vl"),
+        Verdict::Identical,
+        "a list of function items must build and call the same on both backends"
+    );
+}
+
 /// F63: a closure's expression body is the value it hands back, a CONSUMING
 /// position like a function body's tail, so a place read there takes rule 1's
 /// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured

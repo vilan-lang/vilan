@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B593: a function item in a list literal is its closure type — `let fs = [double, double]; fs[1](3)` was refused "cannot call this as a function: it is fn double(i32): i32" on both backends, and `[double, triple]` had no element type at all ("Expected fn double(i32): i32 … but got fn triple(i32): i32"); both build and run, beside a closure literal (`[double, |v| v + 1]`), by index, in a loop and after a push.** Every function item has its own type, as in Rust, so a list of two had none to unify; the list literal now coerces an item element to its closure type (`function_closure_type`, the coercion an annotated `let g: |i32| i32 = double` already makes), so the list is `List<|i32| i32>`. Items of different signatures still have no common type. Pins: `callable::b593_*` (2), `native_differential::a_list_of_function_items_is_identical_on_both_backends` (`native/listed_function_items.vl`, new).
+
+---
+
+<!-- family: fix -->
 **B592: a list literal of array literals under `List<[T; n]>` elaborates its inner literals as the arrays — `let listed: List<[i32; 2]> = [[1, 2], [3, 4]]` was refused on both backends "Expected List<[i32; 2]>, but got List<List<i32>>"; it builds and runs (at an annotated binding, a parameter, a push, and a level deeper: `List<[[u8; 2]; 2]>`).** The list literal deliberately does not seed its expectation into its elements (it moves inference beyond the check), and B389/B447 carved out the numeric and the literal-tuple element; a fixed-array element is the third carve-out, and the narrowest kind: the one expectation that changes what a literal IS. An inner literal of the wrong length gets the array arm's own refusal at it. Pins: `collections::b592_*` (2), `native_differential::a_list_of_fixed_array_literals_is_identical_on_both_backends` (`native/list_of_fixed_arrays.vl`, new).
 
 ---
