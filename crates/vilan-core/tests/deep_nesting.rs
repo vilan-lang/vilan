@@ -30,10 +30,29 @@
 //! into its own `#[inline(never)]` method: `fun` (6,064 bytes of the frame),
 //! `struct` and `enum` (2,896 each), `impl` (2,680), `trait` (2,089), the
 //! tuple comprehension (1,520), closures (1,440), `async` (1,304), `macro
-//! fun` (1,048) and `mod` (976). The frame is now **26,376 bytes (25.8 KiB)
+//! fun` (1,048) and `mod` (976). The frame was then **26,376 bytes (25.8 KiB)
 //! a level unoptimized** and ~1,050 optimized, and an arm's own locals are
 //! paid only on a level that runs that arm (`fun`'s 6,120-byte frame on a
 //! level that declares a function, for one).
+//! N169 (Order 51) measured it again when the canary below went red on the
+//! seal's 1.5 MiB thread (it passed from 1,552 KiB): 28,208 bytes a level of
+//! the canary's chain, `walk_expr_node_inner` 27,184 of them, the frame having
+//! regrown arm by arm since Order 44 — and under the walk ~636 KB of the
+//! analysis's own baseline (`analyze_inner` 214 KB, `analyze_over_world` 83 KB,
+//! `analyze_source`'s three `catch_unwind` layers ~28 KB each, unoptimized).
+//! The rule above became a sweep: every arm whose locals came to 400 bytes or
+//! more went out of line (twenty-three of them — the member accessor, `let`,
+//! the lift region, `for … in`, assignment, `if` and the rest), and the
+//! fixed-message refusals call one helper instead of each building an `Error`.
+//! The frame every level shares is now **5,648 bytes unoptimized**
+//! (`walk_expr_node` 584 + `walk_expr_node_inner` 5,048) and 640 optimized; a
+//! level of the canary's chain is 8,288 (the member accessor's own 2,632 on
+//! top), and the canary fits from ~900 KiB. `VILAN_COUNTERS` prints the shared
+//! figure once per process (`[vilan walk-frame] per-level=…B`), so the next
+//! growth is a number in a log rather than a bisect. (The window bookkeeping
+//! N169 suspected is not on this path at all: the id windows wrap each
+//! module ITEM in `walk_module_items`, below the recursion, and are off on
+//! this file's analyses.)
 //! It was ~36 KiB when this comment was written; Order 36's lazy,
 //! const, callable and visibility arms landed IN that frame while the
 //! recursion stayed put, which is how a nine-level module-cycle pin came to
@@ -43,11 +62,11 @@
 //! worker below spawns with 64 MiB ON PURPOSE — not the harness convention's
 //! 256 MiB: the plant's 5000 levels cost the UNBOUNDED walk ~180 MiB
 //! unoptimized and overflowed exactly this spawn before the bound existed,
-//! while the bounded walk stops near 12.8 MiB (measured at Order 44's seal,
-//! 501 levels at 26,376 bytes; it was 20.3 MiB at N97's 42,464 bytes and
-//! "near 18 MiB" before that, a figure three comments went on quoting —
-//! N111). Growing this spawn to make a
-//! failure pass again would make the pin vacuous.
+//! while the bounded walk stops near 4.7 MiB (N169, 501 chain levels at
+//! 8,288 bytes over the ~0.6 MiB baseline; 12.8 MiB at Order 44's seal's
+//! 26,376 bytes, 20.3 MiB at N97's 42,464 and "near 18 MiB" before that, a
+//! figure three comments went on quoting — N111). Growing this spawn to make
+//! a failure pass again would make the pin vacuous.
 //!
 //! The file grew past that one bound, because the recursive families that can
 //! reach the stack cliff share the worker and the argument. It now pins, in
@@ -247,12 +266,12 @@ fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
 /// | debug | 42,464 B (41.5 KiB) | 1.49 MiB |
 /// | release | ~4,650 B (4.5 KiB) | 0.23 MiB |
 ///
-/// and as it is today (Order 44's seal, below):
+/// and as it is today (N169, Order 51, below):
 ///
 /// | codegen | bytes per level of `expr-walk` | 30 levels + baseline |
 /// |---|---|---|
-/// | debug | 26,376 B (25.8 KiB) | 1.04 MiB |
-/// | release | ~1,050 B (1.0 KiB) | 0.14 MiB |
+/// | debug | 8,288 B (8.1 KiB) | 0.73 MiB |
+/// | release | ~1,075 B (1.0 KiB) | 0.15 MiB |
 ///
 /// (N128, 2026-09-25: debug ~47,400 B and 1.66 MiB at 33 levels — 83% of the
 /// thread; release ~2,120 B and 0.16 MiB. The frame grew; the canary did not
@@ -265,6 +284,17 @@ fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
 /// half the thread — release ~1,050 B and 0.14 MiB. The same chain now also
 /// fits a 1.5 MiB thread, checked at the seal with a scratch copy of this
 /// pin.)
+///
+/// (N169, Order 51: the seal ran this pin on a 1.5 MiB thread from Order 50 on
+/// (`VILAN_CANARY_STACK_KIB=1536`) and it ABORTED there — it passed from 1,552
+/// KiB. Read with gdb at the overflow, the thread held 33 levels at 28,208 B
+/// (0.89 MiB) over a baseline of ~636 KB that the instrument's anchor never
+/// sees: `analyze_source` and its `catch_unwind` layers, `analyze_inner`'s
+/// 214 KB and `analyze_over_world`'s 83 KB unoptimized. Twenty-three more arms
+/// went out of line: **8,288 B a level of this chain** (5,648 B shared by every
+/// level, `[vilan walk-frame]` under `VILAN_COUNTERS`, plus the member
+/// accessor's own method), and the pin fits from ~900 KiB — the 1.5 MiB run
+/// has ~0.6 MiB over.)
 ///
 /// So the debug leg — the one the suite runs — sat at 75% of a 2 MiB thread,
 /// and the canary reds when the frame grows by about a third, or when twelve
@@ -896,9 +926,9 @@ fn analyze_on_a_declared_stack(
 /// at 2 MiB, so the probe refuses past 1 MiB (the red zone's minimum). Measured
 /// with `VILAN_DEPTH_STATS` (Order 44's seal, 2026-09-30), the chain's walk
 /// needs ~0.6 MiB optimized (~1,050 bytes a level; N128 read ~2.1 KiB, and the
-/// 11.3 KiB AGENTS.md once recorded was an older frame) and ~12.6 MiB
-/// unoptimized (26,376 bytes a level), so the probe refuses it under both
-/// profiles.
+/// 11.3 KiB AGENTS.md once recorded was an older frame) and, since N169,
+/// ~4.7 MiB unoptimized (8,288 bytes a level; 12.6 MiB at Order 44's 26,376),
+/// so the probe refuses it under both profiles.
 ///
 /// The THREAD is 16 MiB, larger than the declaration: it was the headroom the
 /// UNPROBED syntactic visitors needed before N128 (`collect_module_paths`, over
@@ -932,15 +962,19 @@ fn a_walk_that_would_overflow_a_declared_stack_is_refused_with_the_fences_diagno
 /// The walk's own funnel, isolated in the debug suite (N128). Since the
 /// syntactic visitors are probed, the 2 MiB declaration above is refused in
 /// `for_each_child` before the walk starts when unoptimized, so that pin no
-/// longer isolates the WALK's probe there. Declared at 8 MiB, the visitors'
-/// ~2.4 MiB fits under the floor (7 MiB used) and the walk's ~12.6 MiB does
+/// longer isolates the WALK's probe there. Declared at 4.5 MiB, the visitors'
+/// ~2.6 MiB fits under the floor (3.5 MiB used) and the walk's ~4.7 MiB does
 /// not, so the refusal is the walk's; the 32 MiB thread keeps even the
 /// unprobed walk off the guard page, so removing the probe reds as a program
 /// PRODUCED rather than as an abort. Debug only: optimized, the walk needs
-/// ~0.6 MiB and nothing refuses — the pin above covers that profile. (The
-/// declaration was 16 MiB, floor 14, until Order 44's seal cut the walk's
-/// frame from ~49 KB to ~26 KB a level: the walk's ~12.6 MiB then fit under
-/// that floor, and the pin went red as a program produced.)
+/// well under a MiB and nothing refuses — the pin above covers that profile.
+/// The declaration sits in the middle of the window N169 measured (the
+/// visitors fit from a ~3.6 MiB declaration up, the walk is refused below
+/// ~5.7 MiB), because the frame moves both ways: it was 16 MiB, floor 14,
+/// until Order 44's seal cut the walk's frame from ~49 KB to ~26 KB a level,
+/// and 8 MiB, floor 7, until N169 cut it again to ~8.3 KB a chain level —
+/// each time the walk then fit under the floor, and the pin went red as a
+/// program produced.
 ///
 /// Planted red by removing the `walk_expr_node` probe.
 #[cfg(debug_assertions)]
@@ -952,7 +986,7 @@ fn the_walks_own_probe_refuses_the_chain_when_the_visitors_fit() {
     );
     let Analysis {
         produced, messages, ..
-    } = analyze_on_a_declared_stack(32 * 1024 * 1024, 8 * 1024 * 1024, source);
+    } = analyze_on_a_declared_stack(32 * 1024 * 1024, 4608 * 1024, source);
     assert!(!produced, "a refused analysis lands no program");
     assert_eq!(messages.len(), 1, "{messages:#?}");
     assert!(

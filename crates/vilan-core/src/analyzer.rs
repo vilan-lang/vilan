@@ -38795,24 +38795,25 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The walk's depth bound (B138): the walk recurses once per level of
-    /// syntactic nesting carrying the largest frame in the analyzer — the
-    /// union of [`Self::walk_expr_node_inner`]'s ~90 arms, measured by
-    /// `VILAN_DEPTH_STATS` (and by gdb, to the byte) at 26,376 B (25.8 KiB)
-    /// per level unoptimized, ~1,050 B optimized — so nesting
-    /// depth, not node count, is what outgrows a stack (the v0.36.0
-    /// incident, commit 0fb5e5f0: a modest server program's walk closed a CI
-    /// worker's ~2 MiB margin). Every realistic fixture peaks at 20 levels
-    /// (both walkthrough entries, the std twin-parity and release-emission
-    /// corpora); 500 is 25x that, and caps the bounded worst case near
-    /// 12.8 MiB unoptimized — deeper nesting gets a clean diagnostic instead
-    /// of a stack overflow.
+    /// syntactic nesting carrying the frame [`Self::walk_expr_node`] and
+    /// [`Self::walk_expr_node_inner`] share across ~90 arms, measured by gdb
+    /// at 5,648 B per level unoptimized and 640 B optimized (N169; `VILAN_COUNTERS` prints it as `[vilan
+    /// walk-frame]`), plus the frame of the arm's own method where it has one
+    /// (8,288 B a level of a method chain unoptimized) — so nesting depth, not
+    /// node count, is what outgrows a stack (the v0.36.0 incident, commit
+    /// 0fb5e5f0: a modest server program's walk closed a CI worker's ~2 MiB
+    /// margin). Every realistic fixture peaks at 20 levels (both walkthrough
+    /// entries, the std twin-parity and release-emission corpora); 500 is 25x
+    /// that, and caps the bounded worst case near 4.7 MiB unoptimized —
+    /// deeper nesting gets a clean diagnostic instead of a stack overflow.
     ///
-    /// The per-level figure is Order 44's seal's re-measurement, and
+    /// The per-level figure is N169's re-measurement, and
     /// `tests/deep_nesting.rs` is where it is held: the record read ~36 KiB
     /// per level and ~18 MiB at the bound until Order 36's lazy, const,
     /// callable and visibility arms landed IN this frame, three comments
-    /// went on quoting the old numbers (N111), and the frame had reached
-    /// 49,120 B when the seal moved its largest arms out of line.
+    /// went on quoting the old numbers (N111), the frame had reached
+    /// 49,120 B when Order 44's seal moved its largest arms out of line, and
+    /// 28,208 B a chain level when N169 moved every arm of 400 B or more.
     const WALK_DEPTH_LIMIT: usize = 500;
 
     fn walk_expr_node(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
@@ -38820,23 +38821,7 @@ impl<'src> Analyzer<'src> {
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::EXPR_WALK);
         self.walk_depth += 1;
         if self.walk_depth > Self::WALK_DEPTH_LIMIT {
-            self.walk_depth -= 1;
-            if !self.walk_depth_refused {
-                self.walk_depth_refused = true;
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: format!(
-                        "this expression nests more than {} levels deep, which analysis \
-                         refuses; lift inner expressions into `let` bindings to flatten it",
-                        Self::WALK_DEPTH_LIMIT
-                    ),
-                });
-            }
-            let id = self.new_entity_id();
-            self.expr_id_to_expr_map.insert(id, Expr::Error);
-            return id;
+            return self.refuse_walk_depth(node);
         }
         // B195: the branch bookkeeping travels the condition's boolean spine
         // only. Stepping off it (into a call argument, a nested `if`) narrows
@@ -38863,12 +38848,58 @@ impl<'src> Analyzer<'src> {
             self.condition_polarity = outer.map(|polarity| polarity.off_spine(node.1.end));
             Some(outer)
         };
+        // N169: the per-level frame, measured where `VILAN_COUNTERS` asks.
+        let walk_level_parent =
+            crate::counters::counters_enabled().then(crate::depth_stats::enter_walk_level);
         let id = self.walk_expr_node_inner(node, scope_id);
+        if let Some(parent) = walk_level_parent {
+            crate::depth_stats::leave_walk_level(parent);
+        }
         if let Some(polarity) = dropped_polarity {
             self.condition_polarity = polarity;
         }
         self.walk_depth -= 1;
         id
+    }
+
+    /// The depth bound's refusal (B138), out of line (N169): the message's
+    /// `format!` and the `Error` it fills would otherwise sit in
+    /// [`Self::walk_expr_node`]'s frame on every level of every walk, for a
+    /// branch that runs at most once per analysis.
+    #[cold]
+    #[inline(never)]
+    fn refuse_walk_depth(&mut self, node: &'src Spanned<Node<'src>>) -> Id {
+        self.walk_depth -= 1;
+        if !self.walk_depth_refused {
+            self.walk_depth_refused = true;
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: format!(
+                    "this expression nests more than {} levels deep, which analysis \
+                     refuses; lift inner expressions into `let` bindings to flatten it",
+                    Self::WALK_DEPTH_LIMIT
+                ),
+            });
+        }
+        let id = self.new_entity_id();
+        self.expr_id_to_expr_map.insert(id, Expr::Error);
+        id
+    }
+
+    /// A walk arm's fixed-message refusal at `span`, out of line (N169): an
+    /// `Error` and its `String` built inline cost [`Self::walk_expr_node_inner`]'s
+    /// shared frame a few hundred bytes per arm, paid on every level of
+    /// nesting whichever arm runs; a call costs it nothing.
+    #[inline(never)]
+    fn refuse_in_walk(&mut self, span: Span, msg: &'static str) {
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: msg.to_string(),
+        });
     }
 
     /// G24 — `const let NAME[: T] = EXPR;`. The binding walks as an ordinary
@@ -38916,11 +38947,14 @@ impl<'src> Analyzer<'src> {
 
     /// One level of the phase-1 walk. Its locals are ONE stack frame taken on
     /// every call, so every level of nesting pays for every arm's locals,
-    /// whichever arm runs (`tests/deep_nesting.rs` measures it). A large arm,
-    /// or a new one that brings much with it, goes in its own
-    /// `#[inline(never)]` method, as the declaration and closure arms do
-    /// (`walk_func_entity` and its siblings below): those locals then exist
-    /// only while that arm runs.
+    /// whichever arm runs (`tests/deep_nesting.rs` measures it). An arm whose
+    /// locals come to ~400 bytes or more, or a new one that brings much with
+    /// it, goes in its own `#[inline(never)]` method, as thirty-three arms do
+    /// (`walk_member_accessor_entity`, `walk_func_entity` and their siblings
+    /// below): those locals then exist only while that arm runs. A refusal
+    /// with a fixed message goes through [`Self::refuse_in_walk`] for the same
+    /// reason. N169 is what happens otherwise: the frame regrew from 26 KB to
+    /// 28 KB a level one modest arm at a time, and the seal's canary went red.
     fn walk_expr_node_inner(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
         // F27 R3.2: a platform-fenced twin whose fence excludes this leg is
         // not collected — no entity of its own, no scope entry, no impl
@@ -38945,12 +38979,7 @@ impl<'src> Analyzer<'src> {
             // caught here, with the idiom. B488: G24 gave the declaration a
             // spelling, `const let`, so the steer names it first.
             if matches!(&inner.0, Node::Assign(..)) {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "`const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`".to_string(),
-                });
+                self.refuse_in_walk(node.1, "`const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`");
                 let id = self.new_entity_id();
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
                 return id;
@@ -39035,28 +39064,7 @@ impl<'src> Analyzer<'src> {
             Node::Null => Some(Expr::Null),
             Node::Bool(x) => Some(Expr::Bool(*x)),
             Node::String(x) => Some(Expr::String(x)),
-            // Validate the trimming rules here, where the literal has its span;
-            // the transformer re-runs the (infallible after this) trim for the
-            // value. A bad literal degrades to `""` so its uses stay typed and
-            // the one diagnostic stands alone.
-            Node::MultilineString(x) => match crate::util::trim_multiline_string(x) {
-                Ok(_) => Some(Expr::MultilineString(x)),
-                Err((message, range)) => {
-                    // The range is relative to the raw inner text, which ends 3
-                    // bytes before the literal does (the closing delimiter).
-                    // Measuring back from the END rather than forward from the
-                    // start keeps this right for BOTH openers: `"""` and the
-                    // `i"""` whose malformed shape degraded to this node.
-                    let base = node.1.end.saturating_sub(3 + x.len());
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: (base + range.start..base + range.end).into(),
-                        msg: message,
-                    });
-                    Some(Expr::String(""))
-                }
-            },
+            Node::MultilineString(..) => self.walk_multiline_string_entity(node),
             Node::Number(whole, fraction, suffix) => {
                 self.prepped_number_literals.push(id);
                 Some(Expr::Number(whole, *fraction, *suffix))
@@ -39092,126 +39100,7 @@ impl<'src> Analyzer<'src> {
                 });
                 None
             }
-            Node::MemberAccessor(subject, member) => {
-                let subject_id = self.walk_expr_node(subject, scope_id);
-                match &member.0 {
-                    Node::Accessor(name) => {
-                        self.member_name_spans.insert(id, member.1);
-                        self.constraints
-                            .push(Constraint::FieldAccessor(FieldAccessorConstraint {
-                                id,
-                                subject_id,
-                                member_name: name,
-                            }));
-                    }
-                    // A number member (`pair.0`) is a tuple's positional
-                    // accessor — the SAME constraint as a named member, so it
-                    // defers with the subject's inference instead of the old
-                    // one-shot pre-solve pass that errored on anything not yet
-                    // resolved. A FRACTIONAL member is the lexer reading
-                    // `pair.0.1` as the float `0.1`: two chained accesses,
-                    // split here (`(pair.0).1`), the inner one on a fresh
-                    // entity. A suffix (`pair.0i32`) is meaningless on a
-                    // position.
-                    Node::Number(name, fraction, suffix) => {
-                        if suffix.is_some() {
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: member.1,
-                                msg: "a tuple position is a bare number (`.0`, `.1`); drop the \
-                                      suffix"
-                                    .to_string(),
-                            });
-                        }
-                        self.member_name_spans.insert(id, member.1);
-                        let (final_subject, final_member) = match fraction {
-                            Some(fraction_part) => {
-                                let inner_id = self.new_entity_id();
-                                if let Some(span) = self.span_map.get(&id).copied() {
-                                    self.span_map.insert(inner_id, span);
-                                }
-                                self.expr_id_to_scope_id_map.insert(inner_id, scope_id);
-                                self.constraints.push(Constraint::FieldAccessor(
-                                    FieldAccessorConstraint {
-                                        id: inner_id,
-                                        subject_id,
-                                        member_name: name,
-                                    },
-                                ));
-                                (inner_id, *fraction_part)
-                            }
-                            None => (subject_id, *name),
-                        };
-                        self.constraints
-                            .push(Constraint::FieldAccessor(FieldAccessorConstraint {
-                                id,
-                                subject_id: final_subject,
-                                member_name: final_member,
-                            }));
-                    }
-                    Node::Call(call_subject, call_generic_arguments, call_arguments) => {
-                        match &call_subject.0 {
-                            Node::Accessor(name) => {
-                                self.chain_stages.push(ChainStage {
-                                    id,
-                                    subject_id,
-                                    subject_end: subject.1.end,
-                                    member_start: member.1.start,
-                                    span: node.1,
-                                });
-                                self.member_name_spans.insert(id, call_subject.1);
-                                let argument_ids =
-                                    self.walk_expr_nodes(&call_arguments.0, scope_id);
-                                self.note_named_arguments(&call_arguments.0, &argument_ids);
-                                let generic_argument_ids = call_generic_arguments
-                                    .as_ref()
-                                    .map(|x| {
-                                        x.0.iter()
-                                            .map(|y| self.walk_generic_argument(y, scope_id))
-                                            .collect()
-                                    })
-                                    .unwrap_or_else(Vec::new);
-                                if !generic_argument_ids.is_empty() {
-                                    self.calls_writing_generics.push(id);
-                                }
-                                self.written_call_arguments.push((
-                                    id,
-                                    subject_id,
-                                    argument_ids.clone(),
-                                ));
-                                self.constraints.push(Constraint::MethodCall {
-                                    id,
-                                    subject_id,
-                                    member_name: name,
-                                    generic_argument_ids,
-                                    argument_ids,
-                                    arguments_span: call_arguments.1,
-                                });
-                            }
-                            _ => {
-                                self.diagnostics.push(Error {
-                                    trace: Vec::new(),
-                                    note: None,
-                                    span: call_subject.1,
-                                    msg: "expected a method name after `.`".to_string(),
-                                });
-                                self.expr_id_to_expr_map.insert(id, Expr::Error);
-                            }
-                        }
-                    }
-                    _ => {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: member.1,
-                            msg: "expected a field or method name after `.`".to_string(),
-                        });
-                        self.expr_id_to_expr_map.insert(id, Expr::Error);
-                    }
-                }
-                None
-            }
+            Node::MemberAccessor(..) => self.walk_member_accessor_entity(node, scope_id, id),
             // The generic arguments are `None` for every path the expression
             // grammar builds — a `<...>` there is the following call's, folded
             // by `parse_call` — so there is nothing to walk here.
@@ -39226,63 +39115,8 @@ impl<'src> Analyzer<'src> {
                     .push((id, subject_type_id, member_name));
                 None
             }
-            // `import`/`use` bind into the scope they appear in — module scope
-            // at a file's top level, a block/impl scope anywhere else (imports
-            // are block-scoped statements, backlog H2; visibility is
-            // block-granular, like a `let`). They compile to nothing: the
-            // `Expr::Void` keeps a statement-position import a well-formed
-            // no-op through typing and emission.
-            Node::Import(root_branch, modifier) => {
-                self.import_statement_spans
-                    .push((self.current_source_id, node.1));
-                self.record_reach_marks(root_branch);
-                let mut entries = Vec::new();
-                flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
-                let mut path_spans: Vec<Span> = Vec::new();
-                for (path, name, leaf_span, alias) in entries {
-                    for (_, segment_span) in &path {
-                        path_spans.push(*segment_span);
-                    }
-                    path_spans.push(leaf_span);
-                    self.prepped_imports.push((
-                        path,
-                        name,
-                        scope_id,
-                        node.1,
-                        leaf_span,
-                        self.current_source_id,
-                        alias,
-                        true,
-                    ));
-                }
-                // B318 S4: a selector's own path is walked too, BINDING
-                // nothing. The walk is what puts the module's segments in
-                // `type_references`, which is where the admission pass reads
-                // the files a statement carried — the one channel that works
-                // the same on every host.
-                self.queue_selector_paths(root_branch, scope_id, node.1, &mut path_spans);
-                self.bank_import_restriction(root_branch, *modifier, scope_id, node.1, path_spans);
-                Some(Expr::Void)
-            }
-            Node::Use(root_branch) => {
-                self.import_statement_spans
-                    .push((self.current_source_id, node.1));
-                self.record_reach_marks(root_branch);
-                let mut entries = Vec::new();
-                flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
-                for (path, name, leaf_span, alias) in entries {
-                    self.prepped_uses.push((
-                        path,
-                        name,
-                        scope_id,
-                        node.1,
-                        leaf_span,
-                        self.current_source_id,
-                        alias,
-                    ));
-                }
-                Some(Expr::Void)
-            }
+            Node::Import(..) => self.walk_import_entity(node, scope_id),
+            Node::Use(..) => self.walk_use_entity(node, scope_id),
             Node::List(items) => {
                 let ids = self.walk_expr_nodes(items, scope_id);
                 Some(Expr::List(ids))
@@ -39295,14 +39129,11 @@ impl<'src> Analyzer<'src> {
             Node::ArrayType(..) => {
                 // `[T; n]` is a TYPE — the type parser produces it in type
                 // position only; in value position it's a stray type annotation.
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "a `[T; n]` array type isn't a value; write an array \
-                          literal like `[value; n]`"
-                        .to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "a `[T; n]` array type isn't a value; write an array \
+                          literal like `[value; n]`",
+                );
                 Some(Expr::Error)
             }
             Node::Tuple(items) => {
@@ -39315,164 +39146,9 @@ impl<'src> Analyzer<'src> {
                 let expr_id = self.walk_expr_node(&children.0.1, body_scope_id);
                 Some(Expr::Block((ids, expr_id)))
             }
-            Node::For(condition, body) => {
-                let body_scope_id = self.create_owned_scope(Some(scope_id)).id;
-                if let Some(condition) = condition.as_ref() {
-                    self.reject_lift_region_condition(condition);
-                }
-                // B223: a `while`-shaped `for`'s condition is a condition, and
-                // gets the condition frame — rooted at its own end, exactly as
-                // an `if`'s is. Reaching the body IS the test having passed, so
-                // an ordinary capture runs on into the body untouched; what the
-                // frame adds is the negated case, where the body runs on the
-                // path the pattern MISSED and the capture must not reach it
-                // (B195's rule, which the `for` was outside of until now).
-                // The else collector is swapped out with it: a `for` has no
-                // else, so what its condition binds on the false path belongs
-                // to nobody and must not leak into an enclosing `if`'s.
-                let outer_polarity = self.condition_polarity;
-                let outer_captures = std::mem::take(&mut self.else_visible_captures);
-                let condition_id = condition.as_ref().map(|condition| {
-                    self.condition_polarity = Some(ConditionPolarity::root(condition.1.end));
-                    self.walk_expr_node(condition, body_scope_id)
-                });
-                self.condition_polarity = outer_polarity;
-                self.else_visible_captures = outer_captures;
-                if let (Some(condition_id), Some(condition)) = (condition_id, condition.as_ref())
-                    && !matches!(condition.0, Node::LiftRegion(..))
-                {
-                    self.prepped_conditions
-                        .push((condition_id, "`for` condition"));
-                }
-                let ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
-                let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
-                Some(Expr::For(condition_id, (ids, expr_id)))
-            }
-            // `for x in iterable` lowers to a native JS `for...of` (see
-            // `Expr::ForEach`); it iterates a JS-iterable (e.g. a `List`, which is
-            // an array). Iterating a custom `Iterator` (the trait protocol) is not
-            // supported yet — that needs trait dispatch.
-            Node::ForIn(binder, iterable, body) => {
-                let iterable_id = self.walk_expr_node(iterable, scope_id);
-                let body_scope_id = self.create_owned_scope(Some(scope_id)).id;
-                // A bare name is the element binding itself; a tuple or array
-                // binder (B368) binds a hidden element and DESTRUCTURES it in a
-                // prelude statement of the body, exactly as a tuple-bound
-                // parameter does (`walk_parameter`'s destructure). `_` and a
-                // binder the parser refused introduce nothing at all.
-                let (name, name_span) = match &binder.0 {
-                    Pattern::Binding(name, _, name_span) => (*name, *name_span),
-                    Pattern::Wildcard => ("_", binder.1),
-                    _ => ("_", binder.1),
-                };
-                let destructured = !matches!(binder.0, Pattern::Binding(..) | Pattern::Wildcard);
-                // The element binding's type is the iterable's element type when
-                // recoverable, else unknown (a `List` value erases its element
-                // type). `_` introduces no binding.
-                let item_id = (name != "_" || destructured).then(|| {
-                    let variable_id = self.new_entity_id();
-                    // The binding starts `Unknown` (so a method call on it defers
-                    // rather than erroring) and is resolved to the iterable's
-                    // element type in the constraint loop, falling back to `any`
-                    // for an iterable whose element type can't be recovered.
-                    let element_type_id = Type::Unknown.get_type_id(self);
-                    self.variables.insert(
-                        variable_id,
-                        Variable {
-                            id: variable_id,
-                            name,
-                            name_span,
-                            initial: None,
-                            type_id: element_type_id,
-                            mutable: false,
-                            annotated: false,
-                        },
-                    );
-                    self.expr_id_to_expr_map
-                        .insert(variable_id, Expr::Variable(variable_id));
-                    self.expr_id_to_scope_id_map
-                        .insert(variable_id, body_scope_id);
-                    self.span_map.insert(variable_id, &node.1);
-                    self.reference_count.entry(variable_id).or_insert(0);
-                    // Visible from its name in the header on — i.e. throughout
-                    // the body, and shadowable by a `let` inside it. A
-                    // destructuring binder's hidden element has no name to
-                    // declare: the names in scope are the pattern's, bound by
-                    // the prelude below.
-                    if !destructured {
-                        self.declare_scope_value(body_scope_id, name, variable_id, name_span.end);
-                    }
-                    // `for e in &mut list` / `&list` — the iterable is a view, so
-                    // each binding is a view of the element (write-through), not a
-                    // copy. The element type still resolves below (a view is
-                    // identity-typed).
-                    if let Some(Expr::Reference(_, mutable)) =
-                        self.expr_id_to_expr_map.get(&iterable_id)
-                    {
-                        self.for_each_views.insert(variable_id, *mutable);
-                    }
-                    self.constraints.push(Constraint::ForEachItem {
-                        item_id: variable_id,
-                        iterable_id,
-                    });
-                    variable_id
-                });
-                // The destructure prelude: one statement, ahead of the body's
-                // own, reading a REFERENCE to the hidden element (the variable
-                // entity is a declaration that emits no value) and binding the
-                // pattern's names for the rest of the iteration.
-                let mut ids = Vec::new();
-                if destructured && let Some(item_id) = item_id {
-                    let walked =
-                        self.walk_pattern(&binder.0, &binder.1, body_scope_id, binder.1.end);
-                    let reference_id = self.new_entity_id();
-                    self.expr_id_to_expr_map
-                        .insert(reference_id, Expr::Local(item_id));
-                    self.expr_id_to_scope_id_map
-                        .insert(reference_id, body_scope_id);
-                    self.span_map.insert(reference_id, &binder.1);
-                    let destructure_id = self.new_entity_id();
-                    self.span_map.insert(destructure_id, &binder.1);
-                    self.expr_id_to_scope_id_map
-                        .insert(destructure_id, body_scope_id);
-                    self.constraints
-                        .push(Constraint::Destructure(DestructureConstraint {
-                            id: destructure_id,
-                            value_id: reference_id,
-                            type_id: None,
-                            scope_id: body_scope_id,
-                            pattern: walked,
-                            // The element's type is `Unknown` until
-                            // `ForEachItem` resolves it from the iterable, so
-                            // the destructure waits for it exactly as a tuple
-                            // parameter waits for its argument.
-                            defer_until_known: true,
-                        }));
-                    ids.push(destructure_id);
-                }
-                ids.extend(self.walk_expr_nodes(&body.0.0, body_scope_id));
-                let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
-                // Decide native `for...of` vs the Iterator-protocol loop once the
-                // iterable's type is known (in `build`).
-                self.prepped_for_each.push((id, iterable_id));
-                Some(Expr::ForEach(iterable_id, item_id, (ids, expr_id)))
-            }
-            // `subject is pattern` — walk the subject and the pattern (binding
-            // captures into the current scope so a guarded `if`/`&&` can use
-            // them), then resolve the pattern against the subject type in
-            // `build`. The expression itself types as `bool`.
-            Node::Is(subject, pattern) => {
-                let subject_id = self.walk_expr_node(subject, scope_id);
-                let walk_pattern =
-                    self.walk_pattern(&pattern.0, &pattern.1, scope_id, pattern.1.end);
-                self.constraints.push(Constraint::Is(PreppedIs {
-                    id,
-                    subject_id,
-                    scope_id,
-                    pattern: walk_pattern,
-                }));
-                None
-            }
+            Node::For(..) => self.walk_for_entity(node, scope_id),
+            Node::ForIn(..) => self.walk_for_in_entity(node, scope_id, id),
+            Node::Is(..) => self.walk_is_entity(node, scope_id, id),
             // Re-export visibility is not tracked yet; walking the inner
             // statement is enough to bind it into the current scope.
             // A macro definition: HERMETIC — the body is never walked in the
@@ -39488,68 +39164,8 @@ impl<'src> Analyzer<'src> {
                 self.transparent_declarations.insert(id, declaration_id);
                 Some(Expr::Void)
             }
-            // A macro invocation: item-position ones already appended their
-            // output (nothing to walk); expression-position ones walk their
-            // spliced replacement, aliased through an empty block so this
-            // node's entity IS the replacement's value.
-            Node::MacroInvocation(name, name_span, _) => {
-                self.record_macro_reference(name, *name_span, scope_id);
-                let key = node as *const Spanned<Node> as usize;
-                if self.macro_item_invocations.contains(&key) {
-                    Some(Expr::Void)
-                } else if self.macro_failed_sites.contains(&key) {
-                    // The expansion failure is already a diagnostic.
-                    Some(Expr::Error)
-                } else if let Some(replacement) =
-                    self.macro_expression_expansions.get(&key).copied()
-                {
-                    let child_id = self.walk_expr_node(replacement, scope_id);
-                    Some(Expr::Block((Vec::new(), child_id)))
-                } else {
-                    // Reached only where expansion never runs — a macro body
-                    // (the world walks the definition's original text).
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: node.1,
-                        msg: format!(
-                            "the invocation `macro {name}(..)` was not expanded: splice \
-                             syntax belongs in program code; inside the macro world, call \
-                             `{name}(..)` as a plain function"
-                        ),
-                    });
-                    Some(Expr::Error)
-                }
-            }
-            // A `macro { .. }` block: like an invocation, but anonymous — its
-            // body is macro-world code and never walks here; the expansion
-            // recorded what this site becomes.
-            Node::MacroBlock(_) => {
-                let key = node as *const Spanned<Node> as usize;
-                if self.macro_item_invocations.contains(&key) {
-                    Some(Expr::Void)
-                } else if self.macro_failed_sites.contains(&key) {
-                    // The expansion failure is already a diagnostic.
-                    Some(Expr::Error)
-                } else if let Some(replacement) =
-                    self.macro_expression_expansions.get(&key).copied()
-                {
-                    let child_id = self.walk_expr_node(replacement, scope_id);
-                    Some(Expr::Block((Vec::new(), child_id)))
-                } else {
-                    // Reached only where expansion never runs — a macro body.
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: node.1,
-                        msg: "this `macro { .. }` block was not expanded: a block cannot \
-                              appear inside macro code (the enclosing body already runs at \
-                              expansion time)"
-                            .to_string(),
-                    });
-                    Some(Expr::Error)
-                }
-            }
+            Node::MacroInvocation(..) => self.walk_macro_invocation_entity(node, scope_id),
+            Node::MacroBlock(..) => self.walk_macro_block_entity(node, scope_id),
             // `export *;` (B318 §2.1) — every item of this module is exported.
             // The marker IS the statement, so there is nothing under it to walk;
             // it takes the same module-level refusal `export` takes, for the same
@@ -39573,79 +39189,14 @@ impl<'src> Analyzer<'src> {
                 self.export_all_modules.insert(scope_id);
                 self.curated_modules.insert(scope_id);
                 if !self.module_scope_ids.contains(&scope_id) {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: node.1,
-                        msg: "`export` is a module-level item and cannot appear inside a body"
-                            .to_string(),
-                    });
-                }
-                Some(Expr::Void)
-            }
-            Node::Export(export_scope, inner, labels) => {
-                // Exports shape a module's public surface, so they only mean
-                // something at a module's top level. A block-scoped `import`
-                // (H2) is deliberately not exportable — and any other `export`
-                // in a body has nothing to attach to.
-                if !self.module_scope_ids.contains(&scope_id) {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: node.1,
-                        msg: "`export` is a module-level item and cannot appear inside a body"
-                            .to_string(),
-                    });
-                }
-                // B382: `[deprecated("…")] export import …;` deprecates each
-                // name the re-export publishes — the alias where it renames,
-                // the leaf where not. Recorded per leaf with the leaf's span,
-                // which is how the statement's own reach (and so the target) is
-                // found again once the world has resolved;
-                // `check_deprecated_reexports` decides it.
-                if let Some(steer) = labels.as_ref().and_then(|labels| labels.deprecated)
-                    && let Node::Import(root_branch, _) = &inner.0
-                {
-                    let mut entries = Vec::new();
-                    flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
-                    for (_, name, leaf_span, alias) in &entries {
-                        self.deprecated_import_leaves.push(DeprecatedImportLeaf {
-                            source: self.current_source_id,
-                            leaf_span: *leaf_span,
-                            bound: alias.map_or(*name, |(alias, _)| alias),
-                            renamed: alias.is_some(),
-                            scope: scope_id,
-                            steer,
-                        });
-                    }
-                }
-                let walked = self.walk_expr_node(inner, scope_id);
-                // A transparent wrapper's own entity is not the declaration's
-                // (`transparent_declarations`): `[derive(Wire)] export struct
-                // Handle` must mark `Handle`.
-                let declaration_id = self
-                    .transparent_declarations
-                    .get(&walked)
-                    .copied()
-                    .unwrap_or(walked);
-                // B318 §1.1: the marker is RECORDED now, where it used to be
-                // discarded. An `export import` records too — the re-export is
-                // an act of publication by a module that can see the item, which
-                // is `prelude.md` §8's "extend by re-export" one level down.
-                self.exported_entities.insert(declaration_id, scope_id);
-                self.curated_modules.insert(scope_id);
-                if let Some(export_scope) = export_scope {
-                    self.export_scopes.insert(
-                        declaration_id,
-                        export_scope
-                            .path
-                            .iter()
-                            .map(|(segment, _)| *segment)
-                            .collect(),
+                    self.refuse_in_walk(
+                        node.1,
+                        "`export` is a module-level item and cannot appear inside a body",
                     );
                 }
                 Some(Expr::Void)
             }
+            Node::Export(..) => self.walk_export_entity(node, scope_id),
             // `[derive(..)]` is transparent: walk the wrapped item; the trait
             // impls are the std macro's, expanded before this walk ever runs.
             Node::Derive(derives, inner) => {
@@ -39749,298 +39300,11 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Dereference(operand_id))
             }
             Node::Jump(target) => Some(Expr::Jump(target)),
-            Node::If(if_) => {
-                /// B195: the captures an earlier condition in this `if`/`else if`
-                /// chain bound under a NEGATION — bound, that is, exactly on the
-                /// path that reaches this branch. `(name, entity, visible_until)`.
-                type InheritedCaptures<'src> = Vec<(&'src str, Id, usize)>;
-
-                /// Declares them into a branch's own scope, from its very start:
-                /// the branch is a fresh scope, so a later `let` of the same name
-                /// inside it still shadows this (the last covering declaration
-                /// wins).
-                fn declare_inherited<'src>(
-                    s: &mut Analyzer<'src>,
-                    body_scope_id: Id,
-                    inherited: &InheritedCaptures<'src>,
-                ) {
-                    for &(name, capture_id, visible_until) in inherited {
-                        s.declare_scope_value_until(
-                            body_scope_id,
-                            name,
-                            capture_id,
-                            0,
-                            visible_until,
-                        );
-                    }
-                }
-
-                /// Returns the walked branch plus the captures THIS branch's
-                /// own condition proves by being false — what B195 hands the
-                /// `else` and what B187 publishes past a diverging guard — and
-                /// the ones it proves by being true, which R15 publishes past a
-                /// `then`-spelled guard. Both empty for a bare `else`, which has
-                /// no condition of its own.
-                fn walk_branch<'src>(
-                    s: &mut Analyzer<'src>,
-                    branch: &'src NodeIfBranch,
-                    scope_id: Id,
-                    inherited: &InheritedCaptures<'src>,
-                ) -> (
-                    ExprIfBranch,
-                    InheritedCaptures<'src>,
-                    InheritedCaptures<'src>,
-                ) {
-                    match branch {
-                        NodeIfBranch::If(if_) => {
-                            let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
-                            // An `else if`'s condition and body are reached only
-                            // on the previous condition's false path, which is
-                            // where a negated capture is bound.
-                            declare_inherited(s, body_scope_id, inherited);
-                            s.reject_lift_region_condition(&if_.condition);
-                            // B195: walk the condition with a fresh polarity
-                            // frame and a fresh collector, so a nested `if` in
-                            // the condition cannot leak either into this one.
-                            let outer_polarity = s
-                                .condition_polarity
-                                .replace(ConditionPolarity::root(if_.condition.1.end));
-                            let outer_captures = std::mem::take(&mut s.else_visible_captures);
-                            let outer_true_captures = std::mem::take(&mut s.then_visible_captures);
-                            let condition_id = s.walk_expr_node(&if_.condition, body_scope_id);
-                            s.condition_polarity = outer_polarity;
-                            let negated_captures =
-                                std::mem::replace(&mut s.else_visible_captures, outer_captures);
-                            let true_captures = std::mem::replace(
-                                &mut s.then_visible_captures,
-                                outer_true_captures,
-                            );
-                            // A lifted condition was already rejected above
-                            // with its targeted message — no second report.
-                            if !matches!(if_.condition.0, Node::LiftRegion(..)) {
-                                s.prepped_conditions.push((condition_id, "`if` condition"));
-                            }
-                            let then_ids = s.walk_expr_nodes(&if_.then.0.0, body_scope_id);
-                            let then_expr_id = s.walk_expr_node(&if_.then.0.1, body_scope_id);
-                            let walked_else = if_.else_.as_ref().map(|x| {
-                                // Everything the enclosing chain proved on
-                                // the way here, plus what this condition
-                                // proves by being false.
-                                let mut passed_on = inherited.clone();
-                                passed_on.extend(negated_captures.iter().copied());
-                                Box::new(walk_branch(s, &x.0, scope_id, &passed_on).0)
-                            });
-                            (
-                                ExprIfBranch::If(
-                                    condition_id,
-                                    (then_ids, then_expr_id),
-                                    walked_else,
-                                ),
-                                negated_captures,
-                                true_captures,
-                            )
-                        }
-                        NodeIfBranch::Else(body) => {
-                            let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
-                            declare_inherited(s, body_scope_id, inherited);
-                            let else_ids = s.walk_expr_nodes(&body.0.0, body_scope_id);
-                            let else_expr_id = s.walk_expr_node(&body.0.1, body_scope_id);
-                            (
-                                ExprIfBranch::Else((else_ids, else_expr_id)),
-                                Vec::new(),
-                                Vec::new(),
-                            )
-                        }
-                    }
-                }
-                let (branch, false_path_captures, true_path_captures) =
-                    walk_branch(self, if_, scope_id, &Vec::new());
-                // B187, the guard clause — negate, diverge, continue. With no
-                // `else` and a then-branch that provably diverges, the ONLY way
-                // past this `if` is the condition's false path, which is the
-                // very path B195 hands the `else` its captures on. So those
-                // captures are published into the ENCLOSING scope, visible from
-                // the end of the `if` onward — an ordinary declaration there, so
-                // a later `let` of the name shadows it like any other.
-                //
-                // Divergence is `Divergence::new`'s answer — one walk, B204 — the one the type
-                // checker itself acts on, so the guard and the editor's
-                // unreachable-code paint cannot disagree about what "dead" is.
-                //
-                // B222: which is why the verdict is not taken HERE. Two of that
-                // walk's four leaves — a `panic(…)` call, an endless `for { … }`
-                // — are facts about the resolved world, not about an
-                // expression's shape, and they settle after this walk has run.
-                // Asking now would answer for `ret` and `jump` and quietly say
-                // "no" to the other ending. So the candidate is written down and
-                // `resolve_world` decides it, once, for all four leaves.
-                if let ExprIfBranch::If(_, (then_ids, then_tail), None) = &branch
-                    && !false_path_captures.is_empty()
-                {
-                    self.guard_continuations.push(GuardContinuation {
-                        scope_id,
-                        visible_from: node.1.end,
-                        diverging_statements: then_ids.clone(),
-                        diverging_tail: *then_tail,
-                        captures: false_path_captures,
-                    });
-                }
-                // R15 (B459, RULED 2026-09-29), B187 mirrored — the one place
-                // the `then`/`else` sugar is not a pure rewrite. A `then`-
-                // spelled STATEMENT (`opt is Some(let v) else ret;`, or `c then
-                // S else ret;`) whose `else` diverges can be left only along
-                // the condition's TRUE path, so the captures that path binds are
-                // published into the enclosing scope from the statement's end —
-                // Swift's `guard`, Rust's `let … else`. The keyword `if` it
-                // spells keeps B171's scoping: the rule is the sugar's. Decided
-                // with B187's candidates in `resolve_world`, so all four
-                // divergence leaves count.
-                if let NodeIfBranch::If(written) = if_
-                    && matches!(
-                        written.spelling,
-                        IfSpelling::Then {
-                            statement: true,
-                            ..
-                        }
-                    )
-                    && let ExprIfBranch::If(_, _, Some(walked_else)) = &branch
-                    && let ExprIfBranch::Else((else_ids, else_tail)) = walked_else.as_ref()
-                    && !true_path_captures.is_empty()
-                {
-                    self.guard_continuations.push(GuardContinuation {
-                        scope_id,
-                        visible_from: node.1.end,
-                        diverging_statements: else_ids.clone(),
-                        diverging_tail: *else_tail,
-                        captures: true_path_captures,
-                    });
-                }
-                // A value `if` — one with a final `else` — has its arms unified
-                // by the same rule a `match`'s legs go through (B163). Queued
-                // here rather than folded into the inference so the check runs
-                // ONCE per `if`, with a resolved world to read; a statement
-                // `if` produces no value, so there is nothing to unify.
-                if if_branch_has_final_else(&branch) {
-                    self.constraints
-                        .push(Constraint::IfArms { id, span: node.1 });
-                }
-                Some(Expr::If(branch))
-            }
+            Node::If(..) => self.walk_if_entity(node, scope_id, id),
             Node::Func(..) => self.walk_func_entity(node, scope_id, id),
-            Node::Call(subject, generic_arguments, arguments) => {
-                // E284: a generic list written SPACED after the callee (`a < b
-                // > (c)`) may be two comparisons the parser read as a generic
-                // call; remembered so a callee that turns out not callable
-                // names both readings.
-                if let Some(generics) = generic_arguments
-                    && generics.1.start > subject.1.end
-                {
-                    self.spaced_generic_calls
-                        .insert(id, (subject.1, generics.1, arguments.1));
-                }
-                let subject_id = self.walk_expr_node(subject, scope_id);
-                // B204: bank the call's subject as the WALK saw it. The pair
-                // is what `DivergenceLeaves` reads to find the `panic(…)`
-                // calls, once names have resolved and before any constraint
-                // has — `function_calls` records the same pair, but not until
-                // the call's own constraint resolves, which would make "does
-                // this body diverge?" depend on fixpoint order.
-                self.call_subjects.push((id, subject_id));
-                self.call_subject_ids.insert(subject_id);
-                let argument_ids = self.walk_expr_nodes(&arguments.0, scope_id);
-                self.note_named_arguments(&arguments.0, &argument_ids);
-                let generic_argument_ids = generic_arguments
-                    .as_ref()
-                    .map(|x| {
-                        x.0.iter()
-                            .map(|y| self.walk_generic_argument(y, scope_id))
-                            .collect()
-                    })
-                    .unwrap_or_else(Vec::new);
-                if !generic_argument_ids.is_empty() {
-                    self.calls_writing_generics.push(id);
-                }
-                // E189: bank the argument entities as the WALK saw them,
-                // beside the subject above. `function_calls` records the same
-                // list, but only for a call that RESOLVED, so a closure
-                // written as the argument of a call that did not is recorded
-                // nowhere — and the call-graph walk, which reads the arguments
-                // out of `function_calls`, never reaches it to give it its
-                // lexical parent.
-                self.written_call_arguments
-                    .push((id, subject_id, argument_ids.clone()));
-                // Defer call type-checking to constraint solving.
-                self.constraints
-                    .push(Constraint::CallSubject(CallSubjectConstraint::from_walk(
-                        id,
-                        subject_id,
-                        generic_argument_ids,
-                        argument_ids,
-                        arguments.1,
-                    )));
-                Some(Expr::Call(id))
-            }
-            Node::FuncReturn(value) => {
-                let value_id = value
-                    .as_ref()
-                    .map(|value| self.walk_expr_node(value, scope_id));
-                // `ret` is a return position exactly like the tail: its value
-                // checks (and binds return-position generics) against the
-                // innermost callable's DECLARED return type. A bare `ret` is
-                // `ret <void>` — a synthesized void value spanned at the `ret`,
-                // legal exactly when the declared type is void. In a closure or
-                // an unannotated function, rets collect on the frame and take
-                // part in the inferred return type instead
-                // (proposal/ret-checking.md rules 3 and 4).
-                match self.return_type_stack.last_mut() {
-                    Some(ReturnFrame::Function(function_id, declared)) => {
-                        let function_id = *function_id;
-                        let return_type_id = *declared;
-                        let checked_id = value_id.unwrap_or_else(|| {
-                            let void_id = self.new_entity_id();
-                            self.expr_id_to_expr_map.insert(void_id, Expr::Void);
-                            self.expr_id_to_scope_id_map.insert(void_id, scope_id);
-                            self.span_map.insert(void_id, &node.1);
-                            void_id
-                        });
-                        self.expected_types.insert(checked_id, return_type_id);
-                        self.seed_tail_expectations(checked_id, return_type_id);
-                        self.constraints.push(Constraint::ReturnType {
-                            body_id: checked_id,
-                            return_type_id,
-                            // A `ret`'s checked value is never a block tail —
-                            // neither regime 1/1' nor B221's reachability
-                            // question is asked of anything but a tail.
-                            statement_ids: Vec::new(),
-                        });
-                        self.return_sites.push((function_id, checked_id));
-                    }
-                    Some(ReturnFrame::Inferred { rets }) => {
-                        rets.push((node.1, value_id));
-                    }
-                    None => {}
-                }
-                Some(Expr::FunctionReturn(value_id))
-            }
-            Node::Lift(subject, continuation) => {
-                let subject_id = self.walk_expr_node(subject, scope_id);
-                // The binder: the continuation's hole, typed by the constraint
-                // as the subject's element.
-                let binder_id = self.new_entity_id();
-                self.expr_id_to_expr_map.insert(binder_id, Expr::LiftBinder);
-                self.expr_id_to_scope_id_map.insert(binder_id, scope_id);
-                self.span_map.insert(binder_id, &node.1);
-                self.lift_binder_stack.push(binder_id);
-                let continuation_id = self.walk_expr_node(continuation, scope_id);
-                self.lift_binder_stack.pop();
-                self.constraints.push(Constraint::Lift {
-                    id,
-                    subject_id,
-                    binder_id,
-                    continuation_id,
-                });
-                Some(Expr::Lift(subject_id, binder_id, continuation_id))
-            }
+            Node::Call(..) => self.walk_call_entity(node, scope_id, id),
+            Node::FuncReturn(..) => self.walk_func_return_entity(node, scope_id),
+            Node::Lift(..) => self.walk_lift_entity(node, scope_id, id),
             Node::LiftBinder => {
                 // Resolve to the innermost enclosing Lift's binder entity, like
                 // a reference to a local.
@@ -40056,84 +39320,13 @@ impl<'src> Analyzer<'src> {
                 // position v1 does not lift in. Sound by construction: the
                 // mark is never silently dropped, it errors here.
                 self.walk_expr_node(inner, scope_id);
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "a bare `?` (expression lifting) is not supported in this position"
-                        .to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "a bare `?` (expression lifting) is not supported in this position",
+                );
                 Some(Expr::Error)
             }
-            Node::LiftRegion(steps, body) => {
-                // v1 validations, where the node shapes and spans are natural.
-                // A region whose body is exactly one split's hole computes
-                // nothing (`let x = a?;`, `f(status?)`) — resolved as a hard
-                // error in review (expression-lifting.md §6.3).
-                if let Node::LiftHole(index) = body.0
-                    && steps.get(index).is_some_and(|(_, is_split)| *is_split)
-                {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: node.1,
-                        msg: "`?` lifts nothing here: the region is the whole expression; \
-                              use `?.` for member access, or remove the `?`"
-                            .to_string(),
-                    });
-                }
-                // `!` may not run after a split: it would early-return from
-                // inside the region (the closure problem, rejected uniformly
-                // in v1 — expression-lifting.md §2).
-                if let Some(first_split) = steps.iter().position(|(_, is_split)| *is_split) {
-                    let after_split_try_assert = steps
-                        .iter()
-                        .skip(first_split + 1)
-                        .any(|(step, _)| contains_try_assert(&step.0))
-                        || contains_try_assert(&body.0);
-                    if after_split_try_assert {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: node.1,
-                            msg: "`!` cannot run after a `?` inside a lifted expression: it \
-                                  would early-return from inside the region; bind the `!` \
-                                  result first (`let ok = value!;`)"
-                                .to_string(),
-                        });
-                    }
-                }
-                let mut walked_steps: Vec<(Id, Id, bool)> = Vec::with_capacity(steps.len());
-                self.lift_region_frames.push(Vec::new());
-                for (step, is_split) in steps {
-                    // Steps may reference EARLIER steps' holes (a receiver
-                    // built from a hoisted value), so the frame grows as the
-                    // walk proceeds.
-                    let step_id = self.walk_expr_node(step, scope_id);
-                    let binder_id = self.new_entity_id();
-                    self.expr_id_to_expr_map.insert(binder_id, Expr::LiftBinder);
-                    self.expr_id_to_scope_id_map.insert(binder_id, scope_id);
-                    // The binder deliberately gets an EMPTY span: it would
-                    // otherwise tie with its receiver in the LSP's
-                    // narrowest-span hover selection and flakily show the
-                    // ELEMENT type over the receiver's own. Diagnostics
-                    // anchor at the step and region ids, never the binder.
-                    self.span_map.insert(binder_id, &EMPTY_SPAN);
-                    self.lift_region_frames
-                        .last_mut()
-                        .expect("frame pushed above")
-                        .push(binder_id);
-                    walked_steps.push((step_id, binder_id, *is_split));
-                }
-                let body_id = self.walk_expr_node(body, scope_id);
-                self.lift_region_frames.pop();
-                self.constraints.push(Constraint::LiftRegion {
-                    id,
-                    steps: walked_steps.clone(),
-                    body_id,
-                });
-                Some(Expr::LiftRegion(walked_steps, body_id))
-            }
+            Node::LiftRegion(..) => self.walk_lift_region_entity(node, scope_id, id),
             Node::LiftHole(index) => {
                 // The result of a region step — a reference to its binder.
                 match self
@@ -40146,435 +39339,15 @@ impl<'src> Analyzer<'src> {
                     None => Some(Expr::Error),
                 }
             }
-            Node::TryAssert(receiver) => {
-                let receiver_id = self.walk_expr_node(receiver, scope_id);
-                // `!` returns the bad half from the nearest enclosing callable,
-                // so that callable must declare a compatible return type. A
-                // closure/`async` block (inferred return) or an undeclared-void
-                // function has nothing to check against — a clean error (v1;
-                // proposal/try-and-lift.md §2).
-                match self.return_type_stack.last() {
-                    Some(ReturnFrame::Function(_, declared)) => {
-                        let return_type_id = *declared;
-                        self.constraints.push(Constraint::TryAssert {
-                            id,
-                            receiver_id,
-                            return_type_id,
-                        });
-                    }
-                    _ => {
-                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
-                            span: node.1,
-                            msg: "`!` requires the nearest enclosing function to declare an `Option`/`Result`-compatible return type (closures and `async` blocks are not yet supported)"
-                                .to_string(),
-                        });
-                    }
-                }
-                Some(Expr::TryAssert(receiver_id))
-            }
-            Node::Binary(op, lhs, rhs) => {
-                // B171: `||` short-circuits, so a pattern capture bound in one
-                // operand is bound only where THAT operand's test ran and
-                // passed. Cap each operand's captures at its own end — which
-                // takes in the other arm and everything after the condition,
-                // the then-branch included, since reaching either of those
-                // proves nothing about this arm.
-                let outer_polarity = self.condition_polarity;
-                let (lhs_id, rhs_id) = match op {
-                    BinaryOp::Or => {
-                        let outer = self.or_operand_end;
-                        // B195: on top of that cap, neither operand of a `||`
-                        // establishes the test for the ELSE branch either.
-                        self.condition_polarity =
-                            outer_polarity.map(ConditionPolarity::into_or_operand);
-                        self.or_operand_end = Some(min_operand_end(outer, lhs.1.end));
-                        let lhs_id = self.walk_expr_node(lhs, scope_id);
-                        self.or_operand_end = Some(min_operand_end(outer, rhs.1.end));
-                        let rhs_id = self.walk_expr_node(rhs, scope_id);
-                        self.or_operand_end = outer;
-                        (lhs_id, rhs_id)
-                    }
-                    // B195: `&&` carries its operands' TRUE side and nothing
-                    // else, so a capture bound on an operand's FALSE side — one
-                    // under a negation — dies with that operand: `!(a is X) &&
-                    // use(n)` does not bind `n` for the right operand, and
-                    // `!(a is X && b)` still binds it for `b`, which the `&&`
-                    // short-circuit did reach by matching.
-                    BinaryOp::And => {
-                        self.condition_polarity =
-                            outer_polarity.map(|polarity| polarity.into_and_operand(lhs.1.end));
-                        let lhs_id = self.walk_expr_node(lhs, scope_id);
-                        self.condition_polarity =
-                            outer_polarity.map(|polarity| polarity.into_and_operand(rhs.1.end));
-                        let rhs_id = self.walk_expr_node(rhs, scope_id);
-                        (lhs_id, rhs_id)
-                    }
-                    _ => {
-                        let lhs_id = self.walk_expr_node(lhs, scope_id);
-                        let rhs_id = self.walk_expr_node(rhs, scope_id);
-                        (lhs_id, rhs_id)
-                    }
-                };
-                self.condition_polarity = outer_polarity;
-                // Overloadable operators dispatch; orderings and `&&`/`||`
-                // aren't overloadable but their operands are checked (B24).
-                if is_overloadable_operator(*op)
-                    || is_ordering_operator(*op)
-                    || matches!(op, BinaryOp::And | BinaryOp::Or)
-                {
-                    self.prepped_binary_ops.push((id, *op, lhs_id));
-                }
-                Some(Expr::Binary(*op, lhs_id, rhs_id))
-            }
-            Node::Let(name, type_, value, mutable, lazy, labels) => {
-                // B570: `auto T` / `auto` on a binding is a SIGNATURE, not an
-                // annotation — the initializer is inferred as if none were
-                // written, and the binding's uses read `T`. Taken off here.
-                let (type_, auto_annotation) = match type_.as_deref() {
-                    Some((Node::AutoType(written), span)) => {
-                        (None, Some((*span, written.as_deref())))
-                    }
-                    other => (other, None),
-                };
-                let name_span = name.1;
-                let name = name.0;
-                // E221: a labelled binding's labels, keyed by its entity id
-                // (`labels::check` refuses them on a local).
-                if let Some(labels) = labels {
-                    self.item_labels.insert(id, (**labels).clone());
-                }
-                // lazy.md §2: the binding holds a memo cell whose initializer
-                // runs at its FIRST USE. Which bindings are module-level is not
-                // an answer this walk has (module bodies register as it goes),
-                // so the declaration is only RECORDED here;
-                // `record_lazy_bindings` partitions it once every scope exists,
-                // and `check_lazy_arguments` refuses the local ones (§3).
-                if *lazy {
-                    self.lazy_binding_declarations.push(id);
-                }
-                // `_` eats the value: the binding is never referenceable.
-                // Visible from the END of the whole statement, so the
-                // initializer reads an enclosing (or shadowed) binding, never
-                // the one being declared.
-                if name != "_" {
-                    self.declare_scope_value(scope_id, name, id, node.1.end);
-                }
-                self.reference_count.entry(id).or_insert(0);
-                let initial = value.as_ref().map(|value| {
-                    let value_id = self.walk_expr_node(value, scope_id);
-                    let assignments = self.assignment_values.entry(id).or_default();
-                    assignments.push(value_id);
-                    value_id
-                });
-                // The annotation's view-ness is recorded before `walk_type_node`
-                // erases the `&`/`&mut`, for the R1 check.
-                if let Some(type_node) = type_ {
-                    self.binding_annotation_view
-                        .insert(id, matches!(&type_node.0, Node::Reference(_, _)));
-                }
-                // Peel a `context` clause on the annotation (reactive-turns
-                // ui-boundary follow-up; parameters shipped with B15): the
-                // BINDING becomes a named injected closure — its initializer
-                // literal defers, passing it matches same-clause parameters,
-                // and calling it is a read at the call site. Resolution is
-                // deferred past the import fixpoint, like parameters'.
-                let mut annotation: Option<&Spanned<Node>> = type_;
-                let mut clause: Option<&Vec<(&'src str, Span)>> = None;
-                if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
-                    annotation.map(|node| (&node.0, node.1))
-                {
-                    if !clause_target_is_a_closure(&inner.0) {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: clause_span,
-                            msg: "a `context` clause is only supported on a closure type"
-                                .to_string(),
-                        });
-                    }
-                    clause = Some(names);
-                    annotation = Some(inner);
-                }
-                // Peel the `async` marker (J2), like parameters.
-                match annotation.map(|node| &node.0) {
-                    Some(Node::AsyncType(inner)) => {
-                        self.async_values.insert(id);
-                        annotation = Some(inner);
-                    }
-                    Some(Node::Tuple(elements)) if elements.len() == 1 => {
-                        if let Node::AsyncType(inner) = &elements[0].0 {
-                            self.async_values.insert(id);
-                            annotation = Some(inner);
-                        }
-                    }
-                    _ => {}
-                }
-                let type_id = match annotation {
-                    Some(node) => {
-                        let type_id = self.walk_type_node(node, scope_id);
-                        // B161: the one value position where a trait is a
-                        // CONSTRAINT rather than an error. Recorded by type id
-                        // because the name has not resolved yet — whether the
-                        // annotation names a trait is the drain's to discover.
-                        self.binding_annotation_type_ids.insert(type_id, id);
-                        self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
-                        type_id
-                    }
-                    None => Type::Unknown.get_type_id(self),
-                };
-                // B309: the clause goes on the annotation's TYPE, with this
-                // binding named as its owner so the entity-keyed index still
-                // knows it is an injected closure.
-                if let Some(names) = clause {
-                    self.record_type_context_clause(type_id, names, scope_id, Some(id));
-                }
-                // An annotated let EXPECTS its value at the annotation — the
-                // same seed the function tail gets from its declared return
-                // type, so expectation-readers (`match` leg propagation, `!`'s
-                // receiver direction) see it.
-                if type_.is_some()
-                    && let Some(value_id) = initial
-                {
-                    self.seed_tail_expectations(value_id, type_id);
-                    self.annotated_landings.insert(value_id);
-                }
-                self.variables.insert(
-                    id,
-                    Variable {
-                        id,
-                        name,
-                        name_span,
-                        initial,
-                        type_id,
-                        mutable: *mutable,
-                        annotated: type_.is_some(),
-                    },
-                );
-                // Collect a variable constraint for type inference.
-                // If the variable has an explicit type annotation, the
-                // constraint will unify the initial value against that
-                // annotation. If not, the value's type becomes the
-                // variable's type once resolved.
-                let value_ids = self.assignment_values.get(&id).cloned().unwrap_or_default();
-                self.constraints
-                    .push(Constraint::Variable(VariableConstraint::from_walk(
-                        id, type_id, value_ids,
-                    )));
-                if let Some((span, written)) = auto_annotation {
-                    self.record_auto_annotation(
-                        AutoOwner::Binding(id),
-                        name,
-                        span,
-                        written,
-                        scope_id,
-                    );
-                } else if type_.is_none() && name != "_" && !name_span.into_range().is_empty() {
-                    self.auto_fill_points.push((id, (name_span, name_span.end)));
-                }
-                Some(Expr::Variable(id))
-            }
-            Node::LetDestructure(pattern, type_, value, mutable) => {
-                // Walk the value, then the binder pattern (which registers its
-                // bindings in scope as `Unknown`-typed variables); a `Destructure`
-                // constraint types them from the value's element types once it
-                // resolves. The whole `let` lowers to the recorded
-                // `Expr::Destructure`, so the walk inserts nothing now.
-                let value_id = value
-                    .as_ref()
-                    .map(|value| self.walk_expr_node(value, scope_id));
-                // Binders become visible after the whole statement, like a
-                // plain `let` — the initializer never sees them.
-                let walk_pattern = self.walk_pattern(&pattern.0, &pattern.1, scope_id, node.1.end);
-                if *mutable {
-                    self.set_pattern_bindings_mutable(&walk_pattern);
-                }
-                let type_id = type_.as_ref().map(|x| self.walk_type_node(x, scope_id));
-                match value_id {
-                    Some(value_id) => {
-                        self.constraints
-                            .push(Constraint::Destructure(DestructureConstraint {
-                                id,
-                                value_id,
-                                type_id,
-                                scope_id,
-                                pattern: walk_pattern,
-                                defer_until_known: false,
-                            }));
-                        None
-                    }
-                    None => {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: node.1,
-                            msg: "a destructuring `let` requires a value".to_string(),
-                        });
-                        Some(Expr::Error)
-                    }
-                }
-            }
-            Node::Assign(target, op, value) => {
-                // R6 (transparent references): `*` is value extraction — an
-                // rvalue — and may not be an assignment target. A view is written
-                // *through* directly (`x = v`), so `*x = v` is rejected.
-                if matches!(&target.0, Node::Dereference(_)) {
-                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
-                        span: target.1,
-                        msg: "cannot assign through `*`: a view is written through directly; write `x = …`, not `*x = …`".to_string(),
-                    });
-                }
-                let value_id = self.walk_expr_node(value, scope_id);
-                // The target is an lvalue node — a local (`Accessor`) or a field
-                // place (`MemberAccessor`). Walking it yields an `Expr::Local`
-                // or, once resolved, an `Expr::Field`; the transformer renders
-                // either as the left side of a JS assignment.
-                //
-                // A lifted chain is a VALUE, not a place — `p?.x = 5` would
-                // assign into a lowering temp (proposal/try-and-lift.md §3).
-                if lift_target_of(target) {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: target.1,
-                        msg: "a lifted chain (`?.`) is not an assignment target".to_string(),
-                    });
-                }
-                let target_id = self.walk_expr_node(target, scope_id);
-                // A compound assignment like `x += v` desugars to `x = x + v`;
-                // the left operand re-reads the same place.
-                let stored_value_id = match op {
-                    Some(op) => {
-                        let lhs_id = self.walk_expr_node(target, scope_id);
-                        // Remember this synthesized re-read so a view target's
-                        // re-read is also deref-wrapped (R5).
-                        self.compound_reread_ids.insert(lhs_id);
-                        let binary_id = self.new_entity_id();
-                        self.expr_id_to_expr_map
-                            .insert(binary_id, Expr::Binary(*op, lhs_id, value_id));
-                        self.expr_id_to_scope_id_map.insert(binary_id, scope_id);
-                        self.span_map.insert(binary_id, &node.1);
-                        if is_overloadable_operator(*op) {
-                            self.prepped_binary_ops.push((binary_id, *op, lhs_id));
-                        }
-                        binary_id
-                    }
-                    None => value_id,
-                };
-                self.prepped_assignments.push((target_id, stored_value_id));
-                // B166: `prepped_assignments` above only wires targets that
-                // resolve to a LOCAL — a field target fell straight through it,
-                // so the assignment door into a struct field checked nothing.
-                // This constraint is that missing check; it defers until the
-                // target resolves and is vacuous when the target turns out not
-                // to be a field. The value's own span anchors a mismatch (E7),
-                // which for a compound `f += v` is the written `v`.
-                self.constraints.push(Constraint::PlaceAssignment {
-                    target_id,
-                    value_id: stored_value_id,
-                    value_span: value.1,
-                });
-                Some(Expr::Assignment(target_id, stored_value_id))
-            }
+            Node::TryAssert(..) => self.walk_try_assert_entity(node, scope_id, id),
+            Node::Binary(..) => self.walk_binary_entity(node, scope_id, id),
+            Node::Let(..) => self.walk_let_entity(node, scope_id, id),
+            Node::LetDestructure(..) => self.walk_let_destructure_entity(node, scope_id, id),
+            Node::Assign(..) => self.walk_assign_entity(node, scope_id),
             Node::Struct(..) => self.walk_struct_entity(node, scope_id, id),
             Node::Enum(..) => self.walk_enum_entity(node, scope_id, id),
-            Node::Match(subject, legs) => {
-                let subject_id = self.walk_expr_node(subject, scope_id);
-                let mut walked_legs = Vec::new();
-                for (patterns, guard, body) in &legs.0 {
-                    // Each leg scopes its captures (and guard) to its own body.
-                    let leg_scope_id = self.create_owned_scope(Some(scope_id)).id;
-                    let walked_patterns = patterns
-                        .iter()
-                        .map(|pattern| {
-                            self.walk_pattern(&pattern.0, &pattern.1, leg_scope_id, pattern.1.end)
-                        })
-                        .collect();
-                    // B223: a guard is a condition for the same reason — the
-                    // leg body runs only where the guard held — so it gets the
-                    // same frame, rooted at the guard's own end, and the same
-                    // swap of the else collector a leg has no use for.
-                    let outer_polarity = self.condition_polarity;
-                    let outer_captures = std::mem::take(&mut self.else_visible_captures);
-                    let guard_id = guard.as_ref().map(|guard| {
-                        self.condition_polarity = Some(ConditionPolarity::root(guard.1.end));
-                        self.walk_expr_node(guard, leg_scope_id)
-                    });
-                    self.condition_polarity = outer_polarity;
-                    self.else_visible_captures = outer_captures;
-                    let body_id = self.walk_expr_node(body, leg_scope_id);
-                    walked_legs.push(WalkLeg {
-                        patterns: walked_patterns,
-                        guard: guard_id,
-                        body: body_id,
-                    });
-                }
-                self.constraints.push(Constraint::Match(PreppedMatch {
-                    id,
-                    subject_id,
-                    scope_id,
-                    legs: walked_legs,
-                    span: node.1,
-                }));
-                // The entity is inserted once the subject type and the leg
-                // patterns have been resolved.
-                None
-            }
-            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
-                let generic_argument_ids = generic_arguments
-                    .as_ref()
-                    .map(|x| {
-                        x.0.iter()
-                            .map(|y| self.walk_generic_argument(y, scope_id))
-                            .collect()
-                    })
-                    .unwrap_or_else(Vec::new);
-                let e_fields = fields
-                    .0
-                    .iter()
-                    .map(|x| {
-                        // The field's NAME always leads its entry, both in
-                        // `name: value` and in the shorthand `name` alone —
-                        // `x.1` is the whole entry's span either way, so the
-                        // name's own span is that span's first `name.len()`
-                        // bytes (E58: the unknown-field diagnostic anchors
-                        // here, not on the value).
-                        let name_span = Span {
-                            start: x.1.start,
-                            end: x.1.start + x.0.0.len(),
-                        };
-                        (
-                            x.0.0,
-                            x.0.1
-                                .as_ref()
-                                .map(|value| self.walk_expr_node(value, scope_id))
-                                .unwrap_or_else(|| {
-                                    // Field shorthand `S { field }` means
-                                    // `S { field: field }`: the value is the
-                                    // local named after the field itself.
-                                    let local_id = self.new_entity_id();
-                                    self.prepped_locals.push((local_id, x.0.0));
-                                    self.expr_id_to_scope_id_map.insert(local_id, scope_id);
-                                    self.span_map.insert(local_id, &x.1);
-                                    local_id
-                                }),
-                            x.0.1.as_ref().map(|y| y.1).unwrap_or(x.1),
-                            name_span,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                self.constraints.push(Constraint::StructInitializer(
-                    StructInitializerConstraint::from_walk(
-                        id,
-                        scope_id,
-                        namespace.clone(),
-                        (name.0, name.1),
-                        generic_argument_ids,
-                        e_fields,
-                        fields.1,
-                    ),
-                ));
-                None
-            }
+            Node::Match(..) => self.walk_match_entity(node, scope_id, id),
+            Node::StructInitializer(..) => self.walk_struct_initializer_entity(node, scope_id, id),
             Node::Impl(..) => self.walk_impl_entity(node, scope_id, id),
             Node::Trait(..) => self.walk_trait_entity(node, scope_id, id),
             Node::TupleComprehension { .. } => {
@@ -40594,133 +39367,48 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::Await(inner_id))
             }
-            // `value as T` (B571): the annotated-binding path with no binding.
-            // The annotation is registered exactly as a `let`'s is — keyed by
-            // this site where a `let` keys its variable — so a bare trait
-            // (B161), a hidden-parameter struct (B184) and a nested trait
-            // (B461) read here as they read there, and the value's
-            // expectation is seeded at the walk (B125) so a generic call in it
-            // binds from the type before its own constraint resolves.
-            Node::Ascribe(value, type_node) => {
-                let value_id = self.walk_expr_node(value, scope_id);
-                // B570 S2: `value as auto T` is an ascription the toolchain
-                // writes and keeps — output only, like every `auto` — so its
-                // type is recorded as a signature and never seeded into the
-                // value.
-                let auto = match &type_node.0 {
-                    Node::AutoType(written) => {
-                        self.record_auto_annotation(
-                            AutoOwner::Ascription(id),
-                            "",
-                            type_node.1,
-                            written.as_deref(),
-                            scope_id,
-                        );
-                        true
-                    }
-                    _ => false,
-                };
-                let type_id = match auto {
-                    true => self
-                        .auto_written
-                        .get(&id)
-                        .copied()
-                        .unwrap_or_else(|| Type::Unknown.get_type_id(self)),
-                    false => {
-                        let type_id = self.walk_type_node(type_node, scope_id);
-                        self.binding_annotation_type_ids.insert(type_id, id);
-                        self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
-                        self.seed_tail_expectations(value_id, type_id);
-                        type_id
-                    }
-                };
-                let stage = match &value.0 {
-                    Node::MemberAccessor(_, member) => match &member.0 {
-                        Node::Call(callee, _, _) => match &callee.0 {
-                            Node::Accessor(name) => Some((*name, member.1)),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                self.ascriptions.insert(
-                    id,
-                    AscriptionSite {
-                        value_id,
-                        type_id,
-                        type_span: type_node.1,
-                        stage,
-                        awaited: false,
-                        auto,
-                    },
-                );
-                self.constraints.push(Constraint::Ascription {
-                    id,
-                    value_id,
-                    type_id,
-                });
-                Some(Expr::Ascribe(value_id))
-            }
+            Node::Ascribe(..) => self.walk_ascribe_entity(node, scope_id, id),
             Node::ClosureType(_, _) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "a closure type is not valid here (expected an expression)".to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "a closure type is not valid here (expected an expression)",
+                );
                 Some(Expr::Error)
             }
             Node::TypeWithContexts(_, _) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg:
-                        "a `context`-typed closure type is not valid here (expected an expression)"
-                            .to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "a `context`-typed closure type is not valid here (expected an expression)",
+                );
                 Some(Expr::Error)
             }
             Node::AsyncType(_) | Node::SyncType(_) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "a closure-type marker is not valid here (expected an expression)"
-                        .to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "a closure-type marker is not valid here (expected an expression)",
+                );
                 Some(Expr::Error)
             }
             Node::DynType(_) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "`dyn Trait` is a type, not a value (expected an expression here)"
-                        .to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "`dyn Trait` is a type, not a value (expected an expression here)",
+                );
                 Some(Expr::Error)
             }
             Node::AutoType(_) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "`auto` marks a type annotation, not a value (expected an expression \
-                          here)"
-                        .to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "`auto` marks a type annotation, not a value (expected an expression \
+                          here)",
+                );
                 Some(Expr::Error)
             }
             Node::MappedType { .. } => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "a mapped tuple type is not valid here (expected an expression)"
-                        .to_string(),
-                });
+                self.refuse_in_walk(
+                    node.1,
+                    "a mapped tuple type is not valid here (expected an expression)",
+                );
                 Some(Expr::Error)
             }
             Node::Module(..) => self.walk_module_entity(node, scope_id, id),
@@ -40734,6 +39422,1598 @@ impl<'src> Analyzer<'src> {
         self.expr_id_to_scope_id_map.insert(id, scope_id);
 
         id
+    }
+
+    /// `walk_expr_node_inner`'s `Node::MemberAccessor` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_member_accessor_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::MemberAccessor(subject, member) = &node.0 else {
+            unreachable!("only the `Node::MemberAccessor` arm walks here")
+        };
+        let subject_id = self.walk_expr_node(subject, scope_id);
+        match &member.0 {
+            Node::Accessor(name) => {
+                self.member_name_spans.insert(id, member.1);
+                self.constraints
+                    .push(Constraint::FieldAccessor(FieldAccessorConstraint {
+                        id,
+                        subject_id,
+                        member_name: name,
+                    }));
+            }
+            // A number member (`pair.0`) is a tuple's positional
+            // accessor — the SAME constraint as a named member, so it
+            // defers with the subject's inference instead of the old
+            // one-shot pre-solve pass that errored on anything not yet
+            // resolved. A FRACTIONAL member is the lexer reading
+            // `pair.0.1` as the float `0.1`: two chained accesses,
+            // split here (`(pair.0).1`), the inner one on a fresh
+            // entity. A suffix (`pair.0i32`) is meaningless on a
+            // position.
+            Node::Number(name, fraction, suffix) => {
+                if suffix.is_some() {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: member.1,
+                        msg: "a tuple position is a bare number (`.0`, `.1`); drop the \
+                              suffix"
+                            .to_string(),
+                    });
+                }
+                self.member_name_spans.insert(id, member.1);
+                let (final_subject, final_member) = match fraction {
+                    Some(fraction_part) => {
+                        let inner_id = self.new_entity_id();
+                        if let Some(span) = self.span_map.get(&id).copied() {
+                            self.span_map.insert(inner_id, span);
+                        }
+                        self.expr_id_to_scope_id_map.insert(inner_id, scope_id);
+                        self.constraints
+                            .push(Constraint::FieldAccessor(FieldAccessorConstraint {
+                                id: inner_id,
+                                subject_id,
+                                member_name: name,
+                            }));
+                        (inner_id, *fraction_part)
+                    }
+                    None => (subject_id, *name),
+                };
+                self.constraints
+                    .push(Constraint::FieldAccessor(FieldAccessorConstraint {
+                        id,
+                        subject_id: final_subject,
+                        member_name: final_member,
+                    }));
+            }
+            Node::Call(call_subject, call_generic_arguments, call_arguments) => {
+                match &call_subject.0 {
+                    Node::Accessor(name) => {
+                        self.chain_stages.push(ChainStage {
+                            id,
+                            subject_id,
+                            subject_end: subject.1.end,
+                            member_start: member.1.start,
+                            span: node.1,
+                        });
+                        self.member_name_spans.insert(id, call_subject.1);
+                        let argument_ids = self.walk_expr_nodes(&call_arguments.0, scope_id);
+                        self.note_named_arguments(&call_arguments.0, &argument_ids);
+                        let generic_argument_ids = call_generic_arguments
+                            .as_ref()
+                            .map(|x| {
+                                x.0.iter()
+                                    .map(|y| self.walk_generic_argument(y, scope_id))
+                                    .collect()
+                            })
+                            .unwrap_or_else(Vec::new);
+                        if !generic_argument_ids.is_empty() {
+                            self.calls_writing_generics.push(id);
+                        }
+                        self.written_call_arguments
+                            .push((id, subject_id, argument_ids.clone()));
+                        self.constraints.push(Constraint::MethodCall {
+                            id,
+                            subject_id,
+                            member_name: name,
+                            generic_argument_ids,
+                            argument_ids,
+                            arguments_span: call_arguments.1,
+                        });
+                    }
+                    _ => {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: call_subject.1,
+                            msg: "expected a method name after `.`".to_string(),
+                        });
+                        self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    }
+                }
+            }
+            _ => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: member.1,
+                    msg: "expected a field or method name after `.`".to_string(),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+            }
+        }
+        None
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Let` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_let_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Let(name, type_, value, mutable, lazy, labels) = &node.0 else {
+            unreachable!("only the `Node::Let` arm walks here")
+        };
+        // B570: `auto T` / `auto` on a binding is a SIGNATURE, not an
+        // annotation — the initializer is inferred as if none were
+        // written, and the binding's uses read `T`. Taken off here.
+        let (type_, auto_annotation) = match type_.as_deref() {
+            Some((Node::AutoType(written), span)) => (None, Some((*span, written.as_deref()))),
+            other => (other, None),
+        };
+        let name_span = name.1;
+        let name = name.0;
+        // E221: a labelled binding's labels, keyed by its entity id
+        // (`labels::check` refuses them on a local).
+        if let Some(labels) = labels {
+            self.item_labels.insert(id, (**labels).clone());
+        }
+        // lazy.md §2: the binding holds a memo cell whose initializer
+        // runs at its FIRST USE. Which bindings are module-level is not
+        // an answer this walk has (module bodies register as it goes),
+        // so the declaration is only RECORDED here;
+        // `record_lazy_bindings` partitions it once every scope exists,
+        // and `check_lazy_arguments` refuses the local ones (§3).
+        if *lazy {
+            self.lazy_binding_declarations.push(id);
+        }
+        // `_` eats the value: the binding is never referenceable.
+        // Visible from the END of the whole statement, so the
+        // initializer reads an enclosing (or shadowed) binding, never
+        // the one being declared.
+        if name != "_" {
+            self.declare_scope_value(scope_id, name, id, node.1.end);
+        }
+        self.reference_count.entry(id).or_insert(0);
+        let initial = value.as_ref().map(|value| {
+            let value_id = self.walk_expr_node(value, scope_id);
+            let assignments = self.assignment_values.entry(id).or_default();
+            assignments.push(value_id);
+            value_id
+        });
+        // The annotation's view-ness is recorded before `walk_type_node`
+        // erases the `&`/`&mut`, for the R1 check.
+        if let Some(type_node) = type_ {
+            self.binding_annotation_view
+                .insert(id, matches!(&type_node.0, Node::Reference(_, _)));
+        }
+        // Peel a `context` clause on the annotation (reactive-turns
+        // ui-boundary follow-up; parameters shipped with B15): the
+        // BINDING becomes a named injected closure — its initializer
+        // literal defers, passing it matches same-clause parameters,
+        // and calling it is a read at the call site. Resolution is
+        // deferred past the import fixpoint, like parameters'.
+        let mut annotation: Option<&Spanned<Node>> = type_;
+        let mut clause: Option<&Vec<(&'src str, Span)>> = None;
+        if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
+            annotation.map(|node| (&node.0, node.1))
+        {
+            if !clause_target_is_a_closure(&inner.0) {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: clause_span,
+                    msg: "a `context` clause is only supported on a closure type".to_string(),
+                });
+            }
+            clause = Some(names);
+            annotation = Some(inner);
+        }
+        // Peel the `async` marker (J2), like parameters.
+        match annotation.map(|node| &node.0) {
+            Some(Node::AsyncType(inner)) => {
+                self.async_values.insert(id);
+                annotation = Some(inner);
+            }
+            Some(Node::Tuple(elements)) if elements.len() == 1 => {
+                if let Node::AsyncType(inner) = &elements[0].0 {
+                    self.async_values.insert(id);
+                    annotation = Some(inner);
+                }
+            }
+            _ => {}
+        }
+        let type_id = match annotation {
+            Some(node) => {
+                let type_id = self.walk_type_node(node, scope_id);
+                // B161: the one value position where a trait is a
+                // CONSTRAINT rather than an error. Recorded by type id
+                // because the name has not resolved yet — whether the
+                // annotation names a trait is the drain's to discover.
+                self.binding_annotation_type_ids.insert(type_id, id);
+                self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
+                type_id
+            }
+            None => Type::Unknown.get_type_id(self),
+        };
+        // B309: the clause goes on the annotation's TYPE, with this
+        // binding named as its owner so the entity-keyed index still
+        // knows it is an injected closure.
+        if let Some(names) = clause {
+            self.record_type_context_clause(type_id, names, scope_id, Some(id));
+        }
+        // An annotated let EXPECTS its value at the annotation — the
+        // same seed the function tail gets from its declared return
+        // type, so expectation-readers (`match` leg propagation, `!`'s
+        // receiver direction) see it.
+        if type_.is_some()
+            && let Some(value_id) = initial
+        {
+            self.seed_tail_expectations(value_id, type_id);
+            self.annotated_landings.insert(value_id);
+        }
+        self.variables.insert(
+            id,
+            Variable {
+                id,
+                name,
+                name_span,
+                initial,
+                type_id,
+                mutable: *mutable,
+                annotated: type_.is_some(),
+            },
+        );
+        // Collect a variable constraint for type inference.
+        // If the variable has an explicit type annotation, the
+        // constraint will unify the initial value against that
+        // annotation. If not, the value's type becomes the
+        // variable's type once resolved.
+        let value_ids = self.assignment_values.get(&id).cloned().unwrap_or_default();
+        self.constraints
+            .push(Constraint::Variable(VariableConstraint::from_walk(
+                id, type_id, value_ids,
+            )));
+        if let Some((span, written)) = auto_annotation {
+            self.record_auto_annotation(AutoOwner::Binding(id), name, span, written, scope_id);
+        } else if type_.is_none() && name != "_" && !name_span.into_range().is_empty() {
+            self.auto_fill_points.push((id, (name_span, name_span.end)));
+        }
+        Some(Expr::Variable(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::LiftRegion` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_lift_region_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::LiftRegion(steps, body) = &node.0 else {
+            unreachable!("only the `Node::LiftRegion` arm walks here")
+        };
+        // v1 validations, where the node shapes and spans are natural.
+        // A region whose body is exactly one split's hole computes
+        // nothing (`let x = a?;`, `f(status?)`) — resolved as a hard
+        // error in review (expression-lifting.md §6.3).
+        if let Node::LiftHole(index) = body.0
+            && steps.get(index).is_some_and(|(_, is_split)| *is_split)
+        {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: "`?` lifts nothing here: the region is the whole expression; \
+                      use `?.` for member access, or remove the `?`"
+                    .to_string(),
+            });
+        }
+        // `!` may not run after a split: it would early-return from
+        // inside the region (the closure problem, rejected uniformly
+        // in v1 — expression-lifting.md §2).
+        if let Some(first_split) = steps.iter().position(|(_, is_split)| *is_split) {
+            let after_split_try_assert = steps
+                .iter()
+                .skip(first_split + 1)
+                .any(|(step, _)| contains_try_assert(&step.0))
+                || contains_try_assert(&body.0);
+            if after_split_try_assert {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: "`!` cannot run after a `?` inside a lifted expression: it \
+                          would early-return from inside the region; bind the `!` \
+                          result first (`let ok = value!;`)"
+                        .to_string(),
+                });
+            }
+        }
+        let mut walked_steps: Vec<(Id, Id, bool)> = Vec::with_capacity(steps.len());
+        self.lift_region_frames.push(Vec::new());
+        for (step, is_split) in steps {
+            // Steps may reference EARLIER steps' holes (a receiver
+            // built from a hoisted value), so the frame grows as the
+            // walk proceeds.
+            let step_id = self.walk_expr_node(step, scope_id);
+            let binder_id = self.new_entity_id();
+            self.expr_id_to_expr_map.insert(binder_id, Expr::LiftBinder);
+            self.expr_id_to_scope_id_map.insert(binder_id, scope_id);
+            // The binder deliberately gets an EMPTY span: it would
+            // otherwise tie with its receiver in the LSP's
+            // narrowest-span hover selection and flakily show the
+            // ELEMENT type over the receiver's own. Diagnostics
+            // anchor at the step and region ids, never the binder.
+            self.span_map.insert(binder_id, &EMPTY_SPAN);
+            self.lift_region_frames
+                .last_mut()
+                .expect("frame pushed above")
+                .push(binder_id);
+            walked_steps.push((step_id, binder_id, *is_split));
+        }
+        let body_id = self.walk_expr_node(body, scope_id);
+        self.lift_region_frames.pop();
+        self.constraints.push(Constraint::LiftRegion {
+            id,
+            steps: walked_steps.clone(),
+            body_id,
+        });
+        Some(Expr::LiftRegion(walked_steps, body_id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::ForIn` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_for_in_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::ForIn(binder, iterable, body) = &node.0 else {
+            unreachable!("only the `Node::ForIn` arm walks here")
+        };
+        // `for x in iterable` lowers to a native JS `for...of` (see
+        // `Expr::ForEach`); it iterates a JS-iterable (e.g. a `List`, which is
+        // an array). Iterating a custom `Iterator` (the trait protocol) is not
+        // supported yet — that needs trait dispatch.
+        let iterable_id = self.walk_expr_node(iterable, scope_id);
+        let body_scope_id = self.create_owned_scope(Some(scope_id)).id;
+        // A bare name is the element binding itself; a tuple or array
+        // binder (B368) binds a hidden element and DESTRUCTURES it in a
+        // prelude statement of the body, exactly as a tuple-bound
+        // parameter does (`walk_parameter`'s destructure). `_` and a
+        // binder the parser refused introduce nothing at all.
+        let (name, name_span) = match &binder.0 {
+            Pattern::Binding(name, _, name_span) => (*name, *name_span),
+            Pattern::Wildcard => ("_", binder.1),
+            _ => ("_", binder.1),
+        };
+        let destructured = !matches!(binder.0, Pattern::Binding(..) | Pattern::Wildcard);
+        // The element binding's type is the iterable's element type when
+        // recoverable, else unknown (a `List` value erases its element
+        // type). `_` introduces no binding.
+        let item_id = (name != "_" || destructured).then(|| {
+            let variable_id = self.new_entity_id();
+            // The binding starts `Unknown` (so a method call on it defers
+            // rather than erroring) and is resolved to the iterable's
+            // element type in the constraint loop, falling back to `any`
+            // for an iterable whose element type can't be recovered.
+            let element_type_id = Type::Unknown.get_type_id(self);
+            self.variables.insert(
+                variable_id,
+                Variable {
+                    id: variable_id,
+                    name,
+                    name_span,
+                    initial: None,
+                    type_id: element_type_id,
+                    mutable: false,
+                    annotated: false,
+                },
+            );
+            self.expr_id_to_expr_map
+                .insert(variable_id, Expr::Variable(variable_id));
+            self.expr_id_to_scope_id_map
+                .insert(variable_id, body_scope_id);
+            self.span_map.insert(variable_id, &node.1);
+            self.reference_count.entry(variable_id).or_insert(0);
+            // Visible from its name in the header on — i.e. throughout
+            // the body, and shadowable by a `let` inside it. A
+            // destructuring binder's hidden element has no name to
+            // declare: the names in scope are the pattern's, bound by
+            // the prelude below.
+            if !destructured {
+                self.declare_scope_value(body_scope_id, name, variable_id, name_span.end);
+            }
+            // `for e in &mut list` / `&list` — the iterable is a view, so
+            // each binding is a view of the element (write-through), not a
+            // copy. The element type still resolves below (a view is
+            // identity-typed).
+            if let Some(Expr::Reference(_, mutable)) = self.expr_id_to_expr_map.get(&iterable_id) {
+                self.for_each_views.insert(variable_id, *mutable);
+            }
+            self.constraints.push(Constraint::ForEachItem {
+                item_id: variable_id,
+                iterable_id,
+            });
+            variable_id
+        });
+        // The destructure prelude: one statement, ahead of the body's
+        // own, reading a REFERENCE to the hidden element (the variable
+        // entity is a declaration that emits no value) and binding the
+        // pattern's names for the rest of the iteration.
+        let mut ids = Vec::new();
+        if destructured && let Some(item_id) = item_id {
+            let walked = self.walk_pattern(&binder.0, &binder.1, body_scope_id, binder.1.end);
+            let reference_id = self.new_entity_id();
+            self.expr_id_to_expr_map
+                .insert(reference_id, Expr::Local(item_id));
+            self.expr_id_to_scope_id_map
+                .insert(reference_id, body_scope_id);
+            self.span_map.insert(reference_id, &binder.1);
+            let destructure_id = self.new_entity_id();
+            self.span_map.insert(destructure_id, &binder.1);
+            self.expr_id_to_scope_id_map
+                .insert(destructure_id, body_scope_id);
+            self.constraints
+                .push(Constraint::Destructure(DestructureConstraint {
+                    id: destructure_id,
+                    value_id: reference_id,
+                    type_id: None,
+                    scope_id: body_scope_id,
+                    pattern: walked,
+                    // The element's type is `Unknown` until
+                    // `ForEachItem` resolves it from the iterable, so
+                    // the destructure waits for it exactly as a tuple
+                    // parameter waits for its argument.
+                    defer_until_known: true,
+                }));
+            ids.push(destructure_id);
+        }
+        ids.extend(self.walk_expr_nodes(&body.0.0, body_scope_id));
+        let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
+        // Decide native `for...of` vs the Iterator-protocol loop once the
+        // iterable's type is known (in `build`).
+        self.prepped_for_each.push((id, iterable_id));
+        Some(Expr::ForEach(iterable_id, item_id, (ids, expr_id)))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Assign` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_assign_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Assign(target, op, value) = &node.0 else {
+            unreachable!("only the `Node::Assign` arm walks here")
+        };
+        // R6 (transparent references): `*` is value extraction — an
+        // rvalue — and may not be an assignment target. A view is written
+        // *through* directly (`x = v`), so `*x = v` is rejected.
+        if matches!(&target.0, Node::Dereference(_)) {
+            self.diagnostics.push(Error { trace: Vec::new(), note: None,
+                span: target.1,
+                msg: "cannot assign through `*`: a view is written through directly; write `x = …`, not `*x = …`".to_string(),
+            });
+        }
+        let value_id = self.walk_expr_node(value, scope_id);
+        // The target is an lvalue node — a local (`Accessor`) or a field
+        // place (`MemberAccessor`). Walking it yields an `Expr::Local`
+        // or, once resolved, an `Expr::Field`; the transformer renders
+        // either as the left side of a JS assignment.
+        //
+        // A lifted chain is a VALUE, not a place — `p?.x = 5` would
+        // assign into a lowering temp (proposal/try-and-lift.md §3).
+        if lift_target_of(target) {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: target.1,
+                msg: "a lifted chain (`?.`) is not an assignment target".to_string(),
+            });
+        }
+        let target_id = self.walk_expr_node(target, scope_id);
+        // A compound assignment like `x += v` desugars to `x = x + v`;
+        // the left operand re-reads the same place.
+        let stored_value_id = match op {
+            Some(op) => {
+                let lhs_id = self.walk_expr_node(target, scope_id);
+                // Remember this synthesized re-read so a view target's
+                // re-read is also deref-wrapped (R5).
+                self.compound_reread_ids.insert(lhs_id);
+                let binary_id = self.new_entity_id();
+                self.expr_id_to_expr_map
+                    .insert(binary_id, Expr::Binary(*op, lhs_id, value_id));
+                self.expr_id_to_scope_id_map.insert(binary_id, scope_id);
+                self.span_map.insert(binary_id, &node.1);
+                if is_overloadable_operator(*op) {
+                    self.prepped_binary_ops.push((binary_id, *op, lhs_id));
+                }
+                binary_id
+            }
+            None => value_id,
+        };
+        self.prepped_assignments.push((target_id, stored_value_id));
+        // B166: `prepped_assignments` above only wires targets that
+        // resolve to a LOCAL — a field target fell straight through it,
+        // so the assignment door into a struct field checked nothing.
+        // This constraint is that missing check; it defers until the
+        // target resolves and is vacuous when the target turns out not
+        // to be a field. The value's own span anchors a mismatch (E7),
+        // which for a compound `f += v` is the written `v`.
+        self.constraints.push(Constraint::PlaceAssignment {
+            target_id,
+            value_id: stored_value_id,
+            value_span: value.1,
+        });
+        Some(Expr::Assignment(target_id, stored_value_id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::If` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_if_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::If(if_) = &node.0 else {
+            unreachable!("only the `Node::If` arm walks here")
+        };
+        /// B195: the captures an earlier condition in this `if`/`else if`
+        /// chain bound under a NEGATION — bound, that is, exactly on the
+        /// path that reaches this branch. `(name, entity, visible_until)`.
+        type InheritedCaptures<'src> = Vec<(&'src str, Id, usize)>;
+
+        /// Declares them into a branch's own scope, from its very start:
+        /// the branch is a fresh scope, so a later `let` of the same name
+        /// inside it still shadows this (the last covering declaration
+        /// wins).
+        fn declare_inherited<'src>(
+            s: &mut Analyzer<'src>,
+            body_scope_id: Id,
+            inherited: &InheritedCaptures<'src>,
+        ) {
+            for &(name, capture_id, visible_until) in inherited {
+                s.declare_scope_value_until(body_scope_id, name, capture_id, 0, visible_until);
+            }
+        }
+
+        /// Returns the walked branch plus the captures THIS branch's
+        /// own condition proves by being false — what B195 hands the
+        /// `else` and what B187 publishes past a diverging guard — and
+        /// the ones it proves by being true, which R15 publishes past a
+        /// `then`-spelled guard. Both empty for a bare `else`, which has
+        /// no condition of its own.
+        fn walk_branch<'src>(
+            s: &mut Analyzer<'src>,
+            branch: &'src NodeIfBranch,
+            scope_id: Id,
+            inherited: &InheritedCaptures<'src>,
+        ) -> (
+            ExprIfBranch,
+            InheritedCaptures<'src>,
+            InheritedCaptures<'src>,
+        ) {
+            match branch {
+                NodeIfBranch::If(if_) => {
+                    let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
+                    // An `else if`'s condition and body are reached only
+                    // on the previous condition's false path, which is
+                    // where a negated capture is bound.
+                    declare_inherited(s, body_scope_id, inherited);
+                    s.reject_lift_region_condition(&if_.condition);
+                    // B195: walk the condition with a fresh polarity
+                    // frame and a fresh collector, so a nested `if` in
+                    // the condition cannot leak either into this one.
+                    let outer_polarity = s
+                        .condition_polarity
+                        .replace(ConditionPolarity::root(if_.condition.1.end));
+                    let outer_captures = std::mem::take(&mut s.else_visible_captures);
+                    let outer_true_captures = std::mem::take(&mut s.then_visible_captures);
+                    let condition_id = s.walk_expr_node(&if_.condition, body_scope_id);
+                    s.condition_polarity = outer_polarity;
+                    let negated_captures =
+                        std::mem::replace(&mut s.else_visible_captures, outer_captures);
+                    let true_captures =
+                        std::mem::replace(&mut s.then_visible_captures, outer_true_captures);
+                    // A lifted condition was already rejected above
+                    // with its targeted message — no second report.
+                    if !matches!(if_.condition.0, Node::LiftRegion(..)) {
+                        s.prepped_conditions.push((condition_id, "`if` condition"));
+                    }
+                    let then_ids = s.walk_expr_nodes(&if_.then.0.0, body_scope_id);
+                    let then_expr_id = s.walk_expr_node(&if_.then.0.1, body_scope_id);
+                    let walked_else = if_.else_.as_ref().map(|x| {
+                        // Everything the enclosing chain proved on
+                        // the way here, plus what this condition
+                        // proves by being false.
+                        let mut passed_on = inherited.clone();
+                        passed_on.extend(negated_captures.iter().copied());
+                        Box::new(walk_branch(s, &x.0, scope_id, &passed_on).0)
+                    });
+                    (
+                        ExprIfBranch::If(condition_id, (then_ids, then_expr_id), walked_else),
+                        negated_captures,
+                        true_captures,
+                    )
+                }
+                NodeIfBranch::Else(body) => {
+                    let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
+                    declare_inherited(s, body_scope_id, inherited);
+                    let else_ids = s.walk_expr_nodes(&body.0.0, body_scope_id);
+                    let else_expr_id = s.walk_expr_node(&body.0.1, body_scope_id);
+                    (
+                        ExprIfBranch::Else((else_ids, else_expr_id)),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+        let (branch, false_path_captures, true_path_captures) =
+            walk_branch(self, if_, scope_id, &Vec::new());
+        // B187, the guard clause — negate, diverge, continue. With no
+        // `else` and a then-branch that provably diverges, the ONLY way
+        // past this `if` is the condition's false path, which is the
+        // very path B195 hands the `else` its captures on. So those
+        // captures are published into the ENCLOSING scope, visible from
+        // the end of the `if` onward — an ordinary declaration there, so
+        // a later `let` of the name shadows it like any other.
+        //
+        // Divergence is `Divergence::new`'s answer — one walk, B204 — the one the type
+        // checker itself acts on, so the guard and the editor's
+        // unreachable-code paint cannot disagree about what "dead" is.
+        //
+        // B222: which is why the verdict is not taken HERE. Two of that
+        // walk's four leaves — a `panic(…)` call, an endless `for { … }`
+        // — are facts about the resolved world, not about an
+        // expression's shape, and they settle after this walk has run.
+        // Asking now would answer for `ret` and `jump` and quietly say
+        // "no" to the other ending. So the candidate is written down and
+        // `resolve_world` decides it, once, for all four leaves.
+        if let ExprIfBranch::If(_, (then_ids, then_tail), None) = &branch
+            && !false_path_captures.is_empty()
+        {
+            self.guard_continuations.push(GuardContinuation {
+                scope_id,
+                visible_from: node.1.end,
+                diverging_statements: then_ids.clone(),
+                diverging_tail: *then_tail,
+                captures: false_path_captures,
+            });
+        }
+        // R15 (B459, RULED 2026-09-29), B187 mirrored — the one place
+        // the `then`/`else` sugar is not a pure rewrite. A `then`-
+        // spelled STATEMENT (`opt is Some(let v) else ret;`, or `c then
+        // S else ret;`) whose `else` diverges can be left only along
+        // the condition's TRUE path, so the captures that path binds are
+        // published into the enclosing scope from the statement's end —
+        // Swift's `guard`, Rust's `let … else`. The keyword `if` it
+        // spells keeps B171's scoping: the rule is the sugar's. Decided
+        // with B187's candidates in `resolve_world`, so all four
+        // divergence leaves count.
+        if let NodeIfBranch::If(written) = if_
+            && matches!(
+                written.spelling,
+                IfSpelling::Then {
+                    statement: true,
+                    ..
+                }
+            )
+            && let ExprIfBranch::If(_, _, Some(walked_else)) = &branch
+            && let ExprIfBranch::Else((else_ids, else_tail)) = walked_else.as_ref()
+            && !true_path_captures.is_empty()
+        {
+            self.guard_continuations.push(GuardContinuation {
+                scope_id,
+                visible_from: node.1.end,
+                diverging_statements: else_ids.clone(),
+                diverging_tail: *else_tail,
+                captures: true_path_captures,
+            });
+        }
+        // A value `if` — one with a final `else` — has its arms unified
+        // by the same rule a `match`'s legs go through (B163). Queued
+        // here rather than folded into the inference so the check runs
+        // ONCE per `if`, with a resolved world to read; a statement
+        // `if` produces no value, so there is nothing to unify.
+        if if_branch_has_final_else(&branch) {
+            self.constraints
+                .push(Constraint::IfArms { id, span: node.1 });
+        }
+        Some(Expr::If(branch))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::LetDestructure` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_let_destructure_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::LetDestructure(pattern, type_, value, mutable) = &node.0 else {
+            unreachable!("only the `Node::LetDestructure` arm walks here")
+        };
+        // Walk the value, then the binder pattern (which registers its
+        // bindings in scope as `Unknown`-typed variables); a `Destructure`
+        // constraint types them from the value's element types once it
+        // resolves. The whole `let` lowers to the recorded
+        // `Expr::Destructure`, so the walk inserts nothing now.
+        let value_id = value
+            .as_ref()
+            .map(|value| self.walk_expr_node(value, scope_id));
+        // Binders become visible after the whole statement, like a
+        // plain `let` — the initializer never sees them.
+        let walk_pattern = self.walk_pattern(&pattern.0, &pattern.1, scope_id, node.1.end);
+        if *mutable {
+            self.set_pattern_bindings_mutable(&walk_pattern);
+        }
+        let type_id = type_.as_ref().map(|x| self.walk_type_node(x, scope_id));
+        match value_id {
+            Some(value_id) => {
+                self.constraints
+                    .push(Constraint::Destructure(DestructureConstraint {
+                        id,
+                        value_id,
+                        type_id,
+                        scope_id,
+                        pattern: walk_pattern,
+                        defer_until_known: false,
+                    }));
+                None
+            }
+            None => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: "a destructuring `let` requires a value".to_string(),
+                });
+                Some(Expr::Error)
+            }
+        }
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Export` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_export_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Export(export_scope, inner, labels) = &node.0 else {
+            unreachable!("only the `Node::Export` arm walks here")
+        };
+        // Exports shape a module's public surface, so they only mean
+        // something at a module's top level. A block-scoped `import`
+        // (H2) is deliberately not exportable — and any other `export`
+        // in a body has nothing to attach to.
+        if !self.module_scope_ids.contains(&scope_id) {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: "`export` is a module-level item and cannot appear inside a body".to_string(),
+            });
+        }
+        // B382: `[deprecated("…")] export import …;` deprecates each
+        // name the re-export publishes — the alias where it renames,
+        // the leaf where not. Recorded per leaf with the leaf's span,
+        // which is how the statement's own reach (and so the target) is
+        // found again once the world has resolved;
+        // `check_deprecated_reexports` decides it.
+        if let Some(steer) = labels.as_ref().and_then(|labels| labels.deprecated)
+            && let Node::Import(root_branch, _) = &inner.0
+        {
+            let mut entries = Vec::new();
+            flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
+            for (_, name, leaf_span, alias) in &entries {
+                self.deprecated_import_leaves.push(DeprecatedImportLeaf {
+                    source: self.current_source_id,
+                    leaf_span: *leaf_span,
+                    bound: alias.map_or(*name, |(alias, _)| alias),
+                    renamed: alias.is_some(),
+                    scope: scope_id,
+                    steer,
+                });
+            }
+        }
+        let walked = self.walk_expr_node(inner, scope_id);
+        // A transparent wrapper's own entity is not the declaration's
+        // (`transparent_declarations`): `[derive(Wire)] export struct
+        // Handle` must mark `Handle`.
+        let declaration_id = self
+            .transparent_declarations
+            .get(&walked)
+            .copied()
+            .unwrap_or(walked);
+        // B318 §1.1: the marker is RECORDED now, where it used to be
+        // discarded. An `export import` records too — the re-export is
+        // an act of publication by a module that can see the item, which
+        // is `prelude.md` §8's "extend by re-export" one level down.
+        self.exported_entities.insert(declaration_id, scope_id);
+        self.curated_modules.insert(scope_id);
+        if let Some(export_scope) = export_scope {
+            self.export_scopes.insert(
+                declaration_id,
+                export_scope
+                    .path
+                    .iter()
+                    .map(|(segment, _)| *segment)
+                    .collect(),
+            );
+        }
+        Some(Expr::Void)
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Call` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_call_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Call(subject, generic_arguments, arguments) = &node.0 else {
+            unreachable!("only the `Node::Call` arm walks here")
+        };
+        // E284: a generic list written SPACED after the callee (`a < b
+        // > (c)`) may be two comparisons the parser read as a generic
+        // call; remembered so a callee that turns out not callable
+        // names both readings.
+        if let Some(generics) = generic_arguments
+            && generics.1.start > subject.1.end
+        {
+            self.spaced_generic_calls
+                .insert(id, (subject.1, generics.1, arguments.1));
+        }
+        let subject_id = self.walk_expr_node(subject, scope_id);
+        // B204: bank the call's subject as the WALK saw it. The pair
+        // is what `DivergenceLeaves` reads to find the `panic(…)`
+        // calls, once names have resolved and before any constraint
+        // has — `function_calls` records the same pair, but not until
+        // the call's own constraint resolves, which would make "does
+        // this body diverge?" depend on fixpoint order.
+        self.call_subjects.push((id, subject_id));
+        self.call_subject_ids.insert(subject_id);
+        let argument_ids = self.walk_expr_nodes(&arguments.0, scope_id);
+        self.note_named_arguments(&arguments.0, &argument_ids);
+        let generic_argument_ids = generic_arguments
+            .as_ref()
+            .map(|x| {
+                x.0.iter()
+                    .map(|y| self.walk_generic_argument(y, scope_id))
+                    .collect()
+            })
+            .unwrap_or_else(Vec::new);
+        if !generic_argument_ids.is_empty() {
+            self.calls_writing_generics.push(id);
+        }
+        // E189: bank the argument entities as the WALK saw them,
+        // beside the subject above. `function_calls` records the same
+        // list, but only for a call that RESOLVED, so a closure
+        // written as the argument of a call that did not is recorded
+        // nowhere — and the call-graph walk, which reads the arguments
+        // out of `function_calls`, never reaches it to give it its
+        // lexical parent.
+        self.written_call_arguments
+            .push((id, subject_id, argument_ids.clone()));
+        // Defer call type-checking to constraint solving.
+        self.constraints
+            .push(Constraint::CallSubject(CallSubjectConstraint::from_walk(
+                id,
+                subject_id,
+                generic_argument_ids,
+                argument_ids,
+                arguments.1,
+            )));
+        Some(Expr::Call(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Import` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_import_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Import(root_branch, modifier) = &node.0 else {
+            unreachable!("only the `Node::Import` arm walks here")
+        };
+        // `import`/`use` bind into the scope they appear in — module scope
+        // at a file's top level, a block/impl scope anywhere else (imports
+        // are block-scoped statements, backlog H2; visibility is
+        // block-granular, like a `let`). They compile to nothing: the
+        // `Expr::Void` keeps a statement-position import a well-formed
+        // no-op through typing and emission.
+        self.import_statement_spans
+            .push((self.current_source_id, node.1));
+        self.record_reach_marks(root_branch);
+        let mut entries = Vec::new();
+        flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
+        let mut path_spans: Vec<Span> = Vec::new();
+        for (path, name, leaf_span, alias) in entries {
+            for (_, segment_span) in &path {
+                path_spans.push(*segment_span);
+            }
+            path_spans.push(leaf_span);
+            self.prepped_imports.push((
+                path,
+                name,
+                scope_id,
+                node.1,
+                leaf_span,
+                self.current_source_id,
+                alias,
+                true,
+            ));
+        }
+        // B318 S4: a selector's own path is walked too, BINDING
+        // nothing. The walk is what puts the module's segments in
+        // `type_references`, which is where the admission pass reads
+        // the files a statement carried — the one channel that works
+        // the same on every host.
+        self.queue_selector_paths(root_branch, scope_id, node.1, &mut path_spans);
+        self.bank_import_restriction(root_branch, *modifier, scope_id, node.1, path_spans);
+        Some(Expr::Void)
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Match` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_match_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Match(subject, legs) = &node.0 else {
+            unreachable!("only the `Node::Match` arm walks here")
+        };
+        let subject_id = self.walk_expr_node(subject, scope_id);
+        let mut walked_legs = Vec::new();
+        for (patterns, guard, body) in &legs.0 {
+            // Each leg scopes its captures (and guard) to its own body.
+            let leg_scope_id = self.create_owned_scope(Some(scope_id)).id;
+            let walked_patterns = patterns
+                .iter()
+                .map(|pattern| {
+                    self.walk_pattern(&pattern.0, &pattern.1, leg_scope_id, pattern.1.end)
+                })
+                .collect();
+            // B223: a guard is a condition for the same reason — the
+            // leg body runs only where the guard held — so it gets the
+            // same frame, rooted at the guard's own end, and the same
+            // swap of the else collector a leg has no use for.
+            let outer_polarity = self.condition_polarity;
+            let outer_captures = std::mem::take(&mut self.else_visible_captures);
+            let guard_id = guard.as_ref().map(|guard| {
+                self.condition_polarity = Some(ConditionPolarity::root(guard.1.end));
+                self.walk_expr_node(guard, leg_scope_id)
+            });
+            self.condition_polarity = outer_polarity;
+            self.else_visible_captures = outer_captures;
+            let body_id = self.walk_expr_node(body, leg_scope_id);
+            walked_legs.push(WalkLeg {
+                patterns: walked_patterns,
+                guard: guard_id,
+                body: body_id,
+            });
+        }
+        self.constraints.push(Constraint::Match(PreppedMatch {
+            id,
+            subject_id,
+            scope_id,
+            legs: walked_legs,
+            span: node.1,
+        }));
+        // The entity is inserted once the subject type and the leg
+        // patterns have been resolved.
+        None
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Ascribe` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_ascribe_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Ascribe(value, type_node) = &node.0 else {
+            unreachable!("only the `Node::Ascribe` arm walks here")
+        };
+        // `value as T` (B571): the annotated-binding path with no binding.
+        // The annotation is registered exactly as a `let`'s is — keyed by
+        // this site where a `let` keys its variable — so a bare trait
+        // (B161), a hidden-parameter struct (B184) and a nested trait
+        // (B461) read here as they read there, and the value's
+        // expectation is seeded at the walk (B125) so a generic call in it
+        // binds from the type before its own constraint resolves.
+        let value_id = self.walk_expr_node(value, scope_id);
+        // B570 S2: `value as auto T` is an ascription the toolchain
+        // writes and keeps — output only, like every `auto` — so its
+        // type is recorded as a signature and never seeded into the
+        // value.
+        let auto = match &type_node.0 {
+            Node::AutoType(written) => {
+                self.record_auto_annotation(
+                    AutoOwner::Ascription(id),
+                    "",
+                    type_node.1,
+                    written.as_deref(),
+                    scope_id,
+                );
+                true
+            }
+            _ => false,
+        };
+        let type_id = match auto {
+            true => self
+                .auto_written
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| Type::Unknown.get_type_id(self)),
+            false => {
+                let type_id = self.walk_type_node(type_node, scope_id);
+                self.binding_annotation_type_ids.insert(type_id, id);
+                self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
+                self.seed_tail_expectations(value_id, type_id);
+                type_id
+            }
+        };
+        let stage = match &value.0 {
+            Node::MemberAccessor(_, member) => match &member.0 {
+                Node::Call(callee, _, _) => match &callee.0 {
+                    Node::Accessor(name) => Some((*name, member.1)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        self.ascriptions.insert(
+            id,
+            AscriptionSite {
+                value_id,
+                type_id,
+                type_span: type_node.1,
+                stage,
+                awaited: false,
+                auto,
+            },
+        );
+        self.constraints.push(Constraint::Ascription {
+            id,
+            value_id,
+            type_id,
+        });
+        Some(Expr::Ascribe(value_id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::MacroInvocation` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_macro_invocation_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::MacroInvocation(name, name_span, _) = &node.0 else {
+            unreachable!("only the `Node::MacroInvocation` arm walks here")
+        };
+        // A macro invocation: item-position ones already appended their
+        // output (nothing to walk); expression-position ones walk their
+        // spliced replacement, aliased through an empty block so this
+        // node's entity IS the replacement's value.
+        self.record_macro_reference(name, *name_span, scope_id);
+        let key = node as *const Spanned<Node> as usize;
+        if self.macro_item_invocations.contains(&key) {
+            Some(Expr::Void)
+        } else if self.macro_failed_sites.contains(&key) {
+            // The expansion failure is already a diagnostic.
+            Some(Expr::Error)
+        } else if let Some(replacement) = self.macro_expression_expansions.get(&key).copied() {
+            let child_id = self.walk_expr_node(replacement, scope_id);
+            Some(Expr::Block((Vec::new(), child_id)))
+        } else {
+            // Reached only where expansion never runs — a macro body
+            // (the world walks the definition's original text).
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: format!(
+                    "the invocation `macro {name}(..)` was not expanded: splice \
+                     syntax belongs in program code; inside the macro world, call \
+                     `{name}(..)` as a plain function"
+                ),
+            });
+            Some(Expr::Error)
+        }
+    }
+
+    /// `walk_expr_node_inner`'s `Node::StructInitializer` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_struct_initializer_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::StructInitializer(namespace, name, generic_arguments, fields) = &node.0 else {
+            unreachable!("only the `Node::StructInitializer` arm walks here")
+        };
+        let generic_argument_ids = generic_arguments
+            .as_ref()
+            .map(|x| {
+                x.0.iter()
+                    .map(|y| self.walk_generic_argument(y, scope_id))
+                    .collect()
+            })
+            .unwrap_or_else(Vec::new);
+        let e_fields = fields
+            .0
+            .iter()
+            .map(|x| {
+                // The field's NAME always leads its entry, both in
+                // `name: value` and in the shorthand `name` alone —
+                // `x.1` is the whole entry's span either way, so the
+                // name's own span is that span's first `name.len()`
+                // bytes (E58: the unknown-field diagnostic anchors
+                // here, not on the value).
+                let name_span = Span {
+                    start: x.1.start,
+                    end: x.1.start + x.0.0.len(),
+                };
+                (
+                    x.0.0,
+                    x.0.1
+                        .as_ref()
+                        .map(|value| self.walk_expr_node(value, scope_id))
+                        .unwrap_or_else(|| {
+                            // Field shorthand `S { field }` means
+                            // `S { field: field }`: the value is the
+                            // local named after the field itself.
+                            let local_id = self.new_entity_id();
+                            self.prepped_locals.push((local_id, x.0.0));
+                            self.expr_id_to_scope_id_map.insert(local_id, scope_id);
+                            self.span_map.insert(local_id, &x.1);
+                            local_id
+                        }),
+                    x.0.1.as_ref().map(|y| y.1).unwrap_or(x.1),
+                    name_span,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.constraints.push(Constraint::StructInitializer(
+            StructInitializerConstraint::from_walk(
+                id,
+                scope_id,
+                namespace.clone(),
+                (name.0, name.1),
+                generic_argument_ids,
+                e_fields,
+                fields.1,
+            ),
+        ));
+        None
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Binary` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_binary_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Binary(op, lhs, rhs) = &node.0 else {
+            unreachable!("only the `Node::Binary` arm walks here")
+        };
+        // B171: `||` short-circuits, so a pattern capture bound in one
+        // operand is bound only where THAT operand's test ran and
+        // passed. Cap each operand's captures at its own end — which
+        // takes in the other arm and everything after the condition,
+        // the then-branch included, since reaching either of those
+        // proves nothing about this arm.
+        let outer_polarity = self.condition_polarity;
+        let (lhs_id, rhs_id) = match op {
+            BinaryOp::Or => {
+                let outer = self.or_operand_end;
+                // B195: on top of that cap, neither operand of a `||`
+                // establishes the test for the ELSE branch either.
+                self.condition_polarity = outer_polarity.map(ConditionPolarity::into_or_operand);
+                self.or_operand_end = Some(min_operand_end(outer, lhs.1.end));
+                let lhs_id = self.walk_expr_node(lhs, scope_id);
+                self.or_operand_end = Some(min_operand_end(outer, rhs.1.end));
+                let rhs_id = self.walk_expr_node(rhs, scope_id);
+                self.or_operand_end = outer;
+                (lhs_id, rhs_id)
+            }
+            // B195: `&&` carries its operands' TRUE side and nothing
+            // else, so a capture bound on an operand's FALSE side — one
+            // under a negation — dies with that operand: `!(a is X) &&
+            // use(n)` does not bind `n` for the right operand, and
+            // `!(a is X && b)` still binds it for `b`, which the `&&`
+            // short-circuit did reach by matching.
+            BinaryOp::And => {
+                self.condition_polarity =
+                    outer_polarity.map(|polarity| polarity.into_and_operand(lhs.1.end));
+                let lhs_id = self.walk_expr_node(lhs, scope_id);
+                self.condition_polarity =
+                    outer_polarity.map(|polarity| polarity.into_and_operand(rhs.1.end));
+                let rhs_id = self.walk_expr_node(rhs, scope_id);
+                (lhs_id, rhs_id)
+            }
+            _ => {
+                let lhs_id = self.walk_expr_node(lhs, scope_id);
+                let rhs_id = self.walk_expr_node(rhs, scope_id);
+                (lhs_id, rhs_id)
+            }
+        };
+        self.condition_polarity = outer_polarity;
+        // Overloadable operators dispatch; orderings and `&&`/`||`
+        // aren't overloadable but their operands are checked (B24).
+        if is_overloadable_operator(*op)
+            || is_ordering_operator(*op)
+            || matches!(op, BinaryOp::And | BinaryOp::Or)
+        {
+            self.prepped_binary_ops.push((id, *op, lhs_id));
+        }
+        Some(Expr::Binary(*op, lhs_id, rhs_id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::MacroBlock` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_macro_block_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::MacroBlock(_) = &node.0 else {
+            unreachable!("only the `Node::MacroBlock` arm walks here")
+        };
+        // A `macro { .. }` block: like an invocation, but anonymous — its
+        // body is macro-world code and never walks here; the expansion
+        // recorded what this site becomes.
+        let key = node as *const Spanned<Node> as usize;
+        if self.macro_item_invocations.contains(&key) {
+            Some(Expr::Void)
+        } else if self.macro_failed_sites.contains(&key) {
+            // The expansion failure is already a diagnostic.
+            Some(Expr::Error)
+        } else if let Some(replacement) = self.macro_expression_expansions.get(&key).copied() {
+            let child_id = self.walk_expr_node(replacement, scope_id);
+            Some(Expr::Block((Vec::new(), child_id)))
+        } else {
+            // Reached only where expansion never runs — a macro body.
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: "this `macro { .. }` block was not expanded: a block cannot \
+                      appear inside macro code (the enclosing body already runs at \
+                      expansion time)"
+                    .to_string(),
+            });
+            Some(Expr::Error)
+        }
+    }
+
+    /// `walk_expr_node_inner`'s `Node::MultilineString` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_multiline_string_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+    ) -> Option<Expr<'src>> {
+        let Node::MultilineString(x) = &node.0 else {
+            unreachable!("only the `Node::MultilineString` arm walks here")
+        };
+        // Validate the trimming rules here, where the literal has its span;
+        // the transformer re-runs the (infallible after this) trim for the
+        // value. A bad literal degrades to `""` so its uses stay typed and
+        // the one diagnostic stands alone.
+        match crate::util::trim_multiline_string(x) {
+            Ok(_) => Some(Expr::MultilineString(x)),
+            Err((message, range)) => {
+                // The range is relative to the raw inner text, which ends 3
+                // bytes before the literal does (the closing delimiter).
+                // Measuring back from the END rather than forward from the
+                // start keeps this right for BOTH openers: `"""` and the
+                // `i"""` whose malformed shape degraded to this node.
+                let base = node.1.end.saturating_sub(3 + x.len());
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: (base + range.start..base + range.end).into(),
+                    msg: message,
+                });
+                Some(Expr::String(""))
+            }
+        }
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Use` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_use_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Use(root_branch) = &node.0 else {
+            unreachable!("only the `Node::Use` arm walks here")
+        };
+        self.import_statement_spans
+            .push((self.current_source_id, node.1));
+        self.record_reach_marks(root_branch);
+        let mut entries = Vec::new();
+        flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
+        for (path, name, leaf_span, alias) in entries {
+            self.prepped_uses.push((
+                path,
+                name,
+                scope_id,
+                node.1,
+                leaf_span,
+                self.current_source_id,
+                alias,
+            ));
+        }
+        Some(Expr::Void)
+    }
+
+    /// `walk_expr_node_inner`'s `Node::TryAssert` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_try_assert_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::TryAssert(receiver) = &node.0 else {
+            unreachable!("only the `Node::TryAssert` arm walks here")
+        };
+        let receiver_id = self.walk_expr_node(receiver, scope_id);
+        // `!` returns the bad half from the nearest enclosing callable,
+        // so that callable must declare a compatible return type. A
+        // closure/`async` block (inferred return) or an undeclared-void
+        // function has nothing to check against — a clean error (v1;
+        // proposal/try-and-lift.md §2).
+        match self.return_type_stack.last() {
+            Some(ReturnFrame::Function(_, declared)) => {
+                let return_type_id = *declared;
+                self.constraints.push(Constraint::TryAssert {
+                    id,
+                    receiver_id,
+                    return_type_id,
+                });
+            }
+            _ => {
+                self.diagnostics.push(Error { trace: Vec::new(), note: None,
+                    span: node.1,
+                    msg: "`!` requires the nearest enclosing function to declare an `Option`/`Result`-compatible return type (closures and `async` blocks are not yet supported)"
+                        .to_string(),
+                });
+            }
+        }
+        Some(Expr::TryAssert(receiver_id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Lift` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_lift_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Lift(subject, continuation) = &node.0 else {
+            unreachable!("only the `Node::Lift` arm walks here")
+        };
+        let subject_id = self.walk_expr_node(subject, scope_id);
+        // The binder: the continuation's hole, typed by the constraint
+        // as the subject's element.
+        let binder_id = self.new_entity_id();
+        self.expr_id_to_expr_map.insert(binder_id, Expr::LiftBinder);
+        self.expr_id_to_scope_id_map.insert(binder_id, scope_id);
+        self.span_map.insert(binder_id, &node.1);
+        self.lift_binder_stack.push(binder_id);
+        let continuation_id = self.walk_expr_node(continuation, scope_id);
+        self.lift_binder_stack.pop();
+        self.constraints.push(Constraint::Lift {
+            id,
+            subject_id,
+            binder_id,
+            continuation_id,
+        });
+        Some(Expr::Lift(subject_id, binder_id, continuation_id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::For` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_for_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::For(condition, body) = &node.0 else {
+            unreachable!("only the `Node::For` arm walks here")
+        };
+        let body_scope_id = self.create_owned_scope(Some(scope_id)).id;
+        if let Some(condition) = condition.as_ref() {
+            self.reject_lift_region_condition(condition);
+        }
+        // B223: a `while`-shaped `for`'s condition is a condition, and
+        // gets the condition frame — rooted at its own end, exactly as
+        // an `if`'s is. Reaching the body IS the test having passed, so
+        // an ordinary capture runs on into the body untouched; what the
+        // frame adds is the negated case, where the body runs on the
+        // path the pattern MISSED and the capture must not reach it
+        // (B195's rule, which the `for` was outside of until now).
+        // The else collector is swapped out with it: a `for` has no
+        // else, so what its condition binds on the false path belongs
+        // to nobody and must not leak into an enclosing `if`'s.
+        let outer_polarity = self.condition_polarity;
+        let outer_captures = std::mem::take(&mut self.else_visible_captures);
+        let condition_id = condition.as_ref().map(|condition| {
+            self.condition_polarity = Some(ConditionPolarity::root(condition.1.end));
+            self.walk_expr_node(condition, body_scope_id)
+        });
+        self.condition_polarity = outer_polarity;
+        self.else_visible_captures = outer_captures;
+        if let (Some(condition_id), Some(condition)) = (condition_id, condition.as_ref())
+            && !matches!(condition.0, Node::LiftRegion(..))
+        {
+            self.prepped_conditions
+                .push((condition_id, "`for` condition"));
+        }
+        let ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
+        let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
+        Some(Expr::For(condition_id, (ids, expr_id)))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Is` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_is_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Is(subject, pattern) = &node.0 else {
+            unreachable!("only the `Node::Is` arm walks here")
+        };
+        // `subject is pattern` — walk the subject and the pattern (binding
+        // captures into the current scope so a guarded `if`/`&&` can use
+        // them), then resolve the pattern against the subject type in
+        // `build`. The expression itself types as `bool`.
+        let subject_id = self.walk_expr_node(subject, scope_id);
+        let walk_pattern = self.walk_pattern(&pattern.0, &pattern.1, scope_id, pattern.1.end);
+        self.constraints.push(Constraint::Is(PreppedIs {
+            id,
+            subject_id,
+            scope_id,
+            pattern: walk_pattern,
+        }));
+        None
+    }
+
+    /// `walk_expr_node_inner`'s `Node::FuncReturn` arm, out of line (N169): its
+    /// locals live only while this arm runs, not in the recursion's shared
+    /// frame (the `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_func_return_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::FuncReturn(value) = &node.0 else {
+            unreachable!("only the `Node::FuncReturn` arm walks here")
+        };
+        let value_id = value
+            .as_ref()
+            .map(|value| self.walk_expr_node(value, scope_id));
+        // `ret` is a return position exactly like the tail: its value
+        // checks (and binds return-position generics) against the
+        // innermost callable's DECLARED return type. A bare `ret` is
+        // `ret <void>` — a synthesized void value spanned at the `ret`,
+        // legal exactly when the declared type is void. In a closure or
+        // an unannotated function, rets collect on the frame and take
+        // part in the inferred return type instead
+        // (proposal/ret-checking.md rules 3 and 4).
+        match self.return_type_stack.last_mut() {
+            Some(ReturnFrame::Function(function_id, declared)) => {
+                let function_id = *function_id;
+                let return_type_id = *declared;
+                let checked_id = value_id.unwrap_or_else(|| {
+                    let void_id = self.new_entity_id();
+                    self.expr_id_to_expr_map.insert(void_id, Expr::Void);
+                    self.expr_id_to_scope_id_map.insert(void_id, scope_id);
+                    self.span_map.insert(void_id, &node.1);
+                    void_id
+                });
+                self.expected_types.insert(checked_id, return_type_id);
+                self.seed_tail_expectations(checked_id, return_type_id);
+                self.constraints.push(Constraint::ReturnType {
+                    body_id: checked_id,
+                    return_type_id,
+                    // A `ret`'s checked value is never a block tail —
+                    // neither regime 1/1' nor B221's reachability
+                    // question is asked of anything but a tail.
+                    statement_ids: Vec::new(),
+                });
+                self.return_sites.push((function_id, checked_id));
+            }
+            Some(ReturnFrame::Inferred { rets }) => {
+                rets.push((node.1, value_id));
+            }
+            None => {}
+        }
+        Some(Expr::FunctionReturn(value_id))
     }
 
     /// `walk_expr_node_inner`'s `Node::Func` arm, out of line: its locals live only
@@ -82322,6 +82602,7 @@ fn analyze_inner<'src>(
     // this is belt and braces rather than a live branch; if it ever failed,
     // the analysis would simply store nothing, which is what B239 did.
     crate::counters::checkpoint("world");
+    crate::depth_stats::report_walk_frame_once();
     if !crate::macros::in_macro_world() {
         let hot_modules = world.hot.as_ref().map_or(0, |hot| hot.modules.len());
         crate::incremental::update_census(|census| {
