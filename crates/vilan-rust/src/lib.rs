@@ -8695,6 +8695,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // substitutes the payload accessor at every reference), so
                 // `matches!` — which binds nothing — cannot serve a pattern
                 // that captures. Every other position keeps the refusal.
+                // F91: a `&&` chain whose conjuncts CAPTURE is a let-chain
+                // (the emitted crate is edition 2024), so a capture left of
+                // the `&&` is in scope in the BODY as the source says — the
+                // `match` [`Self::conjunction`] answers in a value position
+                // scoped it to its arm, and `if held is Some(let name) &&
+                // name.len() > 0 { print(name) }` named a binding rustc had
+                // never seen.
+                if let Some((head, bindings)) = self.capturing_let_chain(*condition, depth)? {
+                    let mut body = String::new();
+                    let walked = self.emit_block(statements, *tail, &mut body, depth + 1);
+                    for binding in &bindings {
+                        self.is_captures.remove(binding);
+                    }
+                    walked?;
+                    let mut out = format!("{head} {{\n{body}{pad}}}");
+                    if let Some(next) = next {
+                        let _ = write!(out, " else {}", self.if_branch(next, depth)?);
+                    }
+                    return Ok(out);
+                }
                 let captured = self.is_condition_captures(*condition);
                 let head = match &captured {
                     Some((subject, pattern, bindings)) => {
@@ -8736,6 +8756,81 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.emit_block(statements, *tail, &mut body, depth + 1)?;
                 Ok(format!("{{\n{body}{pad}}}"))
             }
+        }
+    }
+
+    /// F91: an `if` condition that is a `&&` chain with a CAPTURING `is`-test
+    /// among its conjuncts, as a Rust let-chain head — `if let Some(name) =
+    /// (held).clone() && (name.len() > 0)` — and the captures it binds, which
+    /// are registered (in [`Emitter::is_captures`]) for the rest of the chain
+    /// and the body; the caller releases them. Each capturing conjunct is a
+    /// `let`, copied as `if let` copies its subject (F20); every other one is
+    /// the boolean it is. `None` for a condition that is not such a chain.
+    fn capturing_let_chain(
+        &mut self,
+        condition: Id,
+        depth: usize,
+    ) -> Result<Option<(String, Vec<Id>)>, Error> {
+        if !matches!(
+            self.program.entity_map.get(&condition),
+            Some(Expr::Binary(BinaryOp::And, _, _))
+        ) || self.program.binary_op_dispatch.contains_key(&condition)
+        {
+            return Ok(None);
+        }
+        let mut conjuncts = Vec::new();
+        self.flatten_conjunction(condition, &mut conjuncts);
+        if !conjuncts
+            .iter()
+            .any(|conjunct| self.is_condition_captures(*conjunct).is_some())
+        {
+            return Ok(None);
+        }
+        let mut parts = Vec::new();
+        let mut captured = Vec::new();
+        for conjunct in conjuncts {
+            let part = match self.is_condition_captures(conjunct) {
+                Some((subject, pattern, bindings)) => {
+                    let subject_text = self.expression(subject, depth);
+                    let subject_text = match subject_text {
+                        Ok(text) => self.copy_a_pattern_subject(subject, text),
+                        Err(error) => {
+                            self.release_captures(&captured);
+                            return Err(error);
+                        }
+                    };
+                    let subject_type = self.settled_value_type(subject);
+                    let pattern_text = self.pattern(&pattern, subject_type, self.span_of(conjunct));
+                    let pattern_text = match pattern_text {
+                        Ok(text) => text,
+                        Err(error) => {
+                            self.release_captures(&captured);
+                            return Err(error);
+                        }
+                    };
+                    for binding in &bindings {
+                        self.is_captures.insert(*binding);
+                    }
+                    captured.extend(bindings);
+                    format!("let {pattern_text} = {subject_text}")
+                }
+                None => match self.expression(conjunct, depth) {
+                    Ok(text) => format!("({text})"),
+                    Err(error) => {
+                        self.release_captures(&captured);
+                        return Err(error);
+                    }
+                },
+            };
+            parts.push(part);
+        }
+        Ok(Some((format!("if {}", parts.join(" && ")), captured)))
+    }
+
+    /// Releases the `is` captures a let-chain registered (F91).
+    fn release_captures(&mut self, bindings: &[Id]) {
+        for binding in bindings {
+            self.is_captures.remove(binding);
         }
     }
 

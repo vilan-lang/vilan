@@ -13247,6 +13247,35 @@ fn b606_a_mirrored_stores_states_tell_the_same_on_both_backends() {
     );
 }
 
+/// F91: an `is` capture in a `&&` chain of an `if` CONDITION, read in the
+/// BODY — `if held is Some(let name) && name.len() > 0 { print(name) }` — was
+/// rustc E0425 natively: the chain emitted the `match` a value position
+/// takes, which scopes the capture to its arm. An `if` condition is now a
+/// let-chain (`if let Some(name) = .. && (..)`): two captures, a capture right
+/// of a plain conjunct, a `||` inside a conjunct, a chain that fails late, an
+/// `else if` chain and a capture of a field. The emission pin: no `match`
+/// stands in for a condition.
+#[test]
+fn f91_an_is_capture_in_an_if_conditions_conjunction_reaches_the_body_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f91_is_capture_conjunction_body.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/is_capture_conjunction_body.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a capture left of `&&` in an `if` condition must reach the body natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        main.contains("if let Some(") && !main.contains("_ => false"),
+        "the conditions are let-chains:\n{main}"
+    );
+}
+
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
 /// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
 /// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
