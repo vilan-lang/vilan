@@ -33,6 +33,9 @@ use std::process::Command;
 mod support;
 use support::ladder::documented_legs;
 
+#[path = "../../vilan-core/tests/test_pool/mod.rs"]
+mod test_pool;
+
 /// The repository root (this crate is `crates/vilan-cli`).
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -380,20 +383,13 @@ fn build_example(directory: &str) -> Option<String> {
 #[test]
 fn every_example_builds() {
     let directories = example_directories();
-    let failures: Vec<String> = std::thread::scope(|scope| {
-        let workers: Vec<_> = directories
-            .iter()
-            .map(|directory| scope.spawn(move || build_example(directory)))
-            .collect();
-        workers
-            .into_iter()
-            .filter_map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
-    });
+    // N159: at most the suite's pool at once under nextest; one thread per example otherwise.
+    let failures: Vec<String> = test_pool::map(&directories, directories.len(), |directory| {
+        build_example(directory)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     assert!(
         failures.is_empty(),
         "examples that no longer build:\n\n{}",

@@ -37,6 +37,9 @@ use vilan_core::token::Token;
 
 mod support;
 
+#[path = "../../vilan-core/tests/test_pool/mod.rs"]
+mod test_pool;
+
 /// The tracked sources that carry `style()` builder chains. Each is built as
 /// tracked and built again through the formatter, and the two must render the
 /// same style.
@@ -358,19 +361,9 @@ fn build_both_ways(relative: &str) -> Twins {
 /// each of the two tests below a 220 s straggler under load on 72 s of CPU. A
 /// build failure still panics with the fixture's own message.
 fn every_fixture_built_both_ways() -> Vec<(&'static str, Twins)> {
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = STYLE_SOURCES
-            .iter()
-            .map(|relative| scope.spawn(move || (*relative, build_both_ways(relative))))
-            .collect();
-        workers
-            .into_iter()
-            .map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
+    // N159: at most the suite's pool at once under nextest; one thread per fixture otherwise.
+    test_pool::map(STYLE_SOURCES, STYLE_SOURCES.len(), |relative| {
+        (*relative, build_both_ways(relative))
     })
 }
 
