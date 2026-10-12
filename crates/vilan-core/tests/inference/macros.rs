@@ -1247,6 +1247,153 @@ fn an_unimported_macro_from_another_module_is_not_in_scope() {
     );
 }
 
+// G27: a `macro fun` declared inside an inline `mod { }` was registered
+// nowhere — only a file's TOP-LEVEL definitions were — so an attribute in that
+// same `mod` read "no macro named `tabled` is in scope". It is in scope in its
+// `mod` and the `mod`s nested in it, by every dispatch form: an attribute, a
+// derive, an item invocation and an expression invocation.
+#[test]
+fn g27_a_macro_declared_in_a_mod_is_in_scope_there() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod tables {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("fun table_name(): str { \"tabled\" }")
+            }
+
+            macro fun Named(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("fun derived_name(): str { \"derived\" }")
+            }
+
+            macro fun constant(arguments: Arguments): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Arguments, Source };
+                source("fun seven(): i32 { 7 }")
+            }
+
+            macro fun doubled(arguments: Arguments): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Arguments, Source };
+                import macro_std::option::Option::{ self, Some, None };
+                let text = match arguments.values.get(0) {
+                    Some(let value) => value,
+                    None => "0",
+                };
+                source(i"(({text}) * 2)")
+            }
+
+            [tabled]
+            struct Row {
+                id: i32,
+            }
+
+            [derive(Named)]
+            struct Column {
+                id: i32,
+            }
+
+            macro constant();
+
+            export fun names(): str {
+                table_name() + " " + derived_name() + " " + i"{seven()} {macro doubled(21)}"
+            }
+
+            mod inner {
+                [tabled]
+                struct Cell {
+                    id: i32,
+                }
+
+                export fun name(): str {
+                    table_name()
+                }
+            }
+
+            export fun inner_name(): str {
+                inner::name()
+            }
+        }
+
+        fun main() {
+            print(tables::names());
+            print(tables::inner_name());
+        }
+
+        main();
+        "#,
+        "tabled derived 7 42\ntabled\n",
+    );
+}
+
+// G27: a `mod`'s macro is the `mod`'s — a SIBLING `mod` does not see it, as
+// the file's top level does not (`an_unimported_macro_from_another_module_is_
+// not_in_scope`).
+#[test]
+fn g27_a_mods_macro_is_not_in_scope_in_a_sibling_mod() {
+    assert_fails_once_with(
+        r#"
+        mod tables {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("")
+            }
+        }
+
+        mod other {
+            [tabled]
+            struct Row {
+                id: i32,
+            }
+        }
+
+        fun main() {}
+
+        main();
+        "#,
+        "no macro named `tabled` is in scope",
+    );
+}
+
+// G27: one file's macros compile into ONE macro world, where each is a
+// function by its own name, so a name is defined once per file whichever `mod`
+// declares it — the second is refused with the reason, not left to collide
+// inside the world.
+#[test]
+fn g27_a_macro_name_is_defined_once_per_file_across_mods() {
+    assert_fails_with(
+        r#"
+        mod first {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("")
+            }
+        }
+
+        mod second {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("")
+            }
+        }
+
+        fun main() {}
+
+        main();
+        "#,
+        "a macro named `tabled` is already defined in this file: one file's macros, whichever \
+         `mod` declares them, compile into one macro world",
+    );
+}
+
 // A user macro may now SHADOW a prelude derive for its own file — the
 // reserved-name rule died with the flat namespace.
 #[test]

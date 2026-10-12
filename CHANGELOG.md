@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**G27: a `macro fun` declared inside an inline `mod { }` is in scope in that `mod` — an attribute beside it (`[tabled] struct Row`) read "no macro named `tabled` is in scope".** Only a file's TOP-LEVEL `macro fun`s were registered, so one inside a `mod` was in scope nowhere. It is now in scope throughout its `mod` and the `mod`s nested in it, by every dispatch form (an attribute, a derive, an item and an expression invocation), and not beside or outside it, where the file's top level already could not see it. A file's macros compile into one macro world, so a name declared in two of its `mod`s is refused by name rather than left to collide there. The spec's §10.1 says where a macro's name is in scope. Pins: `g27_a_macro_declared_in_a_mod_is_in_scope_there`, `g27_a_mods_macro_is_not_in_scope_in_a_sibling_mod`, `g27_a_macro_name_is_defined_once_per_file_across_mods`. Tracker G27.
+
+---
+
+<!-- family: fix -->
 **G26: `str::index_of` and `last_index_of` run in a `const` evaluation — `const find("abc")` over `text.index_of("b")` failed "the string method `indexOf` is not available at expansion time", the natural way to search a file `asset::read` returned at build time.** The const interpreter answers the host's `indexOf` / `lastIndexOf` (the two std reaches through `raw_index_of` / `raw_last_index_of`) in UTF-16 code units, the unit `len` and `substring` count, `-1` when absent and an empty needle at 0 and at the length, as the host places it. Every other method std declares on `str` over a host binding already ran; a census pin now holds the class. Pins: `g26_index_of_and_last_index_of_evaluate_at_expansion_time`, `g26_every_str_method_std_declares_evaluates_at_expansion_time`. Tracker G26.
 
 ---

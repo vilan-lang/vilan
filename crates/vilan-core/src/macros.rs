@@ -184,8 +184,19 @@ pub(crate) struct MacroScope<'r> {
 }
 
 impl<'r> MacroScope<'r> {
-    fn get(&self, name: &str) -> Option<&'r MacroDef> {
-        self.names.get(name).copied()
+    /// The macro `name` names inside the inline `mod`s `module_path` (empty at
+    /// the file's top level): one declared in the innermost enclosing `mod`
+    /// first, then each `mod` out, then the file's own, its imports and the
+    /// prelude (G27). A `mod`'s macro is not in scope outside it.
+    fn get(&self, module_path: &[String], name: &str) -> Option<&'r MacroDef> {
+        (1..=module_path.len())
+            .rev()
+            .find_map(|depth| {
+                self.names
+                    .get(&scoped_macro_name(&module_path[..depth], name))
+                    .copied()
+            })
+            .or_else(|| self.names.get(name).copied())
     }
 
     fn block(&self, address: usize) -> Option<&'r MacroDef> {
@@ -460,19 +471,56 @@ pub(crate) fn split_toolchain_refusal(std: &PackageSpec) -> Option<Error> {
     })
 }
 
-/// The top-level `macro fun`s of a file, with each definition's full span.
-fn macro_funs<'a, 'src>(nodes: &'a NodeList<'src>) -> Vec<(&'a Func<'src>, Span)> {
-    nodes
-        .iter()
-        .filter_map(|(node, span)| match node {
-            Node::MacroFun(function) => Some((&**function, *span)),
-            Node::Export(_, inner, _) => match &inner.0 {
-                Node::MacroFun(function) => Some((&**function, inner.1)),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect()
+/// One `macro fun` of a file: the definition, its full span, and the inline
+/// `mod`s declaring it, outermost first (empty at the file's top level).
+struct MacroFunSite<'a, 'src> {
+    function: &'a Func<'src>,
+    span: Span,
+    module_path: Vec<String>,
+}
+
+/// The `macro fun`s of a file — at its top level and inside its inline
+/// `mod { .. }`s (G27), in text order.
+fn macro_funs<'a, 'src>(nodes: &'a NodeList<'src>) -> Vec<MacroFunSite<'a, 'src>> {
+    fn collect<'a, 'src>(
+        nodes: &'a NodeList<'src>,
+        module_path: &mut Vec<String>,
+        sites: &mut Vec<MacroFunSite<'a, 'src>>,
+    ) {
+        for (node, span) in nodes {
+            let (node, span) = match node {
+                Node::Export(_, inner, _) => (&inner.0, inner.1),
+                _ => (node, *span),
+            };
+            match node {
+                Node::MacroFun(function) => sites.push(MacroFunSite {
+                    function,
+                    span,
+                    module_path: module_path.clone(),
+                }),
+                Node::Module(name, body) => {
+                    module_path.push((*name).to_string());
+                    collect(&body.0, module_path, sites);
+                    module_path.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut sites = Vec::new();
+    collect(nodes, &mut Vec::new(), &mut sites);
+    sites
+}
+
+/// The name a macro is registered under in its file's module: its own name at
+/// the file's top level, and `outer::inner::name` inside inline `mod`s (G27) —
+/// a spelling no import leaf or written attribute can collide with, which
+/// [`MacroScope::get`] asks for from the inside out.
+fn scoped_macro_name(module_path: &[String], name: &str) -> String {
+    if module_path.is_empty() {
+        return name.to_string();
+    }
+    format!("{}::{name}", module_path.join("::"))
 }
 
 /// A file's `macro { .. }` blocks, at ANY depth (expression position nests),
@@ -547,7 +595,7 @@ pub(crate) fn register_file(
     }
     let first_span = definitions
         .first()
-        .map(|(_, span)| *span)
+        .map(|site| site.span)
         .or_else(|| blocks.first().map(|(_, span)| *span))
         .unwrap_or_else(|| (0..0).into());
     let _ = first_span;
@@ -570,8 +618,8 @@ pub(crate) fn register_file(
     // the ORIGINAL parse so the error points at the offending import. Block
     // bodies are macro bodies too.
     let mut hermetic = illegal_blocks.is_empty();
-    for (function, _) in &definitions {
-        if let Some(body) = &function.body {
+    for site in &definitions {
+        if let Some(body) = &site.function.body {
             for statement in body.0.0.iter().chain(std::iter::once(&*body.0.1)) {
                 check_hermetic_imports(statement, diagnostics, &mut hermetic);
             }
@@ -586,22 +634,40 @@ pub(crate) fn register_file(
 
     let _ = macro_std; // presence checked above; the world resolves it lazily
     let block_spans: Vec<Span> = blocks.iter().map(|(_, span)| *span).collect();
-    let blanked = Arc::new(blank_to_world(text, &definitions, &block_spans));
-    let (world_key, failure_key) = world_cache_keys(&blanked, &definitions, &block_spans);
+    let definition_spans: Vec<Span> = definitions.iter().map(|site| site.span).collect();
+    let blanked = Arc::new(blank_to_world(text, &definition_spans, &block_spans));
+    let (world_key, failure_key) = world_cache_keys(&blanked, &definition_spans, &block_spans);
     let module = registry.by_module.entry(key.clone()).or_default();
-    for (function, _) in &definitions {
+    // One file's macros compile into ONE world, where each is a function by
+    // its own name — so a name is defined once per file, whichever `mod`
+    // declares it (G27). Each name maps to whether its first definition sits
+    // at the file's top level, which picks the sentence a repeat reads.
+    let mut world_names: HashMap<&str, bool> = HashMap::default();
+    for site in &definitions {
+        let function = site.function;
         let name = function.name.0.to_string();
-        if module.contains_key(&name) {
+        let top_level = site.module_path.is_empty();
+        if let Some(first_top_level) = world_names.get(function.name.0).copied() {
+            let msg = if top_level && first_top_level {
+                format!("a macro named `{name}` is already defined in this module")
+            } else {
+                format!(
+                    "a macro named `{name}` is already defined in this file: one file's \
+                     macros, whichever `mod` declares them, compile into one macro world, \
+                     so each name is defined once per file"
+                )
+            };
             diagnostics.push(Error {
                 trace: Vec::new(),
                 note: None,
                 span: function.name.1,
-                msg: format!("a macro named `{name}` is already defined in this module"),
+                msg,
             });
             continue;
         }
+        world_names.insert(function.name.0, top_level);
         module.insert(
-            name.clone(),
+            scoped_macro_name(&site.module_path, &name),
             MacroDef {
                 name,
                 shape: macro_shape(function),
@@ -728,13 +794,13 @@ fn macro_shape(function: &Func) -> Option<MacroShape> {
 /// sees them as `MacroBlock` statements at its top level, and the world hook
 /// in `analyze_source` wraps each into a synthetic `fun __macro_block_<n>():
 /// Source` — true spans, no offset arithmetic.
-fn blank_to_world(text: &str, definitions: &[(&Func, Span)], blocks: &[Span]) -> String {
+fn blank_to_world(text: &str, definitions: &[Span], blocks: &[Span]) -> String {
     let bytes = text.as_bytes();
     let mut blanked: Vec<u8> = bytes
         .iter()
         .map(|&b| if b == b'\n' { b'\n' } else { b' ' })
         .collect();
-    for (_, span) in definitions {
+    for span in definitions {
         let range = span.into_range();
         let range = range.start.min(bytes.len())..range.end.min(bytes.len());
         blanked[range.clone()].copy_from_slice(&bytes[range.clone()]);
@@ -764,11 +830,11 @@ fn blank_to_world(text: &str, definitions: &[(&Func, Span)], blocks: &[Span]) ->
 /// of the key — text below the last definition may grow and shrink freely —
 /// so a replayed span recorded under a longer file is clamped into range at
 /// the replay site.
-fn world_cache_keys(blanked: &str, definitions: &[(&Func, Span)], blocks: &[Span]) -> (u64, u64) {
+fn world_cache_keys(blanked: &str, definitions: &[Span], blocks: &[Span]) -> (u64, u64) {
     let bytes = blanked.as_bytes();
     let mut segments: Vec<std::ops::Range<usize>> = definitions
         .iter()
-        .map(|(_, span)| span.into_range())
+        .map(|span| span.into_range())
         .chain(blocks.iter().map(|span| span.into_range()))
         .map(|range| range.start.min(bytes.len())..range.end.min(bytes.len()))
         .collect();
@@ -1824,7 +1890,7 @@ impl Expander<'_, '_> {
                         });
                         continue;
                     }
-                    if self.scope.get(name).is_some() {
+                    if self.scope.get(&self.module_path, name).is_some() {
                         self.run_attribute(name, *name_span, item, &[], text, depth);
                     } else if in_macro_world() {
                         // B339: inside a macro WORLD the scope is EMPTY BY
@@ -2022,7 +2088,7 @@ impl Expander<'_, '_> {
                     self.sweep_expressions(item, text, depth);
                     return;
                 }
-                match self.scope.get("service") {
+                match self.scope.get(&self.module_path, "service") {
                     Some(def) => {
                         self.run_service(def, *attribute, item, siblings, text, depth);
                     }
@@ -2300,7 +2366,7 @@ impl Expander<'_, '_> {
         text: &str,
         depth: u32,
     ) {
-        let Some(def) = self.scope.get(name) else {
+        let Some(def) = self.scope.get(&self.module_path, name) else {
             self.diagnostics.push(Error {
                 trace: Vec::new(),
                 note: None,
@@ -2363,7 +2429,7 @@ impl Expander<'_, '_> {
         depth: u32,
         expression_site: Option<usize>,
     ) {
-        let Some(def) = self.scope.get(name) else {
+        let Some(def) = self.scope.get(&self.module_path, name) else {
             self.diagnostics.push(Error {
                 trace: Vec::new(),
                 note: None,
