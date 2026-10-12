@@ -132,3 +132,4 @@ root_edges.push(leaf1);
 root_edges.push(leaf2);
 const root = insert(graph, [ 1, root_edges ]);
 console.log(String(sum_from(graph, root)));
+//# sourceMappingURL=arena.mjs.map

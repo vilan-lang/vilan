@@ -431,6 +431,13 @@ pub const TABLES: &[Table] = &[
                                 `const` keyword (on under `release`, off under `debug`).",
                 values: ValueSet::Boolean,
             },
+            Key {
+                name: "source-maps",
+                documentation: "Write a source map beside each script, so a debugger and \
+                                node's stack traces show `.vl` files and lines (on under \
+                                `debug`, off under `release`).",
+                values: ValueSet::Boolean,
+            },
         ],
     },
     Table {

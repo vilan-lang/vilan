@@ -115,3 +115,4 @@ console.log(String(len(difference(left, right))));
 console.log(String(len(union(left, empty))));
 console.log(String(len(intersection(left, empty))));
 console.log(String(len(difference(left, empty))));
+//# sourceMappingURL=set.mjs.map

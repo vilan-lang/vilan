@@ -67,3 +67,4 @@ console.log(is_some(parse_bool("")));
 console.log(unwrap_or(parse_bool(" true "), false));
 console.log(is_some(parse_bool("tr ue")));
 console.log(unwrap_or(parse_bool("nonsense"), true));
+//# sourceMappingURL=parse-bool.mjs.map

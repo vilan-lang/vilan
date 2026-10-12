@@ -44,3 +44,4 @@ console.log(String(sum(empty)));
 for (const n of numbers) {
 	console.log(String(n));
 }
+//# sourceMappingURL=list-element-type.mjs.map

@@ -265,3 +265,4 @@ console.log($G[0] === 0 && to_json($G[1]) === json && to_json2($G[1][1]) === "[\
 const teams = from_json4("[" + json + "]");
 const $O = teams;
 console.log($O[0] === 0 && to_json4($O[1]) === "[" + json + "]");
+//# sourceMappingURL=json-roundtrip.mjs.map

@@ -165,3 +165,4 @@ if ($u[0] === 1) {
 	console.log(true);
 	console.log($u[1]);
 }
+//# sourceMappingURL=derive-enum.mjs.map

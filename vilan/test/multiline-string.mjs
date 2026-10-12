@@ -13,3 +13,4 @@ if ($a === "key: value!") {
 	$b = console.log("no match");
 }
 process.exit($b);
+//# sourceMappingURL=multiline-string.mjs.map

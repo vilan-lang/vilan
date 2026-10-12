@@ -8,3 +8,4 @@ console.log(String(a[0]));
 let n = [ 5 ];
 scale([ n, 0 ], 4);
 console.log(String(n[0]));
+//# sourceMappingURL=view-primitive.mjs.map

@@ -572,7 +572,7 @@ impl Program<'_> {
     }
 
     /// The byte offset [`Self::site_location`] reports for `anchor`.
-    fn site_offset(&self, anchor: Id, text: &str) -> Option<usize> {
+    pub(crate) fn site_offset(&self, anchor: Id, text: &str) -> Option<usize> {
         let span = **self.span_map.get(&anchor)?;
         if let Some(call) = self.function_calls.get(&anchor) {
             // The callee's name is the identifier that ends where the

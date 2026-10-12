@@ -32,3 +32,4 @@ const maybe = [ 0, 7 ];
 console.log(to_json2(maybe));
 const nothing = [ 1 ];
 console.log(to_json2(nothing));
+//# sourceMappingURL=generic-dispatch.mjs.map

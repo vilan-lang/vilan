@@ -53,6 +53,7 @@ pub mod owned_modules;
 pub mod parsing;
 pub mod platform_color;
 pub mod printer;
+pub mod source_map;
 pub mod span;
 pub mod stack_guard;
 pub mod target;
@@ -83,7 +84,7 @@ pub use span::{Span, Spanned};
 pub use target::{Backend, Platform, PlatformPattern};
 pub use transformer::{
     EmittedChunk, JsProgram, SplitProgram, diagnose, transform, transform_split,
-    transform_split_with_plan, transform_to_ast,
+    transform_split_with_plan, transform_to_ast, transform_with_source_map,
 };
 
 use std::collections::{HashMap, HashSet};

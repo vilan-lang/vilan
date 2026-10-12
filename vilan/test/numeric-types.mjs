@@ -147,3 +147,4 @@ console.log(String(min_value6()));
 console.log(JSON.stringify(200));
 const packet = [ 7, 300, 5 ];
 console.log(to_json(packet));
+//# sourceMappingURL=numeric-types.mjs.map

@@ -143,3 +143,4 @@ console.log(1 < 0);
 console.log(0 === 0);
 console.log(describe(1));
 console.log(describe(-1));
+//# sourceMappingURL=enum-discriminant.mjs.map

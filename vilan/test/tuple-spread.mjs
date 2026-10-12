@@ -40,3 +40,4 @@ console.log(String([ ...make(), 6 ][2]));
 console.log(String(need2([ ...__clone(pair) ])));
 console.log(String(need2([ ...pair, 7 ])));
 console.log(String(forward([ 1, 2, 3 ])));
+//# sourceMappingURL=tuple-spread.mjs.map

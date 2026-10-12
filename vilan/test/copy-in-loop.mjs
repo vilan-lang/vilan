@@ -12,3 +12,4 @@ for (const n of [ 1, 2, 3 ]) {
 	total = total + b[0];
 }
 console.log(String(total));
+//# sourceMappingURL=copy-in-loop.mjs.map

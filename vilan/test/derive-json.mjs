@@ -164,3 +164,4 @@ if ($w[0] === 1) {
 	console.log(true);
 	console.log($w[1]);
 }
+//# sourceMappingURL=derive-json.mjs.map

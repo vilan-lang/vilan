@@ -34,3 +34,4 @@ const closure = () => {
 	return;
 };
 closure();
+//# sourceMappingURL=scoped-import.mjs.map

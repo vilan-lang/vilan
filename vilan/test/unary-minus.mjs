@@ -10,3 +10,4 @@ console.log(String(-(y)));
 console.log(String(7 - 9));
 console.log(String(3 - -(2)));
 console.log(String(-(2 + 3)));
+//# sourceMappingURL=unary-minus.mjs.map

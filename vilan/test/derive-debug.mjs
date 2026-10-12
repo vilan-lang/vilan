@@ -15,3 +15,4 @@ console.log(debug2([ 1, 2 ]));
 const t = [ "hi", [ 3, 4 ], true ];
 console.log(debug3(t));
 console.log(debug4([  ]));
+//# sourceMappingURL=derive-debug.mjs.map

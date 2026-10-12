@@ -9,3 +9,4 @@ const v = slot(w);
 console.log(String(v[0][v[1]]));
 v[0][v[1]] = 25;
 console.log(String(w[0]));
+//# sourceMappingURL=borrows.mjs.map

@@ -915,3 +915,4 @@ set(count, 9, [ 1 ]);
 dispose2(scope);
 set(count, 10, [ 1 ]);
 console.log("post");
+//# sourceMappingURL=reactive-owner.mjs.map

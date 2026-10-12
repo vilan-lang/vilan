@@ -155,3 +155,4 @@ const within = [ 5 ];
 console.log(__dbg_flat(__show_Num(clamp(below, low, high))));
 console.log(__dbg_flat(__show_Num(clamp(above, low, high))));
 console.log(__dbg_flat(__show_Num(clamp(within, low, high))));
+//# sourceMappingURL=trait-default.mjs.map

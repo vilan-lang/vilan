@@ -55,3 +55,4 @@ let tags = [  ];
 tags.push([ "red" ]);
 tags.push([ "blue" ]);
 console.log(join3(tags, " "));
+//# sourceMappingURL=list-join.mjs.map

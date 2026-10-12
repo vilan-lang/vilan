@@ -18,3 +18,4 @@ const p = [ x, y ];
 console.log(String(classify(p)));
 console.log(String(classify([ 0, 9 ])));
 console.log(String(classify([ 1, 4 ])));
+//# sourceMappingURL=match-ergonomics.mjs.map

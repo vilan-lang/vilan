@@ -1024,3 +1024,4 @@ set(second, 21, [ 1 ]);
 console.log(String(get2(doubled)));
 dispose2(stacked);
 dispose2(scope);
+//# sourceMappingURL=reactive-flatten.mjs.map

@@ -83,6 +83,8 @@ enum Role {
     Bundled { source: PathBuf, name: String },
     /// `<leg>.<ext>` — the leg's JavaScript.
     Bundle,
+    /// `<leg>.<ext>.map` — the bundle's source map (E257 S5).
+    SourceMap,
     /// `<leg>.chunks.json`.
     Manifest,
     /// `<leg>.<arm>.js` — one route chunk of a `split = true` browser leg.
@@ -98,6 +100,7 @@ impl Role {
             Role::Emitted { kind } => format!("emitted kind `{kind}`"),
             Role::Bundled { .. } => "bundled copy".to_string(),
             Role::Bundle => "compiled bundle".to_string(),
+            Role::SourceMap => "source map".to_string(),
             Role::Manifest => "build manifest".to_string(),
             Role::Chunk { .. } => "route chunk".to_string(),
             Role::HookOutput { .. } => "hook output".to_string(),
@@ -109,11 +112,12 @@ impl Role {
     fn order(&self) -> u8 {
         match self {
             Role::Bundle => 0,
-            Role::Emitted { .. } => 1,
-            Role::Manifest => 2,
-            Role::Chunk { .. } => 3,
-            Role::Bundled { .. } => 4,
-            Role::HookOutput { .. } => 5,
+            Role::SourceMap => 1,
+            Role::Emitted { .. } => 2,
+            Role::Manifest => 3,
+            Role::Chunk { .. } => 4,
+            Role::Bundled { .. } => 5,
+            Role::HookOutput { .. } => 6,
         }
     }
 }
@@ -232,6 +236,10 @@ pub fn bundle(path: PathBuf, leg: &str) {
     record(path, leg, Role::Bundle);
 }
 
+pub fn source_map(path: PathBuf, leg: &str) {
+    record(path, leg, Role::SourceMap);
+}
+
 pub fn manifest(path: PathBuf, leg: &str) {
     record(path, leg, Role::Manifest);
 }
@@ -323,7 +331,7 @@ fn render(log: &Log) -> String {
                     line(&mut out, "named", &site);
                 }
             }
-            Role::Bundle | Role::Manifest => line(&mut out, "leg", &output.leg),
+            Role::Bundle | Role::SourceMap | Role::Manifest => line(&mut out, "leg", &output.leg),
             Role::Chunk { arm } => {
                 line(&mut out, "leg", &output.leg);
                 line(&mut out, "arm", arm);

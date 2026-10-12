@@ -124,3 +124,4 @@ function __show_Id(value) {
 }
 const some_id = default3();
 console.log(__dbg_flat(__show_Id(some_id)));
+//# sourceMappingURL=default.mjs.map

@@ -13,3 +13,4 @@ console.log(!(eq(a, c)));
 const u1 = [  ];
 const u2 = [  ];
 console.log(eq2(u1, u2));
+//# sourceMappingURL=derive-eq.mjs.map

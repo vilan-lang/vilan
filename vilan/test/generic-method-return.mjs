@@ -21,3 +21,4 @@ if ($a[0] === 0) {
 	$b = console.log(String(-(1)));
 }
 process.exit($b);
+//# sourceMappingURL=generic-method-return.mjs.map

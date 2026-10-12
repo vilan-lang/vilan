@@ -12,3 +12,4 @@ let e = [ 10 ];
 let d = __clone(e);
 d[0] = 1;
 console.log(String(e[0]));
+//# sourceMappingURL=view-basic.mjs.map

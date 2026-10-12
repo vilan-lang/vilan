@@ -127,3 +127,4 @@ function __show_Pair(value) {
 }
 console.log(String(pick3(2, 3)));
 console.log(__dbg_flat(__show_Pair(pick4([ 10 ], [ 20 ]))));
+//# sourceMappingURL=generic-inference.mjs.map

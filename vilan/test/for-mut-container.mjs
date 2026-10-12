@@ -51,3 +51,4 @@ while (true) {
 console.log(String(__at(counter[0], 0, "for-mut-container.vl:32:8")));
 console.log(String(__at(counter[0], 1, "for-mut-container.vl:33:8")));
 console.log(String(__at(counter[0], 2, "for-mut-container.vl:34:8")));
+//# sourceMappingURL=for-mut-container.mjs.map

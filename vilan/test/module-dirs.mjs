@@ -16,3 +16,4 @@ console.log(hello());
 console.log(label());
 console.log(label());
 console.log("width is " + width());
+//# sourceMappingURL=module-dirs.mjs.map

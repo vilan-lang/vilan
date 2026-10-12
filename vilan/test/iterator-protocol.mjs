@@ -60,3 +60,4 @@ numbers.push(3);
 numbers.push(4);
 console.log(String(sum(numbers)));
 console.log(String(product(numbers)));
+//# sourceMappingURL=iterator-protocol.mjs.map

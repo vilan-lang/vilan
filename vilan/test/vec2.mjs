@@ -45,3 +45,4 @@ const threshold = 3.0;
 console.log(String(length_squared(travelled)));
 console.log(length_squared(travelled) > threshold * threshold);
 console.log(length_squared(travelled) === length(travelled) * length(travelled));
+//# sourceMappingURL=vec2.mjs.map

@@ -14,3 +14,4 @@ v[0][v[1]] = 25;
 console.log(String(w[0]));
 const r = peek(w);
 console.log(String(r[0][r[1]]));
+//# sourceMappingURL=borrows-inferred.mjs.map
