@@ -4019,12 +4019,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .parameters
                 .get(binding)
                 .map(|parameter| parameter.type_id),
+            // N170: `inferred_return_types` is keyed by FUNCTION, so a call's
+            // id never hit it; the callee's inferred return is read where it
+            // lives, by [`Self::declared_return_type`]'s signature walk.
             Expr::Call(call_id) => self
-                .program
-                .inferred_return_types
-                .get(call_id)
-                .copied()
-                .or_else(|| self.shared_view_type(*call_id))
+                .shared_view_type(*call_id)
                 .or_else(|| self.declared_return_type(*call_id)),
             Expr::Await(awaited) => self.awaited_type(*awaited),
             _ => None,
@@ -4605,15 +4604,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// The DECLARED return type of a call's callee — what
-    /// [`Emitter::type_of`] falls back to when the solver banked no inferred
-    /// return for the call site.
+    /// The return type of a call's callee — what [`Emitter::type_of`] answers
+    /// for a call that is not a `Shared` view.
     ///
-    /// `inferred_return_types` is keyed by call and filled where inference had
-    /// something to add; a monomorphic callee with a written return type adds
-    /// nothing, so a field read straight off such a call (`fetch_row().id`) had
-    /// no subject type at all and was refused. The declaration is the answer at
-    /// exactly those sites.
+    /// A field read straight off a call (`fetch_row().id`) had no subject type
+    /// at all and was refused. The callee's signature is the answer: its
+    /// written return, or the one inference banked for an unannotated callee
+    /// (`inferred_return_types`, keyed by function — N170).
     ///
     /// F107: a function WRITTEN `async` whose return is itself a `Task`
     /// answers the task's payload ([`Self::assimilated_return`]).

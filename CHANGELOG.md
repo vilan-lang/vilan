@@ -73,6 +73,11 @@ written down.
 <!-- family: fix -->
 **F134: natively a LITERAL leg of a `match` whose subject is a call handing back `Option<&str>` builds — `match shelf.at(0) { Some("first") => .., Some(let name) => *name, None => .. }` was rustc E0277 ("can't compare `Rc<str>` with `str`", at `&*__literal0 == "first"`).** The subject carries the payload view as a reference (F21), so the literal's binder is a `&Rc<str>`, which `&*` read as an `Rc<str>`; the guard now reaches the `str` through either binder (`AsRef::<str>::as_ref`). JS gives the same answer from B577 (fix-51). Pin: `f134_a_literal_leg_over_a_view_subject_matches_natively` (`native/literal_leg_over_a_view_subject.vl`, new; the native run held to `lit`, `second`, `none`, `only literal` until both fixes are on one tree, then a `compare`).
 
+---
+
+<!-- family: tooling -->
+**N170: the native backend's type of a CALL no longer looks the call's id up in `inferred_return_types`, a table keyed by function — the hop could never hit.** The callee's inferred return was always read by the signature walk behind it (`return_type_of`), so no emitted byte moves; the first hop only read as if call-keyed answers existed. Pins: the corpus, both native modes and the copy census, unchanged.
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->
