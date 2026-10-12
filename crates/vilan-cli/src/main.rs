@@ -4590,6 +4590,10 @@ fn compile_unit(
         .package_dir
         .as_ref()
         .map(|directory| expansion_cache_root(directory, goal));
+    // M135: the const cache keeps its table beside the macro-expansion table, in
+    // the same directory and under the same rules (`rm -rf dist` forgets it,
+    // `vilan cache clean` sweeps it). The language server never sets this.
+    vilan_core::const_cache::set_disk_root(workspace.macro_expansion_cache.as_deref());
     // HMR instrumentation is opt-in per compile (an HMR-active `run --watch`,
     // browser legs only) — every other caller passes `false`, so `build`/`run`/
     // `check` output stays byte-identical.

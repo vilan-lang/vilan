@@ -917,6 +917,9 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     // G24: taken AFTER evaluation, so every name the world minted for a
     // snapshot's captures is in it.
     let snapshot_bindings = world.emitted_binding_names();
+    // M135: what this pass evaluated, written to the package's table for the
+    // next process (a no-op without a disk root, or when nothing was added).
+    crate::const_cache::flush_disk();
     Evaluated {
         results,
         assets,
