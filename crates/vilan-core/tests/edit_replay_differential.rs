@@ -389,6 +389,30 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
         inherited > 0,
         "the served keystrokes inherit the stored world's windows"
     );
+    // M110 S7 (Order 51): the warm keystrokes SERVED per-item records for
+    // the re-walked files' unchanged items — and found some stale (the
+    // edited item, its dependents) — or the comparison above said nothing
+    // about the records. The effect edits (a context read removed, a sleep
+    // removed, a node call removed, a push into another module's binding)
+    // are among the legs that served.
+    let items_served: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_served)
+        .sum();
+    let items_stale: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_stale)
+        .sum();
+    let items_filed: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_filed)
+        .sum();
+    eprintln!("S7: {items_served} item records served, {items_stale} stale, {items_filed} filed");
+    assert!(
+        items_served > 0 && items_stale > 0 && items_filed > 0,
+        "the classes leg must serve per-item records on its warm keystrokes and find the \
+         edited items stale (served {items_served}, stale {items_stale}, filed {items_filed})"
+    );
     // The stand-down edit (the browser effect package's last edit, replayed
     // last: edit then undo) applies no rewrite, so the recorded post-rewrite
     // graph is NOT served to it — the log guard.
@@ -616,6 +640,28 @@ fn a_rewritten_graph_replayed_over_a_stood_down_rewrite_is_counted() {
          now reads a call edge without the tree beside it; make the log guard's plant a \
          differential red: {:#?}",
         replayed.divergences
+    );
+}
+
+/// S7's plant (M110, Order 51): an item's record served on its own text and
+/// walk alone, the dirty closure never asked. A push into another module's
+/// use-inferred binding typed with a different type (the M139 shape: the
+/// pusher's constraint writes the owner item's slot) then leaves the owner
+/// item's label at the previous keystroke's element type; a callee's changed
+/// return leaves its callers' labels and checks — the gate must see it.
+#[test]
+fn the_differential_sees_an_item_record_served_over_a_dirty_dependency() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::ItemRecordUnguarded);
+    assert!(
+        divergences.iter().any(
+            |divergence| divergence.contains("pushed into a module binding")
+                || divergence.contains("push into another module's binding")
+        ),
+        "the unguarded-record plant must turn a push into another module's binding red; \
+         it found: {divergences:#?}"
     );
 }
 

@@ -350,3 +350,93 @@ fn the_report_line_names_the_mode() {
             || report.census.entities.anchored() == 0
     );
 }
+
+// --- M110 S7 (Order 51): the per-item records over the windows -----------------
+
+/// One seeded analysis of `package` (the editor's keystroke shape: the seed
+/// is the edited file, every reuse on), answering its census and its
+/// id-free rendering; `clean` answers the canonical analysis's rendering.
+fn seeded(package: &Package, seed: &str) -> (vilan_core::incremental::Census, String) {
+    let observation = observe(package, vec![package.path(seed)], Leg::Incremental);
+    (observation.census, observation.rendering)
+}
+
+fn clean(package: &Package) -> String {
+    observe(package, Vec::new(), Leg::Clean).rendering
+}
+
+/// S7: the second seeded analysis of an unchanged package serves every
+/// re-walked item from the record the first one filed — nothing stale — and
+/// answers what a clean analysis answers. The leaf package: its hot set is
+/// accepted, so the first seeded analysis builds and stores the hot-set
+/// world and files the hot leaf's and the entry's items after the store,
+/// and the second is served from it.
+#[test]
+fn a_second_seeded_analysis_serves_the_items_records() {
+    let package = leaf_package();
+    vilan_core::analyzer::base_cache_clear();
+    let (first, _) = seeded(&package, "views.vl");
+    assert_eq!(first.item_records_served, 0, "{first:#?}");
+    assert!(
+        first.item_records_filed > 0,
+        "the first analysis files the re-walked items' records: {first:#?}"
+    );
+    let (second, rendering) = seeded(&package, "views.vl");
+    assert!(
+        second.hot_world && second.base_hits > 0,
+        "the second analysis is served the stored hot-set world: {second:#?}"
+    );
+    assert!(
+        second.item_records_served > 0 && second.item_records_stale == 0,
+        "an unchanged file's items are served from their records: {second:#?}"
+    );
+    assert_eq!(
+        second.item_records_served, first.item_records_filed,
+        "every item filed is served next time: {second:#?}"
+    );
+    assert_eq!(rendering, clean(&package));
+    package.remove();
+}
+
+/// S7: an edit inside one item re-checks that item and the items that read
+/// from it (the entry's `main` calls the edited `render`, and its import of
+/// `render` binds to it), and serves the rest (the imports of the prefix's
+/// `base` and `ring`) — still answering what a clean analysis answers.
+#[test]
+fn an_edited_items_dependents_are_re_checked_and_the_rest_served() {
+    let mut package = leaf_package();
+    vilan_core::analyzer::base_cache_clear();
+    let (_, _) = seeded(&package, "views.vl");
+    let (settled, _) = seeded(&package, "views.vl");
+    assert!(
+        settled.item_records_stale == 0 && settled.item_records_served > 0,
+        "{settled:#?}"
+    );
+    let before = package.text("views.vl").to_string();
+    let after = before.replacen("\tbase() + 1\n", "\tlet extra = 1;\n\tbase() + extra\n", 1);
+    assert_ne!(before, after, "the edit's anchor is in views.vl");
+    package.set("views.vl", after);
+    let (edited, rendering) = seeded(&package, "views.vl");
+    assert!(
+        edited.hot_world && edited.base_hits > 0,
+        "the edited leaf is served the stored hot-set world: {edited:#?}"
+    );
+    assert!(
+        edited.item_records_stale > 0,
+        "the edited item and its readers are stale: {edited:#?}"
+    );
+    assert!(
+        edited.item_records_served > 0,
+        "the items that do not read the edited one are served: {edited:#?}"
+    );
+    assert!(
+        edited.item_records_served < settled.item_records_served,
+        "fewer items are served than on the unchanged keystroke: {edited:#?} vs {settled:#?}"
+    );
+    assert_eq!(rendering, clean(&package));
+    package.set("views.vl", before);
+    let (undone, rendering) = seeded(&package, "views.vl");
+    assert!(undone.item_records_served > 0, "{undone:#?}");
+    assert_eq!(rendering, clean(&package));
+    package.remove();
+}

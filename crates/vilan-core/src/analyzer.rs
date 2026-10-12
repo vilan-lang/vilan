@@ -22,6 +22,7 @@ mod dbg_stack;
 mod hint_labels;
 mod hover_labels;
 pub mod id_windows;
+mod item_records;
 mod liveness;
 mod written_types;
 
@@ -4603,6 +4604,13 @@ pub struct Analyzer<'src> {
     /// set, the entry, the resolve of their constraints, the post passes).
     /// `None` until the world is stored or served.
     prefix_entity_end: Option<u32>,
+    /// M110 S7: the type counter's twin — every slot below it is the stored
+    /// world's (the same on every hit), every one at or past it this
+    /// analysis's.
+    prefix_type_end: Option<u32>,
+    /// M110 S7 (Order 51): the per-item records' state for this analysis
+    /// (`analyzer/item_records.rs`).
+    items: item_records::ItemState,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -4618,6 +4626,11 @@ pub struct Analyzer<'src> {
     // whose recorded checks are still valid; a module the entry dirtied
     // (`entry_dirty_sources`) drops out for that analysis.
     world_ranges: Vec<(u32, u32)>,
+    // M110 S7: `world_ranges` with the served ITEMS' windows merged in
+    // (`item_records`), sorted and disjoint — what `reusable_entity` searches,
+    // one search per ask. `world_ranges` itself stays module grain for the
+    // bound audit. Sealed by `seal_reuse_ranges` after both seals below.
+    reusable_ranges: Vec<(u32, u32)>,
     // M19 T1: the sources whose Class A checks this analysis SKIPPED and whose
     // diagnostics it replayed, in ascending order. Read by the phase line and
     // by the record pass, which must never re-record a source it did not
@@ -4629,6 +4642,9 @@ pub struct Analyzer<'src> {
     // record (an analysis cancelled between the two stores wrote one), and
     // such a module replays its diagnostics and recomputes its tables.
     world_table_ranges: Vec<(u32, u32)>,
+    // M110 S7: `world_table_ranges` with the served items' windows merged in
+    // — what `table_entity` searches.
+    table_ranges: Vec<(u32, u32)>,
     // M19 T1b: those sources, in ascending order — the phase line's second
     // count and the record pass's exclusion list.
     reused_table_sources: Vec<SourceId>,
@@ -7745,10 +7761,14 @@ impl<'src> Analyzer<'src> {
             bound_recompute_ranges: Vec::new(),
             prefix_impl_count: None,
             prefix_entity_end: None,
+            prefix_type_end: None,
+            items: item_records::ItemState::default(),
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
+            reusable_ranges: Vec::new(),
             reused_sources: Vec::new(),
             world_table_ranges: Vec::new(),
+            table_ranges: Vec::new(),
             reused_table_sources: Vec::new(),
             restored_tables: RestoredTables::default(),
             drop_scan_roots: HashSet::default(),
@@ -9036,8 +9056,12 @@ impl<'src> Analyzer<'src> {
             .method_call_substitution
             .iter()
             .filter(|(call_id, _)| {
-                let reused =
-                    self.reusable_entity(**call_id) && !self.bound_recompute_site(**call_id);
+                // M110 S7: MODULE grain, deliberately — a re-walked file's
+                // items keep their sites live (`item_records`: the question
+                // names the callee's constraint slot, and the hot set's own
+                // impls are the late impls the record's guard would ask of).
+                let reused = (self.frozen_entity(**call_id) || self.world_entity(**call_id))
+                    && !self.bound_recompute_site(**call_id);
                 served += u64::from(reused);
                 !reused
             })
@@ -13622,6 +13646,11 @@ impl<'src> Analyzer<'src> {
             if !self.container_site_visited(ContainerSite::File(source)) {
                 continue;
             }
+            // M110 S7: a served item's written applications are replayed
+            // with its record, as a reused module's are.
+            if self.item_served_at(source, span.start) {
+                continue;
+            }
             let Some(found) =
                 self.container_resource_at(type_id, &containers, &no_generic_resources, &mut memo)
             else {
@@ -13630,6 +13659,8 @@ impl<'src> Analyzer<'src> {
             let key = self.container_structure_key(found.container_type);
             let key_is_new = reported_structures.insert(key.clone());
             if key_is_new {
+                let item = self.item_window_at(source, span.start);
+                self.note_item_container_structure(item, &key);
                 self.note_container_structure(source, key);
             }
             if !reported_instantiations.insert(found.container_type) {
@@ -13661,6 +13692,8 @@ impl<'src> Analyzer<'src> {
             if !reported_structures.insert(key.clone()) {
                 continue;
             }
+            let item = self.item_window_at(source, span.start);
+            self.note_item_container_structure(item, &key);
             self.note_container_structure(source, key);
             reported_instantiations.insert(found.container_type);
             self.report_container_resource(&found, type_id, span, source, None);
@@ -13687,6 +13720,8 @@ impl<'src> Analyzer<'src> {
             if !reported_structures.insert(key.clone()) {
                 continue;
             }
+            let item = self.item_window_at(source, span.start);
+            self.note_item_container_structure(item, &key);
             self.note_container_structure(source, key);
             self.report_container_resource(&found, container_type, span, source, None);
         }
@@ -34154,12 +34189,39 @@ impl<'src> Analyzer<'src> {
     /// record, it was measured here and did not clear the noise floor at
     /// loadavg 110+, and it is left unshipped rather than shipped unmeasured.
     fn compute_resource_types(&mut self) -> HashSet<TypeId> {
+        // M110 S7 (incr-50 C3's Q3): the walk goes window by window — the
+        // slots are visited in id order and the windows lie in id order, so
+        // one merge step names each slot's item and the anchor is set per
+        // item rather than searched per slot. A slot in no window (the
+        // resolve's and the base's unanchored mints, "the program's") still
+        // asks through the spill map, and is counted as a miss as before.
         let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().collect();
+        let windows: Vec<(u32, u32, usize)> = if self.id_windows.on() {
+            self.id_windows
+                .windows
+                .iter()
+                .enumerate()
+                .map(|(index, window)| (window.types.start, window.types.end, index))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut next_window = 0usize;
+        let mut current: Option<(u32, u32, usize)> = None;
         type_ids
             .into_iter()
             .filter(|type_id| {
+                while next_window < windows.len() && windows[next_window].0 <= type_id.0 {
+                    current = Some(windows[next_window]);
+                    next_window += 1;
+                }
                 // M134: a classification's mints belong to the type's item.
-                self.id_windows.set_check_anchor_type(*type_id);
+                match current {
+                    Some((start, end, index)) if type_id.0 >= start && type_id.0 < end => {
+                        self.id_windows.set_anchor_window(index);
+                    }
+                    _ => self.id_windows.set_check_anchor_type(*type_id),
+                }
                 self.type_is_resource(*type_id)
             })
             .collect()
@@ -52193,9 +52255,9 @@ impl<'src> Analyzer<'src> {
 
     fn table_entity(&self, id: Id) -> bool {
         let index = self
-            .world_table_ranges
+            .table_ranges
             .partition_point(|(start, _)| *start <= id.0);
-        index > 0 && id.0 < self.world_table_ranges[index - 1].1
+        index > 0 && id.0 < self.table_ranges[index - 1].1
     }
 
     /// M76 — the files an ENTRY-SHAPED world's checks-reuse record must hold
@@ -52502,7 +52564,36 @@ impl<'src> Analyzer<'src> {
     /// module-level generic can be ground by the entry, so neither answer is
     /// the module's own.
     fn reusable_entity(&self, id: Id) -> bool {
-        self.frozen_entity(id) || self.world_entity(id)
+        // M110 S7: and an item of a re-walked file whose record this
+        // analysis serves (`item_records`) — its Class A output is replayed
+        // from the record exactly as a reused module's is.
+        self.frozen_entity(id) || self.served_entity(id)
+    }
+
+    /// Whether `id` was minted by a reused MODULE or a served ITEM (M110 S7)
+    /// — the remembered half of [`Self::reusable_entity`], without std's
+    /// known-absent half.
+    fn served_entity(&self, id: Id) -> bool {
+        let index = self
+            .reusable_ranges
+            .partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < self.reusable_ranges[index - 1].1
+    }
+
+    /// M110 S7: seals the merged range vectors the per-entity predicates
+    /// search — the reused modules' ranges and the served items' windows in
+    /// one sorted vector each, so a sweep over the program pays one search
+    /// per entity, as it did before the items existed.
+    fn seal_reuse_ranges(&mut self) {
+        let merge = |modules: &[(u32, u32)], items: &[(u32, u32)]| -> Vec<(u32, u32)> {
+            let mut merged: Vec<(u32, u32)> = modules.iter().chain(items).copied().collect();
+            merged.sort_unstable();
+            merged
+        };
+        self.reusable_ranges = merge(&self.world_ranges, self.item_ranges());
+        self.table_ranges = merge(&self.world_table_ranges, self.item_table_ranges());
+        self.restored_tables.label_ranges =
+            merge(&self.restored_tables.label_ranges, self.item_label_ranges());
     }
 
     /// Whether this analysis VISITS `site` — R10's one reuse predicate — and
@@ -52539,7 +52630,10 @@ impl<'src> Analyzer<'src> {
     fn container_site_visited(&self, site: ContainerSite) -> bool {
         let visited = match site {
             ContainerSite::File(source) => self.reused_sources.binary_search(&source).is_err(),
-            ContainerSite::Entity(id) => !self.world_entity(id),
+            // M110 S7: a served item's sites are replayed with its record,
+            // its structure keys included (the written tier, which carries a
+            // file and a span, asks `item_served_at` per site instead).
+            ContainerSite::Entity(id) => !self.served_entity(id),
         };
         container_site_offered(visited);
         visited
@@ -78099,6 +78193,11 @@ struct WorldChecks {
     source_hashes: Vec<u64>,
     sources_fingerprint: u64,
     per_source: HashMap<u32, ModuleDiagnostics>,
+    /// M110 S7: the per-ITEM records of the files this world's analyses
+    /// re-walk (the hot set's, the entry's), keyed by source path and
+    /// ordinal (`item_records::ItemKey`) — which is what lets two entries
+    /// sharing a world keep their own.
+    per_item: HashMap<item_records::ItemKey, std::sync::Arc<item_records::ItemRecord>>,
     /// M110 S3: the post passes' prefix record, with the cold-set fingerprint
     /// it was computed over. One per world key: a session's keystrokes in one
     /// file share a cold set, and a different set files its own.
@@ -78120,6 +78219,7 @@ impl WorldChecks {
     fn compute_bytes(&self) -> usize {
         let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
         let post = self.post.as_ref().map_or(0, |(_, record)| record.bytes);
+        let items: usize = self.per_item.values().map(|record| record.bytes()).sum();
         let modules: usize = self
             .per_source
             .values()
@@ -78130,7 +78230,7 @@ impl WorldChecks {
                     + module.tables.as_ref().map_or(0, ModuleTables::bytes)
             })
             .sum();
-        hashes + modules + post
+        hashes + modules + post + items
     }
 }
 
@@ -78364,6 +78464,10 @@ fn checked_cache_store(
         .unwrap_or_default();
     // M110 S3: a post record filed under the same content stays with it.
     let post = existing.and_then(|recorded| recorded.post.clone());
+    // M110 S7: the item records too.
+    let per_item = existing
+        .map(|recorded| recorded.per_item.clone())
+        .unwrap_or_default();
     // A source this analysis found unrecordable loses whatever an EARLIER one
     // remembered about it: the merge above would otherwise keep serving a
     // record the current derivation has just declared unfit.
@@ -78380,6 +78484,7 @@ fn checked_cache_store(
         source_hashes: source_hashes.to_vec(),
         sources_fingerprint: fingerprint,
         per_source,
+        per_item,
         post,
         bytes: 0,
         last_used: tick,
@@ -80454,6 +80559,7 @@ fn analyze_inner<'src>(
         // `write_type_slot` can attribute the ones that move a module's slots.
         // Set before the entry expansion, which is already entry work.
         world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
+        world.analyzer.prefix_type_end = Some(world.analyzer.type_id);
         // M110 S6: the stored world's windows are its own; this analysis
         // lays out the hot set's and the entry's after them.
         world
@@ -82745,6 +82851,7 @@ fn analyze_inner<'src>(
     // After the store, so the world the cache holds is the pre-entry one it
     // has always been.
     world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
+    world.analyzer.prefix_type_end = Some(world.analyzer.type_id);
     // (S6: no `inherit` here — this analysis laid the prefix's windows out
     // itself and records their demand; a HIT inherits them.)
     world.analyzer.entry_phase = true;
@@ -83124,6 +83231,34 @@ fn analyze_over_world<'src>(
     if !crate::macros::in_macro_world() {
         ALIAS_REACHING_CENSUS.with(|census| census.set(alias_reaching.len()));
     }
+    // M110 S7: the per-item records of the re-walked files (the hot set's
+    // and the entry's items), decided before the module-grain seam below
+    // seals its ranges — the served items join the Class A predicate through
+    // `item_entity`, their tables and labels through `table_entity` and
+    // `label_row_restored`. Only for a SEEDED analysis with a key to file
+    // under: the records are the editor's, as the label tables (S2b) and
+    // the post record (S3) are. FILED on a hit and on a miss alike (the
+    // miss builds the very world the hits inherit, and files its items
+    // after the store, as M19 files its modules); SERVED on a hit only
+    // (term 1 of M19's §4.1: the hit is what makes the prefix's ids the
+    // record's).
+    analyzer.enable_item_records(
+        !entry_is_module
+            && checks_key.is_some()
+            && (!workspace.hot_seeds.is_empty() || workspace.reading_aids)
+            && !crate::incremental::clean_requested(),
+    );
+    analyzer.seal_item_spans();
+    if analyzer.item_records_enabled() {
+        let item_records = checks_key
+            .as_ref()
+            .filter(|_| from_base_cache)
+            .and_then(|key| {
+                item_records::checked_cache_lookup_items(key, &source_hashes[..prefix_len])
+            })
+            .unwrap_or_default();
+        analyzer.decide_item_records(&item_records, &alias_reaching);
+    }
     let reuse_candidates: HashSet<SourceId> = if from_base_cache && !entry_is_module {
         (1..recorded_len as u32)
             .map(SourceId)
@@ -83171,6 +83306,11 @@ fn analyze_over_world<'src>(
         // The splice (§3.2). Before every check that could add to the lists,
         // and the published order is `sort_in_step`'s either way.
         analyzer.replay_world_diagnostics(&replay_records);
+        // M110 S7: the served items' output, spliced the same way (after the
+        // table seam above, whose reset it absorbs its rows into), and the
+        // merged range vectors the per-entity predicates search.
+        analyzer.replay_item_records();
+        analyzer.seal_reuse_ranges();
         // M110 S0's census (Q9): what this analysis replays and what it will
         // check — read off the ranges just sealed, so it is the seam's own
         // answer. The function count walks every function once with a binary
@@ -83327,6 +83467,8 @@ fn analyze_over_world<'src>(
                 crate::phase_pass_mark(stringify!($call));
                 analyzer.id_windows.clear_anchor();
                 analyzer.record_reusable_window(diagnostics_before, warnings_before);
+                // M110 S7: and per ITEM for the re-walked files.
+                analyzer.record_item_window(diagnostics_before, warnings_before);
             } )+
         };
     }
@@ -84211,10 +84353,35 @@ fn analyze_over_world<'src>(
                 || analyzer.entry_dirty_sources.contains(&source)
         };
         let mut tables: HashMap<u32, ModuleTables> = HashMap::default();
-        analyzer.last_use.record_rows(&analyzer, &skip, &mut tables);
-        let file = |id: Id| -> Option<u32> {
+        let file_of = |analyzer: &Analyzer<'_>, id: Id| -> Option<u32> {
             let source = analyzer.source_of_id(id)?;
             (source.0 != 0 && !skip(source)).then_some(source.0)
+        };
+        // M110 S7: the same rows, partitioned per ITEM for the re-walked
+        // files (`item_records`), under the item's window index.
+        let item_of = |analyzer: &Analyzer<'_>, id: Id| -> Option<u32> {
+            analyzer.item_window_of(id).map(|window| window as u32)
+        };
+        let mut item_tables: HashMap<u32, ModuleTables> = HashMap::default();
+        // Asked once, not per row: a cold check keeps no item records and
+        // pays nothing for them (the Mechanics' editor-only rule).
+        let items_enabled = analyzer.item_records_enabled();
+        analyzer
+            .last_use
+            .record_rows(&analyzer, &file_of, &mut tables);
+        if items_enabled {
+            analyzer
+                .last_use
+                .record_rows(&analyzer, &item_of, &mut item_tables);
+        }
+        // One row, filed under its source's slice and its item's.
+        let mut place = |id: Id, row: &mut dyn FnMut(&mut ModuleTables)| {
+            if let Some(source) = file_of(&analyzer, id) {
+                row(tables.entry(source).or_default());
+            }
+            if items_enabled && let Some(window) = item_of(&analyzer, id) {
+                row(item_tables.entry(window).or_default());
+            }
         };
         for (function_id, function) in &analyzer.functions {
             // A function with an empty verdict is the overwhelming majority and
@@ -84222,22 +84389,14 @@ fn analyze_over_world<'src>(
             if function.bumps.is_empty() {
                 continue;
             }
-            if let Some(source) = file(*function_id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .bumps
-                    .push((*function_id, function.bumps.clone()));
-            }
+            place(*function_id, &mut |slice| {
+                slice.bumps.push((*function_id, function.bumps.clone()))
+            });
         }
         for (site_id, decision) in &clone_sites {
-            if let Some(source) = file(*site_id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .clone_sites
-                    .push((*site_id, decision.clone()));
-            }
+            place(*site_id, &mut |slice| {
+                slice.clone_sites.push((*site_id, decision.clone()))
+            });
         }
         // M110 S2b: the label rows, per module, in id order (a record is a
         // function of the module, not of a hash map's walk). Only for an
@@ -84252,13 +84411,9 @@ fn analyze_over_world<'src>(
         };
         label_rows.sort_unstable_by_key(|(id, _)| id.0);
         for (id, label) in label_rows {
-            if let Some(source) = file(*id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .expr_types
-                    .push((*id, label.clone()));
-            }
+            place(*id, &mut |slice| {
+                slice.expr_types.push((*id, label.clone()))
+            });
         }
         let mut label_rows: Vec<(&Id, &String)> = if seeded {
             declaration_labels.iter().collect()
@@ -84267,49 +84422,27 @@ fn analyze_over_world<'src>(
         };
         label_rows.sort_unstable_by_key(|(id, _)| id.0);
         for (id, label) in label_rows {
-            if let Some(source) = file(*id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .declaration_labels
-                    .push((*id, label.clone()));
-            }
+            place(*id, &mut |slice| {
+                slice.declaration_labels.push((*id, label.clone()))
+            });
         }
         for (site_id, decision) in &return_clone_sites {
-            if let Some(source) = file(*site_id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .return_clone_sites
-                    .push((*site_id, decision.clone()));
-            }
+            place(*site_id, &mut |slice| {
+                slice.return_clone_sites.push((*site_id, decision.clone()))
+            });
         }
         for read_id in &return_view_reads {
-            if let Some(source) = file(*read_id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .return_view_reads
-                    .push(*read_id);
-            }
+            place(*read_id, &mut |slice| {
+                slice.return_view_reads.push(*read_id)
+            });
         }
         for call_id in &scalar_view_calls {
-            if let Some(source) = file(*call_id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .scalar_view_calls
-                    .push(*call_id);
-            }
+            place(*call_id, &mut |slice| {
+                slice.scalar_view_calls.push(*call_id)
+            });
         }
         for ref_id in &scalar_view_refs {
-            if let Some(source) = file(*ref_id) {
-                tables
-                    .entry(source)
-                    .or_default()
-                    .scalar_view_refs
-                    .push(*ref_id);
-            }
+            place(*ref_id, &mut |slice| slice.scalar_view_refs.push(*ref_id));
         }
         // M19 T1c: the drop scan's enrolment, per module. Every enrolled root is
         // a bodied function or a closure, so `source_of_id` files it under the
@@ -84317,9 +84450,7 @@ fn analyze_over_world<'src>(
         let mut drop_roots: Vec<Id> = analyzer.drop_scan_roots.iter().copied().collect();
         drop_roots.sort_unstable_by_key(|id| id.0);
         for root in drop_roots {
-            if let Some(source) = file(root) {
-                tables.entry(source).or_default().drop_roots.push(root);
-            }
+            place(root, &mut |slice| slice.drop_roots.push(root));
         }
         // Every source this analysis re-derived gets a slice, including the
         // ones with nothing in any table: "I computed this module and it
@@ -84339,6 +84470,20 @@ fn analyze_over_world<'src>(
             slice.labels_recorded = seeded;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
+        // M110 S7: the item records of the re-walked files, with their
+        // slices — filed only by a complete analysis (a cancelled phase is
+        // a prefix of itself, and a prefix recorded as a whole would replay
+        // a truncated item on every later hit).
+        if items_enabled && !crate::cancel::cancelled() {
+            let digest = analyzer.drop_nominals_world_digest;
+            let (items, purge) = analyzer.take_item_records(item_tables, digest, seeded);
+            item_records::checked_cache_store_items(
+                key,
+                &source_hashes[..prefix_len],
+                items,
+                &purge,
+            );
+        }
     }
 
     // E237: the definition under an entry binding's, member's or field's type.
