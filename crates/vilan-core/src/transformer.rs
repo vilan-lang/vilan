@@ -5140,11 +5140,28 @@ impl<'src> Transformer<'src> {
     /// per-instance half of `scalar_view_refs`, whose analyzer verdict an
     /// abstract `T` cannot reach. An expression with no recorded type answers
     /// by its shape, as the analyzer's `place_is_scalar` does (B505).
+    ///
+    /// B578: three shapes store no type of their own and are rvalues a view
+    /// is taken of as freely as a literal — a CALL (`&xs.len()`, `&seven()`),
+    /// answered by its callee's return type under the call's own binding, and
+    /// a value `if`/`match`/block, answered by its tail leaves. Read as "not
+    /// a scalar", the view of one passed the bare value where a `&usize` or a
+    /// generic `&T` at a scalar instance reads `value[0][value[1]]`, and the
+    /// callee threw a TypeError.
     fn value_resolves_to_scalar(&self, expr_id: Id) -> bool {
         if let Some(type_id) = self.expr_type_id(expr_id) {
             return self.resolves_to_scalar_view_pointee(type_id);
         }
         match self.program.entity_map.get(&expr_id) {
+            Some(Expr::Call(call_id)) => self.call_result_resolves_to_scalar(*call_id),
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                let mut leaves = Vec::new();
+                self.collect_value_tail_leaves(expr_id, &mut leaves);
+                leaves
+                    .into_iter()
+                    .any(|leaf| leaf != expr_id && self.value_resolves_to_scalar(leaf))
+            }
+            Some(Expr::Ascribe(inner)) => self.value_resolves_to_scalar(*inner),
             Some(Expr::Number(..) | Expr::String(_) | Expr::MultilineString(_)) => true,
             Some(Expr::Binary(
                 BinaryOp::Eq
@@ -5164,6 +5181,76 @@ impl<'src> Transformer<'src> {
             Some(Expr::Unary(_, operand)) => self.value_resolves_to_scalar(*operand),
             _ => false,
         }
+    }
+
+    /// B578: whether a call's RESULT is a scalar the view machinery pairs —
+    /// its callee's return type (declared, or inferred for an unannotated
+    /// function; an external's; a closure type's), with a generic return
+    /// resolved through the binding the call instantiates its callee with.
+    fn call_result_resolves_to_scalar(&self, call_id: Id) -> bool {
+        let Some(function_call) = self.program.function_calls.get(&call_id) else {
+            return false;
+        };
+        let target = match self.program.entity_map.get(&function_call.subject_id) {
+            Some(Expr::Local(target)) => Some(*target),
+            _ => None,
+        };
+        let return_type_id = match target {
+            Some(target) if self.program.functions.contains_key(&target) => {
+                let function = &self.program.functions[&target];
+                function
+                    .return_type_id
+                    .or_else(|| self.program.inferred_return_types.get(&target).copied())
+            }
+            Some(target) if self.program.external_functions.contains_key(&target) => {
+                Some(self.program.external_functions[&target].return_type_id)
+            }
+            _ => self
+                .expr_type_id(function_call.subject_id)
+                .and_then(|subject_type| {
+                    match self
+                        .program
+                        .type_id_to_type_map
+                        .get(&self.resolve_type_id(subject_type))
+                    {
+                        Some(Type::Closure(_, return_type_id, _, _)) => Some(*return_type_id),
+                        _ => None,
+                    }
+                }),
+        };
+        let Some(mut return_type_id) = return_type_id else {
+            return false;
+        };
+        if let Some(target) = target
+            && let Some(Type::Generic(constraint_id)) =
+                self.program.type_id_to_type_map.get(&return_type_id)
+            && let Some(bound) = self
+                .call_substitution(call_id, target, &function_call.generic_argument_ids)
+                .and_then(|substitution| substitution.get(constraint_id).copied())
+        {
+            return_type_id = bound;
+        }
+        self.resolves_to_scalar_view_pointee(return_type_id)
+    }
+
+    /// Whether a call hands back a VIEW — a `&`/`&mut`-returning function's
+    /// (a scalar one's `(base, key)` pair, an aggregate's reference at every
+    /// instance), or a scalar `Shared::write()`. `&` of one is the view itself.
+    fn call_returns_a_view(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let returns_a_view = self
+            .program
+            .function_calls
+            .get(call_id)
+            .and_then(|function_call| self.program.entity_map.get(&function_call.subject_id))
+            .and_then(|subject| match subject {
+                Expr::Local(target) => self.program.functions.get(target),
+                _ => None,
+            })
+            .is_some_and(|function| function.returns_view || function.returns_mut_view);
+        returns_a_view || self.emits_scalar_view_pair(call_expr_id)
     }
 
     /// The `(base, key)` pair a view of the scalar place `operand` lowers to —
@@ -5240,6 +5327,12 @@ impl<'src> Transformer<'src> {
             }
             Some(Expr::Dereference(inner)) if self.emits_scalar_view_pair(*inner) => {
                 return self.walk_entity(*inner, block).unwrap_or(js::Node::Void);
+            }
+            // ...and of a call handing one back (B578: a call's result is a
+            // scalar by its return type now, which a view-returning callee's
+            // collapsed `&i32` reads as too).
+            Some(Expr::Call(..)) if self.call_returns_a_view(operand) => {
+                return self.walk_entity(operand, block).unwrap_or(js::Node::Void);
             }
             _ => (
                 js::Node::Array(vec![

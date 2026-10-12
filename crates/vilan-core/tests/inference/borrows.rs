@@ -13679,3 +13679,86 @@ fn b577_a_const_evaluation_reads_the_payload_out() {
         "second!\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B578: a view of an rvalue that stores no type of its own.
+// ---------------------------------------------------------------------------
+
+/// B578: `&xs.len()` handed to `fun shown<T: Display>(value: &T)` threw
+/// `TypeError: Cannot read properties of undefined` on JS — the callee, at a
+/// scalar `T`, reads `value[0][value[1]]`, and the call site passed the bare
+/// number, because a call's result records no type and the "is it a scalar"
+/// question answered no. The same at a concrete `&usize`, a generic call's
+/// `T`, an unannotated function, a closure, a generic method, a `let` holding
+/// the view, and the value `if`/`match`/block; a view-returning call is
+/// re-borrowed as the view it already is, and an aggregate stays its own
+/// reference.
+#[test]
+fn b578_a_view_of_a_call_result_is_a_pair_where_the_pointee_is_a_scalar() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::io::print;
+
+        fun shown(value: &usize): str {
+            i"<{*value}>"
+        }
+
+        fun peek<T: Display>(value: &T): str {
+            i"[{value}]"
+        }
+
+        fun seven(): i32 {
+            7
+        }
+
+        fun identity<T>(value: T): T {
+            value
+        }
+
+        fun made() {
+            40 + 2
+        }
+
+        fun total(values: &List<i32>): i32 {
+            mut sum = 0;
+            for value in values {
+                sum += value;
+            }
+            sum
+        }
+
+        struct Holder {
+            count: i32,
+        }
+
+        impl Holder {
+            fun slot(&self): &i32 {
+                &self.count
+            }
+        }
+
+        fun main() {
+            let xs = [1, 2];
+            print(shown(&xs.len()));
+            print(peek(&xs.len()));
+            print(peek(&seven()));
+            print(peek(&identity(5)));
+            print(peek(&identity("five")));
+            print(peek(&made()));
+            let twice = |value: i32| value * 2;
+            print(peek(&twice(4)));
+            let held = &seven();
+            print(peek(held));
+            print(*held + 1);
+            let holder = Holder { count = 9 };
+            print(peek(&holder.slot()));
+            print(peek(&(if xs.len() > 1 { 1 } else { 2 })));
+            print(peek(&match holder.count { 9 => "nine", _ => "other" }));
+            print(peek(&{ let a = 3; a + 1 }));
+            print(total(&xs.map(|value| value + 1)));
+        }
+        "#,
+        "<2>\n[2]\n[7]\n[5]\n[five]\n[42]\n[8]\n[7]\n8\n[9]\n[1]\n[nine]\n[4]\n5\n",
+    );
+}
