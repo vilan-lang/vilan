@@ -14539,22 +14539,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     ));
                 }
             };
-            if target_parameters.len() != slot.forwarded.len() + 1 {
+            // B606: the slot's arguments in the IMPLEMENTATION's order. A
+            // written parameter forwards the declaration's at its position;
+            // a hidden context parameter (the context pass's, J6) forwards
+            // the declaration's hidden parameter that threads the SAME
+            // context. The two lists differ: the pass threads a hidden
+            // argument at a trait call when some impl of the member reads the
+            // context, so an impl that reads none (`RemoteStoreSome`'s
+            // `attach_observer`) takes fewer, and one the declaration's union
+            // missed (the `Source` blanket's `start`, reading `turn_scope` and
+            // `ambient_nursery` where `Flow::start` threads nothing) takes
+            // more. A missing context of the SAFE flavour is `None` — the
+            // `undefined` the JS table passes, which that flavour reads as
+            // "no ambient value"; a missing STRICT one has no value to stand
+            // in and is refused.
+            let forwarded_here = self.object_slot_arguments(slot, &target_parameters);
+            let Some(forwarded_here) = forwarded_here else {
                 self.object_impls
                     .remove(&(object.name.clone(), rendered_subject.clone()));
                 return Err(unsupported(
                     &format!(
                         "`{}` through a `dyn` object on `{rendered_subject}` (the implementation \
-                         takes {} parameters where the declaration takes {})",
+                         takes {} parameters where the declaration takes {}, and the difference \
+                         is not a context the declaration threads or an optional one)",
                         slot.member,
                         target_parameters.len(),
                         slot.forwarded.len() + 1
                     ),
                     span,
                 ));
-            }
+            };
             let mut forwarded = vec![receiver];
-            forwarded.extend(slot.forwarded.iter().cloned());
+            forwarded.extend(forwarded_here);
             let _ = writeln!(out, "    {} {{", slot.signature);
             let _ = writeln!(out, "        {function_name}({})", forwarded.join(", "));
             let _ = writeln!(out, "    }}");
@@ -14571,6 +14587,68 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.next_type_slot += 1;
         self.types.insert(slot, out);
         Ok(object.name)
+    }
+
+    /// B606: the arguments one object slot hands its implementation after the
+    /// receiver, matched parameter by parameter — see
+    /// [`Self::ensure_object_impl`]. `None` when the implementation's written
+    /// parameters do not line up with the declaration's, or it reads a
+    /// STRICT context the declaration does not thread.
+    fn object_slot_arguments(
+        &self,
+        slot: &ObjectSlot,
+        target_parameters: &[Id],
+    ) -> Option<Vec<String>> {
+        let hidden = |parameter: &Id| {
+            self.program
+                .context_hidden_parameters
+                .get(parameter)
+                .copied()
+        };
+        let declared: Vec<Id> = self
+            .program
+            .functions
+            .get(&slot.declaration)?
+            .parameters
+            .iter()
+            .skip(1)
+            .copied()
+            .collect();
+        if declared.len() != slot.forwarded.len() {
+            return None;
+        }
+        let written: Vec<&String> = declared
+            .iter()
+            .zip(&slot.forwarded)
+            .filter(|(parameter, _)| hidden(parameter).is_none())
+            .map(|(_, name)| name)
+            .collect();
+        let mut written = written.into_iter();
+        let mut arguments = Vec::new();
+        for parameter in target_parameters.iter().skip(1) {
+            match hidden(parameter) {
+                None => arguments.push(written.next()?.clone()),
+                Some(context) => {
+                    let threaded = declared
+                        .iter()
+                        .zip(&slot.forwarded)
+                        .find(|(declared, _)| hidden(declared) == Some(context))
+                        .map(|(_, name)| name.clone());
+                    match threaded {
+                        Some(name) => arguments.push(name),
+                        None if self
+                            .program
+                            .context_optional_hidden_parameters
+                            .contains(parameter) =>
+                        {
+                            arguments.push("None".to_string());
+                        }
+                        None => return None,
+                    }
+                }
+            }
+        }
+        written.next().is_none().then_some(arguments)
     }
 
     /// A call through an object's table: `ObjectX::member(o.object(), ..)`.

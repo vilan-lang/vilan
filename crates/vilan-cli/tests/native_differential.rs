@@ -13201,6 +13201,52 @@ fn b605_a_generic_function_over_a_dyn_pipe_builds_on_both_backends() {
     );
 }
 
+/// B606: a mirrored store's handle as a `dyn Source` — `let motd: dyn
+/// Source<Option<str>> = g.motd()` — was refused natively "`attach_observer`
+/// through a `dyn` object on `RemoteStoreSome_…` (the implementation takes 3
+/// parameters where the declaration takes 5)". The object table forwarded the
+/// declaration's parameters positionally; it now forwards each hidden context
+/// parameter by the context it threads — dropping the two `attach_observer`'s
+/// declaration threads and `RemoteStoreSome`'s impl reads none of, and handing
+/// `None` (the JS table's `undefined`) for the two safe contexts the `Source`
+/// blanket's `start` reads where `Flow::start` threads none.
+#[test]
+fn b606_a_mirrored_stores_handle_as_a_dyn_source_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b606_remote_store_as_dyn_source.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/remote_store_as_dyn_source.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a mirrored store's handle as a `dyn Source` must answer the same natively"
+    );
+}
+
+/// B605 + B606: A153 S2's `states()` — the remote handle telling Pending,
+/// Ready, Absent and Failed through `TransientSource::states()`, whose pipes
+/// are a generic `combine(..).derive(..)` over the handle as a `dyn Source` —
+/// had been held to the JS pin (`reactive_channels`' MIRROR_STATES); it now
+/// prints the same bytes natively.
+#[test]
+fn b606_a_mirrored_stores_states_tell_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b606_store_mirror_states.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/store_mirror_states.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a mirrored store's `states()` must tell the same natively"
+    );
+}
+
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
 /// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
 /// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its

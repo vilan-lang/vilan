@@ -1,0 +1,51 @@
+// B606: a mirrored store's handle as a `dyn Source` builds natively - its object
+// table forwards each member's hidden context parameters by the context they
+// thread (`attach_observer`'s impl reads none of the two its declaration threads;
+// the `Source` blanket's `start` reads two the declaration does not, both safe
+// contexts, handed `None` as the JS table hands `undefined`).
+import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	DuplexTransport,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Wire };
+
+[derive(Storable, Wire)]
+struct Global {
+	messages: HashMap<u53, str>,
+	motd: str,
+}
+
+fun main() {
+	let codec = json_codec();
+	let global = Store::new(Global { messages = HashMap::new(), motd = "welcome" });
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let page = Owner::new();
+	run_with_owner(page, || {
+		let motd: dyn Source<Option<str>> = g.motd();
+		motd.effect(|text| print(i"motd {text.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	global.motd().set("bye");
+	sleep_for(Duration::millis(0));
+	print("done");
+}
