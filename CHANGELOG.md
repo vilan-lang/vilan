@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**N168 (docs): the editor and the test comments say what the std rule is now.** The VS Code README no longer promises that a server opened inside a checkout uses that working tree; it says the server never looks, and that `vilan.stdPath` (or `VILAN_STD`) set to `<checkout>/vilan/std` is the way to work against a tree you are editing. The scratch-root exemptions in `harness_scratch.rs`, `install.rs` and `module_paths.rs` keep their files on the system temp dir with reasons that no longer name the retired ancestor walk.
+
 <!-- family: diagnostics -->
 **B597 + E296: a tuple-, array-, closure- or view-typed `[rpc]` parameter or `[derive(Wire)]` field is refused naming its type, and an `[rpc]` one only once.** The refusals quoted the annotation through `render_type`, which answers `_` for every form it does not know: "parameter `message` of `[rpc]` method `echo` is `_`, which is not Wire". They now quote through a separate `render_type_quoted` (the codegen renderer is untouched - the derive generators emit what it returns): `(i32, i32)`, `(x: i32, y: i32)`, `[u8; 4]`, `|i32| i32`, `&mut i32`, nested inside generics as well (`List<[u8; 2]>`, `Option<(i32, i32)>`). And an `[rpc]` signature type with no `describe` to call (a tuple, an array, a closure, a view) was refused twice for one cause - the generated client and handler then failed at the `[service]` attribute with "[u8; 4] has no method 'describe'" - so that attribute's generated-code diagnostics stand down, as B490 does for a bare-trait return. A `[derive(Wire)]` field still draws the generated-code restatement beside the boundary refusal (filed). Pinned: one error naming the type for an array, a tuple, a labelled tuple, a tuple return and a closure parameter; the derive quotes tuple, array and nested forms.
 

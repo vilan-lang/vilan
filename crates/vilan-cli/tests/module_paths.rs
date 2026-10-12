@@ -12,12 +12,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// A fresh temp directory for one test's project tree.
 ///
 /// `std::env::temp_dir()` and NOT the support scratch root, for the reason
-/// these pins exist (N102): `CARGO_TARGET_TMPDIR` is `<worktree>/target/tmp`,
-/// INSIDE a vilan checkout, and these tests turn on which checkout the
-/// ancestor walk for `vilan/std` reaches. Under a scratch root it reaches the
-/// worktree's own and the stand-in checkout staged here decides nothing.
-/// Recorded in `harness_scratch.rs`'s `PATHS_THE_BINARY_OWNS`: not waiting to
-/// be ported, unable to be.
+/// these pins were written (N102): `CARGO_TARGET_TMPDIR` is `<worktree>/target/tmp`,
+/// INSIDE a vilan checkout, and they turned on which checkout the ancestor walk
+/// for `vilan/std` reached. The walk is gone (N168) - the stand-in checkouts staged
+/// here now prove a checkout above a program is NOT consulted - so the scratch
+/// root would serve; the files stay on the system temp dir until the exemption in
+/// `harness_scratch.rs` is retired.
 fn temp_root(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);

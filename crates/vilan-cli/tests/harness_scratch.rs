@@ -83,16 +83,17 @@ const PATHS_THE_BINARY_OWNS: &[(&str, &str)] = &[
     ),
     (
         "vilan-cli/tests/install.rs",
-        "a machine with NO checkout — under `<worktree>/target/tmp` the \
-         ancestor walk finds the worktree's own `vilan/std`, the embedded \
-         toolchain is never materialized, and the content-keyed cache this \
-         suite asserts about is never written (N102)",
+        "a machine with NO checkout: a copied binary and a fresh home outside \
+         every tree. (N102 first wrote this for the ancestor walk, which found the \
+         worktree's own `vilan/std` under `<worktree>/target/tmp`; the walk is gone \
+         since N168, and the premise - no checkout at or above - still reads \
+         best from the system temp dir)",
     ),
     (
         "vilan-cli/tests/module_paths.rs",
-        "the same reason, from the other side: these pins turn on WHICH \
-         checkout the ancestor walk reaches, and a scratch root inside one \
-         makes the stand-in checkout they stage decide nothing (N102)",
+        "stand-in checkouts staged beside the programs, which N168's pins show \
+         are NOT consulted; kept on the system temp dir with install.rs's machine \
+         rather than inside the worktree whose std they are meant to differ from",
     ),
     (
         "vilan-cli/tests/fs.rs",
