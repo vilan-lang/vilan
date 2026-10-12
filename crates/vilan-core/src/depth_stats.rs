@@ -208,3 +208,56 @@ pub(crate) fn report() {
     }
     eprintln!("{line}");
 }
+
+thread_local! {
+    /// N169: the stack position of the innermost open `walk_expr_node`
+    /// level on this thread, or 0 outside every walk.
+    static WALK_LEVEL_SP: Cell<usize> = const { Cell::new(0) };
+    /// N169: the smallest distance seen from a walk level to its parent's.
+    static WALK_LEVEL_BYTES: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// N169: one level of the phase-1 walk notes where it sits on the stack and
+/// returns its parent's position, which [`leave_walk_level`] restores. The
+/// smallest distance from a level to its parent is what one level of nesting
+/// costs at the least — `walk_expr_node`'s frame plus `walk_expr_node_inner`'s,
+/// the shared frame every level pays whichever arm runs (an arm that walks
+/// through a method of its own adds that method's frame, so its levels sit
+/// farther apart). `tests/deep_nesting.rs`'s canary is that figure times its
+/// depth plus the analysis's own baseline. Called only when
+/// `VILAN_COUNTERS` is set; [`report_walk_frame_once`] prints it.
+#[inline(never)]
+pub(crate) fn enter_walk_level() -> usize {
+    let sp = approximate_sp();
+    let parent = WALK_LEVEL_SP.with(|cell| cell.replace(sp));
+    // A first level (no parent) and a macro world's walk opened inside an
+    // outer one (its parent is the outer walk, a whole analysis away) are not
+    // one level of nesting; the minimum keeps the first out and the second
+    // never wins it.
+    if parent > sp {
+        WALK_LEVEL_BYTES.with(|bytes| bytes.set(bytes.get().min(parent - sp)));
+    }
+    parent
+}
+
+/// N169: closes the level [`enter_walk_level`] opened.
+pub(crate) fn leave_walk_level(parent: usize) {
+    WALK_LEVEL_SP.with(|cell| cell.set(parent));
+}
+
+/// N169: the `[vilan walk-frame]` line, ONCE per process under
+/// `VILAN_COUNTERS`: the walk's per-level stack frame in bytes, as
+/// [`enter_walk_level`] measured it on this build. The figure is a property of
+/// the build (debug frames run ~10× an optimized build's), not of the program,
+/// so one line says it; it waits for an analysis that nested at least once.
+pub(crate) fn report_walk_frame_once() {
+    static PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::counters::counters_enabled() || PRINTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let bytes = WALK_LEVEL_BYTES.with(Cell::get);
+    if bytes == usize::MAX || PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("[vilan walk-frame] per-level={bytes}B");
+}

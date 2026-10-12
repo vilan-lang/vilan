@@ -1871,6 +1871,176 @@ fn a_live_entrys_world_is_never_the_budgets_victim() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// THE PIN (E294): the budget is SIZED by the session's entry worlds — a
+/// declared entry's world is added to the budget rather than spent from it, so
+/// the flat budget still binds everything else, and none of those worlds is its
+/// victim. Withdrawn, they are ordinary again.
+///
+/// The language server's dead-code clock analyzes every declared entry of the
+/// package at every typing pause. Under M67's flat budget those worlds evicted
+/// each other, and kolt's server entry was rebuilt cold on 4 of 6 pauses. Four
+/// entries here, each importing a different sibling so each mints its own key
+/// (M21) and every world the same size by construction, as
+/// [`a_live_entrys_world_is_never_the_budgets_victim`]'s arithmetic rests on:
+/// entries 0 and 1 are the session's, 2 and 3 are not.
+#[test]
+fn the_session_entries_worlds_are_sized_into_the_budget() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    const ENTRIES: usize = 4;
+    let root = scratch::root().join(format!("vilan_e294_session_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch dir");
+    let mut entry_paths = Vec::new();
+    let mut entry_sources: Vec<&'static str> = Vec::new();
+    for index in 0..ENTRIES {
+        std::fs::write(
+            root.join(format!("session_mod_{index}.vl")),
+            format!(
+                "fun session_value_{index}(): i32 {{\n\t{:04}\n}}\n",
+                3000 + index
+            ),
+        )
+        .expect("write module");
+        let entry_path = root.join(format!("session_entry_{index}.vl"));
+        let source = format!(
+            "import pkg::session_mod_{index}::session_value_{index};\n\nfun main() {{\n\tlet _v = session_value_{index}();\n}}\n"
+        );
+        std::fs::write(&entry_path, &source).expect("write entry");
+        entry_sources.push(Box::leak(source.into_boxed_str()));
+        entry_paths.push(entry_path);
+    }
+
+    let analyze = |index: usize| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_paths[index].clone();
+        let source = entry_sources[index];
+        let diagnostics = on_one_thread(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            drop(program);
+            diagnostics
+        });
+        assert_eq!(diagnostics, "[]", "entry {index} must analyze clean");
+    };
+    // The first three entries, in order, under the default budget: three
+    // worlds, entry 2's the most recently stored.
+    let fill = || {
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+        vilan_core::analyzer::base_cache_clear();
+        for index in 0..3 {
+            analyze(index);
+        }
+        assert_eq!(
+            vilan_core::analyzer::base_cache_retained(),
+            3,
+            "three distinct sibling sets retain three worlds under the default \
+             budget — the vacuity guard this pin's arithmetic rests on",
+        );
+    };
+    let hit = |index: usize| {
+        let (hits_before, _) = stats();
+        analyze(index);
+        stats().0 > hits_before
+    };
+
+    // THE CONTROL, first: nothing declared and a budget of one world keeps
+    // the most recent world only — entries 0 and 1, the ones the session
+    // would come back to, are gone.
+    vilan_core::analyzer::set_base_cache_live_entries(&[]);
+    vilan_core::analyzer::set_base_cache_session_entries(&[]);
+    fill();
+    let one_world = vilan_core::analyzer::base_cache_retained_bytes() / 3;
+    assert!(one_world > 0, "a stored world must weigh something");
+    vilan_core::analyzer::set_base_cache_budget(one_world);
+    assert_eq!(vilan_core::analyzer::base_cache_retained(), 1);
+    assert!(
+        !hit(0),
+        "without the sizing the flat budget evicts the session's worlds — \
+         M67's policy, and the control for the one below",
+    );
+
+    // THE PIN. Entries 0 and 1 declared the session's; their keys are learned
+    // at their next admission, and entry 2 is analyzed last, so 0 and 1 are
+    // the least recently used worlds when the budget is applied.
+    fill();
+    vilan_core::analyzer::set_base_cache_session_entries(&entry_paths[..2]);
+    for index in 0..3 {
+        analyze(index);
+    }
+    assert_eq!(
+        vilan_core::analyzer::base_cache_session_entries(),
+        (2, 2),
+        "two entries declared the session's, both keys learned at admission",
+    );
+    vilan_core::analyzer::set_base_cache_budget(one_world);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        3,
+        "the session's two worlds are added to a one-world budget, which still \
+         holds the third",
+    );
+    assert_eq!(
+        vilan_core::analyzer::base_cache_budget_in_force(),
+        3 * one_world,
+        "the bound in force is the flat budget plus the session's two worlds — \
+         the figure the server's status page sets beside the weight",
+    );
+    assert!(
+        hit(0),
+        "the least recently used world, and a session entry's: kept"
+    );
+    assert!(hit(1), "the other session entry's world: kept");
+
+    // The flat budget still binds what is NOT the session's: a fourth world
+    // pushes out the third (the only one the budget may take), and the
+    // session's two stay.
+    analyze(3);
+    assert_eq!(vilan_core::analyzer::base_cache_retained(), 3);
+    assert!(
+        vilan_core::analyzer::base_cache_retained_bytes() <= 3 * one_world,
+        "retained {} B against the bound the sizing states: the budget ({one_world} B) \
+         plus the session's two worlds",
+        vilan_core::analyzer::base_cache_retained_bytes(),
+    );
+    assert!(
+        hit(0) && hit(1),
+        "the session's worlds survive the fourth's store"
+    );
+    assert!(
+        !hit(2),
+        "the world outside the session was the flat budget's victim",
+    );
+
+    // Withdrawn — the package's last document closed — the same budget takes
+    // the session's worlds like any other.
+    vilan_core::analyzer::set_base_cache_session_entries(&[]);
+    vilan_core::analyzer::set_base_cache_budget(one_world);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        1,
+        "with the declaration withdrawn the budget evicts what it sized in a \
+         moment ago",
+    );
+
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ---------------------------------------------------------------------------
 // M19 T1 — module reuse over a cached world
 // (`per-module-analysis-reuse.md` §4.1). The base cache decides WHICH world an

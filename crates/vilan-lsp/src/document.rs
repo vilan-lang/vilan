@@ -29241,6 +29241,11 @@ mod session_growth {
     /// ```
     ///
     /// `0` is the unbounded run every other one is read against.
+    ///
+    /// E294: the server also declares the package's ENTRIES (kolt's `client.vl`
+    /// and `server.vl`), whose worlds the budget is sized by, so the walk
+    /// declares them too — the policy the server runs. `VILAN_E294_SESSION=0`
+    /// leaves them undeclared: M67's flat budget, for the comparison.
     #[test]
     #[ignore = "M67's base-cache budget sweep: needs VILAN_PERF_KOLT, run deliberately"]
     fn base_cache_budget_walk_across_a_sibling_checkout() {
@@ -29264,7 +29269,19 @@ mod session_growth {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(RETAINED_PROGRAMS);
+        let session: Vec<PathBuf> = if std::env::var("VILAN_E294_SESSION").as_deref() == Ok("0") {
+            Vec::new()
+        } else {
+            crate::dead_items::entry_paths(&root)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect()
+        };
+        println!("M67 session entries declared: {}", session.len());
+        vilan_core::analyzer::set_base_cache_session_entries(&session);
         on_big_stack(move || base_cache_budget_walk("kolt_src", &entries, budget_mib, retained));
+        vilan_core::analyzer::set_base_cache_session_entries(&[]);
     }
 
     /// What a base-cache MISS costs over a hit, paired — the other half of the
