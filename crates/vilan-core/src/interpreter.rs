@@ -2457,6 +2457,33 @@ impl<'a> Interpreter<'a> {
                     Err(index_out_of_bounds(length, index))
                 }
             }
+            // B577: the option a call handing back a shared scalar view is
+            // consumed as, matching the emitted helper: the `variant`'s
+            // payload pair `[base, key]` is replaced by `base[key]`, in a new
+            // array; any other variant passes through.
+            "__payload_view_read" => {
+                let value = take(0);
+                let variant = take(1);
+                let pair = match &value {
+                    Value::Array(items) => {
+                        let items = items.borrow();
+                        match (items.first(), items.get(1)) {
+                            (Some(tag), Some(pair)) if strict_equals(tag, &variant) => {
+                                Some(pair.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(pair) = pair else {
+                    return Ok(value);
+                };
+                let base = self.read_index(&pair, &Value::Number(0.0))?;
+                let key = self.read_index(&pair, &Value::Number(1.0))?;
+                let read = self.read_index(&base, &key)?;
+                Ok(Value::Array(Rc::new(RefCell::new(vec![variant, read]))))
+            }
             // The checked slice, matching the emitted `__substring` helper: a
             // range outside `0 <= start <= end <= len` is a panic (`Thrown`),
             // so a const-time violation fails the build with the same message a

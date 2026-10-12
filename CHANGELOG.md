@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: miscompile -->
+**B577: an `Option<&str>` whose payload views a LIST ELEMENT or a scalar field, consumed as a value, answers the element on the JS backend — `shelf.at(1).unwrap_or("none")` over `fun at(&self, index: usize): Option<&str> { .. Some(&self.items[index]) .. }` printed `[ [ 'first', 'second' ], 1 ]` (the view's `(base, key)` pair) where native printed `second`, and `shelf.count(0).unwrap_or(&0) + 1` concatenated `3,4,01`.** A view of a scalar is a `(base, key)` pair on JS, and the one consumer that reads a wrapped one through it is the capture of a `match` over the call itself (`Some(let v) => *v`). Every other position consumes the option as a value of the POINTEE's type — a generic over it (`unwrap_or`, `map`, `is_some`), a method forwarding the call, a `let` holding it, an `is` capture, a `!` lift, a list of options, a parameter typed `Option<&str>` — and was handed the pair as its `T`. The emitter now reads the payload out where the option is consumed (`__payload_view_read`, which the const interpreter runs too), as F99's `.cloned()` does natively; a `match` keeps the pair for a capturing leg and tests a literal leg beside it (`Some("first") =>`) against the value read out. An `Option<&mut i32>` read as a value (`.map(|v| v + 1)`, a parameter printing its capture) took the same fix: no position but the capturing `match` can write through it. Pins: `b577_an_option_viewing_a_scalar_reads_its_payload_where_consumed`, `b577_a_match_over_the_call_captures_the_view_and_tests_the_value`, `b577_a_const_evaluation_reads_the_payload_out`, and `native_differential`'s `b577_an_option_viewing_a_list_element_is_identical_on_both_backends` (`native/payload_view_element_reads.vl`). The JS corpus is byte-identical. Tracker B577.
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

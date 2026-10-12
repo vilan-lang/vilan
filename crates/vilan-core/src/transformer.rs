@@ -2082,6 +2082,15 @@ fn helper_source(name: &str) -> &'static str {
              \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
+        // B577: an enum value whose `variant` carries a scalar view's
+        // `(base, key)` pair, with the pair read out — the option a call
+        // handing back `Option<&str>` is where it is consumed as a value.
+        "__payload_view_read" => {
+            "function __payload_view_read(value, variant) {\n\
+             \tif (value[0] === variant) return [ variant, value[1][0][value[1][1]] ];\n\
+             \treturn value;\n\
+             }"
+        }
         // `str.substring(start, end)` — the checked slice. The native JS method
         // clamps a negative to 0 and SWAPS an inverted pair, so `s.substring(k,
         // -1)` quietly returns `s[0..k]`, the complement of the request; and it
@@ -2750,6 +2759,17 @@ struct Transformer<'src> {
     // whether the guard READS a capture whose copy has to be declared ahead of
     // it (B59) — the guard's reference is to the copy, not the subject's slot.
     is_binding_reads: Option<HashSet<Id>>,
+    // B577: the `match` subject being walked, while it is — the one position
+    // where a call handing back a scalar view in its payload keeps the
+    // `(base, key)` pair, because the leg's capture binds the view
+    // (`wrapped_view_captures`). Saved and restored around each subject, so a
+    // `match` nested in the subject's own arguments answers for itself.
+    payload_view_subject: Option<Id>,
+    // B577: per callee, the variants whose single payload it hands back as a
+    // scalar view's pair ([`Self::payload_view_variants`]) —
+    // decided by the analyzer's verdict on each payload, which an instance
+    // never re-decides, so one answer serves every call.
+    payload_view_variants_memo: HashMap<Id, Vec<usize>>,
     // Runtime helper functions (`__scan`, `__parse_i32`, `__random_int`) an
     // intrinsic call needs; emitted as a prelude only when used.
     used_helpers: BTreeSet<&'static str>,
@@ -3221,6 +3241,8 @@ impl<'src> Transformer<'src> {
             const_capture_values: HashMap::default(),
             emitting_snapshots: HashSet::default(),
             is_binding_reads: None,
+            payload_view_subject: None,
+            payload_view_variants_memo: HashMap::default(),
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
@@ -4583,6 +4605,159 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// B577: `node`, the emission of `id`, with its payload READ OUT when `id`
+    /// is a call handing back a scalar view inside an enum variant (`fun
+    /// at(&self, i: usize): Option<&str> { .. Some(&self.items[i]) .. }`) and
+    /// stands anywhere but as the subject of a `match` that captures it.
+    ///
+    /// The payload is the view's `(base, key)` pair, and the one consumer that
+    /// knows it is the leg capture of a `match` over the call itself
+    /// (`wrapped_view_captures`, whose `*v` reads through the pair and whose
+    /// `v = ..` writes through it). Everywhere else the option is a value of
+    /// the POINTEE's type — a generic over it (`unwrap_or`, `map`, `is_some`)
+    /// is monomorphised at `Option<str>`, a parameter typed `Option<&str>`
+    /// matches its own captures as copies, an `is` capture is a copy — so the
+    /// pair was handed back as the `T` (`shelf.at(1).unwrap_or("none")`
+    /// printed `[ [ 'first', 'second' ], 1 ]`). None of those positions can
+    /// write through the view (the analyzer refuses a write to such a copy), so
+    /// reading it where the option is consumed is rule 1's copy taken at the
+    /// only moment the view is read — the native backend's F99 `.cloned()`.
+    fn read_out_a_payload_view(&mut self, id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        if self.payload_view_subject == Some(id) {
+            return node;
+        }
+        let variants = self.payload_view_variants(id);
+        if variants.is_empty() || node.is_divergent() {
+            return node;
+        }
+        self.payload_view_read(node, &variants)
+    }
+
+    /// `__payload_view_read(value, variant)` per variant carrying the pair.
+    fn payload_view_read(&mut self, value: js::Node<'src>, variants: &[usize]) -> js::Node<'src> {
+        self.used_helpers.insert("__payload_view_read");
+        variants.iter().fold(value, |value, variant| {
+            js::Node::Call(
+                Box::new(js::Node::Local("__payload_view_read".to_string())),
+                vec![value, js::Node::Number(variant.to_string(), None)],
+            )
+        })
+    }
+
+    /// Whether a `match` leg over a subject that KEPT its payload view (the
+    /// `variants` carrying the pair) reads the payload as a VALUE: a literal or
+    /// any other refutable sub-pattern of a carrying variant, or a binding of
+    /// the whole option. A tag test (`None`, `Some(_)`) reads no payload, and
+    /// the view-capturing leg wants the pair.
+    fn pattern_reads_a_kept_payload(&self, pattern: &ExprPattern, variants: &[usize]) -> bool {
+        if variants.is_empty() || self.captures_a_wrapped_scalar_view(pattern) {
+            return false;
+        }
+        match pattern {
+            ExprPattern::Wildcard => false,
+            ExprPattern::Variant(_, variant, payload) => {
+                variants.contains(variant)
+                    && payload
+                        .iter()
+                        .any(|sub_pattern| !matches!(sub_pattern, ExprPattern::Wildcard))
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether a `match` leg's pattern is `V(let v)` binding a wrapped SCALAR
+    /// view — the capture `wrapped_view_captures` makes a pair holder.
+    fn captures_a_wrapped_scalar_view(&self, pattern: &ExprPattern) -> bool {
+        matches!(
+            pattern,
+            ExprPattern::Variant(_, _, payload)
+                if matches!(
+                    payload.as_slice(),
+                    [ExprPattern::Binding(capture)]
+                        if self.program.primitive_views.contains(capture)
+                )
+        )
+    }
+
+    /// B577: the variants whose single payload the callee of the call `id`
+    /// hands back as a scalar view's `(base, key)` pair — a `borrows`
+    /// function (not itself returning a bare view) one of whose TAIL leaves is
+    /// a variant built over `&place` of a scalar place — the analyzer's
+    /// `function_returns_wrapped_view` (a `ret` of one is refused as an
+    /// escape). Empty for every other expression.
+    ///
+    /// The payload's representation is the analyzer's verdict
+    /// (`fixed_view_refs`: a wrapped view's payload is never re-decided per
+    /// instance), so the answer is the callee's alone and memoized by it.
+    fn payload_view_variants(&mut self, id: Id) -> Vec<usize> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return Vec::new();
+        };
+        let Some(Expr::Local(target)) = self
+            .program
+            .function_calls
+            .get(call_id)
+            .and_then(|function_call| self.program.entity_map.get(&function_call.subject_id))
+        else {
+            return Vec::new();
+        };
+        let target = *target;
+        let Some(function) = self.program.functions.get(&target) else {
+            return Vec::new();
+        };
+        if !function.has_body
+            || function.borrows.is_empty()
+            || function.returns_view
+            || function.returns_mut_view
+        {
+            return Vec::new();
+        }
+        if let Some(variants) = self.payload_view_variants_memo.get(&target) {
+            return variants.clone();
+        }
+        let mut leaves = Vec::new();
+        self.collect_value_tail_leaves(function.body.1, &mut leaves);
+        let mut variants = Vec::new();
+        for leaf in leaves {
+            if let Some(variant) = self.scalar_view_variant(leaf)
+                && !variants.contains(&variant)
+            {
+                variants.push(variant);
+            }
+        }
+        self.payload_view_variants_memo
+            .insert(target, variants.clone());
+        variants
+    }
+
+    /// The variant index of `leaf` when it is a variant construction over a
+    /// single `&place`/`&mut place` that emits a scalar `(base, key)` pair.
+    fn scalar_view_variant(&self, leaf: Id) -> Option<usize> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&leaf) else {
+            return None;
+        };
+        let function_call = self.program.function_calls.get(call_id)?;
+        let Some(Expr::Local(constructor)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let Some(Expr::EnumVariant(_, variant)) = self.program.entity_map.get(constructor) else {
+            return None;
+        };
+        let [argument] = function_call.argument_ids.as_slice() else {
+            return None;
+        };
+        match self.program.entity_map.get(argument) {
+            Some(Expr::Reference(operand, _))
+                if self.emits_scalar_view_ref(*argument, *operand)
+                    && !self.program.return_view_reads.contains(argument) =>
+            {
+                Some(*variant)
+            }
+            _ => None,
+        }
+    }
+
     /// The tail leaves a value expression evaluates to: an `if`, a `match` and
     /// a block contribute each branch's tail, anything else is itself — the
     /// analyzer's `collect_tail_leaves`, asked at emission.
@@ -5524,6 +5699,7 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
+        let node = self.read_out_a_payload_view(id, node);
         // C11 (`temporary-drop.md`): a resource value that is neither bound nor
         // moved is owned by its STATEMENT. It has no name of its own, so it is
         // given one here — a minted `const` at the statement's position — and
@@ -7660,9 +7836,27 @@ impl<'src> Transformer<'src> {
                 return None;
             }
             Expr::Match(subject_id, legs) => {
-                let t_subject = self
-                    .walk_entity(*subject_id, block)
-                    .unwrap_or(js::Node::Void);
+                // B577: a leg capturing a wrapped scalar view binds the pair,
+                // so the subject keeps it; with no such capture (`Some("a")
+                // => ..`, `_ => ..`) the legs test the VALUE and it is read out.
+                let keeps_the_view = legs
+                    .iter()
+                    .any(|leg| self.captures_a_wrapped_scalar_view(&leg.pattern));
+                let outer_subject = std::mem::replace(
+                    &mut self.payload_view_subject,
+                    keeps_the_view.then_some(*subject_id),
+                );
+                let t_subject = self.walk_entity(*subject_id, block);
+                self.payload_view_subject = outer_subject;
+                let t_subject = t_subject.unwrap_or(js::Node::Void);
+                // ...and a leg that does not capture it — a literal payload
+                // (`Some("a") =>` beside a `Some(let v) =>`) — tests the value
+                // read out of the kept subject.
+                let kept_view_variants = if keeps_the_view {
+                    self.payload_view_variants(*subject_id)
+                } else {
+                    Vec::new()
+                };
                 // Evaluate the subject once into a temporary; every variant
                 // test and capture reads from it.
                 let subject_name = self.ng.next_name();
@@ -7682,7 +7876,10 @@ impl<'src> Transformer<'src> {
                     let mut body = Vec::new();
                     let mut prelude = Vec::new();
                     let mut guard_condition = None;
-                    let subject = js::Node::Local(subject_name.clone());
+                    let mut subject = js::Node::Local(subject_name.clone());
+                    if self.pattern_reads_a_kept_payload(&leg.pattern, &kept_view_variants) {
+                        subject = self.payload_view_read(subject, &kept_view_variants);
+                    }
                     let mut conditions = Vec::new();
                     match leg.guard {
                         // No guard: captures are declared as `const`s in the body.

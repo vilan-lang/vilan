@@ -13537,3 +13537,145 @@ fn e290_a_tuple_view_subjects_refusals_name_the_slot_not_a_payload() {
          captures are views into the payload",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B577: a call handing back a scalar view inside an enum payload, consumed as
+// a value.
+// ---------------------------------------------------------------------------
+
+/// The shelf the B577 pins read: `Option<&str>` over a list element and a
+/// field, `Option<&mut i32>` over a field.
+const B577_SHELF: &str = r#"
+    import std::io::print;
+    import std::option::Option::{ self, None, Some };
+
+    struct Shelf {
+        items: List<str>,
+        count: i32,
+    }
+
+    impl Shelf {
+        fun at(&self, index: usize): Option<&str> {
+            if index < self.items.len() {
+                Some(&self.items[index])
+            } else {
+                None
+            }
+        }
+
+        fun first(&self): Option<&str> {
+            self.at(0)
+        }
+
+        fun count_mut(&mut self): Option<&mut i32> {
+            Some(&mut self.count)
+        }
+    }
+"#;
+
+/// B577: the payload of `Some(&self.items[index])` is the element's `(base,
+/// key)` pair on JS, and every consumer but a capturing `match` over the call
+/// read it as the value — `unwrap_or` printed `[ [ 'first', 'second' ], 1 ]`.
+/// Each position: a generic over the option (`unwrap_or`, `map`, `is_some`),
+/// a method forwarding the call, a `let` holding it, an `is` capture, a `!`
+/// lift, a list of options, and a `&mut` payload read through `map` and by a
+/// function taking the option.
+#[test]
+fn b577_an_option_viewing_a_scalar_reads_its_payload_where_consumed() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{B577_SHELF}
+            fun suffixed(shelf: &Shelf, index: usize): Option<str> {{
+                let name = shelf.at(index)!;
+                Some(name + "?")
+            }}
+
+            fun shown(found: Option<&mut i32>): str {{
+                match found {{
+                    Some(let value) => i"{{value}}",
+                    None => "none",
+                }}
+            }}
+
+            fun main() {{
+                let shelf = Shelf {{ items = ["first", "second"], count = 1 }};
+                print(shelf.at(1).unwrap_or("none"));
+                print(shelf.at(7).unwrap_or("none"));
+                print(shelf.at(1).map(|name| name + "!").unwrap_or("none"));
+                print(shelf.at(0).is_some());
+                print(shelf.first().unwrap_or("none"));
+                let held = shelf.at(1);
+                print(held.unwrap_or("none"));
+                if shelf.at(0) is Some(let name) {{
+                    print(name);
+                }}
+                print(suffixed(&shelf, 1).unwrap_or("none"));
+                for found in [shelf.at(0), shelf.at(9)] {{
+                    print(found.unwrap_or("-"));
+                }}
+                mut counter = Shelf {{ items = [], count = 1 }};
+                print(counter.count_mut().map(|value| value + 1).unwrap_or(0));
+                print(shown(counter.count_mut()));
+            }}
+            "#
+        ),
+        "second\nnone\nsecond!\ntrue\nfirst\nsecond\nfirst\nsecond?\nfirst\n-\n2\n1\n",
+    );
+}
+
+/// B577: a `match` over the call keeps the pair for the leg that CAPTURES the
+/// view (`Some(let v)`, read and written through it) — and a leg testing the
+/// payload as a value beside it (`Some("first")`), or a `match` with no
+/// capturing leg at all, tests the value read out, not the pair.
+#[test]
+fn b577_a_match_over_the_call_captures_the_view_and_tests_the_value() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{B577_SHELF}
+            fun main() {{
+                mut shelf = Shelf {{ items = ["first", "second"], count = 1 }};
+                for index in [0usize, 1, 2] {{
+                    let said = match shelf.at(index) {{
+                        Some("first") => "literal",
+                        Some(let name) => *name,
+                        None => "none",
+                    }};
+                    print(said);
+                }}
+                match shelf.at(0) {{
+                    Some("first") => print("only a literal"),
+                    _ => print("other"),
+                }}
+                match shelf.count_mut() {{
+                    Some(let count) => count += 10,
+                    None => {{}},
+                }}
+                print(shelf.count);
+            }}
+            "#
+        ),
+        "literal\nsecond\nnone\nonly a literal\n11\n",
+    );
+}
+
+/// B577: the read-out helper the JS emitter calls is one the const
+/// interpreter runs too — a `const` evaluation consuming the option as a value
+/// computes what the program would.
+#[test]
+fn b577_a_const_evaluation_reads_the_payload_out() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{B577_SHELF}
+            fun computed(): str {{
+                let shelf = Shelf {{ items = ["first", "second"], count = 1 }};
+                shelf.at(1).unwrap_or("none") + "!"
+            }}
+
+            fun main() {{
+                print(const computed());
+            }}
+            "#
+        ),
+        "second!\n",
+    );
+}
