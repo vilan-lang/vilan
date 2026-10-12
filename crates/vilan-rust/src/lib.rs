@@ -9203,7 +9203,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         };
         let name = format!("__literal{}", guards.len());
-        guards.push(format!("&*{name} == {literal}"));
+        // F134: the binder is an `Rc<str>` slot, or a REFERENCE to one where
+        // the subject carries a payload view (F21: `match shelf.at(0)` over an
+        // `Option<&str>`), and `&*` read only the first as a `&str`. `AsRef`
+        // reaches the `str` through either.
+        guards.push(format!("AsRef::<str>::as_ref(&{name}) == {literal}"));
         Ok(name)
     }
 

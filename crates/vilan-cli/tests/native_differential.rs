@@ -13336,6 +13336,27 @@ fn f91_an_is_capture_in_an_if_conditions_conjunction_reaches_the_body_on_both_ba
     );
 }
 
+/// F134: a LITERAL leg (`Some("first") =>`) of a `match` whose subject is a
+/// call handing back `Option<&str>` — a payload view, carried through the
+/// subject as a reference natively (F21) — emitted `&*__literal0 == "first"`
+/// over a `&Rc<str>` binder, which rustc refused (E0277). The literal guard
+/// now reaches the `str` through either binder. The native run is held to the
+/// answer itself: the JS backend gives it from B577 (fix-51, Order 51), and
+/// this pin becomes a `compare` once both are on one tree.
+#[test]
+fn f134_a_literal_leg_over_a_view_subject_matches_natively() {
+    let staged = stage();
+    let file = "native_probe_f134_literal_leg_over_a_view_subject.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/literal_leg_over_a_view_subject.vl"),
+    )
+    .expect("write the probe program");
+    let run = run_on(&staged, Some("rust"), file);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "lit\nsecond\nnone\nonly literal\n");
+}
+
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
 /// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
 /// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
