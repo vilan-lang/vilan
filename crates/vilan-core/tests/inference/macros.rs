@@ -1459,6 +1459,43 @@ fn g25_a_codec_derive_over_a_trait_object_member_is_refused_by_name() {
     }
 }
 
+// `[derive(Storable)]` in a program that never imports `std::reactive::store`
+// read "expanded before std's `reactive/store.vl` declared its `Storable`
+// macro: a compiler load-ordering bug (B21's class); please report how this
+// module is reached" — the B21 sentence assumes every std derive's module is
+// always loaded, and `reactive/store.vl` is loaded only by an import. It is a
+// missing import, said so with the line to write; with the import it expands.
+#[test]
+fn a_storable_derive_without_its_import_steers_to_the_import() {
+    let source = r#"
+        [derive(Storable)]
+        struct Row {
+            id: i32,
+        }
+
+        fun main() {}
+        "#;
+    assert_fails_once_with(
+        source,
+        "`[derive(Storable)]` is expanded by the `Storable` macro `std::reactive::store` \
+         declares, and nothing in this program imports that module: write `import \
+         std::reactive::store::Storable;`",
+    );
+    assert_fails_without(source, "load-ordering");
+    assert_compiles(
+        r#"
+        import std::reactive::store::Storable;
+
+        [derive(Storable)]
+        struct Row {
+            id: i32,
+        }
+
+        fun main() {}
+        "#,
+    );
+}
+
 // A user macro may now SHADOW a prelude derive for its own file — the
 // reserved-name rule died with the flat namespace.
 #[test]

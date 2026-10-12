@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**`[derive(Storable)]` in a program that never imports `std::reactive::store` says the import it owes — it read "expanded before std's `reactive/store.vl` declared its `Storable` macro: a compiler load-ordering bug (B21's class); please report how this module is reached".** The B21 sentence assumed every std derive's module loads with every program, which holds for `compare`/`default`/`debug`/`json`/`hash` and not for `reactive/store.vl`, loaded only by an import; reaching the derive without it is a missing import: "write `import std::reactive::store::Storable;`". Pin: `a_storable_derive_without_its_import_steers_to_the_import`. Tracker: fix-51's find (newitems51-fix-51.json, `B?2`).
+
+---
+
 <!-- family: fix -->
 **G25: a `const` evaluation dispatches through a trait object, and the two `dyn` positions it cannot serve are refused by name — `const let T: i32 = total()` over a body that builds a `let source: dyn Src` failed "`$a` is not defined", and `[derive(Json)]` over a struct with a `source: dyn Src` field failed "macro `Json` generated invalid Vilan".** A trait object's method table is a declaration the emitter adds beside the functions, and the const world never recorded it as reached, so an evaluation that built one named a table nothing declared; the table is a keyed emission like an instance now, and `const make().get()`, a `List<dyn Src>` walked inside a `const fun` and a `dyn` local all evaluate. A const RESULT that is or holds a trait object (`const let C: dyn Src`, a struct with a `dyn` field, a `List<dyn Src>`) is refused as one — "this evaluates to a trait object (a `dyn` value), whose method table is code the program builds" — where it read "a `Shared` cell". `[derive(Json)]` / `[derive(Wire)]` over a type with a `dyn` member (a field, a `List<dyn Src>` field, a variant's payload) is refused above the generators, naming the member: the decoders rebuild every member by its type (`dyn Src::from_json_value(..)` was the invalid text), and a trait object names none. The const spec's §9.4 and the encoding page say both. Pins: `g25_a_const_evaluation_dispatches_through_a_trait_object`, `g25_a_const_holding_a_trait_object_is_refused_by_name`, `g25_a_codec_derive_over_a_trait_object_member_is_refused_by_name`. Tracker G25.
 

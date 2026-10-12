@@ -67,6 +67,13 @@ const STD_DERIVE_MACROS: &[(&str, &str)] = &[
     ("Storable", "reactive/store.vl"),
 ];
 
+/// The std derives whose module is NOT loaded with every program (the
+/// analyzer's always-loaded set holds `compare`/`default`/`debug`/`json`/
+/// `hash`), each with the module path a program imports to reach it. A derive
+/// here with no macro in scope means the program never reached the module —
+/// an import it owes, not a compiler bug.
+const IMPORTED_STD_DERIVES: &[(&str, &str)] = &[("Storable", "std::reactive::store")];
+
 /// B376: what to say about `[derive(Name)]` where nothing declares a `Name`
 /// macro — not std, not this file, not an import.
 ///
@@ -2032,7 +2039,22 @@ impl Expander<'_, '_> {
                         // in it at all is not a bug: it is a std that does not
                         // carry the derive, and the author of that std is the
                         // reader.
-                        let msg = if self.std.base_root.join(module).is_file() {
+                        let imported = IMPORTED_STD_DERIVES
+                            .iter()
+                            .find(|(derive, _)| derive == name)
+                            .map(|(_, path)| *path);
+                        let msg = if let Some(path) = imported
+                            && self.std.base_root.join(module).is_file()
+                        {
+                            // A module only an import loads: the program did
+                            // not reach it, which is a missing import and
+                            // nothing about the load order.
+                            format!(
+                                "`[derive({name})]` is expanded by the `{name}` macro \
+                                 `{path}` declares, and nothing in this program imports \
+                                 that module: write `import {path}::{name};`"
+                            )
+                        } else if self.std.base_root.join(module).is_file() {
                             format!(
                                 "`[derive({name})]` expanded before std's `{module}` declared its \
                                  `{name}` macro: a compiler load-ordering bug (B21's class); \
