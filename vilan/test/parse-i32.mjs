@@ -67,3 +67,4 @@ console.log(String(unwrap_or(__parse_i32("-2147483648"), __lazy("fallback", () =
 	return 0;
 }))));
 console.log(is_some(__parse_i32("-2147483649")));
+//# sourceMappingURL=parse-i32.mjs.map

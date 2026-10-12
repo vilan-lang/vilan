@@ -57,3 +57,4 @@ let single = [  ];
 single.push(7);
 console.log(String(unwrap_or(__list_pop(single), 0)));
 console.log(is_none(__list_pop(single)));
+//# sourceMappingURL=list-get-pop.mjs.map

@@ -6,3 +6,4 @@ function combine_twice(self) {
 }
 const c = [ 5 ];
 console.log(String(combine_twice(c)[0]));
+//# sourceMappingURL=self-return.mjs.map

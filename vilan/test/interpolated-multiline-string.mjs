@@ -16,3 +16,4 @@ console.log(nested);
 const empty = "";
 console.log("[" + empty + "]" + "!");
 console.log(format([ 1, 2 ]));
+//# sourceMappingURL=interpolated-multiline-string.mjs.map

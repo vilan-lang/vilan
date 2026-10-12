@@ -19,3 +19,4 @@ console.log(is_empty(""));
 for (const part of "a,b,c".split(",")) {
 	console.log(part);
 }
+//# sourceMappingURL=string-methods.mjs.map

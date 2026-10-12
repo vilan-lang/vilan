@@ -15,3 +15,4 @@ let x = 1;
 x = 2;
 x = x + 3;
 console.log(String(x));
+//# sourceMappingURL=field-assignment.mjs.map

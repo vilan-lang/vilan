@@ -1168,6 +1168,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "libc",
+ "serde_json",
  "sha2",
  "vilan-core",
  "vilan-embedded",
@@ -1182,6 +1183,7 @@ version = "0.48.0"
 dependencies = [
  "indexmap",
  "serde",
+ "serde_json",
  "sha2",
  "toml",
 ]

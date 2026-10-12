@@ -17,3 +17,4 @@ const __s3_m0 = (i) => {
 	return i + 100;
 };
 console.log(String(0 + __s3_m0(0) + __s3_m0(1) + __s3_m0(2)));
+//# sourceMappingURL=macro-invoke.mjs.map

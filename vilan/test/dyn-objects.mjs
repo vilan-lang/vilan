@@ -1158,3 +1158,4 @@ for (const source of sources) {
 	console.log(String(source[1].get(source[0])));
 }
 dispose(watch, [ 1 ]);
+//# sourceMappingURL=dyn-objects.mjs.map

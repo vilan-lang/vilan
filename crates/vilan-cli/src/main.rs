@@ -23,7 +23,7 @@ mod watch_log;
 use job::ManagedChild;
 use vilan_core::analyzer::{Program, SourceId, analyze, check_library_contract};
 use vilan_core::manifest::Package;
-use vilan_core::transformer::{EmittedChunk, transform};
+use vilan_core::transformer::EmittedChunk;
 use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 
 /// `vilan check --explain-cost`'s report (M106's first slice): the package's
@@ -180,6 +180,12 @@ enum Command {
         /// would lie.
         #[arg(long)]
         explain: bool,
+        /// Write a source map beside each script (`<script>.map`) whatever
+        /// the preset says: a debugger and node's stack traces then show
+        /// `.vl` files and lines. The `debug` preset writes one already;
+        /// under `release` this is `[build] source-maps = true` for one build.
+        #[arg(long)]
+        source_maps: bool,
     },
     /// Type-check, reporting diagnostics without writing output. With no path,
     /// checks the project entry from the nearest `vilan.toml`.
@@ -463,6 +469,7 @@ fn run_cli() -> ExitCode {
             watch,
             rerun_hooks,
             explain,
+            source_maps,
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error(&message),
             // `--stdout` prints a bundle, not a build: it writes no output
@@ -475,6 +482,7 @@ fn run_cli() -> ExitCode {
             ),
             Ok(backend) => {
                 PRINT_CHUNKS.store(print_chunks, std::sync::atomic::Ordering::Relaxed);
+                FORCE_SOURCE_MAPS.store(source_maps, std::sync::atomic::Ordering::Relaxed);
                 if explain {
                     explain::ask();
                 }
@@ -1763,6 +1771,11 @@ fn hmr_round(
     // as a swap).
     let mut next = Vec::new();
     let mut other_assets: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    // E257 S5: each leg compiled this round with its source map (a node leg
+    // in the `debug` preset; an HMR-instrumented browser leg builds none), so
+    // a watch round writes the server's `dist/` script exactly as a one-shot
+    // `vilan build` does — the map beside it, the comment naming it.
+    let mut source_maps: Vec<(String, Option<vilan_core::source_map::SourceMap>)> = Vec::new();
     // B203's order: a leg whose artifact another leg reads compiles first, so
     // `next` — and therefore `dist/` — is written producer before consumer.
     for index in schedule.order.clone() {
@@ -1835,11 +1848,19 @@ fn hmr_round(
         // learns a kind stopped emitting and prunes its file (backlog G6) —
         // only a SKIPPED leg, whose files are still current, stays out.
         other_assets.push((unit.name.clone(), assembled));
+        let bundle_path =
+            dist_directory.join(format!("{}.{}", unit.name, platform.script_extension()));
+        let bundle = with_mapping_comment(
+            &bundle_path,
+            compiled.javascript,
+            compiled.source_map.is_some(),
+        );
+        source_maps.push((unit.name.clone(), compiled.source_map));
         next.push(hmr::LegArtifact {
             name: unit.name.clone(),
             is_browser: matches!(platform, Platform::Browser),
             script_extension: platform.script_extension(),
-            bundle: compiled.javascript,
+            bundle,
             css,
             bundled: compiled.bundled,
             sources: compiled.sources.into_iter().collect(),
@@ -1910,6 +1931,29 @@ fn hmr_round(
                 paint::error_prefix(),
                 bundle_path.display()
             );
+        }
+        // A leg compiled this round writes its map, or removes a stale one; a
+        // SKIPPED leg's map is still the one its unchanged bundle names.
+        if let Some((_, map)) = source_maps.iter().find(|(name, _)| *name == leg.name) {
+            let map_path = source_map_path(&bundle_path);
+            match map {
+                Some(map) => {
+                    let file = bundle_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if let Err(error) = fs::write(&map_path, map.to_json(&file, Some(&dist))) {
+                        eprintln!(
+                            "{} cannot write {}: {error}",
+                            paint::error_prefix(),
+                            map_path.display()
+                        );
+                    }
+                }
+                None => {
+                    let _ = fs::remove_file(&map_path);
+                }
+            }
         }
         if let Some(css) = &leg.css {
             let css_path = dist.join(format!("{}.css", leg.name));
@@ -4503,6 +4547,10 @@ impl CompileGoal {
 /// JavaScript say so by not mentioning the rest.
 struct Compiled {
     javascript: String,
+    /// E257 S5: the source map for `javascript` when the build's options ask
+    /// for one (the `debug` preset, `[build] source-maps`, `--source-maps`)
+    /// — written beside it by [`write_script`].
+    source_map: Option<vilan_core::source_map::SourceMap>,
     /// The contributions `asset::emit` / `asset::emit_keyed` accumulated —
     /// `write_assets` deduplicates and orders them into `<output>.<kind>`.
     assets: Vec<vilan_core::const_eval::EmittedAsset>,
@@ -4595,6 +4643,15 @@ fn compile_unit(
     // `check` output stays byte-identical.
     let mut options = unit.options;
     options.hmr = hmr;
+    if FORCE_SOURCE_MAPS.load(std::sync::atomic::Ordering::Relaxed) {
+        options.source_maps = true;
+    }
+    // An HMR-instrumented browser bundle is rewritten after the build (the dev
+    // shim goes in front of it), so a map of the build's text would point a
+    // debugger at the wrong lines; the watch loop writes none yet (E257's S6).
+    if hmr {
+        options.source_maps = false;
+    }
     let split = chunks.filter(|_| unit.split);
     compile_to_js(
         &unit.entry,
@@ -4719,7 +4776,12 @@ fn build_single(
     {
         return RoundOutcome::Failed;
     }
-    match fs::write(&output_path, compiled.javascript) {
+    let mapped = compiled.source_map.is_some();
+    match write_script(
+        &output_path,
+        compiled.javascript,
+        compiled.source_map.as_ref(),
+    ) {
         Ok(()) => {
             println!(
                 "{} {} -> {}",
@@ -4729,6 +4791,9 @@ fn build_single(
             );
             warn_superseded_sibling(&output_path);
             explain::bundle(output_path.clone(), &leg);
+            if mapped {
+                explain::source_map(source_map_path(&output_path), &leg);
+            }
             // The build is complete, so the report is complete. A build that
             // failed has not written the tree it would be explaining, and its
             // diagnostics are the account it owes.
@@ -4957,7 +5022,7 @@ fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
-    run_node_script(&compiled.javascript, args)
+    run_node_script(&compiled.javascript, compiled.source_map.as_ref(), args)
 }
 
 /// Builds every host (non-`none`) member of a workspace into
@@ -5308,7 +5373,10 @@ fn build_workspace_artifacts(
                 &assets,
                 matches!(platform, Platform::Browser),
             )?;
-            if let Err(error) = fs::write(&output, compiled.javascript) {
+            let mapped = compiled.source_map.is_some();
+            if let Err(error) =
+                write_script(&output, compiled.javascript, compiled.source_map.as_ref())
+            {
                 eprintln!(
                     "{} cannot write {}: {error}",
                     paint::error_prefix(),
@@ -5328,6 +5396,9 @@ fn build_workspace_artifacts(
                 paint::out(paint::Style::BOLD, &output.display().to_string())
             );
             warn_superseded_sibling(&output);
+            if mapped {
+                explain::source_map(source_map_path(&output), &unit.name);
+            }
             explain::bundle(output, &unit.name);
         }
     }
@@ -5942,12 +6013,11 @@ fn run_workspace(
     }
     // Run from the project root so the server reads sibling `dist/` bundles; the script
     // path is relative to that working directory.
-    let status = spawn_node(
-        &artifact_path(Path::new("dist"), &server.name, NODE_LEG),
-        args,
-        Some(root),
-    )
-    .and_then(|mut child| child.wait());
+    let script = artifact_path(Path::new("dist"), &server.name, NODE_LEG);
+    // The build just wrote the server's map beside it, or removed a stale one.
+    let mapped = source_map_path(&root.join(&script)).is_file();
+    let status = spawn_node(&script, &node_flags(mapped), args, Some(root))
+        .and_then(|mut child| child.wait());
     exit_code_of(status)
 }
 
@@ -6113,7 +6183,10 @@ fn test_context(file: &Path) -> Result<(PathBuf, Workspace, BuildOptions), Strin
 /// with the captured runtime output (empty for a compile error, which
 /// `compile_to_js` has already reported to stderr).
 fn run_test(file: &Path) -> Result<(), String> {
-    let (pkg_root, workspace, options) = test_context(file)?;
+    let (pkg_root, workspace, mut options) = test_context(file)?;
+    // The test's script is run and thrown away with its JavaScript alone: a
+    // map would be built for nobody (E257 S5).
+    options.source_maps = false;
     let compiled = compile_to_js(
         file,
         &pkg_root,
@@ -7066,6 +7139,13 @@ fn json_string(text: &str) -> String {
 /// `--watch` the flag stays set, so every rebuild re-reports — intended.
 static PRINT_CHUNKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// E257 S5: `vilan build --source-maps` — write the
+/// source map whatever the preset says (debugging.md Q9: the `debug` preset
+/// writes one by default, `release` only when asked). A process-level flag
+/// for [`PRINT_CHUNKS`]'s reason: every compile of the command reads it, and
+/// it changes what the build WRITES, never what it emits.
+static FORCE_SOURCE_MAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `vilan check` without `--watch`: one round, then the process exits — so
 /// a world stored for a later round has no later round (M100).
 static ONE_SHOT_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -7464,6 +7544,10 @@ fn compile_to_js(
             // rename; `transform_split` returns the eager bundle where
             // `transform` returns the whole one, plus the chunk files.
             let emission_clock = vilan_core::PhaseClock::now();
+            // E257 S5: the source map rides beside the JavaScript only from
+            // the single-file JS emission, the one the map entry builds; a
+            // split leg's chunks and the native backend's Rust carry none.
+            let mut source_map = None;
             let emitted = match split {
                 // A module of a package, addressed by path: analysis is the
                 // whole job (E113). Emission's one diagnostic is the missing
@@ -7523,7 +7607,12 @@ fn compile_to_js(
                         emitted.source
                     })
                 }
-                None => transform(&program, options),
+                None => vilan_core::transform_with_source_map(&program, options).map(
+                    |(javascript, map)| {
+                        source_map = map;
+                        javascript
+                    },
+                ),
             };
             phase_emission = emission_clock.elapsed();
             match emitted {
@@ -7536,6 +7625,7 @@ fn compile_to_js(
                     output =
                         Some(Compiled {
                             javascript,
+                            source_map,
                             explain: explained,
                             assets: program.const_assets.clone(),
                             bundled: program.const_bundled_files.clone(),
@@ -7708,23 +7798,116 @@ fn write_run_script(script: &Path, javascript: &str) -> std::io::Result<()> {
     std::io::Write::write_all(&mut file, javascript.as_bytes())
 }
 
+/// The file a script's source map is written to: `<script>.map`
+/// (`dist/server.mjs.map`), the name the script's last line points at.
+fn source_map_path(script: &Path) -> PathBuf {
+    let mut name = script.as_os_str().to_os_string();
+    name.push(".map");
+    PathBuf::from(name)
+}
+
+/// `javascript` with the comment that names its map appended (E257 S5), or
+/// unchanged when there is no map.
+fn with_mapping_comment(script: &Path, javascript: String, map: bool) -> String {
+    if !map {
+        return javascript;
+    }
+    let map_name = source_map_path(script)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut javascript = javascript;
+    // A release build ends without a line break; the comment takes a line of
+    // its own either way, after every line the map describes.
+    if !javascript.is_empty() && !javascript.ends_with('\n') {
+        javascript.push('\n');
+    }
+    javascript.push_str(&vilan_core::source_map::mapping_url_comment(&map_name));
+    javascript
+}
+
+/// Writes a build's script and, beside it, its source map (E257 S5) — the
+/// user's sources spelled relative to the map, so a `dist/` keeps working
+/// when the project moves. A build without a map removes the one an earlier
+/// build left at that path, so a `release` build never ships a stale map.
+fn write_script(
+    script: &Path,
+    javascript: String,
+    map: Option<&vilan_core::source_map::SourceMap>,
+) -> std::io::Result<()> {
+    let map_path = source_map_path(script);
+    match map {
+        Some(map) => {
+            let file = script
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            fs::write(&map_path, map.to_json(&file, script.parent()))?;
+        }
+        None => {
+            let _ = fs::remove_file(&map_path);
+        }
+    }
+    fs::write(
+        script,
+        with_mapping_comment(script, javascript, map.is_some()),
+    )
+}
+
+/// [`write_run_script`] for a script `vilan run` hands node from a temp
+/// directory, with its map beside it (E257 S5). The map names every source by
+/// its absolute `file://` URL — the script is nowhere near the project — and
+/// the answer is whether a map was written, which is what decides
+/// `--enable-source-maps`.
+fn write_run_script_with_map(
+    script: &Path,
+    javascript: &str,
+    map: Option<&vilan_core::source_map::SourceMap>,
+) -> std::io::Result<bool> {
+    let map_path = source_map_path(script);
+    let _ = fs::remove_file(&map_path);
+    let Some(map) = map else {
+        write_run_script(script, javascript)?;
+        return Ok(false);
+    };
+    let file = script
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    fs::write(&map_path, map.to_json(&file, None))?;
+    write_run_script(
+        script,
+        &with_mapping_comment(script, javascript.to_string(), true),
+    )?;
+    Ok(true)
+}
+
 /// Writes `javascript` to a temp file and executes it with Node.js, propagating
 /// its exit code, with stdin/stdout/stderr connected to the terminal. `args` are
 /// forwarded to the program, reachable through `process::args()`. (A temp file
 /// rather than piping via stdin, so the program keeps its own stdin — a piped
 /// script would consume it, breaking `scan()`.)
-fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
+fn run_node_script(
+    javascript: &str,
+    map: Option<&vilan_core::source_map::SourceMap>,
+    args: &[String],
+) -> ExitCode {
     let script = env::temp_dir().join(format!("vilan-run-{}.mjs", std::process::id()));
-    if let Err(error) = write_run_script(&script, javascript) {
-        eprintln!(
-            "{} cannot write {}: {error}",
-            paint::error_prefix(),
-            script.display()
-        );
-        return ExitCode::FAILURE;
-    }
-    let status = spawn_node(&script, args, None).and_then(|mut child| child.wait());
+    let mapped = match write_run_script_with_map(&script, javascript, map) {
+        Ok(mapped) => mapped,
+        Err(error) => {
+            eprintln!(
+                "{} cannot write {}: {error}",
+                paint::error_prefix(),
+                script.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let status =
+        spawn_node(&script, &node_flags(mapped), args, None).and_then(|mut child| child.wait());
     let _ = fs::remove_file(&script);
+    let _ = fs::remove_file(source_map_path(&script));
     exit_code_of(status)
 }
 
@@ -7738,8 +7921,24 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
 /// assigned to a kill-on-close Job object (`windows-support.md` §6) — a restart
 /// round's kill takes the program's whole process tree, and the CLI's own death
 /// reaps it. On unix the wrapper is a transparent newtype: unchanged behavior.
-fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Result<ManagedChild> {
-    spawn_node_with_env(script, args, cwd, &[])
+fn spawn_node(
+    script: &Path,
+    node_flags: &[String],
+    args: &[String],
+    cwd: Option<&Path>,
+) -> std::io::Result<ManagedChild> {
+    spawn_node_with_env(script, node_flags, args, cwd, &[])
+}
+
+/// The flags node runs a `vilan run` program under: `--enable-source-maps`
+/// when its map is beside it (debugging.md Q9 — node then reports an
+/// uncaught panic's stack in `.vl` files and lines).
+fn node_flags(mapped: bool) -> Vec<String> {
+    let mut flags = Vec::new();
+    if mapped {
+        flags.push("--enable-source-maps".to_string());
+    }
+    flags
 }
 
 /// The environment variable a `--watch` session sets on its Node child, and the
@@ -7764,17 +7963,18 @@ fn spawn_watched_node(
 ) -> std::io::Result<ManagedChild> {
     let mut env: Vec<(&str, String)> = vec![(WATCHING_ENV, "1".to_string())];
     env.extend(extra.iter().map(|(name, value)| (*name, value.clone())));
-    spawn_node_with_env(script, args, cwd, &env)
+    spawn_node_with_env(script, &[], args, cwd, &env)
 }
 
 fn spawn_node_with_env(
     script: &Path,
+    node_flags: &[String],
     args: &[String],
     cwd: Option<&Path>,
     env: &[(&str, String)],
 ) -> std::io::Result<ManagedChild> {
     let mut command = std::process::Command::new("node");
-    command.arg(script).args(args);
+    command.args(node_flags).arg(script).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }

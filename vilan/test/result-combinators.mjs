@@ -214,3 +214,4 @@ console.log(String(unwrap_or(and(ok2, [ 0, 5 ]), 0)));
 console.log(String(unwrap_or(or(err2, [ 0, 3 ]), 0)));
 const ro = [ 0, [ 0, 42 ] ];
 console.log(is_some(transpose(ro)));
+//# sourceMappingURL=result-combinators.mjs.map

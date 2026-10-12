@@ -38,3 +38,4 @@ const index = 1;
 __at_put(ys, index, __at(ys, index, "compound-index.vl:43:2") + 5, "compound-index.vl:43:2");
 console.log(String(__at(ys, 1, "compound-index.vl:44:8")));
 console.log(String(calls));
+//# sourceMappingURL=compound-index.mjs.map

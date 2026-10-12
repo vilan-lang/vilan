@@ -114,3 +114,4 @@ async function fetch_maker($h) {
 	console.error(String($j));
 	process.exit(1);
 });
+//# sourceMappingURL=await-postfix.mjs.map

@@ -554,3 +554,4 @@ let cursor = iter(live);
 live.push(3);
 console.log(String(count2(cursor)));
 console.log(String(live.length));
+//# sourceMappingURL=iterator-adapters.mjs.map

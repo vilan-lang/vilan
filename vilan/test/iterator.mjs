@@ -12,3 +12,4 @@ const naturals = from_fn(() => {
 console.log(String(next(naturals)));
 console.log(String(next(naturals)));
 console.log(String(next(naturals)));
+//# sourceMappingURL=iterator.mjs.map

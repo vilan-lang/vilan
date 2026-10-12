@@ -150,7 +150,9 @@ fun main() {
 }
 ```
 
-On node the line is the header of the uncaught `Error`, so a stack follows it;
+On node the line is the header of the uncaught `Error`, so a stack follows it,
+and under `vilan run` that stack is in `.vl` files and lines too (see
+[In a debugger](#in-a-debugger) below);
 the native binary prints the line alone and exits with status 1. A panic that
 is caught (`std::reactive::guarded`, a failing task) carries its message alone.
 
@@ -188,3 +190,33 @@ inside one is not tracking: its panic names its own line. The attribute is
 refused on a trait method (a call through a trait is dispatched, and no call
 site knows to pass a location), and a tracking function cannot be passed as a
 value; wrap it in a closure.
+
+## In a debugger
+
+A `debug` build (the default) writes a **source map** beside each script:
+`main.mjs.map` next to `main.mjs`, `dist/server.mjs.map` next to
+`dist/server.mjs`, named by a `//# sourceMappingURL=` comment on the script's
+last line. A debugger reads it to show your `.vl` files where the JavaScript
+would be, and node reads it to report a stack in them:
+
+```text
+panicked at main.vl:4:5: index out of bounds: the length is 2 but the index is 5
+    at __at (file:///tmp/vilan-run-4242.mjs:3:8)
+    at pick (/srv/app/main.vl:4:5)
+    at <anonymous> (/srv/app/main.vl:9:11)
+```
+
+(`__at` is the runtime's own bounds check, which has no `.vl` line; `main`'s
+body runs at the module's top level, hence `<anonymous>`.)
+
+`vilan run` passes node `--enable-source-maps` whenever there is a map, which
+is where that stack comes from. The map points at statements, calls, closures
+and function heads, and its `names` carry each function's source name. It
+carries your files' text; std's files are named by their path in the std
+cache and marked to be skipped, so "step into" stays in your code.
+
+A `release` build writes no map. Ask for one with `[build] source-maps = true`,
+or for a single build with `vilan build --source-maps`. `source-maps = false`
+turns the `debug` preset's off.
+A map changes no byte of the program it describes: the script is the same with
+it and without it, but for the comment that names it.

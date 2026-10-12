@@ -10,6 +10,7 @@ use crate::impl_select;
 use crate::interpreter::ConstValue;
 use crate::node::{BinaryOp, Convention, ExternBinding};
 use crate::options::BuildOptions;
+use crate::source_map::{MARK, MARK_TEXT, MarkKind, SourceMap, SourceMark};
 use crate::span::Span;
 use crate::teardown;
 use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
@@ -19,7 +20,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
-    Transformer::new(program, options).transform_entry()
+    Transformer::new(program, options)
+        .transform_entry()
+        .map(|(javascript, _)| javascript)
+}
+
+/// [`transform`] with the source map for its output (debugging.md §5.1,
+/// E257 S5) when `options.source_maps` asks for one — the `debug` preset's
+/// default, `[build] source-maps` or `--source-maps` otherwise.
+///
+/// The JavaScript is byte-identical to [`transform`]'s: the walk leaves
+/// marks in the tree, the printer writes a mark character for each, and
+/// [`crate::source_map::strip_marks`] takes them out again as it computes
+/// the map. The corpus pins the identity (`tests/source_maps.rs`).
+pub fn transform_with_source_map<'src>(
+    program: &Program<'src>,
+    options: &BuildOptions,
+) -> Result<(String, Option<SourceMap>), Error> {
+    if !options.source_maps {
+        return transform(program, options).map(|javascript| (javascript, None));
+    }
+    let mut transformer = Transformer::new(program, options);
+    transformer.source_marks = true;
+    transformer.formatter = transformer.formatter.with_marks();
+    let (marked, marks) = transformer.transform_entry()?;
+    let (javascript, map) = crate::source_map::strip_marks(program, &marked, &marks);
+    Ok((javascript, Some(map)))
 }
 
 /// Emission run for its DIAGNOSTICS alone — what `vilan check` of an ENTRY
@@ -438,6 +464,7 @@ fn chunk_forwarder<'src>(function: &js::Function<'src>) -> js::Node<'src> {
                 .collect(),
         )))],
         is_async: function.is_async,
+        origin: None,
     })
 }
 
@@ -579,6 +606,8 @@ fn rewrite_sibling_node(
             rewrite_sibling_node(right, siblings, bound, count);
         }
         js::Node::Await(inner)
+        // E257 S5: a call mark is its call.
+        | js::Node::At(_, inner)
         | js::Node::Unary(_, inner)
         | js::Node::Return(inner)
         | js::Node::Throw(inner)
@@ -600,7 +629,9 @@ fn rewrite_sibling_node(
         | js::Node::Void
         | js::Node::Break
         | js::Node::BreakLabel(_)
-        | js::Node::Continue => {}
+        | js::Node::Continue
+        // E257 S5: a statement mark names nothing and declares nothing.
+        | js::Node::Mark(_) => {}
     }
 }
 
@@ -846,6 +877,8 @@ fn descend_for_preload<'src>(
             descend_for_preload(right, gates, total);
         }
         js::Node::Await(inner)
+        // E257 S5: a call mark is its call.
+        | js::Node::At(_, inner)
         | js::Node::Unary(_, inner)
         | js::Node::Return(inner)
         | js::Node::Throw(inner)
@@ -913,6 +946,8 @@ fn gate_source_name(
             gate_source_name(left, gates).or_else(|| gate_source_name(right, gates))
         }
         js::Node::Await(inner)
+        // E257 S5: a call mark is its call.
+        | js::Node::At(_, inner)
         | js::Node::Unary(_, inner)
         | js::Node::Return(inner)
         | js::Node::Throw(inner)
@@ -1035,6 +1070,8 @@ fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
             collect_reference(right, out);
         }
         js::Node::Await(inner)
+        // E257 S5: a call mark is its call.
+        | js::Node::At(_, inner)
         | js::Node::Unary(_, inner)
         | js::Node::Return(inner)
         | js::Node::Throw(inner)
@@ -1048,7 +1085,9 @@ fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
         | js::Node::Void
         | js::Node::Break
         | js::Node::BreakLabel(_)
-        | js::Node::Continue => {}
+        | js::Node::Continue
+        // E257 S5: a statement mark names nothing and declares nothing.
+        | js::Node::Mark(_) => {}
     }
 }
 
@@ -2833,6 +2872,12 @@ struct Transformer<'src> {
     // (backlog M34). `false` for every emitting transform, which is what keeps
     // the emitted text byte-identical.
     diagnose_only: bool,
+    // E257 S5: leave source-map marks in the tree — a `Mark` before each
+    // statement and tail, an `At` around each call. Set only by
+    // [`transform_with_source_map`]; every other walk (a plain build, a
+    // check's `diagnose`, the const world, the macro interpreter) builds the
+    // tree it always did.
+    source_marks: bool,
 }
 
 /// One thing the shared const world declares: a concrete function, or a KEYED
@@ -3237,10 +3282,13 @@ impl<'src> Transformer<'src> {
             gate_call_names: BTreeMap::new(),
             recorder: None,
             diagnose_only: false,
+            source_marks: false,
         }
     }
 
-    fn transform_entry(self) -> Result<String, Error> {
+    /// The entry's JavaScript, with the source-map marks its printing
+    /// recorded (none unless the printer records them).
+    fn transform_entry(self) -> Result<(String, Vec<SourceMark>), Error> {
         let formatter = self.formatter.clone();
         let line_break = formatter.line_break;
         let program = self.transform_entry_ast()?;
@@ -3262,7 +3310,7 @@ impl<'src> Transformer<'src> {
         } else {
             format!("{}\n{}", prelude, body)
         };
-        Ok(format!("{}{}", output, line_break))
+        Ok((format!("{}{}", output, line_break), formatter.take_marks()))
     }
 
     fn transform_entry_ast(self) -> Result<JsProgram<'src>, Error> {
@@ -3981,6 +4029,7 @@ impl<'src> Transformer<'src> {
     /// which is what keeps every resource-free program byte-identical.
     fn emit_statement(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) {
         let mark = self.pending_temporaries.len();
+        let statement_mark = self.mark_statement(id, block);
         let base = block.len();
         if let Some(node) = self.walk_entity(id, block) {
             // A statement whose value is discarded and is `undefined` (e.g.
@@ -3989,7 +4038,71 @@ impl<'src> Transformer<'src> {
                 block.push(node);
             }
         }
+        Self::drop_bare_mark(statement_mark, block);
         self.close_temporaries(mark, base, block);
+    }
+
+    /// E257 S5: a statement mark for `id` at the end of `block`, when this
+    /// walk leaves marks — its index, for [`Self::drop_bare_mark`]. Placed
+    /// BEFORE the statement is walked, so the lifted temporaries and
+    /// preludes its lowering pushes sit after it and the map points the
+    /// whole run of JS at the one source statement.
+    fn mark_statement(&self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<usize> {
+        if !self.source_marks {
+            return None;
+        }
+        block.push(js::Node::Mark(id));
+        Some(block.len() - 1)
+    }
+
+    /// Drops a statement mark the statement emitted nothing after, so a mark
+    /// is never the last item of its list and a list that was empty without
+    /// marks stays empty with them — every `last()` and `is_empty()` the
+    /// lowering asks of a list answers as it did.
+    fn drop_bare_mark(statement_mark: Option<usize>, block: &mut Vec<js::Node<'src>>) {
+        if let Some(index) = statement_mark
+            && index + 1 == block.len()
+        {
+            block.pop();
+        }
+    }
+
+    /// E257 S5: a tail's mark, pushed just before the statement the tail
+    /// becomes (`return <tail>`, an assignment to a result temp, the bare
+    /// value) — after the tail's own preludes, which is the one place a tail
+    /// has: its value is not known until they ran.
+    fn mark_tail(&self, tail: Id, block: &mut Vec<js::Node<'src>>) {
+        if self.source_marks {
+            block.push(js::Node::Mark(tail));
+        }
+    }
+
+    /// E257 S5: a call mark around a lowered CALL, when this walk leaves
+    /// marks — `At(id, call)`, or `await` around a marked call. Placed here,
+    /// inside the ownership seams, so a return-position `__clone(f(x))` marks
+    /// the user's call and not the copy around it. Anything else a call
+    /// lowers to — a property read, an operator, `undefined` for a stripped
+    /// `dbg` — is left alone: the mark wraps only what prints as a call, so
+    /// every question the lowering asks of the node's shape is asked of the
+    /// shape it had.
+    fn mark_call(&self, id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        if !self.source_marks {
+            return node;
+        }
+        // The shape first: it is a field read, where the entity's kind is a
+        // table lookup this would otherwise pay for every expression lowered.
+        let is_call = match &node {
+            js::Node::Call(..) => true,
+            js::Node::Await(operand) => matches!(**operand, js::Node::Call(..)),
+            _ => false,
+        };
+        if !is_call || !matches!(self.program.entity_map.get(&id), Some(Expr::Call(_))) {
+            return node;
+        }
+        match node {
+            js::Node::Await(operand) => js::Node::Await(Box::new(js::Node::At(id, operand))),
+            node => js::Node::At(id, Box::new(node)),
+        }
     }
 
     /// Give a resource temporary a name and remember where it landed.
@@ -5524,6 +5637,7 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
+        let node = self.mark_call(id, node);
         // C11 (`temporary-drop.md`): a resource value that is neither bound nor
         // moved is owned by its STATEMENT. It has no name of its own, so it is
         // given one here — a minted `const` at the statement's position — and
@@ -6318,6 +6432,7 @@ impl<'src> Transformer<'src> {
                 }
                 let value = self.walk_entity(closure.return_, &mut body);
                 if let Some(value) = value {
+                    self.mark_tail(closure.return_, &mut body);
                     // Same seam as a function body's tail (B152): a divergent
                     // tail is the statement, never a value to `return`.
                     if value.is_divergent() {
@@ -8653,7 +8768,11 @@ impl<'src> Transformer<'src> {
             | js::Node::String(_)
             | js::Node::Bool(_)
             | js::Node::Null
-            | js::Node::Void => true,
+            | js::Node::Void
+            // E257 S5: a statement mark prints nothing of its own, and a
+            // sequence carries it onto the item after it.
+            | js::Node::Mark(_) => true,
+            js::Node::At(_, inner) => Self::node_is_expressible(inner),
             // A block form (no expression spelling), a hoisted `function`
             // declaration, a `...spread` (legal only inside a literal), or a
             // divergent statement.
@@ -10600,6 +10719,7 @@ impl<'src> Transformer<'src> {
                     .current_instance
                     .as_ref()
                     .is_some_and(|instance| instance.is_async),
+            origin: js::Function::origin_of(function.id),
         })
     }
 
@@ -10655,8 +10775,12 @@ impl<'src> Transformer<'src> {
                 // A tail that already left the function — `fun a(): i32 { ret 1
                 // }` — is the statement, not a value to return (B152: wrapping
                 // it emitted `return return 1;`).
-                node if node.is_divergent() => body.push(node),
+                node if node.is_divergent() => {
+                    self.mark_tail(tail, &mut body);
+                    body.push(node)
+                }
                 _ => {
+                    self.mark_tail(tail, &mut body);
                     body.push(js::Node::Return(Box::new(return_expr)));
                 }
             }
@@ -11954,6 +12078,7 @@ impl<'src> Transformer<'src> {
                     if let Some(node) = self.walk_entity(tail, &mut body)
                         && !matches!(node, js::Node::Void)
                     {
+                        self.mark_tail(tail, &mut body);
                         body.push(node);
                     }
                 }
@@ -12007,6 +12132,7 @@ impl<'src> Transformer<'src> {
                 // A tail that emitted itself and reported no value (a block that
                 // LEAVES — B152) has nothing to assign; the arm already diverged.
                 if let Some(value) = value {
+                    self.mark_tail(tail, &mut body);
                     self.push_result_or_divergence(&name, value, &mut body);
                 }
             }
@@ -12047,6 +12173,7 @@ impl<'src> Transformer<'src> {
         if matches!(node, js::Node::Void) {
             return true;
         }
+        self.mark_tail(tail, out);
         // A tail that already leaves the scope (`ret` / `jump`) is emitted as the
         // statement it is under EVERY disposition — returning or assigning one
         // is B152's unparseable `return return 1;` / `t = return 1;`.
@@ -12298,6 +12425,7 @@ impl<'src> Transformer<'src> {
             parameters: vec![js::Parameter { name: value_name }],
             body,
             is_async: false,
+            origin: None,
         }));
         self.record_landed(emission);
         self.record_leave(frame, emission);
@@ -13066,6 +13194,12 @@ struct Formatter {
     space: &'static str,
     array_surround: &'static str,
     // object_surround: &'static str,
+    /// E257 S5: the source-map marks this printing wrote, one record per
+    /// [`MARK`] character and in TEXTUAL order — `Some` only for the
+    /// printing [`transform_with_source_map`] does. Every printer records a
+    /// mark immediately before it renders what follows the mark, which is
+    /// what keeps the records in the order the characters land in.
+    marks: Option<std::cell::RefCell<Vec<SourceMark>>>,
 }
 
 impl Formatter {
@@ -13078,7 +13212,78 @@ impl Formatter {
             indentation: if indent { "\t" } else { "" },
             space: if spaces { " " } else { "" },
             array_surround: if spaces { " " } else { "" },
+            marks: None,
         }
+    }
+
+    /// This printer, recording source-map marks (E257 S5).
+    fn with_marks(mut self) -> Self {
+        self.marks = Some(std::cell::RefCell::new(Vec::new()));
+        self
+    }
+
+    /// The marks recorded so far, leaving none behind.
+    fn take_marks(&self) -> Vec<SourceMark> {
+        self.marks
+            .as_ref()
+            .map(|marks| std::mem::take(&mut *marks.borrow_mut()))
+            .unwrap_or_default()
+    }
+
+    /// Records one mark and answers the character that stands for it — or
+    /// nothing, for a printer that records none.
+    fn mark(&self, kind: MarkKind, id: Id) -> &'static str {
+        match &self.marks {
+            Some(marks) => {
+                marks.borrow_mut().push(SourceMark { kind, id });
+                MARK_TEXT
+            }
+            None => "",
+        }
+    }
+
+    /// Renders a list's items, each statement mark carried onto the item
+    /// after it rather than taking a place of its own. A mark is never a
+    /// list's last item (`drop_bare_mark`), and one that were would print
+    /// nothing and record nothing.
+    fn marked_items(
+        &self,
+        list: &[js::Node],
+        prefix: &str,
+        mut render: impl FnMut(&js::Node) -> String,
+    ) -> Vec<String> {
+        let mut rendered = Vec::with_capacity(list.len());
+        // The run of marks waiting for the item after them, as a range of
+        // `list`: recorded only when that item is, so a mark with nothing
+        // after it records nothing.
+        let mut waiting = 0..0;
+        for (index, node) in list.iter().enumerate() {
+            if let js::Node::Mark(_) = node {
+                if waiting.is_empty() {
+                    waiting = index..index;
+                }
+                waiting.end = index + 1;
+                continue;
+            }
+            // Recorded before the item renders (its own marks follow these
+            // in the text), and the line built once, at its final size.
+            for waiting_mark in &list[waiting.clone()] {
+                if let js::Node::Mark(id) = waiting_mark {
+                    self.mark(MarkKind::Statement, *id);
+                }
+            }
+            let item = render(node);
+            let mut text =
+                String::with_capacity(prefix.len() + waiting.len() * MARK_TEXT.len() + item.len());
+            text.push_str(prefix);
+            for _ in waiting {
+                text.push_str(MARK_TEXT);
+            }
+            waiting = 0..0;
+            text.push_str(&item);
+            rendered.push(text);
+        }
+        rendered
     }
 
     fn file(&self, list: &Vec<js::Node>) -> String {
@@ -13096,7 +13301,12 @@ impl Formatter {
         if !self.space.is_empty() {
             return self.space;
         }
-        match (left.chars().next_back(), right.chars().next()) {
+        // A source-map mark is no character of the output: the fusing
+        // question is asked of the characters on either side of it.
+        match (
+            left.chars().rev().find(|character| *character != MARK),
+            right.chars().find(|character| *character != MARK),
+        ) {
             // `+ +…` and `- -…` lex as the increment and decrement operators.
             (Some('+'), Some('+')) | (Some('-'), Some('-')) => " ",
             // `/ /…` opens a line comment and `/ *…` a block comment.
@@ -13112,9 +13322,16 @@ impl Formatter {
     /// argument, a function-valued binding) indents to its true depth.
     fn sequence(&self, list: &[js::Node], terminator: &'static str, level: usize) -> String {
         let indent = self.indentation.repeat(level);
-        list.iter()
-            .map(|node| format!("{}{}", indent, self.node(node, terminator, level)))
-            .collect::<Vec<_>>()
+        // The marks' own printing only when this printer records them: every
+        // other printing walks the list as it always did.
+        if self.marks.is_none() {
+            return list
+                .iter()
+                .map(|node| format!("{}{}", indent, self.node(node, terminator, level)))
+                .collect::<Vec<_>>()
+                .join(self.line_break);
+        }
+        self.marked_items(list, &indent, |node| self.node(node, terminator, level))
             .join(self.line_break)
     }
 
@@ -13148,7 +13365,7 @@ impl Formatter {
     /// binary operator and pass through bare.
     fn operand(&self, node: &js::Node, level: usize, keeps: impl Fn(u8) -> bool) -> String {
         let rendered = self.node(node, "", level);
-        let wrap = match node {
+        let wrap = match node.unmarked() {
             js::Node::Binary(op, _, _) => !keeps(Self::js_binary_precedence(*op)),
             js::Node::Assignment(_, _) => true,
             _ => false,
@@ -13178,7 +13395,7 @@ impl Formatter {
     fn postfix_subject(&self, node: &js::Node, level: usize) -> String {
         let rendered = self.node(node, "", level);
         let wrap = matches!(
-            node,
+            node.unmarked(),
             // `await` is a unary prefix: every postfix binds tighter than it.
             js::Node::Await(_)
                 | js::Node::Unary(_, _)
@@ -13193,6 +13410,24 @@ impl Formatter {
         } else {
             rendered
         }
+    }
+
+    /// A call, `prefix` (a call mark, or nothing) ahead of it.
+    fn call(
+        &self,
+        prefix: &str,
+        subject: &js::Node,
+        args: &[js::Node],
+        terminator: &'static str,
+        level: usize,
+    ) -> String {
+        let s_subject = self.postfix_subject(subject, level);
+        let s_args = args
+            .iter()
+            .map(|x| self.node(x, "", level))
+            .collect::<Vec<_>>()
+            .join(format!(",{}", self.space).as_str());
+        format!("{}{}({}){}", prefix, s_subject, s_args, terminator)
     }
 
     /// Renders one JavaScript node at block-nesting `level` (used to indent the
@@ -13242,17 +13477,24 @@ impl Formatter {
             // assignment item keeps the parentheses `operand` gives it while
             // everything else passes through bare.
             js::Node::Sequence(items) => {
-                let s_items = items
-                    .iter()
-                    .map(|item| self.operand(item, level, |_| true))
-                    .collect::<Vec<_>>()
-                    .join(format!(",{}", self.space).as_str());
+                // A sequence is a statement list run in expression position
+                // (B224), so its items carry the statements' marks.
+                let render = |item: &js::Node| self.operand(item, level, |_| true);
+                let s_items = match &self.marks {
+                    None => items.iter().map(render).collect::<Vec<_>>(),
+                    Some(_) => self.marked_items(items, "", render),
+                }
+                .join(format!(",{}", self.space).as_str());
                 format!("({}){}", s_items, terminator)
             }
             js::Node::Spread(operand) => {
                 format!("...{}{}", self.node(operand, "", level), terminator)
             }
             js::Node::Function(function) => {
+                let head = match (&self.marks, function.origin_id()) {
+                    (Some(_), Some(origin)) => self.mark(MarkKind::Function, origin),
+                    _ => "",
+                };
                 let name = function.name.as_str();
                 let parameters = function
                     .parameters
@@ -13262,7 +13504,8 @@ impl Formatter {
                     .join(format!(",{}", self.space).as_str());
                 let body = self.sequence(&function.body, ";", level + 1);
                 format!(
-                    "{}function {}({}){}{{{}{}{}{}}}{}",
+                    "{}{}function {}({}){}{{{}{}{}{}}}{}",
+                    head,
                     if function.is_async { "async " } else { "" },
                     name,
                     parameters,
@@ -13293,15 +13536,7 @@ impl Formatter {
             js::Node::Throw(value) => {
                 format!("throw {}{}", self.node(value, "", level), terminator)
             }
-            js::Node::Call(subject, args) => {
-                let s_subject = self.postfix_subject(subject, level);
-                let s_args = args
-                    .iter()
-                    .map(|x| self.node(x, "", level))
-                    .collect::<Vec<_>>()
-                    .join(format!(",{}", self.space).as_str());
-                format!("{}({}){}", s_subject, s_args, terminator)
-            }
+            js::Node::Call(subject, args) => self.call("", subject, args, terminator, level),
             js::Node::Binary(op, lhs, rhs) => {
                 let s_op = match op {
                     BinaryOp::Add => "+",
@@ -13494,6 +13729,10 @@ impl Formatter {
             js::Node::BreakLabel(label) => format!("break {}{}", label, terminator),
             js::Node::Continue => format!("continue{}", terminator),
             js::Node::Closure(closure) => {
+                let head = match (&self.marks, closure.origin) {
+                    (Some(_), Some(origin)) => self.mark(MarkKind::Closure, origin),
+                    _ => "",
+                };
                 let s_parameters = closure
                     .parameters
                     .iter()
@@ -13502,7 +13741,8 @@ impl Formatter {
                     .join(format!(",{}", self.space).as_str());
                 let s_body = self.sequence(&closure.body, ";", level + 1);
                 format!(
-                    "{}({}){}=>{}{{{}{}{}{}}}{}",
+                    "{}{}({}){}=>{}{{{}{}{}{}}}{}",
+                    head,
                     if closure.is_async { "async " } else { "" },
                     s_parameters,
                     self.space,
@@ -13518,6 +13758,20 @@ impl Formatter {
                 // Parenthesise so `await` doesn't bind too loosely (e.g.
                 // `await (a + b)`), mirroring the unary `!` rendering.
                 format!("await ({}){}", self.node(operand, "", level), terminator)
+            }
+            // E257 S5. A statement mark prints through its list
+            // (`marked_items`); one met anywhere else is inert.
+            js::Node::Mark(_) => String::new(),
+            js::Node::At(id, operand) => {
+                let mark = self.mark(MarkKind::Call, *id);
+                match &**operand {
+                    // The mark goes in the call's own text, not around a copy
+                    // of it.
+                    js::Node::Call(subject, args) => {
+                        self.call(mark, subject, args, terminator, level)
+                    }
+                    operand => format!("{}{}", mark, self.node(operand, terminator, level)),
+                }
             }
         }
     }
@@ -14128,9 +14382,29 @@ pub mod js {
         // panic mid-acquisition never drops an unacquired value.
         Try(Vec<Self>, Vec<Self>),
         Void,
+        // E257 S5 (debugging.md §5.1): a STATEMENT mark — the source place of
+        // the statement that follows it in its list. Emitted only by
+        // `transform_with_source_map`; it prints as nothing but the mark
+        // character `source_map::strip_marks` removes, and every walk treats
+        // it as the inert leaf it is. Never the last item of a list: the
+        // emitter drops a mark its statement emitted nothing after.
+        Mark(crate::id::Id),
+        // E257 S5: a CALL mark around a lowered call — the call expression
+        // whose callee the map points at. Transparent: it prints its operand,
+        // and every walk sees through it. Only a `Call` is ever wrapped.
+        At(crate::id::Id, Box<Self>),
     }
 
     impl Node<'_> {
+        /// The node a call mark wraps, or this node: what every question
+        /// about a node's SHAPE is asked of (E257 S5).
+        pub fn unmarked(&self) -> &Self {
+            match self {
+                Self::At(_, operand) => operand.unmarked(),
+                node => node,
+            }
+        }
+
         /// Whether this node is a JS *statement* that leaves its enclosing block
         /// rather than an expression with a value — `return` / `break` /
         /// `continue`. vilan's `ret` and `jump` are expressions (of the never
@@ -14170,6 +14444,26 @@ pub mod js {
         pub parameters: Vec<Parameter>,
         pub body: Vec<Node<'src>>,
         pub is_async: bool,
+        /// E257 S5: the vilan FUNCTION this was emitted from, when it was —
+        /// the head a source map points at and the name it carries in
+        /// `names`. `None` for every function the emitter synthesizes (a
+        /// printer, a drop helper, a chunk forwarder). Packed (the id plus
+        /// one, [`Function::origin_of`]) so the field costs four bytes: a
+        /// `js::Node` is as large as this struct, and the eight an
+        /// `Option<Id>` takes made every node of every build 10% larger.
+        pub origin: Option<std::num::NonZeroU32>,
+    }
+
+    impl Function<'_> {
+        /// `id`, packed for [`Function::origin`].
+        pub fn origin_of(id: crate::id::Id) -> Option<std::num::NonZeroU32> {
+            std::num::NonZeroU32::new(id.0.wrapping_add(1))
+        }
+
+        /// The vilan function this was emitted from, if any.
+        pub fn origin_id(&self) -> Option<crate::id::Id> {
+            self.origin.map(|packed| crate::id::Id(packed.get() - 1))
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -14859,6 +15153,8 @@ fn collect_node(
             collect_node(right, renameable, declarations, children);
         }
         js::Node::Await(inner)
+        // E257 S5: a call mark is its call.
+        | js::Node::At(_, inner)
         | js::Node::Unary(_, inner)
         | js::Node::Return(inner)
         | js::Node::Throw(inner)
@@ -14878,7 +15174,9 @@ fn collect_node(
         | js::Node::Void
         | js::Node::Break
         | js::Node::BreakLabel(_)
-        | js::Node::Continue => {}
+        | js::Node::Continue
+        // E257 S5: a statement mark names nothing and declares nothing.
+        | js::Node::Mark(_) => {}
     }
 }
 
@@ -15029,6 +15327,8 @@ fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
             rename_node(right, rename);
         }
         js::Node::Await(inner)
+        // E257 S5: a call mark is its call.
+        | js::Node::At(_, inner)
         | js::Node::Unary(_, inner)
         | js::Node::Return(inner)
         | js::Node::Throw(inner)
@@ -15043,7 +15343,9 @@ fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
         | js::Node::Void
         | js::Node::Break
         | js::Node::BreakLabel(_)
-        | js::Node::Continue => {}
+        | js::Node::Continue
+        // E257 S5: a statement mark names nothing and declares nothing.
+        | js::Node::Mark(_) => {}
     }
 }
 
@@ -15258,6 +15560,7 @@ mod tests {
                 js::Node::Return(Box::new(js::Node::Local(temporary.to_string()))),
             ],
             is_async: false,
+            origin: None,
         })
     }
 
@@ -15314,6 +15617,7 @@ mod tests {
                     Vec::new(),
                 )))],
                 is_async: false,
+                origin: None,
             })
         };
         let minted: HashSet<String> = ["$D", "$E", "$F"].into_iter().map(str::to_string).collect();

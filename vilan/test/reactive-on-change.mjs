@@ -1046,3 +1046,4 @@ const shown = sub3(labelled, (value, $bi) => {
 set(stored[0], 13, [ 1 ]);
 dispose(shown, [ 1 ]);
 dispose2(sealed);
+//# sourceMappingURL=reactive-on-change.mjs.map

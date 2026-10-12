@@ -18,3 +18,4 @@ console.log(describe(flag));
 console.log(describe(9 > 5));
 const $c = flag;
 console.log($c === true);
+//# sourceMappingURL=bool.mjs.map

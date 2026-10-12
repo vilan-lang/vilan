@@ -30,3 +30,4 @@ function values(self) {
 }
 const card = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ] ]) ] ];
 console.log(class_list(card));
+//# sourceMappingURL=preflight.mjs.map

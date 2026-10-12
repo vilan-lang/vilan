@@ -78,3 +78,4 @@ console.log(String(fold(map2(pts, (pt) => {
 console.log(String(filter(pts, (pt) => {
 	return pt[1] > 15;
 }).length));
+//# sourceMappingURL=closure-param-inference.mjs.map

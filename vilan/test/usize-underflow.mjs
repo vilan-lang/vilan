@@ -30,3 +30,4 @@ console.log(under < first);
 console.log(is_none(checked_sub(first, 1)));
 const floor = saturating_sub(first, 1);
 console.log("" + floor);
+//# sourceMappingURL=usize-underflow.mjs.map

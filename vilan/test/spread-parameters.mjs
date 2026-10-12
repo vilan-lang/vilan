@@ -293,3 +293,4 @@ console.log(String(get(both)[0]));
 set2(count, 21, [ 1 ]);
 console.log(String(get(both)[0]));
 console.log(get(both)[1]);
+//# sourceMappingURL=spread-parameters.mjs.map

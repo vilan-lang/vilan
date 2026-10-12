@@ -44,3 +44,4 @@ if ($h[0] === 0) {
 	$i = console.log("none");
 }
 process.exit($i);
+//# sourceMappingURL=destructuring.mjs.map

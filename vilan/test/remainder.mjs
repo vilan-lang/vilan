@@ -17,3 +17,4 @@ const left = [ 17 ];
 const right = [ 5 ];
 const paced = rem(left, right);
 console.log(String(paced[0]));
+//# sourceMappingURL=remainder.mjs.map

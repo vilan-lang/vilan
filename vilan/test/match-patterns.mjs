@@ -141,3 +141,4 @@ console.log(counted([ 0, 1 ]));
 console.log(counted([ 0, 9 ]));
 console.log(paired([ "start", true ]));
 console.log(paired([ "end", false ]));
+//# sourceMappingURL=match-patterns.mjs.map

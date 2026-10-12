@@ -628,3 +628,4 @@ console.log("captured: " + captured);
 tick();
 tick();
 console.log("module: " + ticks);
+//# sourceMappingURL=shared-compound-write.mjs.map

@@ -117,3 +117,4 @@ console.log(is_none(find(empty, (n) => {
 })));
 console.log(contains(empty, 1));
 console.log(is_none(index_of(empty, 1)));
+//# sourceMappingURL=list-search.mjs.map

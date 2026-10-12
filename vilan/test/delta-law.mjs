@@ -756,3 +756,4 @@ console.log("g calls: incremental=" + calls.v + " (splice/set_at=" + incremental
 console.log("final length " + get2(source).length + ", log held " + held(source[1]) + " ops, base " + oldest(source[1]) + ", version " + at(source[1]));
 drop_cursor2(source, near);
 drop_cursor2(source, far);
+//# sourceMappingURL=delta-law.mjs.map

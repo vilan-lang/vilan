@@ -1071,7 +1071,11 @@ fn eight_concurrent_runs_of_the_filesystem_program_agree_byte_for_byte() {
         .expect("read the work directory")
         .filter_map(|entry| {
             let name = entry.ok()?.file_name().to_string_lossy().into_owned();
-            (name != "file.vl" && name != format!("file.{GOLDEN_EXTENSION}")).then_some(name)
+            // The build's own outputs: the script and its source map (E257 S5).
+            (name != "file.vl"
+                && name != format!("file.{GOLDEN_EXTENSION}")
+                && name != format!("file.{GOLDEN_EXTENSION}.map"))
+            .then_some(name)
         })
         .collect();
     assert!(

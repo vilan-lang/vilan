@@ -37,3 +37,4 @@ for (const $f of $e.keys()) {
 	sum = sum + e2[0][e2[1]];
 }
 console.log(String(sum));
+//# sourceMappingURL=for-views.mjs.map

@@ -150,3 +150,4 @@ console.log(format2([ 1, 2 ]));
 console.log(format3(42));
 console.log(format4("hi"));
 console.log(format5(true));
+//# sourceMappingURL=format.mjs.map

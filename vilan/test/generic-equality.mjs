@@ -51,3 +51,4 @@ console.log(eq2(some_a, some_b));
 console.log(eq2(some_a, some_c));
 console.log(!(eq2(some_a, some_c)));
 console.log(eq2(some_a, [ 1 ]));
+//# sourceMappingURL=generic-equality.mjs.map

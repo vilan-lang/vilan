@@ -78,3 +78,4 @@ r0 = r0 + 100;
 console.log(String(r0));
 console.log(String(__at(__at(grid, 1, "fixed-arrays.vl:67:8"), 0, "fixed-arrays.vl:67:8")));
 console.log(String(r1));
+//# sourceMappingURL=fixed-arrays.mjs.map

@@ -2,3 +2,4 @@ let a = [ 1, 2 ];
 let b = a;
 b[0] = 99;
 console.log(String(b[0]));
+//# sourceMappingURL=copy-elision.mjs.map

@@ -110,3 +110,4 @@ console.log("zero " + as_u533(zero) + " " + as_usize3(zero));
 console.log("positive " + as_u536(positive) + " " + as_usize6(positive));
 console.log("large " + as_u534(large) + " " + as_usize4(large));
 console.log("fold " + as_u8(word) + " " + as_u16(word) + " " + as_u32(word));
+//# sourceMappingURL=unsigned-saturate.mjs.map

@@ -12,3 +12,4 @@ console.log(String(sum[1]));
 const product = mul(a, b);
 console.log(String(product[0]));
 console.log(String(product[1]));
+//# sourceMappingURL=operator-overload.mjs.map

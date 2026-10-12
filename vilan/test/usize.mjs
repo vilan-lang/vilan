@@ -277,3 +277,4 @@ if ($w[0] === 0) {
 	$x = console.log(reason2);
 }
 process.exit($x);
+//# sourceMappingURL=usize.mjs.map

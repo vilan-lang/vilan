@@ -44,3 +44,4 @@ const view = __at(ps, 0, "subscript.vl:40:18");
 view[1] = 50;
 console.log(String(__at(ps, 0, "subscript.vl:42:8")[1]));
 console.log(String(__at(xs, xs.length - 1, "subscript.vl:45:8")));
+//# sourceMappingURL=subscript.mjs.map

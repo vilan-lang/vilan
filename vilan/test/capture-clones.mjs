@@ -280,3 +280,4 @@ console.log(String(place_guarded()));
 console.log(String(called_component()));
 console.log(String(called_readonly()));
 console.log(String(owned_call()));
+//# sourceMappingURL=capture-clones.mjs.map

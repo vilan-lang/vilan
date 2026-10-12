@@ -63,3 +63,4 @@ const shrink = (v) => {
 	return v;
 };
 console.log(String(shrink(3)));
+//# sourceMappingURL=mut-parameters.mjs.map

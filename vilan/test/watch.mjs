@@ -220,3 +220,4 @@ function $g($h) {
 	console.error(String($i));
 	process.exit(1);
 });
+//# sourceMappingURL=watch.mjs.map

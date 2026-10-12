@@ -252,6 +252,10 @@
         "infer-const": {
           "type": "boolean",
           "description": "Fold `let` initializers the compiler can evaluate, without the `const` keyword (on under `release`, off under `debug`)."
+        },
+        "source-maps": {
+          "type": "boolean",
+          "description": "Write a source map beside each script, so a debugger and node's stack traces show `.vl` files and lines (on under `debug`, off under `release`)."
         }
       }
     },

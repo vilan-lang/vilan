@@ -19,3 +19,4 @@ console.log(d[1]);
 console.log(d[2]);
 const d2 = default5();
 console.log(eq(d, d2));
+//# sourceMappingURL=derive-default.mjs.map

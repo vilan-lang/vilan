@@ -116,6 +116,10 @@ package, `vilan test`), never one file at a time.
   ([the dev loop](../guide/dev-loop.md#shipping-routes-separately)).
 - `--explain`: after the build, print where every output came from — see
   below.
+- `--source-maps`: write a source map beside each script whatever the preset
+  says (`main.mjs.map`, named by the script's last line). The `debug` preset
+  writes one already; this is `[build] source-maps = true` for one build. See
+  [debugging](../guide/debugging.md#in-a-debugger).
 
 A `dbg(..)` or `dbg_stack()` call prints in a `debug` build, which is the
 default. A `release` build refuses one — "`dbg` left in a release build", at
@@ -397,6 +401,10 @@ program prints the same bytes under either backend.
   runnable entry, which one to launch. The others still compile; they
   don't run. The manifest's `default-entry` makes the flag
   unnecessary; with neither, the error names both ways to choose.
+
+A program `vilan run` starts runs with node's `--enable-source-maps` whenever
+its build wrote a map (the `debug` preset's default), so an uncaught panic's
+stack names `.vl` files and lines.
 
 ## `vilan fmt [paths…]`
 

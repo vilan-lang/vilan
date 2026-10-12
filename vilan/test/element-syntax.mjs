@@ -182,3 +182,4 @@ console.log(render(attr2(attr2(attr2(view("input"), "type", "checkbox"), "aria-l
 console.log(render(child2(child2(view("ul"), row("alpha")), row("beta"))));
 console.log(render(child2(attr2(view("svg"), "viewBox", "0 0 24 24"), attr2(view("path"), "d", "M5 12h14"))));
 console.log(render(child2(view("div"), child(view("span"), "chained"))));
+//# sourceMappingURL=element-syntax.mjs.map

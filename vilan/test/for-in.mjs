@@ -24,3 +24,4 @@ for (const _ of names) {
 	count = count + 1;
 }
 console.log(String(count));
+//# sourceMappingURL=for-in.mjs.map

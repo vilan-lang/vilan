@@ -79,6 +79,13 @@ pub struct BuildOptions {
     /// `debug` preset prints, the `release` preset refuses the build, and
     /// `[build] dbg = "strip"` / `"keep"` overrides either.
     pub dbg: DbgPolicy,
+    /// Write a source map beside the emitted JavaScript (debugging.md §5.1,
+    /// Q9; E257 S5): `.vl` lines and names in a debugger and in a stack
+    /// trace. On under `debug`, off under `release`, and `[build]
+    /// source-maps` or `vilan build --source-maps` overrides either. Read only
+    /// by the build's writers and `vilan run` — the JavaScript itself is the
+    /// same bytes either way, so no golden depends on it.
+    pub source_maps: bool,
 }
 
 /// The `[build] dbg` policy (debugging.md Q4).
@@ -116,6 +123,7 @@ impl BuildOptions {
                 hmr: false,
                 infer_const: false,
                 dbg: DbgPolicy::Keep,
+                source_maps: true,
             },
             Preset::Release => Self {
                 indent: false,
@@ -125,6 +133,7 @@ impl BuildOptions {
                 hmr: false,
                 infer_const: true,
                 dbg: DbgPolicy::Refuse,
+                source_maps: false,
             },
         }
     }

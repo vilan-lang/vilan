@@ -30,3 +30,4 @@ console.log(String(get(counter)));
 const label = new2("a");
 set(label, "hello");
 console.log(get(label));
+//# sourceMappingURL=generic-methods.mjs.map

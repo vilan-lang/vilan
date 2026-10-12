@@ -8,3 +8,4 @@ let c = [ 10 ];
 increment(c);
 bump(c);
 console.log(String(c[0]));
+//# sourceMappingURL=view-params.mjs.map

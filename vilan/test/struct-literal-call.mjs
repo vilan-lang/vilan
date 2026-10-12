@@ -7,3 +7,4 @@ function shifted(self) {
 console.log(String(sum([ 3, 4 ])));
 console.log(String([ 3, 4 ][0]));
 console.log(String(sum(shifted([ 10, 20 ]))));
+//# sourceMappingURL=struct-literal-call.mjs.map
