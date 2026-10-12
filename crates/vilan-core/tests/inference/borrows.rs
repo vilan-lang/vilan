@@ -13762,3 +13762,47 @@ fn b578_a_view_of_a_call_result_is_a_pair_where_the_pointee_is_a_scalar() {
         "<2>\n[2]\n[7]\n[5]\n[five]\n[42]\n[8]\n[7]\n8\n[9]\n[1]\n[nine]\n[4]\n5\n",
     );
 }
+
+/// B578, inside a generic body: `&identity(value)` where the call's `T` is the
+/// ENCLOSING instance's — the call's binding names the caller's parameter, and
+/// the active instance resolves it (a number pairs, a `str` pairs, through a
+/// free function and a generic method alike).
+#[test]
+fn b578_a_view_of_a_call_result_in_a_generic_body_pairs_per_instance() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::io::print;
+
+        fun peek<T: Display>(value: &T): str {
+            i"[{value}]"
+        }
+
+        fun identity<T>(value: T): T {
+            value
+        }
+
+        fun wrapped<T: Display>(value: T): str {
+            peek(&identity(value))
+        }
+
+        struct Boxed<T> {
+            value: T,
+        }
+
+        impl Boxed<type T: Display> {
+            fun shown(self): str {
+                peek(&identity(self.value))
+            }
+        }
+
+        fun main() {
+            print(wrapped(5));
+            print(wrapped("s"));
+            print(Boxed { value = 7 }.shown());
+            print(Boxed { value = "t" }.shown());
+        }
+        "#,
+        "[5]\n[s]\n[7]\n[t]\n",
+    );
+}
