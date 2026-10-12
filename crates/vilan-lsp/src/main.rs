@@ -2874,7 +2874,8 @@ fn enforce_program_retention(
 }
 
 /// M67: tell the base cache which documents are LIVE, so its byte budget never
-/// evicts a world one of them is analyzed from.
+/// evicts a world one of them is analyzed from — and (E294) which entries are
+/// the session's, so the budget is sized by their worlds.
 ///
 /// The retained set, rendered as entry paths. A URI with no file path (an
 /// untitled buffer) contributes none: it is not an entry the analyzer can key
@@ -2893,6 +2894,28 @@ fn declare_live_entries(retained: &[Url], documents: &DashMap<Url, Document>) {
         })
         .collect();
     vilan_core::analyzer::set_base_cache_live_entries(&entries);
+    // E294: and the session's entries — every declared entry of every package
+    // a document is open in, the worlds the dead-code clock analyzes at each
+    // pause (`schedule_package_union`) whether or not their entry is open.
+    // The base cache sizes its budget by them instead of letting the pause's
+    // legs evict each other. Read from the manifests here, at the same seam,
+    // so the set follows the open documents: a package whose last document
+    // closed stops sizing the budget when its close re-declares.
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for document in documents.iter() {
+        if let Some(dir) = document.manifest_dir()
+            && !packages.iter().any(|known| known == dir)
+        {
+            packages.push(dir.to_path_buf());
+        }
+    }
+    let session: Vec<PathBuf> = packages
+        .iter()
+        .filter_map(|dir| dead_items::entry_paths(dir))
+        .flatten()
+        .map(|(_, path)| path)
+        .collect();
+    vilan_core::analyzer::set_base_cache_session_entries(&session);
 }
 
 /// Land a completed analysis on the open document at `uri`
@@ -10955,6 +10978,51 @@ mod dead_item_clock_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// E294: the server declares its package's ENTRIES to the base cache, so
+    /// the budget is sized by the worlds the clock's legs are served from —
+    /// and withdraws them when the package's last document closes. Only
+    /// `shared.vl` is open: neither entry is live (M67's exemption cannot
+    /// reach them), which is the shape that evicted kolt's server world on 4
+    /// of 6 pauses.
+    #[tokio::test]
+    async fn the_packages_entries_size_the_base_cache_while_a_document_is_open() {
+        let (directory, shared) = workspace();
+        let (service, _socket) = backend();
+        let server = service.inner();
+        assert_eq!(
+            vilan_core::analyzer::base_cache_session_entries(),
+            (0, 0),
+            "nothing declared before a document opens",
+        );
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union — both entries' legs analyzed",
+        );
+        assert_eq!(
+            vilan_core::analyzer::base_cache_session_entries(),
+            (2, 2),
+            "the package's two declared entries are the session's, and each \
+             leg's admission taught the cache its key",
+        );
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: shared.clone(),
+                },
+            })
+            .await;
+        assert_eq!(
+            vilan_core::analyzer::base_cache_session_entries(),
+            (0, 0),
+            "the package's last document closed: its entries stop sizing the \
+             budget in the same breath",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// E140: **the withdrawal is the cone, not the package.** An edit to a file

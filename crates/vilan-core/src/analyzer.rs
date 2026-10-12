@@ -77298,9 +77298,58 @@ struct BaseCacheState {
     /// declare nothing, so the whole mechanism is one `is_empty` check on the
     /// admission path and the eviction behaves exactly as M24 wrote it.
     live_entries: HashMap<PathBuf, Option<BaseCacheKey>>,
+    /// E294: the DECLARED entries of the packages a front end is working in —
+    /// the language server's: every entry of every package it has a document
+    /// open in — each mapped to the key its last analysis used, once one has
+    /// been observed (canonical paths, learned at admission, exactly as
+    /// [`Self::live_entries`] are).
+    ///
+    /// These are the worlds the session comes back to whether or not their
+    /// entry is open: the server's dead-code clock runs one union analysis per
+    /// declared entry at every typing pause (`proposal/dead-code-paint.md`
+    /// §2.4). Under M67's flat budget they evicted each other — on kolt's
+    /// "leaf keystroke + pause" row the server entry's world was rebuilt cold,
+    /// std included, on 4 of 6 pauses (14.2 G instructions against 10.6 G with
+    /// the budget lifted). So the budget is SIZED by them: their worlds are
+    /// added to the budget rather than spent from it (and are therefore never
+    /// its victim — evicting one would lower the bound by exactly what it
+    /// freed), and the flat budget stays whole for everything else, which is
+    /// what M67 measured it against. The growth is bounded by the session's
+    /// packages, not by its history: a package nobody has a document open in
+    /// declares nothing.
+    ///
+    /// EMPTY everywhere but the language server, like the live entries.
+    session_entries: HashMap<PathBuf, Option<BaseCacheKey>>,
 }
 
 impl BaseCacheState {
+    /// The distinct keys a declared entry set names that this cache holds a
+    /// world for. At most one key per declared entry, so this is a few clones
+    /// on a path that runs on a store — and none at all in every front end
+    /// that declares nothing.
+    fn retained_keys(&self, entries: &HashMap<PathBuf, Option<BaseCacheKey>>) -> Vec<BaseCacheKey> {
+        let mut keys: Vec<BaseCacheKey> = Vec::new();
+        for key in entries.values().flatten() {
+            if self.worlds.contains_key(key) && !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+        keys
+    }
+
+    /// The bound in force, in recorded bytes (E294): the flat budget plus
+    /// every retained world a session entry names (`session`, from
+    /// [`Self::retained_keys`]).
+    fn budget_in_force(&self, session: &[BaseCacheKey]) -> usize {
+        let flat = BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        let sized_in: usize = session
+            .iter()
+            .filter_map(|key| self.worlds.get(key))
+            .map(|stored| stored.bytes)
+            .sum();
+        flat.saturating_add(sized_in)
+    }
+
     fn next_tick(&mut self) -> u64 {
         self.tick += 1;
         self.tick
@@ -77323,23 +77372,25 @@ impl BaseCacheState {
     /// the pins assert. An exempt set that alone exceeds the budget stops the
     /// loop rather than spinning it: there is no victim, and a cache that
     /// cannot evict is a cache that stays where it is.
+    ///
+    /// **E294: the budget is sized by the session's entry worlds.** Every
+    /// retained world a declared session entry names is ADDED to the budget,
+    /// so the bound in force is the flat budget plus those worlds, and none of
+    /// them is a victim — evicting one would lower the bound by exactly the
+    /// bytes it freed. The flat budget stays whole for the rest (M67's focus
+    /// walk is what it was measured against); a key that is both live and the
+    /// session's is sized in, once.
     fn evict_to_budget(&mut self, keep: Option<&BaseCacheKey>) {
-        let budget = BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
-        // At most one key per live entry, so this is two clones on a path that
-        // runs on a store — and none at all in every front end that declares
-        // no live entry.
-        let live: Vec<BaseCacheKey> = self
-            .live_entries
-            .values()
-            .flatten()
-            .filter(|key| self.worlds.contains_key(*key))
-            .cloned()
-            .collect();
+        let live = self.retained_keys(&self.live_entries);
+        let session = self.retained_keys(&self.session_entries);
+        let budget = self.budget_in_force(&session);
         while self.retained_bytes > budget {
             let victim = self
                 .worlds
                 .iter()
-                .filter(|(key, _)| Some(*key) != keep && !live.contains(key))
+                .filter(|(key, _)| {
+                    Some(*key) != keep && !live.contains(key) && !session.contains(key)
+                })
                 .min_by_key(|(_, stored)| stored.last_hit)
                 .map(|(key, _)| key.clone());
             let Some(victim) = victim else { return };
@@ -77397,17 +77448,43 @@ pub fn set_base_cache_live_entries(entries: &[PathBuf]) {
     let mut state = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    redeclare_entries(&mut state.live_entries, entries);
+}
+
+/// Declares the session's ENTRIES — every declared entry of every package a
+/// front end is working in (E294; see [`BaseCacheState::session_entries`]).
+///
+/// The budget is sized by these entries' worlds: each one retained is added
+/// to the budget in force rather than spent from it, so it is never the
+/// victim, and the rest of the cache keeps the whole flat budget. The same
+/// shape as [`set_base_cache_live_entries`]: the whole set each time, the
+/// previous declaration REPLACED (a package whose last document closed stops
+/// sizing the budget in the same breath), a path remembered before its key is
+/// known, a known key kept across a re-declaration, and an empty set the
+/// state every other front end is in.
+pub fn set_base_cache_session_entries(entries: &[PathBuf]) {
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    redeclare_entries(&mut state.session_entries, entries);
+}
+
+/// Replaces a declared entry set (M67's live entries, E294's session entries)
+/// with `entries`, canonically, keeping the key already learned for a path
+/// that stays declared.
+fn redeclare_entries(declared: &mut HashMap<PathBuf, Option<BaseCacheKey>>, entries: &[PathBuf]) {
     if entries.is_empty() {
-        state.live_entries.clear();
+        declared.clear();
         return;
     }
-    let mut live: HashMap<PathBuf, Option<BaseCacheKey>> = HashMap::default();
+    let mut next: HashMap<PathBuf, Option<BaseCacheKey>> = HashMap::default();
     for entry in entries {
         let canonical = crate::util::canonical_path(entry);
-        let known = state.live_entries.get(&canonical).cloned().flatten();
-        live.insert(canonical, known);
+        let known = declared.get(&canonical).cloned().flatten();
+        next.insert(canonical, known);
     }
-    state.live_entries = live;
+    *declared = next;
 }
 
 /// How many entries are declared live, and how many of them have had a key
@@ -77429,11 +77506,48 @@ pub fn base_cache_live_entries() -> (usize, usize) {
         .unwrap_or((0, 0))
 }
 
+/// How many session entries are declared, and how many of them have had a key
+/// observed (E294) — the test surface for the sizing, as
+/// [`base_cache_live_entries`] is for the exemption.
+#[doc(hidden)]
+pub fn base_cache_session_entries() -> (usize, usize) {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            let state = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.session_entries.len(),
+                state.session_entries.values().flatten().count(),
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
 /// The budget in force (M24) — the test surface, and what a `[vilan phase]`
 /// reader would want beside `base_cache_retained`.
 #[doc(hidden)]
 pub fn base_cache_budget() -> usize {
     BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The bound the cache is held to right now, in recorded bytes (E294): the
+/// flat [`base_cache_budget`] plus the worlds it holds for the session's
+/// declared entries. What the retained bytes are compared against, so it is
+/// the figure a status page sets beside them.
+#[doc(hidden)]
+pub fn base_cache_budget_in_force() -> usize {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            let state = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session = state.retained_keys(&state.session_entries);
+            state.budget_in_force(&session)
+        })
+        .unwrap_or_else(base_cache_budget)
 }
 
 /// A resident-byte figure, converted into the currency the budget is spent in
@@ -78567,12 +78681,19 @@ fn base_cache_admit(
     // has both, and recorded whether the lookup below hits or misses (a miss
     // stores under exactly this key a moment later). Skipped entirely where
     // nothing is declared live, which is every front end but the server.
-    if !state.live_entries.is_empty() {
+    // E294: the session's entries learn their keys at the same place.
+    if !state.live_entries.is_empty() || !state.session_entries.is_empty() {
         let canonical = crate::util::canonical_path(entry_path);
-        if let Some(slot) = state.live_entries.get_mut(&canonical)
-            && slot.as_ref() != Some(key)
-        {
-            *slot = Some(key.clone());
+        let declared_sets = &mut *state;
+        for declared in [
+            &mut declared_sets.live_entries,
+            &mut declared_sets.session_entries,
+        ] {
+            if let Some(slot) = declared.get_mut(&canonical)
+                && slot.as_ref() != Some(key)
+            {
+                *slot = Some(key.clone());
+            }
         }
     }
     // The wait's deadline is a WALL-CLOCK read, and `Instant::now()` aborts on

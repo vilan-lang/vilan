@@ -101,7 +101,8 @@ pub struct BaseCacheSizes {
     pub worlds: usize,
     /// What those worlds weigh, in resident bytes (M50's re-denomination).
     pub weight_bytes: usize,
-    /// The bound in force, in the same unit (M24/M67).
+    /// The bound in force, in the same unit (M24/M67) — the flat budget plus
+    /// the session's entry worlds it is sized by (E294).
     pub budget_bytes: usize,
 }
 
@@ -111,7 +112,7 @@ impl BaseCacheSizes {
         BaseCacheSizes {
             worlds: vilan_core::analyzer::base_cache_retained(),
             weight_bytes: vilan_core::analyzer::base_cache_retained_weight(),
-            budget_bytes: vilan_core::analyzer::base_cache_budget()
+            budget_bytes: vilan_core::analyzer::base_cache_budget_in_force()
                 .saturating_mul(vilan_core::analyzer::BASE_CACHE_WEIGHT_FACTOR),
         }
     }
