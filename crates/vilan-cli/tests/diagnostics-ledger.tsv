@@ -753,3 +753,4 @@ row	flagship	key
 729	-	a macro named `{name}` is already defined in this file: one file's macros, whichever `mod` declares them, compile into one macro world, so each name is defined once per file
 730	-	`{derive}` cannot be derived for the {kind} `{name}`: its {member} is `{}`, and a trait object names no concrete type to {codec} — the decoder rebuilds every member by its type. Hold the concrete type, or an enum of the concrete types, in that position, or write `impl {name} with {derive}` by hand
 731	-	`[derive({name})]` is expanded by the `{name}` macro `{path}` declares, and nothing in this program imports that module: write `import {path}::{name};`
+NEW	-	`{symbol}` computes on the bits of an integer, but an operand is `{float_label}`, a float: there are no implicit conversions; convert with `as_*` (`value.as_i32()`)

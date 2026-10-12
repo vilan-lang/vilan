@@ -69661,6 +69661,77 @@ impl<'src> Analyzer<'src> {
                         );
                         continue;
                     }
+                    // B607 (R-e, v0.49.0): the bitwise operators. `&`, `|`
+                    // and `^` over two DIFFERENT integer types are B579's
+                    // pair under three more operators — `i32 & usize`
+                    // checked, JS computed it in int32 and the native build
+                    // refused the pair. The shifts stay legal across integer
+                    // types, as in Rust: the right operand is a COUNT, not a
+                    // peer of the left (`a << b.len()` is the usual case).
+                    let integer = |analyzer: &Self, operand: &Type| {
+                        numeric(analyzer, operand) && !float(analyzer, operand)
+                    };
+                    if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor)
+                        && lhs_type != rhs_type
+                        && integer(self, &lhs_type)
+                        && integer(self, &rhs_type)
+                        && !self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
+                    {
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` computes on two values of the same type, but the \
+                                     operands are `{lhs_label}` and `{rhs_label}`: there are no \
+                                     implicit conversions; suffix the literal or convert with \
+                                     `as_*`"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
+                    // And any bitwise operator — shifts included — over a
+                    // FLOAT, on either side: a float has no bits to compute
+                    // on in the language (JS truncated `6.5 & 3.0` to int32
+                    // and printed `2`; rustc has no `BitAnd` for `f64`).
+                    let bitwise = matches!(
+                        op,
+                        BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::Shl
+                            | BinaryOp::Shr
+                            | BinaryOp::UShr
+                    );
+                    let float_operand = if float(self, &lhs_type) {
+                        Some(&lhs_type)
+                    } else if grounded(&rhs_type) && float(self, &rhs_type) {
+                        Some(&rhs_type)
+                    } else {
+                        None
+                    };
+                    if let (true, Some(float_type)) = (bitwise, float_operand) {
+                        let float_label = self.pretty_print_type(float_type, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` computes on the bits of an integer, but an \
+                                     operand is `{float_label}`, a float: there are no implicit \
+                                     conversions; convert with `as_*` (`value.as_i32()`)"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
                 }
                 // Same-type operands on the native path (`B = Self`). The
                 // non-native equality path falls through to the trait
