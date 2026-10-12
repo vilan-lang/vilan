@@ -1358,7 +1358,14 @@ pub(crate) fn expansion_cache_file(build_dir: &Path) -> PathBuf {
 }
 
 /// The header this compiler writes and will read back: the format line, the
-/// toolchain version, and a hash of `macro_std`'s own sources.
+/// toolchain version, the BUILD (a hash of vilan-core's sources, `crate::BUILD_ID`),
+/// and a hash of `macro_std`'s own sources.
+///
+/// The build line is G28: the entry key is "sound because the interpreter is
+/// deterministic by construction" - within ONE build. Two dev builds between releases
+/// share a version, so a change to the expansion engine or the const interpreter was
+/// served the previous build's expansions until `vilan cache clean`. A release build is
+/// unchanged in effect (its sources are its version).
 fn disk_stamp(std: &PackageSpec) -> String {
     static STAMP: OnceLock<String> = OnceLock::new();
     // One `PackageSpec` per process in every real front end, and a wrong-but-
@@ -1386,8 +1393,9 @@ fn disk_stamp(std: &PackageSpec) -> String {
                 }
             }
             format!(
-                "{DISK_FORMAT}\ntoolchain {}\nmacro_std {:016x}",
+                "{DISK_FORMAT}\ntoolchain {}\nbuild {}\nmacro_std {:016x}",
                 env!("CARGO_PKG_VERSION"),
+                crate::BUILD_ID,
                 hasher.finish(),
             )
         })
