@@ -1247,6 +1247,255 @@ fn an_unimported_macro_from_another_module_is_not_in_scope() {
     );
 }
 
+// G27: a `macro fun` declared inside an inline `mod { }` was registered
+// nowhere — only a file's TOP-LEVEL definitions were — so an attribute in that
+// same `mod` read "no macro named `tabled` is in scope". It is in scope in its
+// `mod` and the `mod`s nested in it, by every dispatch form: an attribute, a
+// derive, an item invocation and an expression invocation.
+#[test]
+fn g27_a_macro_declared_in_a_mod_is_in_scope_there() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod tables {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("fun table_name(): str { \"tabled\" }")
+            }
+
+            macro fun Named(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("fun derived_name(): str { \"derived\" }")
+            }
+
+            macro fun constant(arguments: Arguments): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Arguments, Source };
+                source("fun seven(): i32 { 7 }")
+            }
+
+            macro fun doubled(arguments: Arguments): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Arguments, Source };
+                import macro_std::option::Option::{ self, Some, None };
+                let text = match arguments.values.get(0) {
+                    Some(let value) => value,
+                    None => "0",
+                };
+                source(i"(({text}) * 2)")
+            }
+
+            [tabled]
+            struct Row {
+                id: i32,
+            }
+
+            [derive(Named)]
+            struct Column {
+                id: i32,
+            }
+
+            macro constant();
+
+            export fun names(): str {
+                table_name() + " " + derived_name() + " " + i"{seven()} {macro doubled(21)}"
+            }
+
+            mod inner {
+                [tabled]
+                struct Cell {
+                    id: i32,
+                }
+
+                export fun name(): str {
+                    table_name()
+                }
+            }
+
+            export fun inner_name(): str {
+                inner::name()
+            }
+        }
+
+        fun main() {
+            print(tables::names());
+            print(tables::inner_name());
+        }
+
+        main();
+        "#,
+        "tabled derived 7 42\ntabled\n",
+    );
+}
+
+// G27: a `mod`'s macro is the `mod`'s — a SIBLING `mod` does not see it, as
+// the file's top level does not (`an_unimported_macro_from_another_module_is_
+// not_in_scope`).
+#[test]
+fn g27_a_mods_macro_is_not_in_scope_in_a_sibling_mod() {
+    assert_fails_once_with(
+        r#"
+        mod tables {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("")
+            }
+        }
+
+        mod other {
+            [tabled]
+            struct Row {
+                id: i32,
+            }
+        }
+
+        fun main() {}
+
+        main();
+        "#,
+        "no macro named `tabled` is in scope",
+    );
+}
+
+// G27: one file's macros compile into ONE macro world, where each is a
+// function by its own name, so a name is defined once per file whichever `mod`
+// declares it — the second is refused with the reason, not left to collide
+// inside the world.
+#[test]
+fn g27_a_macro_name_is_defined_once_per_file_across_mods() {
+    assert_fails_with(
+        r#"
+        mod first {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("")
+            }
+        }
+
+        mod second {
+            macro fun tabled(item: Item): Source {
+                import macro_std::source;
+                import macro_std::meta::{ Item, Source };
+                source("")
+            }
+        }
+
+        fun main() {}
+
+        main();
+        "#,
+        "a macro named `tabled` is already defined in this file: one file's macros, whichever \
+         `mod` declares them, compile into one macro world",
+    );
+}
+
+// G25: `[derive(Json)]` / `[derive(Wire)]` over a type with a trait object
+// among its members emitted text that was not vilan (`dyn Src::from_json_value(
+// ..)`): the decoders rebuild each member by its type, and a trait object names
+// none. Refused by name above the generators — a field, a field holding a list
+// of them, and an enum variant's payload — for both codecs.
+#[test]
+fn g25_a_codec_derive_over_a_trait_object_member_is_refused_by_name() {
+    for (derive, import, declaration, member, codec) in [
+        (
+            "Json",
+            "import std::json::Json;",
+            "struct Holder { name: str, source: dyn Src }",
+            "field `source` is `dyn Src`",
+            "parse one back from JSON",
+        ),
+        (
+            "Json",
+            "import std::json::Json;",
+            "struct Holder { sources: List<dyn Src> }",
+            "field `sources` is `List<dyn Src>`",
+            "parse one back from JSON",
+        ),
+        (
+            "Wire",
+            "import std::wire::Wire;",
+            "struct Holder { source: dyn Src }",
+            "field `source` is `dyn Src`",
+            "rebuild one from the wire",
+        ),
+        (
+            "Json",
+            "import std::json::Json;",
+            "enum Holder { Empty, Held(dyn Src) }",
+            "variant `Held`'s payload is `dyn Src`",
+            "parse one back from JSON",
+        ),
+    ] {
+        let kind = if declaration.starts_with("enum") {
+            "enum"
+        } else {
+            "struct"
+        };
+        assert_fails_with(
+            &format!(
+                r#"
+                {import}
+
+                trait Src {{
+                    fun get(&self): i32;
+                }}
+
+                [derive({derive})]
+                {declaration}
+
+                fun main() {{}}
+                "#
+            ),
+            &format!(
+                "`{derive}` cannot be derived for the {kind} `Holder`: its {member}, and a trait \
+                 object names no concrete type to {codec}"
+            ),
+        );
+    }
+}
+
+// `[derive(Storable)]` in a program that never imports `std::reactive::store`
+// read "expanded before std's `reactive/store.vl` declared its `Storable`
+// macro: a compiler load-ordering bug (B21's class); please report how this
+// module is reached" — the B21 sentence assumes every std derive's module is
+// always loaded, and `reactive/store.vl` is loaded only by an import. It is a
+// missing import, said so with the line to write; with the import it expands.
+#[test]
+fn a_storable_derive_without_its_import_steers_to_the_import() {
+    let source = r#"
+        [derive(Storable)]
+        struct Row {
+            id: i32,
+        }
+
+        fun main() {}
+        "#;
+    assert_fails_once_with(
+        source,
+        "`[derive(Storable)]` is expanded by the `Storable` macro `std::reactive::store` \
+         declares, and nothing in this program imports that module: write `import \
+         std::reactive::store::Storable;`",
+    );
+    assert_fails_without(source, "load-ordering");
+    assert_compiles(
+        r#"
+        import std::reactive::store::Storable;
+
+        [derive(Storable)]
+        struct Row {
+            id: i32,
+        }
+
+        fun main() {}
+        "#,
+    );
+}
+
 // A user macro may now SHADOW a prelude derive for its own file — the
 // reserved-name rule died with the flat namespace.
 #[test]

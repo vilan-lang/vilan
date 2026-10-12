@@ -750,3 +750,6 @@ row	flagship	key
 726	-	`{current_name}` has no value to be a length
 727	-	`{current_name}` is `{whole}{fraction}{suffix}`, and an array length is a count: bind it to a whole number, unsuffixed or `usize`
 728	-	an array length is a number, a length parameter (`<const N>`), or a name bound to a number; `{current_name}`'s initializer needs evaluating, and const evaluation runs after the program is typed — bind it to a literal (`const let` keeps it compile-time)
+729	-	a macro named `{name}` is already defined in this file: one file's macros, whichever `mod` declares them, compile into one macro world, so each name is defined once per file
+730	-	`{derive}` cannot be derived for the {kind} `{name}`: its {member} is `{}`, and a trait object names no concrete type to {codec} — the decoder rebuilds every member by its type. Hold the concrete type, or an enum of the concrete types, in that position, or write `impl {name} with {derive}` by hand
+731	-	`[derive({name})]` is expanded by the `{name}` macro `{path}` declares, and nothing in this program imports that module: write `import {path}::{name};`

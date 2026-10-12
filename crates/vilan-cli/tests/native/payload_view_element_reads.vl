@@ -1,0 +1,63 @@
+// B577: an `Option<&str>` whose payload views a LIST ELEMENT (or a scalar
+// field) — `Some(&self.items[index])` — consumed anywhere but by a `match`
+// capturing it handed the view's `(base, key)` pair to the consumer on JS:
+// `shelf.at(1).unwrap_or("none")` printed `[ [ 'first', 'second' ], 1 ]`, a
+// `+ 1` concatenated `3,4,01`. Natively the payload is read out where the
+// option is consumed (F99); both backends print the values now.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Shelf {
+	items: List<str>,
+	counts: List<i32>,
+	title: str,
+}
+
+impl Shelf {
+	fun at(&self, index: usize): Option<&str> {
+		if index < self.items.len() {
+			Some(&self.items[index])
+		} else {
+			None
+		}
+	}
+
+	fun count(&self, index: usize): Option<&i32> {
+		if index < self.counts.len() {
+			Some(&self.counts[index])
+		} else {
+			None
+		}
+	}
+
+	fun title(&self, wanted: bool): Option<&str> {
+		if wanted {
+			Some(&self.title)
+		} else {
+			None
+		}
+	}
+}
+
+fun describe(found: Option<&str>): str {
+	match found {
+		Some(let name) => name,
+		None => "nothing",
+	}
+}
+
+fun main() {
+	let shelf = Shelf { items = ["first", "second"], counts = [3, 4], title = "shelf" };
+	print(shelf.at(1).unwrap_or("none"));
+	print(shelf.at(5).unwrap_or("none"));
+	print(shelf.count(0).unwrap_or(&0) + 1);
+	print(shelf.at(0).is_some());
+	print(describe(shelf.at(0)));
+	print(shelf.at(1).map(|name| name + "!").unwrap_or("none"));
+	print(shelf.title(true).unwrap_or("untitled"));
+	print(shelf.title(false).unwrap_or("untitled"));
+	match shelf.at(1) {
+		Some(let name) => print(*name),
+		None => print("absent"),
+	}
+}

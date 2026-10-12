@@ -2082,6 +2082,15 @@ fn helper_source(name: &str) -> &'static str {
              \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
+        // B577: an enum value whose `variant` carries a scalar view's
+        // `(base, key)` pair, with the pair read out — the option a call
+        // handing back `Option<&str>` is where it is consumed as a value.
+        "__payload_view_read" => {
+            "function __payload_view_read(value, variant) {\n\
+             \tif (value[0] === variant) return [ variant, value[1][0][value[1][1]] ];\n\
+             \treturn value;\n\
+             }"
+        }
         // `str.substring(start, end)` — the checked slice. The native JS method
         // clamps a negative to 0 and SWAPS an inverted pair, so `s.substring(k,
         // -1)` quietly returns `s[0..k]`, the complement of the request; and it
@@ -2750,6 +2759,17 @@ struct Transformer<'src> {
     // whether the guard READS a capture whose copy has to be declared ahead of
     // it (B59) — the guard's reference is to the copy, not the subject's slot.
     is_binding_reads: Option<HashSet<Id>>,
+    // B577: the `match` subject being walked, while it is — the one position
+    // where a call handing back a scalar view in its payload keeps the
+    // `(base, key)` pair, because the leg's capture binds the view
+    // (`wrapped_view_captures`). Saved and restored around each subject, so a
+    // `match` nested in the subject's own arguments answers for itself.
+    payload_view_subject: Option<Id>,
+    // B577: per callee, the variants whose single payload it hands back as a
+    // scalar view's pair ([`Self::payload_view_variants`]) —
+    // decided by the analyzer's verdict on each payload, which an instance
+    // never re-decides, so one answer serves every call.
+    payload_view_variants_memo: HashMap<Id, Vec<usize>>,
     // Runtime helper functions (`__scan`, `__parse_i32`, `__random_int`) an
     // intrinsic call needs; emitted as a prelude only when used.
     used_helpers: BTreeSet<&'static str>,
@@ -2991,6 +3011,9 @@ struct EmissionRecorder {
     instances: HashMap<(Id, Vec<String>, Vec<Id>), EmissionId>,
     defaults: HashMap<(Id, String), EmissionId>,
     drops: HashMap<String, EmissionId>,
+    /// G25: a trait object's table, by its emitted NAME — the memo answers a
+    /// name, and an M89 alias names the table it repeats.
+    vtables: HashMap<String, EmissionId>,
 }
 
 thread_local! {
@@ -3221,6 +3244,8 @@ impl<'src> Transformer<'src> {
             const_capture_values: HashMap::default(),
             emitting_snapshots: HashSet::default(),
             is_binding_reads: None,
+            payload_view_subject: None,
+            payload_view_variants_memo: HashMap::default(),
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
@@ -4583,6 +4608,159 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// B577: `node`, the emission of `id`, with its payload READ OUT when `id`
+    /// is a call handing back a scalar view inside an enum variant (`fun
+    /// at(&self, i: usize): Option<&str> { .. Some(&self.items[i]) .. }`) and
+    /// stands anywhere but as the subject of a `match` that captures it.
+    ///
+    /// The payload is the view's `(base, key)` pair, and the one consumer that
+    /// knows it is the leg capture of a `match` over the call itself
+    /// (`wrapped_view_captures`, whose `*v` reads through the pair and whose
+    /// `v = ..` writes through it). Everywhere else the option is a value of
+    /// the POINTEE's type — a generic over it (`unwrap_or`, `map`, `is_some`)
+    /// is monomorphised at `Option<str>`, a parameter typed `Option<&str>`
+    /// matches its own captures as copies, an `is` capture is a copy — so the
+    /// pair was handed back as the `T` (`shelf.at(1).unwrap_or("none")`
+    /// printed `[ [ 'first', 'second' ], 1 ]`). None of those positions can
+    /// write through the view (the analyzer refuses a write to such a copy), so
+    /// reading it where the option is consumed is rule 1's copy taken at the
+    /// only moment the view is read — the native backend's F99 `.cloned()`.
+    fn read_out_a_payload_view(&mut self, id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        if self.payload_view_subject == Some(id) {
+            return node;
+        }
+        let variants = self.payload_view_variants(id);
+        if variants.is_empty() || node.is_divergent() {
+            return node;
+        }
+        self.payload_view_read(node, &variants)
+    }
+
+    /// `__payload_view_read(value, variant)` per variant carrying the pair.
+    fn payload_view_read(&mut self, value: js::Node<'src>, variants: &[usize]) -> js::Node<'src> {
+        self.used_helpers.insert("__payload_view_read");
+        variants.iter().fold(value, |value, variant| {
+            js::Node::Call(
+                Box::new(js::Node::Local("__payload_view_read".to_string())),
+                vec![value, js::Node::Number(variant.to_string(), None)],
+            )
+        })
+    }
+
+    /// Whether a `match` leg over a subject that KEPT its payload view (the
+    /// `variants` carrying the pair) reads the payload as a VALUE: a literal or
+    /// any other refutable sub-pattern of a carrying variant, or a binding of
+    /// the whole option. A tag test (`None`, `Some(_)`) reads no payload, and
+    /// the view-capturing leg wants the pair.
+    fn pattern_reads_a_kept_payload(&self, pattern: &ExprPattern, variants: &[usize]) -> bool {
+        if variants.is_empty() || self.captures_a_wrapped_scalar_view(pattern) {
+            return false;
+        }
+        match pattern {
+            ExprPattern::Wildcard => false,
+            ExprPattern::Variant(_, variant, payload) => {
+                variants.contains(variant)
+                    && payload
+                        .iter()
+                        .any(|sub_pattern| !matches!(sub_pattern, ExprPattern::Wildcard))
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether a `match` leg's pattern is `V(let v)` binding a wrapped SCALAR
+    /// view — the capture `wrapped_view_captures` makes a pair holder.
+    fn captures_a_wrapped_scalar_view(&self, pattern: &ExprPattern) -> bool {
+        matches!(
+            pattern,
+            ExprPattern::Variant(_, _, payload)
+                if matches!(
+                    payload.as_slice(),
+                    [ExprPattern::Binding(capture)]
+                        if self.program.primitive_views.contains(capture)
+                )
+        )
+    }
+
+    /// B577: the variants whose single payload the callee of the call `id`
+    /// hands back as a scalar view's `(base, key)` pair — a `borrows`
+    /// function (not itself returning a bare view) one of whose TAIL leaves is
+    /// a variant built over `&place` of a scalar place — the analyzer's
+    /// `function_returns_wrapped_view` (a `ret` of one is refused as an
+    /// escape). Empty for every other expression.
+    ///
+    /// The payload's representation is the analyzer's verdict
+    /// (`fixed_view_refs`: a wrapped view's payload is never re-decided per
+    /// instance), so the answer is the callee's alone and memoized by it.
+    fn payload_view_variants(&mut self, id: Id) -> Vec<usize> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id) else {
+            return Vec::new();
+        };
+        let Some(Expr::Local(target)) = self
+            .program
+            .function_calls
+            .get(call_id)
+            .and_then(|function_call| self.program.entity_map.get(&function_call.subject_id))
+        else {
+            return Vec::new();
+        };
+        let target = *target;
+        let Some(function) = self.program.functions.get(&target) else {
+            return Vec::new();
+        };
+        if !function.has_body
+            || function.borrows.is_empty()
+            || function.returns_view
+            || function.returns_mut_view
+        {
+            return Vec::new();
+        }
+        if let Some(variants) = self.payload_view_variants_memo.get(&target) {
+            return variants.clone();
+        }
+        let mut leaves = Vec::new();
+        self.collect_value_tail_leaves(function.body.1, &mut leaves);
+        let mut variants = Vec::new();
+        for leaf in leaves {
+            if let Some(variant) = self.scalar_view_variant(leaf)
+                && !variants.contains(&variant)
+            {
+                variants.push(variant);
+            }
+        }
+        self.payload_view_variants_memo
+            .insert(target, variants.clone());
+        variants
+    }
+
+    /// The variant index of `leaf` when it is a variant construction over a
+    /// single `&place`/`&mut place` that emits a scalar `(base, key)` pair.
+    fn scalar_view_variant(&self, leaf: Id) -> Option<usize> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&leaf) else {
+            return None;
+        };
+        let function_call = self.program.function_calls.get(call_id)?;
+        let Some(Expr::Local(constructor)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let Some(Expr::EnumVariant(_, variant)) = self.program.entity_map.get(constructor) else {
+            return None;
+        };
+        let [argument] = function_call.argument_ids.as_slice() else {
+            return None;
+        };
+        match self.program.entity_map.get(argument) {
+            Some(Expr::Reference(operand, _))
+                if self.emits_scalar_view_ref(*argument, *operand)
+                    && !self.program.return_view_reads.contains(argument) =>
+            {
+                Some(*variant)
+            }
+            _ => None,
+        }
+    }
+
     /// The tail leaves a value expression evaluates to: an `if`, a `match` and
     /// a block contribute each branch's tail, anything else is itself — the
     /// analyzer's `collect_tail_leaves`, asked at emission.
@@ -4965,11 +5143,28 @@ impl<'src> Transformer<'src> {
     /// per-instance half of `scalar_view_refs`, whose analyzer verdict an
     /// abstract `T` cannot reach. An expression with no recorded type answers
     /// by its shape, as the analyzer's `place_is_scalar` does (B505).
+    ///
+    /// B578: three shapes store no type of their own and are rvalues a view
+    /// is taken of as freely as a literal — a CALL (`&xs.len()`, `&seven()`),
+    /// answered by its callee's return type under the call's own binding, and
+    /// a value `if`/`match`/block, answered by its tail leaves. Read as "not
+    /// a scalar", the view of one passed the bare value where a `&usize` or a
+    /// generic `&T` at a scalar instance reads `value[0][value[1]]`, and the
+    /// callee threw a TypeError.
     fn value_resolves_to_scalar(&self, expr_id: Id) -> bool {
         if let Some(type_id) = self.expr_type_id(expr_id) {
             return self.resolves_to_scalar_view_pointee(type_id);
         }
         match self.program.entity_map.get(&expr_id) {
+            Some(Expr::Call(call_id)) => self.call_result_resolves_to_scalar(*call_id),
+            Some(Expr::If(..) | Expr::Match(..) | Expr::Block(..)) => {
+                let mut leaves = Vec::new();
+                self.collect_value_tail_leaves(expr_id, &mut leaves);
+                leaves
+                    .into_iter()
+                    .any(|leaf| leaf != expr_id && self.value_resolves_to_scalar(leaf))
+            }
+            Some(Expr::Ascribe(inner)) => self.value_resolves_to_scalar(*inner),
             Some(Expr::Number(..) | Expr::String(_) | Expr::MultilineString(_)) => true,
             Some(Expr::Binary(
                 BinaryOp::Eq
@@ -4989,6 +5184,76 @@ impl<'src> Transformer<'src> {
             Some(Expr::Unary(_, operand)) => self.value_resolves_to_scalar(*operand),
             _ => false,
         }
+    }
+
+    /// B578: whether a call's RESULT is a scalar the view machinery pairs —
+    /// its callee's return type (declared, or inferred for an unannotated
+    /// function; an external's; a closure type's), with a generic return
+    /// resolved through the binding the call instantiates its callee with.
+    fn call_result_resolves_to_scalar(&self, call_id: Id) -> bool {
+        let Some(function_call) = self.program.function_calls.get(&call_id) else {
+            return false;
+        };
+        let target = match self.program.entity_map.get(&function_call.subject_id) {
+            Some(Expr::Local(target)) => Some(*target),
+            _ => None,
+        };
+        let return_type_id = match target {
+            Some(target) if self.program.functions.contains_key(&target) => {
+                let function = &self.program.functions[&target];
+                function
+                    .return_type_id
+                    .or_else(|| self.program.inferred_return_types.get(&target).copied())
+            }
+            Some(target) if self.program.external_functions.contains_key(&target) => {
+                Some(self.program.external_functions[&target].return_type_id)
+            }
+            _ => self
+                .expr_type_id(function_call.subject_id)
+                .and_then(|subject_type| {
+                    match self
+                        .program
+                        .type_id_to_type_map
+                        .get(&self.resolve_type_id(subject_type))
+                    {
+                        Some(Type::Closure(_, return_type_id, _, _)) => Some(*return_type_id),
+                        _ => None,
+                    }
+                }),
+        };
+        let Some(mut return_type_id) = return_type_id else {
+            return false;
+        };
+        if let Some(target) = target
+            && let Some(Type::Generic(constraint_id)) =
+                self.program.type_id_to_type_map.get(&return_type_id)
+            && let Some(bound) = self
+                .call_substitution(call_id, target, &function_call.generic_argument_ids)
+                .and_then(|substitution| substitution.get(constraint_id).copied())
+        {
+            return_type_id = bound;
+        }
+        self.resolves_to_scalar_view_pointee(return_type_id)
+    }
+
+    /// Whether a call hands back a VIEW — a `&`/`&mut`-returning function's
+    /// (a scalar one's `(base, key)` pair, an aggregate's reference at every
+    /// instance), or a scalar `Shared::write()`. `&` of one is the view itself.
+    fn call_returns_a_view(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let returns_a_view = self
+            .program
+            .function_calls
+            .get(call_id)
+            .and_then(|function_call| self.program.entity_map.get(&function_call.subject_id))
+            .and_then(|subject| match subject {
+                Expr::Local(target) => self.program.functions.get(target),
+                _ => None,
+            })
+            .is_some_and(|function| function.returns_view || function.returns_mut_view);
+        returns_a_view || self.emits_scalar_view_pair(call_expr_id)
     }
 
     /// The `(base, key)` pair a view of the scalar place `operand` lowers to —
@@ -5065,6 +5330,12 @@ impl<'src> Transformer<'src> {
             }
             Some(Expr::Dereference(inner)) if self.emits_scalar_view_pair(*inner) => {
                 return self.walk_entity(*inner, block).unwrap_or(js::Node::Void);
+            }
+            // ...and of a call handing one back (B578: a call's result is a
+            // scalar by its return type now, which a view-returning callee's
+            // collapsed `&i32` reads as too).
+            Some(Expr::Call(..)) if self.call_returns_a_view(operand) => {
+                return self.walk_entity(operand, block).unwrap_or(js::Node::Void);
             }
             _ => (
                 js::Node::Array(vec![
@@ -5524,6 +5795,7 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
+        let node = self.read_out_a_payload_view(id, node);
         // C11 (`temporary-drop.md`): a resource value that is neither bound nor
         // moved is owned by its STATEMENT. It has no name of its own, so it is
         // given one here — a minted `const` at the statement's position — and
@@ -7660,9 +7932,27 @@ impl<'src> Transformer<'src> {
                 return None;
             }
             Expr::Match(subject_id, legs) => {
-                let t_subject = self
-                    .walk_entity(*subject_id, block)
-                    .unwrap_or(js::Node::Void);
+                // B577: a leg capturing a wrapped scalar view binds the pair,
+                // so the subject keeps it; with no such capture (`Some("a")
+                // => ..`, `_ => ..`) the legs test the VALUE and it is read out.
+                let keeps_the_view = legs
+                    .iter()
+                    .any(|leg| self.captures_a_wrapped_scalar_view(&leg.pattern));
+                let outer_subject = std::mem::replace(
+                    &mut self.payload_view_subject,
+                    keeps_the_view.then_some(*subject_id),
+                );
+                let t_subject = self.walk_entity(*subject_id, block);
+                self.payload_view_subject = outer_subject;
+                let t_subject = t_subject.unwrap_or(js::Node::Void);
+                // ...and a leg that does not capture it — a literal payload
+                // (`Some("a") =>` beside a `Some(let v) =>`) — tests the value
+                // read out of the kept subject.
+                let kept_view_variants = if keeps_the_view {
+                    self.payload_view_variants(*subject_id)
+                } else {
+                    Vec::new()
+                };
                 // Evaluate the subject once into a temporary; every variant
                 // test and capture reads from it.
                 let subject_name = self.ng.next_name();
@@ -7682,7 +7972,10 @@ impl<'src> Transformer<'src> {
                     let mut body = Vec::new();
                     let mut prelude = Vec::new();
                     let mut guard_condition = None;
-                    let subject = js::Node::Local(subject_name.clone());
+                    let mut subject = js::Node::Local(subject_name.clone());
+                    if self.pattern_reads_a_kept_payload(&leg.pattern, &kept_view_variants) {
+                        subject = self.payload_view_read(subject, &kept_view_variants);
+                    }
                     let mut conditions = Vec::new();
                     match leg.guard {
                         // No guard: captures are declared as `const`s in the body.
@@ -11306,13 +11599,23 @@ impl<'src> Transformer<'src> {
         self.write_type_key_arguments(trait_arguments, &mut type_key);
         let key = (trait_id, type_key);
         if let Some(name) = self.vtables.get(&key) {
-            return name.clone();
+            let name = name.clone();
+            self.record_hit(|recorder| recorder.vtables.get(&name).copied());
+            return name;
         }
         let name = self.ng.next_name();
         // Inserted BEFORE the slots are resolved: a member's body may coerce a
         // value of this very pair (a node holding a `dyn` of its own kind), and
         // the recursion has to find the name rather than build a second table.
         self.vtables.insert(key, name.clone());
+        // G25: a table is a keyed emission like an instance — a `const`
+        // evaluation reaching a `dyn` coercion reaches the table and, through
+        // its frame, the members it names. Unrecorded, the const world had no
+        // declaration for it (`$a` is not defined).
+        let emission = self.record_keyed(|recorder, id| {
+            recorder.vtables.insert(name.clone(), id);
+        });
+        let frame = self.record_enter();
         let members = self.object_dispatchable_members(trait_id);
         let mut entries: Vec<(String, js::Node<'src>)> = Vec::with_capacity(members.len());
         for member_name in members {
@@ -11380,11 +11683,15 @@ impl<'src> Transformer<'src> {
             .collect();
         if let Some(slot_set) = slot_set {
             if let Some(first) = self.vtables_by_slots.get(&slot_set) {
+                let first = first.clone();
+                self.record_hit(|recorder| recorder.vtables.get(&first).copied());
                 self.monomorphized
                     .push(js::Node::ConstVariable(js::Variable {
                         name: name.clone(),
-                        value: Box::new(js::Node::Local(first.clone())),
+                        value: Box::new(js::Node::Local(first)),
                     }));
+                self.record_leave(frame, emission);
+                self.record_landed(emission);
                 return name;
             }
             self.vtables_by_slots.insert(slot_set, name.clone());
@@ -11394,6 +11701,8 @@ impl<'src> Transformer<'src> {
                 name: name.clone(),
                 value: Box::new(js::Node::Vtable(entries)),
             }));
+        self.record_leave(frame, emission);
+        self.record_landed(emission);
         name
     }
 

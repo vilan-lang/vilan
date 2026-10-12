@@ -26,6 +26,13 @@ macro fun derive_display(item: Item): Source
   (for plain values, prefer `const`, §9).
 - Macros may call other macros as ordinary functions during expansion.
 
+A macro's name is in scope where it is declared: at a file's top level,
+throughout the file; inside an inline `mod { … }`, throughout that
+`mod` and the `mod`s nested in it, but not beside or outside it. Another
+file reaches a top-level macro by importing it by name; std's macros are
+in scope everywhere. A file's macros compile together, so each name is
+declared once per file, whichever `mod` declares it.
+
 ## 10.2 The macro environment
 
 A macro's body is ordinary Vilan, but it compiles against

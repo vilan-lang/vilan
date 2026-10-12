@@ -9574,6 +9574,48 @@ fn an_option_of_a_shared_view_consumed_in_place_is_identical_on_both_backends() 
     );
 }
 
+/// B577: an `Option<&str>` whose payload views a LIST ELEMENT or a scalar
+/// field (`Some(&self.items[index])`) handed the `(base, key)` pair to every
+/// consumer but a capturing `match` on JS — `unwrap_or`, `map`, `+ 1`, a user
+/// function taking the option — where natively F99 reads the payload out.
+/// The JS emitter reads it out at the same positions now.
+#[test]
+fn b577_an_option_viewing_a_list_element_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_payload_view_element_reads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/payload_view_element_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an `Option<&str>` over a list element must read its payload out on both backends"
+    );
+}
+
+/// B578: `&` of a call's result (or a value `if`/`match`/block) handed to a
+/// `&usize` or a generic `&T` at a scalar instance — the callee reads the
+/// `(base, key)` pair the view machinery makes of a scalar, and JS passed the
+/// bare value (`shown(&xs.len())` threw a TypeError); natively a reference
+/// to a temporary. The JS emitter gives the temporary its own cell now.
+#[test]
+fn b578_a_view_of_a_call_result_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_views_of_call_results.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/views_of_call_results.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a view of a call result must reach a scalar `&T` as a pair on JS"
+    );
+}
+
 /// A `main` that answers its EXIT CODE (`fun main(): i32`, resource_exit.vl's
 /// shape) emitted its tail followed by the event loop's turn, which rustc
 /// refused ("expected `;`"). It exits with the code natively now, after its

@@ -23,6 +23,36 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: diagnostics -->
+**`[derive(Storable)]` in a program that never imports `std::reactive::store` says the import it owes — it read "expanded before std's `reactive/store.vl` declared its `Storable` macro: a compiler load-ordering bug (B21's class); please report how this module is reached".** The B21 sentence assumed every std derive's module loads with every program, which holds for `compare`/`default`/`debug`/`json`/`hash` and not for `reactive/store.vl`, loaded only by an import; reaching the derive without it is a missing import: "write `import std::reactive::store::Storable;`". Pin: `a_storable_derive_without_its_import_steers_to_the_import`. Tracker: fix-51's find (newitems51-fix-51.json, `B?2`).
+
+---
+
+<!-- family: fix -->
+**G25: a `const` evaluation dispatches through a trait object, and the two `dyn` positions it cannot serve are refused by name — `const let T: i32 = total()` over a body that builds a `let source: dyn Src` failed "`$a` is not defined", and `[derive(Json)]` over a struct with a `source: dyn Src` field failed "macro `Json` generated invalid Vilan".** A trait object's method table is a declaration the emitter adds beside the functions, and the const world never recorded it as reached, so an evaluation that built one named a table nothing declared; the table is a keyed emission like an instance now, and `const make().get()`, a `List<dyn Src>` walked inside a `const fun` and a `dyn` local all evaluate. A const RESULT that is or holds a trait object (`const let C: dyn Src`, a struct with a `dyn` field, a `List<dyn Src>`) is refused as one — "this evaluates to a trait object (a `dyn` value), whose method table is code the program builds" — where it read "a `Shared` cell". `[derive(Json)]` / `[derive(Wire)]` over a type with a `dyn` member (a field, a `List<dyn Src>` field, a variant's payload) is refused above the generators, naming the member: the decoders rebuild every member by its type (`dyn Src::from_json_value(..)` was the invalid text), and a trait object names none. The const spec's §9.4 and the encoding page say both. Pins: `g25_a_const_evaluation_dispatches_through_a_trait_object`, `g25_a_const_holding_a_trait_object_is_refused_by_name`, `g25_a_codec_derive_over_a_trait_object_member_is_refused_by_name`. Tracker G25.
+
+---
+
+<!-- family: fix -->
+**G27: a `macro fun` declared inside an inline `mod { }` is in scope in that `mod` — an attribute beside it (`[tabled] struct Row`) read "no macro named `tabled` is in scope".** Only a file's TOP-LEVEL `macro fun`s were registered, so one inside a `mod` was in scope nowhere. It is now in scope throughout its `mod` and the `mod`s nested in it, by every dispatch form (an attribute, a derive, an item and an expression invocation), and not beside or outside it, where the file's top level already could not see it. A file's macros compile into one macro world, so a name declared in two of its `mod`s is refused by name rather than left to collide there. The spec's §10.1 says where a macro's name is in scope. Pins: `g27_a_macro_declared_in_a_mod_is_in_scope_there`, `g27_a_mods_macro_is_not_in_scope_in_a_sibling_mod`, `g27_a_macro_name_is_defined_once_per_file_across_mods`. Tracker G27.
+
+---
+
+<!-- family: fix -->
+**G26: `str::index_of` and `last_index_of` run in a `const` evaluation — `const find("abc")` over `text.index_of("b")` failed "the string method `indexOf` is not available at expansion time", the natural way to search a file `asset::read` returned at build time.** The const interpreter answers the host's `indexOf` / `lastIndexOf` (the two std reaches through `raw_index_of` / `raw_last_index_of`) in UTF-16 code units, the unit `len` and `substring` count, `-1` when absent and an empty needle at 0 and at the length, as the host places it. Every other method std declares on `str` over a host binding already ran; a census pin now holds the class. Pins: `g26_index_of_and_last_index_of_evaluate_at_expansion_time`, `g26_every_str_method_std_declares_evaluates_at_expansion_time`. Tracker G26.
+
+---
+
+<!-- family: miscompile -->
+**B578: `&` of a CALL's result handed to a generic `&T` (or a `&usize`) runs on the JS backend — `shown(&xs.len())` with `fun shown<T: Display>(value: &T)` threw `TypeError: Cannot read properties of undefined` where native printed `<2>`.** A view of a scalar is a `(base, key)` pair on JS, and the callee at a scalar `T` reads `value[0][value[1]]`; the call site decides whether to make the pair by the operand's type, and a call's result records none, so `&seven()`, `&identity(5)`, `&xs.len()`, `&twice(4)` (a closure), `&boxed.get()` (a generic method's `T`) and a `let held = &seven()` passed the bare number. The same held for a value `if`/`match`/block (`&(if c { 1 } else { 2 })`). The emitter now types such an rvalue by its callee's return — declared, inferred, an external's or a closure type's, with a generic return resolved through the call's own binding — or by its tail leaves, and gives the temporary its own one-slot cell, as a literal's `&11` already had; a call that hands back a VIEW (`&holder.slot()`) is re-borrowed as the view it is. Pins: `b578_a_view_of_a_call_result_is_a_pair_where_the_pointee_is_a_scalar` and `native_differential`'s `b578_a_view_of_a_call_result_is_identical_on_both_backends` (`native/views_of_call_results.vl`). The JS corpus is byte-identical. Tracker B578.
+
+---
+
+<!-- family: miscompile -->
+**B577: an `Option<&str>` whose payload views a LIST ELEMENT or a scalar field, consumed as a value, answers the element on the JS backend — `shelf.at(1).unwrap_or("none")` over `fun at(&self, index: usize): Option<&str> { .. Some(&self.items[index]) .. }` printed `[ [ 'first', 'second' ], 1 ]` (the view's `(base, key)` pair) where native printed `second`, and `shelf.count(0).unwrap_or(&0) + 1` concatenated `3,4,01`.** A view of a scalar is a `(base, key)` pair on JS, and the one consumer that reads a wrapped one through it is the capture of a `match` over the call itself (`Some(let v) => *v`). Every other position consumes the option as a value of the POINTEE's type — a generic over it (`unwrap_or`, `map`, `is_some`), a method forwarding the call, a `let` holding it, an `is` capture, a `!` lift, a list of options, a parameter typed `Option<&str>` — and was handed the pair as its `T`. The emitter now reads the payload out where the option is consumed (`__payload_view_read`, which the const interpreter runs too), as F99's `.cloned()` does natively; a `match` keeps the pair for a capturing leg and tests a literal leg beside it (`Some("first") =>`) against the value read out. An `Option<&mut i32>` read as a value (`.map(|v| v + 1)`, a parameter printing its capture) took the same fix: no position but the capturing `match` can write through it. Pins: `b577_an_option_viewing_a_scalar_reads_its_payload_where_consumed`, `b577_a_match_over_the_call_captures_the_view_and_tests_the_value`, `b577_a_const_evaluation_reads_the_payload_out`, and `native_differential`'s `b577_an_option_viewing_a_list_element_is_identical_on_both_backends` (`native/payload_view_element_reads.vl`). The JS corpus is byte-identical. Tracker B577.
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

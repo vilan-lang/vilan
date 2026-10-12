@@ -13537,3 +13537,272 @@ fn e290_a_tuple_view_subjects_refusals_name_the_slot_not_a_payload() {
          captures are views into the payload",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B577: a call handing back a scalar view inside an enum payload, consumed as
+// a value.
+// ---------------------------------------------------------------------------
+
+/// The shelf the B577 pins read: `Option<&str>` over a list element and a
+/// field, `Option<&mut i32>` over a field.
+const B577_SHELF: &str = r#"
+    import std::io::print;
+    import std::option::Option::{ self, None, Some };
+
+    struct Shelf {
+        items: List<str>,
+        count: i32,
+    }
+
+    impl Shelf {
+        fun at(&self, index: usize): Option<&str> {
+            if index < self.items.len() {
+                Some(&self.items[index])
+            } else {
+                None
+            }
+        }
+
+        fun first(&self): Option<&str> {
+            self.at(0)
+        }
+
+        fun count_mut(&mut self): Option<&mut i32> {
+            Some(&mut self.count)
+        }
+    }
+"#;
+
+/// B577: the payload of `Some(&self.items[index])` is the element's `(base,
+/// key)` pair on JS, and every consumer but a capturing `match` over the call
+/// read it as the value — `unwrap_or` printed `[ [ 'first', 'second' ], 1 ]`.
+/// Each position: a generic over the option (`unwrap_or`, `map`, `is_some`),
+/// a method forwarding the call, a `let` holding it, an `is` capture, a `!`
+/// lift, a list of options, and a `&mut` payload read through `map` and by a
+/// function taking the option.
+#[test]
+fn b577_an_option_viewing_a_scalar_reads_its_payload_where_consumed() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{B577_SHELF}
+            fun suffixed(shelf: &Shelf, index: usize): Option<str> {{
+                let name = shelf.at(index)!;
+                Some(name + "?")
+            }}
+
+            fun shown(found: Option<&mut i32>): str {{
+                match found {{
+                    Some(let value) => i"{{value}}",
+                    None => "none",
+                }}
+            }}
+
+            fun main() {{
+                let shelf = Shelf {{ items = ["first", "second"], count = 1 }};
+                print(shelf.at(1).unwrap_or("none"));
+                print(shelf.at(7).unwrap_or("none"));
+                print(shelf.at(1).map(|name| name + "!").unwrap_or("none"));
+                print(shelf.at(0).is_some());
+                print(shelf.first().unwrap_or("none"));
+                let held = shelf.at(1);
+                print(held.unwrap_or("none"));
+                if shelf.at(0) is Some(let name) {{
+                    print(name);
+                }}
+                print(suffixed(&shelf, 1).unwrap_or("none"));
+                for found in [shelf.at(0), shelf.at(9)] {{
+                    print(found.unwrap_or("-"));
+                }}
+                mut counter = Shelf {{ items = [], count = 1 }};
+                print(counter.count_mut().map(|value| value + 1).unwrap_or(0));
+                print(shown(counter.count_mut()));
+            }}
+            "#
+        ),
+        "second\nnone\nsecond!\ntrue\nfirst\nsecond\nfirst\nsecond?\nfirst\n-\n2\n1\n",
+    );
+}
+
+/// B577: a `match` over the call keeps the pair for the leg that CAPTURES the
+/// view (`Some(let v)`, read and written through it) — and a leg testing the
+/// payload as a value beside it (`Some("first")`), or a `match` with no
+/// capturing leg at all, tests the value read out, not the pair.
+#[test]
+fn b577_a_match_over_the_call_captures_the_view_and_tests_the_value() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{B577_SHELF}
+            fun main() {{
+                mut shelf = Shelf {{ items = ["first", "second"], count = 1 }};
+                for index in [0usize, 1, 2] {{
+                    let said = match shelf.at(index) {{
+                        Some("first") => "literal",
+                        Some(let name) => *name,
+                        None => "none",
+                    }};
+                    print(said);
+                }}
+                match shelf.at(0) {{
+                    Some("first") => print("only a literal"),
+                    _ => print("other"),
+                }}
+                match shelf.count_mut() {{
+                    Some(let count) => count += 10,
+                    None => {{}},
+                }}
+                print(shelf.count);
+            }}
+            "#
+        ),
+        "literal\nsecond\nnone\nonly a literal\n11\n",
+    );
+}
+
+/// B577: the read-out helper the JS emitter calls is one the const
+/// interpreter runs too — a `const` evaluation consuming the option as a value
+/// computes what the program would.
+#[test]
+fn b577_a_const_evaluation_reads_the_payload_out() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{B577_SHELF}
+            fun computed(): str {{
+                let shelf = Shelf {{ items = ["first", "second"], count = 1 }};
+                shelf.at(1).unwrap_or("none") + "!"
+            }}
+
+            fun main() {{
+                print(const computed());
+            }}
+            "#
+        ),
+        "second!\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B578: a view of an rvalue that stores no type of its own.
+// ---------------------------------------------------------------------------
+
+/// B578: `&xs.len()` handed to `fun shown<T: Display>(value: &T)` threw
+/// `TypeError: Cannot read properties of undefined` on JS — the callee, at a
+/// scalar `T`, reads `value[0][value[1]]`, and the call site passed the bare
+/// number, because a call's result records no type and the "is it a scalar"
+/// question answered no. The same at a concrete `&usize`, a generic call's
+/// `T`, an unannotated function, a closure, a generic method, a `let` holding
+/// the view, and the value `if`/`match`/block; a view-returning call is
+/// re-borrowed as the view it already is, and an aggregate stays its own
+/// reference.
+#[test]
+fn b578_a_view_of_a_call_result_is_a_pair_where_the_pointee_is_a_scalar() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::io::print;
+
+        fun shown(value: &usize): str {
+            i"<{*value}>"
+        }
+
+        fun peek<T: Display>(value: &T): str {
+            i"[{value}]"
+        }
+
+        fun seven(): i32 {
+            7
+        }
+
+        fun identity<T>(value: T): T {
+            value
+        }
+
+        fun made() {
+            40 + 2
+        }
+
+        fun total(values: &List<i32>): i32 {
+            mut sum = 0;
+            for value in values {
+                sum += value;
+            }
+            sum
+        }
+
+        struct Holder {
+            count: i32,
+        }
+
+        impl Holder {
+            fun slot(&self): &i32 {
+                &self.count
+            }
+        }
+
+        fun main() {
+            let xs = [1, 2];
+            print(shown(&xs.len()));
+            print(peek(&xs.len()));
+            print(peek(&seven()));
+            print(peek(&identity(5)));
+            print(peek(&identity("five")));
+            print(peek(&made()));
+            let twice = |value: i32| value * 2;
+            print(peek(&twice(4)));
+            let held = &seven();
+            print(peek(held));
+            print(*held + 1);
+            let holder = Holder { count = 9 };
+            print(peek(&holder.slot()));
+            print(peek(&(if xs.len() > 1 { 1 } else { 2 })));
+            print(peek(&match holder.count { 9 => "nine", _ => "other" }));
+            print(peek(&{ let a = 3; a + 1 }));
+            print(total(&xs.map(|value| value + 1)));
+        }
+        "#,
+        "<2>\n[2]\n[7]\n[5]\n[five]\n[42]\n[8]\n[7]\n8\n[9]\n[1]\n[nine]\n[4]\n5\n",
+    );
+}
+
+/// B578, inside a generic body: `&identity(value)` where the call's `T` is the
+/// ENCLOSING instance's — the call's binding names the caller's parameter, and
+/// the active instance resolves it (a number pairs, a `str` pairs, through a
+/// free function and a generic method alike).
+#[test]
+fn b578_a_view_of_a_call_result_in_a_generic_body_pairs_per_instance() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::io::print;
+
+        fun peek<T: Display>(value: &T): str {
+            i"[{value}]"
+        }
+
+        fun identity<T>(value: T): T {
+            value
+        }
+
+        fun wrapped<T: Display>(value: T): str {
+            peek(&identity(value))
+        }
+
+        struct Boxed<T> {
+            value: T,
+        }
+
+        impl Boxed<type T: Display> {
+            fun shown(self): str {
+                peek(&identity(self.value))
+            }
+        }
+
+        fun main() {
+            print(wrapped(5));
+            print(wrapped("s"));
+            print(Boxed { value = 7 }.shown());
+            print(Boxed { value = "t" }.shown());
+        }
+        "#,
+        "[5]\n[s]\n[7]\n[t]\n",
+    );
+}

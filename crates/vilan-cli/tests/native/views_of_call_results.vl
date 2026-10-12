@@ -1,0 +1,77 @@
+// B578: `&` of an RVALUE that stores no type of its own — a call's result, a
+// value `if`/`match`/block — handed where a `&usize` or a generic `&T` at a
+// scalar instance reads `value[0][value[1]]`: JS passed the bare value and
+// the callee threw `TypeError: Cannot read properties of undefined`. Natively
+// a reference to a temporary. Each shape: an extern method (`xs.len()`), a
+// free function, a generic call's `T`, an unannotated function, a closure, a
+// generic method's `T`, a `let` holding the view, a view-returning call
+// re-borrowed, and the three value conditionals.
+import std::display::Display;
+import std::io::print;
+
+fun shown(value: &usize): str {
+	i"<{*value}>"
+}
+
+fun peek<T: Display>(value: &T): str {
+	i"[{value}]"
+}
+
+fun seven(): i32 {
+	7
+}
+
+fun identity<T>(value: T): T {
+	value
+}
+
+fun made() {
+	40 + 2
+}
+
+struct Holder {
+	count: i32,
+}
+
+impl Holder {
+	fun slot(&self): &i32 {
+		&self.count
+	}
+}
+
+struct Boxed<T> {
+	value: T,
+}
+
+impl Boxed<type T> {
+	fun get(self): T {
+		self.value
+	}
+}
+
+fun main() {
+	let xs = [1, 2];
+	print(shown(&xs.len()));
+	print(peek(&xs.len()));
+	print(peek(&seven()));
+	print(peek(&identity(5)));
+	print(peek(&identity("five")));
+	print(peek(&made()));
+	let twice = |value: i32| value * 2;
+	print(peek(&twice(4)));
+	print(peek(&Boxed { value = 3 }.get()));
+	let held = &seven();
+	print(peek(held));
+	print(*held + 1);
+	let holder = Holder { count = 9 };
+	print(peek(&holder.slot()));
+	print(peek(&(if xs.len() > 1 { 1 } else { 2 })));
+	print(peek(&match holder.count {
+		9 => "nine",
+		_ => "other",
+	}));
+	print(peek(&{
+		let a = 3;
+		a + 1
+	}));
+}
