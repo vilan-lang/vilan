@@ -30,6 +30,11 @@ written down.
 
 ---
 
+<!-- family: feature -->
+**E257 S5b: `vilan run --inspect[-brk][=[host:]port]` starts the program under node's inspector with its source map, so a debugger that attaches (chrome://inspect, VS Code's "Attach to Node Process") sets breakpoints in `.vl` files and stops on them.** debugging.md §5.2's CLI half: the flag passes through to node beside `--enable-source-maps`, writes the map whatever the preset says, and is refused under `--watch` (a round restarts the process) and under `--backend rust` (no node runs). Pins: `vilan-cli` `tests/source_maps.rs` — an inspector session under node (`--inspect-brk=127.0.0.1:0`, one breakpoint placed on a `.vl` line through the program's own map, the stop read back through node's `module.SourceMap`, one evaluation in the paused frame, the program then running to its end) skipped, saying so with E257 first, where node lacks the inspector or a WebSocket client; and the two refusals.
+
+---
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

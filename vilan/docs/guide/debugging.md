@@ -215,8 +215,21 @@ and function heads, and its `names` carry each function's source name. It
 carries your files' text; std's files are named by their path in the std
 cache and marked to be skipped, so "step into" stays in your code.
 
+`vilan run --inspect` starts the program under node's inspector, with the map:
+
+```text
+$ vilan run --inspect-brk src/main.vl
+Debugger listening on ws://127.0.0.1:9229/…
+```
+
+Attach a debugger to it — `chrome://inspect` in Chrome, or VS Code's
+"Attach to Node Process" — and set breakpoints in the `.vl` files.
+`--inspect-brk` holds the program before its first line until the debugger
+resumes it; both take an address (`--inspect=127.0.0.1:9230`). Values are
+shown as JavaScript holds them: a struct is its field array, `[1, 2]`.
+
 A `release` build writes no map. Ask for one with `[build] source-maps = true`,
-or for a single build with `vilan build --source-maps`. `source-maps = false`
-turns the `debug` preset's off.
+or for a single build with `vilan build --source-maps`; `--inspect` writes one
+whatever the preset says. `source-maps = false` turns the `debug` preset's off.
 A map changes no byte of the program it describes: the script is the same with
 it and without it, but for the comment that names it.

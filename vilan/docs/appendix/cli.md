@@ -401,6 +401,12 @@ program prints the same bytes under either backend.
   runnable entry, which one to launch. The others still compile; they
   don't run. The manifest's `default-entry` makes the flag
   unnecessary; with neither, the error names both ways to choose.
+- `--inspect[=[host:]port]`: run under node's inspector (default
+  `127.0.0.1:9229`) with the program's source map, so a debugger that
+  attaches sets breakpoints in `.vl` files. `--inspect-brk` also holds the
+  program before its first line until the debugger resumes it. Neither takes
+  `--watch` or `--backend rust`. See
+  [debugging](../guide/debugging.md#in-a-debugger).
 
 A program `vilan run` starts runs with node's `--enable-source-maps` whenever
 its build wrote a map (the `debug` preset's default), so an uncaught panic's

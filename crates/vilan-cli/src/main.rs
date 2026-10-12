@@ -256,6 +256,23 @@ enum Command {
         /// `cargo` in DEBUG by default, and the binary is run).
         #[arg(long)]
         backend: Option<String>,
+        /// Run under node's inspector (`--inspect[=[HOST:]PORT]`, default
+        /// `127.0.0.1:9229`) with the program's source map, so a debugger
+        /// that attaches — chrome://inspect, VS Code's "Attach to Node" —
+        /// sets breakpoints in `.vl` files and shows `.vl` lines. Writes the
+        /// map whatever the preset says.
+        #[arg(long, value_name = "[HOST:]PORT", num_args = 0..=1, require_equals = true)]
+        inspect: Option<Option<String>>,
+        /// `--inspect`, paused before the program's first line until a
+        /// debugger attaches and resumes it.
+        #[arg(
+            long,
+            value_name = "[HOST:]PORT",
+            num_args = 0..=1,
+            require_equals = true,
+            conflicts_with = "inspect"
+        )]
+        inspect_brk: Option<Option<String>>,
         /// Arguments passed through to the running program (after the file).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -545,8 +562,23 @@ fn run_cli() -> ExitCode {
             hmr_port,
             entry,
             backend,
+            inspect,
+            inspect_brk,
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error::<ExitCode>(&message),
+            Ok(_) if watch && (inspect.is_some() || inspect_brk.is_some()) => {
+                report_error::<ExitCode>(concat!(
+                    "`--inspect` has no `--watch` yet: a watch round restarts the node ",
+                    "process, and the debugger attached to it with it. Run ",
+                    "`vilan run --inspect` and re-run it after an edit."
+                ))
+            }
+            Ok(Backend::Rust) if inspect.is_some() || inspect_brk.is_some() => {
+                report_error::<ExitCode>(concat!(
+                    "`--inspect` starts node's inspector, and `--backend rust` runs no node: ",
+                    "debug the native binary with lldb or gdb (CodeLLDB in VS Code)."
+                ))
+            }
             // `--watch` is the JS dev loop — HMR, a swapped bundle, a restarted
             // node process. None of it exists natively yet (the round would be a
             // full `cargo build`), so the combination is refused rather than
@@ -557,10 +589,14 @@ fn run_cli() -> ExitCode {
                 "Re-run `vilan run --backend rust` after an edit."
             )),
             Ok(backend) => {
+                let inspect = Inspect::from_flags(inspect, inspect_brk);
+                if inspect.is_some() {
+                    FORCE_SOURCE_MAPS.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 if watch {
                     run_watch(file, args, no_hmr, hmr_port, entry)
                 } else {
-                    run_once(file, &args, entry.as_deref(), backend)
+                    run_once(file, &args, entry.as_deref(), backend, inspect.as_ref())
                 }
             }
         },
@@ -956,6 +992,7 @@ fn run_once(
     args: &[String],
     entry: Option<&str>,
     backend: Backend,
+    inspect: Option<&Inspect>,
 ) -> ExitCode {
     with_project(file, |project| {
         // `--rerun-hooks` is a `vilan build` flag: `run` is the dev loop, where
@@ -968,7 +1005,7 @@ fn run_once(
             Project::Single { unit, platform, .. } => {
                 let platform = platform.unwrap_or_default();
                 if backend == Backend::Rust || matches!(platform, Platform::Node { .. }) {
-                    run_single(&unit, args, backend)
+                    run_single(&unit, args, backend, inspect)
                 } else {
                     eprintln!(
                         "{} `vilan run` executes with Node, but the package platform is `{}`",
@@ -984,7 +1021,7 @@ fn run_once(
                 default_entry,
                 ..
             } if backend == Backend::Js => {
-                run_workspace(&root, &members, args, entry, &default_entry)
+                run_workspace(&root, &members, args, entry, &default_entry, inspect)
             }
             Project::Workspace { .. } => report_error::<RoundOutcome>(concat!(
                 "`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a ",
@@ -4548,8 +4585,8 @@ impl CompileGoal {
 struct Compiled {
     javascript: String,
     /// E257 S5: the source map for `javascript` when the build's options ask
-    /// for one (the `debug` preset, `[build] source-maps`, `--source-maps`)
-    /// — written beside it by [`write_script`].
+    /// for one (the `debug` preset, `[build] source-maps`, `--source-maps`,
+    /// `run --inspect`) — written beside it by [`write_script`].
     source_map: Option<vilan_core::source_map::SourceMap>,
     /// The contributions `asset::emit` / `asset::emit_keyed` accumulated —
     /// `write_assets` deduplicates and orders them into `<output>.<kind>`.
@@ -4979,7 +5016,12 @@ fn check_declared_modules_no_leg_admits(
 }
 
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
-fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
+fn run_single(
+    unit: &Unit,
+    args: &[String],
+    backend: Backend,
+    inspect: Option<&Inspect>,
+) -> ExitCode {
     let platform = Platform::default();
     if backend == Backend::Rust {
         return native::run(unit, platform, args);
@@ -5022,7 +5064,12 @@ fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
-    run_node_script(&compiled.javascript, compiled.source_map.as_ref(), args)
+    run_node_script(
+        &compiled.javascript,
+        compiled.source_map.as_ref(),
+        inspect,
+        args,
+    )
 }
 
 /// Builds every host (non-`none`) member of a workspace into
@@ -5992,6 +6039,7 @@ fn run_workspace(
     args: &[String],
     entry: Option<&str>,
     default_entry: &DefaultEntry,
+    inspect: Option<&Inspect>,
 ) -> ExitCode {
     let server = match select_node_entry(members, entry, default_entry) {
         Ok(Some(unit)) => unit,
@@ -6016,7 +6064,7 @@ fn run_workspace(
     let script = artifact_path(Path::new("dist"), &server.name, NODE_LEG);
     // The build just wrote the server's map beside it, or removed a stale one.
     let mapped = source_map_path(&root.join(&script)).is_file();
-    let status = spawn_node(&script, &node_flags(mapped), args, Some(root))
+    let status = spawn_node(&script, &node_flags(mapped, inspect), args, Some(root))
         .and_then(|mut child| child.wait());
     exit_code_of(status)
 }
@@ -7139,7 +7187,7 @@ fn json_string(text: &str) -> String {
 /// `--watch` the flag stays set, so every rebuild re-reports — intended.
 static PRINT_CHUNKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// E257 S5: `vilan build --source-maps` — write the
+/// E257 S5: `vilan build --source-maps` and `vilan run --inspect` — write the
 /// source map whatever the preset says (debugging.md Q9: the `debug` preset
 /// writes one by default, `release` only when asked). A process-level flag
 /// for [`PRINT_CHUNKS`]'s reason: every compile of the command reads it, and
@@ -7890,6 +7938,7 @@ fn write_run_script_with_map(
 fn run_node_script(
     javascript: &str,
     map: Option<&vilan_core::source_map::SourceMap>,
+    inspect: Option<&Inspect>,
     args: &[String],
 ) -> ExitCode {
     let script = env::temp_dir().join(format!("vilan-run-{}.mjs", std::process::id()));
@@ -7904,8 +7953,8 @@ fn run_node_script(
             return ExitCode::FAILURE;
         }
     };
-    let status =
-        spawn_node(&script, &node_flags(mapped), args, None).and_then(|mut child| child.wait());
+    let status = spawn_node(&script, &node_flags(mapped, inspect), args, None)
+        .and_then(|mut child| child.wait());
     let _ = fs::remove_file(&script);
     let _ = fs::remove_file(source_map_path(&script));
     exit_code_of(status)
@@ -7930,13 +7979,61 @@ fn spawn_node(
     spawn_node_with_env(script, node_flags, args, cwd, &[])
 }
 
+/// `vilan run --inspect[-brk][=[HOST:]PORT]` (E257 S5b, debugging.md §5.2):
+/// node's inspector over the program `vilan run` starts.
+#[derive(Clone, Debug)]
+struct Inspect {
+    /// `--inspect-brk`: paused before the first line until a debugger
+    /// resumes it.
+    break_first: bool,
+    /// `[HOST:]PORT`, node's default (`127.0.0.1:9229`) when absent.
+    address: Option<String>,
+}
+
+impl Inspect {
+    fn from_flags(
+        inspect: Option<Option<String>>,
+        inspect_brk: Option<Option<String>>,
+    ) -> Option<Self> {
+        match (inspect, inspect_brk) {
+            (_, Some(address)) => Some(Self {
+                break_first: true,
+                address,
+            }),
+            (Some(address), None) => Some(Self {
+                break_first: false,
+                address,
+            }),
+            (None, None) => None,
+        }
+    }
+
+    /// The flag node takes for it.
+    fn node_flag(&self) -> String {
+        let flag = if self.break_first {
+            "--inspect-brk"
+        } else {
+            "--inspect"
+        };
+        match &self.address {
+            Some(address) => format!("{flag}={address}"),
+            None => flag.to_string(),
+        }
+    }
+}
+
 /// The flags node runs a `vilan run` program under: `--enable-source-maps`
 /// when its map is beside it (debugging.md Q9 — node then reports an
-/// uncaught panic's stack in `.vl` files and lines).
-fn node_flags(mapped: bool) -> Vec<String> {
+/// uncaught panic's stack in `.vl` files and lines), and the inspector's
+/// flag when one was asked for. The inspector finds the map through the
+/// script's own `sourceMappingURL` comment, as any debugger does.
+fn node_flags(mapped: bool, inspect: Option<&Inspect>) -> Vec<String> {
     let mut flags = Vec::new();
     if mapped {
         flags.push("--enable-source-maps".to_string());
+    }
+    if let Some(inspect) = inspect {
+        flags.push(inspect.node_flag());
     }
     flags
 }
