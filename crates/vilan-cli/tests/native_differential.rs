@@ -13139,6 +13139,43 @@ fn f131_an_array_literal_against_a_generic_callees_binders_builds_the_array_on_b
     );
 }
 
+/// F133: a fixed array of closures held in an aggregate — `struct Callbacks {
+/// fns: [|i32| i32; 2] }` under `[derive(Debug)]`, an enum payload, an
+/// `Option` and a `List` of such arrays, one past the inline threshold — was
+/// refused natively ("which has no reference equality — `Option` and `List`
+/// of one do"): the emitted aggregate's equality had no impl for `[Rc<dyn
+/// Fn>; N]`. `vilan_rt::ReferenceEq` now covers a fixed array (inline and
+/// heap) element by element, and an enum's equality leg compares a payload
+/// slot through the reference it binds — an `Option` of a closure in a
+/// payload had been a rustc refusal (`&Option<..>: ReferenceEq`). A map of
+/// closures is still refused by name.
+#[test]
+fn f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f133_closure_arrays.vl";
+    std::fs::write(staged.join(file), include_str!("native/closure_arrays.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an array of closures held in an aggregate must build natively"
+    );
+    let file = "native_probe_f133_closure_map.vl";
+    std::fs::write(
+        staged.join(file),
+        "import std::hash_map::HashMap;\nimport std::io::print;\n\nstruct Table {\n\thandlers: HashMap<str, |i32| i32>,\n}\n\nfun main() {\n\tmut table = Table { handlers = HashMap::new() };\n\ttable.handlers.insert(\"inc\", |x: i32| x + 1);\n\tprint(table.handlers.len());\n}\n",
+    )
+    .expect("write the probe program");
+    match compare(&staged, file) {
+        Verdict::Refused(message) => assert!(
+            message.contains("which has no reference equality")
+                && message.contains("a fixed array of one do"),
+            "refused, but not by this name: {message}"
+        ),
+        other => panic!("a map of closures must be refused by name, was {other:?}"),
+    }
+}
+
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
 /// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
 /// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its

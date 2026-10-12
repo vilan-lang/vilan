@@ -38,6 +38,11 @@ written down.
 <!-- family: fix -->
 **F131: natively an array literal handed to a callee generic over its own binders builds the array — `grid == [[1, 2], [3, 4]]` (std's `impl [type T: PartialEq; const N]`, whose `b: [T; N]` is the operand's position) and `m.matches([[1, 2], [3, 4]])` through a bound in a generic body were emitted with `vec![..]` literals and refused by rustc ("expected `[i32; 2]`, found `Vec<i32>`"); JS printed `true`.** An overloaded operator's operands and a call dispatched through a bound or a re-dispatch were positioned against the member's parameters under the CALLER's binding, where the member's own binders (`T`, `N`) are unbound, so a nested literal met an open `T`. Both are now positioned under the binding the instance was minted with, as a direct call's arguments are. Pin: `f131_an_array_literal_against_a_generic_callees_binders_builds_the_array_on_both_backends` (`native/array_literal_generic_callee.vl`, new: `==`/`!=` over nested and three-deep arrays, a flat control, `grid.eq(..)`, a generic impl's member and the bound-dispatched call).
 
+---
+
+<!-- family: fix -->
+**F133: natively a fixed array of closures held in an aggregate builds — `struct Callbacks { fns: [|i32| i32; 2] }` (so `[derive(Debug)]` over it was JS-only), an enum payload, an `Option` or a `List` of such arrays were refused "which has no reference equality — `Option` and `List` of one do"; and an enum payload holding an `Option` of a closure (`Maybe(Option<|i32| i32>)`) was a rustc refusal.** The emitted aggregate's equality compares a held closure by reference (JS's `===` on a function); `vilan_rt::ReferenceEq` now covers a fixed array, inline and past the heap threshold (F122), element by element. An enum's equality leg compared a payload slot through a second reference (`reference_eq(&a0, &b0)` over the `&` its leg binds asked for an impl on `&Option<..>`), and now compares through the slot itself. A map of closures is still refused by name. Pin: `f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends` (`native/closure_arrays.vl`, new; and the map's named refusal).
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

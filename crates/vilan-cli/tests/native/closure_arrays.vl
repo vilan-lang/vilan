@@ -1,0 +1,56 @@
+// F133: a fixed array of closures held in an aggregate builds natively, as an
+// `Option` and a `List` of one do: a struct field `[|i32| i32; 2]` under
+// `[derive(Debug)]`, an enum payload, an `Option` and a `List` of such arrays,
+// and one past the inline threshold (F122's heap array). The emitted Rust
+// aggregate's equality compares the closures by reference, element by element;
+// an enum payload slot is compared through the reference its leg binds, so an
+// `Option` of a closure in a payload builds too.
+import std::debug::Debug;
+import std::io::print;
+
+[derive(Debug)]
+struct Callbacks {
+	fns: [|i32| i32; 2],
+}
+
+enum Hook {
+	Idle,
+	Pair([|i32| i32; 2]),
+	Maybe(Option<|i32| i32>),
+}
+
+struct Wide {
+	fns: [|i32| i32; 70],
+}
+
+struct Maybe {
+	held: Option<[|i32| i32; 2]>,
+	many: List<[|i32| i32; 1]>,
+}
+
+fun run(hook: Hook, value: i32): i32 {
+	match hook {
+		Hook::Idle => value,
+		Hook::Pair(let fns) => fns[1](fns[0](value)),
+		Hook::Maybe(Some(let f)) => f(value),
+		Hook::Maybe(None) => 0,
+	}
+}
+
+fun main() {
+	let f = |x: i32| x + 1;
+	let g = |x: i32| x * 2;
+	let c = Callbacks { fns = [f, g] };
+	print(c.debug());
+	print(c.fns[1](4));
+	print(run(Hook::Pair([f, g]), 5));
+	print(run(Hook::Idle, 5));
+	print(run(Hook::Maybe(Some(g)), 6));
+	let wide = Wide { fns = [g; 70] };
+	print(wide.fns[69](21));
+	let maybe = Maybe { held = Some([g, f]), many = [[f], [g]] };
+	if maybe.held is Some(let pair) {
+		print(pair[0](pair[1](1)));
+	}
+	print(maybe.many[1][0](8));
+}

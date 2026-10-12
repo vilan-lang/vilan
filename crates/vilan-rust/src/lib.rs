@@ -3731,9 +3731,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 let left: Vec<String> = (0..slots).map(|slot| format!("a{slot}")).collect();
                 let right: Vec<String> = (0..slots).map(|slot| format!("b{slot}")).collect();
+                // The legs bind each payload slot by REFERENCE (the match is
+                // over `(self, other)`), so a slot is compared through its
+                // `*`: `reference_eq(&a0, &b0)` asked for an impl over `&Option<
+                // ..>`, and an enum with an `Option` or array of closures in
+                // a payload did not build (F133).
                 let comparisons: Vec<String> = (0..slots)
                     .map(|slot| {
-                        Self::compare_fields(&payload_types[index][slot], &left[slot], &right[slot])
+                        Self::compare_fields(
+                            &payload_types[index][slot],
+                            &format!("(*{})", left[slot]),
+                            &format!("(*{})", right[slot]),
+                        )
                     })
                     .collect();
                 let _ = writeln!(
@@ -3866,7 +3875,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Err(unsupported(
             &format!(
                 "a closure held inside `{rendered}` (in `{owner}`), which has no reference \
-                 equality — `Option` and `List` of one do"
+                 equality — `Option`, `List` and a fixed array of one do"
             ),
             span,
         ))
@@ -3885,7 +3894,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 return Self::reference_equality_reaches(inner);
             }
         }
-        false
+        // F133: a fixed array — `[T; N]` inline, `vilan_rt::HeapArray<T, N>`
+        // past the threshold (F122) — compares element by element. The
+        // length is the last separator's right side, whatever `T` holds.
+        let array_element = rendered
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .and_then(|inner| inner.rsplit_once("; "))
+            .or_else(|| {
+                rendered
+                    .strip_prefix("vilan_rt::HeapArray<")
+                    .and_then(|inner| inner.strip_suffix('>'))
+                    .and_then(|inner| inner.rsplit_once(", "))
+            });
+        array_element.is_some_and(|(element, _)| Self::reference_equality_reaches(element))
     }
 
     /// One emitted aggregate's `impl vilan_rt::Json`.
