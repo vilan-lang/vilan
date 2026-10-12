@@ -412,15 +412,17 @@ impl LastUse {
     pub(super) fn record_rows(
         &self,
         analyzer: &Analyzer<'_>,
-        skip: &dyn Fn(SourceId) -> bool,
+        slice_of: &dyn Fn(&Analyzer<'_>, Id) -> Option<u32>,
         into: &mut HashMap<u32, ModuleTables>,
     ) {
+        // `slice_of` names the record a row is filed under — a source index
+        // (M19 T1b) or an item window (M110 S7); a binding a LIVE region
+        // touched is nobody's row.
         let file = |analyzer: &Analyzer<'_>, id: Id| -> Option<u32> {
             if self.foreign_touched.contains(&id) {
                 return None;
             }
-            let source = analyzer.source_of_id(id)?;
-            (source.0 != 0 && !skip(source)).then_some(source.0)
+            slice_of(analyzer, id)
         };
         for use_id in &self.last_uses {
             if let Some(source) = file(analyzer, *use_id) {

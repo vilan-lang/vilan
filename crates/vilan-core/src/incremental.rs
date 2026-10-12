@@ -214,6 +214,13 @@ pub enum Plant {
     /// hot edit removed is then served from the seed (a monotone fixpoint
     /// cannot shrink).
     PostSeedFromSettled,
+    /// S7: an item's record is served on its OWN text and walk alone — the
+    /// dirty closure over the items it reads from and the items that write
+    /// into its slots is not asked. A push into another module's binding
+    /// then leaves the binding's owner item (its label, its checks) at the
+    /// previous keystroke's answer; a callee's changed return leaves its
+    /// callers'.
+    ItemRecordUnguarded,
 }
 
 impl Plant {
@@ -231,6 +238,7 @@ impl Plant {
             Plant::LabelTablesUnrecorded => 11,
             Plant::ContextLogUnguarded => 12,
             Plant::PostSeedFromSettled => 13,
+            Plant::ItemRecordUnguarded => 14,
         }
     }
 }
@@ -320,6 +328,14 @@ pub struct Census {
     /// outside their anchor's window — both 0 by construction, both pinned.
     pub window_writes_other: u64,
     pub window_outside_anchor: u64,
+    /// M110 S7 (Order 51): the per-item records this analysis SERVED (an
+    /// item of a re-walked file whose checks and tables were replayed from
+    /// the previous analysis's record), the ones it found and could NOT
+    /// serve (the item's text, walk or dependencies moved — "stale"), and
+    /// the ones it FILED for the next analysis.
+    pub item_records_served: u64,
+    pub item_records_stale: u64,
+    pub item_records_filed: u64,
 }
 
 thread_local! {
@@ -350,6 +366,9 @@ thread_local! {
             windows_overflowed: 0,
             window_writes_other: 0,
             window_outside_anchor: 0,
+            item_records_served: 0,
+            item_records_stale: 0,
+            item_records_filed: 0,
         })
     };
 }
@@ -706,7 +725,8 @@ pub fn report(program: &Program) {
              const-hits={} const-misses={} reach-questions={} bound-sites-served={} \
              bound-sites-checked={} graphs-replayed={} context-log-replayed={} \
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
-             windows-overflowed={} window-writes-other={} window-outside-anchor={}",
+             windows-overflowed={} window-writes-other={} window-outside-anchor={} \
+             records-served={} records-stale={} records-filed={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -728,6 +748,9 @@ pub fn report(program: &Program) {
             census.windows_overflowed,
             census.window_writes_other,
             census.window_outside_anchor,
+            census.item_records_served,
+            census.item_records_stale,
+            census.item_records_filed,
         );
     }
 }

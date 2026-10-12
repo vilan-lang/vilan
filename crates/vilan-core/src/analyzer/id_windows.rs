@@ -595,6 +595,17 @@ pub struct IdWindows {
     /// anchors where the slot belongs.
     spilled_types: Vec<(u32, u32)>,
     spilled_entities: Vec<(u32, u32)>,
+    /// M110 S7 (Order 51): the cross-item WRITE edges of this analysis — a
+    /// pre-settle world-changing write by a constraint or drain anchored in
+    /// one window into a slot of ANOTHER (`(writer, written)`), the windows
+    /// written by an anchorless write, and the tail slots written at all.
+    /// The per-item records' dirty closure reads them: an item written by a
+    /// dirty item is dirty (M139's edge), an item written with no anchor to
+    /// name the writer is dirty, and an item reading a written tail slot is.
+    pub cross_writes: crate::fx::FxHashSet<(u32, u32)>,
+    pub unanchored_write_windows: crate::fx::FxHashSet<u32>,
+    /// `(slot, writer window)` — `None` for an anchorless write.
+    pub tail_written: Vec<(u32, Option<u32>)>,
 }
 
 impl IdWindows {
@@ -879,10 +890,15 @@ impl IdWindows {
         self.anchor_missed.set(false);
     }
 
-    /// A pre-settle world-changing write to `slot`, classified by the anchor.
     /// S6: records every window this analysis laid out into the demand
     /// table — what its type lane used, spill included — for the next
-    /// analysis of the same item to size by.
+    /// analysis of the same item to size by. S7: an INHERITED window that
+    /// overflowed on this analysis (a hot constraint or a check anchored to
+    /// a prefix item, minting past the room its world build gave it) raises
+    /// its recorded demand too, so the next world build sizes it right — the
+    /// 1,877 overflowing stored windows of kolt's client leg (the C2 datum)
+    /// were sized once, at the build, from a demand the keystrokes that
+    /// followed never reported.
     pub fn record_demand(&self) {
         if !self.mode.lays_out() {
             return;
@@ -893,6 +909,14 @@ impl IdWindows {
         for window in &self.windows[self.inherited..] {
             let demand = window.types.used() + window.spilled[1];
             table.insert(window.key, demand);
+        }
+        for window in &self.windows[..self.inherited] {
+            if window.spilled[1] == 0 {
+                continue;
+            }
+            let demand = window.types.used() + window.spilled[1];
+            let recorded = table.entry(window.key).or_insert(0);
+            *recorded = (*recorded).max(demand);
         }
     }
 
@@ -935,23 +959,71 @@ impl IdWindows {
         self.anchor.set(window);
     }
 
-    /// The census of world-changing slot writes by window — a binary search
-    /// per write, so it is kept only where the counters read it (a debug
-    /// build, or `VILAN_COUNTERS`); the standing pins run on debug builds.
+    /// The census of world-changing slot writes by window, and (S7) the
+    /// cross-item write EDGES the per-item records' dirty closure reads. A
+    /// binary search per write: kept whenever the windows are on, since every
+    /// editor analysis needs the edges — a served keystroke makes a few
+    /// hundred such writes, a world build with the windows forced on one per
+    /// constraint that moved a slot.
     pub fn note_slot_write(&mut self, slot: TypeId) {
-        if !self.on() || !(cfg!(debug_assertions) || crate::counters::counters_enabled()) {
+        if !self.on() {
             return;
         }
+        let written = self.window_of_type(slot);
         let Some(anchor) = self.anchor.get() else {
             self.census.writes_unanchored += 1;
+            match written {
+                Some(window) => {
+                    self.unanchored_write_windows.insert(window as u32);
+                }
+                None => self.tail_written.push((slot.0, None)),
+            }
             return;
         };
-        match self.window_of_type(slot) {
+        match written {
             Some(window) if window == anchor => self.census.writes_own += 1,
-            Some(_) if self.anchor_is_drain.get() => self.census.writes_drain_other += 1,
-            Some(_) => self.census.writes_other += 1,
-            None => self.census.writes_tail += 1,
+            Some(window) => {
+                if self.anchor_is_drain.get() {
+                    self.census.writes_drain_other += 1;
+                } else {
+                    self.census.writes_other += 1;
+                }
+                self.cross_writes.insert((anchor as u32, window as u32));
+            }
+            None => {
+                self.census.writes_tail += 1;
+                self.tail_written.push((slot.0, Some(anchor as u32)));
+            }
         }
+    }
+
+    /// M110 S7: the anchor set to a window by its INDEX — for a pass that
+    /// walks the windows themselves (`compute_resource_types`) and so knows
+    /// the item without a search per slot.
+    pub fn set_anchor_window(&self, window: usize) {
+        if !self.on() || plant() == Some(Plant::AnchorOff) {
+            return;
+        }
+        self.anchor_entity.set(None);
+        self.anchor_is_drain.set(false);
+        self.anchor_missed.set(false);
+        self.anchor.set(Some(window));
+    }
+
+    /// The tail ENTITY ids anchored to `window` that found no room in it.
+    pub fn spilled_entities_of(&self, window: usize) -> impl Iterator<Item = u32> + '_ {
+        self.spilled_entities
+            .iter()
+            .filter(move |(_, anchored)| *anchored as usize == window)
+            .map(|(id, _)| *id)
+    }
+
+    /// The tail TYPE ids anchored to `window` that found no room in it.
+    pub fn spilled_types_of(&self, window: usize) -> impl Iterator<Item = u32> + '_ {
+        self.spilled_types
+            .iter()
+            .filter(move |(_, anchored)| *anchored as usize == window)
+            .map(|(id, _)| *id)
     }
 
     /// The source a type id belongs to by its window, when one holds it.
