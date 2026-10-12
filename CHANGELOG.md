@@ -43,6 +43,11 @@ written down.
 <!-- family: fix -->
 **F133: natively a fixed array of closures held in an aggregate builds — `struct Callbacks { fns: [|i32| i32; 2] }` (so `[derive(Debug)]` over it was JS-only), an enum payload, an `Option` or a `List` of such arrays were refused "which has no reference equality — `Option` and `List` of one do"; and an enum payload holding an `Option` of a closure (`Maybe(Option<|i32| i32>)`) was a rustc refusal.** The emitted aggregate's equality compares a held closure by reference (JS's `===` on a function); `vilan_rt::ReferenceEq` now covers a fixed array, inline and past the heap threshold (F122), element by element. An enum's equality leg compared a payload slot through a second reference (`reference_eq(&a0, &b0)` over the `&` its leg binds asked for an impl on `&Option<..>`), and now compares through the slot itself. A map of closures is still refused by name. Pin: `f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends` (`native/closure_arrays.vl`, new; and the map's named refusal).
 
+---
+
+<!-- family: fix -->
+**B605: natively a generic function returning an object built over its own parameter builds — `fun pipe_of<P>(value: dyn Source<Option<P>>): dyn Pipe<Option<P>> { value.derive(|v| v) }` was refused "a value of an unbound generic type parameter (parameter 1 of `pipe_of`)", which is why a mirrored store's `states()` (any `TransientSource::states()` over a generic) did not build natively.** Two reads took the CALLEE's `P` where the call's binding was owed: a call through an object read its receiver's recorded type (`pipe_of(a).effect(..)` — `dyn Pipe<Option<P>>`), which the backend counted as closed because an object type's arguments were never asked; and an argument erased into a `dyn Source<Option<P>>` parameter built its object table at the parameter's own arguments. The receiver is now the call's settled type, an object type is closed only when its arguments are, and an erased argument's trait arguments are read under the call's binding. Pin: `b605_a_generic_function_over_a_dyn_pipe_builds_on_both_backends` (`native/generic_dyn_pipe.vl`, new: two instances and a generic `derive` to a concrete pipe).
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

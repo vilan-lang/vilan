@@ -11500,8 +11500,8 @@ fn a153_s2_a_store_mirror_behaves_the_same_on_both_backends() {
 
 /// A153 S2: a patch's ops land in ONE client turn on both backends — an observer
 /// woken by the first op reads the second op's field already landed — and a key
-/// the server does not hold is seeded `null`. (`states()` itself stays on the JS
-/// pin, `reactive_channels`: natively a generic `dyn Pipe` is not emitted yet.)
+/// the server does not hold is seeded `null`. (`states()` itself is
+/// `b606_a_mirrored_stores_states_tell_the_same_on_both_backends`.)
 #[test]
 fn a153_s2_a_patch_lands_in_one_client_turn_on_both_backends() {
     let staged = stage();
@@ -13174,6 +13174,31 @@ fn f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends() {
         ),
         other => panic!("a map of closures must be refused by name, was {other:?}"),
     }
+}
+
+/// B605: a generic function returning an object built over its own
+/// parameter — `pipe_of<P>(value: dyn Source<Option<P>>): dyn Pipe<Option<P>>
+/// { value.derive(|v| v) }` — was refused natively "a value of an unbound
+/// generic type parameter (parameter 1 of `pipe_of`)". The call's object
+/// result (`pipe_of(a).effect(..)`) was read at its record, which names the
+/// callee's `P` (an object type counted as closed whatever its arguments),
+/// and the argument erased into `dyn Source<Option<P>>` built its table at
+/// the parameter's own `P`. Both now read the call's binding: two instances
+/// (`P = str`, `P = i32`) and a generic `derive` to a concrete pipe.
+#[test]
+fn b605_a_generic_function_over_a_dyn_pipe_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b605_generic_dyn_pipe.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_dyn_pipe.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic `dyn Pipe` must build and answer the same natively"
+    );
 }
 
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its

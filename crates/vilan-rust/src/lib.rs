@@ -406,6 +406,13 @@ struct Emitter<'a, 'src> {
     /// that expectation — never while the argument itself is walked, where the
     /// caller's substitution is the one in force.
     argument_substitution: Option<HashMap<TypeId, TypeId>>,
+    /// B605: the CALLEE's binding while one argument's own erasure into its
+    /// parameter's `dyn` type is built — the coercion's recorded trait
+    /// arguments are the parameter's (`dyn Source<Option<P>>` for `pipe_of`'s
+    /// `value`), which only the call's binding closes. Set around the
+    /// argument's value and read by [`Emitter::erase_into_object`] for that
+    /// argument's id alone.
+    erasing_argument: Option<(Id, HashMap<TypeId, TypeId>)>,
     /// How deep [`Emitter::pattern`] is inside a variant's payload or a tuple,
     /// and the guards a `match` leg collects from the string literals it finds
     /// there. A `str` literal at the TOP of a leg is matched against the
@@ -728,6 +735,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_returns_view: false,
             expected_type: None,
             argument_substitution: None,
+            erasing_argument: None,
             pattern_nesting: 0,
             literal_guards: None,
             boxed: HashSet::new(),
@@ -6126,6 +6134,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             return Ok(text);
         };
+        // B605: an argument erased into its parameter's object type names
+        // the trait's arguments in the CALLEE's binders; the call closes them.
+        let arguments = match self.erasing_argument.take() {
+            Some((argument, binding)) if argument == id => {
+                let entries = self.resolved_entries(&binding);
+                arguments
+                    .iter()
+                    .map(|argument| self.substituted(*argument, &entries))
+                    .collect()
+            }
+            other => {
+                self.erasing_argument = other;
+                arguments
+            }
+        };
         // B412: a site erasing a generic parameter may be instantiated at an
         // OBJECT, which is already the erased value — no second pointer.
         if matches!(
@@ -9431,8 +9454,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_) | Type::Trait(_, _),
             )
             | None => false,
+            // B605: an object type is closed only when its trait's arguments
+            // are — `dyn Pipe<Option<P>>` names the callee's `P`.
             Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments, _),
+                Type::Struct(_, arguments)
+                | Type::Enum(_, arguments)
+                | Type::Tuple(arguments, _)
+                | Type::Dyn(_, arguments),
             ) => arguments
                 .clone()
                 .iter()
@@ -12406,10 +12434,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
         // A124 R3: `o.member(..)` where `o` is a trait OBJECT — a slot call.
         if let Some(member) = self.program.dyn_method_calls.get(&call_id).copied() {
+            // B605: the receiver's type as THIS call site settles it — a
+            // generic call's `dyn Pipe<Option<P>>` read under the call's own
+            // binding (`pipe_of(a).effect(..)`), where the record alone names
+            // the callee's `P`.
             let receiver_type = function_call
                 .argument_ids
                 .first()
-                .and_then(|receiver| self.type_of(*receiver))
+                .copied()
+                .and_then(|receiver| self.settled_value_type(receiver))
                 .ok_or_else(|| {
                     unsupported("a call through an object whose receiver has no type", span)
                 })?;
@@ -12906,7 +12939,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             } else {
                 // A by-value parameter CONSUMES its argument, so a plain read
                 // of a place copies — see [`Emitter::copy_a_consumed_place_read`].
+                let saved_erasing = std::mem::replace(
+                    &mut self.erasing_argument,
+                    callee_substitution
+                        .clone()
+                        .map(|binding| (*argument, binding)),
+                );
                 let value = self.value_of_expecting(*argument, expecting, depth);
+                self.erasing_argument = saved_erasing;
                 self.expects_async_value = false;
                 value.map(|value| self.copy_a_consumed_place_read(*argument, value))
             };

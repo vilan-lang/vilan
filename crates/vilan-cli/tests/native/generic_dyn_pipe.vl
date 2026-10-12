@@ -1,0 +1,30 @@
+// B605: a generic function returning an object built over its own parameter -
+// `pipe_of<P>(value: dyn Source<Option<P>>): dyn Pipe<Option<P>>` - builds and
+// runs natively at two instances: the argument is erased into the parameter's
+// object type under the call's binding, and the call's object result is read
+// at the binding the call makes.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Pipe, Signal, SignalCell, Source, run_with_owner };
+
+fun pipe_of<P>(value: dyn Source<Option<P>>): dyn Pipe<Option<P>> {
+	let pipe: dyn Pipe<Option<P>> = value.derive(|v| v);
+	pipe
+}
+
+fun counted<P>(value: dyn Source<Option<P>>): dyn Pipe<i32> {
+	value.derive(|v| if v.is_some() { 1 } else { 0 })
+}
+
+fun main() {
+	let a: SignalCell<Option<str>> = Signal::new(None);
+	let b: SignalCell<Option<i32>> = Signal::new(Some(4));
+	let page = Owner::new();
+	run_with_owner(page, || {
+		pipe_of(a).effect(|state| print(state.unwrap_or("-")));
+		pipe_of(b).effect(|state| print(state.unwrap_or(0)));
+		counted(a).effect(|count| print(i"count {count}"));
+	});
+	a.set(Some("x"));
+	b.set(None);
+}
