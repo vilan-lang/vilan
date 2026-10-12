@@ -1,0 +1,117 @@
+// F129: an argument that copies out of a cell (a spine through a `Shared`
+// view, or a captured `mut` binding's cell) is copied LAST, after the later
+// arguments run, so a later argument that writes the cell in place is seen
+// by the callee, as on JS. A scalar, a `str` and an `own` argument are read
+// where they stand on both backends, and the earlier arguments still run
+// first.
+import std::hash::Hash;
+import std::hash::Hashable;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::shared::Shared;
+
+struct Probe {
+	tag: i32,
+}
+
+impl Probe with Hashable {
+	fun hash(self): Hash {
+		self.tag.hash()
+	}
+}
+
+struct Bag {
+	probes: HashSet<Probe>,
+	items: List<i32>,
+	rows: List<List<i32>>,
+	count: i32,
+	name: str,
+}
+
+struct Words {
+	items: List<str>,
+}
+
+impl Words {
+	fun measured(&self, extra: i32): usize {
+		self.items.len() + extra.as_usize()
+	}
+}
+
+fun mark(cell: Shared<Bag>): Probe {
+	cell.write().probes.insert(Probe { tag = 5 });
+	Probe { tag = 5 }
+}
+
+fun grow(cell: Shared<Bag>): i32 {
+	cell.write().items.push(9);
+	cell.write().rows[0].push(9);
+	cell.write().count += 1;
+	cell.write().name = "new";
+	9
+}
+
+fun has(items: List<i32>, value: i32): bool {
+	items.contains(value)
+}
+
+fun lent(items: &List<i32>, more: &List<i32>): bool {
+	items.contains(more[0])
+}
+
+fun grown(cell: Shared<Bag>): List<i32> {
+	[grow(cell)]
+}
+
+fun kept(own items: List<i32>, value: i32): bool {
+	items.contains(value)
+}
+
+fun counted(count: i32, value: i32): i32 {
+	count + value
+}
+
+fun named(name: str, value: i32): str {
+	name
+}
+
+fun note(text: str): i32 {
+	print(text);
+	0
+}
+
+fun traced(first: i32, items: List<i32>, value: i32): usize {
+	items.len()
+}
+
+fun fresh(): Shared<Bag> {
+	Shared::new(Bag { probes = HashSet::new(), items = [], rows = [[]], count = 0, name = "old" })
+}
+
+fun main() {
+	let a = fresh();
+	print(a.read().probes.contains(mark(a)));
+	let b = fresh();
+	print(has(b.read().items, grow(b)));
+	let c = fresh();
+	print(has(c.read().rows[0], grow(c)));
+	let d = fresh();
+	print(lent(&d.read().items, &grown(d)));
+	let e = fresh();
+	print(kept(e.read().items, grow(e)));
+	let f = fresh();
+	print(counted(f.read().count, grow(f)));
+	let g = fresh();
+	print(named(g.read().name, grow(g)));
+	let h = fresh();
+	print(traced(note("first"), h.read().items, {
+		note("second");
+		grow(h)
+	}));
+	mut words = Words { items = ["a"] };
+	let more = || {
+		words.items.push("b");
+		0
+	};
+	print(words.measured(more()));
+}

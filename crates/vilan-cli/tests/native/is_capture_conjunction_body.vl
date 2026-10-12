@@ -1,0 +1,44 @@
+// F91: an `is` capture in a `&&` chain of an `if` condition is in scope in the
+// body natively, as on JS: the capture left of the `&&`, two captures, a
+// capture right of a plain conjunct, a `||` inside a conjunct, a chain that
+// fails late (the `else` runs), an `else if` chain, and a capture of a field.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Pair {
+	left: Option<str>,
+	right: Option<i32>,
+}
+
+fun describe(held: Option<str>, count: Option<i32>, flag: bool): str {
+	if held is Some(let name) && count is Some(let n) && name.len() > 1 {
+		i"{name} x{n}"
+	} else if flag && count is Some(let n) && n > 2 {
+		i"big {n}"
+	} else {
+		"none"
+	}
+}
+
+fun main() {
+	let held: Option<str> = Some("abc");
+	if held is Some(let name) && name.len() > 0 {
+		print(name);
+	}
+	if held is Some(let name) && (name == "x" || name == "abc") {
+		print(i"either {name}");
+	}
+	if held is Some(let name) && name.len() > 5 {
+		print(name);
+	} else {
+		print("too short");
+	}
+	print(describe(Some("ab"), Some(3), false));
+	print(describe(Some("a"), Some(4), true));
+	print(describe(None, Some(1), true));
+	let pair = Pair { left = Some("l"), right = Some(7) };
+	if pair.left is Some(let text) && pair.right is Some(let value) {
+		print(i"{text}{value}");
+	}
+	print(pair.left.unwrap_or("-"));
+}

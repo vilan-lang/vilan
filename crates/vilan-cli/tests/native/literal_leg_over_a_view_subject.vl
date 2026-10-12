@@ -1,0 +1,35 @@
+// F134: a LITERAL leg of a `match` over a call handing back `Option<&str>` (the
+// subject carries a payload view natively, F21) compares the literal through the
+// view. Expected on both: lit, second, none, only literal (JS since B577).
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Shelf {
+	items: List<str>,
+}
+
+impl Shelf {
+	fun at(&self, index: usize): Option<&str> {
+		if index < self.items.len() {
+			Some(&self.items[index])
+		} else {
+			None
+		}
+	}
+}
+
+fun main() {
+	let shelf = Shelf { items = ["first", "second"] };
+	for index in [0usize, 1, 2] {
+		let said = match shelf.at(index) {
+			Some("first") => "lit",
+			Some(let name) => *name,
+			None => "none",
+		};
+		print(said);
+	}
+	match shelf.at(0) {
+		Some("first") => print("only literal"),
+		_ => print("other"),
+	}
+}

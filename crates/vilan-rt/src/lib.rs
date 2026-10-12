@@ -1069,6 +1069,23 @@ impl<T: ReferenceEq> ReferenceEq for Vec<T> {
     }
 }
 
+/// F133: a fixed array of closures compares element by element, as a `Vec`
+/// of them does — `[|i32| i32; 2]` in a `[derive(..)]`d struct's field.
+impl<T: ReferenceEq, const N: usize> ReferenceEq for [T; N] {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self.iter()
+            .zip(other.iter())
+            .all(|(left, right)| left.reference_eq(right))
+    }
+}
+
+/// F133: the same for a fixed array past the inline threshold (F122).
+impl<T: ReferenceEq, const N: usize> ReferenceEq for HeapArray<T, N> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self.0.reference_eq(&other.0)
+    }
+}
+
 /// A cell compares by IDENTITY (its `PartialEq` is `ptr_eq` already), which is
 /// JavaScript's `===` on the object it is there. So an `Option` or a `Vec` of a
 /// cell holding closures has reference equality too: `Option<Shared<List<||

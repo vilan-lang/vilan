@@ -1,0 +1,38 @@
+// F131: an array literal handed to a callee generic over its own binders is
+// positioned against the parameter under the call's binding: `grid == [[1,
+// 2], [3, 4]]` reaches `impl [type T: PartialEq; const N]`'s `eq(self, b:
+// [T; N])` with `T = [i32; 2]`, and a call dispatched through a bound
+// (`m.matches(..)` in `check`) reads its instance's binding the same way.
+import std::compare::PartialEq;
+import std::io::print;
+
+trait Matches<T> {
+	fun matches(self, other: T): bool;
+}
+
+struct Wrap<type T> {
+	value: T,
+}
+
+impl Wrap<type T: PartialEq> with Matches<T> {
+	fun matches(self, other: T): bool {
+		self.value == other
+	}
+}
+
+fun check<M: Matches<[[i32; 2]; 2]>>(m: M): bool {
+	m.matches([[1, 2], [3, 4]])
+}
+
+fun main() {
+	let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+	print(grid == [[1, 2], [3, 4]]);
+	print(grid != [[1, 2], [3, 5]]);
+	let fixed: [i32; 3] = [1, 2, 3];
+	print(fixed == [1, 2, 3]);
+	let deep: [[[i32; 1]; 2]; 1] = [[[1], [2]]];
+	print(deep == [[[1], [2]]]);
+	print(grid.eq([[1, 2], [3, 4]]));
+	print(Wrap { value = grid }.matches([[1, 2], [3, 4]]));
+	print(check(Wrap { value = grid }));
+}

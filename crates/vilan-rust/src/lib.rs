@@ -347,6 +347,10 @@ struct Emitter<'a, 'src> {
     /// that type's structural key). Keyed separately from [`Self::instances`]
     /// because what varies is `Self`, not a written generic parameter.
     default_instances: HashMap<(Id, String), Reserved>,
+    /// F131: the binding each instance a DISPATCHED call reached was minted
+    /// under ([`Self::dispatch_to_member`]), by instance name — what the
+    /// call's arguments are positioned against, as a direct call's are.
+    dispatched_bindings: HashMap<String, HashMap<TypeId, TypeId>>,
     /// Nominal type declarations, keyed by (declaration, its concrete
     /// arguments). `Pair<i32>` and `Pair<str>` are two Rust structs.
     types: BTreeMap<usize, String>,
@@ -402,6 +406,13 @@ struct Emitter<'a, 'src> {
     /// that expectation — never while the argument itself is walked, where the
     /// caller's substitution is the one in force.
     argument_substitution: Option<HashMap<TypeId, TypeId>>,
+    /// B605: the CALLEE's binding while one argument's own erasure into its
+    /// parameter's `dyn` type is built — the coercion's recorded trait
+    /// arguments are the parameter's (`dyn Source<Option<P>>` for `pipe_of`'s
+    /// `value`), which only the call's binding closes. Set around the
+    /// argument's value and read by [`Emitter::erase_into_object`] for that
+    /// argument's id alone.
+    erasing_argument: Option<(Id, HashMap<TypeId, TypeId>)>,
     /// How deep [`Emitter::pattern`] is inside a variant's payload or a tuple,
     /// and the guards a `match` leg collects from the string literals it finds
     /// there. A `str` literal at the TOP of a leg is matched against the
@@ -712,6 +723,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             functions: BTreeMap::new(),
             instances: HashMap::default(),
             default_instances: HashMap::default(),
+            dispatched_bindings: HashMap::default(),
             types: BTreeMap::new(),
             type_instances: HashMap::default(),
             next_function_slot: 0,
@@ -723,6 +735,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_returns_view: false,
             expected_type: None,
             argument_substitution: None,
+            erasing_argument: None,
             pattern_nesting: 0,
             literal_guards: None,
             boxed: HashSet::new(),
@@ -1416,6 +1429,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(type_id) = self.type_of(argument) else {
             return Ok(());
         };
+        // F130: an ASYNC handle is refused by its vilan type, before any
+        // rendering — `async work()` over a callee that never suspends is
+        // typed `Promise<T>` (std's `Task` is not in that program), which has
+        // no native type to render, so the rendered test below never saw it:
+        // the build went through and the run panicked "printing a `Task` is a
+        // host object's own inspection". The value is the executor's task
+        // either way.
+        if let Some(handle) = self.async_handle_name(type_id) {
+            return Err(unsupported(
+                &format!("`print` of the host handle `{handle}`"),
+                span,
+            ));
+        }
         // A type this emitter cannot render is refused by the render itself,
         // where the diagnosis is better; nothing to add here.
         let Ok(rendered) = self.rust_type(type_id, span) else {
@@ -1431,6 +1457,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         }
         Ok(())
+    }
+
+    /// F130: the name of std's ASYNC handle a vilan type is — `Task<T>`, or
+    /// `Promise<T>` (what `async e` is typed where `std::task` is not in the
+    /// program) — both the executor's task natively, and neither a value the
+    /// language gives a printed form.
+    fn async_handle_name(&self, type_id: TypeId) -> Option<&'src str> {
+        let Some(Type::Struct(struct_id, _)) = self.resolve(type_id) else {
+            return None;
+        };
+        let declaration = self.program.structs.get(struct_id)?;
+        let in_std = self
+            .program
+            .source_of(*struct_id)
+            .is_some_and(|source| self.program.std_sources.contains(&source));
+        (declaration.external && in_std && matches!(declaration.name, "Task" | "Promise"))
+            .then_some(declaration.name)
     }
 
     /// A closure's body, with the destructures a TUPLE PARAMETER owes in front
@@ -3726,9 +3769,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 let left: Vec<String> = (0..slots).map(|slot| format!("a{slot}")).collect();
                 let right: Vec<String> = (0..slots).map(|slot| format!("b{slot}")).collect();
+                // The legs bind each payload slot by REFERENCE (the match is
+                // over `(self, other)`), so a slot is compared through its
+                // `*`: `reference_eq(&a0, &b0)` asked for an impl over `&Option<
+                // ..>`, and an enum with an `Option` or array of closures in
+                // a payload did not build (F133).
                 let comparisons: Vec<String> = (0..slots)
                     .map(|slot| {
-                        Self::compare_fields(&payload_types[index][slot], &left[slot], &right[slot])
+                        Self::compare_fields(
+                            &payload_types[index][slot],
+                            &format!("(*{})", left[slot]),
+                            &format!("(*{})", right[slot]),
+                        )
                     })
                     .collect();
                 let _ = writeln!(
@@ -3861,7 +3913,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Err(unsupported(
             &format!(
                 "a closure held inside `{rendered}` (in `{owner}`), which has no reference \
-                 equality — `Option` and `List` of one do"
+                 equality — `Option`, `List` and a fixed array of one do"
             ),
             span,
         ))
@@ -3880,7 +3932,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 return Self::reference_equality_reaches(inner);
             }
         }
-        false
+        // F133: a fixed array — `[T; N]` inline, `vilan_rt::HeapArray<T, N>`
+        // past the threshold (F122) — compares element by element. The
+        // length is the last separator's right side, whatever `T` holds.
+        let array_element = rendered
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .and_then(|inner| inner.rsplit_once("; "))
+            .or_else(|| {
+                rendered
+                    .strip_prefix("vilan_rt::HeapArray<")
+                    .and_then(|inner| inner.strip_suffix('>'))
+                    .and_then(|inner| inner.rsplit_once(", "))
+            });
+        array_element.is_some_and(|(element, _)| Self::reference_equality_reaches(element))
     }
 
     /// One emitted aggregate's `impl vilan_rt::Json`.
@@ -3954,12 +4019,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .parameters
                 .get(binding)
                 .map(|parameter| parameter.type_id),
+            // N170: `inferred_return_types` is keyed by FUNCTION, so a call's
+            // id never hit it; the callee's inferred return is read where it
+            // lives, by [`Self::declared_return_type`]'s signature walk.
             Expr::Call(call_id) => self
-                .program
-                .inferred_return_types
-                .get(call_id)
-                .copied()
-                .or_else(|| self.shared_view_type(*call_id))
+                .shared_view_type(*call_id)
                 .or_else(|| self.declared_return_type(*call_id)),
             Expr::Await(awaited) => self.awaited_type(*awaited),
             _ => None,
@@ -4540,15 +4604,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// The DECLARED return type of a call's callee — what
-    /// [`Emitter::type_of`] falls back to when the solver banked no inferred
-    /// return for the call site.
+    /// The return type of a call's callee — what [`Emitter::type_of`] answers
+    /// for a call that is not a `Shared` view.
     ///
-    /// `inferred_return_types` is keyed by call and filled where inference had
-    /// something to add; a monomorphic callee with a written return type adds
-    /// nothing, so a field read straight off such a call (`fetch_row().id`) had
-    /// no subject type at all and was refused. The declaration is the answer at
-    /// exactly those sites.
+    /// A field read straight off a call (`fetch_row().id`) had no subject type
+    /// at all and was refused. The callee's signature is the answer: its
+    /// written return, or the one inference banked for an unannotated callee
+    /// (`inferred_return_types`, keyed by function — N170).
     ///
     /// F107: a function WRITTEN `async` whose return is itself a `Task`
     /// answers the task's payload ([`Self::assimilated_return`]).
@@ -5818,17 +5880,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 {
                     return self.spread_tuple(id, &elements, depth, span);
                 }
+                // F132: each element's position is its SLOT's type — `([5, 6,
+                // 7], true)` against `([i32; 3], bool)` builds the array its
+                // first slot declares. The whole tuple's type had been handed
+                // to every element, so a fixed-array slot met a literal that
+                // rendered `vec![..]`. A literal matched by name (B569 §4.1)
+                // stores written element `layout[slot]` at `slot`.
+                let layout = self
+                    .program
+                    .tuple_literal_layouts
+                    .get(&id)
+                    .filter(|layout| layout.len() == elements.len())
+                    .cloned();
+                let slot_types = self
+                    .type_of(id)
+                    .or(self.expected_type)
+                    .and_then(|type_id| self.resolve(type_id))
+                    .and_then(|resolved| match resolved {
+                        Type::Tuple(slots, _) if slots.len() == elements.len() => {
+                            Some(slots.clone())
+                        }
+                        _ => None,
+                    });
                 let mut parts = Vec::new();
-                for element in &elements {
-                    let expecting = self.expected_type;
+                for (written, element) in elements.iter().enumerate() {
+                    let slot = layout.as_ref().map_or(Some(written), |layout| {
+                        layout.iter().position(|stored| *stored == written)
+                    });
+                    let expecting = match &slot_types {
+                        Some(slots) => slot.and_then(|slot| slots.get(slot).copied()),
+                        None => self.expected_type,
+                    };
                     parts.push(self.consumed_value_of_expecting(*element, expecting, depth)?);
                 }
                 // B569 §4.1: a literal matched by name stores its entries in
                 // its type's order and evaluates them as WRITTEN — each bound
                 // in written order, the tuple built from the bindings.
-                if let Some(layout) = self.program.tuple_literal_layouts.get(&id)
-                    && layout.len() == parts.len()
-                {
+                if let Some(layout) = layout {
                     let mut block = String::from("{ ");
                     for (index, part) in parts.iter().enumerate() {
                         let _ = write!(block, "let __entry{index} = {part}; ");
@@ -6072,6 +6160,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some((subject, trait_id, arguments)) = self.program.dyn_coercions.get(&id).cloned()
         else {
             return Ok(text);
+        };
+        // B605: an argument erased into its parameter's object type names
+        // the trait's arguments in the CALLEE's binders; the call closes them.
+        let arguments = match self.erasing_argument.take() {
+            Some((argument, binding)) if argument == id => {
+                let entries = self.resolved_entries(&binding);
+                arguments
+                    .iter()
+                    .map(|argument| self.substituted(*argument, &entries))
+                    .collect()
+            }
+            other => {
+                self.erasing_argument = other;
+                arguments
+            }
         };
         // B412: a site erasing a generic parameter may be instantiated at an
         // OBJECT, which is already the erased value — no second pointer.
@@ -7664,7 +7767,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let substitution = self.call_substitution(id, member_id, &[]);
             let instance = self.ensure_function(member_id, &substitution)?;
             let mut prelude = String::new();
-            let arguments = self.call_arguments(member_id, &[left, right], depth, &mut prelude)?;
+            // F131: the operands are positioned against the member's
+            // parameters under THIS binding, as a direct call's arguments are
+            // — `grid == [[1, 2], [3, 4]]` reaches `impl [type T: PartialEq;
+            // const N]`'s `eq(self, b: [T; N])`, and its inner literals met an
+            // unbound `T` and rendered `vec![..]`.
+            self.argument_substitution = Some(substitution);
+            let arguments = self.call_arguments(member_id, &[left, right], depth, &mut prelude);
+            self.argument_substitution = None;
+            let arguments = arguments?;
             let call = Self::with_argument_prelude(
                 prelude,
                 format!("{}({})", instance.name, arguments.join(", ")),
@@ -8611,6 +8722,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // substitutes the payload accessor at every reference), so
                 // `matches!` — which binds nothing — cannot serve a pattern
                 // that captures. Every other position keeps the refusal.
+                // F91: a `&&` chain whose conjuncts CAPTURE is a let-chain
+                // (the emitted crate is edition 2024), so a capture left of
+                // the `&&` is in scope in the BODY as the source says — the
+                // `match` [`Self::conjunction`] answers in a value position
+                // scoped it to its arm, and `if held is Some(let name) &&
+                // name.len() > 0 { print(name) }` named a binding rustc had
+                // never seen.
+                if let Some((head, bindings)) = self.capturing_let_chain(*condition, depth)? {
+                    let mut body = String::new();
+                    let walked = self.emit_block(statements, *tail, &mut body, depth + 1);
+                    for binding in &bindings {
+                        self.is_captures.remove(binding);
+                    }
+                    walked?;
+                    let mut out = format!("{head} {{\n{body}{pad}}}");
+                    if let Some(next) = next {
+                        let _ = write!(out, " else {}", self.if_branch(next, depth)?);
+                    }
+                    return Ok(out);
+                }
                 let captured = self.is_condition_captures(*condition);
                 let head = match &captured {
                     Some((subject, pattern, bindings)) => {
@@ -8652,6 +8783,81 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.emit_block(statements, *tail, &mut body, depth + 1)?;
                 Ok(format!("{{\n{body}{pad}}}"))
             }
+        }
+    }
+
+    /// F91: an `if` condition that is a `&&` chain with a CAPTURING `is`-test
+    /// among its conjuncts, as a Rust let-chain head — `if let Some(name) =
+    /// (held).clone() && (name.len() > 0)` — and the captures it binds, which
+    /// are registered (in [`Emitter::is_captures`]) for the rest of the chain
+    /// and the body; the caller releases them. Each capturing conjunct is a
+    /// `let`, copied as `if let` copies its subject (F20); every other one is
+    /// the boolean it is. `None` for a condition that is not such a chain.
+    fn capturing_let_chain(
+        &mut self,
+        condition: Id,
+        depth: usize,
+    ) -> Result<Option<(String, Vec<Id>)>, Error> {
+        if !matches!(
+            self.program.entity_map.get(&condition),
+            Some(Expr::Binary(BinaryOp::And, _, _))
+        ) || self.program.binary_op_dispatch.contains_key(&condition)
+        {
+            return Ok(None);
+        }
+        let mut conjuncts = Vec::new();
+        self.flatten_conjunction(condition, &mut conjuncts);
+        if !conjuncts
+            .iter()
+            .any(|conjunct| self.is_condition_captures(*conjunct).is_some())
+        {
+            return Ok(None);
+        }
+        let mut parts = Vec::new();
+        let mut captured = Vec::new();
+        for conjunct in conjuncts {
+            let part = match self.is_condition_captures(conjunct) {
+                Some((subject, pattern, bindings)) => {
+                    let subject_text = self.expression(subject, depth);
+                    let subject_text = match subject_text {
+                        Ok(text) => self.copy_a_pattern_subject(subject, text),
+                        Err(error) => {
+                            self.release_captures(&captured);
+                            return Err(error);
+                        }
+                    };
+                    let subject_type = self.settled_value_type(subject);
+                    let pattern_text = self.pattern(&pattern, subject_type, self.span_of(conjunct));
+                    let pattern_text = match pattern_text {
+                        Ok(text) => text,
+                        Err(error) => {
+                            self.release_captures(&captured);
+                            return Err(error);
+                        }
+                    };
+                    for binding in &bindings {
+                        self.is_captures.insert(*binding);
+                    }
+                    captured.extend(bindings);
+                    format!("let {pattern_text} = {subject_text}")
+                }
+                None => match self.expression(conjunct, depth) {
+                    Ok(text) => format!("({text})"),
+                    Err(error) => {
+                        self.release_captures(&captured);
+                        return Err(error);
+                    }
+                },
+            };
+            parts.push(part);
+        }
+        Ok(Some((format!("if {}", parts.join(" && ")), captured)))
+    }
+
+    /// Releases the `is` captures a let-chain registered (F91).
+    fn release_captures(&mut self, bindings: &[Id]) {
+        for binding in bindings {
+            self.is_captures.remove(binding);
         }
     }
 
@@ -8994,7 +9200,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         };
         let name = format!("__literal{}", guards.len());
-        guards.push(format!("&*{name} == {literal}"));
+        // F134: the binder is an `Rc<str>` slot, or a REFERENCE to one where
+        // the subject carries a payload view (F21: `match shelf.at(0)` over an
+        // `Option<&str>`), and `&*` read only the first as a `&str`. `AsRef`
+        // reaches the `str` through either.
+        guards.push(format!("AsRef::<str>::as_ref(&{name}) == {literal}"));
         Ok(name)
     }
 
@@ -9370,8 +9580,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_) | Type::Trait(_, _),
             )
             | None => false,
+            // B605: an object type is closed only when its trait's arguments
+            // are — `dyn Pipe<Option<P>>` names the callee's `P`.
             Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments, _),
+                Type::Struct(_, arguments)
+                | Type::Enum(_, arguments)
+                | Type::Tuple(arguments, _)
+                | Type::Dyn(_, arguments),
             ) => arguments
                 .clone()
                 .iter()
@@ -12345,10 +12560,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
         // A124 R3: `o.member(..)` where `o` is a trait OBJECT — a slot call.
         if let Some(member) = self.program.dyn_method_calls.get(&call_id).copied() {
+            // B605: the receiver's type as THIS call site settles it — a
+            // generic call's `dyn Pipe<Option<P>>` read under the call's own
+            // binding (`pipe_of(a).effect(..)`), where the record alone names
+            // the callee's `P`.
             let receiver_type = function_call
                 .argument_ids
                 .first()
-                .and_then(|receiver| self.type_of(*receiver))
+                .copied()
+                .and_then(|receiver| self.settled_value_type(receiver))
                 .ok_or_else(|| {
                     unsupported("a call through an object whose receiver has no type", span)
                 })?;
@@ -12733,7 +12953,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
             .collect();
         let views_a_cell = takes_a_view.contains(&true);
-        let borrows_a_cell = borrows_a_cell || borrows_a_read_place || views_a_cell;
+        // F129: an argument that COPIES out of a cell — a spine through a
+        // `Shared` view or over a boxed binding, of a type the JS backend
+        // hands on by reference — while a later argument runs code is copied
+        // LAST, after the other arguments are settled, so a later argument
+        // that writes the cell in place is seen by the callee as on JS (spec
+        // §6.9's native note, the order F49's views and F123's lookups have).
+        let defers_a_copy: Vec<bool> = (0..argument_ids.len())
+            .map(|index| {
+                self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
+            })
+            .collect();
+        let defers_copies = defers_a_copy.contains(&true);
+        let borrows_a_cell =
+            borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies;
+        let mut deferred_copies = String::new();
         let mut view_borrows = String::new();
         let mut views = 0;
         self.refuse_a_closure_beside_a_cell_view(&conventions, argument_ids)?;
@@ -12831,7 +13065,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             } else {
                 // A by-value parameter CONSUMES its argument, so a plain read
                 // of a place copies — see [`Emitter::copy_a_consumed_place_read`].
+                let saved_erasing = std::mem::replace(
+                    &mut self.erasing_argument,
+                    callee_substitution
+                        .clone()
+                        .map(|binding| (*argument, binding)),
+                );
                 let value = self.value_of_expecting(*argument, expecting, depth);
+                self.erasing_argument = saved_erasing;
                 self.expects_async_value = false;
                 value.map(|value| self.copy_a_consumed_place_read(*argument, value))
             };
@@ -12857,6 +13098,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .entity_map
                 .get(argument)
                 .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
+            // F129: the deferred copy is taken after every hoisted argument,
+            // and a `&` argument that computes a value (`&mark(cell)`) is
+            // settled in order with the by-value ones, ahead of it.
+            let lent = matches!(conventions.get(index), Some(Receiving::Ref));
+            let lends = lent && !already_a_reference;
+            if defers_a_copy[index] || (defers_copies && lent && !self.runs_no_code(*argument)) {
+                let name = if defers_a_copy[index] {
+                    format!("__copied{index}")
+                } else {
+                    format!("__borrowed{index}")
+                };
+                let target = if defers_a_copy[index] {
+                    &mut deferred_copies
+                } else {
+                    &mut *prelude
+                };
+                let _ = write!(target, "let {name} = {text}; ");
+                rendered.push(if lends { format!("&{name}") } else { name });
+                continue;
+            }
             // A binding that is ALREADY a `&mut` loan is reborrowed, not
             // borrowed again: `&mut counter` of a `counter: &mut Counter` is a
             // `&mut &mut Counter`, which rustc only takes from a `mut` binding —
@@ -12886,6 +13147,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             rendered.push(text);
         }
+        prelude.push_str(&deferred_copies);
         prelude.push_str(&view_borrows);
         Ok(rendered)
     }
@@ -13250,6 +13512,178 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => id,
         };
         !self.is_natively_copy(place) && self.cell_spine(place).is_some()
+    }
+
+    /// F129: whether the argument at `index` is a copy out of a cell that the
+    /// call takes LAST — after every other argument has been settled — rather
+    /// than where it stands.
+    ///
+    /// A spine through a `Shared` view or over a boxed binding (`cell.read().
+    /// items`, `log.lines`) is natively a copy out of the cell's scoped borrow
+    /// (F62, F103), and the copy had been taken in argument order: a LATER
+    /// argument that wrote the cell in place (`has(cell.read().items,
+    /// grow(cell))`, `grow` pushing into `items`) was not seen by the callee,
+    /// where the JS backend — whose argument is the collection itself —
+    /// printed the written answer. Taking the copy after the later arguments
+    /// is the order spec §6.9's native note gives a view, and the one F123's
+    /// lookups read in.
+    ///
+    /// The copy waits only where the wait is the JS answer and changes no
+    /// other: the value is one JS hands on BY REFERENCE (a struct, a `List`,
+    /// a map, a set, a fixed array, a trait object — a scalar, `str`, `bool`,
+    /// an enum or a tuple is read where it stands there too), the JS backend
+    /// takes no copy of it at the call (`clone_sites`), a later argument runs
+    /// code, and every other argument that runs code can be settled ahead of
+    /// it in its own order: a by-value one, a `&` one that computes its value,
+    /// or a view. The cell's handle must be a binding, and each subscript
+    /// index must run no code, so deferring the read moves nothing but the
+    /// copy itself.
+    fn defers_its_cell_copy(
+        &self,
+        conventions: &[Receiving],
+        argument_ids: &[Id],
+        takes_a_view: &[bool],
+        index: usize,
+    ) -> bool {
+        let argument = argument_ids[index];
+        let by_value = matches!(conventions.get(index), None | Some(Receiving::ByValue));
+        if takes_a_view[index]
+            || !(by_value || matches!(conventions.get(index), Some(Receiving::Ref)))
+        {
+            return false;
+        }
+        let place = match self.program.entity_map.get(&argument) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => argument,
+        };
+        let Some((root, steps)) = self.cell_spine(place) else {
+            return false;
+        };
+        if let CellRoot::View(handle) = root
+            && !matches!(
+                self.program.entity_map.get(&handle),
+                Some(Expr::Local(_) | Expr::Parameter(_))
+            )
+        {
+            return false;
+        }
+        let subscripts_run_code = steps.iter().any(
+            |step| matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript)),
+        );
+        if subscripts_run_code
+            || !self
+                .type_of(place)
+                .is_some_and(|type_id| self.aliases_on_the_js_backend(type_id))
+            || (by_value && self.copy_applies(self.program.clone_sites.get(&argument)))
+        {
+            return false;
+        }
+        let a_later_argument_runs_code = argument_ids
+            .iter()
+            .skip(index + 1)
+            .any(|later| !self.runs_no_code(*later));
+        a_later_argument_runs_code
+            && argument_ids.iter().enumerate().all(|(other, other_id)| {
+                other == index
+                    || takes_a_view.get(other).copied().unwrap_or(false)
+                    || self.runs_no_code(*other_id)
+                    || match conventions.get(other) {
+                        None | Some(Receiving::ByValue) => true,
+                        Some(Receiving::Ref) => self.computes_a_value(*other_id),
+                        Some(Receiving::RefMut) => false,
+                    }
+            })
+    }
+
+    /// F129: whether the JS backend hands a value of `type_id` on BY REFERENCE
+    /// — an object a later write in place shows through — rather than as a
+    /// value read where it stands: a struct other than a scalar, `str`,
+    /// `BigInt` or a `Shared` handle (whose cell is the same either way), a
+    /// fixed array and a trait object. An enum (`bool` among them) and a
+    /// tuple (flattened into its slots) are read where they stand.
+    fn aliases_on_the_js_backend(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, _)) => {
+                self.program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        !(declaration.external
+                            && (scalar_type(declaration.name).is_some()
+                                || matches!(declaration.name, "BigInt" | "Shared")))
+                    })
+            }
+            Some(Type::Array(..) | Type::Dyn(..)) => true,
+            _ => false,
+        }
+    }
+
+    /// F129: whether evaluating `id` runs no code that could write anything —
+    /// a literal, a binding read, a closure being made (its body runs later),
+    /// and the fields, slots, subscripts, references and aggregates of those.
+    /// A call, an operator (an impl may be the user's) or any compound
+    /// expression may.
+    fn runs_no_code(&self, id: Id) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.program.entity_map.get(&id) {
+            Some(
+                Expr::Bool(_)
+                | Expr::Number(..)
+                | Expr::String(_)
+                | Expr::MultilineString(_)
+                | Expr::Null
+                | Expr::Void
+                | Expr::Local(_)
+                | Expr::Parameter(_)
+                | Expr::Closure(_)
+                | Expr::Function(_)
+                | Expr::LengthValue(_),
+            ) => true,
+            Some(
+                &Expr::Field(subject, _, _)
+                | &Expr::TupleIndex(subject, _, _)
+                | &Expr::Reference(subject, _)
+                | &Expr::Dereference(subject)
+                | &Expr::Ascribe(subject),
+            ) => self.runs_no_code(subject),
+            Some(&Expr::Index(subject, subscript)) => {
+                self.runs_no_code(subject) && self.runs_no_code(subscript)
+            }
+            Some(Expr::List(elements) | Expr::Tuple(elements)) => {
+                elements.iter().all(|element| self.runs_no_code(*element))
+            }
+            Some(Expr::StructInitializer(_, fields)) => {
+                fields.values().all(|field| self.runs_no_code(*field))
+            }
+            _ => false,
+        }
+    }
+
+    /// F129: whether a `&` argument COMPUTES its value rather than naming a
+    /// place — a call, an operator, a block, or a `&` written over one — so
+    /// settling it in a `let` ahead of the call and lending the `let` is the
+    /// same argument (a `let` of a written `&temporary` keeps the temporary
+    /// alive with it).
+    fn computes_a_value(&self, id: Id) -> bool {
+        if let Some(&Expr::Reference(operand, false)) = self.program.entity_map.get(&id) {
+            return self.computes_a_value(operand);
+        }
+        !self.is_a_view_call(id)
+            && !matches!(
+                self.program.entity_map.get(&id),
+                Some(
+                    Expr::Local(_)
+                        | Expr::Parameter(_)
+                        | Expr::Variable(_)
+                        | Expr::Field(..)
+                        | Expr::TupleIndex(..)
+                        | Expr::Index(..)
+                        | Expr::Dereference(_)
+                        | Expr::Reference(..)
+                ) | None
+            )
     }
 
     /// Whether the `&` argument at `index` is taken as a VIEW of its boxed
@@ -13870,7 +14304,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
         match argument_ids.get(index) {
             Some(argument) => {
                 let argument = *argument;
-                self.expecting_nothing(|emitter| emitter.expression(argument, depth))
+                // F132: a `print` argument's position is the type the
+                // analysis settled for it, so a literal inside it builds what
+                // that type declares — `print(Frame::Bytes([0, 0, 0, 1]))`
+                // with `Bytes([u8; 4])` had no position to read the payload's
+                // array off and rendered `vec![..]`. Only a closed type is
+                // handed down.
+                let printed = self
+                    .program
+                    .print_argument_types
+                    .get(&argument)
+                    .map(|type_id| self.concrete(*type_id))
+                    .filter(|type_id| self.is_grounded(*type_id));
+                let saved = std::mem::replace(&mut self.expected_type, printed);
+                let rendered = self.expression(argument, depth);
+                self.expected_type = saved;
+                rendered
             }
             None => Ok("()".to_string()),
         }
@@ -14216,22 +14665,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     ));
                 }
             };
-            if target_parameters.len() != slot.forwarded.len() + 1 {
+            // B606: the slot's arguments in the IMPLEMENTATION's order. A
+            // written parameter forwards the declaration's at its position;
+            // a hidden context parameter (the context pass's, J6) forwards
+            // the declaration's hidden parameter that threads the SAME
+            // context. The two lists differ: the pass threads a hidden
+            // argument at a trait call when some impl of the member reads the
+            // context, so an impl that reads none (`RemoteStoreSome`'s
+            // `attach_observer`) takes fewer, and one the declaration's union
+            // missed (the `Source` blanket's `start`, reading `turn_scope` and
+            // `ambient_nursery` where `Flow::start` threads nothing) takes
+            // more. A missing context of the SAFE flavour is `None` — the
+            // `undefined` the JS table passes, which that flavour reads as
+            // "no ambient value"; a missing STRICT one has no value to stand
+            // in and is refused.
+            let forwarded_here = self.object_slot_arguments(slot, &target_parameters);
+            let Some(forwarded_here) = forwarded_here else {
                 self.object_impls
                     .remove(&(object.name.clone(), rendered_subject.clone()));
                 return Err(unsupported(
                     &format!(
                         "`{}` through a `dyn` object on `{rendered_subject}` (the implementation \
-                         takes {} parameters where the declaration takes {})",
+                         takes {} parameters where the declaration takes {}, and the difference \
+                         is not a context the declaration threads or an optional one)",
                         slot.member,
                         target_parameters.len(),
                         slot.forwarded.len() + 1
                     ),
                     span,
                 ));
-            }
+            };
             let mut forwarded = vec![receiver];
-            forwarded.extend(slot.forwarded.iter().cloned());
+            forwarded.extend(forwarded_here);
             let _ = writeln!(out, "    {} {{", slot.signature);
             let _ = writeln!(out, "        {function_name}({})", forwarded.join(", "));
             let _ = writeln!(out, "    }}");
@@ -14248,6 +14713,68 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.next_type_slot += 1;
         self.types.insert(slot, out);
         Ok(object.name)
+    }
+
+    /// B606: the arguments one object slot hands its implementation after the
+    /// receiver, matched parameter by parameter — see
+    /// [`Self::ensure_object_impl`]. `None` when the implementation's written
+    /// parameters do not line up with the declaration's, or it reads a
+    /// STRICT context the declaration does not thread.
+    fn object_slot_arguments(
+        &self,
+        slot: &ObjectSlot,
+        target_parameters: &[Id],
+    ) -> Option<Vec<String>> {
+        let hidden = |parameter: &Id| {
+            self.program
+                .context_hidden_parameters
+                .get(parameter)
+                .copied()
+        };
+        let declared: Vec<Id> = self
+            .program
+            .functions
+            .get(&slot.declaration)?
+            .parameters
+            .iter()
+            .skip(1)
+            .copied()
+            .collect();
+        if declared.len() != slot.forwarded.len() {
+            return None;
+        }
+        let written: Vec<&String> = declared
+            .iter()
+            .zip(&slot.forwarded)
+            .filter(|(parameter, _)| hidden(parameter).is_none())
+            .map(|(_, name)| name)
+            .collect();
+        let mut written = written.into_iter();
+        let mut arguments = Vec::new();
+        for parameter in target_parameters.iter().skip(1) {
+            match hidden(parameter) {
+                None => arguments.push(written.next()?.clone()),
+                Some(context) => {
+                    let threaded = declared
+                        .iter()
+                        .zip(&slot.forwarded)
+                        .find(|(declared, _)| hidden(declared) == Some(context))
+                        .map(|(_, name)| name.clone());
+                    match threaded {
+                        Some(name) => arguments.push(name),
+                        None if self
+                            .program
+                            .context_optional_hidden_parameters
+                            .contains(parameter) =>
+                        {
+                            arguments.push("None".to_string());
+                        }
+                        None => return None,
+                    }
+                }
+            }
+        }
+        written.next().is_none().then_some(arguments)
     }
 
     /// A call through an object's table: `ObjectX::member(o.object(), ..)`.
@@ -14521,6 +15048,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         impl_select::bind_provider_binders(self.program, selected.impl_subject, &mut substitution);
         substitution.extend(self.own_generic_entries(member_id, own_generic_values));
         let name = self.ensure_function(member_id, &substitution)?.name;
+        self.dispatched_bindings
+            .entry(name.clone())
+            .or_insert(substitution);
         Ok(NativeDispatch::Call(name))
     }
 
@@ -14566,7 +15096,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let arguments = match target {
                     Some(target) => {
                         self.refuse_unthreaded_context(target, argument_ids, span)?;
-                        self.call_arguments(target, argument_ids, depth, &mut prelude)?
+                        // F131: each argument's position is its parameter
+                        // under the INSTANCE's binding, as at a direct call —
+                        // `grid == [[1, 2], [3, 4]]` reaches `impl [type T:
+                        // PartialEq; const N]`'s `eq(self, b: [T; N])`, and
+                        // the inner literals met an unbound `T` and rendered
+                        // `vec![..]`.
+                        self.argument_substitution = self.dispatched_bindings.get(&name).cloned();
+                        let arguments =
+                            self.call_arguments(target, argument_ids, depth, &mut prelude);
+                        self.argument_substitution = None;
+                        arguments?
                     }
                     None => self.value_arguments(argument_ids, depth)?,
                 };
