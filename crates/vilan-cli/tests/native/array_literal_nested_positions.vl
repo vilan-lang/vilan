@@ -1,0 +1,34 @@
+// F132: an array literal in a position whose type is a fixed array `[T; n]`
+// one level inside a tuple slot, a struct field's tuple, a variant payload
+// under `print`, or a list element under `print` builds the array natively.
+import std::io::print;
+
+struct Holder {
+	pair: ([i32; 3], bool),
+}
+
+enum Frame {
+	Empty,
+	Bytes([u8; 4]),
+}
+
+fun count(t: ([i32; 2], bool)): i32 {
+	t.0[0] + t.0[1]
+}
+
+fun main() {
+	let holder = Holder { pair = ([5, 6, 7], true) };
+	print(holder.pair.0[2]);
+	let t: ([i32; 2], bool) = ([1, 2], false);
+	print(count(t));
+	print(count(([3, 4], true)));
+	print([Frame::Empty, Frame::Bytes([0, 0, 0, 1])]);
+	print(Frame::Bytes([0, 0, 0, 2]));
+	let fixed: [i32; 2] = [1, 2];
+	print([fixed, [7, 8]]);
+	let wrapped: (Option<[i32; 2]>, i32) = (Some([1, 1]), 2);
+	print(wrapped);
+	let named: (flag: bool, bytes: [u8; 2]) = (bytes = [9, 9], flag = true);
+	print(named.bytes[1]);
+	print(([fixed, [5, 6]], [Frame::Bytes([1, 2, 3, 4])]));
+}

@@ -5818,17 +5818,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 {
                     return self.spread_tuple(id, &elements, depth, span);
                 }
+                // F132: each element's position is its SLOT's type — `([5, 6,
+                // 7], true)` against `([i32; 3], bool)` builds the array its
+                // first slot declares. The whole tuple's type had been handed
+                // to every element, so a fixed-array slot met a literal that
+                // rendered `vec![..]`. A literal matched by name (B569 §4.1)
+                // stores written element `layout[slot]` at `slot`.
+                let layout = self
+                    .program
+                    .tuple_literal_layouts
+                    .get(&id)
+                    .filter(|layout| layout.len() == elements.len())
+                    .cloned();
+                let slot_types = self
+                    .type_of(id)
+                    .or(self.expected_type)
+                    .and_then(|type_id| self.resolve(type_id))
+                    .and_then(|resolved| match resolved {
+                        Type::Tuple(slots, _) if slots.len() == elements.len() => {
+                            Some(slots.clone())
+                        }
+                        _ => None,
+                    });
                 let mut parts = Vec::new();
-                for element in &elements {
-                    let expecting = self.expected_type;
+                for (written, element) in elements.iter().enumerate() {
+                    let slot = layout.as_ref().map_or(Some(written), |layout| {
+                        layout.iter().position(|stored| *stored == written)
+                    });
+                    let expecting = match &slot_types {
+                        Some(slots) => slot.and_then(|slot| slots.get(slot).copied()),
+                        None => self.expected_type,
+                    };
                     parts.push(self.consumed_value_of_expecting(*element, expecting, depth)?);
                 }
                 // B569 §4.1: a literal matched by name stores its entries in
                 // its type's order and evaluates them as WRITTEN — each bound
                 // in written order, the tuple built from the bindings.
-                if let Some(layout) = self.program.tuple_literal_layouts.get(&id)
-                    && layout.len() == parts.len()
-                {
+                if let Some(layout) = layout {
                     let mut block = String::from("{ ");
                     for (index, part) in parts.iter().enumerate() {
                         let _ = write!(block, "let __entry{index} = {part}; ");
@@ -14077,7 +14103,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
         match argument_ids.get(index) {
             Some(argument) => {
                 let argument = *argument;
-                self.expecting_nothing(|emitter| emitter.expression(argument, depth))
+                // F132: a `print` argument's position is the type the
+                // analysis settled for it, so a literal inside it builds what
+                // that type declares — `print(Frame::Bytes([0, 0, 0, 1]))`
+                // with `Bytes([u8; 4])` had no position to read the payload's
+                // array off and rendered `vec![..]`. Only a closed type is
+                // handed down.
+                let printed = self
+                    .program
+                    .print_argument_types
+                    .get(&argument)
+                    .map(|type_id| self.concrete(*type_id))
+                    .filter(|type_id| self.is_grounded(*type_id));
+                let saved = std::mem::replace(&mut self.expected_type, printed);
+                let rendered = self.expression(argument, depth);
+                self.expected_type = saved;
+                rendered
             }
             None => Ok("()".to_string()),
         }

@@ -13090,6 +13090,31 @@ fn f129_a_later_argument_that_replaces_the_copied_place_answers_the_same_on_both
     assert_eq!(compare(&staged, file), Verdict::Identical);
 }
 
+/// F132: an array literal whose position is a fixed array `[T; n]` one level
+/// inside another literal — a tuple slot of a struct field
+/// (`Holder { pair = ([5, 6, 7], true) }`), of an annotated `let` handed to a
+/// call, of a call's own argument, of a tuple matched by name — or inside a
+/// `print` argument (a variant payload in a list, a variant alone, a list of
+/// arrays) was emitted `vec![..]`, which rustc refused ("expected `[i32; 3]`,
+/// found `Vec<i32>`"). A tuple literal now hands each element its SLOT's
+/// type, and a `print` argument is positioned at the type the analysis
+/// settled for it.
+#[test]
+fn f132_an_array_literal_inside_a_tuple_or_a_printed_value_builds_the_array_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f132_array_literal_nested_positions.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_literal_nested_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested array literal must build the fixed array its position declares"
+    );
+}
+
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
 /// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
 /// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
