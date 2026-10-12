@@ -133,7 +133,7 @@ fn fix_manifest(directory: &Path, fixed: &mut Fixed) -> Result<Option<String>, S
 pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Result<(), String> {
     let mut workspace: Workspace = resolve_workspace(unit)?;
     workspace.entry_mode = unit.entry_mode.clone();
-    let std_spec = vilan_core::manifest::resolve_std(&std_dir(&unit.entry)?);
+    let std_spec = vilan_core::manifest::resolve_std(&std_dir()?);
     let package_root = unit
         .package_dir
         .clone()

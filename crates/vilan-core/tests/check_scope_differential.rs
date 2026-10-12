@@ -16,6 +16,7 @@
 
 mod replay_harness;
 mod scratch;
+mod test_pool;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -267,7 +268,7 @@ fn corpus_agrees_between_scoped_and_full_scan_checks() {
     let observe_all = || -> Vec<(String, String, Option<String>)> {
         std::thread::scope(|scope| {
             let workers: Vec<_> = paths
-                .chunks(paths.len().div_ceil(8).max(1))
+                .chunks(paths.len().div_ceil(test_pool::workers(8)).max(1))
                 .map(|chunk| {
                     scope.spawn(move || {
                         chunk
@@ -1001,7 +1002,7 @@ fn module_corpus() -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
 fn observe_corpus(packages: &[(PathBuf, PathBuf)]) -> Vec<ReuseObservation> {
     std::thread::scope(|scope| {
         let workers: Vec<_> = packages
-            .chunks(packages.len().div_ceil(16).max(1))
+            .chunks(packages.len().div_ceil(test_pool::workers(16)).max(1))
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk

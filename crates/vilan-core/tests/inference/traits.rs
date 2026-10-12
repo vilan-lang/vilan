@@ -6129,6 +6129,90 @@ fn b302_a_path_of_three_segments_renders_whole() {
     );
 }
 
+// --- B597 / E296: a tuple, array, closure or view type is QUOTED, and refused once -------
+// `render_type` answered `_` for every annotation form it did not know - a tuple, a fixed
+// array, a closure type, a view - so `parameter `message` of `[rpc]` method `echo` is `_`,
+// which is not Wire` named nothing the author had written; and the refusal of an array or
+// tuple `[rpc]` parameter was said TWICE, the second time by the generated code ("[u8; 4]
+// has no method 'describe'") at the attribute. The messages now quote through
+// `render_type_quoted` (the codegen renderer is untouched: the derive generators emit what
+// it returns), and the generated-code restatement stands down like B490's.
+
+fn rpc_service_with(method: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        [service(StoreClient)]
+        struct Store {{ name: str }}
+        impl Store {{
+            [rpc]
+            {method}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+    )
+}
+
+#[track_caller]
+fn assert_refused_once_naming(method: &str, quoted: &str) {
+    let errors =
+        compile(&rpc_service_with(method)).expect_err("a non-Wire signature must be refused");
+    assert_eq!(errors.len(), 1, "one cause, one refusal; got: {errors:#?}");
+    assert!(
+        errors[0].contains(&format!("is `{quoted}`, which is not Wire")),
+        "the refusal must quote {quoted:?}; got: {errors:#?}"
+    );
+    assert!(!errors[0].contains("is `_`"), "{errors:#?}");
+}
+
+#[test]
+fn e296_an_array_rpc_parameter_is_refused_once_and_names_its_type() {
+    assert_refused_once_naming("fun first(self, rgba: [u8; 4]): u8 { rgba[0] }", "[u8; 4]");
+}
+
+#[test]
+fn b597_a_tuple_rpc_parameter_is_refused_once_and_names_its_type() {
+    assert_refused_once_naming(
+        "fun echo(self, message: (i32, i32)): i32 { message.0 }",
+        "(i32, i32)",
+    );
+}
+
+#[test]
+fn b597_a_labelled_tuple_and_a_tuple_return_quote_their_labels() {
+    assert_refused_once_naming(
+        "fun at(self, point: (x: i32, y: i32)): i32 { point.x }",
+        "(x: i32, y: i32)",
+    );
+    assert_refused_once_naming("fun pair(self): (i32, str) { (1, \"a\") }", "(i32, str)");
+}
+
+#[test]
+fn b597_a_closure_rpc_parameter_is_refused_once_and_names_its_type() {
+    assert_refused_once_naming(
+        "fun call(self, callback: |i32| i32): i32 { 1 }",
+        "|i32| i32",
+    );
+}
+
+#[test]
+fn b597_a_derive_wire_field_quotes_its_tuple_array_and_nested_forms() {
+    for (field, quoted) in [
+        ("both: (i32, i32)", "(i32, i32)"),
+        ("rgba: [u8; 4]", "[u8; 4]"),
+        ("some: Option<(i32, i32)>", "Option<(i32, i32)>"),
+        ("grid: List<[u8; 2]>", "List<[u8; 2]>"),
+    ] {
+        assert_fails_with(
+            &format!(
+                "[derive(Wire)]\nstruct Holder {{\n\t{field},\n}}\nfun main() {{ }}\nmain();\n"
+            ),
+            &format!("is `{quoted}`, which is not Wire"),
+        );
+    }
+}
+
 /// B329: the `[expose]` ELEMENT refusal quotes the annotation as written.
 ///
 /// The element it tests comes off the field's `Source` impl and is a resolved

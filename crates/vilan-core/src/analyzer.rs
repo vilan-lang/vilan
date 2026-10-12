@@ -10637,7 +10637,7 @@ impl<'src> Analyzer<'src> {
                 // taking precedence over the not-Wire message: a resource is not
                 // plain data, so it cannot cross the wire (destruction.md §8).
                 if self.type_is_resource(*field_type_id) {
-                    let rendered = render_type(type_node);
+                    let rendered = render_type_quoted(type_node);
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -10654,7 +10654,7 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
                 if !self.resolved_type_is_wire(*field_type_id) {
-                    let rendered = render_type(type_node);
+                    let rendered = render_type_quoted(type_node);
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -10743,7 +10743,7 @@ impl<'src> Analyzer<'src> {
                 // taking precedence over the not-Hashable message: a resource
                 // cannot be hashed by value (destruction.md §8).
                 if self.type_is_resource(*field_type_id) {
-                    let rendered = render_type(type_node);
+                    let rendered = render_type_quoted(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
@@ -10756,7 +10756,7 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
                 if !self.resolved_type_is_hashable(*field_type_id) {
-                    let rendered = render_type(type_node);
+                    let rendered = render_type_quoted(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
@@ -10782,7 +10782,7 @@ impl<'src> Analyzer<'src> {
         for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
                 if self.type_is_resource(*field_type_id) {
-                    let rendered = render_type(type_node);
+                    let rendered = render_type_quoted(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
@@ -10810,7 +10810,7 @@ impl<'src> Analyzer<'src> {
         for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
                 if self.type_is_resource(*field_type_id) {
-                    let rendered = render_type(type_node);
+                    let rendered = render_type_quoted(type_node);
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -20922,7 +20922,7 @@ impl<'src> Analyzer<'src> {
             for (label, type_node, member_type_id, span) in members {
                 if notifies && label == "return type" {
                     if let Some(type_node) = type_node {
-                        let rendered = render_type(type_node);
+                        let rendered = render_type_quoted(type_node);
                         self.push_anchored(
                             Error {
                                 trace: Vec::new(),
@@ -21050,7 +21050,7 @@ impl<'src> Analyzer<'src> {
                         {
                             self.record_refused_rpc_wire_type(element_type_id);
                         }
-                        let rendered = render_type(element);
+                        let rendered = render_type_quoted(element);
                         self.push_anchored(
                             Error {
                                 trace: Vec::new(),
@@ -21101,7 +21101,7 @@ impl<'src> Analyzer<'src> {
                                 );
                                 self.rpc_refused_key_types.insert(without_spaces(&label));
                             }
-                            let rendered = render_type(key);
+                            let rendered = render_type_quoted(key);
                             let missing = match (key_is_wire, key_is_hashable) {
                                 (false, false) => "neither Wire nor Hashable",
                                 (false, true) => "not Wire",
@@ -21138,7 +21138,24 @@ impl<'src> Analyzer<'src> {
                         if let Some(member_type_id) = member_type_id {
                             self.record_refused_rpc_wire_type(member_type_id);
                         }
-                        let rendered = render_type(type_node);
+                        let rendered = render_type_quoted(type_node);
+                        // E296: a tuple, array, closure or view has no `describe` to
+                        // call, so the generated client and handler fail on it a
+                        // SECOND time at the attribute ("[u8; 4] has no method
+                        // 'describe'") - a restatement of this refusal, at a span the
+                        // author never wrote. Stand the attribute's generated-code
+                        // diagnostics down, as B490 does for a bare-trait return.
+                        if matches!(
+                            type_node,
+                            Node::Tuple(_)
+                                | Node::ArrayType(..)
+                                | Node::ClosureType(..)
+                                | Node::Reference(..)
+                        ) && let Some(origin) =
+                            self.service_attribute_origin(method_id, subject_name)
+                        {
+                            self.rpc_opaque_return_origins.insert(origin);
+                        }
                         self.push_anchored(
                             Error {
                                 trace: Vec::new(),
@@ -74556,34 +74573,87 @@ fn lift_target_of(node: &Spanned<Node<'_>>) -> bool {
 /// annotation is generated back into the module that wrote it and resolves
 /// there exactly as it did).
 fn render_type(node: &Node<'_>) -> String {
+    render_type_in(node, false)
+}
+
+/// [`render_type`] for a MESSAGE that quotes the author's annotation back (B597, E296):
+/// the same names, generic applications and paths, and in addition the forms the codegen
+/// renderer answers `_` for - a tuple (labelled or not), a fixed-length array, a closure
+/// type, a view and the `async`/`sync`/`dyn` wrappers - spelled as written, nested ones
+/// included (`List<(i32, i32)>`). A SEPARATE path, not a wider `render_type`: that one also
+/// feeds the derive generators' emitted source, where `(x: i32, y: i32)` is not an
+/// expression path and failed later and worse (lang-a-49's attempt). A form neither knows
+/// (an unevaluated array length) still renders `_` for that part only.
+fn render_type_quoted(node: &Node<'_>) -> String {
+    render_type_in(node, true)
+}
+
+fn render_type_in(node: &Node<'_>, quoting: bool) -> String {
+    let render_all = |arguments: &[Spanned<Node<'_>>]| {
+        arguments
+            .iter()
+            .map(|argument| render_type_in(&argument.0, quoting))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match node {
         Node::Accessor(name) => name.to_string(),
         Node::AccessorWithGenerics(name, arguments) => {
-            let arguments = arguments
-                .0
-                .iter()
-                .map(|argument| render_type(&argument.0))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{name}<{arguments}>")
+            format!("{name}<{}>", render_all(&arguments.0))
         }
         // `a::b::C` nests to the LEFT (`StaticAccessor(StaticAccessor(a, "b"),
         // "C")`), and only the last segment can carry generic arguments.
         Node::StaticAccessor(subject, name, arguments) => {
-            let subject = render_type(&subject.0);
-            let arguments = arguments.as_ref().map(|arguments| {
-                arguments
-                    .0
-                    .iter()
-                    .map(|argument| render_type(&argument.0))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            });
+            let subject = render_type_in(&subject.0, quoting);
             match arguments {
-                Some(arguments) => format!("{subject}::{name}<{arguments}>"),
+                Some(arguments) => format!("{subject}::{name}<{}>", render_all(&arguments.0)),
                 None => format!("{subject}::{name}"),
             }
         }
+        Node::Labelled(label, inner) if quoting => {
+            format!("{}: {}", label.0, render_type_in(&inner.0, quoting))
+        }
+        Node::Tuple(items) if quoting => {
+            let rendered = render_all(items);
+            // A one-element tuple type keeps its trailing comma, or it reads as grouping.
+            if items.len() == 1 && !matches!(items[0].0, Node::Labelled(..)) {
+                format!("({rendered},)")
+            } else {
+                format!("({rendered})")
+            }
+        }
+        Node::ArrayType(element, length) if quoting => {
+            let length = match &length.0 {
+                Node::Number(digits, _, suffix) => format!("{digits}{}", suffix.unwrap_or("")),
+                Node::Accessor(name) => name.to_string(),
+                _ => "_".to_string(),
+            };
+            format!("[{}; {length}]", render_type_in(&element.0, quoting))
+        }
+        Node::ClosureType(parameters, return_type) if quoting => {
+            let parameters = parameters
+                .0
+                .iter()
+                .map(|(label, type_)| match label {
+                    Some(label) => format!("{label}: {}", render_type_in(&type_.0, quoting)),
+                    None => render_type_in(&type_.0, quoting),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            match return_type {
+                Some(return_type) => {
+                    format!("|{parameters}| {}", render_type_in(&return_type.0, quoting))
+                }
+                None => format!("|{parameters}|"),
+            }
+        }
+        Node::Reference(writable, inner) if quoting => {
+            let mutability = if *writable { "mut " } else { "" };
+            format!("&{mutability}{}", render_type_in(&inner.0, quoting))
+        }
+        Node::AsyncType(inner) if quoting => format!("async {}", render_type_in(&inner.0, quoting)),
+        Node::SyncType(inner) if quoting => format!("sync {}", render_type_in(&inner.0, quoting)),
+        Node::DynType(inner) if quoting => format!("dyn {}", render_type_in(&inner.0, quoting)),
         _ => "_".to_string(),
     }
 }

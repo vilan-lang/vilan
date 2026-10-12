@@ -767,29 +767,25 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
-/// Locate the `std` package directory: `$VILAN_STD`, else the nearest ancestor
-/// of the document containing `vilan/std/vilan.toml` (a checkout — documents in
-/// this repo resolve the working tree). `resolve_std` reads its `[library]`
-/// manifest (or falls back to the layer convention if the path is a bare source
-/// root).
-fn discover_std_dir(start: &Path) -> PathBuf {
+/// Locate the `std` package directory: `$VILAN_STD` (a vilan checkout's `vilan/std`
+/// is reached ONLY this way - or the editor's `vilan.stdPath` - never by walking the
+/// document's ancestors, N168), else the server's own embedded std. `resolve_std`
+/// reads its `[library]` manifest (or falls back to the layer convention if the path
+/// is a bare source root).
+///
+/// The `start` is kept for the signature's callers: a document no longer chooses its
+/// toolchain. The ancestor walk for `vilan/std` ran an INSTALLED server against the
+/// nearest checkout's (possibly edited) std - a v0.47.0 probe written under a worktree
+/// compiled against the worktree's std - and made every std edit during a running
+/// suite change what each later-spawned compile read.
+fn discover_std_dir(_start: &Path) -> PathBuf {
     if let Some(path) = std::env::var_os("VILAN_STD") {
         return PathBuf::from(path);
     }
-    let mut directory = start.parent();
-    while let Some(current) = directory {
-        let candidate = current.join("vilan").join("std");
-        if candidate.join("vilan.toml").is_file() {
-            return candidate;
-        }
-        directory = current.parent();
-    }
-    // No ancestor carries a checkout — a project OUTSIDE the vilan repo (the
-    // kolt shape, and every installed binary). Materialize the server's own
-    // embedded std (real files, so definitions into std keep resolving); the
-    // CLI does the same, so both tools see the identical std from any
-    // directory. On a materialization failure (no writable home OR temp dir)
-    // the path is left nonexistent and imports diagnose it.
+    // Materialize the server's own embedded std (real files, so definitions into
+    // std keep resolving); the CLI does the same, so both tools see the identical
+    // std from any directory. On a materialization failure (no writable home OR
+    // temp dir) the path is left nonexistent and imports diagnose it.
     vilan_embedded::materialize()
         .unwrap_or_else(|_| PathBuf::from("<the embedded std could not be materialized>"))
 }
@@ -797,6 +793,28 @@ fn discover_std_dir(start: &Path) -> PathBuf {
 #[cfg(test)]
 mod std_discovery_tests {
     use super::discover_std_dir;
+
+    /// N168: a checkout above the document is NOT the server's std. The ancestor walk for
+    /// `vilan/std` used to take the nearest one, so an installed server opened on a worktree's
+    /// file served that worktree's (possibly edited) std; `$VILAN_STD` / `vilan.stdPath` is the
+    /// explicit way now. The stand-in checkout carries an empty std; the answer must still be
+    /// the materialized embedded one.
+    #[test]
+    fn a_checkout_above_the_document_is_not_the_servers_std() {
+        let root = std::env::temp_dir().join(format!("vilan-lsp-n168-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let std = root.join("vilan").join("std");
+        std::fs::create_dir_all(std.join("src")).unwrap();
+        std::fs::write(std.join("vilan.toml"), "[library]\nname = \"std\"\n").unwrap();
+        let document = root.join("target").join("probe").join("main.vl");
+        let discovered = discover_std_dir(&document);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_ne!(discovered, std, "the nearest checkout's std was taken");
+        assert!(
+            discovered.join("src/lib.vl").is_file(),
+            "expected the materialized embedded std, got {discovered:?}"
+        );
+    }
 
     #[test]
     fn a_document_outside_any_checkout_falls_back_to_the_embedded_std() {

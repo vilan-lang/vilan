@@ -32,6 +32,7 @@
 
 mod replay_harness;
 mod scratch;
+mod test_pool;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -540,7 +541,7 @@ fn the_corpus_as_modules_answers_the_same_under_every_permutation() {
     assert!(paths.len() > 60, "suspiciously few corpus programs");
     let divergences: Vec<String> = std::thread::scope(|scope| {
         let workers: Vec<_> = paths
-            .chunks(paths.len().div_ceil(16).max(1))
+            .chunks(paths.len().div_ceil(test_pool::workers(16)).max(1))
             .map(|chunk| {
                 scope.spawn(move || {
                     let mut divergences = Vec::new();

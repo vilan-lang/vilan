@@ -10,6 +10,10 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
 
+# G28: the build script hashes the crate's own sources (`BUILD_ID`).
+[build-dependencies]
+sha2 = "0.10"
+
 # The workspace clippy exception list (root Cargo.toml, backlog N21).
 [lints]
 workspace = true

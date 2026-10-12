@@ -30,6 +30,7 @@
 
 mod replay_harness;
 mod scratch;
+mod test_pool;
 
 use std::path::PathBuf;
 
@@ -194,7 +195,7 @@ fn corpus_agrees_between_replayed_and_rederived_module_checks() {
     let observe_all = || -> Vec<ReuseObservation> {
         std::thread::scope(|scope| {
             let workers: Vec<_> = packages
-                .chunks(packages.len().div_ceil(16).max(1))
+                .chunks(packages.len().div_ceil(test_pool::workers(16)).max(1))
                 .map(|chunk| {
                     scope.spawn(move || {
                         chunk
@@ -348,7 +349,7 @@ fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
     let observe_all = || -> Vec<ReuseObservation> {
         std::thread::scope(|scope| {
             let workers: Vec<_> = packages
-                .chunks(packages.len().div_ceil(16).max(1))
+                .chunks(packages.len().div_ceil(test_pool::workers(16)).max(1))
                 .map(|chunk| {
                     scope.spawn(move || {
                         chunk

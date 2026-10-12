@@ -77,8 +77,10 @@ install directory you did not add), point **`vilan.server.path`** at it
 (absolute, or a name to resolve on `PATH`).
 
 The server carries the `std` sources inside itself, so definitions into `std`
-resolve on a machine with nothing else installed. Inside a Vilan checkout it
-uses that working tree instead; **`vilan.stdPath`** overrides both.
+resolve on a machine with nothing else installed. It does NOT look for a Vilan
+checkout around your files (a program under a checkout used to compile against
+that checkout's `std`; N168): to work against a tree you are editing, set
+**`vilan.stdPath`** (or `VILAN_STD`) to `<checkout>/vilan/std`.
 
 ## Settings
 

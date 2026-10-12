@@ -45,6 +45,8 @@ use std::process::Command;
 #[path = "support/mirror_tables.rs"]
 mod mirror_tables;
 mod scratch;
+#[path = "../../vilan-core/tests/test_pool/mod.rs"]
+mod test_pool;
 
 /// The extension a corpus golden carries. Corpus programs are bare files with
 /// no manifest, so `vilan build` compiles them for the default platform (Node)
@@ -272,7 +274,7 @@ fn every_corpus_golden_is_byte_identical() {
     // in parallel chunks — each program is an independent compile.
     let failures: Vec<String> = std::thread::scope(|scope| {
         let workers: Vec<_> = programs
-            .chunks(programs.len().div_ceil(8).max(1))
+            .chunks(programs.len().div_ceil(test_pool::workers(8)).max(1))
             .map(|chunk| {
                 let work = &work;
                 let corpus = &corpus;

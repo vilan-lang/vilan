@@ -54,6 +54,9 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../../vilan-core/tests/test_pool/mod.rs"]
+mod test_pool;
+
 const B473_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -1392,9 +1395,11 @@ fn worker_target(tag: &str, worker: usize) -> PathBuf {
 /// smaller machine. A leg is a vilan compile, a cargo build, two runs: half
 /// the cores keeps a test from starving the suite's others.
 fn leg_workers() -> usize {
-    std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|cores| (cores.get() / 2).clamp(1, 4))
-        .unwrap_or(1)
+        .unwrap_or(1);
+    // N159: and no wider than the suite's pool cap (`VILAN_TEST_POOL`, two under nextest).
+    test_pool::workers(cores)
 }
 
 /// N158: `leg` over every item, at most [`leg_workers`] at once

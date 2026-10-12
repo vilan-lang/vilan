@@ -36,6 +36,7 @@
 
 mod replay_harness;
 mod scratch;
+mod test_pool;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -475,7 +476,7 @@ fn the_corpus_as_modules_answers_what_a_clean_analysis_answers() {
     vilan_core::analyzer::base_cache_clear();
     let results: Vec<(String, Vec<String>, Vec<Census>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = paths
-            .chunks(paths.len().div_ceil(16).max(1))
+            .chunks(paths.len().div_ceil(test_pool::workers(16)).max(1))
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk

@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 
 use vilan_core::lexing::{CONTEXTUAL_KEYWORDS, KEYWORDS};
 use vilan_core::parsing::{self, KNOWN_ATTRIBUTE_MARKERS, ParseErrorReason};
+
+mod test_pool;
 use vilan_core::{PackageSpec, Platform, Workspace, analyze_source};
 
 const REGENERATE_ENV: &str = "VILAN_REGENERATE_MARKER_CENSUS";
@@ -864,10 +866,12 @@ fn probe_all(
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(BTreeMap::new());
-    let workers = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(4)
-        .min(8);
+    let workers = test_pool::workers(
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4)
+            .min(8),
+    );
     std::thread::scope(|scope| {
         for _ in 0..workers {
             std::thread::Builder::new()
