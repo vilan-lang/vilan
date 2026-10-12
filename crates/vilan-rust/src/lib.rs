@@ -12733,7 +12733,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
             .collect();
         let views_a_cell = takes_a_view.contains(&true);
-        let borrows_a_cell = borrows_a_cell || borrows_a_read_place || views_a_cell;
+        // F129: an argument that COPIES out of a cell — a spine through a
+        // `Shared` view or over a boxed binding, of a type the JS backend
+        // hands on by reference — while a later argument runs code is copied
+        // LAST, after the other arguments are settled, so a later argument
+        // that writes the cell in place is seen by the callee as on JS (spec
+        // §6.9's native note, the order F49's views and F123's lookups have).
+        let defers_a_copy: Vec<bool> = (0..argument_ids.len())
+            .map(|index| {
+                self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
+            })
+            .collect();
+        let defers_copies = defers_a_copy.contains(&true);
+        let borrows_a_cell =
+            borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies;
+        let mut deferred_copies = String::new();
         let mut view_borrows = String::new();
         let mut views = 0;
         self.refuse_a_closure_beside_a_cell_view(&conventions, argument_ids)?;
@@ -12857,6 +12871,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .entity_map
                 .get(argument)
                 .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
+            // F129: the deferred copy is taken after every hoisted argument,
+            // and a `&` argument that computes a value (`&mark(cell)`) is
+            // settled in order with the by-value ones, ahead of it.
+            let lent = matches!(conventions.get(index), Some(Receiving::Ref));
+            let lends = lent && !already_a_reference;
+            if defers_a_copy[index] || (defers_copies && lent && !self.runs_no_code(*argument)) {
+                let name = if defers_a_copy[index] {
+                    format!("__copied{index}")
+                } else {
+                    format!("__borrowed{index}")
+                };
+                let target = if defers_a_copy[index] {
+                    &mut deferred_copies
+                } else {
+                    &mut *prelude
+                };
+                let _ = write!(target, "let {name} = {text}; ");
+                rendered.push(if lends { format!("&{name}") } else { name });
+                continue;
+            }
             // A binding that is ALREADY a `&mut` loan is reborrowed, not
             // borrowed again: `&mut counter` of a `counter: &mut Counter` is a
             // `&mut &mut Counter`, which rustc only takes from a `mut` binding —
@@ -12886,6 +12920,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             rendered.push(text);
         }
+        prelude.push_str(&deferred_copies);
         prelude.push_str(&view_borrows);
         Ok(rendered)
     }
@@ -13250,6 +13285,178 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => id,
         };
         !self.is_natively_copy(place) && self.cell_spine(place).is_some()
+    }
+
+    /// F129: whether the argument at `index` is a copy out of a cell that the
+    /// call takes LAST — after every other argument has been settled — rather
+    /// than where it stands.
+    ///
+    /// A spine through a `Shared` view or over a boxed binding (`cell.read().
+    /// items`, `log.lines`) is natively a copy out of the cell's scoped borrow
+    /// (F62, F103), and the copy had been taken in argument order: a LATER
+    /// argument that wrote the cell in place (`has(cell.read().items,
+    /// grow(cell))`, `grow` pushing into `items`) was not seen by the callee,
+    /// where the JS backend — whose argument is the collection itself —
+    /// printed the written answer. Taking the copy after the later arguments
+    /// is the order spec §6.9's native note gives a view, and the one F123's
+    /// lookups read in.
+    ///
+    /// The copy waits only where the wait is the JS answer and changes no
+    /// other: the value is one JS hands on BY REFERENCE (a struct, a `List`,
+    /// a map, a set, a fixed array, a trait object — a scalar, `str`, `bool`,
+    /// an enum or a tuple is read where it stands there too), the JS backend
+    /// takes no copy of it at the call (`clone_sites`), a later argument runs
+    /// code, and every other argument that runs code can be settled ahead of
+    /// it in its own order: a by-value one, a `&` one that computes its value,
+    /// or a view. The cell's handle must be a binding, and each subscript
+    /// index must run no code, so deferring the read moves nothing but the
+    /// copy itself.
+    fn defers_its_cell_copy(
+        &self,
+        conventions: &[Receiving],
+        argument_ids: &[Id],
+        takes_a_view: &[bool],
+        index: usize,
+    ) -> bool {
+        let argument = argument_ids[index];
+        let by_value = matches!(conventions.get(index), None | Some(Receiving::ByValue));
+        if takes_a_view[index]
+            || !(by_value || matches!(conventions.get(index), Some(Receiving::Ref)))
+        {
+            return false;
+        }
+        let place = match self.program.entity_map.get(&argument) {
+            Some(&Expr::Reference(operand, false)) => operand,
+            _ => argument,
+        };
+        let Some((root, steps)) = self.cell_spine(place) else {
+            return false;
+        };
+        if let CellRoot::View(handle) = root
+            && !matches!(
+                self.program.entity_map.get(&handle),
+                Some(Expr::Local(_) | Expr::Parameter(_))
+            )
+        {
+            return false;
+        }
+        let subscripts_run_code = steps.iter().any(
+            |step| matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript)),
+        );
+        if subscripts_run_code
+            || !self
+                .type_of(place)
+                .is_some_and(|type_id| self.aliases_on_the_js_backend(type_id))
+            || (by_value && self.copy_applies(self.program.clone_sites.get(&argument)))
+        {
+            return false;
+        }
+        let a_later_argument_runs_code = argument_ids
+            .iter()
+            .skip(index + 1)
+            .any(|later| !self.runs_no_code(*later));
+        a_later_argument_runs_code
+            && argument_ids.iter().enumerate().all(|(other, other_id)| {
+                other == index
+                    || takes_a_view.get(other).copied().unwrap_or(false)
+                    || self.runs_no_code(*other_id)
+                    || match conventions.get(other) {
+                        None | Some(Receiving::ByValue) => true,
+                        Some(Receiving::Ref) => self.computes_a_value(*other_id),
+                        Some(Receiving::RefMut) => false,
+                    }
+            })
+    }
+
+    /// F129: whether the JS backend hands a value of `type_id` on BY REFERENCE
+    /// — an object a later write in place shows through — rather than as a
+    /// value read where it stands: a struct other than a scalar, `str`,
+    /// `BigInt` or a `Shared` handle (whose cell is the same either way), a
+    /// fixed array and a trait object. An enum (`bool` among them) and a
+    /// tuple (flattened into its slots) are read where they stand.
+    fn aliases_on_the_js_backend(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, _)) => {
+                self.program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        !(declaration.external
+                            && (scalar_type(declaration.name).is_some()
+                                || matches!(declaration.name, "BigInt" | "Shared")))
+                    })
+            }
+            Some(Type::Array(..) | Type::Dyn(..)) => true,
+            _ => false,
+        }
+    }
+
+    /// F129: whether evaluating `id` runs no code that could write anything —
+    /// a literal, a binding read, a closure being made (its body runs later),
+    /// and the fields, slots, subscripts, references and aggregates of those.
+    /// A call, an operator (an impl may be the user's) or any compound
+    /// expression may.
+    fn runs_no_code(&self, id: Id) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.program.entity_map.get(&id) {
+            Some(
+                Expr::Bool(_)
+                | Expr::Number(..)
+                | Expr::String(_)
+                | Expr::MultilineString(_)
+                | Expr::Null
+                | Expr::Void
+                | Expr::Local(_)
+                | Expr::Parameter(_)
+                | Expr::Closure(_)
+                | Expr::Function(_)
+                | Expr::LengthValue(_),
+            ) => true,
+            Some(
+                &Expr::Field(subject, _, _)
+                | &Expr::TupleIndex(subject, _, _)
+                | &Expr::Reference(subject, _)
+                | &Expr::Dereference(subject)
+                | &Expr::Ascribe(subject),
+            ) => self.runs_no_code(subject),
+            Some(&Expr::Index(subject, subscript)) => {
+                self.runs_no_code(subject) && self.runs_no_code(subscript)
+            }
+            Some(Expr::List(elements) | Expr::Tuple(elements)) => {
+                elements.iter().all(|element| self.runs_no_code(*element))
+            }
+            Some(Expr::StructInitializer(_, fields)) => {
+                fields.values().all(|field| self.runs_no_code(*field))
+            }
+            _ => false,
+        }
+    }
+
+    /// F129: whether a `&` argument COMPUTES its value rather than naming a
+    /// place — a call, an operator, a block, or a `&` written over one — so
+    /// settling it in a `let` ahead of the call and lending the `let` is the
+    /// same argument (a `let` of a written `&temporary` keeps the temporary
+    /// alive with it).
+    fn computes_a_value(&self, id: Id) -> bool {
+        if let Some(&Expr::Reference(operand, false)) = self.program.entity_map.get(&id) {
+            return self.computes_a_value(operand);
+        }
+        !self.is_a_view_call(id)
+            && !matches!(
+                self.program.entity_map.get(&id),
+                Some(
+                    Expr::Local(_)
+                        | Expr::Parameter(_)
+                        | Expr::Variable(_)
+                        | Expr::Field(..)
+                        | Expr::TupleIndex(..)
+                        | Expr::Index(..)
+                        | Expr::Dereference(_)
+                        | Expr::Reference(..)
+                ) | None
+            )
     }
 
     /// Whether the `&` argument at `index` is taken as a VIEW of its boxed

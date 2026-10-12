@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: miscompile -->
+**F129: natively an argument that copies out of a cell is copied AFTER the later arguments run — `has(cell.read().items, grow(cell))` and `cell.read().probes.contains(mark(cell))` (a user-hashed key), where the later argument writes the cell in place, printed `false` natively against JS's `true`, silently.** A spine through a `Shared` view or over a captured `mut` binding's cell is natively a copy out of the cell's borrow, and it was taken in argument order, before the writing argument ran; on JS the argument is the collection itself, so the callee saw the write. The copy now waits until the other arguments are settled — in their own order, a `&` argument that computes its value (`&grown(cell)`) settled with the by-value ones — which is the order spec §6.9's native note gives a view and F123 gave std's lookups. It waits only where the wait is JS's answer: a value JS hands on by reference (a struct, a `List`, a map or set, a fixed array, a trait object) that JS does not copy at the call (an `own` parameter's argument is copied there on both), with a later argument that runs code; a scalar, a `str`, an enum and a tuple are read where they stand on both backends, as before. A later argument that REPLACES the copied place whole (`cell.write().items = [..]`) is the residue: JS keeps the object it had evaluated, the native copy taken last sees the replacement (an ignored pin, filed). Pins: `f129_a_copy_out_of_a_cell_is_taken_after_the_later_arguments_on_both_backends` (`native/shared_view_argument_order.vl`, new: the two repros, a subscript, a written `&` beside a computed one, a captured binding's receiver, the scalar/`str`/`own` controls and the order of the earlier arguments), `f129_a_later_argument_that_replaces_the_copied_place_answers_the_same_on_both_backends` (ignored, `native/shared_view_argument_replaced.vl`).
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

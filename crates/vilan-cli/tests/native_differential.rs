@@ -13039,6 +13039,57 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
     );
 }
 
+/// F129 (R-h): an argument that copies out of a cell — a spine through a
+/// `Shared` view (`has(cell.read().items, grow(cell))`, a user-hashed
+/// `cell.read().probes.contains(mark(cell))`, a subscript `cell.read().
+/// rows[0]`, a written `&cell.read().items` beside a computed `&grown(cell)`)
+/// or a captured `mut` binding's cell (`words.measured(more())`) — was copied
+/// where it stood, so a LATER argument that wrote the cell in place was not
+/// seen by the callee natively (`false` against JS's `true`, silently). The
+/// copy is now taken last, after the other arguments are settled in their
+/// own order (`first` still prints before `second`). A scalar, a `str` and an
+/// `own` argument (which the JS backend copies at the call) are read where
+/// they stand on both. The emission pin: six deferred copies.
+#[test]
+fn f129_a_copy_out_of_a_cell_is_taken_after_the_later_arguments_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f129_shared_view_argument_order.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_argument_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a later argument's in-place write of a cell must be seen by the callee natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("let __copied").count(),
+        6,
+        "the six copies out of a cell wait for the later arguments:\n{main}"
+    );
+}
+
+/// F129's residue: a later argument that REPLACES the copied place whole
+/// (`cell.write().items = [..]`, `words = Words { .. }`) is not seen on JS,
+/// whose argument is the object the place held when it was evaluated, and is
+/// seen by the native copy taken last. Neither order of a copy answers both
+/// shapes; the in-place write is the one F129 ruled.
+#[test]
+#[ignore = "F129 residue (a new item, filed by native-51): a later argument that replaces the copied place whole is seen natively and not on JS"]
+fn f129_a_later_argument_that_replaces_the_copied_place_answers_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f129_shared_view_argument_replaced.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_argument_replaced.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(compare(&staged, file), Verdict::Identical);
+}
+
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
 /// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
 /// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
