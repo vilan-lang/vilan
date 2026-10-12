@@ -342,3 +342,81 @@ fn a_plain_fun_is_still_const_callable() {
         "\"6\"",
     );
 }
+
+/// G26: `str::index_of` / `last_index_of` (over the host's `indexOf` /
+/// `lastIndexOf`) failed any `const` evaluation — "the string method
+/// `indexOf` is not available at expansion time" — while `contains`, `split`
+/// and `substring` ran. Present, absent, an empty needle (0 and the length,
+/// as the host places it) and a position after a non-BMP character, which
+/// counts UTF-16 code units like `len` does.
+#[test]
+fn g26_index_of_and_last_index_of_evaluate_at_expansion_time() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun find(text: str): usize {
+            match text.index_of("b") {
+                Some(let at) => at,
+                None => 99,
+            }
+        }
+
+        fun positions(): str {
+            let text = "a-b-c";
+            i"{text.index_of("-").unwrap_or(99)} {text.last_index_of("-").unwrap_or(99)} {text.index_of("z").is_none()} {text.last_index_of("z").is_none()} {text.index_of("").unwrap_or(99)} {text.last_index_of("").unwrap_or(99)} {"a😀b".index_of("b").unwrap_or(99)}"
+        }
+
+        fun main() {
+            print(const find("abc"));
+            print(const positions());
+            print(positions());
+        }
+        "#;
+    assert_emits_containing(source, "\"1 3 true true 0 5 3\"");
+    assert_compiles_and_runs(source, "1\n1 3 true true 0 5 3\n1 3 true true 0 5 3\n");
+}
+
+/// G26's census, as a class: EVERY method std declares on `str` over a host
+/// binding (`impl str`'s externals — `len` through `code_at`, `parse_i32`,
+/// `parse_f64`, the two raw searches — and the std surface built on them)
+/// evaluates at expansion time, to what the program computes at run time.
+#[test]
+fn g26_every_str_method_std_declares_evaluates_at_expansion_time() {
+    let source = r#"
+        import std::display::Display;
+        import std::io::print;
+
+        fun census(): str {
+            let text = " a-b-c ";
+            let parts = [
+                i"{text.len()}",
+                text.trim(),
+                text.to_uppercase(),
+                text.to_lowercase(),
+                i"{text.contains("b")}",
+                i"{text.starts_with(" ")}",
+                i"{text.ends_with("c")}",
+                text.replace("-", "+"),
+                text.repeat(2),
+                i"{text.split("-").len()}",
+                text.substring(1, 3),
+                i"{text.code_at(1)}",
+                i"{"12".parse_i32().unwrap_or(0)}",
+                i"{"1.5".parse_f64().unwrap_or(0.0)}",
+                i"{text.index_of("-").unwrap_or(99)}",
+                i"{text.last_index_of("-").unwrap_or(99)}",
+                text.strip_prefix(" a").unwrap_or("?"),
+                text.strip_suffix("c ").unwrap_or("?"),
+            ];
+            parts.join("|")
+        }
+
+        fun main() {
+            print(const census());
+            print(census());
+        }
+        "#;
+    let expected = "7|a-b-c| A-B-C | a-b-c |true|true|false| a+b+c | a-b-c  a-b-c |3|a-|97|12|1.5|2|4|-b-c | a-b-";
+    assert_compiles_and_runs(source, &format!("{expected}\n{expected}\n"));
+}

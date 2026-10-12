@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**G26: `str::index_of` and `last_index_of` run in a `const` evaluation — `const find("abc")` over `text.index_of("b")` failed "the string method `indexOf` is not available at expansion time", the natural way to search a file `asset::read` returned at build time.** The const interpreter answers the host's `indexOf` / `lastIndexOf` (the two std reaches through `raw_index_of` / `raw_last_index_of`) in UTF-16 code units, the unit `len` and `substring` count, `-1` when absent and an empty needle at 0 and at the length, as the host places it. Every other method std declares on `str` over a host binding already ran; a census pin now holds the class. Pins: `g26_index_of_and_last_index_of_evaluate_at_expansion_time`, `g26_every_str_method_std_declares_evaluates_at_expansion_time`. Tracker G26.
+
+---
+
 <!-- family: miscompile -->
 **B578: `&` of a CALL's result handed to a generic `&T` (or a `&usize`) runs on the JS backend — `shown(&xs.len())` with `fun shown<T: Display>(value: &T)` threw `TypeError: Cannot read properties of undefined` where native printed `<2>`.** A view of a scalar is a `(base, key)` pair on JS, and the callee at a scalar `T` reads `value[0][value[1]]`; the call site decides whether to make the pair by the operand's type, and a call's result records none, so `&seven()`, `&identity(5)`, `&xs.len()`, `&twice(4)` (a closure), `&boxed.get()` (a generic method's `T`) and a `let held = &seven()` passed the bare number. The same held for a value `if`/`match`/block (`&(if c { 1 } else { 2 })`). The emitter now types such an rvalue by its callee's return — declared, inferred, an external's or a closure type's, with a generic return resolved through the call's own binding — or by its tail leaves, and gives the temporary its own one-slot cell, as a literal's `&11` already had; a call that hands back a VIEW (`&holder.slot()`) is re-borrowed as the view it is. Pins: `b578_a_view_of_a_call_result_is_a_pair_where_the_pointee_is_a_scalar` and `native_differential`'s `b578_a_view_of_a_call_result_is_identical_on_both_backends` (`native/views_of_call_results.vl`). The JS corpus is byte-identical. Tracker B578.
 

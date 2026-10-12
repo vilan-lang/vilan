@@ -3011,6 +3011,18 @@ impl<'a> Interpreter<'a> {
                 }
                 str_result(s.replace(&*from, &to))
             }
+            // `str::index_of` / `last_index_of` over the host's `indexOf` /
+            // `lastIndexOf` (G26): the position in UTF-16 code units — the
+            // unit `len` and `substring` count — or `-1` when absent; an empty
+            // needle is at 0 and at the length, as the host places it.
+            "indexOf" => {
+                let needle = expect_str(&argument(0))?;
+                Ok(Value::Number(utf16_position(s, &needle, false)))
+            }
+            "lastIndexOf" => {
+                let needle = expect_str(&argument(0))?;
+                Ok(Value::Number(utf16_position(s, &needle, true)))
+            }
             "split" => {
                 let separator = expect_str(&argument(0))?;
                 let parts: Vec<Value> = if separator.is_empty() {
@@ -3452,6 +3464,24 @@ fn truthy(value: &Value) -> bool {
 }
 
 /// JS `===`: same-type value equality; reference identity for containers.
+/// The host's `indexOf` (`last` false) or `lastIndexOf` (`last` true) of
+/// `needle` in `text`, in UTF-16 code units, `-1` when absent.
+fn utf16_position(text: &str, needle: &str, last: bool) -> f64 {
+    let text: Vec<u16> = text.encode_utf16().collect();
+    let needle: Vec<u16> = needle.encode_utf16().collect();
+    if needle.len() > text.len() {
+        return -1.0;
+    }
+    let starts = 0..=text.len() - needle.len();
+    let matches_at = |start: &usize| text[*start..*start + needle.len()] == needle[..];
+    let found = if last {
+        starts.rev().find(matches_at)
+    } else {
+        starts.into_iter().find(matches_at)
+    };
+    found.map_or(-1.0, |start| start as f64)
+}
+
 fn strict_equals<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
     match (a, b) {
         (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
