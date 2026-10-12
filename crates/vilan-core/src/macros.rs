@@ -293,6 +293,73 @@ pub(crate) fn scope_for<'r>(
     }
 }
 
+/// G25: `[derive(Json)]` / `[derive(Wire)]` over a type with a TRAIT OBJECT
+/// among its members (`source: dyn Src`, `List<dyn Src>`, a variant's `dyn`
+/// payload) — refused here, above the generators, for B117's reason: the
+/// decoder each generator writes rebuilds every member BY ITS TYPE
+/// (`<type>::from_json_value(..)`, `<type>::rebuild(..)`), and a trait object
+/// names no type to rebuild — so the generated text was not even vilan (`dyn
+/// Src::from_json_value(..)`), and nothing a generator could write would
+/// decode one. `None` for every other derive and every other member.
+fn dyn_member_derive_refusal(derive: &str, item: &Spanned<Node>, text: &str) -> Option<String> {
+    let codec = match derive {
+        "Json" => "parse one back from JSON",
+        "Wire" => "rebuild one from the wire",
+        _ => return None,
+    };
+    let (kind, name, members): (&str, &str, Vec<(String, &Spanned<Node>)>) = match &item.0 {
+        Node::Struct(name, _generics, _external, _resource, fields, _labels) => (
+            "struct",
+            name.0,
+            fields
+                .iter()
+                .flat_map(|fields| &fields.0)
+                .filter_map(|(field, _)| {
+                    field
+                        .1
+                        .as_ref()
+                        .map(|type_| (format!("field `{}`", field.0.0), type_))
+                })
+                .collect(),
+        ),
+        Node::Enum(name, _generics, _resource, variants, _labels) => (
+            "enum",
+            name.0,
+            variants
+                .0
+                .iter()
+                .flat_map(|(variant, _)| {
+                    variant
+                        .1
+                        .iter()
+                        .map(move |type_| (format!("variant `{}`'s payload", variant.0), type_))
+                })
+                .collect(),
+        ),
+        _ => return None,
+    };
+    fn holds_a_trait_object(type_: &Spanned<Node>) -> bool {
+        if matches!(type_.0, Node::DynType(_)) {
+            return true;
+        }
+        let mut found = false;
+        type_.0.for_each_child(&mut |child| {
+            found = found || holds_a_trait_object(child);
+        });
+        found
+    }
+    let (member, type_) = members
+        .into_iter()
+        .find(|(_, type_)| holds_a_trait_object(type_))?;
+    Some(format!(
+        "`{derive}` cannot be derived for the {kind} `{name}`: its {member} is `{}`, and a \
+         trait object names no concrete type to {codec} — the decoder rebuilds every member by \
+         its type. Hold the concrete type, or an enum of the concrete types, in that position, \
+         or write `impl {name} with {derive}` by hand",
+        slice(text, type_.1)
+    ))
+}
+
 /// Which package a file belongs to, for import-root resolution.
 pub(crate) enum FilePackage {
     Entry,
@@ -1881,7 +1948,9 @@ impl Expander<'_, '_> {
                     // generators cannot disagree — and so nothing is generated
                     // to fail later inside a body the author never wrote (B117;
                     // `analyzer::resource_derive_refusal` carries the rule).
-                    if let Some(refusal) = crate::analyzer::resource_derive_refusal(name, item) {
+                    if let Some(refusal) = crate::analyzer::resource_derive_refusal(name, item)
+                        .or_else(|| dyn_member_derive_refusal(name, item, text))
+                    {
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,

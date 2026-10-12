@@ -420,3 +420,109 @@ fn g26_every_str_method_std_declares_evaluates_at_expansion_time() {
     let expected = "7|a-b-c| A-B-C | a-b-c |true|true|false| a+b+c | a-b-c  a-b-c |3|a-|97|12|1.5|2|4|-b-c | a-b-";
     assert_compiles_and_runs(source, &format!("{expected}\n{expected}\n"));
 }
+
+/// The trait and the two implementors the G25 const pins evaluate.
+const G25_SOURCES: &str = r#"
+    import std::io::print;
+
+    trait Src {
+        fun get(&self): i32;
+    }
+
+    struct Fixed {
+        value: i32,
+    }
+
+    impl Fixed with Src {
+        fun get(&self): i32 {
+            self.value
+        }
+    }
+
+    struct Doubled {
+        value: i32,
+    }
+
+    impl Doubled with Src {
+        fun get(&self): i32 {
+            self.value * 2
+        }
+    }
+"#;
+
+/// G25: a `const` evaluation that builds a trait object INSIDE it — a `let`
+/// typed `dyn Src`, a function returning one, a list of them — failed "`$a` is
+/// not defined": the object's method table is a declaration the emitter adds
+/// beside the functions, and the const world never recorded it as reached, so
+/// the evaluation named a table nothing declared. The table is a keyed
+/// emission like an instance now, and the values come out as plain data.
+#[test]
+fn g25_a_const_evaluation_dispatches_through_a_trait_object() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{G25_SOURCES}
+            fun total(): i32 {{
+                let source: dyn Src = Fixed {{ value = 4 }};
+                source.get()
+            }}
+
+            fun make(doubled: bool): dyn Src {{
+                if doubled {{ Doubled {{ value = 3 }} }} else {{ Fixed {{ value = 3 }} }}
+            }}
+
+            fun sum(): i32 {{
+                let sources: List<dyn Src> = [Fixed {{ value = 1 }}, Doubled {{ value = 5 }}];
+                mut sum = 0;
+                for source in sources {{
+                    sum += source.get();
+                }}
+                sum
+            }}
+
+            const let T: i32 = total();
+
+            fun main() {{
+                print(T);
+                print(const make(true).get());
+                print(const make(false).get());
+                print(const sum());
+            }}
+            "#
+        ),
+        "4\n6\n3\n11\n",
+    );
+}
+
+/// G25: a `const` whose VALUE is or holds a trait object — `const let C: dyn
+/// Src`, a struct with a `dyn` field — is refused as that, not as "a `Shared`
+/// cell" (or, before the table was reached, "`$a` is not defined"): the
+/// object's table is code the program builds, which no build can write down
+/// as data, and the steer keeps the concrete type at the const.
+#[test]
+fn g25_a_const_holding_a_trait_object_is_refused_by_name() {
+    for (declaration, read) in [
+        ("const let C: dyn Src = Fixed { value = 3 };", "C.get()"),
+        (
+            "struct Holder { source: dyn Src }\nconst let C: Holder = Holder { source = Fixed { value = 3 } };",
+            "C.source.get()",
+        ),
+        (
+            "const let C: List<dyn Src> = [Fixed { value = 3 }];",
+            "C.len()",
+        ),
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"{G25_SOURCES}
+                {declaration}
+
+                fun main() {{
+                    print({read});
+                }}
+                "#
+            ),
+            "this evaluates to a trait object (a `dyn` value), whose method table is code the \
+             program builds rather than data a build can write down",
+        );
+    }
+}

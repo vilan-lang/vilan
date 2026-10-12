@@ -214,7 +214,11 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 
 `[derive(Wire)]` requires every field to be Wire, recursively, checked at
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
-types with a custom encoding.
+types with a custom encoding. Neither `[derive(Wire)]` nor `[derive(Json)]`
+takes a trait object among a type's members (`source: dyn Src`, a
+`List<dyn Src>`, a variant's `dyn` payload): the decoder rebuilds every
+member by its type, and a `dyn` names none — hold the concrete type, or
+an enum of the concrete types, there instead.
 
 **A reader ENFORCES the type it is asked for.** The frame is text a
 stranger chose, so a read whose value is of the wrong JSON kind poisons the

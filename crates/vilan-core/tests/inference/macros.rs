@@ -1394,6 +1394,71 @@ fn g27_a_macro_name_is_defined_once_per_file_across_mods() {
     );
 }
 
+// G25: `[derive(Json)]` / `[derive(Wire)]` over a type with a trait object
+// among its members emitted text that was not vilan (`dyn Src::from_json_value(
+// ..)`): the decoders rebuild each member by its type, and a trait object names
+// none. Refused by name above the generators — a field, a field holding a list
+// of them, and an enum variant's payload — for both codecs.
+#[test]
+fn g25_a_codec_derive_over_a_trait_object_member_is_refused_by_name() {
+    for (derive, import, declaration, member, codec) in [
+        (
+            "Json",
+            "import std::json::Json;",
+            "struct Holder { name: str, source: dyn Src }",
+            "field `source` is `dyn Src`",
+            "parse one back from JSON",
+        ),
+        (
+            "Json",
+            "import std::json::Json;",
+            "struct Holder { sources: List<dyn Src> }",
+            "field `sources` is `List<dyn Src>`",
+            "parse one back from JSON",
+        ),
+        (
+            "Wire",
+            "import std::wire::Wire;",
+            "struct Holder { source: dyn Src }",
+            "field `source` is `dyn Src`",
+            "rebuild one from the wire",
+        ),
+        (
+            "Json",
+            "import std::json::Json;",
+            "enum Holder { Empty, Held(dyn Src) }",
+            "variant `Held`'s payload is `dyn Src`",
+            "parse one back from JSON",
+        ),
+    ] {
+        let kind = if declaration.starts_with("enum") {
+            "enum"
+        } else {
+            "struct"
+        };
+        assert_fails_with(
+            &format!(
+                r#"
+                {import}
+
+                trait Src {{
+                    fun get(&self): i32;
+                }}
+
+                [derive({derive})]
+                {declaration}
+
+                fun main() {{}}
+                "#
+            ),
+            &format!(
+                "`{derive}` cannot be derived for the {kind} `Holder`: its {member}, and a trait \
+                 object names no concrete type to {codec}"
+            ),
+        );
+    }
+}
+
 // A user macro may now SHADOW a prelude derive for its own file — the
 // reserved-name rule died with the flat namespace.
 #[test]

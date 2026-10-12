@@ -175,6 +175,13 @@ const-evaluable contents. The expression's *type* is checked exactly
 as if it ran at runtime; `const` never changes typing, only when the
 computation happens.
 
+A trait object may be built and called *during* the evaluation — a
+`let source: dyn Src = ..` inside a `const fun` dispatches as it would at
+runtime — but a result that is or holds one (`const let C: dyn Src`, a
+struct with a `dyn` field) is refused: its method table is code the
+program builds, not data a build can write down. Keep the concrete type
+at the `const` and let the value meet the `dyn` type where it is used.
+
 ## 9.5 Inferred `const`
 
 A **release** build additionally folds `let` and `mut` initializers

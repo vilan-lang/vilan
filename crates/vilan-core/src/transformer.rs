@@ -3011,6 +3011,9 @@ struct EmissionRecorder {
     instances: HashMap<(Id, Vec<String>, Vec<Id>), EmissionId>,
     defaults: HashMap<(Id, String), EmissionId>,
     drops: HashMap<String, EmissionId>,
+    /// G25: a trait object's table, by its emitted NAME — the memo answers a
+    /// name, and an M89 alias names the table it repeats.
+    vtables: HashMap<String, EmissionId>,
 }
 
 thread_local! {
@@ -11596,13 +11599,23 @@ impl<'src> Transformer<'src> {
         self.write_type_key_arguments(trait_arguments, &mut type_key);
         let key = (trait_id, type_key);
         if let Some(name) = self.vtables.get(&key) {
-            return name.clone();
+            let name = name.clone();
+            self.record_hit(|recorder| recorder.vtables.get(&name).copied());
+            return name;
         }
         let name = self.ng.next_name();
         // Inserted BEFORE the slots are resolved: a member's body may coerce a
         // value of this very pair (a node holding a `dyn` of its own kind), and
         // the recursion has to find the name rather than build a second table.
         self.vtables.insert(key, name.clone());
+        // G25: a table is a keyed emission like an instance — a `const`
+        // evaluation reaching a `dyn` coercion reaches the table and, through
+        // its frame, the members it names. Unrecorded, the const world had no
+        // declaration for it (`$a` is not defined).
+        let emission = self.record_keyed(|recorder, id| {
+            recorder.vtables.insert(name.clone(), id);
+        });
+        let frame = self.record_enter();
         let members = self.object_dispatchable_members(trait_id);
         let mut entries: Vec<(String, js::Node<'src>)> = Vec::with_capacity(members.len());
         for member_name in members {
@@ -11670,11 +11683,15 @@ impl<'src> Transformer<'src> {
             .collect();
         if let Some(slot_set) = slot_set {
             if let Some(first) = self.vtables_by_slots.get(&slot_set) {
+                let first = first.clone();
+                self.record_hit(|recorder| recorder.vtables.get(&first).copied());
                 self.monomorphized
                     .push(js::Node::ConstVariable(js::Variable {
                         name: name.clone(),
-                        value: Box::new(js::Node::Local(first.clone())),
+                        value: Box::new(js::Node::Local(first)),
                     }));
+                self.record_leave(frame, emission);
+                self.record_landed(emission);
                 return name;
             }
             self.vtables_by_slots.insert(slot_set, name.clone());
@@ -11684,6 +11701,8 @@ impl<'src> Transformer<'src> {
                 name: name.clone(),
                 value: Box::new(js::Node::Vtable(entries)),
             }));
+        self.record_leave(frame, emission);
+        self.record_landed(emission);
         name
     }
 
