@@ -1429,6 +1429,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(type_id) = self.type_of(argument) else {
             return Ok(());
         };
+        // F130: an ASYNC handle is refused by its vilan type, before any
+        // rendering — `async work()` over a callee that never suspends is
+        // typed `Promise<T>` (std's `Task` is not in that program), which has
+        // no native type to render, so the rendered test below never saw it:
+        // the build went through and the run panicked "printing a `Task` is a
+        // host object's own inspection". The value is the executor's task
+        // either way.
+        if let Some(handle) = self.async_handle_name(type_id) {
+            return Err(unsupported(
+                &format!("`print` of the host handle `{handle}`"),
+                span,
+            ));
+        }
         // A type this emitter cannot render is refused by the render itself,
         // where the diagnosis is better; nothing to add here.
         let Ok(rendered) = self.rust_type(type_id, span) else {
@@ -1444,6 +1457,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         }
         Ok(())
+    }
+
+    /// F130: the name of std's ASYNC handle a vilan type is — `Task<T>`, or
+    /// `Promise<T>` (what `async e` is typed where `std::task` is not in the
+    /// program) — both the executor's task natively, and neither a value the
+    /// language gives a printed form.
+    fn async_handle_name(&self, type_id: TypeId) -> Option<&'src str> {
+        let Some(Type::Struct(struct_id, _)) = self.resolve(type_id) else {
+            return None;
+        };
+        let declaration = self.program.structs.get(struct_id)?;
+        let in_std = self
+            .program
+            .source_of(*struct_id)
+            .is_some_and(|source| self.program.std_sources.contains(&source));
+        (declaration.external && in_std && matches!(declaration.name, "Task" | "Promise"))
+            .then_some(declaration.name)
     }
 
     /// A closure's body, with the destructures a TUPLE PARAMETER owes in front

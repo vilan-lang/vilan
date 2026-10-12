@@ -7308,40 +7308,66 @@ const ASYNC_PANIC_PROBE: &str = concat!(
 /// honest and one release too late — what node prints there is its own object
 /// inspection (`Promise { <pending> }`, `[Function (anonymous)]`), so the
 /// program cannot work and nothing is gained by letting it build.
+///
+/// F130: the same refusal for a task whose callee never SUSPENDS — `async
+/// work()` there is typed `Promise<i32>` (no `std::task` in the program),
+/// which has no native rendering, so the rendered test never saw it: the
+/// build went through and the run panicked. It is refused by its vilan type.
 #[test]
 fn printing_a_host_handle_is_refused_at_compile_time() {
     let staged = stage();
-    let (file, source, needle) = (
-        "native_probe_print_task.vl",
-        PRINT_HANDLE_PROBE,
-        "`print` of the host handle `Task`",
-    );
-    std::fs::write(staged.join(file), source).expect("write the probe program");
-    let output = vilan(&staged)
-        .args(["build", "--backend", "rust", "--stdout", file])
-        .output()
-        .expect("build the probe");
-    let message = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "{file} must be refused rather than built"
-    );
-    assert!(
-        message.contains(needle),
-        "{file} must be refused by name (`{needle}`); it said:\n{message}"
-    );
-    // Non-vacuous: the JS backend BUILDS the same program, so the refusal
-    // is the native backend's answer and not a defect in the probe.
-    let javascript = vilan(&staged)
-        .args(["build", file])
-        .output()
-        .expect("build the probe on the JS backend");
-    assert!(
-        javascript.status.success(),
-        "{file} must be a program the JS backend accepts:\n{}",
-        String::from_utf8_lossy(&javascript.stderr)
-    );
+    for (file, source, needle) in [
+        (
+            "native_probe_print_task.vl",
+            PRINT_HANDLE_PROBE,
+            "`print` of the host handle `Task`",
+        ),
+        (
+            "native_probe_f130_print_ready_task.vl",
+            PRINT_READY_TASK_PROBE,
+            "`print` of the host handle `Promise`",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let output = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", file])
+            .output()
+            .expect("build the probe");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{file} must be refused rather than built"
+        );
+        assert!(
+            message.contains(needle),
+            "{file} must be refused by name (`{needle}`); it said:\n{message}"
+        );
+        // Non-vacuous: the JS backend BUILDS the same program, so the refusal
+        // is the native backend's answer and not a defect in the probe.
+        let javascript = vilan(&staged)
+            .args(["build", file])
+            .output()
+            .expect("build the probe on the JS backend");
+        assert!(
+            javascript.status.success(),
+            "{file} must be a program the JS backend accepts:\n{}",
+            String::from_utf8_lossy(&javascript.stderr)
+        );
+    }
 }
+
+const PRINT_READY_TASK_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "async fun work(): i32 {\n",
+    "\t7\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet task = async work();\n",
+    "\tprint(task);\n",
+    "}\n",
+);
 
 const PRINT_HANDLE_PROBE: &str = concat!(
     "import std::io::print;\n",

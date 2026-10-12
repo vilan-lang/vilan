@@ -58,6 +58,11 @@ written down.
 <!-- family: fix -->
 **F91: natively an `is` capture in a `&&` chain of an `if` condition is in scope in the body — `if held is Some(let name) && name.len() > 0 { print(name) }` was rustc E0425 ("cannot find value `name`"), while JS printed the capture.** The chain was emitted as the `match` a value position takes (`match held { Some(name) => cond, _ => false }`), which scopes the capture to its arm; an `if` condition is now a Rust let-chain (`if let Some(name) = held.clone() && (..)`, the emitted crate being edition 2024), so every capture binds for the rest of the chain and the body. A chain in a value position (`let ok = x is Some(let v) && v > 2`, a closure's tail) keeps the `match`. Pin: `f91_an_is_capture_in_an_if_conditions_conjunction_reaches_the_body_on_both_backends` (`native/is_capture_conjunction_body.vl`, new: two captures, a capture right of a plain conjunct, a `||` inside a conjunct, a chain that fails late, an `else if` chain and a capture of a field).
 
+---
+
+<!-- family: diagnostics -->
+**F130: natively `print(task)` of a task whose async callee never suspends is refused at compile time, by name, as F25's other host handles are — `async fun work(): i32 { 7 }`, `let task = async work(); print(task)` built and then panicked at run time ("printing a `Task` is a host object's own inspection").** The refusal tested the RENDERED type, and `async work()` there is typed `Promise<i32>` (the program has no `std::task`, whose `Task<T>` the suspending case gets), which has no native rendering, so the test never saw it. `print` of std's async handle — `Task<T>` or `Promise<T>` — is now refused by its vilan type ("`print` of the host handle `Promise`"). Pin: `printing_a_host_handle_is_refused_at_compile_time` (gains the never-suspending probe; the JS backend builds both).
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->
