@@ -347,6 +347,10 @@ struct Emitter<'a, 'src> {
     /// that type's structural key). Keyed separately from [`Self::instances`]
     /// because what varies is `Self`, not a written generic parameter.
     default_instances: HashMap<(Id, String), Reserved>,
+    /// F131: the binding each instance a DISPATCHED call reached was minted
+    /// under ([`Self::dispatch_to_member`]), by instance name — what the
+    /// call's arguments are positioned against, as a direct call's are.
+    dispatched_bindings: HashMap<String, HashMap<TypeId, TypeId>>,
     /// Nominal type declarations, keyed by (declaration, its concrete
     /// arguments). `Pair<i32>` and `Pair<str>` are two Rust structs.
     types: BTreeMap<usize, String>,
@@ -712,6 +716,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             functions: BTreeMap::new(),
             instances: HashMap::default(),
             default_instances: HashMap::default(),
+            dispatched_bindings: HashMap::default(),
             types: BTreeMap::new(),
             type_instances: HashMap::default(),
             next_function_slot: 0,
@@ -7690,7 +7695,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let substitution = self.call_substitution(id, member_id, &[]);
             let instance = self.ensure_function(member_id, &substitution)?;
             let mut prelude = String::new();
-            let arguments = self.call_arguments(member_id, &[left, right], depth, &mut prelude)?;
+            // F131: the operands are positioned against the member's
+            // parameters under THIS binding, as a direct call's arguments are
+            // — `grid == [[1, 2], [3, 4]]` reaches `impl [type T: PartialEq;
+            // const N]`'s `eq(self, b: [T; N])`, and its inner literals met an
+            // unbound `T` and rendered `vec![..]`.
+            self.argument_substitution = Some(substitution);
+            let arguments = self.call_arguments(member_id, &[left, right], depth, &mut prelude);
+            self.argument_substitution = None;
+            let arguments = arguments?;
             let call = Self::with_argument_prelude(
                 prelude,
                 format!("{}({})", instance.name, arguments.join(", ")),
@@ -14769,6 +14782,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         impl_select::bind_provider_binders(self.program, selected.impl_subject, &mut substitution);
         substitution.extend(self.own_generic_entries(member_id, own_generic_values));
         let name = self.ensure_function(member_id, &substitution)?.name;
+        self.dispatched_bindings
+            .entry(name.clone())
+            .or_insert(substitution);
         Ok(NativeDispatch::Call(name))
     }
 
@@ -14814,7 +14830,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let arguments = match target {
                     Some(target) => {
                         self.refuse_unthreaded_context(target, argument_ids, span)?;
-                        self.call_arguments(target, argument_ids, depth, &mut prelude)?
+                        // F131: each argument's position is its parameter
+                        // under the INSTANCE's binding, as at a direct call —
+                        // `grid == [[1, 2], [3, 4]]` reaches `impl [type T:
+                        // PartialEq; const N]`'s `eq(self, b: [T; N])`, and
+                        // the inner literals met an unbound `T` and rendered
+                        // `vec![..]`.
+                        self.argument_substitution = self.dispatched_bindings.get(&name).cloned();
+                        let arguments =
+                            self.call_arguments(target, argument_ids, depth, &mut prelude);
+                        self.argument_substitution = None;
+                        arguments?
                     }
                     None => self.value_arguments(argument_ids, depth)?,
                 };

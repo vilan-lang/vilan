@@ -33,6 +33,11 @@ written down.
 <!-- family: fix -->
 **F132: natively an array literal one level inside another literal builds the fixed array its position declares — `Holder { pair = ([5, 6, 7], true) }` with `pair: ([i32; 3], bool)`, `let t: ([i32; 2], bool) = ([1, 2], false); count(t)` and `print([Frame::Empty, Frame::Bytes([0, 0, 0, 1])])` with `Bytes([u8; 4])` were emitted as `vec![..]` and refused by rustc ("expected `[i32; 3]`, found `Vec<i32>`").** A tuple literal handed its WHOLE type to every element, so no element saw its slot's `[T; n]`; each element now takes its slot's type (a literal matched by name, B569 §4.1, its stored slot's). A `print` argument had no position at all, so a variant constructor or a list in it had nothing to read a payload's or an element's array type off; it is now positioned at the type the analysis settled for it (only a closed one). JS was right throughout. Pin: `f132_an_array_literal_inside_a_tuple_or_a_printed_value_builds_the_array_on_both_backends` (`native/array_literal_nested_positions.vl`, new: the three repros, a call's own tuple argument, a variant alone under `print`, a list of arrays, an `Option` of an array in a tuple, a tuple matched by name, and a tuple of both).
 
+---
+
+<!-- family: fix -->
+**F131: natively an array literal handed to a callee generic over its own binders builds the array — `grid == [[1, 2], [3, 4]]` (std's `impl [type T: PartialEq; const N]`, whose `b: [T; N]` is the operand's position) and `m.matches([[1, 2], [3, 4]])` through a bound in a generic body were emitted with `vec![..]` literals and refused by rustc ("expected `[i32; 2]`, found `Vec<i32>`"); JS printed `true`.** An overloaded operator's operands and a call dispatched through a bound or a re-dispatch were positioned against the member's parameters under the CALLER's binding, where the member's own binders (`T`, `N`) are unbound, so a nested literal met an open `T`. Both are now positioned under the binding the instance was minted with, as a direct call's arguments are. Pin: `f131_an_array_literal_against_a_generic_callees_binders_builds_the_array_on_both_backends` (`native/array_literal_generic_callee.vl`, new: `==`/`!=` over nested and three-deep arrays, a flat control, `grid.eq(..)`, a generic impl's member and the bound-dispatched call).
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

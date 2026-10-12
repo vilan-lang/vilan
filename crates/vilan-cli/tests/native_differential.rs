@@ -13115,6 +13115,30 @@ fn f132_an_array_literal_inside_a_tuple_or_a_printed_value_builds_the_array_on_b
     );
 }
 
+/// F131: an array literal handed to a callee generic over its own binders —
+/// the operands of `grid == [[1, 2], [3, 4]]` (std's `impl [type T:
+/// PartialEq; const N]`, whose `b: [T; N]` is the argument's position), and
+/// the argument of a member reached through a bound (`m.matches([[1, 2], [3,
+/// 4]])` in a generic `check`) — met the callee's binders unbound, so its
+/// inner (or whole) literal rendered `vec![..]` and rustc refused it. The
+/// operator's and the dispatched call's arguments are now positioned under
+/// the instance's binding, as a direct call's are.
+#[test]
+fn f131_an_array_literal_against_a_generic_callees_binders_builds_the_array_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f131_array_literal_generic_callee.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_literal_generic_callee.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an array literal against a generic callee's `[T; N]` must build the array"
+    );
+}
+
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its
 /// `[T; N]` type and lives on the heap natively (`vilan_rt::HeapArray`) —
 /// `mut big = [0; 4000000]` aborted "thread 'main' has overflowed its
