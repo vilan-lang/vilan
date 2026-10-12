@@ -982,7 +982,7 @@ def measure(argv, cwd=None, env=None, counter="auto", log=None):
 perf_count.measure = measure
 perf_count.hardware_counter_available = lambda: True
 perf_gate.loadavg = lambda: 0.5
-options = argparse.Namespace(base={base:?}, tip={tip:?}, base_std=None, tip_std=None, runs=5, threshold=1.10,
+options = argparse.Namespace(base={base:?}, tip={tip:?}, base_std=None, tip_std=None, runs=5, threshold=1.10, rss_threshold=1.05,
                              max_load=2.0)
 sources = {{"base": {{"copy": {kolt:?}, "label": "kolt@x"}}, "tip": {{"copy": {kolt:?}, "label": "kolt@x"}},
            "kolt": "x", "different": False}}
@@ -1243,4 +1243,91 @@ fn calibrate_takes_a_prepared_kolt_tree_and_runs_no_git_in_it() {
         report.contains("kolt@tree") && report.contains("calibrated"),
         "the split names the prepared tree and agrees:\n{report}"
     );
+}
+
+/// N166: the seal judges the T3 kolt row's peak RSS at ITS OWN threshold
+/// (`--rss-threshold`, `VILAN_PERF_RSS_THRESHOLD`, default 1.05) - RSS is
+/// deterministic where CPU is not, so it carries the tighter gate - while the
+/// CPU and instruction rows stay on `--threshold`. A tip 7% over the base in
+/// RSS (CPU and instructions equal, `--threshold 5` as everywhere here) is red
+/// by default, names both thresholds in its output, and is green again once
+/// the RSS threshold is loosened by environment or flag; 4% is green.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_seal_judges_peak_rss_at_its_own_threshold_and_names_both() {
+    let scratch = Scratch::new("seal-rss");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(&budgets, HEADER).expect("write the fixture budgets");
+    let vilan = fake_vilan(&scratch);
+    let base = base_kolt(&scratch, "base", false);
+    let tip = tip_kolt(&scratch, "tip", false);
+    fs::write(tip.join("MIGRATED"), "").expect("mark the tip's tree");
+    let verdicts = scratch.path("verdicts");
+    let seal = |tip_rss: u64, extra: &[&str], env: Option<&str>| {
+        let driver = format!(
+            r#"
+import os, sys
+sys.path.insert(0, {scripts:?})
+import perf_count, perf_gate
+def measure(argv, cwd=None, env=None, counter="auto", log=None):
+    migrated = os.path.exists(os.path.join(cwd, "MIGRATED"))
+    return {{"counter": "instructions:u", "instructions": 1,
+             "peak_rss_kb": {tip_rss} if migrated else 100, "cpu_s": 1.0, "exit": 0}}
+perf_count.measure = measure
+perf_count.hardware_counter_available = lambda: True
+perf_gate.loadavg = lambda: 0.5
+perf_gate.phase_split = lambda vilan, directory: {{"analyze": 1.0}}
+perf_gate.subject_dir = lambda subject, work: work
+sys.argv = ["perf_gate.py", "--budgets", {budgets:?}, "--work", {work:?}, "--scratch", {work:?}, "seal",
+            "--tip", {vilan:?}, "--base", {vilan:?}, "--kolt", {base:?}, "--tip-kolt", {tip:?},
+            "--base-std", {work:?}, "--runs", "1", "--threshold", "5", "--verdict-dir", {verdicts:?},
+            "--sha", "0123456789abcdef"] + {extra:?}
+perf_gate.main()
+"#,
+            scripts = repository_root().join("scripts").display().to_string(),
+            budgets = budgets.display().to_string(),
+            work = scratch.0.display().to_string(),
+            vilan = vilan.display().to_string(),
+            base = base.display().to_string(),
+            tip = tip.display().to_string(),
+            verdicts = verdicts.display().to_string(),
+            extra = extra,
+        );
+        let mut command = Command::new("python3");
+        command
+            .args(["-c", &driver])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env_remove("VILAN_PERF_RSS_THRESHOLD");
+        if let Some(value) = env {
+            command.env("VILAN_PERF_RSS_THRESHOLD", value);
+        }
+        let output = command.output().expect("run the seal driver");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        (output.status.success(), text)
+    };
+    let (ok, text) = seal(107, &[], None);
+    assert!(
+        !ok && text.contains("kolt check peak RSS x1.070 > 1.05 (the RSS threshold)"),
+        "a 7% RSS rise passed the seal's default RSS threshold:\n{text}"
+    );
+    assert!(
+        text.contains("thresholds: CPU and instructions 5.00, peak RSS 1.05"),
+        "the seal names both thresholds:\n{text}"
+    );
+    let verdict = fs::read_to_string(verdicts.join("perf-0123456789abcdef.json")).expect("verdict");
+    assert!(
+        verdict.contains("\"rss_threshold\": 1.05") && verdict.contains("\"verdict\": \"red\""),
+        "{verdict}"
+    );
+    let (ok, text) = seal(104, &[], None);
+    assert!(ok, "a 4% RSS rise is inside 1.05:\n{text}");
+    let (ok, text) = seal(107, &[], Some("1.10"));
+    assert!(
+        ok && text.contains("peak RSS 1.10"),
+        "the environment variable sets the RSS threshold:\n{text}"
+    );
+    let (ok, text) = seal(107, &["--rss-threshold", "1.08"], Some("1.01"));
+    assert!(ok, "the flag beats the environment:\n{text}");
+    // The CPU threshold is untouched by it: a 7% CPU rise stays inside 1.10.
 }

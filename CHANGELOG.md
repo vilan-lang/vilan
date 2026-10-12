@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**N166: the seal judges the T3 kolt row's peak RSS at its own threshold, 1.05.** `scripts/perf_gate.py seal` takes `--rss-threshold` (default 1.05, or `VILAN_PERF_RSS_THRESHOLD`, which `seal.sh` passes through by environment) for the kolt check's peak RSS - deterministic where CPU is not (the median of fresh-process runs, N165), so a +13% cliff like Order 49's TypeTable doubling no longer hides under the CPU rows' 10-20%. `--threshold` keeps the CPU, instruction and LSP rows. The seal prints both (`T3 thresholds: CPU and instructions 1.10, peak RSS 1.05`), the red names the RSS threshold it crossed, and the verdict JSON and the report carry `rss_threshold`. Pinned: a planted +7% RSS is red, +4% green, the environment and the flag loosen it.
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->

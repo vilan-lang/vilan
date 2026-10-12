@@ -5,6 +5,7 @@
     scripts/perf_gate.py measure   --vilan BIN [--json OUT]                     # the table, no verdict
     scripts/perf_gate.py ratchet   --from MEASURED.json [--release [--ci-from CI.json | --ci-run-of SHA]]   # the seal's ceiling ratchet
     scripts/perf_gate.py seal      --vilan TIP --base RELEASE --kolt DIR [--tip-kolt MIGRATED] [--lsp-json BASE.json TIP.json]
+                                   [--threshold 1.10 (CPU, instructions, LSP rows)] [--rss-threshold 1.05 (peak RSS)]
     scripts/perf_gate.py calibrate --vilan BIN --kolt DIR                       # S4: genapp vs kolt phase split
     scripts/perf_gate.py report    --verdict perf-<sha>.json --out perf/report-vX.Y.Z.md
 
@@ -58,6 +59,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_RSS_THRESHOLD = 1.05  # N166: peak RSS is deterministic, so it carries a tighter gate than the CPU rows
 BUDGETS = os.path.join(REPO, "perf", "budgets.toml")
 DEFAULT_VERDICTS = os.path.join(os.path.expanduser("~"), ".vilan", "perf-verdicts")
 
@@ -586,8 +588,11 @@ def t3_compare(options, sources):
         red.append(f"loadavg {load:.1f} > {options.max_load}: the CPU verdict is not trusted (Q3) — re-run quiet")
     if ratio["cpu_s"] > options.threshold:
         red.append(f"kolt check CPU x{ratio['cpu_s']:.3f}")
-    if ratio["peak_rss_kb"] > options.threshold:
-        red.append(f"kolt check peak RSS x{ratio['peak_rss_kb']:.3f}")
+    # N166: peak RSS is deterministic where CPU is not (the median of fresh-process runs), so it is judged at
+    # its OWN, tighter threshold; the CPU and instruction rows stay on `--threshold`.
+    if ratio["peak_rss_kb"] > options.rss_threshold:
+        red.append(f"kolt check peak RSS x{ratio['peak_rss_kb']:.3f} > {options.rss_threshold:g} "
+                   "(the RSS threshold)")
     if sources["different"]:
         notes.append(different_sources_note(sources))
         # The checks were clean before the measurement (`refuse_unchecked_sources`); a run that then fails
@@ -600,7 +605,8 @@ def t3_compare(options, sources):
         notes.append("the two compilers disagree on the program (exit codes): the comparison covers different work")
     return {"kolt": sources["kolt"], "sources": {side: sources[side]["label"] for side in ("base", "tip")},
             "different_sources": sources["different"], "counter": counter, "load_max": load, "runs": options.runs, "base": summary["base"],
-            "tip": summary["tip"], "ratio": ratio, "threshold": options.threshold, "red": red, "notes": notes}
+            "tip": summary["tip"], "ratio": ratio, "threshold": options.threshold,
+            "rss_threshold": options.rss_threshold, "red": red, "notes": notes}
 
 
 def e121_rows(data, lsp_json):
@@ -739,6 +745,8 @@ def command_seal(options):
             print(f"  T3 {label} @{t3['kolt']}: CPU x{t3['ratio']['cpu_s']:.3f}  "
                   f"RSS x{t3['ratio']['peak_rss_kb']:.3f}  instructions x{t3['ratio']['instructions']:.3f}  "
                   f"(load max {t3['load_max']:.1f})")
+            print(f"  T3 thresholds: CPU and instructions {t3['threshold']:.2f}, peak RSS {t3['rss_threshold']:.2f} "
+                  "(VILAN_PERF_RSS_THRESHOLD / --rss-threshold)")
             print("  T3 peak RSS, a fresh process per run, median of " + str(t3["runs"]) + ": "
                   + "; ".join(f"{side} {t3[side]['peak_rss_kb'] / 1024:.1f} MB "
                               f"[{' '.join(str(k // 1024) for k in t3[side]['peak_rss_runs_kb'])}]"
@@ -892,7 +900,8 @@ def command_report(options):
         out.append(f"Verdict **{verdict['verdict']}** at `{verdict['sha'][:10]}`, {verdict['date']}, load "
                    f"{verdict['load']:.1f}. kolt `vilan check`: CPU x{t3['ratio']['cpu_s']:.3f}, peak RSS "
                    f"x{t3['ratio']['peak_rss_kb']:.3f}, instructions x{t3['ratio']['instructions']:.3f} against "
-                   f"the previous release.")
+                   f"the previous release" + (f" (peak RSS judged at x{t3['rss_threshold']:g}, CPU and instructions at "
+                                      f"x{t3['threshold']:g})." if "rss_threshold" in t3 else "."))
         for note in t3.get("notes", []):
             out += ["", f"> **Note:** {note}"]
     for note in verdict.get("lsp_notes", []):
@@ -985,6 +994,10 @@ def main():
                                       "kolt tree, used as it stands (no git); the base keeps --kolt/--commit")
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--threshold", type=float, default=1.10)
+    p.add_argument("--rss-threshold", type=float,
+                   default=float(os.environ.get("VILAN_PERF_RSS_THRESHOLD") or DEFAULT_RSS_THRESHOLD),
+                   help="N166: the ratio past which the T3 kolt row's PEAK RSS is red (default 1.05, or "
+                        "$VILAN_PERF_RSS_THRESHOLD); --threshold judges the CPU, instruction and LSP rows")
     p.add_argument("--max-load", type=float, default=2.0)
     p.add_argument("--lsp-json", nargs=2, metavar=("BASE", "TIP"))
     p.add_argument("--sha")
