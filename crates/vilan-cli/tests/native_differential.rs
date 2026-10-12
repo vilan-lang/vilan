@@ -9517,11 +9517,45 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// `push_many([])`, and B600 refuses the `Option::None.is_some()` that
 /// replaced it at `vilan check` — "cannot infer the type of this value" at the
 /// user's call — so the library-body probe now proves that the refusal comes
-/// from the CHECK, at the call, before any body is instantiated; the
-/// in-body note has no reachable std probe left, filed with B600's report.)
+/// from the CHECK, at the call, before any body is instantiated.) N167: the
+/// in-body note's std probe is `std::fs::copy_dir`, which checks clean and
+/// whose body reaches a host binding the native backend does not emit
+/// (`new_fs_options`): the refusal is drawn at the user's call and names the
+/// body and its file.
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
+    let file = "native_probe_n167_std_body_refusal.vl";
+    std::fs::write(
+        staged.join(file),
+        "import std::fs::copy_dir;\n\nfun main() {\n\tcopy_dir(\"a\", \"b\");\n}\n",
+    )
+    .expect("write the probe");
+    let checked = vilan(&staged)
+        .args(["check", file])
+        .output()
+        .expect("check the probe");
+    assert!(
+        checked.status.success(),
+        "the std-body probe must check clean, so the refusal is the native backend's:\n{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let output = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the std-body probe is refused natively"
+    );
+    assert!(
+        stderr.contains(&format!("{file}:4:2"))
+            && stderr.contains(
+                "The construct is in `copy_dir`'s body (`fs.vl`), which this call instantiates.",
+            ),
+        "the refusal inside std's body is drawn at the user's call and names the body:\n{stderr}"
+    );
     let file = "native_probe_f108_open_option.vl";
     std::fs::write(
         staged.join(file),

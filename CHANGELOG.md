@@ -63,6 +63,11 @@ written down.
 <!-- family: diagnostics -->
 **F130: natively `print(task)` of a task whose async callee never suspends is refused at compile time, by name, as F25's other host handles are — `async fun work(): i32 { 7 }`, `let task = async work(); print(task)` built and then panicked at run time ("printing a `Task` is a host object's own inspection").** The refusal tested the RENDERED type, and `async work()` there is typed `Promise<i32>` (the program has no `std::task`, whose `Task<T>` the suspending case gets), which has no native rendering, so the test never saw it. `print` of std's async handle — `Task<T>` or `Promise<T>` — is now refused by its vilan type ("`print` of the host handle `Promise`"). Pin: `printing_a_host_handle_is_refused_at_compile_time` (gains the never-suspending probe; the JS backend builds both).
 
+---
+
+<!-- family: diagnostics -->
+**N167: the native backend's in-body anchor note — a refusal raised inside a std function's body, drawn at the user's call that instantiated it, "The construct is in `copy_dir`'s body (`fs.vl`), which this call instantiates." — is pinned again.** Its probe had been `Option::None.is_some()`, which B600 refuses at `vilan check` now (as F108's `push_many([])` was before it), so nothing reached the note. The probe is `std::fs::copy_dir("a", "b")`: it checks clean, and its body reaches a host binding the native backend does not emit (`new_fs_options`). Pin: `a_refusal_inside_another_files_body_names_where_to_look` (gains the probe; proven red with the anchor disabled).
+
 ## v0.48.0 — 2026-10-11
 
 <!-- family: breaking -->
