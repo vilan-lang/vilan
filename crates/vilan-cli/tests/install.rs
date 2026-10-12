@@ -235,6 +235,62 @@ fn version_reports_the_toolchain_and_its_build() {
     );
 }
 
+/// N168: the std an installed toolchain compiles against is ITS OWN, whatever
+/// sits above the program. A probe written under a vilan worktree
+/// (`vilan/.claude/worktrees/*/target/`) ran v0.47.0 against that worktree's
+/// edited std ("found '[' expected a type"): the ancestor walk for
+/// `vilan/std` took the nearest checkout over the binary's own. The walk is
+/// gone; `$VILAN_STD` is the one way to point a binary at a checkout's std.
+///
+/// The stand-in checkout carries an EMPTY std, so anything compiled against it
+/// fails on its first import - the poison. The binary is a copy outside every
+/// checkout, the program sits inside the poisoned one, and the control (the
+/// same program, `$VILAN_STD` naming the poison) shows the checkout is
+/// reachable and does decide verdicts.
+#[test]
+fn an_installed_binary_never_reads_std_from_the_nearest_checkout() {
+    let machine = Machine::new("nearest-checkout");
+    let checkout = machine.root.join("checkout");
+    let std = checkout.join("vilan").join("std");
+    fs::create_dir_all(std.join("src")).expect("stage the stand-in std");
+    fs::write(std.join("vilan.toml"), "[library]\nname = \"std\"\n").expect("write");
+    let macro_std = checkout.join("vilan").join("macro_std");
+    fs::create_dir_all(macro_std.join("src")).expect("stage the stand-in macro_std");
+    fs::write(
+        macro_std.join("vilan.toml"),
+        "[library]\nname = \"macro_std\"\n",
+    )
+    .expect("write");
+    // A worktree-shaped home for the probe, as the report found it.
+    let probe = checkout.join("target").join("probe");
+    fs::create_dir_all(&probe).expect("create the probe directory");
+    fs::write(
+        probe.join("probe.vl"),
+        "import std::io::print;\n\nfun main() {\n    print(\"probe\");\n}\n",
+    )
+    .expect("write the probe");
+
+    let installed = machine.vilan(&["check", probe.join("probe.vl").to_str().expect("utf-8")]);
+    assert!(
+        installed.status.success(),
+        "an installed binary compiled against the nearest checkout's std:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    // The control: `$VILAN_STD` is the explicit way, and it does decide.
+    let explicit = Command::new(&machine.binary)
+        .args(["check", probe.join("probe.vl").to_str().expect("utf-8")])
+        .current_dir(&probe)
+        .env("VILAN_STD", &std)
+        .env("HOME", &machine.home)
+        .output()
+        .expect("run the copied binary");
+    assert!(
+        !explicit.status.success(),
+        "the stand-in std is reachable through $VILAN_STD and must fail the probe"
+    );
+}
+
 fn modified(path: &Path) -> std::time::SystemTime {
     fs::metadata(path)
         .expect("metadata")

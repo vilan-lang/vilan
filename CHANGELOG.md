@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**N168: a binary compiles against `$VILAN_STD` or its own embedded std, never the nearest checkout's.** `vilan` and `vilan-lsp` used to walk the program's ancestors for `vilan/std/vilan.toml` and take the first, so an INSTALLED toolchain read whichever checkout a program happened to sit in - a v0.47.0 probe under `vilan/.claude/worktrees/lang-50/target/` ran against that worktree's edited std ("found '[' expected a type") - and a std edit made while a suite ran changed what every later-spawned compile read. The walk is gone: `$VILAN_STD` (or the editor's `vilan.stdPath`) names a tree, otherwise the std embedded at build time (materialized under `~/.vilan/std-cache/<hash>/`), which a build re-embeds on every std edit. This settles N56's remaining case too: a bare file belonging to no package no longer takes the shell's checkout. `cargo run`/nextest see a std edit after their build step; to run a binary against a tree without rebuilding, set `VILAN_STD=<checkout>/vilan/std`. Pinned: an installed binary beside a poisoned stand-in checkout compiles clean (and fails through `$VILAN_STD`), for the CLI and the language server.
+
 <!-- family: tooling -->
 **N166: the seal judges the T3 kolt row's peak RSS at its own threshold, 1.05.** `scripts/perf_gate.py seal` takes `--rss-threshold` (default 1.05, or `VILAN_PERF_RSS_THRESHOLD`, which `seal.sh` passes through by environment) for the kolt check's peak RSS - deterministic where CPU is not (the median of fresh-process runs, N165), so a +13% cliff like Order 49's TypeTable doubling no longer hides under the CPU rows' 10-20%. `--threshold` keeps the CPU, instruction and LSP rows. The seal prints both (`T3 thresholds: CPU and instructions 1.10, peak RSS 1.05`), the red names the RSS threshold it crossed, and the verdict JSON and the report carry `rss_threshold`. Pinned: a planted +7% RSS is red, +4% green, the environment and the flag loosen it.
 

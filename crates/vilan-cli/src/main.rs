@@ -6175,57 +6175,33 @@ fn discover_tests(path: Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The `std` package directory, resolved in order (proposal/releases.md §3):
-/// `$VILAN_STD`; the nearest ancestor of the entry file containing
-/// `vilan/std/vilan.toml` — a checkout, so a `vilan` built from this repo
-/// compiles against the working tree; else the binary's own embedded std,
-/// materialized once to `~/.vilan/std-cache/<hash>/` — what an installed binary
-/// uses, from any directory, with no checkout. `resolve_std` reads the resulting
-/// package's `[library]` manifest (or, if `$VILAN_STD` points at a bare source
-/// root with no manifest, uses it as the base layer).
+/// `$VILAN_STD`; else the binary's own embedded std, materialized once to
+/// `~/.vilan/std-cache/<hash>/` - what every binary uses, from any directory,
+/// with no checkout. `resolve_std` reads the resulting package's `[library]`
+/// manifest (or, if `$VILAN_STD` points at a bare source root with no manifest,
+/// uses it as the base layer).
 ///
-/// # The working directory is not a toolchain (tracker N56)
+/// # A binary reads a checkout's std only when told to (tracker N168)
 ///
-/// The ancestor walk used to run a SECOND time from the process working
-/// directory, so a file addressed by absolute path was compiled against
-/// whichever checkout the shell happened to be standing in. That is not a
-/// fallback, it is a different toolchain: `vilan check ~/code/app/src/x.vl` from
-/// inside this repository expanded the application's derives against the working
-/// tree's `std`, and where the two versions differ every derive fails at once —
-/// 37 `macro PartialEq's definition did not compile` from the vilan tree, 0 from
-/// the application's own directory, on one unchanged file. `file_project` already
-/// resolves the PACKAGE from the file's own location (G20); the std it compiles
-/// against has to come from the same place.
+/// This used to walk the entry's ancestors for `vilan/std/vilan.toml` and take
+/// the nearest, "so a `vilan` built from this repo compiles against the working
+/// tree". That made the installed toolchain read whichever checkout the program
+/// happened to sit in: a v0.47.0 probe under `vilan/.claude/worktrees/lang-50/
+/// target/` compiled against the worktree's edited std ("found '[' expected a
+/// type"), and a std edit made while a suite ran changed the std every later
+/// spawned compile read. The embedded std IS the tree's std at build time (the
+/// build script re-embeds on every std edit, so `cargo run` and nextest see an
+/// edit after their build step), so a dev build gives up nothing but the live
+/// read; `VILAN_STD=<checkout>/vilan/std` is the explicit way to point any
+/// binary at a tree.
 ///
-/// The one thing the working directory legitimately answers for is a file that
-/// belongs to nothing — a bare `.vl` with no `vilan.toml` at or above it, which
-/// is a scratch program and not a package's module. `vilan check /tmp/probe.vl`
-/// run from a checkout means the checkout's std, because there is no other
-/// toolchain in the question; a file INSIDE a package has one, and it is the
-/// package's. (An entry that does not exist yet keeps the working directory too:
-/// there is no location to ask, and the read error is reported either way.)
-fn std_dir(entry: &Path) -> Result<PathBuf, String> {
+/// This also settles tracker N56, the other half of the same question (the
+/// working directory is not a toolchain): neither the entry's location nor the
+/// shell's picks a std any more, for a file in a package or a bare scratch
+/// program alike.
+fn std_dir() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("VILAN_STD") {
         return Ok(PathBuf::from(path));
-    }
-    let entry_dir = entry
-        .canonicalize()
-        .ok()
-        .and_then(|file| file.parent().map(Path::to_path_buf));
-    let in_a_package = entry_dir.as_deref().and_then(find_project_root).is_some();
-    let working_dir = if in_a_package {
-        None
-    } else {
-        env::current_dir().ok()
-    };
-    for start in [entry_dir, working_dir].into_iter().flatten() {
-        let mut directory = Some(start.as_path());
-        while let Some(current) = directory {
-            let candidate = current.join("vilan").join("std");
-            if candidate.join("vilan.toml").is_file() {
-                return Ok(candidate);
-            }
-            directory = current.parent();
-        }
     }
     vilan_embedded::materialize()
 }
@@ -7125,7 +7101,7 @@ fn compile_to_js(
         return Err(ExitCode::FAILURE);
     }
     let filename = file.to_string_lossy().into_owned();
-    let std_directory = match std_dir(file) {
+    let std_directory = match std_dir() {
         Ok(directory) => directory,
         Err(error) => {
             diagnostic_line(&format!("{} {error}", paint::error_prefix()));
