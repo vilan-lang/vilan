@@ -57,6 +57,9 @@ impl TypeDefinitions {
 /// it: where its name is, what it is, and the matched value's type.
 #[derive(Debug, Clone)]
 pub(super) struct PatternSite {
+    /// The file the pattern is written in (E313: a module served as a view
+    /// of its entry's world reads its OWN rows, never the entry's).
+    source: SourceId,
     name_span: Span,
     kind: PatternSiteKind,
     /// The matched value's type — for a variant, only when it IS the enum.
@@ -80,6 +83,10 @@ enum PatternSiteKind {
 /// enum and variant it names, so the editor can read the variant's `///`.
 #[derive(Debug, Clone)]
 pub struct PatternLabel {
+    /// The file `name_span` is an offset into (E313). A row is read only by
+    /// the document that IS this source — the entry, or a module served as a
+    /// view of the entry's world (M104).
+    pub source: SourceId,
     pub name_span: Span,
     pub label: String,
     pub variant: Option<(Id, usize)>,
@@ -94,11 +101,52 @@ pub struct PatternLabel {
 /// clause or a supertrait list (its required members, as E237's block).
 #[derive(Debug, Clone)]
 pub struct ReferenceHover {
+    /// The file `span` is an offset into (E313), as [`PatternLabel::source`].
+    pub source: SourceId,
     pub span: Span,
     /// The fenced line or block.
     pub code: String,
     /// The declaration a type parameter belongs to, as written.
     pub declared_by: Option<String>,
+}
+
+/// E313: the files whose hover rows one analysis renders.
+///
+/// The rows (E237's definitions, E240's type-position names, E241's
+/// patterns, E206's call signatures) were the ENTRY's alone, which M104 made
+/// wrong: once two files of one world are open the server answers each
+/// module as a VIEW of its entry's world, and a view read the entry's rows at
+/// its own offsets — kolt's `channel.vl` hovered the `cut` of `shortcut` as
+/// a `None` pattern written in `client.vl` at the same bytes, and the `in` of
+/// `to_string` in `prefs.vl` as an `Ok` leg. Under the editor's reading aids
+/// (`Workspace::reading_aids`, exactly the front end that serves views) every
+/// file of the world renders its rows, keyed by file, except std's, a
+/// derive's template and the files under the package's declared `generated`
+/// root (`Workspace::generated_root`: kolt's 18,000-line lucide module is
+/// three quarters of the world's generic call sites, and a hook's output is
+/// read for what it exports, not hovered for its detail). Without the reading
+/// aids — `vilan check`, a build — the entry alone, as before.
+pub(super) struct HoverRows {
+    every_view: bool,
+    generated: HashSet<SourceId>,
+}
+
+impl HoverRows {
+    pub(super) fn new(workspace: &Workspace, sources: &[std::path::PathBuf]) -> HoverRows {
+        let generated = match (&workspace.generated_root, workspace.reading_aids) {
+            (Some(root), true) => sources
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| crate::util::canonical_path(path).starts_with(root))
+                .filter_map(|(index, _)| u32::try_from(index).ok().map(SourceId))
+                .collect(),
+            _ => HashSet::default(),
+        };
+        HoverRows {
+            every_view: workspace.reading_aids,
+            generated,
+        }
+    }
 }
 
 impl Parameter<'_> {
@@ -382,11 +430,28 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E313: whether `source`'s banked rows are rendered ([`HoverRows`]).
+    pub(super) fn renders_hover_rows(&self, source: SourceId, rows: &HoverRows) -> bool {
+        source == SourceId(0)
+            || (rows.every_view
+                && self.banks_hover_rows(source)
+                && !rows.generated.contains(&source))
+    }
+
+    /// E313: whether a file BANKS its hover rows as the walk meets them —
+    /// every file but std's and a derive's generated template, whose rows no
+    /// document can ask for. Which of the banked rows are rendered is
+    /// [`HoverRows`]' question, asked at the tail.
+    pub(super) fn banks_hover_rows(&self, source: SourceId) -> bool {
+        source != DERIVED_SOURCE && !self.std_sources.contains(&source)
+    }
+
     /// E241: bank one variant pattern for its hover. `span` is the whole
     /// path's (`Option::None`); the label belongs to the LAST segment, the
     /// variant's own name, which is what a caret on `None` is on.
     pub(super) fn record_pattern_variant(
         &mut self,
+        source: SourceId,
         span: Span,
         path: &[&'src str],
         enum_id: Id,
@@ -406,6 +471,7 @@ impl<'src> Analyzer<'src> {
         )
         .then_some(matched);
         self.pattern_sites.push(PatternSite {
+            source,
             name_span: (start..start + length).into(),
             kind: PatternSiteKind::Variant {
                 enum_id,
@@ -417,8 +483,14 @@ impl<'src> Analyzer<'src> {
     }
 
     /// E241: bank a `_` for its hover — the type it matches whole.
-    pub(super) fn record_pattern_wildcard(&mut self, span: Span, matched: TypeId) {
+    pub(super) fn record_pattern_wildcard(
+        &mut self,
+        source: SourceId,
+        span: Span,
+        matched: TypeId,
+    ) {
         self.pattern_sites.push(PatternSite {
+            source,
             name_span: span,
             kind: PatternSiteKind::Wildcard,
             matched: Some(matched),
@@ -429,21 +501,25 @@ impl<'src> Analyzer<'src> {
     /// value's type (`Option<i32>`, the bare enum where nothing more is
     /// known), the variant and its payload as this match binds it; a `_` as
     /// `_: T`.
-    pub(super) fn pattern_labels(&self) -> Vec<PatternLabel> {
+    pub(super) fn pattern_labels(&self, rows: &HoverRows) -> Vec<PatternLabel> {
         let empty = SubstitutionContext::default();
-        let mut labels: Vec<PatternLabel> = Vec::new();
+        let mut labels: Vec<Option<PatternLabel>> = Vec::new();
+        // A pattern may resolve more than once (a re-walk once its
+        // scrutinee's type is known): the answer that knows the matched type
+        // wins, and otherwise the latest. Indexed by (file, span), since
+        // every file of the world now banks its rows.
+        let mut at: HashMap<(SourceId, Span), usize> = HashMap::default();
         for site in &self.pattern_sites {
-            // A pattern may resolve more than once (a re-walk once its
-            // scrutinee's type is known): the answer that knows the matched
-            // type wins, and otherwise the latest.
-            let earlier = labels
-                .iter()
-                .position(|label| label.name_span == site.name_span);
+            if !self.renders_hover_rows(site.source, rows) {
+                continue;
+            }
+            let earlier = at.get(&(site.source, site.name_span)).copied();
             if let Some(earlier) = earlier {
-                if site.matched.is_none() && labels[earlier].matched {
+                if site.matched.is_none() && labels[earlier].as_ref().is_some_and(|row| row.matched)
+                {
                     continue;
                 }
-                labels.remove(earlier);
+                labels[earlier] = None;
             }
             let matched_label = site
                 .matched
@@ -487,14 +563,16 @@ impl<'src> Analyzer<'src> {
                     (label, Some((*enum_id, *variant_index)))
                 }
             };
-            labels.push(PatternLabel {
+            at.insert((site.source, site.name_span), labels.len());
+            labels.push(Some(PatternLabel {
+                source: site.source,
                 name_span: site.name_span,
                 label,
                 variant,
                 matched: site.matched.is_some(),
-            });
+            }));
         }
-        labels
+        labels.into_iter().flatten().collect()
     }
 
     /// [`Analyzer::collect_generics`] through a TRAIT's or an object's
@@ -526,11 +604,12 @@ impl<'src> Analyzer<'src> {
 
     /// E240: the entry's type-position names that are a type parameter or a
     /// trait, rendered — every other row keeps its plain label.
-    pub(super) fn reference_hovers(&self) -> Vec<ReferenceHover> {
-        let owners = self.generic_owners();
+    pub(super) fn reference_hovers(&self, rows: &HoverRows) -> Vec<ReferenceHover> {
+        let owners = self.generic_owners(rows);
         let mut hovers: Vec<ReferenceHover> = Vec::new();
+        let mut seen: HashSet<(SourceId, Span)> = HashSet::default();
         for (source, span, definition, type_id) in &self.type_references {
-            if *source != SourceId(0) || hovers.iter().any(|hover| hover.span == *span) {
+            if !self.renders_hover_rows(*source, rows) || seen.contains(&(*source, *span)) {
                 continue;
             }
             match type_id.borrow_type(self) {
@@ -539,6 +618,7 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                     let hover = ReferenceHover {
+                        source: *source,
                         span: *span,
                         code: self.type_parameter_line(*constraint_id),
                         declared_by: owners.get(constraint_id).cloned(),
@@ -547,22 +627,25 @@ impl<'src> Analyzer<'src> {
                     // `fun pick<U, ..>` — which no row covers: its declaration
                     // answers the same as every use.
                     if let Some(binder_span) = definition
-                        .filter(|binder| self.source_of_id(*binder) == Some(SourceId(0)))
+                        .filter(|binder| self.source_of_id(*binder) == Some(*source))
                         .and_then(|binder| self.span_map.get(&binder))
-                        && !hovers.iter().any(|known| known.span == **binder_span)
+                        && seen.insert((*source, **binder_span))
                     {
                         hovers.push(ReferenceHover {
                             span: **binder_span,
                             ..hover.clone()
                         });
                     }
+                    seen.insert((*source, *span));
                     hovers.push(hover);
                 }
                 Type::Trait(trait_id, _) if *definition == Some(*trait_id) => {
                     let Some(block) = self.type_definition_block(*type_id) else {
                         continue;
                     };
+                    seen.insert((*source, *span));
                     hovers.push(ReferenceHover {
+                        source: *source,
                         span: *span,
                         code: block,
                         declared_by: None,
@@ -594,8 +677,11 @@ impl<'src> Analyzer<'src> {
     /// Every type parameter the ENTRY declares, mapped to the declaration
     /// that introduces it, as written: a function's signature, an impl's or a
     /// trait's head, a struct's or an enum's name line.
-    fn generic_owners(&self) -> HashMap<TypeId, String> {
-        let entry = Some(SourceId(0));
+    fn generic_owners(&self, rows: &HoverRows) -> HashMap<TypeId, String> {
+        let entry = |id: Id| {
+            self.source_of_id(id)
+                .is_some_and(|source| self.renders_hover_rows(source, rows))
+        };
         let mut owners: HashMap<TypeId, String> = HashMap::default();
         let own = |owners: &mut HashMap<TypeId, String>, ids: &[TypeId], label: &str| {
             for id in ids {
@@ -603,9 +689,7 @@ impl<'src> Analyzer<'src> {
             }
         };
         for (id, function) in &self.functions {
-            if self.source_of_id(*id) == entry
-                && !function.generic_parameter_constraint_ids.is_empty()
-            {
+            if entry(*id) && !function.generic_parameter_constraint_ids.is_empty() {
                 let label = self.function_signature_label(function);
                 own(
                     &mut owners,
@@ -615,7 +699,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for implementation in &self.implementations {
-            if implementation.source != SourceId(0) {
+            if !self.renders_hover_rows(implementation.source, rows) {
                 continue;
             }
             let mut generics = Vec::new();
@@ -639,7 +723,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (id, trait_) in &self.traits {
-            if self.source_of_id(*id) == entry {
+            if entry(*id) {
                 let label = self.trait_header_label(trait_);
                 own(
                     &mut owners,
@@ -649,7 +733,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (id, struct_) in &self.structs {
-            if self.source_of_id(*id) == entry {
+            if entry(*id) {
                 let label = format!(
                     "struct {}{}",
                     struct_.name,
@@ -663,7 +747,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (id, enum_) in &self.enums {
-            if self.source_of_id(*id) == entry {
+            if entry(*id) {
                 let label = format!(
                     "enum {}{}",
                     enum_.name,
@@ -678,39 +762,53 @@ impl<'src> Analyzer<'src> {
     /// E237: the definition blocks for the entry's typed positions — every
     /// binding and parameter it declares, every member it reads, every field
     /// of a struct it declares — deduplicated by rendered type.
-    pub(super) fn type_definitions(&self, expr_type_ids: &HashMap<Id, TypeId>) -> TypeDefinitions {
-        let entry = Some(SourceId(0));
+    pub(super) fn type_definitions(
+        &self,
+        expr_type_ids: &HashMap<Id, TypeId>,
+        rows: &HoverRows,
+    ) -> TypeDefinitions {
+        let entry = |id: Id| {
+            self.source_of_id(id)
+                .is_some_and(|source| self.renders_hover_rows(source, rows))
+        };
         let mut positions: Vec<TypeId> = Vec::new();
         for (id, variable) in &self.variables {
-            if self.source_of_id(*id) == entry {
+            if entry(*id) {
                 positions.push(variable.type_id);
             }
         }
         for (id, parameter) in &self.parameters {
-            if self.source_of_id(*id) == entry {
+            if entry(*id) {
                 positions.push(parameter.type_id);
             }
         }
         for id in self.member_name_spans.keys() {
-            if self.source_of_id(*id) == entry
+            if entry(*id)
                 && let Some(type_id) = expr_type_ids.get(id)
             {
                 positions.push(*type_id);
             }
         }
         for (id, struct_) in &self.structs {
-            if self.source_of_id(*id) == entry {
+            if entry(*id) {
                 positions.extend(struct_.fields.iter().map(|field| field.type_id));
             }
         }
         let empty = SubstitutionContext::default();
         let mut definitions = TypeDefinitions::default();
-        let mut by_label: HashMap<String, Option<u32>> = HashMap::default();
+        // Deduplicated by the rendered type — except a type PARAMETER, whose
+        // bare rendering is its name (B261: an implicit `x: Signal<str>`
+        // prints `Signal`), so two parameters bounded by `Signal<str>` and
+        // `Signal<Option<Channel>>` print alike and must not share a block
+        // (E313 made the table every file's, where the two met in kolt).
+        let mut by_label: HashMap<(String, Option<TypeId>), Option<u32>> = HashMap::default();
         for type_id in positions {
             if definitions.by_type.contains_key(&type_id) {
                 continue;
             }
-            let label = self.pretty_print_type(type_id.borrow_type(self), &empty);
+            let type_ = type_id.borrow_type(self);
+            let parameter = matches!(type_, Type::Generic(_)).then_some(type_id);
+            let label = (self.pretty_print_type(type_, &empty), parameter);
             let index = match by_label.get(&label) {
                 Some(index) => *index,
                 None => {

@@ -42987,9 +42987,10 @@ impl<'src> Analyzer<'src> {
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PATTERN);
         match pattern {
             WalkPattern::Wildcard(span, source_id) => {
-                // E241: `_` hovers as what it matches whole.
-                if *source_id == SourceId(0) {
-                    self.record_pattern_wildcard(*span, expected_type_id);
+                // E241: `_` hovers as what it matches whole — in every file
+                // a view can serve (E313); the tail renders the ones asked.
+                if self.banks_hover_rows(*source_id) {
+                    self.record_pattern_wildcard(*source_id, *span, expected_type_id);
                 }
                 Some(ExprPattern::Wildcard)
             }
@@ -43172,9 +43173,11 @@ impl<'src> Analyzer<'src> {
                     return None;
                 }
                 // E241: the hover answer for the variant's name — the variant
-                // of the matched value's type, its payload as substituted.
-                if source_id == SourceId(0) {
+                // of the matched value's type, its payload as substituted
+                // (E313: banked in every file a view can serve).
+                if self.banks_hover_rows(source_id) {
                     self.record_pattern_variant(
+                        source_id,
                         span,
                         path,
                         enum_id,
@@ -73553,13 +73556,15 @@ pub struct Program<'src> {
     /// T>`, `trait Flow<T>`.
     pub member_headers: HashMap<Id, String>,
     /// E237: the definition block of each entry-file binding's, parameter's,
-    /// member read's and field's type, keyed by that type id.
+    /// member read's and field's type, keyed by that type id — every file a
+    /// view can serve under the editor's reading aids (E313).
     pub type_definitions: TypeDefinitions,
-    /// E241: an entry-file variant PATTERN's name span and its hover label —
+    /// E241: a variant PATTERN's file, name span and hover label (the entry's,
+    /// and under the reading aids every file a view can serve — E313) —
     /// the variant of the matched value's type with its payload substituted
     /// (`Option<i32>::Some(i32)`) — and the enum and variant it names.
     pub pattern_labels: Vec<PatternLabel>,
-    /// E240: the entry's type-position names that are a type parameter
+    /// E240: the entry's (E313: and every view's) type-position names that are a type parameter
     /// (`type I: Read<U>` and the declaration introducing it) or a trait (its
     /// required members), by span.
     pub reference_hovers: Vec<ReferenceHover>,
@@ -77467,6 +77472,12 @@ pub struct Workspace {
     /// the fill points) are kept on every analysis, so a stored world serves
     /// both kinds of caller and only the per-analysis tables are skipped.
     pub reading_aids: bool,
+    /// E313: the entry package's declared `generated` root, canonical
+    /// (`build-hooks.md` §12) — a hook's output, whose files the editor's
+    /// per-file hover rows skip ([`hover_labels::HoverRows`]). Set by the
+    /// language server beside `reading_aids`; a front-end fact out of the
+    /// base cache key for the same reason.
+    pub generated_root: Option<PathBuf>,
 }
 
 /// Whether the analysis is looking at a program its package declares, or at a
@@ -85444,11 +85455,13 @@ fn analyze_over_world<'src>(
     // keeps "show one line when nothing is substituted" a property of the map
     // rather than a rule its readers each have to remember.
     //
-    // ENTRY-FILE sites only, which is not a shortcut but the reach of the one
-    // question this answers: a hover resolves through `entity_at`, whose table
-    // is the entry's id range and nothing else (M27), so a label for a call
-    // inside std could never be looked up — and std is where the generic call
-    // sites are. This is the compiler's largest per-process retention's
+    // The sites of the files a hover can be asked in, which is not a shortcut
+    // but the reach of the one question this answers: a hover resolves through
+    // `entity_at`, whose table is the hovered document's id range and nothing
+    // else (M27) — the entry's, or a view's module's under the editor's
+    // reading aids (E313, `HoverRows`) — so a label for a
+    // call inside std could never be looked up, and std is where the generic
+    // call sites are. This is the compiler's largest per-process retention's
     // neighbourhood (M11), and a String per generic call in the whole world is
     // what the unfiltered loop would have kept.
     // M110 S2b: the reused modules' declaration labels, restored before the
@@ -85465,12 +85478,17 @@ fn analyze_over_world<'src>(
                 .map(|(id, label)| (*id, label.clone())),
         );
     }
+    // E313: the files whose hover rows this analysis renders.
+    let hover_rows = hover_labels::HoverRows::new(workspace, &sources);
     let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
     for (call_id, substitution) in &analyzer.method_call_substitution {
         if substitution.is_empty() {
             continue;
         }
-        if analyzer.source_of_id(*call_id) != Some(SourceId(0)) {
+        if !analyzer
+            .source_of_id(*call_id)
+            .is_some_and(|source| analyzer.renders_hover_rows(source, &hover_rows))
+        {
             continue;
         }
         let Some(call) = analyzer.function_calls.get(call_id) else {
@@ -85756,12 +85774,13 @@ fn analyze_over_world<'src>(
     }
 
     // E237: the definition under an entry binding's, member's or field's type.
-    let type_definitions = analyzer.type_definitions(&expr_type_ids);
+    // E313: for every file a view can serve, under the editor's reading aids.
+    let type_definitions = analyzer.type_definitions(&expr_type_ids, &hover_rows);
     crate::phase_pass_mark("the class D partition and the records");
     // E241: a variant pattern's label, rendered once its types have settled.
-    let pattern_labels = analyzer.pattern_labels();
+    let pattern_labels = analyzer.pattern_labels(&hover_rows);
     // E240: type parameters and traits named in type position.
-    let reference_hovers = analyzer.reference_hovers();
+    let reference_hovers = analyzer.reference_hovers(&hover_rows);
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();

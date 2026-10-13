@@ -316,6 +316,10 @@ fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
         // only what `pkg::<the open file>` means; a file the manifest declares is
         // a program whichever file the editor happens to be showing.
         let declared_entries = vilan_core::platform_color::declared_entry_module_names(&manifest);
+        // E313: a hook's output renders no per-file hover rows.
+        workspace.generated_root = manifest
+            .generated_root()
+            .map(|generated| vilan_core::util::canonical_path(root.join(generated)));
         workspace.entry_mode =
             if vilan_core::platform_color::is_package_module(&pkg_root, &manifest, entry_path) {
                 vilan_core::EntryMode::OpenFile { declared_entries }
@@ -371,7 +375,10 @@ fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
             .max_by_key(|layer| layer.root.as_os_str().len())
             .map(|layer| layer.root.clone())
             .unwrap_or(spec.base_root);
-        let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        let (mut workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        workspace.generated_root = manifest
+            .generated_root()
+            .map(|generated| vilan_core::util::canonical_path(root.join(generated)));
         return ProjectContext {
             platform: None,
             shared_platforms: Vec::new(),
@@ -3950,9 +3957,11 @@ impl Document {
     /// bare enum (`Option`, unfenced): the enum's name for a caret on the
     /// variant, and without the arguments the match is over.
     fn pattern_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        // E313: this document's rows only — a view of a world reads the
+        // world's program, whose rows are every file's.
         let site = program.pattern_labels.iter().find(|site| {
             let range = site.name_span.into_range();
-            range.start <= offset && offset < range.end
+            site.source == self.focus && range.start <= offset && offset < range.end
         })?;
         let mut out = HoverBlocks::new();
         out.push_code(Block::Signature, &site.label);
@@ -3983,7 +3992,7 @@ impl Document {
             .iter()
             .filter(|hover| {
                 let range = hover.span.into_range();
-                range.start <= offset && offset < range.end
+                hover.source == self.focus && range.start <= offset && offset < range.end
             })
             .min_by_key(|hover| hover.span.into_range().len())?;
         let named_trait = self
@@ -32367,3 +32376,7 @@ mod auto_editor_tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 }
+
+#[cfg(test)]
+#[path = "editor_review_tests.rs"]
+mod editor_review_tests;
