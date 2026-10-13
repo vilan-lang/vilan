@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**B616: an array literal inside a list literal's tuple element elaborates to the fixed array its annotation states — `let pairs: List<([i32; 2], bool)> = [([1, 2], true)]` was refused "Expected List<([i32; 2], bool)>, but got List<(List<i32>, bool)> instead." while `let t: ([i32; 2], bool) = ([1, 2], true)` and `let xs: List<[i32; 2]> = [[1, 2]]` checked.** B592 directed a list literal's element by its expected array type only when the element was itself a list literal; the direction now reaches an array literal through a tuple, a nested list and a variant constructor's payload (`[Some([1, 2])]` against `List<Option<[i32; 2]>>`), with the array arm's count check. Both backends run the shapes. Pins: `array_lengths::b616_an_array_literal_inside_a_list_elements_tuple_elaborates_to_the_array`, `array_lengths::b616_a_wrong_length_inside_the_tuple_is_refused_by_the_array_rule`. Tracker B616.
+
+---
+
 <!-- family: diagnostics -->
 **E295: a blanket's static named on a head its bound does not admit says which bound — `i32::tag(1)` over `impl type T: Leaf with Tag` read only "cannot find 'tag' in i32"; it now continues "; `tag` is provided by `impl type T: Leaf with Tag`, and `i32` does not implement `Leaf`" (of several bounds, the missing ones).** After B595 a head the bound admits resolves (`str::tag(1)`); the candidate scan dropped the blanket by its bound for any other, and the refusal said nothing of it. Pin: `traits::e295_a_blankets_static_on_an_unadmitted_head_names_the_missing_bound`. Tracker E295.
 

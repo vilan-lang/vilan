@@ -47138,6 +47138,11 @@ impl<'src> Analyzer<'src> {
                     .as_ref()
                     .filter(|expected| matches!(expected, Type::Array(..)))
                     .cloned();
+                // B616's candidate direction (see the item arm below).
+                let determined_element = seeded_element
+                    .as_ref()
+                    .filter(|expected| self.type_is_fully_determined(expected))
+                    .cloned();
                 let mut element_type = match seeded_element {
                     Some(expected @ Type::Dyn(..)) => expected,
                     _ => Type::Unknown,
@@ -47163,6 +47168,20 @@ impl<'src> Analyzer<'src> {
                                 ) =>
                         {
                             array_literal_element.clone().unwrap_or(Type::Unknown)
+                        }
+                        // B616: and B592's direction one level deeper — an
+                        // element whose literal holds an array literal at a
+                        // position the expected element type makes a fixed
+                        // array (`[([1, 2], true)]` against `List<([i32; 2],
+                        // bool)>`, `[[[1, 2]]]` against `List<List<[i32;
+                        // 2]>>`, `[Some([1, 2])]`) takes the whole expected
+                        // element, as the annotated tuple does alone.
+                        (_, Type::Unknown)
+                            if determined_element.as_ref().is_some_and(|expected| {
+                                self.literal_elaborates_an_array(*item_id, expected)
+                            }) =>
+                        {
+                            determined_element.clone().unwrap_or(Type::Unknown)
                         }
                         _ => element_type.clone(),
                     };
@@ -58642,6 +58661,53 @@ impl<'src> Analyzer<'src> {
 
     /// Whether `expr_id` is a tuple literal holding an unsuffixed numeric
     /// literal at any depth (`(0, 3)`, `((1, 2), "x")`) — B447's literal tuple.
+    /// B616: whether the literal `expr_id` holds an array literal at a
+    /// position `expected` makes a fixed array — the one expectation that
+    /// changes what a literal IS (B592) — through list and tuple literals and
+    /// a variant constructor's payload arguments.
+    fn literal_elaborates_an_array(&self, expr_id: Id, expected: &Type) -> bool {
+        let list_id = self.primitive_struct_ids.get("List").copied();
+        match (self.expr_id_to_expr_map.get(&expr_id), expected) {
+            (Some(Expr::List(_)), Type::Array(..)) => true,
+            (Some(Expr::List(item_ids)), Type::Struct(id, arguments))
+                if Some(*id) == list_id && arguments.len() == 1 =>
+            {
+                let element = arguments[0].get_type(self);
+                item_ids
+                    .iter()
+                    .any(|item_id| self.literal_elaborates_an_array(*item_id, &element))
+            }
+            (Some(Expr::Tuple(item_ids)), Type::Tuple(element_ids, _))
+                if item_ids.len() == element_ids.len() =>
+            {
+                item_ids
+                    .iter()
+                    .zip(element_ids)
+                    .any(|(item_id, element_id)| {
+                        self.literal_elaborates_an_array(*item_id, &element_id.get_type(self))
+                    })
+            }
+            (Some(Expr::Call(call_id)), Type::Enum(enum_id, arguments)) => {
+                let Some(call) = self.function_calls.get(call_id) else {
+                    return false;
+                };
+                let mut subject = call.subject_id;
+                while let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&subject) {
+                    subject = *target;
+                }
+                matches!(
+                    self.expr_id_to_expr_map.get(&subject),
+                    Some(Expr::EnumVariant(variant_enum, _)) if variant_enum == enum_id
+                ) && call.argument_ids.iter().any(|argument_id| {
+                    arguments.iter().any(|argument| {
+                        self.literal_elaborates_an_array(*argument_id, &argument.get_type(self))
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
     fn tuple_literal_holds_unsuffixed_numeric(&self, expr_id: Id) -> bool {
         match self.expr_id_to_expr_map.get(&expr_id) {
             Some(Expr::Tuple(element_ids)) => element_ids.iter().any(|element_id| {
