@@ -25488,7 +25488,10 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         ] {
             assert_eq!(
                 hovered,
-                format!("{}\n\nWhere it is.\n\n---\n\n{shape}", fence("at: Point")),
+                format!(
+                    "{}\n\nWhere it is.\n\n---\n\n{shape}",
+                    fence("struct Holder\nat: Point")
+                ),
                 "{position}"
             );
         }
