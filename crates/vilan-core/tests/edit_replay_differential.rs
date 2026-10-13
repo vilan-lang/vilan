@@ -357,6 +357,81 @@ fn a_push_into_an_unedited_modules_binding_stales_its_item_record_over_the_std_p
     );
 }
 
+/// **std-prefix P2's gate** (`std-prefix.md` §13, incr-51c's Q1 as ruled): the
+/// prefix LAYERED under the world build. Every §6 edit class, applied and
+/// undone, with layering on — S1's hot-set worlds (and the canonical ones)
+/// that MISS are built over the std-only prefix and stored under their own
+/// keys; their hits are S1's as before — answers what the canonical clean
+/// analysis answers and emits what a clean analysis of the same (layered)
+/// shape emits. Non-vacuous: worlds are built layered, the prefix is SERVED
+/// to a later world build (a second hot set in the package takes std from
+/// memory), S1's hot-set hits still serve item records over a layered world,
+/// and the guards still refuse where they must (each refusal answering
+/// canonically, which the comparison holds).
+#[test]
+fn every_edit_class_answers_what_a_clean_analysis_answers_with_the_prefix_layered() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::incremental::set_std_prefix_layering(Some(true));
+    let Replayed {
+        divergences,
+        censuses,
+        ..
+    } = replay_the_classes();
+    let mut divergences = divergences;
+    let mut censuses = censuses;
+    for fixture in POST_PASS_FIXTURES {
+        let mut package = fixture.write();
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix_layering(None);
+    assert!(
+        divergences.is_empty(),
+        "{} step(s) of the edit script observe the layered analysis:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let layered = censuses
+        .iter()
+        .filter(|census| census.prefix_layered)
+        .count();
+    let prefix_hits: u64 = censuses
+        .iter()
+        .filter(|census| census.prefix_layered)
+        .map(|census| census.prefix_hits)
+        .sum();
+    let hot_hits = censuses
+        .iter()
+        .filter(|census| census.hot_world && census.base_hits > 0)
+        .count();
+    let served: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_served)
+        .sum();
+    eprintln!(
+        "{} analyses: {layered} layered world builds ({prefix_hits} over a served prefix), \
+         {hot_hits} hot-set hits, {served} item records served",
+        censuses.len()
+    );
+    assert!(
+        layered >= 8 && prefix_hits >= 4,
+        "the script must build worlds over the prefix and serve the prefix to later builds \
+         (layered {layered}, prefix hits {prefix_hits}); the comparison is otherwise vacuous \
+         about P2"
+    );
+    assert!(
+        hot_hits >= 8 && served > 0,
+        "S1's hot-set worlds stay what a keystroke is served from (hot-set hits {hot_hits}, \
+         item records served {served})"
+    );
+}
+
 /// A package impl of a std trait whose member std's own resolve asks about —
 /// kolt's `impl ProxySignal<type T> with Signal<T>` and std's `get` lookups —
 /// for the std-prefix tests below.

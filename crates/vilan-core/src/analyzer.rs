@@ -333,6 +333,46 @@ struct ImplReachLog {
     floor: Option<usize>,
 }
 
+impl ImplReachLog {
+    /// std-prefix P2: the questions of this (std's, filter `everything`) log
+    /// that `filter` would have recorded — a member question about one of its
+    /// names, or anything when it records everything.
+    fn kept_by(&self, filter: &ReachFilter) -> ImplReachLog {
+        let members = self
+            .members
+            .iter()
+            .filter(|(name, _)| filter.everything || filter.members.contains(&***name))
+            .map(|(name, receivers)| (name.clone(), receivers.clone()))
+            .collect();
+        let traits = match filter.everything {
+            true => self.traits.clone(),
+            false => HashMap::default(),
+        };
+        ImplReachLog {
+            members,
+            traits,
+            ..ImplReachLog::default()
+        }
+    }
+
+    /// Adds `other`'s questions to this log's (a receiver asked by a package
+    /// source on either side stays asked by one).
+    fn absorb(&mut self, other: ImplReachLog) {
+        for (name, receivers) in other.members {
+            let into = self.members.entry(name).or_default();
+            for (receiver, by_package) in receivers {
+                note_receiver(into, &receiver, by_package);
+            }
+        }
+        for (trait_id, receivers) in other.traits {
+            let into = self.traits.entry(trait_id).or_default();
+            for (receiver, by_package) in receivers {
+                note_receiver(into, &receiver, by_package);
+            }
+        }
+    }
+}
+
 /// Which questions an [`ImplReachLog`] keeps, read off the LATE files' syntax
 /// (the entry, and a hot set's modules) before anything resolves.
 ///
@@ -78452,6 +78492,16 @@ struct BaseCacheState {
     ///
     /// EMPTY everywhere but the language server, like the live entries.
     session_entries: HashMap<PathBuf, Option<BaseCacheKey>>,
+    /// std-prefix P2 (E294's pinned half): the std PREFIX each declared entry
+    /// — live or the session's — last built its world over (a LAYERED build),
+    /// by the entry's canonical path. Those prefixes are held live the way the
+    /// session's worlds are: sized into the budget, never its victim, so the
+    /// next world build of the session (a pause's union analysis, a keystroke
+    /// in another file, the other leg) takes std from memory instead of
+    /// draining it again. One per (platform, std closure) in practice — kolt's
+    /// two legs pin two — and bounded by the declared entries: an entry that
+    /// leaves both sets unpins its prefix in the same breath.
+    entry_prefixes: HashMap<PathBuf, BaseCacheKey>,
 }
 
 impl BaseCacheState {
@@ -78467,6 +78517,25 @@ impl BaseCacheState {
             }
         }
         keys
+    }
+
+    /// The session's retained worlds (E294) and the std prefixes its entries
+    /// built over (P2) — every key the budget sizes in.
+    fn pinned_keys(&self) -> Vec<BaseCacheKey> {
+        let mut keys = self.retained_keys(&self.session_entries);
+        for key in self.entry_prefixes.values() {
+            if self.worlds.contains_key(key) && !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+        keys
+    }
+
+    /// Drops the prefix pins of entries no longer declared (P2).
+    fn prune_entry_prefixes(&mut self) {
+        let (live, session) = (&self.live_entries, &self.session_entries);
+        self.entry_prefixes
+            .retain(|entry, _| live.contains_key(entry) || session.contains_key(entry));
     }
 
     /// The bound in force, in recorded bytes (E294): the flat budget plus
@@ -78514,7 +78583,7 @@ impl BaseCacheState {
     /// session's is sized in, once.
     fn evict_to_budget(&mut self, keep: Option<&BaseCacheKey>) {
         let live = self.retained_keys(&self.live_entries);
-        let session = self.retained_keys(&self.session_entries);
+        let session = self.pinned_keys();
         let budget = self.budget_in_force(&session);
         while self.retained_bytes > budget {
             let victim = self
@@ -78581,6 +78650,7 @@ pub fn set_base_cache_live_entries(entries: &[PathBuf]) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     redeclare_entries(&mut state.live_entries, entries);
+    state.prune_entry_prefixes();
 }
 
 /// Declares the session's ENTRIES — every declared entry of every package a
@@ -78600,6 +78670,7 @@ pub fn set_base_cache_session_entries(entries: &[PathBuf]) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     redeclare_entries(&mut state.session_entries, entries);
+    state.prune_entry_prefixes();
 }
 
 /// Replaces a declared entry set (M67's live entries, E294's session entries)
@@ -78657,6 +78728,46 @@ pub fn base_cache_session_entries() -> (usize, usize) {
         .unwrap_or((0, 0))
 }
 
+/// std-prefix P2: the world builds this process LAYERED over the prefix, and
+/// how many of them were served the prefix from memory.
+static PREFIX_LAYERED_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREFIX_LAYERED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process's layered world builds and prefix hits (std-prefix P2) — the
+/// test surface a front end's own threads can be read through.
+#[doc(hidden)]
+pub fn base_cache_prefix_stats() -> (u64, u64) {
+    (
+        PREFIX_LAYERED_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+        PREFIX_LAYERED_HITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How many std prefixes the declared entries pin, and how many of them the
+/// cache holds (std-prefix P2) — the test surface for the pin.
+#[doc(hidden)]
+pub fn base_cache_pinned_prefixes() -> (usize, usize) {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            let state = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut keys: Vec<&BaseCacheKey> = Vec::new();
+            for key in state.entry_prefixes.values() {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            let held = keys
+                .iter()
+                .filter(|key| state.worlds.contains_key(**key))
+                .count();
+            (keys.len(), held)
+        })
+        .unwrap_or((0, 0))
+}
+
 /// The budget in force (M24) — the test surface, and what a `[vilan phase]`
 /// reader would want beside `base_cache_retained`.
 #[doc(hidden)]
@@ -78666,7 +78777,7 @@ pub fn base_cache_budget() -> usize {
 
 /// The bound the cache is held to right now, in recorded bytes (E294): the
 /// flat [`base_cache_budget`] plus the worlds it holds for the session's
-/// declared entries. What the retained bytes are compared against, so it is
+/// declared entries and the std prefixes they pin (P2). What the retained bytes are compared against, so it is
 /// the figure a status page sets beside them.
 #[doc(hidden)]
 pub fn base_cache_budget_in_force() -> usize {
@@ -78676,7 +78787,7 @@ pub fn base_cache_budget_in_force() -> usize {
             let state = cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let session = state.retained_keys(&state.session_entries);
+            let session = state.pinned_keys();
             state.budget_in_force(&session)
         })
         .unwrap_or_else(base_cache_budget)
@@ -79888,9 +79999,13 @@ impl Drop for BaseCacheBuild {
 /// and is only ever taken by a thread holding no claim of its own, so it
 /// cannot close a cycle. Returning `(None, None)` means "build, but do not
 /// claim": someone else owns the key, or this thread already does.
+///
+/// `learn` is whether a declared entry learns `key` as its world's: false for
+/// the std prefix a LAYERED build (P2) takes, which is not the entry's world.
 fn base_cache_admit(
     key: &BaseCacheKey,
     entry_path: &Path,
+    learn: bool,
 ) -> (Option<World<'static>>, Option<BaseCacheBuild>) {
     let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
     let mut state = cache
@@ -79902,7 +80017,20 @@ fn base_cache_admit(
     // stores under exactly this key a moment later). Skipped entirely where
     // nothing is declared live, which is every front end but the server.
     // E294: the session's entries learn their keys at the same place.
-    if !state.live_entries.is_empty() || !state.session_entries.is_empty() {
+    // std-prefix P2: a layered build's prefix is not the entry's world, but a
+    // declared entry PINS it (`BaseCacheState::entry_prefixes`).
+    if !learn
+        && key.std_prefix
+        && (!state.live_entries.is_empty() || !state.session_entries.is_empty())
+    {
+        let canonical = crate::util::canonical_path(entry_path);
+        if state.live_entries.contains_key(&canonical)
+            || state.session_entries.contains_key(&canonical)
+        {
+            state.entry_prefixes.insert(canonical, key.clone());
+        }
+    }
+    if learn && (!state.live_entries.is_empty() || !state.session_entries.is_empty()) {
         let canonical = crate::util::canonical_path(entry_path);
         let declared_sets = &mut *state;
         for declared in [
@@ -80336,7 +80464,7 @@ fn shape_after_hot_load(
         HotLoadRefusal::Refused(reason) => reason,
     };
     refuse_hot_world(key);
-    note_hot_refusal(reason);
+    note_hot_refusal(reason, key);
     shape.refusing(key)
 }
 
@@ -80680,6 +80808,82 @@ fn load_hot_modules<'src>(
     Ok(())
 }
 
+/// M110 S1's third guard: whether a hot module imports — directly, or through
+/// a prefix module's re-export — a PREFIX module's USE-INFERRED binding, one
+/// whose type the first use in walk order decides (i7's `mut items = []`, a
+/// `Context::new()` with no type argument, `spec/contexts.md` §8.1). The
+/// canonical world may walk that hot module first and let it decide; the
+/// hot-set world always lets the prefix decide. `prefix_modules` are the
+/// stored world's package modules (name, file, module scope), resolved; asked
+/// while that resolution is fresh and BEFORE the store, so a refused hot world
+/// is never stored. The use-inferred plant (M110 S1) answers `false`.
+fn hot_set_imports_a_use_inferred_binding(
+    analyzer: &Analyzer<'_>,
+    prefix_modules: &[(&str, &NodeList<'_>, Id)],
+    hot_modules: &[&str],
+    pkg_root: &Path,
+) -> bool {
+    let mut use_inferred = analyzer.use_inferred_module_bindings(
+        prefix_modules
+            .iter()
+            .map(|(name, _, scope_id)| (*name, *scope_id)),
+    );
+    let pkg_roots: [&Path; 1] = [pkg_root];
+    // Closed over the prefix's own imports: a module that imports from
+    // one of these can re-export the binding (`export import`), and the
+    // hot module that imports IT reaches the binding all the same. An
+    // over-approximation, which is the safe side.
+    if !use_inferred.is_empty() {
+        let edges: Vec<(&str, Vec<String>)> = prefix_modules
+            .iter()
+            .map(|(name, ast, _)| {
+                let targets = collect_module_paths(ast, "pkg")
+                    .into_iter()
+                    .map(|(request, _)| {
+                        deepest_module_or_namespace(&pkg_roots, request)
+                            .unwrap_or_else(|| request.to_string())
+                    })
+                    .collect();
+                (*name, targets)
+            })
+            .collect();
+        loop {
+            let before = use_inferred.len();
+            for (name, targets) in &edges {
+                if !use_inferred.contains(name)
+                    && targets
+                        .iter()
+                        .any(|target| use_inferred.contains(target.as_str()))
+                {
+                    use_inferred.insert(name);
+                }
+            }
+            if use_inferred.len() == before {
+                break;
+            }
+        }
+    }
+    let imports_one = !use_inferred.is_empty()
+        && hot_modules.iter().any(|module| {
+            let Some(resolution) = resolve_module_in_roots(&pkg_roots, module) else {
+                return true;
+            };
+            let Some(loaded) = load_package_module(&resolution.path) else {
+                return true;
+            };
+            collect_module_paths(&loaded.ast.0, "pkg")
+                .into_iter()
+                .any(|(request, _)| {
+                    let resolved = deepest_module_or_namespace(&pkg_roots, request)
+                        .unwrap_or_else(|| request.to_string());
+                    use_inferred
+                        .iter()
+                        .any(|open| resolved == *open || resolved.starts_with(&format!("{open}::")))
+                })
+        });
+    imports_one && !crate::incremental::planted(crate::incremental::Plant::UseInferredGuardOff)
+}
+
 /// std-prefix P1 (`std-prefix.md` §4.2): the package half of the canonical
 /// two-phase resolve, over a std-only prefix whose own resolve was std's alone.
 ///
@@ -80696,15 +80900,30 @@ fn load_hot_modules<'src>(
 /// M110 S1's third guard (a use-inferred binding a hot module imports) has no
 /// work here: the package walks in the canonical order among itself, after
 /// std, so the first use in walk order is the canonical world's first use.
+///
+/// std-prefix P2: a LAYERED world records what its own key's filter asks
+/// (`ReachFilter` of the entry and S1's hot set — the late files of the world
+/// it becomes), and keeps std's questions that filter would have kept beside
+/// the package's: the world is stored as S1's or the canonical miss stores
+/// it, and that world's resolve asked both at once.
 fn resolve_package_over_prefix(
     world: &mut World<'_>,
     nodes: &Spanned<NodeList<'_>>,
+    layered: Option<&Layered>,
 ) -> Result<(), ImplReached> {
     let package_sources = world.prefix_len as u32..world.sources.len() as u32;
     let analyzer = &mut world.analyzer;
     let std_log = std::mem::take(analyzer.impl_reach.get_mut());
     analyzer.source_paths = world.sources.clone();
-    match ReachFilter::of(std::iter::once(&nodes.0)) {
+    let filter = match layered {
+        Some(layered) => layered.world_key.reach.clone(),
+        None => ReachFilter::of(std::iter::once(&nodes.0)),
+    };
+    let kept_std = match (layered, &filter) {
+        (Some(_), Some(filter)) => Some(std_log.kept_by(filter)),
+        _ => None,
+    };
+    match filter {
         Some(filter) => {
             analyzer.begin_impl_reach_log(filter);
             analyzer.resolve_world();
@@ -80712,8 +80931,12 @@ fn resolve_package_over_prefix(
         }
         None => analyzer.resolve_world(),
     }
-    let package_log = std::mem::replace(analyzer.impl_reach.get_mut(), std_log);
+    let mut package_log = std::mem::replace(analyzer.impl_reach.get_mut(), std_log);
     let verdict = analyzer.impl_reach(package_sources);
+    if let Some(kept_std) = kept_std {
+        package_log.absorb(kept_std);
+        analyzer.prefix_impl_count = package_log.floor;
+    }
     *analyzer.impl_reach.get_mut() = package_log;
     if let Some(mut reached) = verdict {
         // The impl guard's plant (M110 S1) lets a package impl through too.
@@ -80826,11 +81049,14 @@ fn refuse_hot_world(key: &BaseCacheKey) {
 }
 
 /// A hot-set world refused once its build began (the census's `hot-refusal`)
-/// — and, when it was the std-prefix world (P1), one prefix refusal.
-fn note_hot_refusal(reason: &'static str) {
+/// — and, when the refused world is the std prefix (`key`: P1's, or the one a
+/// layered build took, P2), one prefix refusal. A layered build's S1 guard
+/// refuses S1's hot set alone; the prefix it stood on was not what failed.
+fn note_hot_refusal(reason: &'static str, key: &BaseCacheKey) {
     crate::incremental::update_census(|census| {
         census.hot_refusal = Some(reason);
-        if census.prefix_world {
+        if census.prefix_world && (key.std_prefix || !census.prefix_layered) {
+            census.prefix_layered = false;
             census.prefix_world = false;
             census.prefix_refusals += 1;
             census.prefix_refusal = Some(reason);
@@ -81517,6 +81743,157 @@ fn hot_set_of(
     }
 }
 
+/// std-prefix P1/P2: the prefix's key — the std CLOSURE of the entry's seeds
+/// and every module of `set` (§4.3), recording every question std's resolve
+/// asks — and the key a refusal of it is remembered under (per PACKAGE: the
+/// prefix key plus the package's paths).
+fn std_prefix_keys(
+    base_cache_key: &BaseCacheKey,
+    set: &HotSet,
+    std: &PackageSpec,
+    platform: Platform,
+    workspace: &Workspace,
+) -> (BaseCacheKey, BaseCacheKey) {
+    let closure = std_closure(
+        base_cache_key.std_seeds.iter().map(String::as_str).chain(
+            set.requests
+                .iter()
+                .filter(|(origin, _)| *origin == Origin::Std)
+                .map(|(_, module)| *module),
+        ),
+        std,
+        platform,
+        &workspace.entry_prelude,
+    );
+    let prefix_key = BaseCacheKey {
+        std_seeds: closure.iter().map(|module| module.to_string()).collect(),
+        entry_pkg: None,
+        entry_open_module: None,
+        hot: None,
+        // Every question std's resolve asks is recorded: the impls that may
+        // answer one are whichever package builds over the prefix.
+        reach: Some(ReachFilter {
+            everything: true,
+            members: Default::default(),
+        }),
+        std_prefix: true,
+        ..base_cache_key.clone()
+    };
+    let package_refusal_key = BaseCacheKey {
+        hot: Some((set.paths.clone(), Vec::new())),
+        ..prefix_key.clone()
+    };
+    (prefix_key, package_refusal_key)
+}
+
+/// std-prefix P2: a world build LAYERED over the std prefix — the world the
+/// analysis stores, and continues as, once the prefix world it took has walked
+/// and resolved the world's own package modules ([`finish_layered_world`]).
+struct Layered {
+    /// The world's own key — S1's hot-set key, or the canonical one — and
+    /// the key its S1 refusals are remembered under.
+    world_key: BaseCacheKey,
+    world_refusal_key: BaseCacheKey,
+    /// S1's hot set, walked after the store; `None` for a canonical world.
+    hot: Option<HotSet>,
+    /// The claim this analysis's miss took on `world_key` (M44), held until
+    /// the analysis ends — after the store, so a waiter wakes to a hit.
+    _claim: Option<BaseCacheBuild>,
+}
+
+/// Why [`finish_layered_world`] could not finish: one of S1's own guards,
+/// over the world the prefix built.
+enum LayeredRefusal {
+    UseInferred,
+    HotLoad(HotLoadRefusal),
+}
+
+impl LayeredRefusal {
+    /// The shape to rebuild in — what S1's miss answers to the same guard.
+    fn shape(self, layered: &Layered, shape: AnalysisShape) -> AnalysisShape {
+        match self {
+            LayeredRefusal::UseInferred => {
+                refuse_hot_world(&layered.world_refusal_key);
+                note_hot_refusal("use-inferred-binding", &layered.world_refusal_key);
+                shape.refusing(&layered.world_refusal_key)
+            }
+            LayeredRefusal::HotLoad(refusal) => {
+                shape_after_hot_load(refusal, &layered.world_refusal_key, shape)
+            }
+        }
+    }
+}
+
+/// std-prefix P2: turns a prefix world whose package modules have walked and
+/// resolved over std (`load_hot_modules`, [`resolve_package_over_prefix`])
+/// into the world S1's miss — or the canonical miss — would have stored, stores
+/// it under `layered.world_key` when `store`, and walks S1's hot set over it,
+/// as that miss does after its store. What the prefix's own analysis counted as
+/// ENTRY work (the package's writes into std's slots, the prefix's id ends) is
+/// the stored world's own resolution here, so it is reset to the state a
+/// canonical store point holds. S1's use-inferred guard runs over the world's
+/// package modules first, so a refused hot world is never stored.
+fn finish_layered_world(
+    world: &mut World<'_>,
+    layered: &Layered,
+    std: &PackageSpec,
+    platform: Platform,
+    workspace: &Workspace,
+    pkg_root: &Path,
+    store: bool,
+) -> Result<(), LayeredRefusal> {
+    let Some(prefix_hot) = world.hot.take() else {
+        return Ok(());
+    };
+    if let Some(hot) = &layered.hot {
+        let roots: [&Path; 1] = [pkg_root];
+        let package_modules: Vec<(&str, &NodeList<'_>, Id)> = prefix_hot
+            .modules
+            .iter()
+            .filter_map(|name| {
+                let module_id = prefix_hot.module_nodes.get(&(Origin::Pkg, *name))?;
+                let scope_id = world.analyzer.modules.get(module_id)?.body.1;
+                let resolution = resolve_module_in_roots(&roots, name)?;
+                let loaded = load_package_module(&resolution.path)?;
+                Some((*name, &loaded.ast.0, scope_id))
+            })
+            .collect();
+        if hot_set_imports_a_use_inferred_binding(
+            &world.analyzer,
+            &package_modules,
+            &hot.modules,
+            pkg_root,
+        ) {
+            return Err(LayeredRefusal::UseInferred);
+        }
+    }
+    // The canonical store point: nothing past it yet.
+    world.analyzer.entry_phase = false;
+    world.analyzer.entry_dirty_sources.clear();
+    world.analyzer.prefix_entity_end = None;
+    world.analyzer.prefix_type_end = None;
+    world.prefix_len = world.sources.len();
+    let adds_package = !prefix_hot.modules.is_empty();
+    world.hot = layered.hot.as_ref().map(|hot| HotWorld {
+        modules: hot.modules.clone(),
+        namespaces: Vec::new(),
+        ..prefix_hot
+    });
+    // A world with no package module and no hot set IS the prefix under
+    // another key: storing it would hold std twice, and the next analysis of
+    // it is a prefix hit anyway.
+    if store && (adds_package || layered.hot.is_some()) {
+        base_cache_store(layered.world_key.clone(), world);
+        if !crate::macros::in_macro_world() {
+            crate::incremental::update_census(|census| census.base_stores += 1);
+        }
+    }
+    world.analyzer.prefix_entity_end = Some(world.analyzer.entity_id);
+    world.analyzer.prefix_type_end = Some(world.analyzer.type_id);
+    world.analyzer.entry_phase = true;
+    load_hot_modules(world, std, platform, workspace, pkg_root).map_err(LayeredRefusal::HotLoad)
+}
+
 /// std-prefix P1 (`std-prefix.md` §4.2): the hot set that makes the stored
 /// world STD ALONE — every package module the entry reaches, walked over the
 /// prefix the way M110 S1 walks a hot set, so the prefix's resolve is std's
@@ -82005,35 +82382,8 @@ fn analyze_inner<'src>(
             hot_world
         }
         Some(Ok(set)) => {
-            let closure = std_closure(
-                base_cache_key.std_seeds.iter().map(String::as_str).chain(
-                    set.requests
-                        .iter()
-                        .filter(|(origin, _)| *origin == Origin::Std)
-                        .map(|(_, module)| *module),
-                ),
-                std,
-                platform,
-                &workspace.entry_prelude,
-            );
-            let prefix_key = BaseCacheKey {
-                std_seeds: closure.iter().map(|module| module.to_string()).collect(),
-                entry_pkg: None,
-                entry_open_module: None,
-                hot: None,
-                // Every question std's resolve asks is recorded: the impls that
-                // may answer one are whichever package builds over the prefix.
-                reach: Some(ReachFilter {
-                    everything: true,
-                    members: Default::default(),
-                }),
-                std_prefix: true,
-                ..base_cache_key.clone()
-            };
-            let package_refusal_key = BaseCacheKey {
-                hot: Some((set.paths.clone(), Vec::new())),
-                ..prefix_key.clone()
-            };
+            let (prefix_key, package_refusal_key) =
+                std_prefix_keys(&base_cache_key, &set, std, platform, workspace);
             if hot_world_refused(&package_refusal_key) {
                 note_prefix_refusal("refused-before");
                 hot_world
@@ -82050,11 +82400,10 @@ fn analyze_inner<'src>(
         crate::incremental::update_census(|census| census.hot_world = built);
     }
     let (cached_world, build_claim) = if reuse_allowed {
-        base_cache_admit(&base_cache_key, entry_path)
+        base_cache_admit(&base_cache_key, entry_path, true)
     } else {
         (None, None)
     };
-    let _build_claim = build_claim;
     if reuse_allowed && !crate::macros::in_macro_world() {
         crate::incremental::update_census(|census| match cached_world {
             Some(_) => {
@@ -82064,6 +82413,70 @@ fn analyze_inner<'src>(
             None => census.base_misses += 1,
         });
     }
+    // std-prefix P2 (`std-prefix.md` §13, incr-51c's Q1 as ruled): the prefix
+    // LAYERED under the world build. A world this analysis must BUILD — S1's
+    // hot-set world or the canonical one, missed — takes std from the std-only
+    // prefix pinned per (platform, std closure) instead of draining it again:
+    // its own package modules (every one but S1's hot set) walk and resolve
+    // over the prefix as P1's do, §4.2's guard refusing the prefix where a
+    // package impl could answer a question std asked; the world is then stored
+    // under its OWN key, exactly where S1's or the canonical miss stores it,
+    // and the analysis continues as that miss does (S1's hot set, the entry).
+    // A hit on the world's key is untouched: S1's hot sets stay what the
+    // keystroke is served from. Refusals fall back to the world's own build
+    // (`AnalysisShape::without_prefix`), remembered per package as P1's are.
+    let layering_wanted = !std_prefix_wanted
+        && crate::incremental::std_prefix_layering()
+        && shape.std_prefix
+        && hot_shape_allowed
+        && !crate::macros::in_macro_world();
+    let mut layered: Option<Layered> = None;
+    let (cached_world, build_claim, hot_world) = match (cached_world, layering_wanted) {
+        (None, true) => match std_prefix_set(&entry_pkg_seeds, entry_path, pkg_root, workspace) {
+            Err(reason) => {
+                note_prefix_refusal(reason);
+                (None, build_claim, hot_world)
+            }
+            Ok(mut set) => {
+                let (prefix_key, package_refusal_key) =
+                    std_prefix_keys(&base_cache_key, &set, std, platform, workspace);
+                if hot_world_refused(&package_refusal_key) {
+                    note_prefix_refusal("refused-before");
+                    (None, build_claim, hot_world)
+                } else {
+                    // The world's own package modules: S1's hot set walks after
+                    // the store, as it does over a canonical prefix.
+                    if let Some(hot) = &hot_world {
+                        set.modules.retain(|module| !hot.modules.contains(module));
+                    }
+                    layered = Some(Layered {
+                        world_key: std::mem::replace(&mut base_cache_key, prefix_key),
+                        world_refusal_key: std::mem::replace(&mut refusal_key, package_refusal_key),
+                        hot: hot_world,
+                        _claim: build_claim,
+                    });
+                    let (prefix_world, prefix_claim) = if reuse_allowed {
+                        base_cache_admit(&base_cache_key, entry_path, false)
+                    } else {
+                        (None, None)
+                    };
+                    let served = prefix_world.is_some();
+                    PREFIX_LAYERED_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if served {
+                        PREFIX_LAYERED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    crate::incremental::update_census(|census| {
+                        census.prefix_world = true;
+                        census.prefix_layered = true;
+                        census.prefix_hits += u64::from(served);
+                    });
+                    (prefix_world, prefix_claim, Some(set))
+                }
+            }
+        },
+        (cached_world, _) => (cached_world, build_claim, hot_world),
+    };
+    let _build_claim = build_claim;
     if let Some(mut world) = cached_world {
         // std-prefix P1: a served prefix is shared by every package with its
         // std closure, so the package walked over it is THIS analysis's, not
@@ -82112,7 +82525,7 @@ fn analyze_inner<'src>(
         // the entry walks — the canonical two-phase order with std's half done
         // alone (§4.2) — unless a package impl answers a question std asked.
         if base_cache_key.std_prefix
-            && let Err(reached) = resolve_package_over_prefix(&mut world, nodes)
+            && let Err(reached) = resolve_package_over_prefix(&mut world, nodes, layered.as_ref())
         {
             let shape = shape_after_impl_reach(shape, &reached, Some(&refusal_key));
             return analyze_inner(
@@ -82125,6 +82538,26 @@ fn analyze_inner<'src>(
                 workspace,
                 shape,
             );
+        }
+        // std-prefix P2: the layered world is stored under its own key, and
+        // its hot set (S1's) walks over it.
+        if let Some(layered) = &layered {
+            let store =
+                reuse_allowed && BASE_CACHE_STORE.load(std::sync::atomic::Ordering::Relaxed);
+            if let Err(refusal) = finish_layered_world(
+                &mut world, layered, std, platform, workspace, pkg_root, store,
+            ) {
+                return analyze_inner(
+                    nodes,
+                    entry_source,
+                    std,
+                    pkg_root,
+                    entry_path,
+                    platform,
+                    workspace,
+                    refusal.shape(layered, shape),
+                );
+            }
         }
         if expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace) {
             // Generated code demands a module this world never loaded:
@@ -82151,10 +82584,32 @@ fn analyze_inner<'src>(
         // for such a world is additionally narrowed by
         // `Analyzer::alias_reaching_sources`, which is where that argument is
         // written — so the key rides on both shapes now.
-        let checks_key = Some(base_cache_key.clone());
-        let hot_key = world.hot.is_some().then(|| refusal_key.clone());
+        // A LAYERED world (P2) was built by this analysis, not served: its
+        // checks key is the world's, and nothing of it is a hit's.
+        let (checks_key, hot_key, from_base_cache) = match &layered {
+            Some(layered) => (
+                reuse_allowed.then(|| layered.world_key.clone()),
+                world
+                    .hot
+                    .is_some()
+                    .then(|| layered.world_refusal_key.clone()),
+                false,
+            ),
+            None => (
+                Some(base_cache_key.clone()),
+                world.hot.is_some().then(|| refusal_key.clone()),
+                true,
+            ),
+        };
         return match analyze_over_world(
-            world, nodes, std, pkg_root, platform, workspace, checks_key, true,
+            world,
+            nodes,
+            std,
+            pkg_root,
+            platform,
+            workspace,
+            checks_key,
+            from_base_cache,
         ) {
             Ok(program) => program,
             Err(reached) => analyze_inner(
@@ -83629,7 +84084,7 @@ fn analyze_inner<'src>(
         });
         if reaches_hot {
             refuse_hot_world(&refusal_key);
-            note_hot_refusal("generated-reference");
+            note_hot_refusal("generated-reference", &refusal_key);
             return analyze_inner(
                 nodes,
                 entry_source,
@@ -84302,71 +84757,19 @@ fn analyze_inner<'src>(
     // from. The canonical world may walk that hot module first and let it
     // decide; the hot-set world always lets the prefix decide.
     if let Some(hot) = &hot_world {
-        let mut use_inferred = analyzer.use_inferred_module_bindings(
-            loaded
-                .iter()
-                .filter(|(.., origin)| *origin == Origin::Pkg)
-                .map(|(name, _, _, scope_id, ..)| (*name, *scope_id)),
-        );
-        let pkg_roots: [&Path; 1] = [pkg_root];
-        // Closed over the prefix's own imports: a module that imports from
-        // one of these can re-export the binding (`export import`), and the
-        // hot module that imports IT reaches the binding all the same. An
-        // over-approximation, which is the safe side.
-        if !use_inferred.is_empty() {
-            let edges: Vec<(&str, Vec<String>)> = loaded
-                .iter()
-                .filter(|(.., origin)| *origin == Origin::Pkg)
-                .map(|(name, ast, ..)| {
-                    let targets = collect_module_paths(&ast.0, "pkg")
-                        .into_iter()
-                        .map(|(request, _)| {
-                            deepest_module_or_namespace(&pkg_roots, request)
-                                .unwrap_or_else(|| request.to_string())
-                        })
-                        .collect();
-                    (*name, targets)
-                })
-                .collect();
-            loop {
-                let before = use_inferred.len();
-                for (name, targets) in &edges {
-                    if !use_inferred.contains(name)
-                        && targets
-                            .iter()
-                            .any(|target| use_inferred.contains(target.as_str()))
-                    {
-                        use_inferred.insert(name);
-                    }
-                }
-                if use_inferred.len() == before {
-                    break;
-                }
-            }
-        }
-        let imports_one = !use_inferred.is_empty()
-            && hot.modules.iter().any(|module| {
-                let Some(resolution) = resolve_module_in_roots(&pkg_roots, module) else {
-                    return true;
-                };
-                let Some(loaded) = load_package_module(&resolution.path) else {
-                    return true;
-                };
-                collect_module_paths(&loaded.ast.0, "pkg")
-                    .into_iter()
-                    .any(|(request, _)| {
-                        let resolved = deepest_module_or_namespace(&pkg_roots, request)
-                            .unwrap_or_else(|| request.to_string());
-                        use_inferred.iter().any(|open| {
-                            resolved == *open || resolved.starts_with(&format!("{open}::"))
-                        })
-                    })
-            });
-        if imports_one
-            && !crate::incremental::planted(crate::incremental::Plant::UseInferredGuardOff)
-        {
+        let prefix_modules: Vec<(&str, &NodeList<'_>, Id)> = loaded
+            .iter()
+            .filter(|(.., origin)| *origin == Origin::Pkg)
+            .map(|(name, ast, _, scope_id, ..)| (*name, &ast.0, *scope_id))
+            .collect();
+        if hot_set_imports_a_use_inferred_binding(
+            &analyzer,
+            &prefix_modules,
+            &hot.modules,
+            pkg_root,
+        ) {
             refuse_hot_world(&refusal_key);
-            note_hot_refusal("use-inferred-binding");
+            note_hot_refusal("use-inferred-binding", &refusal_key);
             return analyze_inner(
                 nodes,
                 entry_source,
@@ -84444,13 +84847,12 @@ fn analyze_inner<'src>(
             census.sources_walked = world.sources.len() + hot_modules;
         });
     }
-    if reuse_allowed
+    let world_storable = reuse_allowed
         && (crate::macros::in_macro_world()
             || BASE_CACHE_STORE.load(std::sync::atomic::Ordering::Relaxed))
         && !entry_is_module
-        && (!entry_is_open_module || base_cache_key.entry_open_module.is_some())
-        && !prefix_unstorable
-    {
+        && (!entry_is_open_module || base_cache_key.entry_open_module.is_some());
+    if world_storable && !prefix_unstorable {
         base_cache_store(base_cache_key.clone(), &world);
         crate::counters::checkpoint("world-stored");
         if !crate::macros::in_macro_world() {
@@ -84482,7 +84884,7 @@ fn analyze_inner<'src>(
     // the entry walks — the canonical two-phase order with std's half done
     // alone (§4.2) — unless a package impl answers a question std asked.
     if base_cache_key.std_prefix
-        && let Err(reached) = resolve_package_over_prefix(&mut world, nodes)
+        && let Err(reached) = resolve_package_over_prefix(&mut world, nodes, layered.as_ref())
     {
         let shape = shape_after_impl_reach(shape, &reached, Some(&refusal_key));
         return analyze_inner(
@@ -84495,6 +84897,26 @@ fn analyze_inner<'src>(
             workspace,
             shape,
         );
+    }
+    // std-prefix P2: the layered world, stored under its own key where the
+    // prefix it was built over could be (the closure check above), and its
+    // hot set (S1's) walked over it.
+    if let Some(layered) = &layered {
+        let store = world_storable && !prefix_unstorable;
+        if let Err(refusal) = finish_layered_world(
+            &mut world, layered, std, platform, workspace, pkg_root, store,
+        ) {
+            return analyze_inner(
+                nodes,
+                entry_source,
+                std,
+                pkg_root,
+                entry_path,
+                platform,
+                workspace,
+                refusal.shape(layered, shape),
+            );
+        }
     }
     // The suppressed entry expansion runs here, symmetric with the hit path
     // (§6.13); a generated demand for an unloaded module rebuilds fresh.
@@ -84516,7 +84938,19 @@ fn analyze_inner<'src>(
     // A MISS derives everything and RECORDS it; only a hit replays. The key
     // rides along either way, since the record is keyed by the world it
     // describes.
-    let hot_key = world.hot.is_some().then(|| refusal_key.clone());
+    let (checks_key, hot_key) = match &layered {
+        Some(layered) => (
+            layered.world_key.clone(),
+            world
+                .hot
+                .is_some()
+                .then(|| layered.world_refusal_key.clone()),
+        ),
+        None => (
+            base_cache_key,
+            world.hot.is_some().then(|| refusal_key.clone()),
+        ),
+    };
     let answer = analyze_over_world(
         world,
         nodes,
@@ -84530,7 +84964,7 @@ fn analyze_inner<'src>(
         // `Analyzer::alias_reaching_sources` is what closes that gap, and it
         // narrows the READING side, so the record itself is filed the same way
         // on both shapes.
-        (reuse_allowed && !entry_is_module).then_some(base_cache_key),
+        (reuse_allowed && !entry_is_module).then_some(checks_key),
         false,
     );
     match answer {
@@ -84568,8 +85002,10 @@ fn shape_after_impl_reach(
         refuse_hot_world(key);
     }
     if !crate::macros::in_macro_world() {
-        if reached.by_hot {
-            note_hot_refusal("impl-reached");
+        if reached.by_hot
+            && let Some(key) = hot_key
+        {
+            note_hot_refusal("impl-reached", key);
         }
         crate::incremental::update_census(|census| {
             census.resolve_deferred |= reached.by_entry;
