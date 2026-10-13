@@ -123,6 +123,11 @@ written down.
 <!-- family: feature -->
 **E298: a module segment hovers as ITS module — `overlay` in `import pkg::lib::overlay::{ .. }` answers `mod pkg::lib::overlay` (E299's line), the module's `///` (the block that opens its file), "Exports `Overlay`, `show`." (B318's offered names, a dozen then "and N more"), its file (`src/lib/overlay.vl`, std's as `std/src/..`) and its platform (`[platform("browser")] mod self;`, or the std layer it sits in); `model` in `model::global()` answers the same.** It answered `module overlay`, the word restated. The package root `pkg` answers with the package (`The package `kolt`.` and its description) and the top-level modules it holds; `std` likewise; a bodiless namespace keeps E152's `namespace ui` / "Holds …". A segment that does not resolve hovers nothing. Pins: `editor_review_tests::e298_a_module_segment_hovers_as_its_module` (an import's segments, the root, a std segment, a platform-gated module in value position agreeing with its import), and E152's pin, whose two module segments now read as modules. Tracker E298.
 
+---
+
+<!-- family: feature -->
+**E307: a field hovers under the struct it belongs to — `struct AppInputLayerData` on its own line above `on_toggle_sidebar: || void`, in the one fence, at an initializer key (kolt `views.vl:79`), at the field's declaration and at a member read (`ring.items` answers `struct Ring<T>` / `items: List<i32>`).** The owner's head is the struct's declaration line as written (E238's header shape, its generic parameters included), printed through one function for the three positions so they cannot drift. A member read of an `[internal]` field now leads with its reason too, as the declaration and the key already did (E213). The item's struct-VARIANT case does not arise: vilan's enum variants carry tuple payloads only. Six field-hover pins gained the line. Pin: `editor_review_tests::e307_a_field_hover_names_its_struct`. Tracker E307.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

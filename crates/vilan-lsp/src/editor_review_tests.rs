@@ -992,3 +992,50 @@ fn e298_a_module_segment_hovers_as_its_module() {
         );
     });
 }
+
+/// E307: a field hovers under the struct it belongs to — an initializer key
+/// with a closure-typed field (kolt `views.vl:79`), its declaration, a
+/// generic struct, a member read, and an internal field (E213's lead first).
+#[test]
+fn e307_a_field_hover_names_its_struct() {
+    on_big_stack(|| {
+        let source = "struct AppInputLayerData {\n\t/// Toggles the sidebar.\n\ton_toggle_sidebar: || void,\n}\n\n\
+             struct Ring<T> {\n\titems: List<T>,\n\t[internal(\"the cursor\")]\n\tcursor: usize,\n}\n\n\
+             fun main() {\n\tlet data = AppInputLayerData {\n\t\ton_toggle_sidebar = || {},\n\t};\n\
+             \tlet ring = Ring { items = [1], cursor = 0 };\n\tlet _ = ring.items;\n\tlet _ = data;\n\tlet _ = ring.cursor;\n}\n";
+        let package = Package::new("e307", &[("client.vl", source)]);
+        let document = package.world();
+        let hover = |needle: &str, delta: usize| {
+            document
+                .hover(at(source, needle, delta))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        let key = hover("on_toggle_sidebar = ", 2);
+        assert!(
+            key.starts_with("```vilan\nstruct AppInputLayerData\non_toggle_sidebar: || void\n```\n\nToggles the sidebar."),
+            "{key}"
+        );
+        assert_eq!(
+            hover("on_toggle_sidebar: ||", 2),
+            key,
+            "the declaration and the key agree"
+        );
+        let read = hover("ring.items", 6);
+        assert!(
+            read.starts_with("```vilan\nstruct Ring<T>\nitems: List<i32>\n```"),
+            "{read}"
+        );
+        let declared = hover("items: List<T>", 1);
+        assert!(
+            declared.starts_with("```vilan\nstruct Ring<T>\nitems: List<T>\n```"),
+            "{declared}"
+        );
+        let internal = hover("ring.cursor", 6);
+        assert!(
+            internal.starts_with(
+                "**internal** — the cursor\n\n```vilan\nstruct Ring<T>\ncursor: usize\n```"
+            ),
+            "{internal}"
+        );
+    });
+}

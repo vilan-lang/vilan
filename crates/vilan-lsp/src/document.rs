@@ -4687,7 +4687,26 @@ impl Document {
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
         let mut out = HoverBlocks::new();
-        out.push_code(Block::Signature, &format!("{name}: {type_label}"));
+        // E307: a FIELD read names the struct it belongs to, as its
+        // declaration and an initializer key do.
+        let line = format!("{name}: {type_label}");
+        let line = match program.entity_map.get(&id) {
+            Some(Expr::Field(_, struct_id, index)) => {
+                // And leads with an internal field's reason, as they do (E213).
+                out.push_some(
+                    Block::Diagnostic,
+                    program
+                        .structs
+                        .get(struct_id)
+                        .and_then(|structure| structure.fields.get(*index))
+                        .and_then(|field| field.internal)
+                        .map(internal_line),
+                );
+                owned_field_line(program, *struct_id, &line)
+            }
+            _ => line,
+        };
+        out.push_code(Block::Signature, &line);
         // E204: a FIELD's own `///`, where the read resolves to one. A field
         // carries no entity id, so `doc_comment_of` has nothing to look up —
         // `Expr::Field`'s (struct, index) key is what names the declaration,
@@ -4751,7 +4770,10 @@ impl Document {
         // E213: a FIELD is the case visibility cannot serve at all, and the
         // one the item was filed about.
         out.push_some(Block::Diagnostic, field.internal.map(internal_line));
-        out.push_code(Block::Signature, &format!("{}: {type_label}", field.name));
+        out.push_code(
+            Block::Signature,
+            &owned_field_line(program, struct_id, &format!("{}: {type_label}", field.name)),
+        );
         out.push_some(
             Block::Doc,
             self.struct_field_docs(program, struct_id, index),
@@ -10559,6 +10581,23 @@ fn declared_platform_attribute(note: &str) -> Option<&str> {
     let start = head.rfind("`[platform(")?;
     let attribute = head[start..].strip_prefix('`')?.strip_suffix('`')?;
     attribute.ends_with(")] mod self;").then_some(attribute)
+}
+
+/// E307: a field's `name: T` line under the struct it belongs to — the
+/// owner's head as its declaration writes it (`struct Ring<T>`, E238's
+/// header shape), on its own line in the same fence. The three positions a
+/// field hovers at (its declaration, an initializer key, a member read) all
+/// print through this one function.
+fn owned_field_line(program: &Program, struct_id: Id, line: &str) -> String {
+    let head = program
+        .declaration_labels
+        .get(&struct_id)
+        .and_then(|label| label.lines().next())
+        .map(|first| first.trim_end().trim_end_matches('{').trim_end());
+    match head {
+        Some(head) if !head.is_empty() => format!("{head}\n{line}"),
+        _ => line.to_string(),
+    }
 }
 
 /// E298: how many names a module hover lists before "and N more".
@@ -17737,7 +17776,7 @@ pub(crate) mod tests {
             "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet n = p.|x;\n}\n",
         )
         .expect("hovering the field should produce a label");
-        assert_eq!(hover, "```vilan\nx: i32\n```");
+        assert_eq!(hover, "```vilan\nstruct Point\nx: i32\n```");
     }
 
     // --- E211: every candidate states the prefix it replaces ----------------
@@ -17954,7 +17993,8 @@ pub(crate) mod tests {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.x +", "p.¦x +"), '¦')
             .expect("hover on the field read");
         assert_eq!(
-            hover, "```vilan\nx: i32\n```\n\nThe abscissa.\n\nMeasured from the left edge.",
+            hover,
+            "```vilan\nstruct Point\nx: i32\n```\n\nThe abscissa.\n\nMeasured from the left edge.",
             "the whole `///` block, as a function's hover shows a function's"
         );
     }
@@ -17963,10 +18003,13 @@ pub(crate) mod tests {
     fn e204_hover_on_a_field_declaration_answers_the_field_and_not_the_struct() {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("\tx: i32,", "\t¦x: i32,"), '¦')
             .expect("hover on the field declaration");
-        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(
+            hover.starts_with("```vilan\nstruct Point\nx: i32\n```"),
+            "{hover}"
+        );
         assert!(hover.contains("The abscissa."), "{hover}");
         assert!(
-            !hover.contains("struct Point"),
+            !hover.contains("struct Point {"),
             "the struct's block is the answer for the struct's NAME: {hover}"
         );
     }
@@ -17975,9 +18018,12 @@ pub(crate) mod tests {
     fn e204_hover_on_an_initializer_field_key_answers_the_field() {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("{ x = 1", "{ ¦x = 1"), '¦')
             .expect("hover on the initializer key");
-        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(
+            hover.starts_with("```vilan\nstruct Point\nx: i32\n```"),
+            "{hover}"
+        );
         assert!(hover.contains("The abscissa."), "{hover}");
-        assert!(!hover.contains("struct Point"), "{hover}");
+        assert!(!hover.contains("struct Point {"), "{hover}");
     }
 
     #[test]
@@ -17997,7 +18043,7 @@ pub(crate) mod tests {
     fn e204_an_undocumented_field_hovers_exactly_as_before() {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.y;", "p.¦y;"), '¦')
             .expect("hover on the undocumented field");
-        assert_eq!(hover, "```vilan\ny: i32\n```");
+        assert_eq!(hover, "```vilan\nstruct Point\ny: i32\n```");
     }
 
     #[test]
@@ -25244,11 +25290,14 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let block = fence("struct UserId {\n\tvalue: i32,\n}");
         let read = hover(&document, "print(user.id.value)", 0, 11);
-        assert_eq!(read, format!("{}\n\n---\n\n{block}", fence("id: UserId")));
+        assert_eq!(
+            read,
+            format!("{}\n\n---\n\n{block}", fence("struct User\nid: UserId"))
+        );
         let declared = hover(&document, "\tid: UserId,", 0, 1);
         assert_eq!(
             declared,
-            format!("{}\n\n---\n\n{block}", fence("id: UserId"))
+            format!("{}\n\n---\n\n{block}", fence("struct User\nid: UserId"))
         );
     }
 
