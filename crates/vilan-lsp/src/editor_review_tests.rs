@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use super::Document;
 use super::tests::{on_big_stack, std_root};
 use vilan_core::analyzer::SourceId;
-use vilan_core::id::Id;
 
 /// The world a kolt module is served from: the client entry analyzed whole,
 /// then the module's view of it — the shape the server answers an open
@@ -844,62 +843,6 @@ fn e311_a_function_reached_through_a_path_paints_as_a_function() {
     });
 }
 
-#[test]
-#[ignore = "E299: scratch"]
-fn e299_scratch() {
-    on_big_stack(|| {
-        let client = "import pkg::lib::overlay::show;\nimport std::reactive::store::Store;\n\nfun main() {\n\tshow();\n}\n";
-        let overlay = "/// The overlay.\nexport fun show() {}\n";
-        let package = Package::new("e299s", &[("client.vl", client)]);
-        std::fs::create_dir_all(package.path("lib")).unwrap();
-        std::fs::write(package.path("lib/overlay.vl"), overlay).unwrap();
-        let world = package.world();
-        let program = world.program.as_ref().unwrap();
-        println!("{:?}", world.diagnostics);
-        for (id, module) in &program.modules {
-            let source = program.source_of(*id);
-            println!(
-                "{id:?} {:?} {:?} {:?} children={:?}",
-                module.name,
-                source,
-                source.and_then(|s| program.source_path(s)),
-                program.module_children_scopes.get(id)
-            );
-        }
-        println!(
-            "by name: {:?}",
-            program
-                .module_id_by_name
-                .iter()
-                .take(60)
-                .collect::<Vec<_>>()
-        );
-        for root in [Id(0), Id(1)] {
-            let module = &program.modules[&root];
-            let scope = &program.scopes[&module.body.1];
-            println!(
-                "root {:?} body: {:?}",
-                module.name,
-                scope
-                    .name_to_id_map
-                    .iter()
-                    .filter(|(_, id)| program.modules.contains_key(*id))
-                    .collect::<Vec<_>>()
-            );
-        }
-        for (id, module) in &program.modules {
-            if let Some(children) = program.module_children_scopes.get(id) {
-                let scope = &program.scopes[children];
-                println!(
-                    "children of {:?}: {:?}",
-                    module.name,
-                    scope.name_to_id_map.keys().collect::<Vec<_>>()
-                );
-            }
-        }
-    });
-}
-
 /// E299's package: a nested module with a free function, a method, a trait
 /// requirement and a generic call site; the client calls into it and std.
 const E299_OVERLAY: &str = "/// The overlay.\nexport struct Overlay {\n\topen: bool,\n}\n\n\
@@ -970,5 +913,82 @@ fn e299_a_function_hover_opens_with_its_mod_line() {
         );
         // Out of scope: a type's hover keeps its shape.
         assert!(hover(&world, client, "Overlay,").starts_with("```vilan\nstruct Overlay"));
+    });
+}
+
+/// E298: each segment of a module path answers for ITS module — in an
+/// import and in value position — with its `mod` line, its `///`, what it
+/// exports, its file and its platform; the package root with the package;
+/// a std segment; E152's bodiless namespace unchanged.
+#[test]
+fn e298_a_module_segment_hovers_as_its_module() {
+    on_big_stack(|| {
+        let client = "import pkg::lib::overlay::{ Overlay, show };\nimport pkg::model;\n\
+             import std::reactive::store::Store;\n\n\
+             fun main() {\n\tshow();\n\tlet _ = model::global();\n}\n";
+        let overlay = "/// What floats above the page.\n///\n/// Dismissed by a click outside.\n\n\
+             export struct Overlay {\n\topen: bool,\n}\n\nexport fun show() {}\n\nfun hidden() {}\n";
+        let model = "[platform(\"browser\")] mod self;\n\nexport fun global(): i32 {\n\t1\n}\n";
+        let package = Package::new("e298", &[("client.vl", client), ("model.vl", model)]);
+        std::fs::create_dir_all(package.path("lib")).unwrap();
+        std::fs::write(package.path("lib/overlay.vl"), overlay).unwrap();
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let hover = |needle: &str, delta: usize| {
+            world
+                .hover(at(client, needle, delta))
+                .unwrap_or_else(|| panic!("{needle:?}+{delta} hovers"))
+        };
+        let overlay_hover = hover("overlay::{", 2);
+        assert!(
+            overlay_hover.starts_with("```vilan\nmod pkg::lib::overlay\n```\n\nWhat floats above the page.\n\nDismissed by a click outside."),
+            "{overlay_hover}"
+        );
+        assert!(
+            overlay_hover.contains("Exports `Overlay`, `show`."),
+            "{overlay_hover}"
+        );
+        assert!(
+            overlay_hover.contains("`src/lib/overlay.vl`"),
+            "{overlay_hover}"
+        );
+        // `lib` has no body: E152's namespace answer stands.
+        assert_eq!(
+            hover("lib::overlay", 1),
+            "```vilan\nnamespace lib\n```\n\n---\n\nHolds `overlay`."
+        );
+        // The package root.
+        let root = hover("pkg::lib", 1);
+        assert!(
+            root.starts_with("```vilan\nmod pkg\n```\n\nThe package `app`."),
+            "{root}"
+        );
+        assert!(root.contains("Holds "), "{root}");
+        // A std segment, and a platform-gated module in value position.
+        let store = hover("store::Store", 2);
+        assert!(
+            store.starts_with("```vilan\nmod std::reactive::store\n```"),
+            "{store}"
+        );
+        assert!(store.contains("`std/src/reactive/store.vl`"), "{store}");
+        let std_root_hover = hover("std::reactive", 1);
+        assert!(
+            std_root_hover.starts_with("```vilan\nmod std\n```"),
+            "{std_root_hover}"
+        );
+        let value = hover("model::global", 2);
+        assert!(
+            value.starts_with("```vilan\nmod pkg::model\n```"),
+            "{value}"
+        );
+        assert!(
+            value.contains("declares `[platform(\"browser\")] mod self;`"),
+            "{value}"
+        );
+        assert_eq!(
+            value,
+            hover("import pkg::model", 13),
+            "an import and a value path agree"
+        );
     });
 }

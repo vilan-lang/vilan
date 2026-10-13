@@ -3794,6 +3794,17 @@ impl Document {
         if let Some(rendered) = self.namespace_hover(program, offset) {
             return Some(rendered);
         }
+        // E298: any other module segment answers for ITS module — and an
+        // ORIGIN (`pkg::`, a dependency's name) that resolution records no
+        // reference for, read off the word before its `::`.
+        if let Some(module) = self
+            .type_reference_at(program, offset)
+            .and_then(|(module, _)| module)
+            .or_else(|| self.origin_segment_at(program, offset))
+            && let Some(rendered) = self.module_hover(program, module)
+        {
+            return Some(rendered);
+        }
         // A variant PATTERN in a `match` leg or an `is`: the variant of the
         // matched value's type (E241), not the bare enum's name.
         if let Some(rendered) = self.pattern_hover(program, offset) {
@@ -3845,6 +3856,13 @@ impl Document {
         // attribute of `title(..)` — is a string the desugar minted from the
         // written token, and answers for the link it lowers to.
         let id = self.markup_name_link(program, id).unwrap_or(id);
+        // E298: a module segment in VALUE position (`model::global()`'s
+        // `model`) answers as it does in an import.
+        if let Some(Expr::Module(module)) = program.entity_map.get(&id)
+            && let Some(rendered) = self.module_hover(program, *module)
+        {
+            return Some(rendered);
+        }
         // A function (or requirement-carrying binding): the full signature —
         // and, at a GENERIC call site, the signature that call reached under it
         // (E206). The site's label is keyed by the id under the cursor, so no
@@ -4215,6 +4233,163 @@ impl Document {
             .copied()
             .find(|module| program.source_of(*module) == Some(source))?;
         module_path(program, module)
+    }
+
+    /// E298: the origin root (`pkg`, `std`, a dependency) whose name is the
+    /// word under `offset`, written as a path's head (`pkg::lib`).
+    fn origin_segment_at(&self, program: &Program, offset: usize) -> Option<Id> {
+        let text = self.analyzed_text();
+        let bytes = text.as_bytes();
+        if !bytes
+            .get(offset)
+            .is_some_and(|byte| is_identifier_char(char::from(*byte)))
+        {
+            return None;
+        }
+        let start = text[..offset]
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |at| at + 1);
+        let end = text[offset..]
+            .find(|character: char| !is_identifier_char(character))
+            .map_or(text.len(), |at| offset + at);
+        if !text[end..].starts_with("::") || text[..start].ends_with("::") {
+            return None;
+        }
+        program.module_id_by_name.get(&text[start..end]).copied()
+    }
+
+    /// E298: the hover for a MODULE — its `mod` line (E299's path), its
+    /// `///` doc (the block that opens its file), what an import of it may
+    /// take ("Exports …", B318's offered names, a dozen then "and N more"),
+    /// and where it lives (its file, and the platform it is gated to). An
+    /// origin root (`pkg`, `std`, a dependency) answers with its package and
+    /// the top-level modules it holds. `None` for a module E152's bodiless
+    /// namespace hover answers, and for anything that is not a module.
+    fn module_hover(&self, program: &Program, module: Id) -> Option<String> {
+        if !program.modules.contains_key(&module) || self.is_namespace_module(program, module) {
+            return None;
+        }
+        let path = module_path(program, module)?;
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("mod {path}"));
+        let names = |names: Vec<String>| {
+            let shown: Vec<String> = names
+                .iter()
+                .take(MODULE_PREVIEW_CAP)
+                .map(|name| format!("`{name}`"))
+                .collect();
+            let more = names.len().saturating_sub(MODULE_PREVIEW_CAP);
+            if more > 0 {
+                format!("{}, and {more} more", shown.join(", "))
+            } else {
+                shown.join(", ")
+            }
+        };
+        if program
+            .module_id_by_name
+            .values()
+            .any(|root| *root == module)
+        {
+            // An origin: the package it names, and its top-level modules.
+            if path == "pkg"
+                && let Some(manifest_dir) = self.manifest_dir()
+                && let Ok(text) = std::fs::read_to_string(manifest_dir.join("vilan.toml"))
+                && let Ok((manifest, _)) = vilan_core::manifest::Manifest::parse(&text)
+                && let Some(package) = manifest.package.as_ref()
+            {
+                let mut line = String::new();
+                if let Some(name) = &package.name {
+                    line.push_str(&format!("The package `{name}`."));
+                }
+                if let Some(description) = &package.description {
+                    line.push_str(&format!(" {description}"));
+                }
+                out.push(Block::Doc, line.trim().to_string());
+            }
+            let scope = program.modules.get(&module)?.body.1;
+            let mut held: Vec<String> = program
+                .scopes
+                .get(&scope)
+                .map(|scope| {
+                    scope
+                        .name_to_id_map
+                        .iter()
+                        .filter(|(_, child)| program.modules.contains_key(*child))
+                        .map(|(name, _)| (*name).to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            held.sort();
+            if !held.is_empty() {
+                out.push(Block::Preview, format!("Holds {}.", names(held)));
+            }
+            return out.rendered();
+        }
+        let source = program.source_of(module)?;
+        let file = program.source_path(source)?;
+        // The module's own `///`: the block that opens its file, set off
+        // from the first item by a blank line.
+        let text = if source == self.focus {
+            Some(self.analyzed_text().to_string())
+        } else {
+            std::fs::read_to_string(file).ok()
+        };
+        out.push_some(Block::Doc, text.as_deref().and_then(module_doc));
+        // What an import of it may take: B318's offered rows.
+        let importables = vilan_core::analyzer::module_importables(file);
+        let curated = vilan_core::analyzer::module_is_curated(&importables);
+        let mut exported: Vec<String> = importables
+            .iter()
+            .filter(|row| !curated || row.exported.is_exported())
+            .map(|row| row.name.to_string())
+            .collect();
+        exported.dedup();
+        if !exported.is_empty() {
+            out.push(Block::Preview, format!("Exports {}.", names(exported)));
+        }
+        // Where it lives: the file under its package, and its platform.
+        let canonical = program.canonical_sources.get(source.0 as usize)?;
+        // Relative to its package's manifest, or — for a document in no
+        // package — to the directory `pkg::` is rooted at, the entry's.
+        let package = canonical
+            .ancestors()
+            .skip(1)
+            .find(|directory| directory.join("vilan.toml").is_file())
+            .or_else(|| {
+                program
+                    .canonical_sources
+                    .first()
+                    .and_then(|entry| entry.parent())
+            });
+        let shown = match package.and_then(|package| canonical.strip_prefix(package).ok()) {
+            Some(relative) if program.std_sources.contains(&source) => {
+                format!("std/{}", relative.to_string_lossy().replace('\\', "/"))
+            }
+            Some(relative) => relative.to_string_lossy().replace('\\', "/"),
+            None => canonical.to_string_lossy().into_owned(),
+        };
+        out.push(Block::Platform, format!("`{shown}`"));
+        if let Some(platforms) = program.module_platforms.get(&source) {
+            let names: Vec<String> = platforms
+                .iter()
+                .map(|(name, _)| format!("\"{name}\""))
+                .collect();
+            out.push(
+                Block::Platform,
+                format!("declares `[platform({})] mod self;`", names.join(", ")),
+            );
+        } else if let Some(layer) = program
+            .source_layers
+            .get(source.0 as usize)
+            .and_then(|layer| layer.requiring)
+            && let Some((_, library, label, _)) = program.layer_platforms.get(layer as usize)
+        {
+            out.push(
+                Block::Platform,
+                format!("in the `{label}` layer of `{library}`"),
+            );
+        }
+        out.rendered()
     }
 
     /// The hover for a pure namespace: what it HOLDS (E152).
@@ -10384,6 +10559,32 @@ fn declared_platform_attribute(note: &str) -> Option<&str> {
     let start = head.rfind("`[platform(")?;
     let attribute = head[start..].strip_prefix('`')?.strip_suffix('`')?;
     attribute.ends_with(")] mod self;").then_some(attribute)
+}
+
+/// E298: how many names a module hover lists before "and N more".
+const MODULE_PREVIEW_CAP: usize = 12;
+
+/// E298: a module's `///` doc — the block of `///` lines that OPENS its file
+/// (blank lines before it allowed), set off from what follows by a blank line
+/// or the end of the file; a block that runs straight into a declaration is
+/// that declaration's own doc, not the module's.
+fn module_doc(text: &str) -> Option<String> {
+    let mut lines = text
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .peekable();
+    let mut docs: Vec<&str> = Vec::new();
+    while let Some(line) = lines.peek() {
+        let Some(comment) = line.trim().strip_prefix("///") else {
+            break;
+        };
+        docs.push(comment.strip_prefix(' ').unwrap_or(comment));
+        lines.next();
+    }
+    if docs.is_empty() || lines.peek().is_some_and(|next| !next.trim().is_empty()) {
+        return None;
+    }
+    Some(docs.join("\n"))
 }
 
 /// E299/E298: a module's path from its origin — `std::reactive::store`,
@@ -24687,11 +24888,21 @@ fun main() {
         // read as a namespace only because the entry-attributed placeholder
         // from its namespace mint outlived the body that adopted the node.
         let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
-        assert_eq!(document.hover(above).as_deref(), Some("module lib"),);
+        // E298: and as a module it answers with its `mod` line, what it
+        // exports and where it lives.
+        assert_eq!(
+            document.hover(above).as_deref(),
+            Some("```vilan\nmod pkg::lib\n```\n\n---\n\nExports `surface`.\n\n`lib/lib.vl`"),
+        );
         // A module with a file of its own is unmoved: it has a declaration,
         // and `namespace` is not what it is.
         let leaf = E152_ENTRY.find("::widget").expect("the `widget` segment") + 2;
-        assert_eq!(document.hover(leaf).as_deref(), Some("module widget"));
+        assert_eq!(
+            document.hover(leaf).as_deref(),
+            Some(
+                "```vilan\nmod pkg::lib::ui::widget\n```\n\n---\n\nExports `label`, `wide`.\n\n`lib/ui/widget.vl`"
+            ),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -118,6 +118,11 @@ written down.
 <!-- family: feature -->
 **E299: a function's hover opens with WHERE it lives — `mod pkg::lib::overlay` on its own line, above E238's `impl`/`trait` header and the `fun` line, in the one fence.** Every function hover carries it: a free function, a method, a trait requirement or default, a blanket member, an operator's dispatched method, an `as` alias's target, a std function (`mod std::list`), and the document's own (`mod pkg::client` for an entry its siblings reach as `pkg::client`, `mod pkg` for a file in no package); at E206's generic call site the line sits once, above both readings. The path is the declaring module's, walked up the module graph from its origin (`pkg`, `std`, a dependency's name) — one helper, which E298's module hover shares. A derive's generated code names no module and shows none; types, constants and variables keep their shape. Twenty-three hover pins gained the line. Pin: `editor_review_tests::e299_a_function_hover_opens_with_its_mod_line`. Tracker E299.
 
+---
+
+<!-- family: feature -->
+**E298: a module segment hovers as ITS module — `overlay` in `import pkg::lib::overlay::{ .. }` answers `mod pkg::lib::overlay` (E299's line), the module's `///` (the block that opens its file), "Exports `Overlay`, `show`." (B318's offered names, a dozen then "and N more"), its file (`src/lib/overlay.vl`, std's as `std/src/..`) and its platform (`[platform("browser")] mod self;`, or the std layer it sits in); `model` in `model::global()` answers the same.** It answered `module overlay`, the word restated. The package root `pkg` answers with the package (`The package `kolt`.` and its description) and the top-level modules it holds; `std` likewise; a bodiless namespace keeps E152's `namespace ui` / "Holds …". A segment that does not resolve hovers nothing. Pins: `editor_review_tests::e298_a_module_segment_hovers_as_its_module` (an import's segments, the root, a std segment, a platform-gated module in value position agreeing with its import), and E152's pin, whose two module segments now read as modules. Tracker E298.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->
