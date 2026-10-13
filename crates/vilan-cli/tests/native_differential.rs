@@ -12845,6 +12845,26 @@ fn array_lengths_s5_std_array_impls_answer_on_both_backends() {
     );
 }
 
+/// B623: array-lengths' second std wave — `Default`, `Json` and `FromJson`
+/// over every array length (`0` its own decode impl), the derives over an
+/// array field, an enum's array payload and a length-generic struct, and the
+/// decoder's length check, the same on both backends.
+#[test]
+fn b623_std_array_default_and_json_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_std_second_wave.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_std_second_wave.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "std's second array wave must answer the same natively"
+    );
+}
+
 /// array-lengths.md S4: a named length — a top-level `const let`, a `let`
 /// chained through it, a local `let` — in a type and in a repeat literal,
 /// resolved to its number before the fixpoint, the same on both backends.

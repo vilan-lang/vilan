@@ -1,0 +1,56 @@
+// array-lengths' second std wave (B623): `Default`, `Json` and `FromJson` over
+// every array length, the derives over an array field (a struct's, an enum
+// payload's, a length-generic struct's), and the decoder's length check.
+import std::compare::PartialEq;
+import std::default::{ Default, default_of };
+import std::io::print;
+import std::json::{ FromJson, Json, from_json_value_of };
+
+[derive(Default, Json, PartialEq)]
+struct Grid {
+	cells: [i32; 2],
+	names: [str; 3],
+	rows: [List<i32>; 2],
+	none: [bool; 0],
+}
+
+[derive(Json)]
+enum Shape {
+	Pair([i32; 2]),
+	Both([f64; 1], [str; 2]),
+}
+
+[derive(Default, Json)]
+struct Ring<T, const N> {
+	slots: [T; N],
+	head: usize,
+}
+
+fun main() {
+	mut grid: Grid = Grid::default();
+	grid.rows[0].push(5);
+	print(grid.rows[1].len());
+	let zeros: [i32; 3] = default_of<[i32; 3]>();
+	print(zeros == [0, 0, 0]);
+	let text = grid.to_json();
+	print(text);
+	let back: Result<Grid, str> = Grid::from_json(text);
+	print(back.unwrap() == grid);
+	let short: Result<Grid, str> = Grid::from_json("{\"cells\":[1],\"names\":[\"a\",\"b\",\"c\"],\"rows\":[[],[]],\"none\":[]}");
+	print(short.unwrap_err());
+	let long: Result<Grid, str> = Grid::from_json("{\"cells\":[1,2],\"names\":[\"a\",\"b\",\"c\"],\"rows\":[[],[]],\"none\":[1]}");
+	print(long.unwrap_err());
+	let shape = Shape::Both([1.5], ["x", "y"]);
+	print(shape.to_json());
+	let pair: Result<Shape, str> = Shape::from_json("{\"Pair\":[1,2]}");
+	print(pair.unwrap().to_json());
+	let ring: Ring<str, 3> = Ring::default();
+	print(ring.to_json());
+	let decoded: Result<Ring<i32, 2>, str> = Ring::from_json("{\"slots\":[4,5],\"head\":1}");
+	print(decoded.unwrap().slots[1]);
+	let direct = from_json_value_of<[i32; 2]>("[7,8]".try_parse_json().unwrap());
+	print(direct.unwrap()[1]);
+	let empty = from_json_value_of<[str; 0]>("[]".try_parse_json().unwrap());
+	print(empty.is_ok());
+	print(from_json_value_of<[i32; 1]>("7".try_parse_json().unwrap()).unwrap_err());
+}
