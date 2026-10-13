@@ -13259,7 +13259,7 @@ fn f135_a_read_argument_is_copied_before_a_later_argument_writes_its_cell_on_bot
 /// held when it was evaluated (1). The in-place write (`more()` pushing) is
 /// the same on both (F129's pin).
 #[test]
-#[ignore = "F135 (its binding half - a new item filed by native-52, retarget to its id): a later argument that re-binds a captured binding under a `&self` call is seen natively and not on JS"]
+#[ignore = "F138 (F135's binding half, filed by native-52; retarget to its id): a later argument that re-binds a captured binding under a `&self` call is seen natively and not on JS"]
 fn f135_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same_on_both_backends()
 {
     let staged = stage();
