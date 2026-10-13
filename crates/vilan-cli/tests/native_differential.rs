@@ -7315,9 +7315,11 @@ const ASYNC_PANIC_PROBE: &str = concat!(
 /// program cannot work and nothing is gained by letting it build.
 ///
 /// F130: the same refusal for a task whose callee never SUSPENDS — `async
-/// work()` there is typed `Promise<i32>` (no `std::task` in the program),
+/// work()` there was typed `Promise<i32>` (no `std::task` in the program),
 /// which has no native rendering, so the rendered test never saw it: the
-/// build went through and the run panicked. It is refused by its vilan type.
+/// build went through and the run panicked. It is refused by its vilan type —
+/// `Task<i32>` since B618 (an `async` seeds `std::task`), the same refusal
+/// the suspending callee's task gets.
 #[test]
 fn printing_a_host_handle_is_refused_at_compile_time() {
     let staged = stage();
@@ -7330,7 +7332,7 @@ fn printing_a_host_handle_is_refused_at_compile_time() {
         (
             "native_probe_f130_print_ready_task.vl",
             PRINT_READY_TASK_PROBE,
-            "`print` of the host handle `Promise`",
+            "`print` of the host handle `Task`",
         ),
     ] {
         std::fs::write(staged.join(file), source).expect("write the probe program");

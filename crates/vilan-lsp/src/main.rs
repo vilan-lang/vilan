@@ -8189,6 +8189,11 @@ async fn main() {
     // N176: one malloc arena, not eight per core (glibc only).
     memory::limit_arenas();
     apply_base_cache_budget_from_env();
+    // std-prefix P2: a world this server must BUILD (an S1 hot-set or
+    // canonical miss — a keystroke in another file, a pause's union leg)
+    // takes std from the prefix the session's entries pin, instead of
+    // draining it again. `VILAN_STD_PREFIX=off` turns it off.
+    vilan_core::incremental::set_std_prefix_layering_default(true);
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     // E222: the one custom request, beside the standard surface.
@@ -11233,6 +11238,78 @@ mod dead_item_clock_tests {
             "the package's last document closed: its entries stop sizing the \
              budget in the same breath",
         );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// std-prefix P2 (E294's pinned half): **a world the session must rebuild
+    /// takes std from the prefix its entries pin.** The package clock's union
+    /// analyzes both declared entries; with the prefix layered under the
+    /// world build, the client's world (std + `shared.vl`) is built over the
+    /// std-only prefix and the entry PINS it (sized into the budget, never its
+    /// victim; the server's std-only world is std itself, built and stored as
+    /// before). An edit to `shared.vl` stales the client's world, and the
+    /// union that lands again rebuilt it over the pinned prefix — std was not
+    /// drained a second time. The pins go with the package's last document.
+    #[tokio::test]
+    async fn a_world_rebuilt_after_an_edit_takes_std_from_the_pinned_prefix() {
+        vilan_core::incremental::set_std_prefix_layering(Some(true));
+        let (directory, shared) = workspace();
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union — both entries' legs analyzed",
+        );
+        let (pinned, held) = vilan_core::analyzer::base_cache_pinned_prefixes();
+        assert!(
+            pinned >= 1 && held == pinned,
+            "the entries pin the prefix their worlds were built over: {pinned} pinned, \
+             {held} held",
+        );
+        let (builds_before, hits_before) = vilan_core::analyzer::base_cache_prefix_stats();
+        assert!(
+            builds_before >= 1,
+            "the client leg (std + `shared.vl`) was a layered build: {builds_before}"
+        );
+
+        server
+            .did_change(whole_file_change(
+                &shared,
+                2,
+                &format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n"),
+            ))
+            .await;
+        assert!(
+            wait_for_grays(server, &shared, false).await,
+            "the edit withdraws the paint",
+        );
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "and the union lands again",
+        );
+        let (builds_after, hits_after) = vilan_core::analyzer::base_cache_prefix_stats();
+        assert!(
+            builds_after > builds_before && hits_after > hits_before,
+            "the entries' worlds, stale after the edit, were rebuilt over the pinned \
+             prefix: builds {builds_before} -> {builds_after}, prefix hits {hits_before} \
+             -> {hits_after}",
+        );
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: shared.clone(),
+                },
+            })
+            .await;
+        assert_eq!(
+            vilan_core::analyzer::base_cache_pinned_prefixes().0,
+            0,
+            "the package's last document closed: its entries unpin their prefixes",
+        );
+        vilan_core::incremental::set_std_prefix_layering(None);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

@@ -702,3 +702,69 @@ fn b593_items_of_different_signatures_are_refused() {
         "(this literal's element type), but got",
     );
 }
+
+/// A `Callable` struct's impl is an impl of the STRUCT: a closure whose shape
+/// matches its `call` does not become a receiver of that impl's members. The
+/// coercion (`compare_type`'s closure arm) let `impl_subject_admits` answer
+/// yes, so `twice.call(5f)` on a closure compiled to `Scale`'s `call` with the
+/// closure as `self` and printed `NaN`.
+#[test]
+fn a_closure_is_no_receiver_of_a_callable_structs_impl() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::operators::Callable;
+
+        struct Scale {
+            unit: f64,
+        }
+
+        impl Scale with Callable {
+            fun call(self, n: f64): f64 {
+                self.unit * n
+            }
+        }
+
+        fun main() {
+            let scale = Scale { unit = 2f };
+            print(scale(3f));
+            let twice = |n: f64| n * 2f;
+            print(twice.call(5f));
+        }
+        "#,
+        "has no method 'call'",
+    );
+}
+
+/// The coercion itself stands: the same struct still lands in a closure slot
+/// and still answers the call operator.
+#[test]
+fn a_callable_struct_still_coerces_into_a_closure_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Callable;
+
+        struct Scale {
+            unit: f64,
+        }
+
+        impl Scale with Callable {
+            fun call(self, n: f64): f64 {
+                self.unit * n
+            }
+        }
+
+        fun apply(f: |f64| f64, n: f64): f64 {
+            f(n)
+        }
+
+        fun main() {
+            let scale = Scale { unit = 2f };
+            print(scale(3f));
+            print(apply(scale, 4f));
+        }
+        "#,
+        "6\n8\n",
+    );
+}

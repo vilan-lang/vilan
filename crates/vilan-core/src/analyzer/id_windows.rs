@@ -561,6 +561,15 @@ impl IdWindowsReport {
     }
 }
 
+/// The anchor state [`IdWindows::saved_anchor`] hands back.
+#[derive(Clone, Copy, Debug)]
+pub struct SavedAnchor {
+    anchor: Option<usize>,
+    entity: Option<Id>,
+    is_drain: bool,
+    missed: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct IdWindows {
     pub mode: Mode,
@@ -1014,6 +1023,45 @@ impl IdWindows {
         self.anchor_is_drain.set(false);
         self.anchor_missed.set(false);
         self.anchor.set(Some(window));
+    }
+
+    /// B624: the anchor in force, to put back after a mint that belongs to
+    /// another item ([`Self::anchor_at_owner`]).
+    pub fn saved_anchor(&self) -> SavedAnchor {
+        SavedAnchor {
+            anchor: self.anchor.get(),
+            entity: self.anchor_entity.get(),
+            is_drain: self.anchor_is_drain.get(),
+            missed: self.anchor_missed.get(),
+        }
+    }
+
+    pub fn restore_anchor(&self, saved: SavedAnchor) {
+        self.anchor.set(saved.anchor);
+        self.anchor_entity.set(saved.entity);
+        self.anchor_is_drain.set(saved.is_drain);
+        self.anchor_missed.set(saved.missed);
+    }
+
+    /// B624: anchors the next mints at the window of `owner` — the node a
+    /// memoized slot is KEYED by — rather than at whichever constraint asked
+    /// for it first. A slot keyed by a node is that node's item's: a list
+    /// literal's element slot is the binding's, and the constraint of another
+    /// item that grounds it WRITES it (M139's edge, `cross_writes`), which is
+    /// what the per-item records' dirty closure reads. Minted in the asker's
+    /// window instead, the owner's type mentions a slot of another item that
+    /// no edge names, and the owner's record survives the asker's edit. An
+    /// owner in no window keeps the anchor in force. The caller restores the
+    /// saved anchor after the mint.
+    pub fn anchor_at_owner(&self, owner: Id) {
+        if !self.on() || plant() == Some(Plant::AnchorOff) {
+            return;
+        }
+        if let Some(window) = self.window_of_entity(owner) {
+            self.anchor_entity.set(Some(owner));
+            self.anchor.set(Some(window));
+            self.anchor_missed.set(false);
+        }
     }
 
     /// The tail ENTITY ids anchored to `window` that found no room in it.

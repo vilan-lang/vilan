@@ -297,6 +297,141 @@ fn every_edit_class_answers_what_a_clean_analysis_answers_over_the_std_prefix() 
     );
 }
 
+/// **B624** (std-prefix P2's precondition): over the std-only prefix every
+/// package module re-walks, so M110 S7's item records are filed and served for
+/// the whole package — and an UNEDITED module's record must go stale when an
+/// EDITED module pushes a different type into its use-inferred binding (M139's
+/// write edge, `id_windows.cross_writes`). The classes package's `bag` /
+/// `a_spoil` pair alone: `a_spoil` loads first and its push moves from `2` to
+/// `"two"`; `bag`'s declaration label must read the clean `List<any>`, not its
+/// record's `List<i32>`. Non-vacuous: the analyses are prefix worlds and serve
+/// item records (the bystander `side` and the entry's `twice`, which read
+/// nothing the edit dirties).
+#[test]
+fn a_push_into_an_unedited_modules_binding_stales_its_item_record_over_the_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let mut package = Package::write(
+        "b624",
+        Platform::default(),
+        &[
+            (
+                "main.vl",
+                "import pkg::bag::fill;\nimport pkg::a_spoil::spoil;\nimport pkg::side::side_value;\n\nfun main() {\n\tfill();\n\tspoil();\n\tprint(twice());\n}\n\nfun twice(): i32 {\n\tside_value() * 2\n}\n",
+            ),
+            ("bag.vl", CLASSES_BAG),
+            ("a_spoil.vl", CLASSES_SPOIL),
+            ("side.vl", CLASSES_SIDE),
+        ],
+    );
+    let mut divergences = Vec::new();
+    let seed = package.path("a_spoil.vl");
+    let first = observe(&package, vec![seed.clone()], Leg::Incremental);
+    let mut censuses = vec![first.census];
+    for edit in CLASS_EDITS.iter().filter(|edit| edit.file == "a_spoil.vl") {
+        censuses.extend(replay(&mut package, edit, &mut divergences));
+    }
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(None);
+    assert!(
+        divergences.is_empty(),
+        "the item records over the std prefix answer what a clean analysis does:\n{}",
+        divergences.join("\n")
+    );
+    assert!(
+        censuses.iter().all(|census| census.prefix_world),
+        "every analysis is a prefix world: {censuses:#?}"
+    );
+    let served: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_served)
+        .sum();
+    assert!(
+        served > 0,
+        "the prefix worlds serve item records, or the comparison is vacuous: {censuses:#?}"
+    );
+}
+
+/// **std-prefix P2's gate** (`std-prefix.md` §13, incr-51c's Q1 as ruled): the
+/// prefix LAYERED under the world build. Every §6 edit class, applied and
+/// undone, with layering on — S1's hot-set worlds (and the canonical ones)
+/// that MISS are built over the std-only prefix and stored under their own
+/// keys; their hits are S1's as before — answers what the canonical clean
+/// analysis answers and emits what a clean analysis of the same (layered)
+/// shape emits. Non-vacuous: worlds are built layered, the prefix is SERVED
+/// to a later world build (a second hot set in the package takes std from
+/// memory), S1's hot-set hits still serve item records over a layered world,
+/// and the guards still refuse where they must (each refusal answering
+/// canonically, which the comparison holds).
+#[test]
+fn every_edit_class_answers_what_a_clean_analysis_answers_with_the_prefix_layered() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::incremental::set_std_prefix_layering(Some(true));
+    let Replayed {
+        divergences,
+        censuses,
+        ..
+    } = replay_the_classes();
+    let mut divergences = divergences;
+    let mut censuses = censuses;
+    for fixture in POST_PASS_FIXTURES {
+        let mut package = fixture.write();
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix_layering(None);
+    assert!(
+        divergences.is_empty(),
+        "{} step(s) of the edit script observe the layered analysis:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let layered = censuses
+        .iter()
+        .filter(|census| census.prefix_layered)
+        .count();
+    let prefix_hits: u64 = censuses
+        .iter()
+        .filter(|census| census.prefix_layered)
+        .map(|census| census.prefix_hits)
+        .sum();
+    let hot_hits = censuses
+        .iter()
+        .filter(|census| census.hot_world && census.base_hits > 0)
+        .count();
+    let served: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_served)
+        .sum();
+    eprintln!(
+        "{} analyses: {layered} layered world builds ({prefix_hits} over a served prefix), \
+         {hot_hits} hot-set hits, {served} item records served",
+        censuses.len()
+    );
+    assert!(
+        layered >= 8 && prefix_hits >= 4,
+        "the script must build worlds over the prefix and serve the prefix to later builds \
+         (layered {layered}, prefix hits {prefix_hits}); the comparison is otherwise vacuous \
+         about P2"
+    );
+    assert!(
+        hot_hits >= 8 && served > 0,
+        "S1's hot-set worlds stay what a keystroke is served from (hot-set hits {hot_hits}, \
+         item records served {served})"
+    );
+}
+
 /// A package impl of a std trait whose member std's own resolve asks about —
 /// kolt's `impl ProxySignal<type T> with Signal<T>` and std's `get` lookups —
 /// for the std-prefix tests below.
@@ -403,12 +538,20 @@ fn packages_with_one_std_closure_share_one_std_prefix() {
     );
 }
 
+/// A package impl on a std CONCRETE type std's own resolve asks about —
+/// `SignalCell<T>`'s `get`, asked of `SignalCell<T>` itself — for the guard's
+/// refusing case.
+const PREFIX_PEEK: &str = "import std::reactive::SignalCell;\n\n\
+export trait Peek {\n\tfun get(self): i32;\n}\n\n\
+export impl SignalCell<type T> with Peek {\n\tfun get(self): i32 {\n\t\t0\n\t}\n}\n";
+
 /// **std-prefix P1, §4.2's guard.** A package impl that could answer a
-/// question std's own resolve asked — here a package `impl .. with Signal<T>`
-/// declaring `get`, which std's reactive code looks up — refuses the prefix:
-/// the analysis is built in the shape it would have taken without it (the
-/// canonical one: no hot seed), answers what the clean analysis answers, and
-/// the next analysis of the same package does not try again.
+/// question std's own resolve asked — here a trait impl on std's
+/// `SignalCell<T>` declaring `get`, which std's reactive code looks up on
+/// `SignalCell<T>` — refuses the prefix: the analysis is built in the shape it
+/// would have taken without it (the canonical one: no hot seed), answers what
+/// the clean analysis answers, and the next analysis of the same package does
+/// not try again.
 #[test]
 fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
     let _switch = SWITCH_LOCK
@@ -422,9 +565,9 @@ fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
         &[
             (
                 "main.vl",
-                "import pkg::proxy::ProxySignal;\n\nfun main() {\n\tprint(\"ok\");\n}\n",
+                "import pkg::peek::Peek;\n\nfun main() {\n\tprint(\"ok\");\n}\n",
             ),
-            ("proxy.vl", PREFIX_PROXY),
+            ("peek.vl", PREFIX_PEEK),
         ],
     );
     let refused = observe_over_the_prefix(&package);
@@ -443,6 +586,66 @@ fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
         Some("refused-before"),
         "a refused package is not built over the prefix again: {:?}",
         remembered.census
+    );
+}
+
+/// kolt's `src/lib/scale_step.vl`: a package struct made callable (B340).
+/// std asks whether its closure types are `Callable`, and the call operator's
+/// coercion admitted this impl for them (M145's second refusal on kolt).
+const PREFIX_SCALE: &str = "import std::operators::Callable;\n\n\
+export struct Scale {\n\tunit: f64,\n}\n\n\
+export impl Scale with Callable {\n\tfun call(self, n: f64): f64 {\n\t\tself.unit * n\n\t}\n}\n";
+
+/// **M145: the guard asks what the LOOKUP asked.** kolt's `impl
+/// ProxySignal<type T> with Signal<T>` declares `get`, and std's reactive code
+/// looks `get` up on its own generic `T` (`fun f<T: Signal<U>>`, a parameter
+/// the declaration owns and the body's comparison holds RIGID). That lookup
+/// admits no impl on a concrete head — only a blanket could answer it — yet the
+/// verdict, read after the resolve with no rigidity in force, read `T` as a
+/// hole and refused kolt's client. The question now remembers the rigidity it
+/// was asked under and the verdict re-asks the admission under it. And kolt's
+/// callable `Scale` (B340): std asks whether `|T| R` is `Callable`, and the
+/// call operator's COERCION admitted `impl Scale with Callable` for a closure
+/// receiver — an impl subject never coerces now. The package is SERVED over
+/// the prefix, answering what the clean analysis answers.
+#[test]
+fn m145_a_package_impl_on_its_own_type_is_served_over_the_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let package = Package::write(
+        "prefix_proxy",
+        NODE,
+        &[
+            (
+                "main.vl",
+                "import pkg::proxy::ProxySignal;\nimport pkg::scale::Scale;\n\
+                 import std::reactive::{ Signal, SignalCell, Subscriber, Source };\n\n\
+                 fun main() {\n\tprint(Scale { unit = 2f }(3f));\n\tlet cell = SignalCell::new(1);\n\
+                 \tlet proxy = ProxySignal {\n\t\tget = || cell.get(),\n\
+                 \t\tset = |value: i32| cell.set(value),\n\
+                 \t\ton_settle = |subscriber: Subscriber| cell.on_settle(subscriber),\n\
+                 \t\tnotify = || cell.notify(),\n\t};\n\tproxy.set(2);\n\tprint(proxy.get());\n}\n",
+            ),
+            ("proxy.vl", PREFIX_PROXY),
+            ("scale.vl", PREFIX_SCALE),
+        ],
+    );
+    let served = observe_over_the_prefix(&package);
+    let again = observe_over_the_prefix(&package);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        served.census.prefix_world && served.census.prefix_refusals == 0,
+        "the package's impl on its own type is served over the prefix: {:?}",
+        served.census
+    );
+    assert!(
+        again.census.prefix_world && again.census.prefix_hits == 1,
+        "and the next analysis is served the stored prefix: {:?}",
+        again.census
     );
 }
 
