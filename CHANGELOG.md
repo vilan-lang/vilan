@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**N173: `vilan test`'s failing test reports its stack in `.vl` lines.** It printed `at check (file:///tmp/vilan-test-1477831.mjs:18:2)` — a place that is gone when the run ends — where `vilan run` of the same code reads `main_test.vl:4:2`. `vilan test` now builds the test's source map (one per test file, about 0.3 % of its build), writes it beside the temp script and hands node `--enable-source-maps`, the way `vilan run` does (E257 S5); the map and the script are removed after the run. std's `assert` frame names std's file.
+
+---
+
+<!-- family: tooling -->
 **N174: the LSP latency harness SKIPS a scenario whose anchors are missing, by name, and runs the rest — and the two dead E121 rows are re-anchored on the owner's kolt as it is.** `scripts/lsp-latency.py` used to refuse the whole run when any named scenario's edit, hover, completion or References anchor had left the tree, which left Order 51's seal with no LSP rows at all after the mirrored-store exhibit (A153 S5, kolt `dee494ab`) rewrote `model.vl` and `channel.vl`. A scenario that does not land is now skipped with its reason on stderr (`SKIPPED parse break: …`) and in the JSON (`skipped: [..]` with `skipped_reasons`, the `parse repair` row named beside its break), and the run refuses only when nothing is left. `perf_gate.py seal` prints the skipped list beside the measured LSP rows and is RED on a skipped MANDATE row (`mandate = true` in `perf/budgets.toml`: leaf, css, parse break — or a mandate row the BASE side skipped), a note on an informational one; the report carries the skipped rows, the rows measured, and a `series` string per re-anchored row. `model.vl keystroke`'s References probe now asks `fun global()` (the mirrored store's reader, used in `sidebar.vl` and `views.vl`), and `parse break` / `parse repair` edit `channel_name.adopt(channel.current_name());` in `channel.vl` (a statement over a `g.channels()` boundary): the shapes are kept, the figures are NEW series. `VILAN_PERF_LSP_SCENARIOS` stays as the explicit form.
 
 ---

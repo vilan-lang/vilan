@@ -212,6 +212,45 @@ fun main() {
     );
 }
 
+/// N173: `vilan test`'s failing test reports its stack in `.vl` lines, as `vilan run` does — it used
+/// to print `file:///tmp/vilan-test-<pid>.mjs:18:2`, a place that is gone when the run ends.
+#[test]
+fn a_failing_test_names_vl_lines_in_its_stack() {
+    let directory = project("test_stack");
+    write(&directory, "vilan.toml", "[package]\nname = \"maps\"\n");
+    write(
+        &directory,
+        "main_test.vl",
+        "import std::io::assert;\n\nfun check(value: i32) {\n\tassert(value == 3, \"check failed\");\n}\n\nfun main() {\n\tcheck(4);\n}\n",
+    );
+    let output = vilan()
+        .args(["test", "main_test.vl"])
+        .current_dir(&directory)
+        .output()
+        .expect("run vilan");
+    assert!(!output.status.success(), "the failing test exits non-zero");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("at check (")
+                && line.contains("main_test.vl:4:")),
+        "a frame for `check` at its `.vl` line:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("at ") && line.contains("main_test.vl:8:")),
+        "the caller's frame at `main`'s call:\n{text}"
+    );
+    assert!(
+        !text.contains("vilan-test-"),
+        "no temp script place is named:\n{text}"
+    );
+}
+
 /// `--watch`, handed to a `vilan run --inspect` that refuses it before a
 /// round starts. A constant, not a literal in the test: `build_hooks`'s
 /// `every_test_that_drives_a_watch_session_is_in_the_group` reads a

@@ -6236,9 +6236,10 @@ fn test_context(file: &Path) -> Result<(PathBuf, Workspace, BuildOptions), Strin
 /// `compile_to_js` has already reported to stderr).
 fn run_test(file: &Path) -> Result<(), String> {
     let (pkg_root, workspace, mut options) = test_context(file)?;
-    // The test's script is run and thrown away with its JavaScript alone: a
-    // map would be built for nobody (E257 S5).
-    options.source_maps = false;
+    // N173: the script is thrown away, but node reads its map while it runs: a
+    // failing test's stack names `.vl` lines (`vilan run`'s rule, E257 S5),
+    // not the temp script's. One map per test file, about 0.3% of its build.
+    options.source_maps = true;
     let compiled = compile_to_js(
         file,
         &pkg_root,
@@ -6253,11 +6254,20 @@ fn run_test(file: &Path) -> Result<(), String> {
     )
     .map_err(|_| String::new())?;
     let script = env::temp_dir().join(format!("vilan-test-{}.mjs", std::process::id()));
-    if let Err(error) = write_run_script(&script, &compiled.javascript) {
-        return Err(format!("cannot write {}: {error}", script.display()));
-    }
-    let output = std::process::Command::new("node").arg(&script).output();
+    let mapped = match write_run_script_with_map(
+        &script,
+        &compiled.javascript,
+        compiled.source_map.as_ref(),
+    ) {
+        Ok(mapped) => mapped,
+        Err(error) => return Err(format!("cannot write {}: {error}", script.display())),
+    };
+    let output = std::process::Command::new("node")
+        .args(node_flags(mapped, None))
+        .arg(&script)
+        .output();
     let _ = fs::remove_file(&script);
+    let _ = fs::remove_file(source_map_path(&script));
     match output {
         Ok(result) if result.status.success() => Ok(()),
         Ok(result) => {
