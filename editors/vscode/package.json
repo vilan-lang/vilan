@@ -128,6 +128,19 @@
           "default": true,
           "description": "Show a type that declares [hint(Trait<..>)] by the trait it is used as, marked with ~ (a pipeline node reads ': ~Source<Option<str>>', not its whole upstream). The full type stays in the hint's tooltip and in hover. Applies live."
         },
+        "vilan.inlayHints.chains": {
+          "type": "string",
+          "enum": [
+            "every",
+            "changes"
+          ],
+          "enumDescriptions": [
+            "Hint every stage of a chain split one stage per line.",
+            "Hint a stage only where its type differs from the stage before it (the first stage always)."
+          ],
+          "default": "every",
+          "description": "Which stages of a chain split one stage per line carry an ` as T` inlay hint. 'Ascribe every stage of this chain' still writes every stage. Applies live."
+        },
         "vilan.semanticTokens.enabled": {
           "type": "boolean",
           "default": true,

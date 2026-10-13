@@ -5534,6 +5534,7 @@ impl Document {
                     .hint_labels
                     .get(id)
                     .map(|hint| format!(": {}", hint.label)),
+                chain: None,
             });
         }
         // B570 S3 (§4.3): after a STALE `auto`, the type it would become —
@@ -5554,6 +5555,7 @@ impl Document {
                     name: diagnostic.span,
                     label: format!(" ⟶ {becomes}"),
                     abbreviated: None,
+                    chain: None,
                 });
             }
         }
@@ -5571,6 +5573,9 @@ impl Document {
                     .abbreviated
                     .as_ref()
                     .map(|abbreviated| format!(" as {abbreviated}")),
+                // E302: the chain's HEAD is not a stage — it is hinted as
+                // always and is no stage's predecessor.
+                chain: (stage.id != stage.chain).then_some(stage.chain.0),
             });
         }
         hints.sort_by_key(|hint| hint.name.end);

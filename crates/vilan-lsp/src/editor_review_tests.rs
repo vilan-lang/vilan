@@ -1510,3 +1510,61 @@ fn e301_an_inlay_hint_resolves_to_its_bindings_hover_and_its_type() {
         );
     });
 }
+
+/// E302: the owner's four-line example under `vilan.inlayHints.chains =
+/// "changes"` — the stages whose printed type moves are hinted, the one that
+/// keeps `Option<i32>` is not; an all-same chain shows its first hint only;
+/// `"every"` (the default) is E278's answer unchanged.
+#[test]
+fn e302_changes_hints_only_a_stage_whose_type_moves() {
+    use crate::keystroke::{ChainHints, chain_hints};
+    on_big_stack(|| {
+        let source = "fun main() {\n\tlet some = Some(5)\n\t\t.map(|x| x * 2)\n\t\t.and_then(|x| Some(x + 1))\n\t\t.is_some();\n\
+             \tlet same = Some(1)\n\t\t.map(|x| x + 1)\n\t\t.map(|x| x + 2)\n\t\t.map(|x| x + 3);\n\
+             \tlet _ = some;\n\tlet _ = same;\n}\n";
+        let document = Document::analyze(source, &std_root(), Path::new("/e302/main.vl"));
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let line = |offset: usize| source[..offset].matches('\n').count() + 1;
+        let stages = |mode: ChainHints| -> Vec<(usize, String)> {
+            chain_hints(document.keystroke_hints_served(false, true), mode)
+                .into_iter()
+                .filter(|hint| hint.label.starts_with(" as "))
+                .map(|hint| (line(hint.offset), hint.label))
+                .collect()
+        };
+        let every = stages(ChainHints::Every);
+        let changes = stages(ChainHints::Changes);
+        assert!(
+            every.contains(&(3, " as Option<i32>".to_string())),
+            "{every:?}"
+        );
+        assert!(
+            every.contains(&(4, " as Option<i32>".to_string())),
+            "{every:?}"
+        );
+        assert!(every.contains(&(5, " as bool".to_string())), "{every:?}");
+        // The first chain: the and_then keeps `Option<i32>` and is hidden.
+        assert!(
+            changes.contains(&(3, " as Option<i32>".to_string())),
+            "{changes:?}"
+        );
+        assert!(
+            !changes.iter().any(|(at_line, _)| *at_line == 4),
+            "{changes:?}"
+        );
+        assert!(
+            changes.contains(&(5, " as bool".to_string())),
+            "{changes:?}"
+        );
+        // The all-same chain: its first stage only.
+        let same: Vec<&(usize, String)> = changes
+            .iter()
+            .filter(|(at_line, _)| (7..=9).contains(at_line))
+            .collect();
+        assert_eq!(same.len(), 1, "{changes:?}");
+    });
+}

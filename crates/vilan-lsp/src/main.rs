@@ -91,6 +91,9 @@ struct Config {
     /// trait it is used as (`: ~Source<i32>`). On by default; read per
     /// request, so it switches live.
     inlay_hints_abbreviate: bool,
+    /// E302: `vilan.inlayHints.chains` — `"every"` (the default) or
+    /// `"changes"`. Read per request, so it switches live.
+    inlay_hints_chains: keystroke::ChainHints,
     semantic_tokens_enabled: bool,
     completion_function_call: CompletionFunctionCall,
     /// E222: the client pairs a generic `<` ITSELF — it asked
@@ -109,6 +112,7 @@ impl Default for Config {
         Config {
             inlay_hints_enabled: true,
             inlay_hints_abbreviate: true,
+            inlay_hints_chains: keystroke::ChainHints::Every,
             semantic_tokens_enabled: true,
             completion_function_call: CompletionFunctionCall::Full,
             client_closes_generics: false,
@@ -136,6 +140,11 @@ impl Config {
             .and_then(|v| v.as_bool())
         {
             config.inlay_hints_abbreviate = abbreviate;
+        }
+        match root.pointer("/inlayHints/chains").and_then(|v| v.as_str()) {
+            Some("changes") => config.inlay_hints_chains = keystroke::ChainHints::Changes,
+            Some("every") => config.inlay_hints_chains = keystroke::ChainHints::Every,
+            _ => {}
         }
         if let Some(enabled) = root
             .pointer("/semanticTokens/enabled")
@@ -851,6 +860,30 @@ mod config_tests {
     use serde_json::json;
 
     // Defaults preserve today's behavior: every provider on, full completion.
+    /// E302: `vilan.inlayHints.chains` reads `"every"` (the default) or
+    /// `"changes"`.
+    #[test]
+    fn config_parses_inlay_hints_chains() {
+        use crate::keystroke::ChainHints;
+        assert_eq!(Config::default().inlay_hints_chains, ChainHints::Every);
+        assert_eq!(
+            Config::from_settings(&json!({ "inlayHints": { "chains": "changes" } }))
+                .inlay_hints_chains,
+            ChainHints::Changes
+        );
+        assert_eq!(
+            Config::from_settings(&json!({ "vilan": { "inlayHints": { "chains": "every" } } }))
+                .inlay_hints_chains,
+            ChainHints::Every
+        );
+        // An unknown spelling keeps the default rather than flipping anything.
+        assert_eq!(
+            Config::from_settings(&json!({ "inlayHints": { "chains": "some" } }))
+                .inlay_hints_chains,
+            ChainHints::Every
+        );
+    }
+
     /// E227 (Q4): `vilan.inlayHints.abbreviate` is on unless a client says
     /// otherwise, in either payload shape, and a wrong-typed value keeps the
     /// default rather than flipping it.
@@ -4481,7 +4514,8 @@ impl LanguageServer for Backend {
                     .config
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let moved = current.inlay_hints_abbreviate != config.inlay_hints_abbreviate;
+                let moved = current.inlay_hints_abbreviate != config.inlay_hints_abbreviate
+                    || current.inlay_hints_chains != config.inlay_hints_chains;
                 *current = config;
                 moved
             };
@@ -5056,61 +5090,67 @@ impl LanguageServer for Backend {
             {
                 return Ok(None);
             }
-            let abbreviate = self
-                .config
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .inlay_hints_abbreviate;
+            let (abbreviate, chains) = {
+                let config = self
+                    .config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (config.inlay_hints_abbreviate, config.inlay_hints_chains)
+            };
             let uri = params.text_document.uri;
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
             let range = params.range;
-            let hints = document
-                // E232 (door 2): the landed hints, each following the edits
-                // since its analysis — the edited line's included, so the line
-                // no longer jumps the moment typing starts (E121 withheld them
-                // there). The offsets are already live-space, so one index
-                // answers both the hint's position and the viewport compare.
-                //
-                // E227: a `[hint]`ed type shows by the trait it is used as
-                // (`: ~Source<i32>`), with the full type as its tooltip. The
-                // abbreviated hint carries no `text_edits`, ever: an editor that
-                // inserts a hint on double-click must never write `~Source<..>`
-                // into a file — it does not lex.
-                .keystroke_hints_served(self.schedule.dependency_moved(&uri), abbreviate)
-                .into_iter()
-                .filter_map(|hint| {
-                    let position = document.line_index.position(hint.offset);
-                    let visible = position >= range.start && position <= range.end;
-                    // E301: the tooltip and the type name's target are
-                    // resolved when the hint is hovered (`inlayHint/resolve`),
-                    // off this keystroke path; what the resolve needs rides in
-                    // `data`.
-                    let data = serde_json::json!({
-                        "uri": uri.as_str(),
-                        "line": position.line,
-                        "character": position.character,
-                        "label": hint.label,
-                        "full": hint.full,
-                    });
-                    visible.then_some(InlayHint {
-                        position,
-                        label: inlay_hint_label(&hint.label, hint.full.is_some()),
-                        kind: Some(InlayHintKind::TYPE),
-                        text_edits: None,
-                        // E227: an abbreviation's full type, until resolved.
-                        tooltip: hint.full.map(|full| {
-                            // `: T` for a binding, ` as T` for a stage (E278).
-                            let full = full.trim_start_matches(": ").trim_start_matches(" as ");
-                            InlayHintTooltip::String(full.to_string())
-                        }),
-                        padding_left: Some(false),
-                        padding_right: Some(false),
-                        data: Some(data),
-                    })
+            let hints = keystroke::chain_hints(
+                document
+                    // E232 (door 2): the landed hints, each following the edits
+                    // since its analysis — the edited line's included, so the line
+                    // no longer jumps the moment typing starts (E121 withheld them
+                    // there). The offsets are already live-space, so one index
+                    // answers both the hint's position and the viewport compare.
+                    //
+                    // E227: a `[hint]`ed type shows by the trait it is used as
+                    // (`: ~Source<i32>`), with the full type as its tooltip. The
+                    // abbreviated hint carries no `text_edits`, ever: an editor that
+                    // inserts a hint on double-click must never write `~Source<..>`
+                    // into a file — it does not lex.
+                    .keystroke_hints_served(self.schedule.dependency_moved(&uri), abbreviate),
+                // E302: `"changes"` keeps a chain's stage only where its type moves.
+                chains,
+            )
+            .into_iter()
+            .filter_map(|hint| {
+                let position = document.line_index.position(hint.offset);
+                let visible = position >= range.start && position <= range.end;
+                // E301: the tooltip and the type name's target are
+                // resolved when the hint is hovered (`inlayHint/resolve`),
+                // off this keystroke path; what the resolve needs rides in
+                // `data`.
+                let data = serde_json::json!({
+                    "uri": uri.as_str(),
+                    "line": position.line,
+                    "character": position.character,
+                    "label": hint.label,
+                    "full": hint.full,
+                });
+                visible.then_some(InlayHint {
+                    position,
+                    label: inlay_hint_label(&hint.label, hint.full.is_some()),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    // E227: an abbreviation's full type, until resolved.
+                    tooltip: hint.full.map(|full| {
+                        // `: T` for a binding, ` as T` for a stage (E278).
+                        let full = full.trim_start_matches(": ").trim_start_matches(" as ");
+                        InlayHintTooltip::String(full.to_string())
+                    }),
+                    padding_left: Some(false),
+                    padding_right: Some(false),
+                    data: Some(data),
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
             Ok(Some(hints))
         })
     }

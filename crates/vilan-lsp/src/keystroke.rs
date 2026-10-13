@@ -883,11 +883,13 @@ impl LandedSnapshot {
                         offset: name.end,
                         label: abbreviated.clone(),
                         full: Some(hint.label.clone()),
+                        chain: hint.chain,
                     },
                     _ => ServedHint {
                         offset: name.end,
                         label: hint.label.clone(),
                         full: None,
+                        chain: hint.chain,
                     },
                 })
             })
@@ -905,6 +907,42 @@ pub struct ServedHint {
     pub offset: usize,
     pub label: String,
     pub full: Option<String>,
+    /// E302: [`LandedHint::chain`].
+    pub chain: Option<u32>,
+}
+
+/// E302: `vilan.inlayHints.chains`. `Every` hints each stage of a chain split
+/// one per line (E278, the default); `Changes` only a stage whose type, as the
+/// hint PRINTS it, differs from the stage before it — the first always, and a
+/// hidden stage still the predecessor of the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChainHints {
+    #[default]
+    Every,
+    Changes,
+}
+
+/// E302: `hints` under `mode` — a binding's hint always passes; a stage
+/// passes under `Changes` when its label differs from its chain's previous
+/// stage's (or it opens the chain). `hints` is in offset order, which is the
+/// chain's own order.
+pub fn chain_hints(hints: Vec<ServedHint>, mode: ChainHints) -> Vec<ServedHint> {
+    if mode == ChainHints::Every {
+        return hints;
+    }
+    let mut previous: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    hints
+        .into_iter()
+        .filter(|hint| {
+            let Some(chain) = hint.chain else {
+                return true;
+            };
+            match previous.insert(chain, hint.label.clone()) {
+                Some(before) => before != hint.label,
+                None => true,
+            }
+        })
+        .collect()
 }
 
 /// One inlay hint as an analysis landed it: the binding NAME it follows, in
@@ -922,6 +960,10 @@ pub struct LandedHint {
     /// E227: `: ~Source<..>` where a `[hint]` abbreviates the type, else
     /// `None`.
     pub abbreviated: Option<String>,
+    /// E302: the chain a STAGE hint belongs to (its head's id), so
+    /// `vilan.inlayHints.chains = "changes"` can compare a stage with the one
+    /// before it. `None` for a binding's hint.
+    pub chain: Option<u32>,
 }
 
 /// How the live buffer got from the analyzed text (E232): the ordered edits
