@@ -10781,6 +10781,139 @@ fn b457_a_read_passed_to_a_callee_that_writes_nothing_is_not_copied() {
 }
 
 // ---------------------------------------------------------------------------
+// F135 — a read beside a LATER argument that writes its cell (R-a, door (1))
+// ---------------------------------------------------------------------------
+//
+// Spec §6.7: `read()` copies at the moment it is evaluated, on both backends.
+// B457's copy of a read argument (the callee writes the cell) extended to a
+// later ARGUMENT of the same call that writes it: the read is the cell's own
+// storage on JS, so the callee saw the later write there and not natively.
+// Every position (a bare read, a spine, a receiver, a `&` operand) and every
+// callee (a closure value's call too); the later argument writes the cell
+// itself or reaches a write through its calls.
+
+#[test]
+fn f135_a_read_beside_a_later_argument_that_writes_its_cell_is_a_copy() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "struct Bag {\n",
+            "\titems: List<i32>,\n",
+            "}\n",
+            "fun grow(cell: Shared<Bag>): i32 {\n",
+            "\tcell.write().items.push(9);\n",
+            "\t9\n",
+            "}\n",
+            "fun deeper(cell: Shared<Bag>): i32 {\n",
+            "\tgrow(cell)\n",
+            "}\n",
+            "fun whole(bag: Bag, value: i32): bool {\n",
+            "\tbag.items.contains(value)\n",
+            "}\n",
+            "fun has(items: List<i32>, value: i32): bool {\n",
+            "\titems.contains(value)\n",
+            "}\n",
+            "fun lent(items: &List<i32>, value: i32): bool {\n",
+            "\titems.contains(value)\n",
+            "}\n",
+            "fun fresh(): Shared<Bag> {\n",
+            "\tShared::new(Bag { items = [] })\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet a = fresh();\n",
+            "\tprint(whole(a.read(), grow(a)));\n",
+            "\tlet b = fresh();\n",
+            "\tprint(has(b.read().items, deeper(b)));\n",
+            "\tlet c = fresh();\n",
+            "\tprint(c.read().items.contains(grow(c)));\n",
+            "\tlet d = fresh();\n",
+            "\tprint(lent(&d.read().items, grow(d)));\n",
+            "\tlet e = fresh();\n",
+            "\tlet check = |items: List<i32>, value: i32| items.contains(value);\n",
+            "\tprint(check(e.read().items, grow(e)));\n",
+            "\tlet f = fresh();\n",
+            "\tprint(has(f.read().items, {\n",
+            "\t\tf.write().items.push(9);\n",
+            "\t\t9\n",
+            "\t}));\n",
+            "}\n",
+        ),
+        "false\nfalse\nfalse\nfalse\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn f135_a_scalar_view_of_a_read_holds_the_value_read_where_it_stands() {
+    // A `&` of a read's scalar field had been a `(base, key)` pair over the
+    // cell's live storage on JS, read through after the later argument wrote
+    // it (1); it is a fresh holder of the value read where it stands (0).
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "struct Bag {\n",
+            "\tcount: i32,\n",
+            "}\n",
+            "fun bump(cell: Shared<Bag>): i32 {\n",
+            "\tcell.write().count += 1;\n",
+            "\t0\n",
+            "}\n",
+            "fun seen(count: &i32, value: i32): i32 {\n",
+            "\t*count + value\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet cell = Shared::new(Bag { count = 0 });\n",
+            "\tprint(seen(&cell.read().count, bump(cell)));\n",
+            "\tprint(cell.read().count);\n",
+            "}\n",
+        ),
+        "0\n1\n",
+    );
+}
+
+#[test]
+fn f135_a_read_beside_arguments_that_write_no_cell_of_its_own_is_not_copied() {
+    // Only a LATER argument that can write THIS cell forces the copy: an
+    // earlier writing argument has run before the read is taken, a later one
+    // that writes another cell (or writes nothing) cannot reach the storage.
+    // (Cells are told apart by the handles that reach them: `quiet` is
+    // written by nothing, so no call can reach a write of it; a cell that IS
+    // written somewhere is asked through the later argument's write summary,
+    // as conservative as B457's.)
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "import std::shared::Shared;\n",
+        "fun grow(cell: Shared<List<i32>>): i32 {\n",
+        "\tcell.write().push(9);\n",
+        "\t9\n",
+        "}\n",
+        "fun fill(cell: Shared<List<i32>>): i32 {\n",
+        "\tcell.write().push(9);\n",
+        "\t9\n",
+        "}\n",
+        "fun peek(cell: Shared<List<i32>>): i32 {\n",
+        "\tcell.read().len().as_i32()\n",
+        "}\n",
+        "fun has(value: i32, items: List<i32>, more: i32): bool {\n",
+        "\titems.contains(value + more)\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tlet other = Shared::new([1, 2]);\n",
+        "\tprint(has(grow(cell), cell.read(), peek(cell)));\n",
+        "\tlet quiet = Shared::new([1, 2]);\n",
+        "\tprint(has(0, quiet.read(), fill(other)));\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a read no later argument can write must not be copied:\n{emitted}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B418 — a place or a `Shared` read reaching a binding THROUGH a branch copies
 // ---------------------------------------------------------------------------
 //

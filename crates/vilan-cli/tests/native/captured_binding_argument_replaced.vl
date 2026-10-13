@@ -1,0 +1,25 @@
+// F135's binding half (spec §6.9, not §6.7's `read()`): a `&self` call on a
+// captured `mut` binding whose later argument RE-BINDS the binding whole. The
+// native view of the binding's cell is taken after the other arguments, as
+// §6.9's native note orders it, and sees the new value; the JS receiver is
+// the object the binding held when it was evaluated, and does not.
+import std::io::print;
+
+struct Words {
+	items: List<str>,
+}
+
+impl Words {
+	fun measured(&self, extra: i32): usize {
+		self.items.len() + extra.as_usize()
+	}
+}
+
+fun main() {
+	mut words = Words { items = ["a"] };
+	let swap = || {
+		words = Words { items = ["x", "y", "z"] };
+		0
+	};
+	print(words.measured(swap()));
+}

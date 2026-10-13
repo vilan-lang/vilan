@@ -12935,13 +12935,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F123: a std lookup that runs no user code (`HashSet::contains`,
         // `HashMap::get`/`contains_key` over a key whose `hash` is std's)
         // reads a `Shared` view's field receiver through the cell, as F114's
-        // reading intrinsics do, instead of copying the collection out.
+        // reading intrinsics do, instead of copying the collection out — unless
+        // the key argument writes the cell (F135: the read is a copy taken
+        // where it stands, spec §6.7, which the analyzer's `clone_sites` marks
+        // for the JS backend too).
         let reads_a_shared_receiver = views_allowed
             && matches!(conventions.first(), Some(Receiving::Ref))
             && self.std_lookup_runs_no_user_code(target, argument_ids)
-            && argument_ids
-                .first()
-                .is_some_and(|receiver| self.is_a_cell_read_place(*receiver));
+            && argument_ids.first().is_some_and(|receiver| {
+                self.is_a_cell_read_place(*receiver)
+                    && !self.copy_applies(self.program.clone_sites.get(receiver))
+            });
         let takes_a_view: Vec<bool> = argument_ids
             .iter()
             .enumerate()
@@ -12953,12 +12957,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
             .collect();
         let views_a_cell = takes_a_view.contains(&true);
-        // F129: an argument that COPIES out of a cell — a spine through a
-        // `Shared` view or over a boxed binding, of a type the JS backend
-        // hands on by reference — while a later argument runs code is copied
-        // LAST, after the other arguments are settled, so a later argument
-        // that writes the cell in place is seen by the callee as on JS (spec
-        // §6.9's native note, the order F49's views and F123's lookups have).
+        // F129: an argument that COPIES out of a captured binding's cell — a
+        // spine over a boxed binding, of a type the JS backend hands on by
+        // reference — while a later argument runs code is copied LAST, after
+        // the other arguments are settled, so a later argument that writes
+        // the binding in place is seen by the callee as on JS (spec §6.9's
+        // native note, the order F49's views have). A `Shared` read is copied
+        // where it stands (F135: spec §6.7).
         let defers_a_copy: Vec<bool> = (0..argument_ids.len())
             .map(|index| {
                 self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
@@ -13514,19 +13519,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         !self.is_natively_copy(place) && self.cell_spine(place).is_some()
     }
 
-    /// F129: whether the argument at `index` is a copy out of a cell that the
-    /// call takes LAST — after every other argument has been settled — rather
-    /// than where it stands.
+    /// F129: whether the argument at `index` is a copy out of a captured
+    /// `mut` binding's cell that the call takes LAST — after every other
+    /// argument has been settled — rather than where it stands.
     ///
-    /// A spine through a `Shared` view or over a boxed binding (`cell.read().
-    /// items`, `log.lines`) is natively a copy out of the cell's scoped borrow
-    /// (F62, F103), and the copy had been taken in argument order: a LATER
-    /// argument that wrote the cell in place (`has(cell.read().items,
-    /// grow(cell))`, `grow` pushing into `items`) was not seen by the callee,
-    /// where the JS backend — whose argument is the collection itself —
-    /// printed the written answer. Taking the copy after the later arguments
-    /// is the order spec §6.9's native note gives a view, and the one F123's
-    /// lookups read in.
+    /// A spine over a boxed binding (`log.lines`, the binding itself) is
+    /// natively a copy out of the cell's scoped borrow (F62, F103), and the
+    /// copy had been taken in argument order: a LATER argument that wrote the
+    /// binding in place (`words.measured(more())`, `more` pushing into
+    /// `words.items`) was not seen by the callee, where the JS backend —
+    /// whose argument is the binding's object itself — printed the written
+    /// answer. Taking the copy after the later arguments is the order spec
+    /// §6.9's native note gives a view of the binding.
+    ///
+    /// A spine through a `Shared` view is NOT deferred (F135, R-a door (1)):
+    /// it is a `read()`, which copies where it is evaluated (spec §6.7), and
+    /// the JS backend copies such an argument when a later one writes the
+    /// cell (the analyzer's `clone_sites`).
     ///
     /// The copy waits only where the wait is the JS answer and changes no
     /// other: the value is one JS hands on BY REFERENCE (a struct, a `List`,
@@ -13535,9 +13544,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// takes no copy of it at the call (`clone_sites`), a later argument runs
     /// code, and every other argument that runs code can be settled ahead of
     /// it in its own order: a by-value one, a `&` one that computes its value,
-    /// or a view. The cell's handle must be a binding, and each subscript
-    /// index must run no code, so deferring the read moves nothing but the
-    /// copy itself.
+    /// or a view. Each subscript index must run no code, so deferring the
+    /// read moves nothing but the copy itself.
     fn defers_its_cell_copy(
         &self,
         conventions: &[Receiving],
@@ -13559,12 +13567,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some((root, steps)) = self.cell_spine(place) else {
             return false;
         };
-        if let CellRoot::View(handle) = root
-            && !matches!(
-                self.program.entity_map.get(&handle),
-                Some(Expr::Local(_) | Expr::Parameter(_))
-            )
-        {
+        // F135 (R-a, door (1)): a spine through a `Shared` view is a
+        // `read()`, which COPIES where it is evaluated (spec §6.7) — on JS
+        // too, which copies such an argument when a later one writes the cell
+        // (the analyzer's `clone_sites`) — so it is read where it stands.
+        if matches!(root, CellRoot::View(_)) {
             return false;
         }
         let subscripts_run_code = steps.iter().any(

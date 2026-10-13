@@ -37,6 +37,9 @@ fun main() {
 
 - `read()` copies: mutating the result is lost
   (`shared.read().push(x)`, the classic trap). Mutate through `write()`.
+  The copy is taken where the `read()` is evaluated: in
+  `has(cell.read().items, grow(cell))` the callee gets the items from
+  before `grow` writes the cell. To see the write, read after it.
 - `write()` returns a view. Use it within the same statement
   (`cell.write() = v`, `cell.write().push(item)`); it obeys the usual view
   rules (no storing, no holding across `await`).

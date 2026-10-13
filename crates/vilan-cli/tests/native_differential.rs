@@ -13119,11 +13119,12 @@ fn f125_a_bigint_as_text_writes_its_digits_on_both_backends() {
 /// cell per call (F114 read the intrinsics only). They run `key.hash()`
 /// and the table's lookup, nothing else, so over a key whose `hash` is
 /// std's (a `str`, an integer, a tuple of those) the receiver is now read
-/// through a view of the cell, taken after the key is evaluated — a key
-/// argument that writes the cell is seen by the lookup, as on JS (the copy
-/// had been taken first, and printed `false` against JS's `true`). A user
-/// key type's written `hash` keeps the copy. The emission pin: one
-/// `read_with(` left in `main`, the user key's.
+/// through a view of the cell. A key argument that writes the cell takes
+/// the copy where the read stands instead (F135, R-a door (1): `read()`
+/// copies where it is evaluated, on both backends — the JS backend copies
+/// that receiver too, and both print `false`). A user key type's written
+/// `hash` keeps the copy. The emission pin: two `read_with(` left in `main`,
+/// the writing key's and the user key's.
 #[test]
 fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends() {
     let staged = stage();
@@ -13141,22 +13142,39 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
     let main = emitted_main(&staged, file);
     assert_eq!(
         main.matches("read_with(").count(),
-        1,
-        "only the user key's lookup copies its set out of the cell:\n{main}"
+        2,
+        "only the writing key's and the user key's lookups copy their set out of the cell:\n{main}"
     );
 }
 
-/// F129 (R-h): an argument that copies out of a cell — a spine through a
-/// `Shared` view (`has(cell.read().items, grow(cell))`, a user-hashed
+/// The stdout of `file` on the JS and on the native backend.
+fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
+    let run = |arguments: &[&str]| {
+        let output = vilan(staged)
+            .args(arguments)
+            .output()
+            .expect("run the probe");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    (
+        run(&["run", file]),
+        run(&["run", "--backend", "rust", file]),
+    )
+}
+
+/// F129, as F135 (R-a, door (1)) ruled it: an argument read out of a
+/// `Shared` cell — `has(cell.read().items, grow(cell))`, a user-hashed
 /// `cell.read().probes.contains(mark(cell))`, a subscript `cell.read().
-/// rows[0]`, a written `&cell.read().items` beside a computed `&grown(cell)`)
-/// or a captured `mut` binding's cell (`words.measured(more())`) — was copied
-/// where it stood, so a LATER argument that wrote the cell in place was not
-/// seen by the callee natively (`false` against JS's `true`, silently). The
-/// copy is now taken last, after the other arguments are settled in their
-/// own order (`first` still prints before `second`). A scalar, a `str` and an
-/// `own` argument (which the JS backend copies at the call) are read where
-/// they stand on both. The emission pin: six deferred copies.
+/// rows[0]`, a written `&cell.read().items` beside a computed `&grown(cell)`
+/// — is a copy taken where it stands (spec §6.7), so a LATER argument that
+/// writes the cell in place is not seen by the callee on either backend: the
+/// JS backend, whose argument had been the cell's own storage, copies it, and
+/// the native copy is no longer taken last (F129's R-h order, reverted for a
+/// read). A captured `mut` binding's receiver (`words.measured(more())`) is
+/// spec §6.9's view, taken after the later arguments on both, and sees the
+/// write. A scalar, a `str` and an `own` argument are read where they stand
+/// on both. The emission pin: the binding's receiver is the one deferred
+/// copy left.
 #[test]
 fn f129_a_copy_out_of_a_cell_is_taken_after_the_later_arguments_on_both_backends() {
     let staged = stage();
@@ -13166,32 +13184,89 @@ fn f129_a_copy_out_of_a_cell_is_taken_after_the_later_arguments_on_both_backends
         include_str!("native/shared_view_argument_order.vl"),
     )
     .expect("write the probe program");
+    let expected = "false\nfalse\nfalse\nfalse\nfalse\n9\nold\nfirst\nsecond\n0\n2\n";
     assert_eq!(
-        compare(&staged, file),
-        Verdict::Identical,
-        "a later argument's in-place write of a cell must be seen by the callee natively"
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "a read out of a cell is copied where it stands, on both backends"
     );
     let main = emitted_main(&staged, file);
     assert_eq!(
         main.matches("let __copied").count(),
-        6,
-        "the six copies out of a cell wait for the later arguments:\n{main}"
+        1,
+        "only the captured binding's receiver waits for the later arguments:\n{main}"
     );
 }
 
-/// F129's residue: a later argument that REPLACES the copied place whole
-/// (`cell.write().items = [..]`, `words = Words { .. }`) is not seen on JS,
-/// whose argument is the object the place held when it was evaluated, and is
-/// seen by the native copy taken last. Neither order of a copy answers both
-/// shapes; the in-place write is the one F129 ruled.
+/// F135 (F129's residue, R-a door (1)): a later argument that REPLACES the
+/// read's place whole (`cell.write().items = [..]`) is not seen by the
+/// callee on either backend — the JS argument is the object the place held
+/// when it was evaluated, and the native copy is taken where it stands (it
+/// had been taken last, and saw the replacement).
 #[test]
-#[ignore = "F135 (F129's residue, filed by native-51): a later argument that replaces the copied place whole is seen natively and not on JS"]
 fn f129_a_later_argument_that_replaces_the_copied_place_answers_the_same_on_both_backends() {
     let staged = stage();
     let file = "native_probe_f129_shared_view_argument_replaced.vl";
     std::fs::write(
         staged.join(file),
         include_str!("native/shared_view_argument_replaced.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        both_stdouts(&staged, file),
+        ("0\n".to_string(), "0\n".to_string())
+    );
+}
+
+/// F135 (R-a, door (1)): B457's copy of a `read()` argument, extended from
+/// "the callee writes the cell" to "a LATER ARGUMENT writes it" — a bare
+/// read handed whole, a scalar `&` view of a read's field (a fresh holder on
+/// JS, not a pair over the cell's storage), a closure value's call, a later
+/// block that writes the cell itself, and a later argument that replaces the
+/// field. Each printed the later write on JS (`true`, `10`) and not natively;
+/// both now print the copy's answer. A read beside a write of ANOTHER cell
+/// takes no copy (the JS pin: four `__clone`s of a read, no fifth).
+#[test]
+fn f135_a_read_argument_is_copied_before_a_later_argument_writes_its_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f135_shared_read_argument_copies.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_read_argument_copies.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "false\n9\nfalse\nfalse\nfalse\nfalse\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let output = vilan(&staged)
+        .args(["build", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let emitted = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        emitted.contains("has(f.v[0], grow(g))"),
+        "a read beside a write of another cell is not copied:\n{emitted}"
+    );
+}
+
+/// F135's binding half (spec §6.9, outside R-a's `read()`): a later argument
+/// that RE-BINDS a captured `mut` binding whose `&self` view the call takes
+/// (`words.measured(swap())`, `swap` assigning `words` whole). The native
+/// view is taken after the other arguments, as §6.9's native note orders it,
+/// and sees the new binding (3); the JS receiver is the object the binding
+/// held when it was evaluated (1). The in-place write (`more()` pushing) is
+/// the same on both (F129's pin).
+#[test]
+#[ignore = "F135 (its binding half - a new item filed by native-52, retarget to its id): a later argument that re-binds a captured binding under a `&self` call is seen natively and not on JS"]
+fn f135_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same_on_both_backends()
+{
+    let staged = stage();
+    let file = "native_probe_f135_captured_binding_argument_replaced.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_argument_replaced.vl"),
     )
     .expect("write the probe program");
     assert_eq!(compare(&staged, file), Verdict::Identical);

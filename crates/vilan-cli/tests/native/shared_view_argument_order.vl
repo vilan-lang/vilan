@@ -1,9 +1,11 @@
-// F129: an argument that copies out of a cell (a spine through a `Shared`
-// view, or a captured `mut` binding's cell) is copied LAST, after the later
-// arguments run, so a later argument that writes the cell in place is seen
-// by the callee, as on JS. A scalar, a `str` and an `own` argument are read
-// where they stand on both backends, and the earlier arguments still run
-// first.
+// F129, as F135 (R-a, door (1)) ruled it: an argument read out of a
+// `Shared` cell (a spine through a read) is a COPY taken where it stands, on
+// both backends (spec §6.7), so a later argument that writes the cell in
+// place is NOT seen by the callee — JS copies the read for it. A captured
+// `mut` binding's receiver is spec §6.9's view, taken after the later
+// arguments, so its in-place write IS seen on both. A scalar, a `str` and an
+// `own` argument are read where they stand on both backends, and the earlier
+// arguments still run first.
 import std::hash::Hash;
 import std::hash::Hashable;
 import std::hash_set::HashSet;

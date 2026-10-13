@@ -33915,6 +33915,36 @@ impl<'src> Analyzer<'src> {
                     let Some(function_call) = self.function_calls.get(call_id) else {
                         continue;
                     };
+                    // F135 (R-a, door (1)): spec §6.7's `read()` COPIES, at the
+                    // moment it is evaluated. An argument read out of a cell —
+                    // `x.read()` or a spine through one (`x.read().items`,
+                    // `&x.read().rows[0]`) — is the cell's own storage on JS,
+                    // so a LATER argument of the same call that writes the
+                    // cell in place (`has(x.read().items, grow(x))`) would be
+                    // seen by the callee there and not natively, which copies
+                    // where the argument stands: the argument is a copy.
+                    // B457's policy (the callee writes) extended to a later
+                    // argument, whatever the callee — a closure value's call
+                    // included — and whatever position the read stands in.
+                    for (index, argument_id) in function_call.argument_ids.iter().enumerate() {
+                        let place = match self.expr_id_to_expr_map.get(argument_id) {
+                            Some(Expr::Reference(operand, false)) => *operand,
+                            _ => *argument_id,
+                        };
+                        // A cell no write mutates in place cannot be written by
+                        // a later argument: the call index is not built for it.
+                        let Some(cell) = self
+                            .shared_read_spine_cell(place)
+                            .filter(|cell| self.shared_cells.mutated.contains(cell))
+                        else {
+                            continue;
+                        };
+                        if function_call.argument_ids[index + 1..].iter().any(|later| {
+                            self.reaches_an_in_place_write(*later, cell, calls_index(self))
+                        }) {
+                            consider(self, place, None);
+                        }
+                    }
                     let callee_id = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
                         Some(Expr::Local(callee_id)) => *callee_id,
                         _ => continue,
@@ -35062,6 +35092,54 @@ impl<'src> Analyzer<'src> {
                     && self.span_map.get(write_id).is_some_and(|write_span| {
                         write_span.start >= start && write_span.end <= end
                     })
+            })
+    }
+
+    /// F135: the cell a `Shared::read()` spine reads out of — the read itself,
+    /// or a field, tuple slot or subscript over one (`x.read().rows[0]`) —
+    /// else `None`.
+    fn shared_read_spine_cell(&self, place: Id) -> Option<CellSlot> {
+        let mut current = place;
+        loop {
+            if let Some(cell) = self.shared_cells.reads.get(&current) {
+                return Some(*cell);
+            }
+            current = match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Field(subject, _, _)
+                | Expr::TupleIndex(subject, _, _)
+                | Expr::Index(subject, _)
+                | Expr::Ascribe(subject) => *subject,
+                _ => return None,
+            };
+        }
+    }
+
+    /// F135: whether evaluating `expr_id` can write `cell` in place — an
+    /// in-place write inside its span, or a call inside it (the expression
+    /// itself among them) whose write summary reaches one. A cell no write
+    /// mutates in place answers no at once.
+    fn reaches_an_in_place_write(
+        &self,
+        expr_id: Id,
+        cell: CellSlot,
+        calls: &LexicalCandidates,
+    ) -> bool {
+        if !self.shared_cells.mutated.contains(&cell) {
+            return false;
+        }
+        if self.spans_an_in_place_write(expr_id, cell) {
+            return true;
+        }
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        let mut summaries: HashMap<Id, bool> = HashMap::default();
+        calls
+            .inside(source, span.start, span.end)
+            .into_iter()
+            .any(|call_id| {
+                self.call_reaches_an_in_place_write(call_id, cell, calls, &mut summaries)
             })
     }
 
