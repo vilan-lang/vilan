@@ -21784,6 +21784,10 @@ impl<'src> Analyzer<'src> {
         let (name, arguments) = match &type_ {
             Type::Struct(id, arguments) => (self.structs.get(id).map(|s| s.name), arguments),
             Type::Enum(id, arguments) => (self.enums.get(id).map(|e| e.name), arguments),
+            // B611: a fixed array is `Hashable` when its element is — std's
+            // `impl [type T: Hashable; _] with Hashable`, read as `List`'s
+            // arm below reads `List` — at a literal length or a `const N`.
+            Type::Array(element, _) => return self.resolved_type_is_hashable(*element),
             _ => return false,
         };
         let Some(name) = name else {

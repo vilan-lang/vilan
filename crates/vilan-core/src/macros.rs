@@ -3100,8 +3100,8 @@ fn void_type_expr() -> js::Node<'static> {
 }
 
 /// The `List<GenericParameter>` for a struct/enum declaration's own parameters:
-/// each name, its written trait bounds, and its default AS WRITTEN (`""` when
-/// it has none). A TUPLE-bounded parameter (`T: (2..)`) reads with no bounds —
+/// each name, its written trait bounds, its default AS WRITTEN (`""` when
+/// it has none), and whether it is a length parameter (`const N`, B611). A TUPLE-bounded parameter (`T: (2..)`) reads with no bounds —
 /// the tuple form replaces the trait-bound list and has no v1 spelling in the
 /// reflection surface.
 ///
@@ -3133,6 +3133,9 @@ fn construct_generic_parameters(
                             .map(|default| slice(text, default.1).to_string())
                             .unwrap_or_default(),
                     ),
+                    // B611: a LENGTH parameter (`const N`), which a generated
+                    // impl binds as `const N`, never as a type binder.
+                    js::Node::Bool(parameter.is_const),
                 ])
             })
             .collect(),

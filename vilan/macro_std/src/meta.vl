@@ -68,10 +68,11 @@ export struct Field {
 }
 
 // One declared generic parameter of a struct or enum: its name, its written
-// trait bounds (`T: Json + Debug` collects both), and its default AS WRITTEN
-// (the `Self` in `<B = Self>`) or `""` when it has none. A parameter carrying
-// a TUPLE bound (`T: (2..)`) reads with an empty `bounds` — the tuple form
-// replaces the trait-bound list and has no v1 spelling here.
+// trait bounds (`T: Json + Debug` collects both), its default AS WRITTEN
+// (the `Self` in `<B = Self>`) or `""` when it has none, and whether it is a
+// LENGTH parameter (`const N`, which takes no bound and no default). A
+// parameter carrying a TUPLE bound (`T: (2..)`) reads with an empty `bounds` —
+// the tuple form replaces the trait-bound list and has no v1 spelling here.
 //
 // The subject's parameters are what keep a generated impl from spelling the
 // subject BARE in an applied position: `[derive(Wire)]` on `struct Handle<T>`
@@ -81,6 +82,7 @@ export struct GenericParameter {
 	name: str,
 	bounds: List<TypeExpr>,
 	default_: str,
+	is_const: bool,
 }
 
 // The subject as a derived impl must spell it in EVERY applied role — a
@@ -125,8 +127,9 @@ fun subject_spelling(name: str, generics: List<GenericParameter>): str {
 // the test.
 //
 // The declaration's own bounds and defaults belong to the declaration, not to
-// the impl, so neither is repeated here. A non-generic subject binds nothing
-// and renders `""`.
+// the impl, so neither is repeated here. A LENGTH parameter binds as `const N`
+// (B611): it stands for a number, so no trait is required of it, reached or
+// not. A non-generic subject binds nothing and renders `""`.
 fun derive_binders(generics: List<GenericParameter>, reached: List<str>, trait_name: str): str {
 	if generics.len() == 0 {
 		ret "";
@@ -145,7 +148,9 @@ fun derive_binders(generics: List<GenericParameter>, reached: List<str>, trait_n
 				is_reached = true;
 			}
 		}
-		if is_reached {
+		if parameter.is_const {
+			rendered = rendered + i"const {parameter.name}";
+		} else if is_reached {
 			rendered = rendered + i"type {parameter.name}: {trait_name}";
 		} else {
 			rendered = rendered + i"type {parameter.name}";
