@@ -711,7 +711,11 @@ impl<'src> Analyzer<'src> {
         let empty = SubstitutionContext::default();
         let mut subjects: Vec<String> = Vec::new();
         for implementation in &self.implementations {
-            if !files.contains(&implementation.source) {
+            // A derive's impl is provided from its attribute's file (B354).
+            let provided_from = self
+                .derived_origin_file(implementation.impl_id)
+                .unwrap_or(implementation.source);
+            if !files.contains(&provided_from) {
                 continue;
             }
             let Some((_, provided)) = implementation

@@ -3818,6 +3818,12 @@ impl Document {
         if let Some(rendered) = self.field_declaration_hover(program, offset) {
             return Some(rendered);
         }
+        // E312: a MACRO — a derive in `[derive(..)]` answers what it writes
+        // for this item and the trait it implements; any other macro its
+        // signature, under its `mod` line.
+        if let Some(rendered) = self.macro_hover(program, offset) {
+            return Some(rendered);
+        }
         // A type PARAMETER or a TRAIT named in type position (E240): the
         // parameter with its bound and the declaration that introduces it; the
         // trait's required members and its `///`.
@@ -4093,6 +4099,19 @@ impl Document {
             Block::Doc,
             named_trait.and_then(|definition| self.analysis(program).doc_comment_of(definition)),
         );
+        // E312: an IMPORT leaf that names a trait AND the derive macro of
+        // that name binds both; the second facet is said under the first.
+        if let Some(definition) = named_trait
+            && self.in_an_import(offset)
+            && let Some(name) = crate::references::name_of(program, Definition::Entity(definition))
+            && let Some(macro_id) = self.macro_named(program, name)
+        {
+            let mut also = format!("Also a derive macro: `[derive({name})]`.");
+            if let Some(doc) = self.analysis(program).doc_comment_of(macro_id) {
+                also.push_str(&format!("\n\n{doc}"));
+            }
+            out.push(Block::Doc, also);
+        }
         out.rendered()
     }
 
@@ -4257,6 +4276,175 @@ impl Document {
             .copied()
             .find(|module| program.source_of(*module) == Some(source))?;
         module_path(program, module)
+    }
+
+    /// E312: the hover for a MACRO named under `offset` — a derive in
+    /// `[derive(X)]`, a macro attribute, an import leaf naming only a macro, a
+    /// macro call. A derive answers with what it WRITES for this item: its
+    /// `mod` line and the generated impls' heads (`impl Account with
+    /// Storable`, one line each), the implemented trait's `///` and the
+    /// macro's own, and the macro facet as a note (`derive macro: macro fun
+    /// Storable(item: Item): Source`); a derive whose expansion was refused
+    /// leads with the refusal. Any other macro answers its signature under its
+    /// `mod` line, and its `///`.
+    fn macro_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (Some(macro_id), signature) = self.type_reference_at(program, offset)? else {
+            return None;
+        };
+        if !matches!(program.entity_map.get(&macro_id), Some(Expr::Macro)) {
+            return None;
+        }
+        let analysis = self.analysis(program);
+        let mod_line = self
+            .declaring_module_path(program, macro_id)
+            .map(|path| format!("mod {path}\n"))
+            .unwrap_or_default();
+        // The derive's own expansion: the generated runs whose attribute is
+        // the name under the caret, in this file.
+        let origins: Vec<(&std::ops::Range<u32>, Span)> = program
+            .derived_origins
+            .iter()
+            .filter(|(_, span, source)| {
+                *source == self.focus && span.start <= offset && offset < span.end
+            })
+            .map(|(range, span, _)| (range, *span))
+            .collect();
+        let generated: Vec<&vilan_core::analyzer::Implementation> = program
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                origins
+                    .iter()
+                    .any(|(range, _)| range.contains(&implementation.impl_id.0))
+            })
+            .collect();
+        let mut out = HoverBlocks::new();
+        // A refused derive leads with what refused it (E213's rule): the
+        // file's diagnostics at the derive's name.
+        if let Some(name_span) = origins
+            .first()
+            .map(|(_, span)| *span)
+            .or_else(|| self.text_word_span(offset))
+            && self
+                .analyzed_text()
+                .get(..name_span.start)
+                .is_some_and(|before| {
+                    before.trim_end().ends_with("derive(") || before.trim_end().ends_with(',')
+                })
+        {
+            for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+                if self
+                    .diagnostic_sources
+                    .get(index)
+                    .copied()
+                    .unwrap_or(SourceId(0))
+                    == self.focus
+                    && spans_overlap(diagnostic.span, name_span)
+                {
+                    out.push(Block::Diagnostic, diagnostic.msg.clone());
+                }
+            }
+        }
+        if generated.is_empty() {
+            out.push_code(Block::Signature, &format!("{mod_line}{signature}"));
+            out.push_some(Block::Doc, analysis.doc_comment_of(macro_id));
+            return out.rendered();
+        }
+        let heads: Vec<String> = generated
+            .iter()
+            .filter_map(|implementation| {
+                program.member_headers.get(&implementation.impl_id).cloned()
+            })
+            .collect();
+        out.push_code(Block::Signature, &format!("{mod_line}{}", heads.join("\n")));
+        out.push(Block::SignatureNote, format!("derive macro: `{signature}`"));
+        // The trait the reader is opting into: the generated impl's trait of
+        // the derive's own name, else the first it implements.
+        let name = self
+            .analyzed_text()
+            .get(origins[0].1.into_range())
+            .unwrap_or_default();
+        let implemented = generated
+            .iter()
+            .flat_map(|implementation| implementation.trait_ids.iter().copied())
+            .find(|trait_id| {
+                program
+                    .traits
+                    .get(trait_id)
+                    .is_some_and(|trait_| trait_.name == name)
+            })
+            .or_else(|| {
+                generated
+                    .iter()
+                    .flat_map(|implementation| implementation.trait_ids.iter().copied())
+                    .next()
+            });
+        out.push_some(
+            Block::Doc,
+            implemented.and_then(|trait_id| analysis.doc_comment_of(trait_id)),
+        );
+        out.push_some(Block::Doc, analysis.doc_comment_of(macro_id));
+        out.rendered()
+    }
+
+    /// The identifier span under `offset` in the analyzed text.
+    fn text_word_span(&self, offset: usize) -> Option<Span> {
+        let text = self.analyzed_text();
+        if !text
+            .as_bytes()
+            .get(offset)
+            .is_some_and(|byte| is_identifier_char(char::from(*byte)))
+        {
+            return None;
+        }
+        let start = text[..offset]
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |at| at + 1);
+        let end = text[offset..]
+            .find(|character: char| !is_identifier_char(character))
+            .map_or(text.len(), |at| offset + at);
+        Some(Span::from(start..end))
+    }
+
+    /// Whether `offset` sits inside an `import` statement — from the line's
+    /// `import` keyword to its `;`.
+    fn in_an_import(&self, offset: usize) -> bool {
+        let text = self.analyzed_text();
+        let Some(start) = text[..offset].rfind("import ") else {
+            return false;
+        };
+        !text[start..offset].contains(';')
+            && text[..start]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|head| head.trim().is_empty() || head.trim() == "export")
+    }
+
+    /// E312: the macro declared under `name` — read off each macro's name
+    /// span in its file. Asked only for an import leaf that names a trait.
+    fn macro_named(&self, program: &Program, name: &str) -> Option<Id> {
+        let mut macros: Vec<Id> = program
+            .entity_map
+            .iter()
+            .filter(|(_, expr)| matches!(expr, Expr::Macro))
+            .map(|(id, _)| *id)
+            .collect();
+        macros.sort_by_key(|id| id.0);
+        macros.into_iter().find(|id| {
+            let Some(span) = program.span_map.get(id) else {
+                return false;
+            };
+            let Some(path) = program
+                .source_of(*id)
+                .and_then(|source| program.source_path(source))
+            else {
+                return false;
+            };
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.get(span.into_range()).map(|word| word == name))
+                .unwrap_or(false)
+        })
     }
 
     /// E298: the origin root (`pkg`, `std`, a dependency) whose name is the

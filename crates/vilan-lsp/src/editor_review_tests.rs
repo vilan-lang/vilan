@@ -1199,3 +1199,90 @@ fn e310_a_trait_in_a_parameter_type_hovers_with_its_implementors() {
         );
     });
 }
+
+/// E312: a derive answers what it writes for THIS item (kolt `account.vl:9`'s
+/// `[derive(Storable)]`), the trait it implements and its own facet; a
+/// prelude derive likewise; the import leaf naming the trait AND the derive
+/// says both (`account.vl:2`); a user macro attribute keeps its signature,
+/// now under its `mod` line.
+#[test]
+fn e312_a_derive_answers_what_it_writes() {
+    on_big_stack(|| {
+        let client = "import std::reactive::store::{ Storable, Store };\n\n\
+             /// An account.\n[derive(Storable, PartialEq)]\nstruct Account {\n\tname: str,\n}\n\n\
+             macro fun derive_tag(item: Item): Source {\n\timport macro_std::source;\n\timport macro_std::meta::{ Item, Source };\n\tsource(\"\")\n}\n\n\
+             [derive_tag]\nstruct Point {\n\tx: i32,\n}\n\n\
+             fun main() {\n\tlet _ = Account { name = \"a\" };\n\tlet _: Option<Store<Account>> = None;\n}\n";
+        let package = Package::new("e312", &[("client.vl", client)]);
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let hover = |needle: &str| {
+            world
+                .hover(at(client, needle, 1))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        let storable = hover("Storable, PartialEq");
+        assert!(
+            storable.starts_with("```vilan\nmod std::reactive::store\nimpl Account with Storable\nimpl Store<Account>\n"),
+            "{storable}"
+        );
+        assert!(
+            storable.contains("derive macro: `macro fun Storable(item: Item): Source`"),
+            "{storable}"
+        );
+        assert!(
+            storable.contains("A type a store diffs by its shape."),
+            "{storable}"
+        );
+        let partial = hover("PartialEq)]");
+        assert!(
+            partial.starts_with("```vilan\nmod std::compare\nimpl Account with PartialEq\n```"),
+            "{partial}"
+        );
+        // The two-facet import leaf: the trait first, then the macro.
+        let leaf = hover("Storable, Store }");
+        assert!(
+            leaf.starts_with("```vilan\nmod std::reactive::store_core\ntrait Storable {"),
+            "{leaf}"
+        );
+        assert!(
+            leaf.contains("Also a derive macro: `[derive(Storable)]`."),
+            "{leaf}"
+        );
+        // A user macro attribute: its signature, under its `mod` line.
+        let tag = hover("derive_tag]");
+        assert_eq!(
+            tag,
+            "```vilan\nmod pkg::client\nmacro fun derive_tag(item: Item): Source\n```"
+        );
+    });
+}
+
+/// E312: a derive whose expansion is REFUSED leads with the refusal.
+#[test]
+fn e312_a_refused_derive_leads_with_the_refusal() {
+    on_big_stack(|| {
+        let client = "[derive(PartialEq)]\nstruct Hook {\n\trun: || void,\n}\n\nfun main() {}\n";
+        let package = Package::new("e312-refused", &[("client.vl", client)]);
+        let world = package.world();
+        let refusal = world
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.span.start <= at(client, "PartialEq", 0)
+                    && at(client, "PartialEq", 0) < diagnostic.span.end
+            })
+            .expect("the derive is refused at its name")
+            .msg
+            .clone();
+        let hover = world
+            .hover(at(client, "PartialEq", 2))
+            .expect("the derive hovers");
+        assert!(hover.starts_with(&refusal), "{hover}");
+        assert!(
+            hover.contains("macro fun PartialEq(item: Item): Source"),
+            "{hover}"
+        );
+        assert!(hover.contains("impl Hook with PartialEq"), "{hover}");
+    });
+}
