@@ -2191,6 +2191,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.mint(rebuilt)
     }
 
+    /// F137: a tuple LITERAL records no type of its own — `match (self,
+    /// other)`, the derived `PartialEq` of an enum, is the shape — so its
+    /// patterns had no element types to read a variant's arguments off, and
+    /// a generic enum's variant pattern fell back to the DECLARATION's own
+    /// parameters, which the impl's substitution does not bind (`Slots<any>`,
+    /// refused). The tuple of its elements' settled types, minted.
+    fn tuple_literal_type(&mut self, id: Id) -> Option<TypeId> {
+        let Some(Expr::Tuple(elements)) = self.program.entity_map.get(&id).cloned() else {
+            return None;
+        };
+        let mut types = Vec::with_capacity(elements.len());
+        for element in elements {
+            types.push(self.settled_value_type(element)?);
+        }
+        Some(self.mint(Type::Tuple(types, TupleLabels::NONE)))
+    }
+
     /// F101: the element types of a tuple-family type in this instance — a
     /// tuple's own elements, or a mapped tuple's `(U in T: F<U>)` template
     /// with `U` bound to each element of `T` (itself a family, so a mapped
@@ -8657,7 +8674,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `let`. A field subject asks only for the head, without minting
     /// ([`Self::call_value_head`], F92).
     fn settled_value_type(&mut self, id: Id) -> Option<TypeId> {
-        let recorded = self.type_of(id)?;
+        let Some(recorded) = self.type_of(id) else {
+            return self.tuple_literal_type(id);
+        };
         let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id).cloned() else {
             return Some(recorded);
         };

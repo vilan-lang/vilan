@@ -63,6 +63,11 @@ written down.
 <!-- family: fix -->
 **F136 (native): an aggregate holding a MAP of closures builds — a handler table `struct Table { handlers: HashMap<str, |i32| i32> }`, an enum payload, an `Option` and a `List` of such maps, a map of `Option`s of closures, and a `(str, closure)` pair were refused by name ("which has no reference equality — `Option`, `List` and a fixed array of one do"); JS ran them.** `vilan_rt::ReferenceEq` gains the map (std's `HashMap` equality: the same keys, order-insensitive, each value by reference) and its `(key, value)` entry (the key by value — a key is hashable, so it holds no closure); the equality is unobservable from vilan, closures not being `PartialEq`, so what matters is that the table builds. A shape still without an impl (a tuple of three holding a closure) keeps the named refusal, whose sentence now lists the map and the pair. Pins: `f136_a_map_of_closures_in_an_aggregate_builds_on_both_backends` (`native/map_of_closures_in_an_aggregate.vl`, new), F133's refusal half moved to the tuple of three, and vilan-rt's `a_map_of_closures_compares_its_values_by_reference_in_any_order`. Tracker F136.
 
+---
+
+<!-- family: fix -->
+**F137 (native): a GENERIC enum's derived `PartialEq` builds — `[derive(PartialEq)] enum Slots<T> { Full(List<T>), Empty }` then `s == t` was refused "the rust backend does not emit a generic type instantiated at `any`"; JS printed `true`.** The generator's body is `match (self, other) { .. }`, and a tuple LITERAL records no type of its own (the item's bisect: the analyzer's record is absent, not open), so each variant pattern under it read the enum's arguments off the declaration's own parameters, which the impl's substitution does not bind. The native emitter now types a tuple-literal subject by its elements' settled types — which also covers a generic function's own `match (left, right)` over two generic enums. Pin: `f137_a_generic_enums_derived_equality_builds_on_both_backends` (`native/generic_enum_derived_equality.vl`, new: two parameters, a nested generic payload, a unit variant, a generic function's tuple match). Tracker F137.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

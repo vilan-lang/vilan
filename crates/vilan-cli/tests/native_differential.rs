@@ -13409,6 +13409,32 @@ fn f136_a_map_of_closures_in_an_aggregate_builds_on_both_backends() {
     );
 }
 
+/// F137: a GENERIC enum's derived `PartialEq` (`[derive(PartialEq)] enum
+/// Slots<T> { Full(List<T>), Empty }`, then `s == t`) was refused natively
+/// "a generic type instantiated at `any`": the generator's body matches the
+/// tuple literal `(self, other)`, which records no type, so each variant
+/// pattern read the enum's arguments off the declaration's own parameters,
+/// which the impl's substitution does not bind. The analyzer's record was
+/// absent, not open (the item's bisect): the native emitter now types a
+/// tuple literal subject by its elements' settled types. Two parameters, a
+/// nested generic payload, and a generic function's own `match` over a tuple
+/// literal of generic enums.
+#[test]
+fn f137_a_generic_enums_derived_equality_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f137_generic_enum_derived_equality.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_enum_derived_equality.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic enum's derived equality must build natively at the site's argument"
+    );
+}
+
 /// B605: a generic function returning an object built over its own
 /// parameter — `pipe_of<P>(value: dyn Source<Option<P>>): dyn Pipe<Option<P>>
 /// { value.derive(|v| v) }` — was refused natively "a value of an unbound
