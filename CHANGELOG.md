@@ -133,6 +133,11 @@ written down.
 <!-- family: feature -->
 **E304: a function's label always states its return type — `fun quiet(): void` where the declaration writes none and returns nothing, the inferred type where the body returns one (`fun three() { 3 }` reads `fun three(): i32`), the written one as written.** The label ended at the parameter list exactly when the source did, so a reader could not tell a void function from one whose return type the label dropped. The label prints the solver's recorded EXACT inference of the return (the record the return checking already keeps for every function, called or not); with none it ends at its parameters, as before. Every reader of the label follows — hover, completion's detail, signature help, E206's second line, E240's "A type parameter of `fun …`", a trait's required-members block — and the conformance steer's suggested declaration with them; the source is untouched (`vilan fmt` keeps `fun f() {`). Five pins moved. Pin: `editor_review_tests::e304_a_function_label_always_states_its_return_type` (no annotation, a written `: void`, an inferred non-void, a method, an inferred method, a trait default, a requirement, a closure-typed parameter unchanged). Tracker E304.
 
+---
+
+<!-- family: fix -->
+**E308: a generic impl's or trait's member hovers under the receiver's instantiation — `get` in kolt `command_palette.vl:220`'s `filtered_commands.get()` reads `fun get(self): List<Hit<Command>>` under the declared `fun get(self): T`.** The item's premise (E206's line was minted only from the function's own substitution, so `get`, with none, got no line) was wrong: the call's substitution already carries the impl's binders as the receiver settled them, and the file's own analysis showed the line. kolt's file is a module served as a VIEW of its entry's world, whose E206 rows were the entry's alone — E313's cause, closed there. Pinned now as the item asked: the kolt shape, a function with both its own and the impl's parameters (one merged line, `fun map(self, f: |List<Hit<Command>>| usize): Boxed<usize>`), a trait member through a bound (`fun read(self): str`), a non-generic function (one line). Pin: `editor_review_tests::e308_a_generic_impls_member_renders_under_the_receivers_binders`. Tracker E308.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

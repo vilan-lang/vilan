@@ -1081,3 +1081,64 @@ fn e304_a_function_label_always_states_its_return_type() {
         assert_eq!(signature("apply(|x|", 0), "fun apply(f: |i32| i32): i32");
     });
 }
+
+/// E308: a member of a GENERIC impl or trait renders under the impl's
+/// binders as the receiver settled them — kolt `command_palette.vl:220`'s
+/// `filtered_commands.get()` reads `fun get(self): List<Hit<Command>>` under
+/// the declared `fun get(self): T` — merged with the function's own
+/// substitution into one line; a non-generic member shows one line.
+#[test]
+fn e308_a_generic_impls_member_renders_under_the_receivers_binders() {
+    on_big_stack(|| {
+        let source = "struct Hit<C> {\n\tcommand: C,\n}\n\nstruct Command {\n\tname: str,\n}\n\n\
+             struct Boxed<T> {\n\tvalue: T,\n}\n\n\
+             impl Boxed<type T> {\n\tfun get(self): T {\n\t\tself.value\n\t}\n\
+             \tfun map<U>(self, f: |T| U): Boxed<U> {\n\t\tBoxed { value = f(self.value) }\n\t}\n}\n\n\
+             trait Read<T> {\n\tfun read(self): T;\n}\n\n\
+             impl Command with Read<str> {\n\tfun read(self): str {\n\t\tself.name\n\t}\n}\n\n\
+             fun through<R: Read<str>>(reader: R): str {\n\treader.read()\n}\n\n\
+             fun plain(command: Command): str {\n\tcommand.name\n}\n\n\
+             fun main() {\n\tlet hits = Boxed { value = [Hit { command = Command { name = \"a\" } }] };\n\
+             \tlet _ = hits.get().len();\n\tlet _ = hits.map(|list| list.len()).get();\n\
+             \tlet _ = through(Command { name = \"b\" });\n\tlet _ = plain(Command { name = \"c\" });\n}\n";
+        let package = Package::new("e308", &[("client.vl", source)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let fence = |needle: &str| {
+            let hover = document
+                .hover(at(source, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover
+                .split("```")
+                .nth(1)
+                .expect("a fence")
+                .trim_start_matches("vilan\n")
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(
+            fence("get().len()"),
+            "mod pkg::client\nimpl Boxed<type T>\nfun get(self): T\n\nfun get(self): List<Hit<Command>>"
+        );
+        // The impl's `T` and the function's own `U`, one merged line.
+        assert_eq!(
+            fence("map(|list|"),
+            "mod pkg::client\nimpl Boxed<type T>\nfun map<U>(self, f: |T| U): Boxed<U>\n\n\
+             fun map(self, f: |List<Hit<Command>>| usize): Boxed<usize>"
+        );
+        // A trait member through a bound: the bound's arguments.
+        assert_eq!(
+            fence("read()"),
+            "mod pkg::client\ntrait Read<T>\nfun read(self): T\n\nfun read(self): str"
+        );
+        // A non-generic function: one line.
+        assert_eq!(
+            fence("plain(Command"),
+            "mod pkg::client\nfun plain(command: Command): str"
+        );
+    });
+}
