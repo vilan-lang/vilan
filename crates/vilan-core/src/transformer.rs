@@ -5392,6 +5392,14 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
         let zero = || js::Node::Number("0".to_string(), None);
+        // F135 (spec §6.7): a scalar read OUT OF A CELL (`&x.read().count`)
+        // is a value, copied where it is evaluated — a fresh holder, as an
+        // rvalue's, rather than a pair over the cell's live storage that a
+        // later write of the cell would show through.
+        if self.is_a_shared_read_spine(operand) {
+            let value = self.walk_entity(operand, block).unwrap_or(js::Node::Void);
+            return js::Node::Array(vec![js::Node::Array(vec![value]), zero()]);
+        }
         let (base, key) = match self.program.entity_map.get(&operand) {
             Some(Expr::Field(subject, _, field_index)) => (
                 self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
@@ -5458,6 +5466,36 @@ impl<'src> Transformer<'src> {
             ),
         };
         js::Node::Array(vec![base, key])
+    }
+
+    /// F135: whether `place` reads out of a `Shared::read()` — the read itself
+    /// or a field, tuple slot or subscript over one.
+    fn is_a_shared_read_spine(&self, place: Id) -> bool {
+        let mut current = place;
+        loop {
+            current = match self.program.entity_map.get(&current) {
+                Some(
+                    &Expr::Field(subject, _, _)
+                    | &Expr::TupleIndex(subject, _, _)
+                    | &Expr::Index(subject, _)
+                    | &Expr::Ascribe(subject),
+                ) => subject,
+                Some(Expr::Call(call_id)) => {
+                    return self
+                        .program
+                        .function_calls
+                        .get(call_id)
+                        .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                            Some(Expr::Local(function_id)) => {
+                                self.program.intrinsics.get(function_id)
+                            }
+                            _ => None,
+                        })
+                        .is_some_and(|intrinsic| matches!(intrinsic, Intrinsic::SharedValue));
+                }
+                _ => return false,
+            };
+        }
     }
 
     /// Whether this intrinsic call is a `Shared::write()` whose pointee resolves
@@ -6234,6 +6272,18 @@ impl<'src> Transformer<'src> {
                                 && this.value_resolves_to_scalar(arg)
                             {
                                 return Some(this.scalar_view_of_place(arg, block));
+                            }
+                            // F135 (spec §6.7: `read()` copies where it is
+                            // evaluated): a `&` of a cell's read that a later
+                            // argument writes in place lends a COPY — the
+                            // analyzer marks the read place, under the `&`.
+                            if let Some(&Expr::Reference(operand, false)) =
+                                this.program.entity_map.get(&arg)
+                                && this.program.clone_sites.contains_key(&operand)
+                                && !this.emits_scalar_view_ref(arg, operand)
+                            {
+                                let node = this.walk_entity(operand, block)?;
+                                return Some(this.maybe_clone(operand, node));
                             }
                             // An argument to an `own` parameter is copied (marked in
                             // `clone_sites`), like a binding copy.

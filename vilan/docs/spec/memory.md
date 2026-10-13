@@ -433,6 +433,21 @@ cell under another live view traps, while overlapping writes through the
 cell do not (the reconciled trap law of §6.0; a `write` view is *not*
 exclusive). See [cells](../std/cells.md).
 
+**`read()` copies where it is evaluated, on both backends.** A `read()` is a
+value, not a view: an argument read out of a cell — `cell.read()`, or a
+field, tuple slot or element of one — is what the cell held when that
+argument was evaluated. A LATER argument of the same call that writes the
+cell, in place (`cell.write().items.push(9)`) or by replacing the field
+(`cell.write().items = [..]`), is therefore not seen by the callee:
+`has(cell.read().items, grow(cell))` answers from the items before `grow`.
+A program that wants the written value reads after the write
+(`let added = grow(cell); has(cell.read().items, added)`). The JavaScript
+backend, whose read would otherwise hand on the cell's own storage, copies
+such an argument (and one whose callee writes the cell); the native backend
+copies every read out of the cell's borrow where it stands. This is not
+§6.9's view of a captured binding, which is taken after the call's other
+arguments.
+
 ## 6.8 Resources and destruction
 
 *(Design: [destruction](https://github.com/vilan-lang/proposals/blob/main/proposal/destruction.md).)* Rule 1 copies values, and a

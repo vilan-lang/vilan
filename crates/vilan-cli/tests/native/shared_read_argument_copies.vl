@@ -1,0 +1,63 @@
+// F135 (R-a, door (1)): spec §6.7's `read()` copies at the moment it is
+// evaluated, on both backends. A read argument beside a LATER argument that
+// writes the same cell in place is a copy on JS too (it had been the cell's
+// own storage there, so the callee saw the later write): a bare read, a
+// scalar `&` view of a read's field, a callee that is a closure value, a
+// later block that writes the cell itself, and a read that a later argument
+// replaces whole. A read beside a later argument that writes ANOTHER cell
+// is untouched.
+import std::io::print;
+import std::shared::Shared;
+
+struct Bag {
+	items: List<i32>,
+	count: i32,
+}
+
+fun grow(cell: Shared<Bag>): i32 {
+	cell.write().items.push(9);
+	cell.write().count += 1;
+	9
+}
+
+fun replace(cell: Shared<Bag>): i32 {
+	cell.write().items = [9];
+	9
+}
+
+fun whole(bag: Bag, value: i32): bool {
+	bag.items.contains(value)
+}
+
+fun seen(count: &i32, value: i32): i32 {
+	*count + value
+}
+
+fun has(items: List<i32>, value: i32): bool {
+	items.contains(value)
+}
+
+fun fresh(): Shared<Bag> {
+	Shared::new(Bag { items = [], count = 0 })
+}
+
+fun main() {
+	let a = fresh();
+	print(whole(a.read(), grow(a)));
+	let b = fresh();
+	print(seen(&b.read().count, grow(b)));
+	let c = fresh();
+	let check = |items: List<i32>, value: i32| items.contains(value);
+	print(check(c.read().items, grow(c)));
+	let d = fresh();
+	print(has(d.read().items, {
+		d.write().items.push(9);
+		9
+	}));
+	let e = fresh();
+	print(has(e.read().items, replace(e)));
+	let f = fresh();
+	let g = fresh();
+	print(has(f.read().items, grow(g)));
+	print(f.read().items.len() + g.read().items.len());
+}
