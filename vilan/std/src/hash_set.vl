@@ -6,7 +6,7 @@
 // underlying native map; the original value is stored alongside so `for x in set`
 // yields real `T`s in INSERTION order, on both backends: a duplicate insert keeps
 // its value's place, and a value removed and inserted again goes to the end.
-import pkg::compare::PartialEq;
+import pkg::compare::{ Eq, PartialEq };
 import pkg::debug::Debug;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
@@ -128,6 +128,10 @@ impl HashSet<type T: Hashable> with PartialEq {
 		true
 	}
 }
+
+/// A set of `Eq` elements is `Eq` (B621): its `eq` is the `PartialEq` impl above,
+/// membership by the canonical `Hash`.
+impl HashSet<type T: Hashable + Eq> with Eq {}
 
 /// The set half of the explicit termination family, and the end of an iterator
 /// chain: `xs.iter().filter(f).to_list().to_set()`. Duplicates collapse and the

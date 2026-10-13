@@ -32,6 +32,10 @@ trait Ord with Eq + PartialOrd {
 
 - `==`/`!=` dispatch through `PartialEq`; `<`/`<=`/`>`/`>=` through
   `PartialOrd`. Numbers, `str`, and `bool` implement them in std.
+- `Eq` marks an equality that is total. The integers, `str` and `bool`
+  are `Eq` (the floats are not: NaN), and `List<T>`, `Option<T>`,
+  `Result<T, E>`, `HashSet<T>` and `HashMap<K, V>` are `Eq` when what
+  they hold is, so a `T: Eq` takes `[1, 2]`, `Some(true)` and `Ok(1)`.
 - A tuple is `PartialEq` when its elements are, compared position by
   position at any arity: `(1, "a") == (1, "a")`, and a `T: PartialEq`
   takes a pair; it is `Eq` when its elements are. Ordering a tuple is not
@@ -51,8 +55,10 @@ trait Default {
 ```
 
 Zero for numbers, `""` for `str`, `false` for `bool`, `None` for
-`Option<T>`, and the empty container for `List<T>`, `HashMap<K, V>` and
-`HashSet<T>`. `[derive(Default)]` composes fields' defaults — so a struct
+`Option<T>`, the empty container for `List<T>`, `HashMap<K, V>` and
+`HashSet<T>`, and the element's default at every position for a fixed
+array `[T; n]`. `default_of<T>()` is `T::default()` spelled for a type
+that cannot head a path: `default_of<[i32; 4]>()`. `[derive(Default)]` composes fields' defaults — so a struct
 holding a container derives one. Used as a bound by helpers like
 `unwrap_or_default` and `List.sum`.
 

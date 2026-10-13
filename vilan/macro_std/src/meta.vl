@@ -37,6 +37,15 @@ export impl TypeExpr {
 			rendered + ">"
 		}
 	}
+
+	// Whether this type can head a path — `Point::default()`,
+	// `Option<i32>::from_json_value(..)`: a named type, applied or not. A fixed
+	// array, a tuple, a closure or a reference arrives as opaque text (see
+	// `mentions`) and cannot, so a generator calls an associated function of one
+	// through a generic helper instead — `default_of<[i32; 2]>()` (B623).
+	fun is_path_head(self): bool {
+		!opaque_type_text(self.name)
+	}
 }
 
 // One struct field: its name, its written type, whether it is marked

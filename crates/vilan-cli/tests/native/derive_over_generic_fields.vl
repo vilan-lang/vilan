@@ -1,0 +1,43 @@
+// B622: `[derive(Hashable)]` over a generic struct's generic fields (`T`,
+// `List<T>`, `Option<T>`, `[T; N]`, a derived `Inner<T>`), read under the
+// derived impl's own binders, the same on both backends.
+import std::hash::Hashable;
+import std::io::print;
+
+[derive(Hashable)]
+struct Inner<T> {
+	v: T,
+}
+
+[derive(Hashable)]
+struct Holder<T> {
+	item: T,
+	items: List<T>,
+	maybe: Option<T>,
+	inner: Inner<T>,
+}
+
+[derive(Hashable)]
+struct Buf<T, const N> {
+	items: [T; N],
+}
+
+[derive(Hashable)]
+enum Either<L, R> {
+	Left(L),
+	Right(List<R>),
+}
+
+fun holder(value: i32): Holder<i32> {
+	Holder { item = value, items = [value], maybe = Some(value), inner = Inner { v = value } }
+}
+
+fun main() {
+	print(holder(1).hash() == holder(1).hash());
+	print(holder(1).hash() == holder(2).hash());
+	let buffer: Buf<str, 2> = Buf { items = ["x", "y"] };
+	print(buffer.hash() == Buf { items = ["x", "y"] }.hash());
+	let left: Either<i32, str> = Either::Left(3);
+	let right: Either<i32, str> = Either::Right(["r"]);
+	print(left.hash() == right.hash());
+}

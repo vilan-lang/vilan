@@ -909,6 +909,18 @@ export fun json_codec(): Codec {
 // helpers are file-scoped (each file compiles as its own hermetic world);
 // the `Wire` TRAIT stays in `wire.vl`. Outputs carry their own imports.
 
+// `T::from_json_value(value)` as the generated decoders spell it: a type that heads
+// a path calls its own, and one that cannot (a fixed array:
+// `[i32; 2]::from_json_value(..)` is no expression) calls the generic
+// `from_json_value_of<[i32; 2]>(..)`, which the `Json` derive imports (B623).
+macro fun decoded(type_: TypeExpr, value: str): str {
+	if type_.is_path_head() {
+		i"{type_.render()}::from_json_value({value})"
+	} else {
+		i"from_json_value_of<{type_.render()}>({value})"
+	}
+}
+
 export macro fun struct_json_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of, init_of, quote, join };
 
@@ -954,7 +966,7 @@ export macro fun struct_json_impls(target: StructItem): str {
 	mut literal = init_of(target.name);
 	for field in target.fields {
 		let label = quote(field.name);
-		literal = literal.field(field.name, i"{field.type_.render()}::from_json_value(value.field({label}))!");
+		literal = literal.field(field.name, decoded(field.type_, i"value.field({label})") + "!");
 	}
 	from_json_value = from_json_value.expr(i"Result::Ok({literal.render()})");
 	impl_of(target.name)
@@ -1098,17 +1110,17 @@ export macro fun enum_json_impls(target: EnumItem): str {
 		if arity == 0 {
 			from_arms = from_arms.arm(tag, i"Result::Ok({target.name}::{variant.name})");
 		} else if arity == 1 {
-			let payload_type = match variant.payload.get(0) {
-				Some(let type_) => type_.render(),
-				None => "_",
+			let payload = match variant.payload.get(0) {
+				Some(let type_) => decoded(type_, i"value.field({tag})"),
+				None => i"_::from_json_value(value.field({tag}))",
 			};
-			from_arms = from_arms.arm(tag, i"Result::Ok({target.name}::{variant.name}({payload_type}::from_json_value(value.field({tag}))!))");
+			from_arms = from_arms.arm(tag, i"Result::Ok({target.name}::{variant.name}({payload}!))");
 		} else {
 			mut elements: List<str> = [];
 			mut index = 0;
 			for type_ in variant.payload {
 				let position = quote(i"{index}");
-				elements.push(i"{type_.render()}::from_json_value(value.field({tag}).field({position}))!");
+				elements.push(decoded(type_, i"value.field({tag}).field({position})") + "!");
 				index = index + 1;
 			}
 			let element_list = join(elements, ", ");
@@ -1281,17 +1293,38 @@ export macro fun Json(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	if item.as_struct() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n"
+		mut types: List<TypeExpr> = [];
+		for field in target.fields {
+			types.push(field.type_);
+		}
+		ret source(i"import std::json::\{ Json, FromJson, JsonValue{decoder_imports(types)} \};\n"
 			+ "import std::result::Result;\n"
 			+ struct_json_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n"
+		mut types: List<TypeExpr> = [];
+		for variant in target.variants {
+			for type_ in variant.payload {
+				types.push(type_);
+			}
+		}
+		ret source(i"import std::json::\{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str{decoder_imports(types)} \};\n"
 			+ "import std::result::Result;\n"
 			+ "import std::option::Option;\n"
 			+ enum_json_impls(target));
 	}
 	source("")
+}
+
+// The helper `decoded` spells a member through, imported only where some member
+// needs it so a derive over path-headed types is unchanged (B623).
+macro fun decoder_imports(types: List<TypeExpr>): str {
+	for type_ in types {
+		if !type_.is_path_head() {
+			ret ", from_json_value_of";
+		}
+	}
+	""
 }
 
 // `[derive(Wire)]` emits the §6.1 VISITOR impls and nothing else (B301).
@@ -1538,5 +1571,85 @@ export impl Result<type T: FromJson, type E: FromJson> with FromJson {
 			"Err" => Ok(Err(E::from_json_value(value.field("Err"))!)),
 			_ => Err("unknown variant in JSON for enum Result"),
 		}
+	}
+}
+
+// --- Fixed arrays (array-lengths' second std wave, B623) ---
+// Last in the file so the lines above keep their numbers (the corpus goldens
+// carry std source positions).
+
+// A fixed array is a JSON array, as a `List` is: each element serialized via its
+// own `to_json`.
+export impl [type T: Json; _] with Json {
+	fun to_json(self): str {
+		mut result = "[";
+		mut first = true;
+		for element in self {
+			if !first {
+				result = result + ",";
+			}
+			result = result + element.to_json();
+			first = false;
+		}
+		result + "]"
+	}
+}
+
+/// `T::from_json_value(value)` spelled as a call every type can make: a fixed
+/// array cannot head a path (`[i32; 2]::from_json_value(..)` is no expression),
+/// so `[derive(Json)]` decodes such a field through this (B623).
+export fun from_json_value_of<T: FromJson>(value: JsonValue): Result<T, str> {
+	T::from_json_value(value)
+}
+
+// A JSON array rebuilds into a fixed array when it holds exactly `N` elements;
+// another count is a decode error naming both, as a wrong shape is.
+export impl [type T: FromJson; const N] with FromJson {
+	fun from_json(text: str): Result<[T; N], str> {
+		match text.try_parse_json() {
+			Some(let value) => from_json_value_of<[T; N]>(value),
+			None => Err("not valid JSON"),
+		}
+	}
+	fun from_json_value(value: JsonValue): Result<[T; N], str> {
+		if value.kind() != JsonKind::Array {
+			ret Err("expected an array");
+		}
+		let elements = value.elements();
+		if elements.len() != N {
+			ret Err(i"expected an array of {N} elements, found {elements.len()}");
+		}
+		// The first element seeds every position and each later one overwrites its
+		// own: there is no `List` to `[T; N]` conversion to build from (the paper's
+		// `to_array` is unbuilt), and the length is checked above, so `elements[0]`
+		// is there — the empty array is the impl below.
+		mut result = [T::from_json_value(elements[0])!; N];
+		mut index = 1;
+		for index < N {
+			result[index] = T::from_json_value(elements[index])!;
+			index += 1;
+		}
+		Ok(result)
+	}
+}
+
+// The empty array: nothing seeds the repeat above, so length 0 is its own impl,
+// the more specific one (array-lengths.md §5.4).
+export impl [type T: FromJson; 0] with FromJson {
+	fun from_json(text: str): Result<[T; 0], str> {
+		match text.try_parse_json() {
+			Some(let value) => from_json_value_of<[T; 0]>(value),
+			None => Err("not valid JSON"),
+		}
+	}
+	fun from_json_value(value: JsonValue): Result<[T; 0], str> {
+		if value.kind() != JsonKind::Array {
+			ret Err("expected an array");
+		}
+		let count = value.elements().len();
+		if count != 0 {
+			ret Err(i"expected an array of 0 elements, found {count}");
+		}
+		Ok([])
 	}
 }
