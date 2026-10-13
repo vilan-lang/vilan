@@ -19,10 +19,12 @@ use crate::util::{join_with, plural};
 
 mod auto_annotations;
 mod dbg_stack;
+mod held_tables;
 mod hint_labels;
 mod hover_labels;
 pub mod id_windows;
 mod item_records;
+mod live_ranges;
 mod liveness;
 mod written_types;
 
@@ -4629,6 +4631,12 @@ pub struct Analyzer<'src> {
     /// M110 S7 (Order 51): the per-item records' state for this analysis
     /// (`analyzer/item_records.rs`).
     items: item_records::ItemState,
+    /// M110 S7b: the calls whose top-level R11 discovery SEEDED an
+    /// instantiation this analysis — walked for a live call, replayed from
+    /// the record for a reused module's or served item's (`ModuleTables::
+    /// r11_seed_calls`) — filed per source and per item by the class D
+    /// partition for the analysis that will replay them.
+    r11_seed_calls: Vec<Id>,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -4663,6 +4671,24 @@ pub struct Analyzer<'src> {
     // M110 S7: `world_table_ranges` with the served items' windows merged in
     // — what `table_entity` searches.
     table_ranges: Vec<(u32, u32)>,
+    // M110 S7b (Order 52): the LIVE ranges — the complement of the three
+    // predicates' reused ranges over entity-id space (`live_ranges.rs`):
+    // `reusable_entity`'s (frozen ∪ `reusable_ranges`), `table_entity`'s
+    // (`table_ranges`) and the bound audit's module grain (frozen ∪
+    // `world_ranges`). Sealed with them; a whole-program pass walks these
+    // instead of sweeping the table and asking per entity.
+    live_class_a: live_ranges::LiveRanges,
+    live_table: live_ranges::LiveRanges,
+    live_module: live_ranges::LiveRanges,
+    // M110 S7b: the held table passes' lane — the complement of the modules'
+    // and items' ranges whose record carried held rows (`held_tables.rs`).
+    live_held: live_ranges::LiveRanges,
+    // M110 S7b: the view bindings and the view origins, computed ONCE per
+    // analysis for the five checks and the two tail passes that ask (each
+    // was a fixpoint over every binding of the program per ask). Cleared
+    // before the tree rewrites of the extraction tail, which move reads.
+    view_bindings_memo: std::cell::OnceCell<HashSet<Id>>,
+    view_origins_memo: std::cell::OnceCell<HashMap<Id, Vec<Id>>>,
     // M19 T1b: those sources, in ascending order — the phase line's second
     // count and the record pass's exclusion list.
     reused_table_sources: Vec<SourceId>,
@@ -7821,12 +7847,19 @@ impl<'src> Analyzer<'src> {
             prefix_entity_end: None,
             prefix_type_end: None,
             items: item_records::ItemState::default(),
+            r11_seed_calls: Vec::new(),
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reusable_ranges: Vec::new(),
             reused_sources: Vec::new(),
             world_table_ranges: Vec::new(),
             table_ranges: Vec::new(),
+            live_class_a: live_ranges::LiveRanges::default(),
+            live_table: live_ranges::LiveRanges::default(),
+            live_module: live_ranges::LiveRanges::default(),
+            live_held: live_ranges::LiveRanges::default(),
+            view_bindings_memo: std::cell::OnceCell::new(),
+            view_origins_memo: std::cell::OnceCell::new(),
             reused_table_sources: Vec::new(),
             restored_tables: RestoredTables::default(),
             drop_scan_roots: HashSet::default(),
@@ -9109,23 +9142,29 @@ impl<'src> Analyzer<'src> {
         // diagnostic to find. The slots the skipped questions would have
         // minted are not minted: no reader depends on a post-settle
         // `TypeId`'s VALUE (the census in the S2a entry of the CHANGELOG).
-        let mut served: u64 = 0;
-        let recorded: Vec<(Id, SubstitutionContext)> = self
-            .method_call_substitution
-            .iter()
-            .filter(|(call_id, _)| {
-                // M110 S7: MODULE grain, deliberately — a re-walked file's
-                // items keep their sites live (`item_records`: the question
-                // names the callee's constraint slot, and the hot set's own
-                // impls are the late impls the record's guard would ask of).
-                let reused = (self.frozen_entity(**call_id) || self.world_entity(**call_id))
-                    && !self.bound_recompute_site(**call_id);
-                served += u64::from(reused);
-                !reused
-            })
+        // M110 S7: MODULE grain, deliberately — a re-walked file's items keep
+        // their sites live (`item_records`: the question names the callee's
+        // constraint slot, and the hot set's own impls are the late impls the
+        // record's guard would ask of). M143 (S7b): the live modules' sites
+        // are WALKED (`live_module_entries`) rather than every recorded site
+        // of the program asked; the reused modules whose audit must re-run
+        // (`bound_recompute_ranges`: a late impl answers one of their
+        // recorded questions) are added by range.
+        let mut recorded: Vec<(Id, SubstitutionContext)> = self
+            .live_module_entries(&self.method_call_substitution)
             .map(|(call_id, substitution)| (*call_id, substitution.clone()))
             .collect();
+        for (start, end) in self.bound_recompute_ranges.clone() {
+            for id in (start..end).map(Id) {
+                if !self.live_module.covers(id.0)
+                    && let Some(substitution) = self.method_call_substitution.get(&id)
+                {
+                    recorded.push((id, substitution.clone()));
+                }
+            }
+        }
         let checked = recorded.len() as u64;
+        let served = (self.method_call_substitution.len() as u64).saturating_sub(checked);
         crate::incremental::update_census(|census| {
             census.bound_sites_served += served;
             census.bound_sites_checked += checked;
@@ -14315,15 +14354,15 @@ impl<'src> Analyzer<'src> {
         // 1. Arguments to an `any` parameter. Only direct `Local(callee)` calls
         //    are resolved — dispatched / generic callees are conservatively
         //    skipped, as in the view-argument checks.
-        for expr in self.expr_id_to_expr_map.values() {
+        // S1: keyed on the call site — a std callee with an `any` parameter
+        // called from entry keeps its entry-anchored report. M110 S7b: the
+        // live calls only, walked.
+        for (_, expr) in self.live_entries_where(&self.expr_id_to_expr_map, |expr| {
+            matches!(expr, Expr::Call(_))
+        }) {
             let Expr::Call(call_id) = expr else {
                 continue;
             };
-            // S1: keyed on the call site — a std callee with an `any`
-            // parameter called from entry keeps its entry-anchored report.
-            if self.reusable_entity(*call_id) {
-                continue;
-            }
             let Some(function_call) = self.function_calls.get(call_id) else {
                 continue;
             };
@@ -14354,11 +14393,8 @@ impl<'src> Analyzer<'src> {
         // 2. A binding annotated `any` (an inferred `any` is not a coercion —
         //    an unannotated `let x = db` infers the resource type, which R1's
         //    move rules police, not R12).
-        for variable in self.variables.values() {
-            // S1: the coercion anchors at the binding's own initializer.
-            if self.reusable_entity(variable.id) {
-                continue;
-            }
+        // S1: the coercion anchors at the binding's own initializer.
+        for (_, variable) in self.live_entries(&self.variables) {
             if variable.annotated
                 && matches!(variable.type_id.get_type(self), Type::Any)
                 && let Some(initial) = variable.initial
@@ -19114,11 +19150,6 @@ impl<'src> Analyzer<'src> {
         }
         let mut worklist: VecDeque<R11Instance> = VecDeque::new();
         let mut enqueued: HashSet<(Id, Vec<TypeId>)> = HashSet::default();
-        // B65 rides R11 unchanged, like every other rule: a capture's loan-ness
-        // is whole-program, so the same set serves every instantiation. B109's
-        // return crossings ride it for the same reason.
-        let loaned_captures = self.collect_loaned_pattern_captures();
-        let value_crossings = self.compute_return_value_crossings();
 
         // Seed: every call in the program, under NO known generic-resources — so
         // only a parameter bound to a CONCRETE resource seeds a check. (A call
@@ -19131,10 +19162,30 @@ impl<'src> Analyzer<'src> {
         self.seed_inherited_default_admissions(&mut worklist, &mut enqueued);
         let empty: HashSet<TypeId> = HashSet::default();
         let mut seed_memo: HashMap<TypeId, bool> = HashMap::default();
-        let all_calls: Vec<Id> = self.function_calls.keys().copied().collect();
+        // M110 S7b: a reused module's and a served item's calls are not
+        // discovered again — the calls among them that SEEDED an instantiation
+        // when they were last walked come back as a class D row
+        // (`r11_seed_calls`), and only those are asked. The walk keeps
+        // `function_calls`' order over every call, live and replayed alike,
+        // because the first call to seed an instantiation is the one that
+        // reports it, and a clean analysis walks them all in that order. The
+        // instantiations themselves are re-derived here on every analysis —
+        // their verdicts anchor inside the CALLEE's body, which may be another
+        // module's, so nothing of R11 is replayed.
+        let all_calls: Vec<Id> = self
+            .function_calls
+            .keys()
+            .copied()
+            .filter(|call_id| {
+                self.live_table.covers(call_id.0)
+                    || self.restored_tables.r11_seed_calls.contains(call_id)
+            })
+            .collect();
+        self.r11_seed_calls.clear();
         for call_id in all_calls {
             // M134: R11's mints at this instantiation belong to the call's item.
             self.id_windows.set_anchor(call_id);
+            let enqueued_before = enqueued.len();
             self.r11_discover(
                 call_id,
                 &empty,
@@ -19142,8 +19193,20 @@ impl<'src> Analyzer<'src> {
                 &mut worklist,
                 &mut enqueued,
             );
+            if enqueued.len() > enqueued_before {
+                self.r11_seed_calls.push(call_id);
+            }
         }
+        crate::phase_pass_mark("R11: the seed walk");
 
+        // The whole-program sets an instantiation's scan reads, built at the
+        // FIRST instantiation (M110 S7b): a served keystroke whose live calls
+        // seed nothing pays for none of them.
+        //
+        // B65 rides R11 unchanged, like every other rule: a capture's loan-ness
+        // is whole-program, so the same set serves every instantiation. B109's
+        // return crossings ride it for the same reason.
+        //
         // M94: the three candidate kinds an instantiation classifies, indexed
         // ONCE by source span. Every reader of what they yield (the body scan,
         // the exactly-once and partial-move checks) asks only about the
@@ -19151,37 +19214,59 @@ impl<'src> Analyzer<'src> {
         // slices out the candidates inside the callee's declaration instead
         // of re-classifying the whole program — which, with `Flow`/`Pipe` as
         // `[resource]` traits, made R11 O(instances × program).
-        let binding_candidates = LexicalCandidates::build(
-            self,
-            self.variables
-                .values()
-                .map(|variable| variable.id)
-                .chain(self.parameters.values().map(|parameter| parameter.id)),
-        );
-        let place_candidates = LexicalCandidates::build(
-            self,
-            self.expr_id_to_expr_map
-                .iter()
-                .filter(|(_, expr)| {
-                    matches!(
-                        expr,
-                        Expr::Local(_)
-                            | Expr::Field(_, _, _)
-                            | Expr::TupleIndex(_, _, _)
-                            | Expr::Index(_, _)
-                    )
-                })
-                .map(|(id, _)| *id),
-        );
-        let test_candidates = LexicalCandidates::build(
-            self,
-            self.expr_id_to_expr_map
-                .iter()
-                .filter(|(_, expr)| matches!(expr, Expr::Is(..)))
-                .map(|(id, _)| *id),
-        );
+        struct R11Sets {
+            loaned_captures: HashMap<Id, Id>,
+            value_crossings: HashSet<Id>,
+            binding_candidates: LexicalCandidates,
+            place_candidates: LexicalCandidates,
+            test_candidates: LexicalCandidates,
+        }
+        let mut sets: Option<R11Sets> = None;
 
         while let Some(instance) = worklist.pop_front() {
+            if sets.is_none() {
+                sets = Some(R11Sets {
+                    loaned_captures: self.collect_loaned_pattern_captures(),
+                    value_crossings: self.compute_return_value_crossings(),
+                    binding_candidates: LexicalCandidates::build(
+                        self,
+                        self.variables
+                            .values()
+                            .map(|variable| variable.id)
+                            .chain(self.parameters.values().map(|parameter| parameter.id)),
+                    ),
+                    place_candidates: LexicalCandidates::build(
+                        self,
+                        self.expr_id_to_expr_map
+                            .iter()
+                            .filter(|(_, expr)| {
+                                matches!(
+                                    expr,
+                                    Expr::Local(_)
+                                        | Expr::Field(_, _, _)
+                                        | Expr::TupleIndex(_, _, _)
+                                        | Expr::Index(_, _)
+                                )
+                            })
+                            .map(|(id, _)| *id),
+                    ),
+                    test_candidates: LexicalCandidates::build(
+                        self,
+                        self.expr_id_to_expr_map
+                            .iter()
+                            .filter(|(_, expr)| matches!(expr, Expr::Is(..)))
+                            .map(|(id, _)| *id),
+                    ),
+                });
+                crate::phase_pass_mark("R11: the whole-program sets");
+            }
+            let R11Sets {
+                loaned_captures,
+                value_crossings,
+                binding_candidates,
+                place_candidates,
+                test_candidates,
+            } = sets.as_ref().expect("built above");
             let resources: HashSet<TypeId> = instance.resources.iter().copied().collect();
             // Delta classification: only the places whose resource-ness is CAUSED
             // by this instantiation (resource under the parameter set, but not
@@ -19217,7 +19302,7 @@ impl<'src> Analyzer<'src> {
             let partial_move_roots = self.collect_partial_move_roots(
                 &resource_value_places,
                 &no_module_level,
-                &loaned_captures,
+                loaned_captures,
                 &known_instantiation,
             );
             let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
@@ -19229,9 +19314,9 @@ impl<'src> Analyzer<'src> {
                     resource_bindings: &resource_bindings,
                     resource_value_places: &resource_value_places,
                     module_level_bindings: &no_module_level,
-                    loaned_captures: &loaned_captures,
+                    loaned_captures,
                     is_refinements: &is_refinements,
-                    value_crossings: &value_crossings,
+                    value_crossings,
                     partial_move_roots: &partial_move_roots,
                     dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
                 };
@@ -27123,83 +27208,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Every binding a write in the program can reach: an assignment's place
-    /// root, an explicit `&mut place`, and any argument — the receiver
-    /// included — bound to a `&mut` parameter. A write through some OTHER name
-    /// for the same storage still lands here, because taking the `&mut` that
-    /// makes the second name is itself one of the three forms.
-    ///
-    /// Split by what the write DOES to the storage at the root — see
-    /// [`WrittenRoots`], whose two sets answer two different questions.
-    ///
-    /// Whole-program, computed once: the pass that consumes it
-    /// ([`Self::compute_capture_clone_sites`]) is whole-program too, and a
-    /// per-body split would buy nothing — a binding is local to one body.
-    fn collect_written_roots(&self) -> WrittenRoots {
-        let mut written_places: Vec<Id> = Vec::new();
-        let mut in_place_writes: Vec<Id> = Vec::new();
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                Expr::Assignment(target_id, _) => {
-                    written_places.push(*target_id);
-                    // B88: the one write form that leaves the storage alone.
-                    // Assigning a whole OWNED binding rebinds it — a fresh
-                    // value is installed and every alias of the old one keeps
-                    // the old one — so it cannot reach into a subject temp.
-                    // Any DEEPER target writes into the storage that temp
-                    // aliases, and through a VIEW root even the whole-binding
-                    // form is an in-place write, since that is how a write
-                    // through a view reaches the caller at all.
-                    let rebinds = matches!(
-                        self.expr_id_to_expr_map.get(target_id),
-                        Some(Expr::Local(_))
-                    ) && !self.subject_is_writable_view(*target_id);
-                    if !rebinds {
-                        in_place_writes.push(*target_id);
-                    }
-                }
-                Expr::Reference(operand_id, true) => {
-                    written_places.push(*operand_id);
-                    in_place_writes.push(*operand_id);
-                }
-                Expr::Call(call_id) => {
-                    let Some(function_call) = self.function_calls.get(call_id) else {
-                        continue;
-                    };
-                    // An unresolvable callee (dispatched, generic) is
-                    // conservative: every place argument counts as written.
-                    match self.callee_conventions(function_call.subject_id) {
-                        Some(conventions) => {
-                            for (index, argument_id) in
-                                function_call.argument_ids.iter().enumerate()
-                            {
-                                if conventions.get(index).copied() == Some(Convention::RefMut) {
-                                    written_places.push(*argument_id);
-                                    in_place_writes.push(*argument_id);
-                                }
-                            }
-                        }
-                        None => {
-                            written_places.extend(&function_call.argument_ids);
-                            in_place_writes.extend(&function_call.argument_ids);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let roots = |places: Vec<Id>| -> HashSet<Id> {
-            places
-                .into_iter()
-                .filter_map(|place_id| self.place_root(place_id))
-                .collect()
-        };
-        WrittenRoots {
-            any: roots(written_places),
-            in_place: roots(in_place_writes),
-        }
-    }
-
     /// The SHARE elision's predicate: whether a capture may alias this subject
     /// instead of copying it — i.e. whether anything can write through the
     /// place while the alias is live.
@@ -27489,6 +27497,24 @@ impl<'src> Analyzer<'src> {
 
     /// Local bindings that hold a view (`let v = &x`, or `let w = v` where `v`
     /// is one) — a greatest fixpoint, since a view can be copied between locals.
+    /// [`Self::compute_view_bindings`] once per analysis (M110 S7b).
+    fn view_bindings(&self) -> &HashSet<Id> {
+        self.view_bindings_memo
+            .get_or_init(|| self.compute_view_bindings())
+    }
+
+    /// [`Self::compute_view_origins`] once per analysis (M110 S7b).
+    fn view_origins(&self) -> &HashMap<Id, Vec<Id>> {
+        self.view_origins_memo
+            .get_or_init(|| self.compute_view_origins())
+    }
+
+    /// Forgets both memos: the tree is about to be rewritten.
+    fn clear_view_memos(&mut self) {
+        self.view_bindings_memo.take();
+        self.view_origins_memo.take();
+    }
+
     fn compute_view_bindings(&self) -> HashSet<Id> {
         // A `for e in &mut list` binding, or a `Some(let v)` capture over a
         // wrapped-view call, holds a view with no `initial` to follow.
@@ -27841,6 +27867,17 @@ impl<'src> Analyzer<'src> {
         let external_ids: Vec<Id> = self.external_functions.keys().copied().collect();
         for external_id in external_ids {
             if self.bumps_tabled.contains(&external_id) {
+                continue;
+            }
+            // M110 S7b: a restored module's externals come back as rows too
+            // (an empty verdict has no row and is the default); the
+            // declaration is the whole input, so the row is the answer.
+            if self.table_entity(external_id) {
+                if let Some(positions) = self.restored_tables.bumps.get(&external_id).cloned()
+                    && let Some(external) = self.external_functions.get_mut(&external_id)
+                {
+                    external.bumps = positions;
+                }
                 continue;
             }
             let Some(parameters) = self
@@ -28292,7 +28329,7 @@ impl<'src> Analyzer<'src> {
 
     /// recovered later by `borrows` (Phase 5).
     fn check_view_escape(&mut self) {
-        let view_bindings = self.compute_view_bindings();
+        let view_bindings = self.view_bindings().clone();
         // A closure that captures a view is itself second-class (P4c): it cannot
         // escape either, or the captured view would outlive its target.
         let closure_ids: Vec<Id> = self.closures.keys().copied().collect();
@@ -28339,12 +28376,10 @@ impl<'src> Analyzer<'src> {
         // C16's own list: the argument id and the callee that keeps it, which is
         // the whole diagnosis and the reason this escape gets its own sentence.
         let mut stored_escapes: Vec<(Id, String)> = Vec::new();
-        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
-            // S1: every escape this loop finds anchors inside the iterated
-            // expression; the precomputes above stay whole-program.
-            if self.reusable_entity(*expr_id) {
-                continue;
-            }
+        // S1: every escape this loop finds anchors inside the iterated
+        // expression; the precomputes above stay whole-program. M110 S7b: the
+        // live expressions only, walked.
+        for (_, expr) in self.live_entries(&self.expr_id_to_expr_map) {
             match expr {
                 Expr::FunctionReturn(Some(value_id))
                     if !function_return_value_ids.contains(value_id)
@@ -30428,11 +30463,10 @@ impl<'src> Analyzer<'src> {
         // between "restored" and "derived here" is exact — every call this skips
         // contributed exactly the row the record holds for it.
         let mut calls: HashSet<Id> = self.restored_tables.scalar_view_calls.clone();
+        // M110 S7b: the live calls only, walked.
         calls.extend(
-            self.function_calls
-                .keys()
-                .copied()
-                .filter(|call_id| !self.table_entity(*call_id))
+            self.live_table_entries(&self.function_calls)
+                .map(|(call_id, _)| *call_id)
                 .filter(|call_id| self.call_returns_scalar_view(*call_id)),
         );
         calls
@@ -30444,14 +30478,15 @@ impl<'src> Analyzer<'src> {
     fn compute_scalar_view_refs(&self) -> HashSet<Id> {
         // M19 T1b: as above — the key is the expression the loop is standing on.
         let mut refs: HashSet<Id> = self.restored_tables.scalar_view_refs.clone();
+        // M110 S7b: the live expressions only, walked.
         refs.extend(
-            self.expr_id_to_expr_map
-                .iter()
-                .filter(|(expr_id, _)| !self.table_entity(**expr_id))
-                .filter_map(|(expr_id, expr)| match expr {
-                    Expr::Reference(operand, _) if self.place_is_scalar(*operand) => Some(*expr_id),
-                    _ => None,
-                }),
+            self.live_table_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Reference(..))
+            })
+            .filter_map(|(expr_id, expr)| match expr {
+                Expr::Reference(operand, _) if self.place_is_scalar(*operand) => Some(*expr_id),
+                _ => None,
+            }),
         );
         refs
     }
@@ -30529,11 +30564,11 @@ impl<'src> Analyzer<'src> {
     /// `&self` calls are not events; index-into-container views root at the
     /// container, so element granularity is the container (conservative).
     fn check_invalidation(&mut self) {
-        let view_origins = self.compute_view_origins();
+        let view_origins = self.view_origins().clone();
         // E1/E2 match by ORIGIN (which local root a view borrows); E3 needs
         // every live view, origin or not — a `shared.read()` view has no
         // local root but must still fence `await`.
-        let mut view_bindings = self.compute_view_bindings();
+        let mut view_bindings = self.view_bindings().clone();
         view_bindings.extend(view_origins.keys().copied());
         // No early return on an empty set: the signature rule (below) must
         // run even in a program with no view BINDINGS at all — an async
@@ -30544,19 +30579,16 @@ impl<'src> Analyzer<'src> {
             view_bindings: &view_bindings,
             view_anchors: &view_anchors,
         };
+        // S1: every violation the scan finds anchors inside the scanned
+        // body; the precomputed view sets above stay whole-program. M110 S7b:
+        // the live bodies only, walked.
         let bodies: Vec<(Id, Vec<Id>, Id)> = self
-            .functions
-            .iter()
+            .live_entries(&self.functions)
             .filter(|(_, function)| function.has_body)
-            // S1: every violation the scan finds anchors inside the scanned
-            // body; the precomputed view sets above stay whole-program.
-            .filter(|(id, _)| !self.reusable_entity(**id))
             .map(|(id, function)| (*id, function.body.0.clone(), function.body.1))
             .collect();
         let closure_returns: Vec<Id> = self
-            .closures
-            .iter()
-            .filter(|(closure_id, _)| !self.reusable_entity(**closure_id))
+            .live_entries(&self.closures)
             .map(|(_, closure)| closure.return_)
             .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
@@ -31280,19 +31312,19 @@ impl<'src> Analyzer<'src> {
     /// binding isn't read after the inner scope — reseating an outer view to a
     /// block-local place serves no purpose anyway.
     fn check_reseat_escape(&mut self) {
-        let view_bindings = self.compute_view_bindings();
+        let view_bindings = self.view_bindings().clone();
         if view_bindings.is_empty() {
             return;
         }
         let mut violations: Vec<(Id, &'src str)> = Vec::new();
-        for (assignment_id, expr) in &self.expr_id_to_expr_map {
+        // S1: the violation anchors at the assignment itself (M110 S7b: the
+        // live expressions only, walked).
+        for (assignment_id, expr) in self.live_entries_where(&self.expr_id_to_expr_map, |expr| {
+            matches!(expr, Expr::Assignment(..))
+        }) {
             let Expr::Assignment(target_id, value_id) = expr else {
                 continue;
             };
-            // S1: the violation anchors at the assignment itself.
-            if self.reusable_entity(*assignment_id) {
-                continue;
-            }
             // A reseat targets the view binding itself (`view = …`), not `*view`.
             let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(target_id) else {
                 continue;
@@ -31746,16 +31778,17 @@ impl<'src> Analyzer<'src> {
     /// after `build()`, once field accessors have resolved to `Expr::Field`, so
     /// the whole place chain is walkable.
     fn check_readonly_mutation(&mut self) {
+        // S1: a frozen (std) assignment's mutability was judged when std was
+        // pinned clean; the skip keys on the assignment itself. M110 S7b: the
+        // live assignments only, walked.
         let assignment_targets: Vec<Id> = self
-            .expr_id_to_expr_map
-            .values()
-            .filter_map(|expr| match expr {
+            .live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Assignment(..))
+            })
+            .filter_map(|(_, expr)| match expr {
                 Expr::Assignment(target_id, _) => Some(*target_id),
                 _ => None,
             })
-            // S1: a frozen (std) assignment's mutability was judged when std
-            // was pinned clean; the skip keys on the assignment itself.
-            .filter(|target_id| !self.reusable_entity(*target_id))
             .collect();
         // B571 §7.1: a write THROUGH an ascription — an assignment whose place
         // stands on one, or a `&mut` view of one — is refused before the
@@ -31765,23 +31798,23 @@ impl<'src> Analyzer<'src> {
         if !self.ascriptions.is_empty() {
             let mut written_places = assignment_targets.clone();
             written_places.extend(
-                self.expr_id_to_expr_map
-                    .iter()
-                    .filter_map(|(id, expr)| match expr {
-                        // A view of an ascription ITSELF was refused where the
-                        // `&` is written (`refuse_view_of_ascription`).
-                        Expr::Reference(operand, true)
-                            if !matches!(
-                                self.expr_id_to_expr_map.get(operand),
-                                Some(Expr::Ascribe(_))
-                            ) =>
-                        {
-                            Some((*id, *operand))
-                        }
-                        _ => None,
-                    })
-                    .filter(|(id, _)| !self.reusable_entity(*id))
-                    .map(|(_, operand)| operand),
+                self.live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                    matches!(expr, Expr::Reference(_, true))
+                })
+                .filter_map(|(id, expr)| match expr {
+                    // A view of an ascription ITSELF was refused where the
+                    // `&` is written (`refuse_view_of_ascription`).
+                    Expr::Reference(operand, true)
+                        if !matches!(
+                            self.expr_id_to_expr_map.get(operand),
+                            Some(Expr::Ascribe(_))
+                        ) =>
+                    {
+                        Some((*id, *operand))
+                    }
+                    _ => None,
+                })
+                .map(|(_, operand)| operand),
             );
             written_places.sort_by_key(|id| id.0);
             for place_id in written_places {
@@ -31837,14 +31870,15 @@ impl<'src> Analyzer<'src> {
     /// is a place when every element is). A target that failed to resolve, a
     /// `*` target and a lifted chain already carry their own refusal.
     fn check_assignment_places(&mut self) {
+        // M110 S7b: the live assignments only, walked.
         let mut assignment_targets: Vec<Id> = self
-            .expr_id_to_expr_map
-            .values()
-            .filter_map(|expr| match expr {
+            .live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Assignment(..))
+            })
+            .filter_map(|(_, expr)| match expr {
                 Expr::Assignment(target_id, _) => Some(*target_id),
                 _ => None,
             })
-            .filter(|target_id| !self.reusable_entity(*target_id))
             .collect();
         // Source order, so a program with several reports them in reading order.
         assignment_targets.sort_unstable_by_key(|target_id| target_id.0);
@@ -32523,16 +32557,17 @@ impl<'src> Analyzer<'src> {
     /// calls (`subject -> Local(callee)`) are resolved; dispatched/generic
     /// callees are conservatively skipped.
     fn check_mutable_arguments(&mut self) {
+        // S1: keyed on the CALL SITE, never the callee — an entry call into
+        // a `&mut`-parameter std function must keep its diagnostic. M110 S7b:
+        // the live calls only, walked.
         let call_ids: Vec<Id> = self
-            .expr_id_to_expr_map
-            .values()
-            .filter_map(|expr| match expr {
+            .live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Call(_))
+            })
+            .filter_map(|(_, expr)| match expr {
                 Expr::Call(call_id) => Some(*call_id),
                 _ => None,
             })
-            // S1: keyed on the CALL SITE, never the callee — an entry call
-            // into a `&mut`-parameter std function must keep its diagnostic.
-            .filter(|call_id| !self.reusable_entity(*call_id))
             .collect();
         for call_id in call_ids {
             let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -32678,13 +32713,11 @@ impl<'src> Analyzer<'src> {
     fn check_view_value_reads(&mut self) {
         // The fixpoint stays whole-program: an entry expression can read a
         // std module-level binding, so narrowing it would change verdicts.
-        let view_bindings = self.compute_view_bindings();
+        let view_bindings = self.view_bindings().clone();
         let mut leaks: Vec<Id> = Vec::new();
-        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
-            // S1: the leak anchors inside the iterated expression.
-            if self.reusable_entity(*expr_id) {
-                continue;
-            }
+        // S1: the leak anchors inside the iterated expression. M110 S7b: the
+        // live expressions only, walked (`live_entries`).
+        for (_, expr) in self.live_entries(&self.expr_id_to_expr_map) {
             match expr {
                 // Both operands of a binary operator are values.
                 Expr::Binary(_, lhs, rhs) => {
@@ -32817,15 +32850,16 @@ impl<'src> Analyzer<'src> {
     /// sees bare-place arguments; an *explicit* `&mut a` argument (or any other
     /// `&mut a`, e.g. `let v = &mut a`) is caught here.
     fn check_mutable_references(&mut self) {
+        // S1: the reference expression is its own anchor. M110 S7b: the live
+        // expressions only, walked.
         let references: Vec<(Id, Id)> = self
-            .expr_id_to_expr_map
-            .iter()
+            .live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Reference(_, true))
+            })
             .filter_map(|(reference_id, expr)| match expr {
                 Expr::Reference(operand_id, true) => Some((*reference_id, *operand_id)),
                 _ => None,
             })
-            // S1: the reference expression is its own anchor.
-            .filter(|(reference_id, _)| !self.reusable_entity(*reference_id))
             .collect();
         for (reference_id, operand_id) in references {
             if let Some((name, fix)) = self.readonly_root(operand_id) {
@@ -32859,10 +32893,12 @@ impl<'src> Analyzer<'src> {
     /// Runs after `infer_borrows`, so a `borrows`-call initializer counts as a
     /// view.
     fn check_view_bindings(&mut self) {
+        // S1: a binding's diagnostics anchor at its own declaration.
+        // Synthetic and derived bindings have no frozen range and stay. M110
+        // S7b: the live bindings only, walked.
         let bindings: Vec<(Id, bool, Option<Id>, &'src str, Span)> = self
-            .variables
-            .values()
-            .map(|variable| {
+            .live_entries(&self.variables)
+            .map(|(_, variable)| {
                 (
                     variable.id,
                     variable.mutable,
@@ -32871,9 +32907,6 @@ impl<'src> Analyzer<'src> {
                     variable.name_span,
                 )
             })
-            // S1: a binding's diagnostics anchor at its own declaration.
-            // Synthetic and derived bindings have no frozen range and stay.
-            .filter(|(binding_id, ..)| !self.reusable_entity(*binding_id))
             .collect();
         for (binding_id, mutable, initial, name, name_span) in bindings {
             let holds_view = self.binding_or_param_is_view(binding_id);
@@ -32924,16 +32957,16 @@ impl<'src> Analyzer<'src> {
     /// `subject -> Local(callee)` calls are resolved; dispatched/generic callees
     /// are conservatively skipped (as elsewhere).
     fn check_view_arguments(&mut self) {
+        // S1: keyed on the call site, never the callee (as in
+        // `check_mutable_arguments` above); the live calls only, walked.
         let call_ids: Vec<Id> = self
-            .expr_id_to_expr_map
-            .values()
-            .filter_map(|expr| match expr {
+            .live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Call(_))
+            })
+            .filter_map(|(_, expr)| match expr {
                 Expr::Call(call_id) => Some(*call_id),
                 _ => None,
             })
-            // S1: keyed on the call site, never the callee (as in
-            // `check_mutable_arguments` above).
-            .filter(|call_id| !self.reusable_entity(*call_id))
             .collect();
         for call_id in call_ids {
             let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -33551,17 +33584,14 @@ impl<'src> Analyzer<'src> {
         // S1: both sweeps key on the discarding statement's own home — a std
         // `[must_use]` function discarded in entry code still warns (the
         // statement is entry-side); std's own discards were pinned clean.
-        for function in self.functions.values() {
-            if self.reusable_entity(function.id) {
-                continue;
-            }
+        // M110 S7b: the live functions and blocks only, walked.
+        for (_, function) in self.live_entries(&self.functions) {
             statements.extend(function.body.0.iter().copied());
         }
-        for (block_id, expr) in self.expr_id_to_expr_map.iter() {
+        for (_, expr) in self.live_entries_where(&self.expr_id_to_expr_map, |expr| {
+            matches!(expr, Expr::Block(_))
+        }) {
             if let Expr::Block((block_statements, _tail)) = expr {
-                if self.reusable_entity(*block_id) {
-                    continue;
-                }
                 statements.extend(block_statements.iter().copied());
             }
         }
@@ -33659,22 +33689,18 @@ impl<'src> Analyzer<'src> {
         // span lives in `member_name_spans` under the access expr (the call's
         // own id). A free call's subject carries the callee-name span itself.
         let mut call_subjects: HashSet<Id> = HashSet::default();
-        for (call_id, call) in self.function_calls.iter() {
+        // M19 T1: was `std_sources.contains(source_of_id(..))` — a LINEAR
+        // scan of `source_ranges` per call site, at 53 sources and 116k
+        // expressions most of this check's cost; the sealed ranges answer the
+        // wider question: a deprecation warning inside a reused module is
+        // remembered, not re-derived. M110 S7b: the live calls only, walked.
+        // The `source_of_id` below runs only for the sites that actually warn.
+        for (call_id, call) in self.live_entries(&self.function_calls) {
             let Some(Expr::Local(target_id)) = self.expr_id_to_expr_map.get(&call.subject_id)
             else {
                 continue;
             };
             call_subjects.insert(call.subject_id);
-            // M19 T1: was `std_sources.contains(source_of_id(..))` — a LINEAR
-            // scan of `source_ranges` per call site, at 53 sources and 116k
-            // expressions most of this check's cost. `reusable_entity` is the
-            // sealed binary search, and it answers the wider question: a
-            // deprecation warning inside a reused module is remembered, not
-            // re-derived. The `source_of_id` below now runs only for the sites
-            // that actually warn.
-            if self.reusable_entity(*call_id) {
-                continue;
-            }
             let Some((name, steer)) = self.deprecated_steer(target_id) else {
                 continue;
             };
@@ -33689,11 +33715,13 @@ impl<'src> Analyzer<'src> {
         // Pass 2 — the remaining references (the function passed as a value):
         // every resolved `Expr::Local` to a deprecated function that is not
         // some call's callee, anchored at its own (name) span.
-        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+        for (expr_id, expr) in self.live_entries_where(&self.expr_id_to_expr_map, |expr| {
+            matches!(expr, Expr::Local(_))
+        }) {
             let Expr::Local(target_id) = expr else {
                 continue;
             };
-            if call_subjects.contains(expr_id) || self.reusable_entity(*expr_id) {
+            if call_subjects.contains(expr_id) {
                 continue;
             }
             let Some((name, steer)) = self.deprecated_steer(target_id) else {
@@ -33759,7 +33787,11 @@ impl<'src> Analyzer<'src> {
     /// binding is the cell — `shared.read().push(x)` grows it — and the receiver
     /// is the only position a value reaches a `&mut` binding through, a `&mut`
     /// parameter taking a view and nothing else.
-    fn compute_clone_sites(&mut self, shared_captures: &HashSet<Id>) -> HashMap<Id, CopyDecision> {
+    fn compute_clone_sites(
+        &mut self,
+        shared_captures: &HashSet<Id>,
+        calls: &std::cell::OnceCell<LexicalCandidates>,
+    ) -> HashMap<Id, CopyDecision> {
         self.donated_projections = self.compute_donated_projections(shared_captures);
         // Phase 1 — the candidate positions, collected before any classifying
         // so the (`&mut`, memoizing) resource query can run over them.
@@ -33811,24 +33843,18 @@ impl<'src> Analyzer<'src> {
         // M96: B457's call-through test asks, per loop and per function, which
         // calls lie inside a span. Indexed once here, where the expression map
         // is iterated and not changed, in that iteration's order.
-        let calls = LexicalCandidates::build(
-            self,
-            self.expr_id_to_expr_map
-                .iter()
-                .filter(|(_, expr)| matches!(expr, Expr::Call(_)))
-                .map(|(id, _)| *id),
-        );
-        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
-            // M19 T1b: a reused module's decisions are restored below. Every
-            // position this loop `consider`s is a sub-expression of the entry it
-            // is standing on, so skipping the expression skips exactly the rows
-            // the record holds — and `is_elidable_copy`, the one input that
-            // could have been the ENTRY's, cannot be: it answers true only for a
-            // binding the last-use pass is not opaque about, and a binding
-            // touched from a second region is opaque by construction.
-            if self.table_entity(*expr_id) {
-                continue;
-            }
+        // M110 S7b: built at the first ask — a served keystroke whose live
+        // positions never reach B457's call-through test pays nothing for it.
+        let calls_index = |analyzer: &Self| -> &LexicalCandidates { analyzer.calls_index(calls) };
+        // M19 T1b: a reused module's decisions are restored below. Every
+        // position this loop `consider`s is a sub-expression of the entry it
+        // is standing on, so skipping the expression skips exactly the rows
+        // the record holds — and `is_elidable_copy`, the one input that
+        // could have been the ENTRY's, cannot be: it answers true only for a
+        // binding the last-use pass is not opaque about, and a binding
+        // touched from a second region is opaque by construction. M110 S7b:
+        // the live expressions only, walked (`live_table_entries`).
+        for (expr_id, expr) in self.live_table_entries(&self.expr_id_to_expr_map) {
             match expr {
                 Expr::Variable(variable_id) => {
                     if let Some(variable) = self.variables.get(variable_id)
@@ -33876,7 +33902,11 @@ impl<'src> Analyzer<'src> {
                 Expr::ForEach(iterable_id, _, _) => {
                     if let Some(cell) = self.shared_cells.reads.get(iterable_id).copied()
                         && (self.spans_an_in_place_write(*expr_id, cell)
-                            || self.spans_a_call_reaching_a_write(*expr_id, cell, &calls))
+                            || self.spans_a_call_reaching_a_write(
+                                *expr_id,
+                                cell,
+                                calls_index(self),
+                            ))
                     {
                         consider(self, *iterable_id, None);
                     }
@@ -33971,7 +34001,7 @@ impl<'src> Analyzer<'src> {
                                     self.function_reaches_an_in_place_write(
                                         callee_id,
                                         cell,
-                                        &calls,
+                                        calls_index(self),
                                         &mut HashMap::default(),
                                     )
                                 });
@@ -34173,11 +34203,10 @@ impl<'src> Analyzer<'src> {
         // leaves and their decisions are restored below. The seam id is the
         // returning expression, which lives in the same file as the leaves it
         // reaches, so skipping it skips exactly the rows the record holds.
+        // M110 S7b: the live closures only, walked.
         let mut seams: Vec<(Id, Option<Id>, bool)> = self
-            .closures
-            .values()
-            .filter(|closure| !self.table_entity(closure.id))
-            .map(|closure| (closure.return_, Some(closure.id), false))
+            .live_table_entries(&self.closures)
+            .map(|(_, closure)| (closure.return_, Some(closure.id), false))
             .collect();
         seams.extend(
             self.return_sites
@@ -34307,55 +34336,16 @@ impl<'src> Analyzer<'src> {
     /// classification, 158–342 ms of a 5.7 s debug checks phase on kolt's
     /// client leg against the drop planner's gate at 950–1230 ms in the same
     /// phase. It is named residue rather than left unmentioned.
-    fn compute_capture_clone_sites(&mut self, written_roots: &WrittenRoots) -> CapturePlan {
+    fn compute_capture_clone_sites(&mut self, held: &held_tables::HeldFold) -> CapturePlan {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
         // leg's body). A capture rooting one of those must clone even under
         // the elision below: the alias would ride the seam out (the
-        // `unwrap` leak).
-        let mut candidates: Vec<(Id, Id)> = Vec::new();
-        let mut seam_roots: HashSet<Id> = HashSet::default();
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                Expr::Destructure(value_id, pattern) => {
-                    if self.is_capture_subject_place(*value_id) {
-                        let mut captures = Vec::new();
-                        Self::collect_pattern_captures(pattern, &mut captures);
-                        candidates.extend(captures.into_iter().map(|id| (id, *value_id)));
-                    }
-                }
-                Expr::Match(subject_id, legs) => {
-                    for leg in legs {
-                        self.insert_seam_roots(leg.body, &mut seam_roots);
-                        if self.is_capture_subject_place(*subject_id) {
-                            let mut captures = Vec::new();
-                            Self::collect_pattern_captures(&leg.pattern, &mut captures);
-                            candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
-                        }
-                    }
-                }
-                Expr::Is(subject_id, pattern) if self.is_capture_subject_place(*subject_id) => {
-                    let mut captures = Vec::new();
-                    Self::collect_pattern_captures(pattern, &mut captures);
-                    candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
-                }
-                _ => {}
-            }
-        }
-        let closure_tails: Vec<Id> = self
-            .closures
-            .values()
-            .map(|closure| closure.return_)
-            .collect();
-        for tail in closure_tails {
-            self.insert_seam_roots(tail, &mut seam_roots);
-        }
-        // Every function return position — the tail and each value-carrying
-        // `ret` of every bodied function (B116's join, completed by B134).
-        for (_, value_id) in &self.return_sites {
-            self.insert_seam_roots(*value_id, &mut seam_roots);
-        }
+        // `unwrap` leak). M110 S7b: both are the fold's (`held_tables.rs`).
+        let candidates: &[(Id, Id)] = &held.captures;
+        let seam_roots = &held.capture_seam_roots;
+        let written_roots = &held.written;
         // Phase 2 — the type filter (second because `type_is_resource`
         // memoizes, `&mut`), then the SHARE elision: an IMMUTABLE capture
         // from a STABLE subject (`share_subject_is_stable` — nothing can
@@ -34376,7 +34366,7 @@ impl<'src> Analyzer<'src> {
         let mut classified: Vec<(Id, Id, CopyDecision)> = Vec::new();
         let mut shared: HashSet<Id> = HashSet::default();
         let mut materialized: HashSet<Id> = HashSet::default();
-        for (capture_id, subject_id) in candidates {
+        for &(capture_id, subject_id) in candidates {
             let Some((type_id, capture_is_mutable)) = self
                 .variables
                 .get(&capture_id)
@@ -34517,7 +34507,39 @@ impl<'src> Analyzer<'src> {
         // item rather than searched per slot. A slot in no window (the
         // resolve's and the base's unanchored mints, "the program's") still
         // asks through the spill map, and is counted as a miss as before.
-        let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().collect();
+        //
+        // M110 S7b: a restored MODULE's slots are not classified again — its
+        // resource slots come back as a class D row (`ModuleTables::
+        // resource_slots`: the same ids on every hit, §2.1) and the walk
+        // covers the complement of the restored sources' runs. A cold check,
+        // with nothing restored, walks the whole table as before.
+        let restored_runs: Vec<(u32, u32)> = if self.reused_table_sources.is_empty() {
+            Vec::new()
+        } else {
+            let runs = self.type_id_sources.runs();
+            runs.iter()
+                .enumerate()
+                .filter(|(_, (_, source))| self.reused_table_sources.binary_search(source).is_ok())
+                .map(|(index, (start, _))| {
+                    let end = runs
+                        .get(index + 1)
+                        .map_or(self.type_id_sources.high(), |(next, _)| *next);
+                    (*start, end)
+                })
+                .collect()
+        };
+        let live_slots = live_ranges::LiveRanges::complement(&restored_runs, self.type_id);
+        let type_ids: Vec<TypeId> = live_slots
+            .ids()
+            .map(TypeId)
+            .filter(|type_id| self.type_id_to_type_map.contains_key(type_id))
+            .collect();
+        let restored: Vec<TypeId> = self
+            .restored_tables
+            .resource_slots
+            .iter()
+            .copied()
+            .collect();
         let windows: Vec<(u32, u32, usize)> = if self.id_windows.on() {
             self.id_windows
                 .windows
@@ -34546,23 +34568,8 @@ impl<'src> Analyzer<'src> {
                 }
                 self.type_is_resource(*type_id)
             })
+            .chain(restored)
             .collect()
-    }
-
-    /// Record every place ROOT a seam expression can hand out. The scan has to
-    /// look THROUGH the forms that forward a value without being places
-    /// themselves — a braced match leg (`Some(let inner) => { inner }`), an
-    /// `if`/`match` in tail position — or a returned capture slips out
-    /// un-copied and the alias leaks anyway. `collect_tail_leaves` is the same
-    /// shape the view-escape checks walk with.
-    fn insert_seam_roots(&self, expr_id: Id, seam_roots: &mut HashSet<Id>) {
-        let mut leaves = Vec::new();
-        self.collect_tail_leaves(expr_id, &mut leaves);
-        for leaf in leaves {
-            if let Some(root) = self.place_root(leaf) {
-                seam_roots.insert(root);
-            }
-        }
     }
 
     /// Every `Binding` capture id in a pattern tree, in declaration (source)
@@ -34696,203 +34703,6 @@ impl<'src> Analyzer<'src> {
         matches!(type_id.borrow_type(self), Type::Struct(id, _) if *id == shared_struct_id)
     }
 
-    /// B267: the program's [`SharedCells`] — one walk over the expression map.
-    ///
-    /// Three things come out of it, and each is a syntactic fact rather than an
-    /// inference: which slots can hold one cell (the unions), which cells a
-    /// write mutates in place (the classification), and where the reads are.
-    ///
-    /// **Why unions rather than a root comparison.** `place_root` answers
-    /// "which binding is this path rooted at", which is not cell identity: a
-    /// local minted by `Shared::new` and then stored in a struct field is one
-    /// cell under two names, and `let g = h.clone()` hands the same cell to a
-    /// second name outright, so a write through either reaches a read through
-    /// the other. Every way a handle can move between slots is one of four
-    /// forms — a binding's initializer, a construction slot, an assignment,
-    /// and `clone()` — so unioning at those four and dropping everything ELSE
-    /// into `Unknown` covers the relation without an alias analysis.
-    ///
-    /// **Under a counted `Shared` this walk stays, and becomes easier to
-    /// justify** (C14 §11 Q7). It approximates cell identity statically
-    /// because today there is no runtime answer to approximate: nothing
-    /// counts, so nothing in a running program knows which handles name one
-    /// cell, and the approximation is load-bearing for CORRECTNESS — every
-    /// hole in the `Unknown` sink is a copy that should have been taken and
-    /// was not, which is a miscompile (the match-capture hole in pass 2 below
-    /// was exactly that, measured). Counting (C14 S4) produces the runtime
-    /// answer, and this walk becomes what it always wanted to be: an ELISION
-    /// heuristic over a fact the runtime also holds, where a wrong
-    /// approximation costs a copy nobody needed rather than one somebody did.
-    /// A strictly better failure mode, reached by adding a count rather than
-    /// by making the walk cleverer.
-    fn compute_shared_cells(&self) -> SharedCells {
-        let Some([new_ids, read_ids, write_ids, clone_ids]) = self.shared_members() else {
-            return SharedCells::default();
-        };
-        let mut cells = SharedCells::default();
-        // Pass 1 — the calls, and the assignment targets that make a write a
-        // REBIND. `rewrite_view_assignment_targets` has already turned
-        // `h.write() = x` into an assignment to a `Dereference` of the call, so
-        // the rebinding form is "the target IS this call, bare or dereferenced"
-        // and every other spelling (`h.write().push(9)`, `h.write()[0] = 9`,
-        // `mutate(h.write())`) falls through to the in-place classification.
-        let mut clone_receivers: HashMap<Id, Id> = HashMap::default();
-        let mut new_calls: HashSet<Id> = HashSet::default();
-        let mut write_receivers: Vec<(Id, Id)> = Vec::new();
-        let mut benign: HashSet<Id> = HashSet::default();
-        let mut rebinding: HashSet<Id> = HashSet::default();
-        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
-            if let Expr::Assignment(target_id, _) = expr {
-                let named = match self.expr_id_to_expr_map.get(target_id) {
-                    Some(Expr::Dereference(operand_id)) => *operand_id,
-                    _ => *target_id,
-                };
-                rebinding.insert(named);
-            }
-            let Some((callee_id, receiver_id)) = self.call_callee_and_receiver(*expr_id) else {
-                continue;
-            };
-            if new_ids.contains(&callee_id) {
-                new_calls.insert(*expr_id);
-            } else if read_ids.contains(&callee_id) {
-                benign.insert(receiver_id);
-                cells.reads.insert(*expr_id, CellSlot::Unknown);
-            } else if write_ids.contains(&callee_id) {
-                benign.insert(receiver_id);
-                write_receivers.push((*expr_id, receiver_id));
-            } else if clone_ids.contains(&callee_id) {
-                benign.insert(receiver_id);
-                clone_receivers.insert(*expr_id, receiver_id);
-            }
-        }
-        // The slot a handle expression names. `clone()` is transparent: it
-        // hands back the receiver's own cell, so the chain is followed rather
-        // than dropped into `Unknown`.
-        let slot_of = |mut expr_id: Id| -> Option<CellSlot> {
-            for _ in 0..clone_receivers.len() + 1 {
-                match self.expr_id_to_expr_map.get(&expr_id)? {
-                    Expr::Local(binding_id) => return Some(CellSlot::Binding(*binding_id)),
-                    Expr::Field(_, struct_id, index) => {
-                        return Some(CellSlot::Field(*struct_id, *index));
-                    }
-                    Expr::Call(_) => expr_id = *clone_receivers.get(&expr_id)?,
-                    _ => return None,
-                }
-            }
-            None
-        };
-        // Pass 2 — the unions, at the four forms a handle moves between slots.
-        // A slot fed by `Shared::new` is a FRESH cell and joins nothing; that
-        // is what keeps `bind_each`'s four cells four cells.
-        let mut placed: HashSet<Id> = HashSet::default();
-        let mut moved: Vec<(CellSlot, Id)> = Vec::new();
-        for (parameter_id, parameter) in self.parameters.iter() {
-            if let Some(shared_struct_id) = self.primitive_struct_ids.get("Shared").copied()
-                && self.type_is_shared_handle(parameter.type_id, shared_struct_id)
-            {
-                cells.union(CellSlot::Binding(*parameter_id), CellSlot::Unknown);
-            }
-        }
-        // A handle BINDING with no initializer got its cell from somewhere this
-        // walk cannot follow, for the same reason a parameter did — so it joins
-        // `Unknown` the same way. The shape that reaches this is a MATCH
-        // CAPTURE, and `Weak::upgrade` (C1) is the first API in the language
-        // that produces one: `match weak.upgrade() { Some(let strong) => .. }`
-        // binds a handle to the cell through a pattern, and a capture has no
-        // `initial` for pass 2 to chase.
-        //
-        // Without it the capture is a SINGLETON component nothing ever mutates,
-        // so B267's elision hands out the cell's own storage — measured, before
-        // this line: `let copy = strong.read()` followed by
-        // `cell.write().push(9)` through the original handle printed a length
-        // of 2 where the same program written without the upgrade printed 1.
-        // The original handle is tainted by pass 3 (it was the receiver of a
-        // `downgrade`, which is not one of the four benign calls), so joining
-        // the capture to `Unknown` too is what puts the two ends of one cell in
-        // one component again.
-        for variable in self.variables.values() {
-            if variable.initial.is_none()
-                && let Some(shared_struct_id) = self.primitive_struct_ids.get("Shared").copied()
-                && self.type_is_shared_handle(variable.type_id, shared_struct_id)
-            {
-                cells.union(CellSlot::Binding(variable.id), CellSlot::Unknown);
-            }
-        }
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                Expr::Variable(variable_id) => {
-                    if let Some(variable) = self.variables.get(variable_id)
-                        && let Some(value_id) = variable.initial
-                        && self.is_shared_handle(value_id)
-                    {
-                        moved.push((CellSlot::Binding(*variable_id), value_id));
-                    }
-                }
-                Expr::StructInitializer(struct_id, assignments) => {
-                    for (index, value_id) in assignments {
-                        if self.is_shared_handle(*value_id) {
-                            moved.push((CellSlot::Field(*struct_id, *index), *value_id));
-                        }
-                    }
-                }
-                Expr::Assignment(target_id, value_id) => {
-                    if self.is_shared_handle(*target_id)
-                        && let Some(target_slot) = slot_of(*target_id)
-                    {
-                        placed.insert(*target_id);
-                        moved.push((target_slot, *value_id));
-                    }
-                }
-                _ => {}
-            }
-        }
-        for (slot, value_id) in moved {
-            placed.insert(value_id);
-            if new_calls.contains(&value_id) {
-                continue;
-            }
-            cells.union(slot, slot_of(value_id).unwrap_or(CellSlot::Unknown));
-        }
-        // Pass 3 — the escape taint. A handle that appears anywhere ELSE (an
-        // argument, a list element, a returned tail, an `is` subject) has been
-        // handed to code this walk cannot see, so its slot joins `Unknown` and
-        // every write through an unplaceable handle now hazards it.
-        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
-            if !matches!(expr, Expr::Local(_) | Expr::Field(_, _, _))
-                || benign.contains(expr_id)
-                || placed.contains(expr_id)
-                || !self.is_shared_handle(*expr_id)
-            {
-                continue;
-            }
-            cells.union(
-                slot_of(*expr_id).unwrap_or(CellSlot::Unknown),
-                CellSlot::Unknown,
-            );
-        }
-        // Pass 4 — resolve every read and write onto its component, and record
-        // which components a write MUTATES rather than rebinds.
-        let read_ids: Vec<Id> = cells.reads.keys().copied().collect();
-        for read_id in read_ids {
-            let receiver_id = self
-                .call_callee_and_receiver(read_id)
-                .map(|(_, receiver_id)| receiver_id);
-            let slot = receiver_id
-                .and_then(slot_of)
-                .map_or(CellSlot::Unknown, |slot| cells.find(slot));
-            cells.reads.insert(read_id, slot);
-        }
-        for (write_id, receiver_id) in write_receivers {
-            let slot = slot_of(receiver_id).map_or(CellSlot::Unknown, |slot| cells.find(slot));
-            let rebinds = rebinding.contains(&write_id);
-            cells.writes.insert(write_id, (slot, rebinds));
-            if !rebinds {
-                cells.mutated.insert(slot);
-            }
-        }
-        cells
-    }
-
     /// B267 (`B256`'s unblocker): the bindings whose `Shared` read may keep
     /// naming the cell's storage instead of copying it — rule 2 (§6.2) read at
     /// a slot rather than at a local.
@@ -34960,69 +34770,30 @@ impl<'src> Analyzer<'src> {
     /// choice and `clone_sites` is unchanged.
     fn compute_shared_place_lets(
         &self,
-        written_roots: &WrittenRoots,
-        seam_leaves: &std::cell::OnceCell<Vec<Id>>,
+        held: &held_tables::HeldFold,
     ) -> (HashSet<Id>, HashSet<Id>) {
-        // The cheap tests first, so a program with no candidate pays for none
-        // of the whole-program sets below: an immutable `let` holding no view,
+        // M110 S7b: the candidates (an immutable `let` holding no view,
         // initialized from a projection of another binding, at a type a copy
-        // would actually copy.
-        let mut candidates: Vec<(Id, Id, Id)> = Vec::new();
-        for expr in self.expr_id_to_expr_map.values() {
-            let Expr::Variable(variable_id) = expr else {
-                continue;
-            };
-            let Some(variable) = self.variables.get(variable_id) else {
-                continue;
-            };
-            let Some(value_id) = variable.initial else {
-                continue;
-            };
-            // B571: the initializer's VALUE, under any ascription — the id
-            // rule 1's copy is keyed at.
-            let value_id = self.peel_ascriptions(value_id);
-            if variable.mutable || self.view_binding_mutability(*variable_id).is_some() {
-                continue;
-            }
-            let Some(root) = self.projection_root(value_id) else {
-                continue;
-            };
-            if root == *variable_id
-                || !self.is_cloneable_aggregate(&variable.type_id.get_type(self))
-                || !self.type_is_plain_value(variable.type_id, &mut Vec::new())
-            {
-                continue;
-            }
-            candidates.push((*variable_id, value_id, root));
-        }
-        if candidates.is_empty() {
-            return (HashSet::default(), HashSet::default());
-        }
-        // A leaf whose type cannot carry storage — a scalar read off the
-        // binding at a tail (`layout.table[at]`) — aliases nothing.
-        let seam_leaves = seam_leaves.get_or_init(|| self.value_seam_leaves());
-        let seam_roots = self.seam_roots_of(seam_leaves, &|analyzer, leaf| {
-            analyzer.place_value_type_id(leaf).is_none_or(|type_id| {
-                let leaf_type = type_id.get_type(analyzer);
-                analyzer.is_cloneable_aggregate(&leaf_type) || matches!(leaf_type, Type::Generic(_))
-            })
-        });
-        let candidate_bindings: HashSet<Id> =
-            candidates.iter().map(|candidate| candidate.0).collect();
-        let handed_on = self.bindings_handed_on_whole(&candidate_bindings);
+        // would actually copy — B571: the initializer's VALUE under any
+        // ascription), the hand-ons, the written roots and the seam roots
+        // whose leaf can carry storage (a scalar read off the binding at a
+        // tail aliases nothing) are the fold's (`held_tables.rs`).
         let mut bindings = HashSet::default();
         let mut initializers = HashSet::default();
-        for (variable_id, value_id, root) in candidates {
-            if handed_on.contains(&variable_id)
-                || written_roots.in_place.contains(&variable_id)
-                || seam_roots.contains(&variable_id)
-                || self.last_use.is_opaque(variable_id)
-                || !self.root_is_stable(root, written_roots)
+        for (let_id, value_id, root) in &held.place_lets {
+            let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(let_id) else {
+                continue;
+            };
+            if held.handed_on.contains(variable_id)
+                || held.written.in_place.contains(variable_id)
+                || held.plain_seam_roots.contains(variable_id)
+                || self.last_use.is_opaque(*variable_id)
+                || !self.root_is_stable(*root, &held.written)
             {
                 continue;
             }
-            bindings.insert(variable_id);
-            initializers.insert(value_id);
+            bindings.insert(*variable_id);
+            initializers.insert(*value_id);
         }
         (bindings, initializers)
     }
@@ -35109,78 +34880,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// The bindings some expression hands on WHOLE — a store (a construction
-    /// slot, an assignment, another `let`), a call argument not provably a loan,
-    /// a pattern's subject. M90 shares only a `let` that is read through
-    /// projections and loans: a shared binding owns nothing, so rule 2 could
-    /// not donate it at a store, and the copy it then took there would be a
-    /// copy the native backend (which keeps the `let`'s own) never needed.
-    fn bindings_handed_on_whole(&self, of: &HashSet<Id>) -> HashSet<Id> {
-        let mut handed_on = HashSet::default();
-        let reads_one = |value_id: Id| match self.expr_id_to_expr_map.get(&value_id) {
-            Some(Expr::Local(binding_id)) => of.contains(binding_id).then_some(*binding_id),
-            _ => None,
-        };
-        let whole = |handed_on: &mut HashSet<Id>, value_id: Id| {
-            if let Some(binding_id) = reads_one(value_id) {
-                handed_on.insert(binding_id);
-            }
-        };
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                Expr::Variable(variable_id) => {
-                    if let Some(initial) = self
-                        .variables
-                        .get(variable_id)
-                        .and_then(|variable| variable.initial)
-                    {
-                        whole(&mut handed_on, initial);
-                    }
-                }
-                Expr::Assignment(_, value_id) => whole(&mut handed_on, *value_id),
-                Expr::List(slots) | Expr::Tuple(slots) => {
-                    for slot in slots {
-                        whole(&mut handed_on, *slot);
-                    }
-                }
-                Expr::StructInitializer(_, assignments) => {
-                    for value_id in assignments.values() {
-                        whole(&mut handed_on, *value_id);
-                    }
-                }
-                Expr::Match(subject_id, _)
-                | Expr::Is(subject_id, _)
-                | Expr::Destructure(subject_id, _) => whole(&mut handed_on, *subject_id),
-                Expr::Call(call_id) => {
-                    let Some(function_call) = self.function_calls.get(call_id) else {
-                        continue;
-                    };
-                    if !function_call
-                        .argument_ids
-                        .iter()
-                        .any(|argument_id| reads_one(*argument_id).is_some())
-                    {
-                        continue;
-                    }
-                    let conventions = self.callee_conventions(function_call.subject_id);
-                    for (index, argument_id) in function_call.argument_ids.iter().enumerate() {
-                        let loaned = conventions.as_ref().is_some_and(|conventions| {
-                            matches!(
-                                conventions.get(index),
-                                Some(Convention::Bare | Convention::Ref)
-                            )
-                        });
-                        if !loaned {
-                            whole(&mut handed_on, *argument_id);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        handed_on
-    }
-
     /// The binding a chain of field, element and index projections reads —
     /// `config.layout.table` → `config`; a bare read is its own root. `None`
     /// through anything else (a dereference, a call), which [`Self::compute_shared_place_lets`]
@@ -35223,42 +34922,38 @@ impl<'src> Analyzer<'src> {
 
     fn compute_shared_read_bindings(
         &self,
-        written_roots: &WrittenRoots,
-        seam_leaves: &std::cell::OnceCell<Vec<Id>>,
+        held: &held_tables::HeldFold,
+        calls: &std::cell::OnceCell<LexicalCandidates>,
     ) -> (HashSet<Id>, HashSet<Id>) {
         if self.shared_cells.reads.is_empty() {
             return (HashSet::default(), HashSet::default());
         }
-        let seam_leaves = seam_leaves.get_or_init(|| self.value_seam_leaves());
-        let seam_roots = self.seam_roots_of(seam_leaves, &|_, _| true);
-        let sequences = self.statement_sequences();
+        // M110 S7b: the candidates, the written roots and the seam roots are
+        // the fold's (`held_tables.rs`); the statement sequences are indexed
+        // on the first candidate whose cell is mutated.
+        let sequences: std::cell::OnceCell<Vec<&Vec<Id>>> = std::cell::OnceCell::new();
         let mut bindings = HashSet::default();
         let mut reads = HashSet::default();
-        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
-            let Expr::Variable(variable_id) = expr else {
+        for (expr_id, variable_id, value_id) in &held.shared_reads {
+            let Some(cell) = self.shared_cells.reads.get(value_id).copied() else {
                 continue;
             };
-            let Some(value_id) = self
-                .variables
-                .get(variable_id)
-                .and_then(|variable| variable.initial)
-            else {
-                continue;
-            };
-            let Some(cell) = self.shared_cells.reads.get(&value_id).copied() else {
-                continue;
-            };
-            if written_roots.in_place.contains(variable_id)
-                || seam_roots.contains(variable_id)
+            if held.written.in_place.contains(variable_id)
+                || held.seam_roots.contains(variable_id)
                 || self.last_use.is_opaque(*variable_id)
             {
                 continue;
             }
             if !self.shared_cells.mutated.contains(&cell)
-                || self.rebind_orphans_the_read(*expr_id, cell, &sequences)
+                || self.rebind_orphans_the_read(
+                    *expr_id,
+                    cell,
+                    sequences.get_or_init(|| self.statement_sequences()),
+                    calls,
+                )
             {
                 bindings.insert(*variable_id);
-                reads.insert(value_id);
+                reads.insert(*value_id);
             }
         }
         (bindings, reads)
@@ -35282,6 +34977,7 @@ impl<'src> Analyzer<'src> {
         declaration_id: Id,
         cell: CellSlot,
         sequences: &[&Vec<Id>],
+        calls: &std::cell::OnceCell<LexicalCandidates>,
     ) -> bool {
         let Some((statements, index)) = sequences.iter().find_map(|statements| {
             statements
@@ -35303,10 +34999,10 @@ impl<'src> Analyzer<'src> {
                     _ => *target_id,
                 };
                 if self.shared_cells.writes.get(&named) == Some(&(cell, true)) {
-                    return !self.spans_a_cell_hazard(*value_id, cell);
+                    return !self.spans_a_cell_hazard(*value_id, cell, calls);
                 }
             }
-            if self.spans_a_cell_hazard(*statement_id, cell) {
+            if self.spans_a_cell_hazard(*statement_id, cell, calls) {
                 return false;
             }
         }
@@ -35321,32 +35017,28 @@ impl<'src> Analyzer<'src> {
     /// safe direction for a refusal test. `Shared`'s own `new`/`read`/`clone`
     /// are not calls in this sense — they run no user code and write nothing —
     /// but a `write()` is, whatever it turns out to be.
-    fn spans_a_cell_hazard(&self, expr_id: Id, cell: CellSlot) -> bool {
+    fn spans_a_cell_hazard(
+        &self,
+        expr_id: Id,
+        cell: CellSlot,
+        calls: &std::cell::OnceCell<LexicalCandidates>,
+    ) -> bool {
         let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
         else {
             return true;
         };
-        let (start, end) = (span.start, span.end);
-        self.expr_id_to_expr_map.iter().any(|(other_id, other)| {
-            if !matches!(other, Expr::Call(_)) || *other_id == expr_id {
-                return false;
-            }
-            if self.source_of_id(*other_id) != Some(source) {
-                return false;
-            }
-            let Some(other_span) = self.span_map.get(other_id) else {
-                return false;
-            };
-            if other_span.start < start || other_span.end > end {
-                return false;
-            }
-            match self.shared_cells.writes.get(other_id) {
+        // M110 S7b: the calls inside the span off the lexical index (M96),
+        // not a sweep of every expression per ask.
+        self.calls_index(calls)
+            .inside(source, span.start, span.end)
+            .into_iter()
+            .filter(|other_id| *other_id != expr_id)
+            .any(|other_id| match self.shared_cells.writes.get(&other_id) {
                 // A rebind of this very cell is not a hazard — it is the answer
                 // — and a write to any other cell cannot reach this storage.
                 Some((written, rebinds)) => *written == cell && !rebinds,
-                None => !self.shared_cells.reads.contains_key(other_id),
-            }
-        })
+                None => !self.shared_cells.reads.contains_key(&other_id),
+            })
     }
 
     /// Whether a write that mutates `cell` IN PLACE (`cell.write().push(..)`,
@@ -35547,57 +35239,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Every binding root a VALUE SEAM can hand out — the same question
-    /// [`Self::compute_capture_clone_sites`] asks of its captures, asked of the
-    /// whole program, because B267's elision has to know whether the storage it
-    /// is about to share can leave the frame that shares it.
-    ///
-    /// Collected as LEAVES, once, for the passes that each root them their own
-    /// way ([`Self::seam_roots_of`]: B267 every leaf, M90 the aggregate ones).
-    fn value_seam_leaves(&self) -> Vec<Id> {
-        let mut leaves = Vec::new();
-        for function in self.functions.values() {
-            if function.has_body {
-                self.collect_tail_leaves(function.body.1, &mut leaves);
-            }
-        }
-        for closure in self.closures.values() {
-            self.collect_tail_leaves(closure.return_, &mut leaves);
-        }
-        for module in self.modules.values() {
-            self.collect_tail_leaves(module.body.1, &mut leaves);
-        }
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                Expr::FunctionReturn(Some(value_id)) => {
-                    self.collect_tail_leaves(*value_id, &mut leaves);
-                }
-                Expr::Match(_, legs) => {
-                    for leg in legs {
-                        self.collect_tail_leaves(leg.body, &mut leaves);
-                    }
-                }
-                Expr::Block((_, tail_id))
-                | Expr::For(_, (_, tail_id))
-                | Expr::ForEach(_, _, (_, tail_id)) => {
-                    self.collect_tail_leaves(*tail_id, &mut leaves)
-                }
-                Expr::If(branch) => self.collect_branch_tail_leaves(branch, &mut leaves),
-                _ => {}
-            }
-        }
-        leaves
-    }
-
-    /// The roots of the `leaves` that `keep` admits.
-    fn seam_roots_of(&self, leaves: &[Id], keep: &dyn Fn(&Self, Id) -> bool) -> HashSet<Id> {
-        leaves
-            .iter()
-            .filter(|leaf| keep(self, **leaf))
-            .filter_map(|leaf| self.place_root(*leaf))
-            .collect()
-    }
-
     /// The `if` chain's tails, for the walk above.
     fn collect_branch_tail_leaves(&self, branch: &ExprIfBranch, leaves: &mut Vec<Id>) {
         match branch {
@@ -35652,7 +35293,9 @@ impl<'src> Analyzer<'src> {
     /// into the variant on every write (B509's remainder).
     fn compute_donated_projections(&self, shared_captures: &HashSet<Id>) -> HashSet<Id> {
         let mut donated = HashSet::default();
-        for expr in self.expr_id_to_expr_map.values() {
+        // M110 S7b: read only for the live positions `compute_clone_sites`
+        // decides, so the live expressions are the whole input.
+        for (_, expr) in self.live_table_entries(&self.expr_id_to_expr_map) {
             let slots: Vec<Id> = match expr {
                 Expr::List(slots) | Expr::Tuple(slots) => slots.clone(),
                 Expr::StructInitializer(_, assignments) => assignments.values().copied().collect(),
@@ -52505,16 +52148,6 @@ impl<'src> Analyzer<'src> {
         self.reused_sources.sort_unstable();
     }
 
-    /// Whether `id` was minted by a source this analysis is REUSING — a module
-    /// of a base-cached world whose content is unchanged and whose type slots
-    /// the entry did not move (M19 T1, `per-module-analysis-reuse.md` §4.1).
-    fn world_entity(&self, id: Id) -> bool {
-        let index = self
-            .world_ranges
-            .partition_point(|(start, _)| *start <= id.0);
-        index > 0 && id.0 < self.world_ranges[index - 1].1
-    }
-
     /// Seals [`Self::world_table_ranges`] and merges the restored rows (M19
     /// T1b). `reusable` is the subset of T1's reusable set whose record also
     /// carries tables.
@@ -52542,11 +52175,19 @@ impl<'src> Analyzer<'src> {
             return;
         }
         let mut label_sources: HashSet<SourceId> = HashSet::default();
+        let mut hint_sources: HashSet<SourceId> = HashSet::default();
+        let mut held_sources: HashSet<SourceId> = HashSet::default();
         for source in &with_tables {
             if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
                 self.restored_tables.absorb(tables);
                 if tables.labels_recorded {
                     label_sources.insert(*source);
+                }
+                if tables.hints_recorded {
+                    hint_sources.insert(*source);
+                }
+                if tables.held_recorded {
+                    held_sources.insert(*source);
                 }
             }
         }
@@ -52557,6 +52198,20 @@ impl<'src> Analyzer<'src> {
             .map(|range| (range.start, range.end))
             .collect();
         self.restored_tables.label_ranges.sort_unstable();
+        self.restored_tables.hint_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| hint_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.restored_tables.hint_ranges.sort_unstable();
+        self.restored_tables.held_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| held_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.restored_tables.held_ranges.sort_unstable();
         self.world_table_ranges = self
             .source_ranges
             .iter()
@@ -52578,10 +52233,14 @@ impl<'src> Analyzer<'src> {
             let nominals = self.restored_tables.drop_nominals_world;
             let agree = self.restored_tables.drop_nominals_agree;
             let label_ranges = std::mem::take(&mut self.restored_tables.label_ranges);
+            let hint_ranges = std::mem::take(&mut self.restored_tables.hint_ranges);
+            let held_ranges = std::mem::take(&mut self.restored_tables.held_ranges);
             self.restored_tables = RestoredTables {
                 drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
                 label_ranges,
+                hint_ranges,
+                held_ranges,
                 ..RestoredTables::default()
             };
         }
@@ -52603,6 +52262,14 @@ impl<'src> Analyzer<'src> {
     /// no rows and is rendered like a hot one.
     fn label_row_restored(&self, id: Id) -> bool {
         let ranges = &self.restored_tables.label_ranges;
+        let index = ranges.partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < ranges[index - 1].1
+    }
+
+    /// M110 S7b: whether `id`'s module or item restored its STAGE HINT rows
+    /// ([`RestoredTables::hint_ranges`]) — the stages `stage_hints` may skip.
+    pub(super) fn hint_row_restored(&self, id: Id) -> bool {
+        let ranges = &self.restored_tables.hint_ranges;
         let index = ranges.partition_point(|(start, _)| *start <= id.0);
         index > 0 && id.0 < ranges[index - 1].1
     }
@@ -52948,6 +52615,124 @@ impl<'src> Analyzer<'src> {
         self.table_ranges = merge(&self.world_table_ranges, self.item_table_ranges());
         self.restored_tables.label_ranges =
             merge(&self.restored_tables.label_ranges, self.item_label_ranges());
+        self.restored_tables.hint_ranges =
+            merge(&self.restored_tables.hint_ranges, self.item_hint_ranges());
+        self.restored_tables.held_ranges =
+            merge(&self.restored_tables.held_ranges, self.item_held_ranges());
+        // M110 S7b: the complements, over the entity counter's high water —
+        // every id this analysis holds lies below it. The Class A lane's
+        // plant leaves the served ITEMS' windows live: a pass walking the
+        // lane then re-derives a served item's output beside its replay,
+        // which the edit-replay differential sees as a doubled diagnostic.
+        let high = self.entity_id;
+        let served_left_live =
+            crate::incremental::planted(crate::incremental::Plant::LiveRangeWalksServed);
+        let class_a_reused: Vec<(u32, u32)> = self
+            .frozen_ranges
+            .iter()
+            .chain(if served_left_live {
+                &self.world_ranges
+            } else {
+                &self.reusable_ranges
+            })
+            .copied()
+            .collect();
+        self.live_class_a = live_ranges::LiveRanges::complement(&class_a_reused, high);
+        self.live_table = live_ranges::LiveRanges::complement(&self.table_ranges, high);
+        let module_reused: Vec<(u32, u32)> = self
+            .frozen_ranges
+            .iter()
+            .chain(&self.world_ranges)
+            .copied()
+            .collect();
+        self.live_module = live_ranges::LiveRanges::complement(&module_reused, high);
+        self.live_held =
+            live_ranges::LiveRanges::complement(&self.restored_tables.held_ranges, high);
+        if !crate::macros::in_macro_world() {
+            let ranges = self.live_class_a.ranges().len() as u64;
+            let entities = self.live_class_a.count();
+            crate::incremental::update_census(|census| {
+                census.live_ranges += ranges;
+                census.live_entities += entities;
+            });
+        }
+    }
+
+    /// M110 S7b: the entries of an id-keyed table a **Class A** pass visits —
+    /// the live ones, walked or swept as [`live_ranges::LiveRanges::walks`]
+    /// decides. The one predicate a routed pass asks: it must not ask
+    /// [`Self::reusable_entity`] beside it (the plant that leaves a served
+    /// window live would then be hidden), and it must be order-insensitive
+    /// (a walk yields ids ascending, a sweep the map's order).
+    fn live_entries<'a, V: 'a, T: live_ranges::IdTable<'a, V>>(
+        &'a self,
+        table: &'a T,
+    ) -> live_ranges::LiveEntries<'a, V, T, live_ranges::Any<V>> {
+        live_ranges::LiveEntries::over(table, &self.live_class_a)
+    }
+
+    /// [`Self::live_entries`] with the pass's SHAPE asked first on a sweep
+    /// (`live_ranges::LiveEntries`).
+    fn live_entries_where<'a, V: 'a, T: live_ranges::IdTable<'a, V>, F: Fn(&V) -> bool>(
+        &'a self,
+        table: &'a T,
+        keep: F,
+    ) -> live_ranges::LiveEntries<'a, V, T, F> {
+        live_ranges::LiveEntries::over_where(table, &self.live_class_a, keep)
+    }
+
+    /// The same for a **class D** pass, over `table_entity`'s complement.
+    fn live_table_entries<'a, V: 'a, T: live_ranges::IdTable<'a, V>>(
+        &'a self,
+        table: &'a T,
+    ) -> live_ranges::LiveEntries<'a, V, T, live_ranges::Any<V>> {
+        live_ranges::LiveEntries::over(table, &self.live_table)
+    }
+
+    /// [`Self::live_table_entries`] with the pass's shape asked first.
+    fn live_table_entries_where<'a, V: 'a, T: live_ranges::IdTable<'a, V>, F: Fn(&V) -> bool>(
+        &'a self,
+        table: &'a T,
+        keep: F,
+    ) -> live_ranges::LiveEntries<'a, V, T, F> {
+        live_ranges::LiveEntries::over_where(table, &self.live_table, keep)
+    }
+
+    /// The same at MODULE grain (frozen ∪ reused modules; a re-walked file's
+    /// items stay live) — the bound audit's predicate (M143).
+    fn live_module_entries<'a, V: 'a, T: live_ranges::IdTable<'a, V>>(
+        &'a self,
+        table: &'a T,
+    ) -> live_ranges::LiveEntries<'a, V, T, live_ranges::Any<V>> {
+        live_ranges::LiveEntries::over(table, &self.live_module)
+    }
+
+    /// The same for the HELD table passes (`held_tables.rs`): the regions
+    /// whose contributions are not restored.
+    fn live_held_entries<'a, V: 'a, T: live_ranges::IdTable<'a, V>>(
+        &'a self,
+        table: &'a T,
+    ) -> live_ranges::LiveEntries<'a, V, T, live_ranges::Any<V>> {
+        live_ranges::LiveEntries::over(table, &self.live_held)
+    }
+
+    /// M96/B457's index of every call by span, built into `calls` on the
+    /// first ask (M110 S7b): the shared reads' and the clone sites' call-
+    /// through tests share it, and an analysis that asks neither pays for
+    /// no sweep.
+    fn calls_index<'a>(
+        &self,
+        calls: &'a std::cell::OnceCell<LexicalCandidates>,
+    ) -> &'a LexicalCandidates {
+        calls.get_or_init(|| {
+            LexicalCandidates::build(
+                self,
+                self.expr_id_to_expr_map
+                    .iter()
+                    .filter(|(_, expr)| matches!(expr, Expr::Call(_)))
+                    .map(|(id, _)| *id),
+            )
+        })
     }
 
     /// Whether this analysis VISITS `site` — R10's one reuse predicate — and
@@ -52963,7 +52748,7 @@ impl<'src> Analyzer<'src> {
     /// carries a file and no entity id — and `container_site_visited(Id)`,
     /// asked by the other two, which carry an entity id and would pay a real
     /// binary search to resolve a file. That is why both arms survive the fold:
-    /// on a COLD analysis `world_ranges` is empty and [`Self::world_entity`]
+    /// on a COLD analysis `world_ranges` is empty and the module-grain search
     /// returns on its first branch, where resolving the file per entity would
     /// cost a search to buy nothing; and the written tier has no id to ask
     /// with. They agree wherever both can be asked, because `world_ranges` IS
@@ -53090,15 +52875,6 @@ impl<'src> Analyzer<'src> {
             .entry(source.0)
             .or_default()
             .push((call_id, constraint_id, trait_id));
-    }
-
-    /// M110 S2a: whether a reused site's module is one this analysis
-    /// re-audits ([`Analyzer::bound_recompute_ranges`]).
-    fn bound_recompute_site(&self, id: Id) -> bool {
-        let index = self
-            .bound_recompute_ranges
-            .partition_point(|(start, _)| *start <= id.0);
-        index > 0 && id.0 < self.bound_recompute_ranges[index - 1].1
     }
 
     /// M110 S2a: whether an impl that arrived AFTER the stored world (the
@@ -61855,15 +61631,17 @@ impl<'src> Analyzer<'src> {
         // Every dotted call of a std `View` method, by its CALL ENTITY, with its
         // receiver entity: the links the walk may cross.
         let mut links: HashMap<Id, (Id, Id)> = HashMap::default();
+        // M110 S7b: the live calls only, walked.
         let call_entities: HashMap<Id, Id> = self
-            .expr_id_to_expr_map
-            .iter()
+            .live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Call(_))
+            })
             .filter_map(|(entity, expr)| match expr {
                 Expr::Call(call_id) => Some((*call_id, *entity)),
                 _ => None,
             })
             .collect();
-        for (call_id, function_call) in &self.function_calls {
+        for (call_id, function_call) in self.live_entries(&self.function_calls) {
             if !self.member_name_spans.contains_key(call_id) {
                 continue;
             }
@@ -62027,7 +61805,8 @@ impl<'src> Analyzer<'src> {
     /// Skips std, dependencies and generated code, as A155 does.
     fn check_written_autofocus(&mut self) {
         let mut sites: Vec<(SourceId, Span)> = Vec::new();
-        for (call_id, function_call) in &self.function_calls {
+        // M110 S7b: the live calls only, walked.
+        for (call_id, function_call) in self.live_entries(&self.function_calls) {
             let Some(member_name) = self.member_name_spans.get(call_id) else {
                 continue;
             };
@@ -78650,6 +78429,33 @@ struct ModuleTables {
     last_use_unreached: Vec<Id>,
     last_use_statements: Vec<(Id, Vec<Id>)>,
     declaration_statements: Vec<(Id, Vec<Id>)>,
+    /// M110 S7b: the module's regions' cross-file reads, `(region, binding)`
+    /// — the region the module's own, the binding another module's (a
+    /// prefix id, identical on every hit). The last-use net reads them for
+    /// a restored region whose binding is live this analysis.
+    foreign_reads: Vec<(Id, Id)>,
+    /// M110 S7b: the module's calls whose top-level R11 discovery seeded an
+    /// instantiation (`Analyzer::r11_seed_calls`) — the only calls R11 asks
+    /// again for a restored module; the instantiations are re-derived.
+    r11_seed_calls: Vec<Id>,
+    /// M110 S7b: the module's type slots that classify as RESOURCES
+    /// (`compute_resource_types`). `TypeId`s, deliberately, and only in a
+    /// per-SOURCE record of the stored world's prefix: a prefix slot is the
+    /// same slot on every hit (§2.1 — the world is the cached clone), and a
+    /// module whose slots the entry moved is not restored at all. Never in
+    /// an item's record (an item's window is classified live).
+    resource_slots: Vec<u32>,
+    /// M110 S7b: the editor's per-stage inlay hints for the module's chain
+    /// stages (`Analyzer::stage_hints`) — rendered strings keyed by the
+    /// stage's id, the S2b label rows' shape; filed only by an analysis that
+    /// asked for reading aids (`hints_recorded`).
+    stage_hints: Vec<StageHint>,
+    /// M110 S7b: the module's contributions to the six held table passes
+    /// (`held_tables.rs`), and whether they were filed at all — a module
+    /// whose rows would name another re-walked window's entity files none
+    /// and stays live for those passes.
+    held: held_tables::HeldRows,
+    held_recorded: bool,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
     return_clone_sites: Vec<(Id, CopyDecision)>,
@@ -78698,6 +78504,10 @@ struct ModuleTables {
     /// carries none, and the tail must render that module's labels rather
     /// than skip them.
     labels_recorded: bool,
+    /// M110 S7b: whether `stage_hints` was FILED for this module (only an
+    /// analysis with reading aids computes them); a record written by any
+    /// other analysis carries none, and the stages are hinted live.
+    hints_recorded: bool,
 }
 
 impl ModuleTables {
@@ -78734,7 +78544,10 @@ impl ModuleTables {
             .iter()
             .chain(self.declaration_statements.iter())
             .map(|(_, chain)| std::mem::size_of::<(Id, Vec<Id>)>() + chain.len() * id)
-            .sum();
+            .sum::<usize>()
+            + self.foreign_reads.len() * std::mem::size_of::<(Id, Id)>()
+            + self.r11_seed_calls.len() * id
+            + self.resource_slots.len() * std::mem::size_of::<u32>();
         let bumps: usize = self
             .bumps
             .iter()
@@ -78744,7 +78557,19 @@ impl ModuleTables {
             .sum();
         let decisions = (self.clone_sites.len() + self.return_clone_sites.len())
             * std::mem::size_of::<(Id, CopyDecision)>();
-        flat * id + chains + bumps + decisions + labels
+        let hints: usize = self
+            .stage_hints
+            .iter()
+            .map(|hint| {
+                std::mem::size_of::<StageHint>()
+                    + hint.full.len()
+                    + hint.abbreviated.as_ref().map_or(0, String::len)
+                    + match &hint.written {
+                        Ok(text) | Err(text) => text.len(),
+                    }
+            })
+            .sum();
+        flat * id + chains + bumps + decisions + labels + hints + self.held.bytes()
     }
 }
 
@@ -78763,6 +78588,12 @@ struct RestoredTables {
     last_use_unreached: HashSet<Id>,
     last_use_statements: HashMap<Id, Vec<Id>>,
     declaration_statements: HashMap<Id, Vec<Id>>,
+    /// M110 S7b: the BINDINGS the restored regions read across files.
+    foreign_reads: HashSet<Id>,
+    /// M110 S7b: the restored modules' and items' R11 seed calls.
+    r11_seed_calls: HashSet<Id>,
+    /// M110 S7b: the restored MODULES' resource slots.
+    resource_slots: HashSet<TypeId>,
     bumps: HashMap<Id, BTreeSet<u32>>,
     clone_sites: HashMap<Id, CopyDecision>,
     return_clone_sites: HashMap<Id, CopyDecision>,
@@ -78786,6 +78617,14 @@ struct RestoredTables {
     /// The id ranges of the modules whose record CARRIED label rows — the
     /// only ids the tail's builders may skip rendering for. Sorted, disjoint.
     label_ranges: Vec<(u32, u32)>,
+    /// M110 S7b: the restored stage hints, and the id ranges of the modules
+    /// and items whose record carried them (the stages `stage_hints` skips).
+    stage_hints: Vec<StageHint>,
+    hint_ranges: Vec<(u32, u32)>,
+    /// M110 S7b: the restored held rows, and the ranges of the modules and
+    /// items whose record carried them (the regions the held passes skip).
+    held: held_tables::HeldRows,
+    held_ranges: Vec<(u32, u32)>,
 }
 
 impl Default for RestoredTables {
@@ -78798,6 +78637,9 @@ impl Default for RestoredTables {
             last_use_unreached: HashSet::default(),
             last_use_statements: HashMap::default(),
             declaration_statements: HashMap::default(),
+            foreign_reads: HashSet::default(),
+            r11_seed_calls: HashSet::default(),
+            resource_slots: HashSet::default(),
             bumps: HashMap::default(),
             clone_sites: HashMap::default(),
             return_clone_sites: HashMap::default(),
@@ -78810,6 +78652,10 @@ impl Default for RestoredTables {
             expr_types: HashMap::default(),
             declaration_labels: HashMap::default(),
             label_ranges: Vec::new(),
+            stage_hints: Vec::new(),
+            hint_ranges: Vec::new(),
+            held: held_tables::HeldRows::default(),
+            held_ranges: Vec::new(),
         }
     }
 }
@@ -78825,6 +78671,12 @@ impl RestoredTables {
             .extend(tables.last_use_statements.iter().cloned());
         self.declaration_statements
             .extend(tables.declaration_statements.iter().cloned());
+        self.foreign_reads
+            .extend(tables.foreign_reads.iter().map(|(_, binding)| *binding));
+        self.r11_seed_calls
+            .extend(tables.r11_seed_calls.iter().copied());
+        self.resource_slots
+            .extend(tables.resource_slots.iter().map(|slot| TypeId(*slot)));
         self.bumps.extend(tables.bumps.iter().cloned());
         self.clone_sites.extend(tables.clone_sites.iter().cloned());
         self.return_clone_sites
@@ -78839,6 +78691,10 @@ impl RestoredTables {
         self.expr_types.extend(tables.expr_types.iter().cloned());
         self.declaration_labels
             .extend(tables.declaration_labels.iter().cloned());
+        self.stage_hints.extend(tables.stage_hints.iter().cloned());
+        if tables.held_recorded {
+            self.held.extend(&tables.held);
+        }
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
         // enrolment restore stands down rather than serving half an answer.
@@ -84744,6 +84600,14 @@ fn analyze_over_world<'src>(
     class_a_checks! {
         analyzer.check_resource_any_coercion();
         analyzer.check_resource_moves();
+        // A155: one element's class written twice in one statically visible
+        // chain, and A157: a written `autofocus` in an element head. Both read
+        // which `View` member a link resolved to (settled by `build()`) and
+        // anchor inside the chain they judge — Class A, in the window since
+        // M110 S7b (they swept every call of the program after the record
+        // store); the published order is `sort_in_step`'s either way.
+        analyzer.check_class_written_twice();
+        analyzer.check_written_autofocus();
     }
     // M19 T1: record what this analysis actually RE-DERIVED, for the analysis
     // that will replay it (§3.2). Three exclusions, each load-bearing:
@@ -84811,13 +84675,6 @@ fn analyze_over_world<'src>(
         // past.
         // B515 reads the import reaches, which the plain-reach pass consumes.
         analyzer.check_trait_method_scope(global_scope_id);
-        // A155: one element's class written twice in one statically visible
-        // chain. Post-build because it reads which `View` member each link
-        // resolved to.
-        analyzer.check_class_written_twice();
-        // A157: a written `autofocus` in an element head. Post-build for the same
-        // reason: it reads which `View` member the head's `attr` resolved to.
-        analyzer.check_written_autofocus();
         analyzer.check_plain_reaches();
         analyzer.check_duplicate_module_declarations();
         // Two impls declaring one name for one subject (B57): a coherence rule, so
@@ -85179,6 +85036,8 @@ fn analyze_over_world<'src>(
     // (they judged the program as written) and BEFORE the last-use dataflow,
     // so the reads count as uses for liveness, copy elision and drop extents.
     crate::phase_pass_mark("the intrinsic table");
+    // M110 S7b: the two rewrites below move reads; the view memos go first.
+    analyzer.clear_view_memos();
     analyzer.expand_dbg_stacks();
     crate::phase_pass_mark("analyzer.expand_dbg_stacks()");
     // Transparent references (R5): rewrite bare assignments to a view into the
@@ -85190,36 +85049,46 @@ fn analyze_over_world<'src>(
     // answer about a tree that no longer exists is worse than none. Every
     // elision below reads it.
     crate::phase_pass_mark("the tables before the last-use dataflow");
+    analyzer.clear_view_memos();
     analyzer.last_use = liveness::LastUse::compute(&analyzer);
     crate::phase_pass_mark("liveness::LastUse::compute");
     // S3 (`lifetimes.md` §6): the same answers, asked for DISPOSAL — where each
     // enrolled binding's teardown `finally` closes. Must follow the dataflow;
     // `plan_resource_drops` (which bindings drop) ran long before it.
     analyzer.plan_last_use_drop_extents();
+    crate::phase_pass_mark("analyzer.plan_last_use_drop_extents()");
+    // M110 S7b: the five held passes below read whole-program inputs — the
+    // written roots, the `Shared` cells, the value seams, their candidates
+    // — folded from the live regions' contributions (one walk) and the
+    // restored regions' rows (`held_tables.rs`); each decision below is then
+    // taken over every candidate, so no output row is ever served.
+    let held_live = analyzer.collect_held_rows();
+    crate::phase_pass_mark("analyzer.collect_held_rows()");
+    let mut held = analyzer.fold_held(&held_live);
     // B267: the cell-aware half of rule 2, which needs the dataflow above and
     // feeds every elision below — a binding it admits copies nothing at its
     // read and may donate nothing at its own.
-    analyzer.shared_cells = analyzer.compute_shared_cells();
-    // The three passes below read one whole-program written-roots set and one
-    // set of value-seam leaves; the tree is final, so they are taken once.
-    let written_roots = analyzer.collect_written_roots();
-    // Taken on first ask: a program with no `Shared` read and no candidate
-    // `let` (plain code) never walks the seams for these two passes.
-    let seam_leaves: std::cell::OnceCell<Vec<Id>> = std::cell::OnceCell::new();
+    analyzer.shared_cells = std::mem::take(&mut held.cells);
+    crate::phase_pass_mark("the held fold");
+    // M96/B457: every call of the program indexed by span, on first ask —
+    // the call-through tests of the shared reads and the clone sites.
+    let calls_index: std::cell::OnceCell<LexicalCandidates> = std::cell::OnceCell::new();
     (analyzer.shared_read_bindings, analyzer.elided_shared_reads) =
-        analyzer.compute_shared_read_bindings(&written_roots, &seam_leaves);
+        analyzer.compute_shared_read_bindings(&held, &calls_index);
+    crate::phase_pass_mark("analyzer.compute_shared_read_bindings()");
     // M90: before the capture plan, whose move elision must refuse to move out
     // of a shared `let` exactly as rule 2 below does.
     (analyzer.shared_place_lets, analyzer.shared_place_inits) =
-        analyzer.compute_shared_place_lets(&written_roots, &seam_leaves);
+        analyzer.compute_shared_place_lets(&held);
+    crate::phase_pass_mark("analyzer.compute_shared_place_lets()");
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
-    let capture_plan = analyzer.compute_capture_clone_sites(&written_roots);
-    crate::phase_pass_mark("the drop extents, shared cells and capture plan");
+    let capture_plan = analyzer.compute_capture_clone_sites(&held);
+    crate::phase_pass_mark("analyzer.compute_capture_clone_sites()");
     let resource_types = analyzer.compute_resource_types();
     crate::phase_pass_mark("analyzer.compute_resource_types()");
-    let clone_sites = analyzer.compute_clone_sites(&capture_plan.shared);
+    let clone_sites = analyzer.compute_clone_sites(&capture_plan.shared, &calls_index);
     crate::phase_pass_mark("analyzer.compute_clone_sites()");
     let (return_clone_sites, return_view_reads) = analyzer.compute_return_clone_sites();
     crate::phase_pass_mark("analyzer.compute_return_clone_sites()");
@@ -85513,7 +85382,9 @@ fn analyze_over_world<'src>(
         );
     }
     // E238: the block each member is declared in, and each block's header.
+    crate::phase_pass_mark("the label tables");
     let (member_owners, member_headers) = analyzer.member_headers();
+    crate::phase_pass_mark("analyzer.member_headers()");
 
     if let Some(key) = &checks_key
         && !entry_is_module
@@ -85567,10 +85438,26 @@ fn analyze_over_world<'src>(
                 slice.bumps.push((*function_id, function.bumps.clone()))
             });
         }
+        // M110 S7b: the externals' verdicts likewise (`infer_bumps` restores
+        // them for a reused module instead of re-deriving every one).
+        for (external_id, external) in &analyzer.external_functions {
+            if external.bumps.is_empty() || analyzer.bumps_tabled.contains(external_id) {
+                continue;
+            }
+            place(*external_id, &mut |slice| {
+                slice.bumps.push((*external_id, external.bumps.clone()))
+            });
+        }
         for (site_id, decision) in &clone_sites {
             place(*site_id, &mut |slice| {
                 slice.clone_sites.push((*site_id, decision.clone()))
             });
+        }
+        // M110 S7b: R11's seed calls, per source and per item; the resource
+        // slots per SOURCE only (an item's window is classified live), by
+        // the slot's own source stamp.
+        for call_id in &analyzer.r11_seed_calls {
+            place(*call_id, &mut |slice| slice.r11_seed_calls.push(*call_id));
         }
         // M110 S2b: the label rows, per module, in id order (a record is a
         // function of the module, not of a hash map's walk). Only for an
@@ -85599,6 +85486,12 @@ fn analyze_over_world<'src>(
             place(*id, &mut |slice| {
                 slice.declaration_labels.push((*id, label.clone()))
             });
+        }
+        // M110 S7b: the stage hints, the same way (computed only with
+        // reading aids; `stage_hints` is sorted by span, so a record is a
+        // function of the module).
+        for hint in &stage_hints {
+            place(hint.id, &mut |slice| slice.stage_hints.push(hint.clone()));
         }
         for (site_id, decision) in &return_clone_sites {
             place(*site_id, &mut |slice| {
@@ -85635,6 +85528,29 @@ fn analyze_over_world<'src>(
                 tables.entry(index).or_default();
             }
         }
+        // M110 S7b: the live regions' held rows, per source and per item.
+        held_live.partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            held_live.partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
+        // M110 S7b: the resource slots per SOURCE (an item's window is
+        // classified live), by the slot's own source stamp.
+        {
+            let mut resource_slots: Vec<TypeId> = resource_types.iter().copied().collect();
+            resource_slots.sort_unstable_by_key(|slot| slot.0);
+            for slot in resource_slots {
+                let Some(source) = analyzer.type_id_sources.get(slot.0) else {
+                    continue;
+                };
+                if source.0 != 0 && !skip(source) {
+                    tables
+                        .entry(source.0)
+                        .or_default()
+                        .resource_slots
+                        .push(slot.0);
+                }
+            }
+        }
         // The enrolment's restore condition rides every slice this analysis
         // writes, the empty ones included — a module that enrolled nothing is
         // exactly the module whose gate cost the most to answer.
@@ -85642,6 +85558,10 @@ fn analyze_over_world<'src>(
             slice.drop_nominals_world = analyzer.drop_nominals_world_digest;
             // M110 S2b: the label rows ride only a seeded analysis's record.
             slice.labels_recorded = seeded;
+            // M110 S7b: the stage hints only a reading-aids analysis's; a
+            // module's held rows name nothing outside the stored world.
+            slice.hints_recorded = workspace.reading_aids;
+            slice.held_recorded = true;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
         // M110 S7: the item records of the re-walked files, with their
@@ -85650,7 +85570,8 @@ fn analyze_over_world<'src>(
         // a truncated item on every later hit).
         if items_enabled && !crate::cancel::cancelled() {
             let digest = analyzer.drop_nominals_world_digest;
-            let (items, purge) = analyzer.take_item_records(item_tables, digest, seeded);
+            let (items, purge) =
+                analyzer.take_item_records(item_tables, digest, seeded, workspace.reading_aids);
             item_records::checked_cache_store_items(
                 key,
                 &source_hashes[..prefix_len],
@@ -85662,6 +85583,7 @@ fn analyze_over_world<'src>(
 
     // E237: the definition under an entry binding's, member's or field's type.
     let type_definitions = analyzer.type_definitions(&expr_type_ids);
+    crate::phase_pass_mark("the class D partition and the records");
     // E241: a variant pattern's label, rendered once its types have settled.
     let pattern_labels = analyzer.pattern_labels();
     // E240: type parameters and traits named in type position.

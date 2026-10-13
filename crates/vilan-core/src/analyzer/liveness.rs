@@ -162,6 +162,9 @@ pub(super) struct LastUse {
     /// live walk sees the foreign read, finds no declaration region for it, and
     /// marks it opaque, which is what the full walk concludes too.
     foreign_touched: HashSet<Id>,
+    /// M110 S7b: the cross-file touches as `(region, binding)` pairs, filed
+    /// under the READING region's record (`record_rows`).
+    foreign_reads: Vec<(Id, Id)>,
 }
 
 impl LastUse {
@@ -252,7 +255,7 @@ impl LastUse {
 
     /// Run the pass over every region of the program.
     pub(super) fn compute(analyzer: &Analyzer<'_>) -> Self {
-        let view_origins = analyzer.compute_view_origins();
+        let view_origins = analyzer.view_origins().clone();
         // M19 T1b: a reused module's rows come back verbatim and its regions
         // are not walked. The seed goes in FIRST, so `or_insert_with` on a
         // statement chain keeps the restored answer if a live region also
@@ -276,6 +279,7 @@ impl LastUse {
             declaration_region: HashMap::default(),
             conflicted: restored.last_use_opaque.clone(),
             foreign_touched: HashSet::default(),
+            foreign_reads: Vec::new(),
         };
 
         // Function bodies. A nested `fun` is a region of its own and is not
@@ -328,7 +332,17 @@ impl LastUse {
         // traversal does not know about would otherwise hide a use and turn a
         // live binding into a reported last use — the one wrong answer this
         // pass must never give. A gap costs elisions, never correctness.
-        for (expr_id, expr) in &analyzer.expr_id_to_expr_map {
+        // M19 T1b: a reused module's reads were not walked because its answer
+        // was restored, so the net has nothing to prove about them. M110 S7b:
+        // the LIVE reads only, walked (`live_table_entries`); a restored
+        // region's read of a binding that is live this analysis (a reused
+        // module reading a dirty module's binding) comes back as a
+        // `foreign_reads` row of the restored region and is marked below.
+        for (expr_id, expr) in analyzer
+            .live_table_entries_where(&analyzer.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Local(_))
+            })
+        {
             let Expr::Local(binding_id) = expr else {
                 continue;
             };
@@ -337,19 +351,20 @@ impl LastUse {
             {
                 continue;
             }
-            // M19 T1b: a reused module's reads were not walked because its
-            // answer was restored, so the net has nothing to prove about them.
-            // Both halves of the test are the module's own — the site and the
-            // binding — because a use of a module binding from a LIVE region is
-            // a foreign touch, and the record never carried such a binding.
-            if analyzer.table_entity(*expr_id) && analyzer.table_entity(*binding_id) {
-                continue;
-            }
             let reached = walk
                 .walked_uses
                 .get(binding_id)
                 .is_some_and(|sites| sites.contains(expr_id));
             if !reached {
+                opaque.insert(*binding_id);
+                unreached.insert(*binding_id);
+            }
+        }
+        // M110 S7b: a restored region's cross-file read of a binding that is
+        // live this analysis — the walk could not see the read (the region was
+        // not walked), and a full analysis marks such a binding opaque.
+        for binding_id in &restored.foreign_reads {
+            if !analyzer.table_entity(*binding_id) {
                 opaque.insert(*binding_id);
                 unreached.insert(*binding_id);
             }
@@ -397,6 +412,7 @@ impl LastUse {
             unreached,
             derived_opaque,
             foreign_touched: walk.foreign_touched,
+            foreign_reads: walk.foreign_reads,
         }
     }
 
@@ -461,6 +477,16 @@ impl LastUse {
                     .push((*binding_id, chain.clone()));
             }
         }
+        // M110 S7b: filed under the READING region, which is the record's
+        // own; the binding is the other file's (a prefix id on a hit).
+        for (region, binding_id) in &self.foreign_reads {
+            if let Some(source) = slice_of(analyzer, *region) {
+                into.entry(source)
+                    .or_default()
+                    .foreign_reads
+                    .push((*region, *binding_id));
+            }
+        }
     }
 }
 
@@ -501,6 +527,10 @@ struct Liveness<'a, 'src> {
     conflicted: HashSet<Id>,
     /// M19 T1b: bindings touched from a region of another file.
     foreign_touched: HashSet<Id>,
+    /// M110 S7b: the same touches as `(region, binding)` pairs — the row a
+    /// region's record keeps so that, when the region is restored and the
+    /// binding is live, the net below still marks the binding opaque.
+    foreign_reads: Vec<(Id, Id)>,
 }
 
 impl Liveness<'_, '_> {
@@ -521,6 +551,7 @@ impl Liveness<'_, '_> {
     fn note_touch(&mut self, binding_id: Id) {
         if self.analyzer.source_of_id(binding_id) != self.region_source {
             self.foreign_touched.insert(binding_id);
+            self.foreign_reads.push((self.region, binding_id));
         }
     }
 

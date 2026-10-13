@@ -206,6 +206,12 @@ impl TypeSourceRuns {
         self.high
     }
 
+    /// The runs themselves: `(start, source)` ascending, each run ending
+    /// where the next begins and the last at [`Self::high`].
+    pub fn runs(&self) -> &[(u32, SourceId)] {
+        &self.runs
+    }
+
     /// What the stamp is WORTH in the world tally's currency (M11/M41: one
     /// `SourceId` per slot the world minted, a figure proportional to the
     /// world's types) — not what the run-length form happens to allocate,

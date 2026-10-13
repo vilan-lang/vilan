@@ -394,6 +394,21 @@ fn a_second_seeded_analysis_serves_the_items_records() {
         second.item_records_served, first.item_records_filed,
         "every item filed is served next time: {second:#?}"
     );
+    // M110 S7b: the Class A passes walk the LIVE ranges — the complement of
+    // the frozen, reused and served ranges — so the served analysis covers
+    // fewer entities than the one that filed, and the first (nothing reused
+    // yet) covers every non-std entity.
+    assert!(
+        second.live_ranges > 0 && second.live_entities > 0,
+        "the served analysis seals live ranges: {second:#?}"
+    );
+    assert!(
+        second.live_entities < first.live_entities,
+        "the served analysis walks fewer live entities than the filing one: \
+         {} vs {}",
+        second.live_entities,
+        first.live_entities
+    );
     assert_eq!(rendering, clean(&package));
     package.remove();
 }

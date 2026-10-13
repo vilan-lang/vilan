@@ -263,6 +263,11 @@ pub enum Plant {
     /// previous keystroke's answer; a callee's changed return leaves its
     /// callers'.
     ItemRecordUnguarded,
+    /// S7b (M142, Order 52): the Class A live ranges are sealed with the
+    /// served ITEMS' windows left live — a pass that walks the live ranges
+    /// then visits a served item's bodies and derives its output a second
+    /// time beside the replay of its record (a doubled diagnostic).
+    LiveRangeWalksServed,
 }
 
 impl Plant {
@@ -281,6 +286,7 @@ impl Plant {
             Plant::ContextLogUnguarded => 12,
             Plant::PostSeedFromSettled => 13,
             Plant::ItemRecordUnguarded => 14,
+            Plant::LiveRangeWalksServed => 15,
         }
     }
 }
@@ -378,6 +384,12 @@ pub struct Census {
     pub item_records_served: u64,
     pub item_records_stale: u64,
     pub item_records_filed: u64,
+    /// M110 S7b (Order 52): the Class A LIVE ranges this analysis sealed
+    /// (`analyzer/live_ranges.rs`) and the entity ids they cover — the
+    /// complement of the frozen, reused and served ranges, which is what a
+    /// whole-program pass walks in place of the table.
+    pub live_ranges: u64,
+    pub live_entities: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -420,6 +432,8 @@ thread_local! {
             item_records_served: 0,
             item_records_stale: 0,
             item_records_filed: 0,
+            live_ranges: 0,
+            live_entities: 0,
             prefix_world: false,
             prefix_hits: 0,
             prefix_refusals: 0,
@@ -784,8 +798,8 @@ pub fn report(program: &Program) {
              bound-sites-checked={} graphs-replayed={} context-log-replayed={} \
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
-             records-served={} records-stale={} records-filed={} prefix-world={} \
-             prefix-hits={} prefix-refusals={}",
+             records-served={} records-stale={} records-filed={} live-ranges={} \
+             live-entities={} prefix-world={} prefix-hits={} prefix-refusals={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -810,6 +824,8 @@ pub fn report(program: &Program) {
             census.item_records_served,
             census.item_records_stale,
             census.item_records_filed,
+            census.live_ranges,
+            census.live_entities,
             u8::from(census.prefix_world),
             census.prefix_hits,
             census.prefix_refusals,
