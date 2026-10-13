@@ -59,6 +59,16 @@ above `fun get_or_insert(self, key: UserId, make: || SignalCell<Option<User>>):
 SignalCell<Option<User>>`. A call that substitutes nothing, and a hover on
 the declaration itself, show the one line they always did.
 
+Every function's hover opens with WHERE it lives — `mod pkg::lib::overlay`,
+`mod std::list` — and every function states a return type, `: void` where
+none is written. A module segment of a path (`overlay` in `import
+pkg::lib::overlay::{ .. }`, `model` in `model::global()`) hovers as that
+module: its `mod` line, the `///` that opens its file, what it exports and
+where it lives. A field names the struct it belongs to (`struct Ring<T>` above
+`items: List<T>`); a `match` leg names what it matches over and the bindings it
+introduces; a trait named in a parameter's type lists what can be passed
+there; a `[derive(..)]` shows the impls it writes for the item.
+
 A METHOD's hover names the block it is declared in, on its own line above
 the `fun` line and in real syntax: `impl Memo<type K: Hashable, type V>`
 for an inherent method, `impl MemoCell<type T> with Source<T>` for a
@@ -110,6 +120,12 @@ A chain written **one stage per line** is hinted per stage, in the
 spelling an ascription is written in: each line that ends a stage shows
 ` as List<usize>` — or ` as ~Pipe<str>` where the abbreviation applies —
 and so does the chain's head when the first link breaks onto a new line.
+`vilan.inlayHints.chains = "changes"` hints a stage only where its type, as
+the hint prints it, differs from the stage before it (the first stage
+always); **Ascribe every stage of this chain** still writes every stage. An
+element's tag and its head's items are not a chain you wrote, and carry no
+stage hints. Hovering a hint shows what its binding's name hovers, and a
+click on its type's name goes to that type.
 A stage you have already ascribed shows nothing, and neither does the
 last stage of a chain that lands in an annotated `let`. On a hinted line
 the refactor **Ascribe this stage** writes it into the file — the full
@@ -476,6 +492,7 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 | `vilan.stdPath` | — | an explicit `std` root, overriding discovery |
 | `vilan.inlayHints.enabled` | `true` | |
 | `vilan.inlayHints.abbreviate` | `true` | show a `[hint]`ed type by its trait, `~Source<T>`; off shows every full type |
+| `vilan.inlayHints.chains` | `every` | `changes`: hint a chain's stage only where its type changes |
 | `vilan.semanticTokens.enabled` | `true` | off falls back to the TextMate grammar |
 | `vilan.completion.functionCall` | `full` | `parensOnly`, or `none` |
 | `vilan.autoClosing.generics` | `true` | pair a generic `<` and type over its `>`; off for Vim emulation |
