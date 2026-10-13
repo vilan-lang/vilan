@@ -128,6 +128,11 @@ written down.
 <!-- family: feature -->
 **E307: a field hovers under the struct it belongs to — `struct AppInputLayerData` on its own line above `on_toggle_sidebar: || void`, in the one fence, at an initializer key (kolt `views.vl:79`), at the field's declaration and at a member read (`ring.items` answers `struct Ring<T>` / `items: List<i32>`).** The owner's head is the struct's declaration line as written (E238's header shape, its generic parameters included), printed through one function for the three positions so they cannot drift. A member read of an `[internal]` field now leads with its reason too, as the declaration and the key already did (E213). The item's struct-VARIANT case does not arise: vilan's enum variants carry tuple payloads only. Six field-hover pins gained the line. Pin: `editor_review_tests::e307_a_field_hover_names_its_struct`. Tracker E307.
 
+---
+
+<!-- family: feature -->
+**E304: a function's label always states its return type — `fun quiet(): void` where the declaration writes none and returns nothing, the inferred type where the body returns one (`fun three() { 3 }` reads `fun three(): i32`), the written one as written.** The label ended at the parameter list exactly when the source did, so a reader could not tell a void function from one whose return type the label dropped. The label prints the solver's recorded EXACT inference of the return (the record the return checking already keeps for every function, called or not); with none it ends at its parameters, as before. Every reader of the label follows — hover, completion's detail, signature help, E206's second line, E240's "A type parameter of `fun …`", a trait's required-members block — and the conformance steer's suggested declaration with them; the source is untouched (`vilan fmt` keeps `fun f() {`). Five pins moved. Pin: `editor_review_tests::e304_a_function_label_always_states_its_return_type` (no annotation, a written `: void`, an inferred non-void, a method, an inferred method, a trait default, a requirement, a closure-typed parameter unchanged). Tracker E304.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

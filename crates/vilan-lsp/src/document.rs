@@ -16842,7 +16842,7 @@ pub(crate) mod tests {
         )
         .expect("hover on the declaration");
         assert!(
-            hover.contains("```vilan\nmod pkg\nasync fun warm()\n```"),
+            hover.contains("```vilan\nmod pkg\nasync fun warm(): void\n```"),
             "{hover}"
         );
     }
@@ -25166,7 +25166,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
                 .starts_with(&fence("mod pkg\nimpl User\nfun peek(&self): i32"))
         );
         assert!(hover(&document, "user.rename(", 0, 6).starts_with(&fence(
-            "mod pkg\nimpl User\nfun rename(&mut self, own name: str)"
+            "mod pkg\nimpl User\nfun rename(&mut self, own name: str): void"
         )));
     }
 
@@ -25400,7 +25400,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let blocks: Vec<&str> = hover.split("\n\n").collect();
         assert_eq!(blocks[0], "**deprecated** — use keep()", "{hover}");
         assert_eq!(
-            blocks[1], "```vilan\nmod pkg\nasync fun save()\n```",
+            blocks[1], "```vilan\nmod pkg\nasync fun save(): void\n```",
             "{hover}"
         );
         assert_eq!(blocks[2], "Writes the state.", "{hover}");
@@ -25551,7 +25551,10 @@ fun main() {\n\tlet boxed = Boxed { value = 3 };\n\tprint(pick(boxed));\n\teach(
     fn e240_a_type_parameter_inside_a_closure_type_hovers_as_the_parameter() {
         assert_eq!(
             hover("observer: |T| void", 11),
-            parameter("type T", "fun each<T>(items: List<T>, observer: |T| void)")
+            parameter(
+                "type T",
+                "fun each<T>(items: List<T>, observer: |T| void): void"
+            )
         );
     }
 

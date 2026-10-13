@@ -1039,3 +1039,45 @@ fn e307_a_field_hover_names_its_struct() {
         );
     });
 }
+
+/// E304: the function label always carries a return type — `: void` where
+/// none is written and nothing is returned, the inferred type where the body
+/// returns one, the written one untouched; a method and a trait default
+/// alike; a closure-typed parameter's label unchanged.
+#[test]
+fn e304_a_function_label_always_states_its_return_type() {
+    on_big_stack(|| {
+        let source = "struct Counter {\n\tcount: i32,\n}\n\n\
+             impl Counter {\n\tfun bump(self) {\n\t\tlet _ = self.count + 1;\n\t}\n\tfun doubled(self) {\n\t\tself.count * 2\n\t}\n}\n\n\
+             trait Greets {\n\tfun greet(self): str;\n\tfun twice(self) {\n\t\tlet _ = self.greet();\n\t}\n}\n\n\
+             fun quiet() {\n\tlet _ = 1;\n}\n\nfun written(): void {}\n\nfun three() {\n\t3\n}\n\n\
+             fun apply(f: |i32| i32): i32 {\n\tf(1)\n}\n\n\
+             fun main() {\n\tquiet();\n\twritten();\n\tlet _ = three();\n\tlet counter = Counter { count = 1 };\n\
+             \tcounter.bump();\n\tlet _ = counter.doubled();\n\tlet _ = apply(|x| x);\n}\n";
+        let package = Package::new("e304", &[("client.vl", source)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let signature = |needle: &str, delta: usize| {
+            let hover = document
+                .hover(at(source, needle, delta))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover
+                .lines()
+                .find(|line| line.starts_with("fun "))
+                .unwrap_or_else(|| panic!("a `fun` line in {hover}"))
+                .to_string()
+        };
+        assert_eq!(signature("quiet();", 0), "fun quiet(): void");
+        assert_eq!(signature("written();", 0), "fun written(): void");
+        assert_eq!(signature("three();", 0), "fun three(): i32");
+        assert_eq!(signature("bump();", 0), "fun bump(self): void");
+        assert_eq!(signature("doubled();", 0), "fun doubled(self): i32");
+        assert_eq!(signature("fun twice", 4), "fun twice(self): void");
+        assert_eq!(signature("fun greet", 4), "fun greet(self): str");
+        assert_eq!(signature("apply(|x|", 0), "fun apply(f: |i32| i32): i32");
+    });
+}

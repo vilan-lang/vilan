@@ -24817,9 +24817,16 @@ impl<'src> Analyzer<'src> {
         }
         let generics =
             self.generic_list_label_under(&function.generic_parameter_constraint_ids, substitution);
+        // E304: a function that WRITES no return type still states one — the
+        // type its body was inferred to return (`: void` for a body that
+        // returns nothing), so a reader can tell a void function from one
+        // whose return type the label dropped. Only an inference the solver
+        // recorded as exact is printed; with none the label ends at its
+        // parameters, as before.
         let return_label = function
             .return_type_id
             .or_else(|| self.auto_written_type_id(function.id))
+            .or_else(|| self.inferred_return_types.get(&function.id).copied())
             .map(|return_type_id| {
                 format!(
                     ": {}",
