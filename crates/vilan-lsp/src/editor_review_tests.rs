@@ -721,3 +721,124 @@ fn e303_an_element_head_mints_no_stage_hints() {
         }
     });
 }
+
+/// `VILAN_EDITOR_TOKENS="file:from-to;…"` (1-based lines): every semantic
+/// token on those lines, with its text and kind.
+#[test]
+#[ignore = "E311: the kolt token probe - needs VILAN_EDITOR_KOLT and VILAN_EDITOR_TOKENS, run deliberately"]
+fn kolt_token_probe() {
+    let Some(root) = std::env::var_os("VILAN_EDITOR_KOLT").map(PathBuf::from) else {
+        return;
+    };
+    let probes = std::env::var("VILAN_EDITOR_TOKENS").unwrap_or_default();
+    on_big_stack(move || {
+        for probe in probes.split(';').filter(|probe| !probe.is_empty()) {
+            let (file, lines) = probe.split_once(':').expect("file:from-to");
+            let (from, to) = lines.split_once('-').expect("from-to");
+            let (from, to): (usize, usize) = (from.parse().unwrap(), to.parse().unwrap());
+            let document = kolt_view(&root, file);
+            let text = document.analyzed_text().to_string();
+            for (span, kind, modifiers) in document.semantic_tokens() {
+                let range = span.into_range();
+                let line = text[..range.start].matches('\n').count() + 1;
+                if (from..=to).contains(&line) {
+                    println!("{file}:{line} {:?} {kind:?} {modifiers}", &text[range]);
+                }
+            }
+        }
+    });
+}
+
+/// Every semantic token over the one occurrence of `needle` in `text`, as
+/// `(token text, kind)`.
+fn tokens_over(document: &Document, needle: &str) -> Vec<(String, String)> {
+    let text = document.analyzed_text();
+    let start = text.find(needle).unwrap_or_else(|| panic!("{needle:?}"));
+    assert_eq!(text.matches(needle).count(), 1, "{needle:?} occurs once");
+    let end = start + needle.len();
+    let mut tokens: Vec<(usize, String, String)> = document
+        .semantic_tokens()
+        .into_iter()
+        .filter(|(span, _, _)| span.start >= start && span.end <= end)
+        .map(|(span, kind, _)| {
+            (
+                span.start,
+                text[span.into_range()].to_string(),
+                format!("{kind:?}"),
+            )
+        })
+        .collect();
+    tokens.sort();
+    tokens
+        .into_iter()
+        .map(|(_, word, kind)| (word, kind))
+        .collect()
+}
+
+/// E311: a function a PATH reaches paints as a Function — `stroke1` in
+/// `.border(px(1), Theme::stroke1())` inside a `css` block's chain link (kolt
+/// `login_page.vl:97`), and equally in a property's hole, a condition body,
+/// plain code and a module-qualified call: the call's one entity spans the
+/// whole path, and its token lost to the type's at the overlap.
+#[test]
+fn e311_a_function_reached_through_a_path_paints_as_a_function() {
+    on_big_stack(|| {
+        let source = "import std::web::style::{ Color, Style };\n\n\
+             struct Theme {}\n\nimpl Theme {\n\tfun stroke1(): Color {\n\t\tColor::hex(\"#5e5e5e\")\n\t}\n\
+             \tfun ink(): Color {\n\t\tColor::hex(\"#000000\")\n\t}\n}\n\n\
+             fun plain(): Color {\n\tlet c = Theme::stroke1();\n\tc\n}\n\n\
+             fun block(): View {\n\t<div .styled(css {\n\t\tpadding(style::Length::px(4));\n\t\t.border(px(1), Theme::stroke1());\n\
+             \t\tcolor(Theme::ink());\n\t\t.hover {\n\t\t\t.border(px(2), Theme::ink());\n\t\t}\n\t}) />\n}\n\n\
+             fun main() {\n\tlet _ = plain();\n\tlet _ = block();\n}\n";
+        let package = Package::new("e311", &[("client.vl", source)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let pair = |word: &str, kind: &str| (word.to_string(), kind.to_string());
+        assert_eq!(
+            tokens_over(&document, ".border(px(1), Theme::stroke1());"),
+            vec![
+                pair("border", "Method"),
+                pair("px", "Function"),
+                pair("Theme", "Struct"),
+                pair("stroke1", "Function"),
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "color(Theme::ink());"),
+            vec![
+                pair("color", "Property"),
+                pair("Theme", "Struct"),
+                pair("ink", "Function")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, ".border(px(2), Theme::ink());"),
+            vec![
+                pair("border", "Method"),
+                pair("px", "Function"),
+                pair("Theme", "Struct"),
+                pair("ink", "Function"),
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "let c = Theme::stroke1();"),
+            vec![
+                pair("c", "Variable"),
+                pair("Theme", "Struct"),
+                pair("stroke1", "Function")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "padding(style::Length::px(4));"),
+            vec![
+                pair("padding", "Property"),
+                pair("style", "Namespace"),
+                pair("px", "Function")
+            ]
+        );
+    });
+}

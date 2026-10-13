@@ -5203,7 +5203,7 @@ impl Document {
                             _ => 0,
                         };
                         tokens.push((
-                            variant_leaf(program, *target, span),
+                            path_leaf(program, self.analyzed_text(), *target, span),
                             classify_target(*target),
                             readonly | internal_modifier(*target),
                         ));
@@ -10328,23 +10328,41 @@ fn declared_platform_attribute(note: &str) -> Option<&str> {
 /// type-reference token (`Side`) — so the overlap filter dropped it, and the
 /// variant was never painted at all, let alone dimmed. Its token is the LEAF:
 /// the variant's name at the end of the span, when the span is longer than it.
-/// Every other reference keeps its span.
-fn variant_leaf(program: &Program, target: Id, span: Span) -> Span {
-    let Some(Expr::EnumVariant(enum_id, index)) = program.entity_map.get(&target) else {
-        return span;
-    };
-    let Some(variant) = program
-        .enums
-        .get(enum_id)
-        .and_then(|enumeration| enumeration.variants.get(*index))
-    else {
-        return span;
-    };
+///
+/// E311: the same for every declaration a path reaches — an associated
+/// function through its type (`Theme::stroke1()`, `Color::hex(..)`), which
+/// went unpainted everywhere (the owner met it in a `css` block's chain link,
+/// kolt `login_page.vl:97`), and a module-qualified function or constant: the
+/// leaf is the name after the last `::` of the written path. Every other
+/// reference keeps its span.
+fn path_leaf(program: &Program, text: &str, target: Id, span: Span) -> Span {
     let range = span.into_range();
-    if range.end - range.start <= variant.name.len() {
+    let name = match program.entity_map.get(&target) {
+        Some(Expr::EnumVariant(enum_id, index)) => program
+            .enums
+            .get(enum_id)
+            .and_then(|enumeration| enumeration.variants.get(*index))
+            .map(|variant| variant.name),
+        _ => crate::references::name_of(program, crate::references::Definition::Entity(target)),
+    };
+    let Some(name) = name else {
+        return span;
+    };
+    if range.end - range.start <= name.len() {
         return span;
     }
-    Span::from(range.end - variant.name.len()..range.end)
+    let leaf = range.end - name.len();
+    let written_path = text
+        .get(range.start..leaf)
+        .is_some_and(|head| head.ends_with("::"))
+        && text.get(leaf..range.end) == Some(name);
+    // A variant's span is its path whatever the text says (E221's rule).
+    let variant = matches!(program.entity_map.get(&target), Some(Expr::EnumVariant(..)));
+    if written_path || variant {
+        Span::from(leaf..range.end)
+    } else {
+        span
+    }
 }
 
 /// How the label reads in the editor, in ONE place: hover's lead line and the
