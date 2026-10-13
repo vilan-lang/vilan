@@ -86,6 +86,24 @@ thread_local! {
     /// How many impl ROWS the member and trait lookups have examined on this
     /// thread (M107). See [`impl_rows_examined`].
     static IMPL_ROWS_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// M133: the `impl_bounds_hold` questions [`ImplBoundsMemo`] served, and
+    /// the ones it computed and kept, on this thread. See
+    /// [`impl_bounds_memo_counts`].
+    static IMPL_BOUNDS_MEMO_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// M133: `(served, computed)` — the `impl_bounds_hold` questions about a
+/// ground receiver the fixpoint's memo answered from its table, and the ones
+/// it computed and kept, on this thread since the last
+/// [`reset_impl_bounds_memo_counts`]. Only this count sees the memo: an
+/// answer served is the answer computed.
+pub fn impl_bounds_memo_counts() -> (u64, u64) {
+    IMPL_BOUNDS_MEMO_COUNTS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`impl_bounds_memo_counts`].
+pub fn reset_impl_bounds_memo_counts() {
+    IMPL_BOUNDS_MEMO_COUNTS.with(|count| count.set((0, 0)));
 }
 
 /// The impl rows the member lookup (`impl_member_candidates`), the two
@@ -5587,6 +5605,10 @@ pub struct Analyzer<'src> {
     // argument that stays abstract leaves the binder where it was, which is
     // what happened for every shape before the grounding existed.
     bound_argument_grounding_depth: u32,
+    /// M133: [`Analyzer::impl_bounds_hold`]'s answers for a GROUND receiver,
+    /// for the length of one world's fixpoint (`None` outside it) — see
+    /// [`ImplBoundsMemo`].
+    impl_bounds_memo: Option<ImplBoundsMemo>,
     // proposal/lazy.md §1 — the three tables the `lazy` lowering needs, filled
     // by `record_lazy_arguments` once every call has resolved and read by the
     // transformer through their `Program` twins.
@@ -7428,6 +7450,45 @@ impl ImplAdmission {
     }
 }
 
+/// M133 — [`Analyzer::impl_bounds_hold`] memoized per (impl, ground
+/// receiver) for one world's fixpoint.
+///
+/// Method resolution asks every candidate impl whether its binders' bounds
+/// hold for the receiver, once per CALL: a `Slot` blanket added to std is
+/// asked again at every `.place(..)` of every view type, and reactive-ui asks
+/// ~2,900 questions about ~300 (impl, receiver) pairs. The answer is a
+/// function of the impl (its subject and binder bounds, fixed once walked),
+/// of the receiver, of the impls in the world (the `impl_count` key: an impl
+/// that joins clears the table) and of which generics are RIGID where the
+/// question is asked (`generic_is_rigid_here`, which `compare_type` reads):
+/// the key carries the innermost scope that can change that set (a scope
+/// declaring a generic, a binder's owner, or a scope whose names could
+/// shadow a generic's name — `boundary_scopes`' reading).
+///
+/// It is consulted only where the answer cannot depend on anything else: a
+/// receiver with no generic, unknown or labelled position (`ground_key`), no
+/// generic open for inference, the outermost grounding step, and no impl
+/// reach log recording (a hit would skip the trait questions the log keeps).
+/// B401's admission is not read by the computation at all (it narrows the
+/// candidate LIST, before this is asked), and it is rebuilt only before a
+/// fixpoint, where the table starts empty.
+#[derive(Clone, Debug, Default)]
+struct ImplBoundsMemo {
+    /// The impl count the answers were computed against.
+    impl_count: usize,
+    /// (impl subject, the receiver's ground key, the boundary scope) -> holds.
+    answers: HashMap<(TypeId, Vec<u32>, Option<Id>), bool>,
+    /// Per scope: whether it is a boundary (see the type's note).
+    boundary_scopes: HashMap<Id, bool>,
+    /// The names every generic parameter goes by, and the scopes that own an
+    /// implicit or anonymous binder — read once, when the table is opened.
+    generic_names: HashSet<String>,
+    binder_owner_scopes: HashSet<Id>,
+    /// Hits and computed answers, for the cost report.
+    hits: u64,
+    misses: u64,
+}
+
 /// B401 — the impl admission the analyzer's OWN method lookup reads, built
 /// before the fixpoint ([`Analyzer::build_lookup_admission`]) from the same
 /// rows [`build_impl_admission`] resolves after it.
@@ -7953,6 +8014,7 @@ impl<'src> Analyzer<'src> {
             own_generic_call_bindings: HashMap::default(),
             spread_packs: HashMap::default(),
             bound_argument_grounding_depth: 0,
+            impl_bounds_memo: None,
             lazy_argument_thunks: IndexMap::default(),
             lazy_argument_forwards: HashSet::default(),
             lazy_cells: HashSet::default(),
@@ -22264,6 +22326,167 @@ impl<'src> Analyzer<'src> {
     /// `Signal<View>` in child position reached `std::web::ui`'s `Source<str>` text
     /// arm and stringified the view.
     fn impl_bounds_hold(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
+        let Some(key) = self.impl_bounds_memo_key(impl_subject, subject_type) else {
+            return self.impl_bounds_hold_computed(impl_subject, subject_type);
+        };
+        if let Some(memo) = self.impl_bounds_memo.as_mut()
+            && let Some(answer) = memo.answers.get(&key).copied()
+        {
+            memo.hits += 1;
+            return answer;
+        }
+        let answer = self.impl_bounds_hold_computed(impl_subject, subject_type);
+        if let Some(memo) = self.impl_bounds_memo.as_mut() {
+            memo.misses += 1;
+            memo.answers.insert(key, answer);
+        }
+        answer
+    }
+
+    /// Opens [`ImplBoundsMemo`] for a fixpoint.
+    fn open_impl_bounds_memo(&mut self) {
+        let generic_names: HashSet<String> = self
+            .generic_constraint_names
+            .values()
+            .map(|name| (*name).to_string())
+            .collect();
+        let binder_owner_scopes: HashSet<Id> = self
+            .implicit_generic_scopes
+            .values()
+            .chain(self.anonymous_binder_scopes.values())
+            .copied()
+            .collect();
+        self.impl_bounds_memo = Some(ImplBoundsMemo {
+            impl_count: self.implementations.len(),
+            generic_names,
+            binder_owner_scopes,
+            ..ImplBoundsMemo::default()
+        });
+    }
+
+    /// Closes [`ImplBoundsMemo`], reporting its counts to the cost report.
+    fn close_impl_bounds_memo(&mut self) {
+        if let Some(memo) = self.impl_bounds_memo.take() {
+            IMPL_BOUNDS_MEMO_COUNTS.with(|count| {
+                let (served, computed) = count.get();
+                count.set((served + memo.hits, computed + memo.misses));
+            });
+        }
+    }
+
+    /// The memo key for this question, or `None` when it must be computed
+    /// ([`ImplBoundsMemo`] says when). Clears the table when an impl joined.
+    fn impl_bounds_memo_key(
+        &mut self,
+        impl_subject: TypeId,
+        subject_type: &Type,
+    ) -> Option<(TypeId, Vec<u32>, Option<Id>)> {
+        if self.impl_bounds_memo.is_none()
+            || self.bound_argument_grounding_depth != 0
+            || !self.inferable_generics.is_empty()
+            || self.impl_reach.borrow().recording
+        {
+            return None;
+        }
+        let mut receiver = Vec::new();
+        if !self.ground_key(subject_type, &mut receiver, 0) {
+            return None;
+        }
+        let impl_count = self.implementations.len();
+        let boundary = self.rigid_boundary_scope();
+        let memo = self.impl_bounds_memo.as_mut()?;
+        if memo.impl_count != impl_count {
+            memo.impl_count = impl_count;
+            memo.answers.clear();
+        }
+        Some((impl_subject, receiver, boundary))
+    }
+
+    /// Writes `type_`'s structure into `out` when it is GROUND — every
+    /// position a nominal, a primitive, an array of a known length, an
+    /// unlabelled tuple or an object over ground arguments. False for
+    /// anything a later write could still move, or that compares by more
+    /// than its structure (a closure, a labelled tuple, a function item).
+    fn ground_key(&self, type_: &Type, out: &mut Vec<u32>, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let arguments = |out: &mut Vec<u32>, tag: u32, id: u32, arguments: &[TypeId]| {
+            out.extend([tag, id, arguments.len() as u32]);
+            arguments
+                .iter()
+                .all(|argument| self.ground_key(&argument.get_type(self), out, depth + 1))
+        };
+        match type_ {
+            Type::Struct(id, items) => arguments(out, 1, id.0, items),
+            Type::Enum(id, items) => arguments(out, 2, id.0, items),
+            Type::Dyn(id, items) => arguments(out, 3, id.0, items),
+            Type::Tuple(items, labels) if *labels == TupleLabels::NONE => {
+                arguments(out, 4, 0, items)
+            }
+            Type::Array(item, length) => match length.get_type(self) {
+                Type::Length(count) => {
+                    out.extend([5, count as u32]);
+                    self.ground_key(&item.get_type(self), out, depth + 1)
+                }
+                _ => false,
+            },
+            Type::Void => {
+                out.push(6);
+                true
+            }
+            Type::Never => {
+                out.push(7);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The innermost scope, from the one the constraint being resolved is
+    /// anchored in outward, that can decide which generics are rigid there:
+    /// one that declares a generic, owns an implicit or anonymous binder, or
+    /// holds a name some generic goes by (which would shadow it). Every scope
+    /// below it passes a generic's name lookup straight through, so two
+    /// questions under one boundary see one rigid set. `None` when no scope
+    /// is one — nothing is rigid.
+    fn rigid_boundary_scope(&mut self) -> Option<Id> {
+        let mut current = self.rigid_binder_scope;
+        while let Some(scope_id) = current {
+            let known = self
+                .impl_bounds_memo
+                .as_ref()
+                .and_then(|memo| memo.boundary_scopes.get(&scope_id).copied());
+            let boundary = match known {
+                Some(boundary) => boundary,
+                None => {
+                    let memo = self.impl_bounds_memo.as_ref()?;
+                    let scope = self.scopes.get(&scope_id)?;
+                    let boundary = memo.binder_owner_scopes.contains(&scope_id)
+                        || scope.name_to_id_map.iter().any(|(name, entity)| {
+                            memo.generic_names.contains(*name)
+                                || matches!(
+                                    self.expr_id_to_expr_map.get(entity),
+                                    Some(Expr::Generic(_))
+                                )
+                        });
+                    self.impl_bounds_memo
+                        .as_mut()?
+                        .boundary_scopes
+                        .insert(scope_id, boundary);
+                    boundary
+                }
+            };
+            if boundary {
+                return Some(scope_id);
+            }
+            current = self.scopes.get(&scope_id).and_then(|scope| scope.parent_id);
+        }
+        None
+    }
+
+    /// [`Self::impl_bounds_hold`], computed.
+    fn impl_bounds_hold_computed(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
         let impl_subject_type = impl_subject.get_type(self);
         let Some((_, bindings)) =
             self.reconcile_declaration(&impl_subject_type, subject_type, &impl_subject_type)
@@ -68025,6 +68248,9 @@ impl<'src> Analyzer<'src> {
         let mut fruitless_backstops = 0u32;
         self.fixpoint_stalled = false;
         self.literal_lets_wait = true;
+        // M133: the bound answers memoize for this fixpoint — the impls are
+        // walked and their subjects resolved by now.
+        self.open_impl_bounds_memo();
 
         for _ in 0..max_iterations {
             let mut progress = self.resolve_constraints();
@@ -68136,6 +68362,7 @@ impl<'src> Analyzer<'src> {
         }
         self.fixpoint_stalled = false;
         self.literal_lets_wait = false;
+        self.close_impl_bounds_memo();
         self.recheck_lenient_subscript_indexes();
         if split_on {
             split.push(("fixpoint", split_mark.elapsed()));

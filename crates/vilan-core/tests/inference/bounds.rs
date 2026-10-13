@@ -15020,3 +15020,117 @@ fn b588_a_tuple_bound_the_blanket_does_not_contain_stays_refused() {
         assert_fails_with(&source, refusal);
     }
 }
+
+// --- M133: `impl_bounds_hold` memoized per (impl, ground receiver) -----------
+
+/// The overlapping-impl program M133's pins share: `Holder<T: Shown>` and
+/// `Holder<T>` both provide `name`, so every call's candidates are asked
+/// whether their binders' bounds hold — `i32` is `Shown`, `bool` is not.
+fn m133_holder_program(calls: usize) -> String {
+    let mut source = String::from(
+        r#"
+        import std::io::print;
+        trait Shown {
+            fun shown(self): str;
+        }
+        impl i32 with Shown {
+            fun shown(self): str {
+                "i32"
+            }
+        }
+        trait Named {
+            fun name(self): str;
+        }
+        struct Holder<T> {
+            value: T,
+        }
+        impl Holder<type T: Shown> with Named {
+            fun name(self): str {
+                "shown " + self.value.shown()
+            }
+        }
+        impl Holder<type T> with Named {
+            fun name(self): str {
+                "plain"
+            }
+        }
+        fun main() {
+        "#,
+    );
+    for _ in 0..calls {
+        source.push_str("print(Holder { value = 1 }.name());\n");
+        source.push_str("print(Holder { value = true }.name());\n");
+    }
+    source.push_str("}\n");
+    source
+}
+
+/// M133: the memo answers each (impl, receiver) pair once per receiver —
+/// `Holder<i32>` keeps the `Shown` impl and `Holder<bool>` the plain one, on
+/// every call, however many there are.
+#[test]
+fn m133_the_bound_memo_keeps_each_receivers_own_answer() {
+    assert_compiles_and_runs(
+        &m133_holder_program(3),
+        "shown i32\nplain\nshown i32\nplain\nshown i32\nplain\n",
+    );
+}
+
+/// M133: a repeated question about a ground receiver is served from the
+/// memo: ten more calls of the same two receivers add served answers and
+/// compute nothing new.
+#[test]
+fn m133_a_repeated_ground_receiver_is_served_from_the_memo() {
+    fn memo_counts(calls: usize) -> ((u64, u64), bool) {
+        let source = m133_holder_program(calls);
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let source: &'static str = Box::leak(source.into_boxed_str());
+                vilan_core::analyzer::reset_impl_bounds_memo_counts();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                assert!(program.is_some(), "analysis should produce a program");
+                (
+                    vilan_core::analyzer::impl_bounds_memo_counts(),
+                    vilan_core::analyzer::served_from_base_cache(),
+                )
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    }
+    // As `method_lookup_compares_only_the_impls_that_can_provide_the_member`
+    // measures: both analyses served std's world from the base cache, so each
+    // counts its entry's questions alone.
+    let served = |calls: usize| {
+        (0..4)
+            .map(|_| memo_counts(calls))
+            .find(|(_, served)| *served)
+            .map(|(counts, _)| counts)
+            .expect("the base cache serves a repeated analysis of the same world")
+    };
+    let (served_one, computed_one) = served(1);
+    let (served_eleven, computed_eleven) = served(11);
+    assert_eq!(
+        computed_eleven, computed_one,
+        "ten more calls of the same two receivers computed new bound answers \
+         ({computed_one} -> {computed_eleven}): the memo must key them by (impl, receiver)"
+    );
+    assert!(
+        served_eleven >= served_one + 20,
+        "ten more calls of two receivers, two candidates each, must be served from \
+         the memo ({served_one} -> {served_eleven})"
+    );
+}
