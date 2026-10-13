@@ -638,7 +638,11 @@ impl<'src> Analyzer<'src> {
                                 code: block,
                                 declared_by: None,
                                 implemented_by: self.implementors_in_reach(
-                                    *trait_id, arguments, *source, &mut reach,
+                                    *trait_id,
+                                    arguments,
+                                    *source,
+                                    &mut reach,
+                                    rows.every_view,
                                 ),
                             });
                         }
@@ -677,8 +681,13 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         code: block,
                         declared_by: None,
-                        implemented_by: self
-                            .implementors_in_reach(*trait_id, arguments, *source, &mut reach),
+                        implemented_by: self.implementors_in_reach(
+                            *trait_id,
+                            arguments,
+                            *source,
+                            &mut reach,
+                            rows.every_view,
+                        ),
                     });
                 }
                 _ => {}
@@ -700,7 +709,12 @@ impl<'src> Analyzer<'src> {
         written: &[TypeId],
         source: SourceId,
         reach: &mut Option<HashMap<SourceId, HashSet<SourceId>>>,
+        every_view: bool,
     ) -> Vec<String> {
+        // Only an editor reads the list (it is the hover's preview).
+        if !every_view {
+            return Vec::new();
+        }
         let reach = reach.get_or_insert_with(|| match self.entry_scope_id {
             Some(entry_scope_id) => self.trait_reach_by_file(entry_scope_id, None),
             None => HashMap::default(),
