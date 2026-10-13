@@ -10876,7 +10876,9 @@ impl<'src> Analyzer<'src> {
                     }, *declaration_id);
                     continue;
                 }
-                if !self.resolved_type_is_hashable(*field_type_id) {
+                let under_binders =
+                    self.hashable_member_under_binders(*declaration_id, *field_type_id);
+                if !self.resolved_type_is_hashable(under_binders) {
                     let rendered = render_type_quoted(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
                         note: None,
@@ -21827,6 +21829,70 @@ impl<'src> Analyzer<'src> {
             .map(|(_, span, _)| (source, *span))
     }
 
+    /// B622: a `[derive(Hashable)]` member's type read under the derived
+    /// impl's OWN binders — the subject's parameters substituted by the
+    /// arguments of the impl the derive wrote over the declaration.
+    ///
+    /// The derive binds every parameter a member reaches under `Hashable`
+    /// (B194: `impl Holder<type T: Hashable> with Hashable`), so under that
+    /// impl a reached `T` — and a `List<T>`, a `[T; N]`, an `Inner<T>` whose
+    /// impl asks `T: Hashable` — is `Hashable`. Read at the declaration's own
+    /// `T`, whose bound is whatever the struct wrote (most often nothing), the
+    /// boundary refused the very field the derive accounts for. A non-generic
+    /// declaration, or one with no `Hashable` impl over its binders, reads the
+    /// member as declared.
+    ///
+    /// Deliberately NOT the Wire boundary's: there a parameter-typed field is
+    /// refused on purpose (C7's guard, `borrows::
+    /// a_wire_type_with_a_parameter_typed_field_is_rejected`) so a Wire type's
+    /// parameters stay phantom and `resolved_type_is_wire` may answer a
+    /// derived name without its arguments.
+    fn hashable_member_under_binders(
+        &mut self,
+        declaration_id: Id,
+        member_type_id: TypeId,
+    ) -> TypeId {
+        let Some(trait_id) = self.hashable_trait_id else {
+            return member_type_id;
+        };
+        let parameters = match self.structs.get(&declaration_id) {
+            Some(struct_) => struct_.generic_parameter_constraint_ids.clone(),
+            None => match self.enums.get(&declaration_id) {
+                Some(enum_) => enum_.generic_parameter_constraint_ids.clone(),
+                None => return member_type_id,
+            },
+        };
+        if parameters.is_empty() {
+            return member_type_id;
+        }
+        // The derive's impl: over the declaration, providing the trait, every
+        // subject argument one of its own binders (a hand-written impl at a
+        // concrete instance is not the derive's).
+        let binder_arguments = self.implementations.iter().find_map(|implementation| {
+            if !implementation.trait_ids.contains(&trait_id) {
+                return None;
+            }
+            let arguments = match self.borrow_type_by_type_id(implementation.subject) {
+                Type::Struct(id, arguments) | Type::Enum(id, arguments)
+                    if *id == declaration_id =>
+                {
+                    arguments
+                }
+                _ => return None,
+            };
+            (arguments.len() == parameters.len()
+                && arguments.iter().all(|argument| {
+                    matches!(self.borrow_type_by_type_id(*argument), Type::Generic(_))
+                }))
+            .then(|| arguments.clone())
+        });
+        let Some(binder_arguments) = binder_arguments else {
+            return member_type_id;
+        };
+        let context: SubstitutionContext = parameters.into_iter().zip(binder_arguments).collect();
+        self.substitute_type_id(member_type_id, &context)
+    }
+
     fn resolved_type_is_wire(&mut self, type_id: TypeId) -> bool {
         let type_ = type_id.get_type(self);
         let (name, arguments) = match &type_ {
@@ -21869,6 +21935,13 @@ impl<'src> Analyzer<'src> {
             // `impl [type T: Hashable; _] with Hashable`, read as `List`'s
             // arm below reads `List` — at a literal length or a `const N`.
             Type::Array(element, _) => return self.resolved_type_is_hashable(*element),
+            // B622: a parameter is `Hashable` when its bound says so — the
+            // bound a derived member reads under `hashable_member_under_binders`.
+            Type::Generic(constraint) => {
+                return self.hashable_trait_id.is_some_and(|hashable| {
+                    self.generic_bound_carries_trait(*constraint, hashable)
+                });
+            }
             _ => return false,
         };
         let Some(name) = name else {
@@ -21877,7 +21950,11 @@ impl<'src> Analyzer<'src> {
         if HASHABLE_SCALAR_NAMES.contains(&name) {
             return true;
         }
-        if self.hashable_names.contains(name) {
+        // B622: the name answers for a NON-generic derive only (a backed enum,
+        // a plain struct). A generic one's impl binds its reached parameters
+        // under `Hashable`, so `Holder<|| i32>` is the impl table's question,
+        // below; read by name it was a silently broken key.
+        if self.hashable_names.contains(name) && arguments.is_empty() {
             return true;
         }
         if matches!(name, "List" | "Option")

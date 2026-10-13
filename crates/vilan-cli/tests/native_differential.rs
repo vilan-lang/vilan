@@ -12865,6 +12865,25 @@ fn b623_std_array_default_and_json_answer_on_both_backends() {
     );
 }
 
+/// B622: `[derive(Hashable)]` over a generic struct's generic fields —
+/// refused at the declaration before, read under the derived impl's binders
+/// now — hashes the same on both backends.
+#[test]
+fn b622_derives_over_generic_fields_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_derive_over_generic_fields.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/derive_over_generic_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a derive over generic fields must answer the same natively"
+    );
+}
+
 /// array-lengths.md S4: a named length — a top-level `const let`, a `let`
 /// chained through it, a local `let` — in a type and in a repeat literal,
 /// resolved to its number before the fixpoint, the same on both backends.

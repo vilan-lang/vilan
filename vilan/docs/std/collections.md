@@ -311,6 +311,11 @@ fun main() {
 }
 ```
 
+A generic struct derives too: the derive binds each parameter a field
+reaches under `Hashable`, so `struct Tagged<T> { item: T, tags: List<T> }`
+is a key at `Tagged<str>`, and an argument that is not `Hashable` is
+refused where it is used.
+
 `keys()` returns the real `K`s (in insertion order), and the key is snapshot
 on insert, so mutating the original afterward can't desync the map.
 
