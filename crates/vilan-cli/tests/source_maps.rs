@@ -511,3 +511,93 @@ fn run_inspect_brk_stops_at_a_breakpoint_on_a_vl_line() {
     );
     assert_eq!(String::from_utf8_lossy(&program_output.stdout), "12\n");
 }
+
+/// E257 S6: a `split = true` leg maps its eager bundle and each route chunk —
+/// each file printed apart, so stripped apart, each beside its own map and
+/// naming it — and the maps change no byte of the program: the same build with
+/// `source-maps = false` writes every file without its last line.
+#[test]
+fn a_split_leg_maps_its_eager_bundle_and_each_chunk() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/split/project");
+    let stage = |tag: &str, maps: bool| {
+        let directory = project(tag);
+        for entry in std::fs::read_dir(&fixture).expect("the split fixture") {
+            let path = entry.expect("an entry").path();
+            if path.is_file() {
+                std::fs::copy(&path, directory.join(path.file_name().expect("a name")))
+                    .expect("copy");
+            }
+        }
+        if !maps {
+            let manifest = directory.join("vilan.toml");
+            let text = std::fs::read_to_string(&manifest).expect("vilan.toml");
+            std::fs::write(&manifest, format!("{text}\n[build]\nsource-maps = false\n"))
+                .expect("write vilan.toml");
+        }
+        let output = vilan()
+            .arg("build")
+            .current_dir(&directory)
+            .output()
+            .expect("run vilan");
+        succeeded(&output, "vilan build (split)");
+        directory
+    };
+    let mapped = stage("split_mapped", true);
+    let plain = stage("split_plain", false);
+    let scripts = [
+        "app.js",
+        "app.Route_Home.js",
+        "app.Route_Docs.js",
+        "app.Route_NotFound.js",
+    ];
+    for script in scripts {
+        let with_map = std::fs::read_to_string(mapped.join(script)).expect(script);
+        let without = std::fs::read_to_string(plain.join(script)).expect(script);
+        assert_eq!(
+            with_map,
+            format!("{without}//# sourceMappingURL={script}.map\n"),
+            "{script}: the plain bytes plus the comment naming its own map"
+        );
+        assert!(!plain.join(format!("{script}.map")).exists());
+        let map = map_json(&mapped.join(format!("{script}.map")));
+        assert_eq!(map["version"], 3);
+        assert_eq!(map["file"], script);
+        assert!(
+            !map["mappings"].as_str().expect("mappings").is_empty(),
+            "{script} maps somewhere"
+        );
+        let sources: Vec<&str> = map["sources"]
+            .as_array()
+            .expect("sources")
+            .iter()
+            .map(|source| source.as_str().expect("a string"))
+            .collect();
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.ends_with(".vl") && !source.starts_with("file:")),
+            "{script}: the fixture's own sources, spelled relative: {sources:?}"
+        );
+    }
+    // A build that no longer splits sweeps the chunks' maps with the chunks.
+    let manifest = mapped.join("vilan.toml");
+    let text = std::fs::read_to_string(&manifest).expect("vilan.toml");
+    std::fs::write(&manifest, text.replace("split = true", "split = false")).expect("write");
+    let output = vilan()
+        .arg("build")
+        .current_dir(&mapped)
+        .output()
+        .expect("run vilan");
+    succeeded(&output, "vilan build (unsplit)");
+    for chunk in &scripts[1..] {
+        assert!(!mapped.join(chunk).exists(), "{chunk} swept");
+        assert!(
+            !mapped.join(format!("{chunk}.map")).exists(),
+            "{chunk}.map swept with its chunk"
+        );
+    }
+    assert!(
+        mapped.join("app.js.map").exists(),
+        "the bundle keeps its map"
+    );
+}

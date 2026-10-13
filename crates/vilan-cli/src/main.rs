@@ -6965,7 +6965,9 @@ fn write_chunks(
     sweep_stale_sidecar(output_js, styles);
     for chunk in chunks {
         let path = directory.join(&chunk.file);
-        if let Err(error) = fs::write(&path, &chunk.source) {
+        // Each chunk beside its own map when the build writes maps (E257 S6),
+        // named from the chunk's last line as the bundle's is.
+        if let Err(error) = write_script(&path, chunk.source.clone(), chunk.map.as_ref()) {
             eprintln!(
                 "{} cannot write {}: {error}",
                 paint::error_prefix(),
@@ -6979,14 +6981,14 @@ fn write_chunks(
             paint::out(paint::Style::BOLD, &path.display().to_string()),
             chunk.arm
         );
-        explain::chunk(
-            path,
-            &output_js
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            &chunk.arm,
-        );
+        let leg = output_js
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if chunk.map.is_some() {
+            explain::source_map(source_map_path(&path), &leg);
+        }
+        explain::chunk(path, &leg, &chunk.arm);
     }
     if !is_browser {
         return Ok(());
@@ -7085,6 +7087,12 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], write
     };
     let manifest = format!("{leg}.chunks.json");
     let keep: Vec<&str> = wrote.iter().map(|chunk| chunk.file.as_str()).collect();
+    // A chunk's map (E257 S6) is kept with its chunk, when this build wrote one.
+    let keep_maps: Vec<String> = wrote
+        .iter()
+        .filter(|chunk| chunk.map.is_some())
+        .map(|chunk| format!("{}.map", chunk.file))
+        .collect();
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -7096,8 +7104,17 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], write
             .strip_prefix(&format!("{leg}."))
             .and_then(|rest| rest.strip_suffix(".js"))
             .is_some_and(|arm| !arm.is_empty());
+        // `<leg>.<arm>.js.map` — which the bundle's own `<leg>.js.map` does not
+        // match either.
+        let is_chunk_map = name
+            .strip_prefix(&format!("{leg}."))
+            .and_then(|rest| rest.strip_suffix(".js.map"))
+            .is_some_and(|arm| !arm.is_empty());
         let is_manifest = name == manifest;
-        if (!is_chunk && !is_manifest) || keep.contains(&name.as_str()) {
+        if (!is_chunk && !is_chunk_map && !is_manifest)
+            || keep.contains(&name.as_str())
+            || keep_maps.contains(&name)
+        {
             continue;
         }
         if is_manifest && writes_manifest {
@@ -7582,9 +7599,10 @@ fn compile_to_js(
             // rename; `transform_split` returns the eager bundle where
             // `transform` returns the whole one, plus the chunk files.
             let emission_clock = vilan_core::PhaseClock::now();
-            // E257 S5: the source map rides beside the JavaScript only from
-            // the single-file JS emission, the one the map entry builds; a
-            // split leg's chunks and the native backend's Rust carry none.
+            // E257 S5: the source map rides beside the JavaScript from the
+            // JS emissions — the single-file one and (S6) a split leg's eager
+            // bundle, whose chunks carry their own; the native backend's Rust
+            // carries none.
             let mut source_map = None;
             let emitted = match split {
                 // A module of a package, addressed by path: analysis is the
@@ -7625,6 +7643,7 @@ fn compile_to_js(
                             );
                         }
                         sink.extend(split_program.chunks);
+                        source_map = split_program.map;
                         split_program.main
                     })
                 }

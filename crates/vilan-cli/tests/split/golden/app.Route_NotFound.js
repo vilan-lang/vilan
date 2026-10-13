@@ -4,3 +4,4 @@ function not_found_page($bO, $bP) {
 	return panel("Nothing here", "try /docs/1", $bO, $bP);
 }
 __vilan_chunks.fn.not_found_page = not_found_page;
+//# sourceMappingURL=app.Route_NotFound.js.map

@@ -5,3 +5,4 @@ function home_page($bG, $bH) {
 	return panel("Home", LABEL, $bG, $bH);
 }
 __vilan_chunks.fn.home_page = home_page;
+//# sourceMappingURL=app.Route_Home.js.map

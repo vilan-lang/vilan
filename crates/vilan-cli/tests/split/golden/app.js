@@ -1694,3 +1694,4 @@ const route = cell(derive(current_path([ 1 ]), (path, $l, $m, $n) => {
 mount_root("app", ($aR) => {
 	return app(route, [ 1 ], $aR);
 });
+//# sourceMappingURL=app.js.map
