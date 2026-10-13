@@ -44656,14 +44656,7 @@ impl<'src> Analyzer<'src> {
                     && arguments.len() == 1
                     && matches!(arguments[0].get_type(self), Type::Generic(_)) =>
             {
-                let slot = match self.list_element_slots.get(&call_id).copied() {
-                    Some(slot) => slot,
-                    None => {
-                        let slot = Type::Unknown.get_type_id(self);
-                        self.list_element_slots.insert(call_id, slot);
-                        slot
-                    }
-                };
+                let slot = self.element_slot_of(call_id);
                 Type::Struct(id, vec![slot])
             }
             other => other,
@@ -45470,12 +45463,25 @@ impl<'src> Analyzer<'src> {
         None
     }
 
-    fn list_literal_element_slot(&mut self, literal_id: Id) -> TypeId {
-        if let Some(slot) = self.list_element_slots.get(&literal_id).copied() {
+    ///
+    /// Also the slot of a container constructor's hole (`List::new()`,
+    /// keyed by the call). B624: minted in the OWNER's id window — the
+    /// literal's or the call's item — whoever asks first: a module binding's
+    /// `[]` is typed first by whichever module's use resolves first, and a
+    /// slot minted in THAT item's window left the binding's type mentioning
+    /// another item's slot that no edge named, so the binding's per-item
+    /// record (M110 S7) survived an edit of the pusher. Minted at home, the
+    /// pusher's fill is a write into the owner's window, which the dirty
+    /// closure carries.
+    fn element_slot_of(&mut self, owner_id: Id) -> TypeId {
+        if let Some(slot) = self.list_element_slots.get(&owner_id).copied() {
             return slot;
         }
+        let saved = self.id_windows.saved_anchor();
+        self.id_windows.anchor_at_owner(owner_id);
         let slot = Type::Unknown.get_type_id(self);
-        self.list_element_slots.insert(literal_id, slot);
+        self.id_windows.restore_anchor(saved);
+        self.list_element_slots.insert(owner_id, slot);
         slot
     }
 
@@ -46948,7 +46954,7 @@ impl<'src> Analyzer<'src> {
                 if item_ids.is_empty() {
                     return match self.primitive_struct_ids.get("List").copied() {
                         Some(list_id) => {
-                            let slot = self.list_literal_element_slot(expr_id);
+                            let slot = self.element_slot_of(expr_id);
                             // B129: an empty `[]` takes its element type from
                             // where it lands. When the expectation is `List<E>`
                             // — a call argument checked against a substituted
@@ -47237,7 +47243,7 @@ impl<'src> Analyzer<'src> {
                         // fixpoint's re-runs reach the same one and a fill
                         // survives them.
                         let arguments = match matches!(element_type, Type::Unknown) {
-                            true => vec![self.list_literal_element_slot(expr_id)],
+                            true => vec![self.element_slot_of(expr_id)],
                             false => vec![element_type.get_type_id(self)],
                         };
                         Type::Struct(list_id, arguments)
@@ -82313,6 +82319,13 @@ fn analyze_inner<'src>(
         );
     }
     let lib_ast = lib_loaded.map(|loaded| loaded.ast);
+    // Every source registers its path's key (M110 S6's demand table and S7's
+    // item records are keyed by it), std's surface included — one missing
+    // here shifted every later source onto the NEXT source's path.
+    analyzer
+        .id_windows
+        .source_keys
+        .push(crate::content_hash(&lib_path.to_string_lossy()));
     sources.push(lib_path);
     source_hashes.push(lib_loaded.map_or(0, |loaded| crate::content_hash(loaded.text)));
     let lib_source_id = SourceId((sources.len() - 1) as u32);
@@ -82528,6 +82541,10 @@ fn analyze_inner<'src>(
                     .dependency_sources
                     .insert(SourceId(sources.len() as u32));
             }
+            analyzer
+                .id_windows
+                .source_keys
+                .push(crate::content_hash(&lib_path.to_string_lossy()));
             sources.push(lib_path);
             source_hashes.push(crate::content_hash(lib_loaded.text));
             let lib_source_id = SourceId((sources.len() - 1) as u32);
@@ -83238,6 +83255,13 @@ fn analyze_inner<'src>(
                                 .dependency_sources
                                 .insert(SourceId(sources.len() as u32));
                         }
+                        // The source's path key, beside the source (M110 S6/S7;
+                        // the entry-module arm above registers no source, so
+                        // no key either — it is `SourceId(0)`'s).
+                        analyzer
+                            .id_windows
+                            .source_keys
+                            .push(crate::content_hash(&module_path.to_string_lossy()));
                         sources.push(module_path);
                         source_hashes.push(crate::content_hash(loaded.text));
                         (
@@ -83248,11 +83272,6 @@ fn analyze_inner<'src>(
                     }
                 };
                 analyzer.source_texts.push((module_source_id, module_text));
-                analyzer.id_windows.source_keys.push(
-                    sources
-                        .last()
-                        .map_or(0, |path| crate::content_hash(&path.to_string_lossy())),
-                );
                 let module_scope = analyzer.create_scope(Some(global_scope_id));
                 let module_scope_id = analyzer.push_scope(module_scope);
                 // A65: a module already has an entity when a CHILD of it loaded
@@ -84672,6 +84691,12 @@ fn analyze_over_world<'src>(
     // files by path — this call's paths, since a cached world's entry is
     // another call's (`sources[0]` is re-pointed on the hit path).
     analyzer.source_paths = sources.clone();
+    debug_assert!(
+        analyzer.id_windows.source_keys.len() == sources.len(),
+        "every source registers its path key ({} keys, {} sources)",
+        analyzer.id_windows.source_keys.len(),
+        sources.len()
+    );
     analyzer.prelude_repair = workspace.prelude_repair;
     if !crate::macros::in_macro_world() {
         SERVED_FROM_BASE_CACHE.with(|served| served.set(from_base_cache));
@@ -84850,15 +84875,15 @@ fn analyze_over_world<'src>(
     // after the store, as M19 files its modules); SERVED on a hit only
     // (term 1 of M19's §4.1: the hit is what makes the prefix's ids the
     // record's).
-    // std-prefix P1: not over the std-only prefix. Its re-walked files are the
-    // whole package, and the dirty closure misses one edge there — a push from
-    // an EDITED module into an UNEDITED module's use-inferred binding (M139's
-    // shape: the owner's record came back with the old element type) — which
-    // S1 never meets, its use-inferred guard refusing every hot set that
-    // imports such a binding. Filed; the prefix's adoption (P2) decides.
+    // Over the std-only prefix too (B624): its re-walked files are the whole
+    // package, so an UNEDITED module's binding sits beside the EDITED module
+    // that pushes into it — the shape S1's use-inferred guard never lets in.
+    // The push is a write into the binding's window because the element slot
+    // is minted at its owner (`element_slot_of`), so the dirty closure carries
+    // the pusher's edit to the owner's record.
     analyzer.enable_item_records(
         !entry_is_module
-            && checks_key.as_ref().is_some_and(|key| !key.std_prefix)
+            && checks_key.is_some()
             && (!workspace.hot_seeds.is_empty() || workspace.reading_aids)
             && !crate::incremental::clean_requested(),
     );

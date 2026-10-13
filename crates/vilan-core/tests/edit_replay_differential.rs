@@ -297,6 +297,66 @@ fn every_edit_class_answers_what_a_clean_analysis_answers_over_the_std_prefix() 
     );
 }
 
+/// **B624** (std-prefix P2's precondition): over the std-only prefix every
+/// package module re-walks, so M110 S7's item records are filed and served for
+/// the whole package — and an UNEDITED module's record must go stale when an
+/// EDITED module pushes a different type into its use-inferred binding (M139's
+/// write edge, `id_windows.cross_writes`). The classes package's `bag` /
+/// `a_spoil` pair alone: `a_spoil` loads first and its push moves from `2` to
+/// `"two"`; `bag`'s declaration label must read the clean `List<any>`, not its
+/// record's `List<i32>`. Non-vacuous: the analyses are prefix worlds and serve
+/// item records (the bystander `side` and the entry's `twice`, which read
+/// nothing the edit dirties).
+#[test]
+fn a_push_into_an_unedited_modules_binding_stales_its_item_record_over_the_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let mut package = Package::write(
+        "b624",
+        Platform::default(),
+        &[
+            (
+                "main.vl",
+                "import pkg::bag::fill;\nimport pkg::a_spoil::spoil;\nimport pkg::side::side_value;\n\nfun main() {\n\tfill();\n\tspoil();\n\tprint(twice());\n}\n\nfun twice(): i32 {\n\tside_value() * 2\n}\n",
+            ),
+            ("bag.vl", CLASSES_BAG),
+            ("a_spoil.vl", CLASSES_SPOIL),
+            ("side.vl", CLASSES_SIDE),
+        ],
+    );
+    let mut divergences = Vec::new();
+    let seed = package.path("a_spoil.vl");
+    let first = observe(&package, vec![seed.clone()], Leg::Incremental);
+    let mut censuses = vec![first.census];
+    for edit in CLASS_EDITS.iter().filter(|edit| edit.file == "a_spoil.vl") {
+        censuses.extend(replay(&mut package, edit, &mut divergences));
+    }
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(None);
+    assert!(
+        divergences.is_empty(),
+        "the item records over the std prefix answer what a clean analysis does:\n{}",
+        divergences.join("\n")
+    );
+    assert!(
+        censuses.iter().all(|census| census.prefix_world),
+        "every analysis is a prefix world: {censuses:#?}"
+    );
+    let served: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_served)
+        .sum();
+    assert!(
+        served > 0,
+        "the prefix worlds serve item records, or the comparison is vacuous: {censuses:#?}"
+    );
+}
+
 /// A package impl of a std trait whose member std's own resolve asks about —
 /// kolt's `impl ProxySignal<type T> with Signal<T>` and std's `get` lookups —
 /// for the std-prefix tests below.
