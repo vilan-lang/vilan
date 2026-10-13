@@ -82264,6 +82264,12 @@ fn analyze_inner<'src>(
     let mut macro_site_counter: u32 = 0;
     let mut generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>> =
         HashMap::default();
+    // B619: which round of the drain this is (0 = the first). A module MINTED in a
+    // later round is one only macro-GENERATED code reaches; it mints after the
+    // first round's modules, so a redundant written import of it would reorder
+    // the output. `counters::late_round_mints` counts them (a std-prefix P3 key
+    // check, closed over WRITTEN imports, refuses a world that grew this way).
+    let mut drain_round: u32 = 0;
     loop {
         // Canonical drain (WO-1b, completed by B603 — `std-prefix.md` §4.1): the
         // load order, and therefore every module node, `SourceId`, scope and walk
@@ -82471,6 +82477,9 @@ fn analyze_inner<'src>(
             }
             discovered.sort_unstable_by_key(|(origin, name, _)| load_order_key((*origin, name)));
             for (origin, name, module) in discovered {
+                if drain_round > 0 && !crate::macros::in_macro_world() {
+                    crate::counters::count_late_round_mint();
+                }
                 // A65: the origin's own namespace scope — where a top-level module
                 // registers, and where the walk down a nested path starts.
                 let origin_scope_id = match origin {
@@ -83140,6 +83149,7 @@ fn analyze_inner<'src>(
         if to_load.is_empty() {
             break;
         }
+        drain_round += 1;
     }
 
     // M110 S1's guard. The hot set's closure was taken over WRITTEN imports,

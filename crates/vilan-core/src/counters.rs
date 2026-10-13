@@ -192,6 +192,25 @@ pub(crate) fn count_late_type_slot_write() {
 }
 
 thread_local! {
+    static LATE_ROUND_MINTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Modules the module drain MINTED in a round after the first (B619, B603's
+/// residue): a module only macro-GENERATED code reaches is discovered once the
+/// first round's macro epilogue has expanded, and it mints after that round's
+/// modules - so a redundant written `import` of it would reorder the output.
+/// Zero on kolt's two legs, the eleven examples and every corpus file. The
+/// invariant a std-prefix P3 key check (closure over WRITTEN imports) will
+/// refuse on; monotonic, read as a difference around the analysis in question.
+pub fn late_round_mints() -> u64 {
+    LATE_ROUND_MINTS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_late_round_mint() {
+    LATE_ROUND_MINTS.with(|count| count.set(count.get() + 1));
+}
+
+thread_local! {
     static SETTLED_TYPE_SLOTS_MINTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -270,7 +289,7 @@ pub fn checkpoint(label: &str) {
     };
     eprintln!(
         "[vilan counters] {label} slots={} settled-slots={} late-writes={} inferences={} \
-         attempts={} selections={} impl-rows={} bound-checks={}{}{allocations}",
+         attempts={} selections={} impl-rows={} bound-checks={} late-round-mints={}{}{allocations}",
         work.slots,
         settled_type_slots_minted(),
         late_type_slot_writes(),
@@ -279,6 +298,7 @@ pub fn checkpoint(label: &str) {
         work.selections,
         work.impl_rows,
         crate::analyzer::generic_bound_checks(),
+        late_round_mints(),
         heap_fragment()
     );
 }
