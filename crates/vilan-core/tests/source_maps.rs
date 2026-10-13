@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use vilan_core::options::BuildOptions;
-use vilan_core::source_map::SourceMap;
+use vilan_core::source_map::{RUNTIME_SOURCE, SOURCES_CONTENT_CAP, SourceMap};
 use vilan_core::{
     PackageSpec, Platform, Workspace, analyze_source, transform, transform_with_source_map,
 };
@@ -284,10 +284,29 @@ fn assert_valid(javascript: &str, map: &SourceMap) -> Vec<Segment> {
         .map(|index| index.as_u64().expect("an index"))
         .collect();
     for (index, source) in map.sources.iter().enumerate() {
-        // std by its path, never its text; the user's files carry theirs.
-        assert_eq!(source.ignored, source.content.is_none(), "{source:?}");
-        assert_eq!(contents[index].is_null(), source.ignored);
         assert_eq!(ignored.contains(&(index as u64)), source.ignored);
+        assert_eq!(contents[index].is_null(), source.content.is_none());
+        if let Some(url) = source.url {
+            // The runtime helpers (S6): a source of their own, carried and
+            // ignored, named by its synthetic URL.
+            assert_eq!(url, RUNTIME_SOURCE);
+            assert!(source.ignored && source.content.is_some(), "{source:?}");
+            assert_eq!(sources[index], RUNTIME_SOURCE);
+            continue;
+        }
+        if source.ignored {
+            // std by its path, never its text.
+            assert!(source.content.is_none(), "{source:?}");
+        } else {
+            // The user's files carry theirs, up to the cap (S6).
+            let length = std::fs::metadata(&source.path).map_or(0, |meta| meta.len() as usize);
+            assert_eq!(
+                source.content.is_none(),
+                length > SOURCES_CONTENT_CAP,
+                "{}: {length} bytes",
+                source.path.display()
+            );
+        }
         assert!(
             sources[index]
                 .as_str()
@@ -700,6 +719,133 @@ fn a_map_directory_spells_the_users_files_relative_and_std_absolute() {
             assert!(sources[index].starts_with("file://"), "{sources:?}");
         }
     }
+}
+
+/// E257 S6: the runtime helpers the script opens with (`__at`, `__panic`)
+/// map into a synthetic source of their own — carried, ignore-listed, each
+/// generated line on the same line of the carried text — so a frame inside
+/// one names it and a debugger's "step into" passes over it.
+#[test]
+fn the_runtime_helpers_map_into_an_ignored_source_of_their_own() {
+    let source = r#"
+import std::io::print;
+
+fun pick(rows: List<i32>, at: usize): i32 {
+    rows[at]
+}
+
+fun main() {
+    print(pick([1, 2, 3], 1));
+}
+"#;
+    let (built, _) = build_program("runtime", source);
+    let segments = assert_valid(&built.mapped, &built.map);
+    let (index, runtime) = built
+        .map
+        .sources
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.url == Some(RUNTIME_SOURCE))
+        .unwrap_or_else(|| panic!("a runtime source:\n{}", built.mapped));
+    assert!(runtime.ignored);
+    let carried = runtime.content.as_deref().expect("the helpers' text");
+    assert!(
+        carried.starts_with("function __at(") && carried.contains("function __panic("),
+        "{carried}"
+    );
+    // The carried text IS the script's opening lines.
+    assert!(built.mapped.starts_with(carried), "{}", built.mapped);
+    let generated: Vec<&str> = built.mapped.split('\n').collect();
+    let original: Vec<&str> = carried.split('\n').collect();
+    let into_runtime: Vec<&Segment> = segments
+        .iter()
+        .filter(|segment| segment.source == index as i64)
+        .collect();
+    assert_eq!(
+        into_runtime.len(),
+        original.iter().filter(|line| !line.is_empty()).count(),
+        "one segment per helper line"
+    );
+    for segment in into_runtime {
+        assert_eq!(segment.generated_column, 0);
+        assert_eq!(segment.column, 0);
+        assert_eq!(
+            generated[segment.generated_line], original[segment.line as usize],
+            "{segment:?}"
+        );
+    }
+    // The user's code starts after them: `pick` still maps to `main.vl`.
+    let head = generated_position(&built.mapped, "function pick", 0);
+    let user = built
+        .map
+        .sources
+        .iter()
+        .position(|entry| entry.path.ends_with("main.vl"))
+        .expect("the user's file") as i64;
+    assert!(
+        segments
+            .iter()
+            .any(|segment| segment.generated_line == head.0 && segment.source == user)
+    );
+}
+
+/// E257 S6, debug-51's Q1 as ruled: a user file past
+/// [`SOURCES_CONTENT_CAP`] goes by its path, relative to the map, and its
+/// text is not carried — kolt's generated icon table made its client's map
+/// 978 KB. The file still maps: a debugger reads it from disk.
+#[test]
+fn a_user_file_past_the_cap_goes_by_its_relative_path() {
+    let mut source =
+        String::from("import std::io::print;\n\nfun main() {\n    print(\"big\");\n}\n");
+    let filler = format!("// {}\n", "x".repeat(96));
+    while source.len() <= SOURCES_CONTENT_CAP {
+        source.push_str(&filler);
+    }
+    let (built, _) = build_program("cap", &source);
+    assert_valid(&built.mapped, &built.map);
+    let entry = built
+        .map
+        .sources
+        .iter()
+        .find(|entry| entry.path.ends_with("main.vl"))
+        .expect("the user's file");
+    assert!(!entry.ignored, "a user file is never ignore-listed");
+    assert!(
+        entry.content.is_none(),
+        "past the cap, the text stays on disk"
+    );
+    let dist = entry.path.parent().expect("a directory").join("dist");
+    let json: serde_json::Value =
+        serde_json::from_str(&built.map.to_json("main.mjs", Some(Path::new(&dist))))
+            .expect("valid JSON");
+    let spelled: Vec<&str> = json["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .map(|source| source.as_str().expect("a string"))
+        .collect();
+    let at = spelled
+        .iter()
+        .position(|spelled| *spelled == "../main.vl")
+        .unwrap_or_else(|| panic!("the relative path: {spelled:?}"));
+    assert!(json["sourcesContent"][at].is_null());
+
+    // At the cap exactly, it is still carried.
+    let mut source =
+        String::from("import std::io::print;\n\nfun main() {\n    print(\"small\");\n}\n");
+    while source.len() + filler.len() <= SOURCES_CONTENT_CAP {
+        source.push_str(&filler);
+    }
+    source.push_str(&"/".repeat(SOURCES_CONTENT_CAP - source.len()));
+    assert_eq!(source.len(), SOURCES_CONTENT_CAP);
+    let (built, _) = build_program("at_cap", &source);
+    let entry = built
+        .map
+        .sources
+        .iter()
+        .find(|entry| entry.path.ends_with("main.vl"))
+        .expect("the user's file");
+    assert_eq!(entry.content.as_deref(), Some(source.as_str()));
 }
 
 /// The marks cost the JS tree no width: `js::Node` is as large as its

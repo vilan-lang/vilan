@@ -2301,3 +2301,105 @@ fn force_refresh_is_a_no_op_outside_a_watch_session() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// E257 S6: an HMR-instrumented browser bundle carries a source map. The shim
+/// goes in front of the bundle when `dist/` is written, so the map is shifted
+/// down by the shim's lines; the bundle names it at the dev channel (the
+/// page's server does not serve maps, and a swap evaluates the bundle's text),
+/// and the channel serves it beside `/bundle/<leg>.js`. Read back the way a
+/// debugger reads it — node's own `module.SourceMap` over the served map — the
+/// instrumented file's `print` call lands on its `.vl` line.
+#[test]
+fn a_watch_rounds_browser_bundle_maps_through_the_shim() {
+    let dir = temp_project("browser_map");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    // The marked call is not the program's last statement, so a map that
+    // missed the shift cannot land on it by being the nearest segment above.
+    let source = "import std::io::print;\n\nfun main() {\n\tprint(\"map_marker\");\n\tprint(\"after\");\n\tprint(\"last\");\n}\n";
+    write(&dir, "src/client.vl", source);
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+    );
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let port = wait_for_port(&lines, deadline).expect("the dev channel's port");
+        let token = dev_token(&dir, "client", deadline);
+        let bundle = std::fs::read_to_string(dir.join("dist/client.js")).expect("client.js");
+        let url = format!("http://127.0.0.1:{port}/bundle/client.js.map?token={token}");
+        assert!(
+            bundle.ends_with(&format!("\n//# sourceMappingURL={url}\n")),
+            "the instrumented bundle names its map at the dev channel:\n{}",
+            &bundle[bundle.len().saturating_sub(300)..]
+        );
+        assert!(
+            bundle.contains("window.__VILAN_HMR__"),
+            "and it is the instrumented bundle"
+        );
+        let map =
+            String::from_utf8_lossy(&dev_get(port, "/bundle/client.js.map", &token)).into_owned();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/client.js.map")).expect("client.js.map"),
+            map,
+            "the channel serves the map `dist/` holds"
+        );
+        let refused = http_get_head(port, "/bundle/client.js.map");
+        assert!(
+            refused.starts_with("HTTP/1.1 403 Forbidden"),
+            "the map is behind the token like every route: {refused:?}"
+        );
+        // Where the `print` call sits in the INSTRUMENTED file.
+        let call = bundle
+            .find("\"map_marker\"")
+            .expect("the program's print in the bundle");
+        let line_start = bundle[..call].rfind('\n').map_or(0, |at| at + 1);
+        let line = bundle[..call].matches('\n').count();
+        let column = bundle[line_start..call]
+            .find(|character: char| !character.is_whitespace())
+            .unwrap_or(0);
+        let map_file = dir.join("served.map.json");
+        std::fs::write(&map_file, &map).expect("write the served map");
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(format!(
+                "const {{ SourceMap }} = require('node:module');\
+                 const map = new SourceMap(JSON.parse(require('node:fs').readFileSync({:?}, 'utf8')));\
+                 const entry = map.findEntry({line}, {column});\
+                 const shim = map.findEntry(0, 0);\
+                 console.log(JSON.stringify([Object.keys(shim).length, entry.originalSource, entry.originalLine]));",
+                map_file.to_str().expect("utf-8 path")
+            ))
+            .output()
+            .expect("run node");
+        let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let original_line = source[..source.find("print(\"map_marker\")").expect("the print")]
+            .matches('\n')
+            .count();
+        assert!(
+            found.starts_with("[0,")
+                && found.contains("client.vl")
+                && found.ends_with(&format!(",{original_line}]")),
+            "the shim's lines map nothing, and generated {line}:{column} reads back as \
+             client.vl line {original_line}; got {found} ({})",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }));
+    support::kill_watcher(&mut watcher);
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome.unwrap();
+}

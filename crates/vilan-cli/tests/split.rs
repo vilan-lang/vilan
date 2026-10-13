@@ -706,17 +706,21 @@ fn a_split_build_warns_when_the_gate_costs_more_than_it_defers() {
     );
 
     // The numbers are this build's own: the eager bundle it just wrote, and the
-    // chunk files it just wrote.
-    let eager = std::fs::metadata(staged.join("app.js"))
-        .expect("the eager bundle")
-        .len();
+    // chunk files it just wrote — each the program's bytes, without the last
+    // line that names its source map (E257 S6), which the measure is not about.
+    let emitted = |name: &str| -> u64 {
+        let text = std::fs::read_to_string(staged.join(name)).expect("an artifact");
+        let comment = format!("//# sourceMappingURL={name}.map\n");
+        text.strip_suffix(&comment).unwrap_or(&text).len() as u64
+    };
+    let eager = emitted("app.js");
     let deferred: u64 = [
         "app.Route_Home.js",
         "app.Route_Docs.js",
         "app.Route_NotFound.js",
     ]
     .iter()
-    .map(|name| std::fs::metadata(staged.join(name)).expect("a chunk").len())
+    .map(|name| emitted(name))
     .sum();
     assert!(
         stderr.contains(&format!("defers only {deferred}"))
@@ -749,7 +753,8 @@ fn stage_workspace(tag: &str) -> PathBuf {
     staged
 }
 
-/// The leg's chunk FILES currently on disk. The build manifest is deliberately
+/// The leg's chunk FILES currently on disk, each chunk's source map (E257 S6)
+/// with it. The build manifest is deliberately
 /// not one of them: since `fullstack-dx.md` §10.3 `client.chunks.json` is
 /// written on every build of the leg, so it can no longer stand in for "this
 /// build split" — the manifest's own `chunks` list is what says that, and
@@ -789,12 +794,16 @@ fn vilan_run_emits_the_leg_whole_and_clears_the_chunks_a_build_left() {
     let staged = stage_workspace("whole");
     build(&staged, &[]);
     let dist = staged.join("dist");
+    // Each chunk beside its source map (E257 S6: the debug preset maps).
     assert_eq!(
         chunk_artifacts(&dist),
         vec![
             "client.Route_Docs.js",
+            "client.Route_Docs.js.map",
             "client.Route_Home.js",
+            "client.Route_Home.js.map",
             "client.Route_NotFound.js",
+            "client.Route_NotFound.js.map",
         ],
         "`vilan build` honours `split`"
     );

@@ -28,6 +28,7 @@ import {
     Uri,
 } from 'vscode';
 import { PlacedClosers } from './closers';
+import { registerDebugging } from './debugging';
 import {
     FileStatus,
     MenuRow,
@@ -902,6 +903,9 @@ export function activate(context: ExtensionContext): void {
     );
 
     void startClient(context).then(() => schedulePlatformRefresh());
+
+    // E257 S6: the `vilan` debug type and the "Debug" lens on `fun main`.
+    registerDebugging(context);
 
     context.subscriptions.push(
         commands.registerCommand('vilan.restartServer', async () => {
