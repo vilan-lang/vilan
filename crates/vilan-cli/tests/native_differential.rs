@@ -13353,8 +13353,9 @@ fn f131_an_array_literal_against_a_generic_callees_binders_builds_the_array_on_b
 /// Fn>; N]`. `vilan_rt::ReferenceEq` now covers a fixed array (inline and
 /// heap) element by element, and an enum's equality leg compares a payload
 /// slot through the reference it binds — an `Option` of a closure in a
-/// payload had been a rustc refusal (`&Option<..>: ReferenceEq`). A map of
-/// closures is still refused by name.
+/// payload had been a rustc refusal (`&Option<..>: ReferenceEq`). A shape
+/// with no impl (a tuple of three holding a closure, since F136 admitted a
+/// map) is still refused by name.
 #[test]
 fn f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends() {
     let staged = stage();
@@ -13366,20 +13367,46 @@ fn f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends() {
         Verdict::Identical,
         "an array of closures held in an aggregate must build natively"
     );
-    let file = "native_probe_f133_closure_map.vl";
+    let file = "native_probe_f133_closure_triple.vl";
     std::fs::write(
         staged.join(file),
-        "import std::hash_map::HashMap;\nimport std::io::print;\n\nstruct Table {\n\thandlers: HashMap<str, |i32| i32>,\n}\n\nfun main() {\n\tmut table = Table { handlers = HashMap::new() };\n\ttable.handlers.insert(\"inc\", |x: i32| x + 1);\n\tprint(table.handlers.len());\n}\n",
+        "import std::io::print;\n\nstruct Row {\n\tentry: (str, i32, |i32| i32),\n}\n\nfun main() {\n\tlet row = Row { entry = (\"inc\", 1, |x: i32| x + 1) };\n\tlet (name, _, run) = row.entry;\n\tprint(name);\n\tprint(run(1));\n}\n",
     )
     .expect("write the probe program");
     match compare(&staged, file) {
         Verdict::Refused(message) => assert!(
             message.contains("which has no reference equality")
-                && message.contains("a fixed array of one do"),
+                && message.contains("a map and a key-closure pair of one do"),
             "refused, but not by this name: {message}"
         ),
-        other => panic!("a map of closures must be refused by name, was {other:?}"),
+        other => {
+            panic!("a tuple of three holding a closure must be refused by name, was {other:?}")
+        }
     }
+}
+
+/// F136: an aggregate holding a MAP of closures — a handler table, `struct
+/// Table { handlers: HashMap<str, |i32| i32> }`, an enum payload, an
+/// `Option` and a `List` of such maps, a map of `Option`s of closures — and a
+/// `(str, closure)` pair were refused natively by name ("which has no
+/// reference equality"): `vilan_rt::ReferenceEq` had no impl for
+/// `vilan_rt::Map` or its `(key, value)` entry. The map compares as std's
+/// `HashMap` equality does (the same keys, order-insensitive), each value by
+/// reference, and the entry's key by value.
+#[test]
+fn f136_a_map_of_closures_in_an_aggregate_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f136_map_of_closures.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/map_of_closures_in_an_aggregate.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a map of closures held in an aggregate must build natively"
+    );
 }
 
 /// B605: a generic function returning an object built over its own

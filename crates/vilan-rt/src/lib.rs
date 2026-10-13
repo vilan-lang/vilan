@@ -1086,6 +1086,29 @@ impl<T: ReferenceEq, const N: usize> ReferenceEq for HeapArray<T, N> {
     }
 }
 
+/// F136: a map of closures — a handler table, `HashMap<str, |i32| i32>` —
+/// compares as std's `HashMap` equality does (I9: the same keys, ORDER-
+/// INSENSITIVE), each value by reference. The key a `NativeMap` stores beside
+/// its value is an entry tuple (below).
+impl<K: std::hash::Hash + Eq + Clone, V: ReferenceEq> ReferenceEq for Map<K, V> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self.iter().all(|(key, value)| {
+                other
+                    .get(key)
+                    .is_some_and(|theirs| value.reference_eq(theirs))
+            })
+    }
+}
+
+/// F136: a map's `(key, value)` entry: the key compares BY VALUE (a key is
+/// hashable, so it holds no closure), the value by reference.
+impl<K: PartialEq, V: ReferenceEq> ReferenceEq for (K, V) {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1.reference_eq(&other.1)
+    }
+}
+
 /// A cell compares by IDENTITY (its `PartialEq` is `ptr_eq` already), which is
 /// JavaScript's `===` on the object it is there. So an `Option` or a `Vec` of a
 /// cell holding closures has reference equality too: `Option<Shared<List<||
@@ -2482,6 +2505,35 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// F136: a map of closures compares as std's `HashMap` does — the same
+    /// keys, in ANY order — each value by reference; a key compares by value.
+    #[test]
+    fn a_map_of_closures_compares_its_values_by_reference_in_any_order() {
+        let double: Rc<dyn Fn(i32) -> i32> = Rc::new(|x| x * 2);
+        let square: Rc<dyn Fn(i32) -> i32> = Rc::new(|x| x * x);
+        let other_double: Rc<dyn Fn(i32) -> i32> = Rc::new(|x| x * 2);
+        let mut first: Map<i32, Rc<dyn Fn(i32) -> i32>> = Map::new();
+        first.insert(1, double.clone());
+        first.insert(2, square.clone());
+        let mut reordered: Map<i32, Rc<dyn Fn(i32) -> i32>> = Map::new();
+        reordered.insert(2, square.clone());
+        reordered.insert(1, double.clone());
+        assert!(first.reference_eq(&reordered));
+        let mut swapped = Map::new();
+        swapped.insert(1, other_double);
+        swapped.insert(2, square.clone());
+        assert!(
+            !first.reference_eq(&swapped),
+            "an equal-looking closure is another closure"
+        );
+        let mut shorter = Map::new();
+        shorter.insert(1, double.clone());
+        assert!(!first.reference_eq(&shorter));
+        let entry = (str_new("double"), double.clone());
+        assert!(entry.reference_eq(&(str_new("double"), double.clone())));
+        assert!(!entry.reference_eq(&(str_new("twice"), double)));
+    }
 
     /// F39: a read of a cell under a live `&mut` of it dies with the
     /// runtime's sentence (and, through `panic_with`, a `String` payload

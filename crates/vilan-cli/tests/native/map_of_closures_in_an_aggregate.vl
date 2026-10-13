@@ -1,0 +1,62 @@
+// F136: an aggregate holding a MAP of closures — a handler table — builds
+// natively: a struct field, an enum payload, an `Option` of one, a `List` of
+// them, a map whose values are `Option`s of closures, and a pair of a key and
+// a closure. Their equality compares each closure by reference (the map's
+// keys and the pair's key by value), which no vilan program can observe —
+// closures are not `PartialEq` — so the program prints what it runs.
+import std::hash_map::HashMap;
+import std::io::print;
+
+struct Table {
+	handlers: HashMap<str, |i32| i32>,
+}
+
+enum Slot {
+	Handlers(HashMap<i32, |i32| i32>),
+	Empty,
+}
+
+struct Nested {
+	maybe: Option<HashMap<str, |i32| i32>>,
+	many: List<HashMap<str, || void>>,
+	optional: HashMap<str, Option<|| i32>>,
+	named: (str, |i32| i32),
+}
+
+fun main() {
+	mut table = Table { handlers = HashMap::new() };
+	table.handlers.insert("double", |x: i32| x * 2);
+	table.handlers.insert("square", |x: i32| x * x);
+	if table.handlers.get("double") is Some(let double) {
+		print(double(21));
+	}
+	if table.handlers.get("square") is Some(let square) {
+		print(square(5));
+	}
+	let copy = table;
+	print(copy.handlers.len());
+	mut slot = Slot::Handlers(HashMap::new());
+	if slot is Slot::Handlers(let map) {
+		print(map.len());
+	}
+	slot = Slot::Empty;
+	mut optional: HashMap<str, Option<|| i32>> = HashMap::new();
+	optional.insert("seven", Some(|| 7));
+	optional.insert("none", None);
+	let nested = Nested {
+		maybe = Some(copy.handlers),
+		many = [],
+		optional,
+		named = ("triple", |x: i32| x * 3),
+	};
+	print(nested.many.len());
+	if nested.maybe is Some(let handlers) {
+		print(handlers.len());
+	}
+	if nested.optional.get("seven") is Some(Some(let seven)) {
+		print(seven());
+	}
+	let (name, run) = nested.named;
+	print(name);
+	print(run(3));
+}

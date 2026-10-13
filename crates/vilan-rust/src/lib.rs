@@ -3900,9 +3900,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// Refuses a closure-reaching field whose shape `vilan_rt::ReferenceEq` has
     /// no impl for, BY NAME, rather than emitting Rust that rustc will refuse.
     ///
-    /// The trait covers an `Rc` at any depth under an `Option` or a `Vec`, which
-    /// is every shape std writes. A `Map<K, || void>` is not one of them and
-    /// says so here.
+    /// The trait covers an `Rc` at any depth under an `Option`, a `Vec`, a
+    /// fixed array (F133) and a map's values (F136), which is every shape std
+    /// writes. A tuple of three holding one is not among them and says so
+    /// here.
     fn check_reference_equality(rendered: &str, owner: &str, span: Span) -> Result<(), Error> {
         if !mentions_a_closure(rendered)
             || compares_by_cell_identity(rendered)
@@ -3913,7 +3914,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Err(unsupported(
             &format!(
                 "a closure held inside `{rendered}` (in `{owner}`), which has no reference \
-                 equality — `Option`, `List` and a fixed array of one do"
+                 equality — `Option`, `List`, a fixed array, a map and a key-closure pair of \
+                 one do"
             ),
             span,
         ))
@@ -3945,7 +3947,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .and_then(|inner| inner.strip_suffix('>'))
                     .and_then(|inner| inner.rsplit_once(", "))
             });
-        array_element.is_some_and(|(element, _)| Self::reference_equality_reaches(element))
+        if array_element.is_some_and(|(element, _)| Self::reference_equality_reaches(element)) {
+            return true;
+        }
+        // F136: a map of closures (`vilan_rt::Map<K, V>`, std's `NativeMap`)
+        // compares its values by reference, and a value that is the map's
+        // `(key, value)` entry compares its key by value — a key holds no
+        // closure (it is hashable).
+        if let Some((key, value)) = rendered
+            .strip_prefix("vilan_rt::Map<")
+            .and_then(|inner| inner.strip_suffix('>'))
+            .and_then(split_at_the_top_level_comma)
+        {
+            return !mentions_a_closure(key) && Self::reference_equality_reaches(value);
+        }
+        rendered
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+            .and_then(split_at_the_top_level_comma)
+            .is_some_and(|(key, value)| {
+                !mentions_a_closure(key) && Self::reference_equality_reaches(value)
+            })
     }
 
     /// One emitted aggregate's `impl vilan_rt::Json`.
@@ -16102,6 +16124,29 @@ fn is_closure_type(rendered: &str) -> bool {
 /// either side (node prints `[Function: <name>]` off a name this backend cannot
 /// reproduce, and `JSON.stringify` omits the key), so an aggregate that reaches
 /// one refuses at run time by name rather than guessing bytes.
+/// F136: a rendered two-part list (`K, V`) split at its one comma outside
+/// every bracket — `None` when there is no such comma, or more than one.
+fn split_at_the_top_level_comma(rendered: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut split = None;
+    for (index, character) in rendered.char_indices() {
+        match character {
+            '<' | '(' | '[' => depth += 1,
+            '>' if rendered[..index].ends_with('-') => {}
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if split.is_some() {
+                    return None;
+                }
+                split = Some(index);
+            }
+            _ => {}
+        }
+    }
+    let index = split?;
+    Some((rendered[..index].trim(), rendered[index + 1..].trim()))
+}
+
 fn mentions_a_closure(rendered: &str) -> bool {
     rendered.contains("dyn Fn")
 }
