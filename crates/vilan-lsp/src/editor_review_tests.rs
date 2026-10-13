@@ -540,3 +540,72 @@ fn e313_two_implicit_parameters_keep_their_own_definitions() {
         }
     });
 }
+
+/// The E305 head: the kolt positions (`views.vl:113`'s `on:click`,
+/// `views.vl:116`'s `.styled`), an attribute, a chain item over two lines
+/// and an event with a named handler.
+const E305_HEAD: &str = "import std::web::style::Style;\n\n\
+     fun icon_style(): Style {\n\tstyle::style()\n}\n\nfun ping() {}\n\n\
+     export fun bar(open: || void): View {\n\t<div>\n\t\t<button\n\t\t\ttitle(\"Search\")\n\
+     \t\t\ton:click(|_| {\n\t\t\t\topen();\n\t\t\t})\n\
+     \t\t\t.styled(icon_style())\n\
+     \t\t\t.text(\n\t\t\t\t\"wide\",\n\t\t\t)\n\
+     \t\t\ton:dblclick(ping)\n\t\t/>\n\t</div>\n}\n";
+
+/// E305: the head's written tokens answer for themselves — `on:` and the
+/// event name as the event hook the desugar lowers to, `.styled` as
+/// `styled`'s own signature (as it hovers outside markup), an attribute's
+/// name as `attr` — in the entry and in a view.
+#[test]
+fn e305_an_element_heads_written_tokens_answer_for_themselves() {
+    on_big_stack(|| {
+        let client = "import pkg::bar::bar;\n\nfun main() {\n\tlet _ = bar(|| {});\n}\n";
+        let package = Package::new("e305", &[("client.vl", client), ("bar.vl", E305_HEAD)]);
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let view = package.view(&world, "bar.vl");
+        let lone = Document::analyze(E305_HEAD, &std_root(), &package.path("bar.vl"));
+        for document in [&view, &lone] {
+            let hover = |needle: &str, delta: usize| {
+                document
+                    .hover(at(E305_HEAD, needle, delta))
+                    .unwrap_or_else(|| panic!("{needle:?}+{delta} hovers"))
+            };
+            for (needle, delta) in [
+                ("on:click", 0),
+                ("on:click", 1),
+                ("on:click", 3),
+                ("on:click", 7),
+            ] {
+                let answer = hover(needle, delta);
+                assert!(
+                    answer.contains("fun on_event(self, event: str"),
+                    "{needle}+{delta}: {answer}"
+                );
+            }
+            for delta in [0, 3, 10] {
+                let answer = hover("on:dblclick", delta);
+                assert!(
+                    answer.contains("fun on(self, event: str"),
+                    "dblclick+{delta}: {answer}"
+                );
+            }
+            for delta in [1, 4] {
+                let answer = hover(".styled(icon_style())", delta);
+                assert!(
+                    answer.contains("fun styled(self, style: Style): View"),
+                    "{answer}"
+                );
+                let answer = hover(".text(\n", delta);
+                assert!(
+                    answer.contains("fun text(self, content: str): View"),
+                    "{answer}"
+                );
+            }
+            let answer = hover("title(", 2);
+            assert!(answer.contains("fun attr(self, name: str"), "{answer}");
+            // The written string is still the reader's own: no hover.
+            assert_eq!(document.hover(at(E305_HEAD, "\"Search\"", 2)), None);
+        }
+    });
+}

@@ -3841,6 +3841,10 @@ impl Document {
             return Some(rendered);
         }
         let id = self.entity_at(offset)?;
+        // E305: an element head's NAME — the event of `on:click(..)`, the
+        // attribute of `title(..)` — is a string the desugar minted from the
+        // written token, and answers for the link it lowers to.
+        let id = self.markup_name_link(program, id).unwrap_or(id);
         // A function (or requirement-carrying binding): the full signature —
         // and, at a GENERIC call site, the signature that call reached under it
         // (E206). The site's label is keyed by the id under the cursor, so no
@@ -3903,6 +3907,32 @@ impl Document {
         };
         blocks.push_some(Block::Diagnostic, internal_lead(program, binding));
         blocks.rendered()
+    }
+
+    /// E305: the head LINK a markup name lowers to. `on:click(|e| ..)` is
+    /// `.on_event("click", |e| ..)` and `title("Search")` is
+    /// `.attr("title", "Search")` (`elements.rs`), and the name's string
+    /// literal spans the written NAME — no quote opens it, which is what
+    /// tells it from a string the reader wrote. Its hover is the method's:
+    /// the event hook or `attr`, with its `///`, exactly as the `on:` before
+    /// it answers. `None` for anything else.
+    fn markup_name_link(&self, program: &Program, id: Id) -> Option<Id> {
+        let Some(Expr::String(_)) = program.entity_map.get(&id) else {
+            return None;
+        };
+        let span = program.span_map.get(&id)?.into_range();
+        let first = self.analyzed_text().as_bytes().get(span.start).copied()?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        let analysis = self.analysis(program);
+        self.entity_spans
+            .iter()
+            .filter(|(start, end, link)| *link != id && *start <= span.start && span.end <= *end)
+            .filter(|(_, _, link)| matches!(program.entity_map.get(link), Some(Expr::Call(_))))
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(_, _, link)| *link)
+            .filter(|link| analysis.function_target(*link).is_some())
     }
 
     /// The hover for an identifier that spells an `as` alias — its own name
