@@ -400,17 +400,33 @@ fn normalize(rendering: &str, root: &Path, permuted: Option<&Permuted>) -> Strin
     out
 }
 
-/// The clean analysis of a package written from `files`, rendered.
-fn observe_clean(name: &str, platform: Platform, files: &[(String, String)]) -> (String, PathBuf) {
+/// The prefixed analyses [`observe_leg`] saw (std-prefix P1's non-vacuity).
+static PREFIX_WORLDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The analysis of a package written from `files` on `leg`, rendered.
+fn observe_leg(
+    name: &str,
+    platform: Platform,
+    files: &[(String, String)],
+    leg: Leg,
+) -> (String, PathBuf) {
     let borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(file, text)| (file.as_str(), text.as_str()))
         .collect();
     let package = Package::write(name, platform, &borrowed);
-    let observation = observe(&package, Vec::new(), Leg::Clean);
+    let observation = observe(&package, Vec::new(), leg);
+    if observation.census.prefix_world {
+        PREFIX_WORLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let root = package.directory.clone();
     package.remove();
     (observation.rendering, root)
+}
+
+/// The clean analysis of a package written from `files`, rendered.
+fn observe_clean(name: &str, platform: Platform, files: &[(String, String)]) -> (String, PathBuf) {
+    observe_leg(name, platform, files, Leg::Clean)
 }
 
 /// The first row where the canonical rendering and a permuted one part.
@@ -438,6 +454,7 @@ fn compare(
     files: &[(String, String)],
     opaque: &[&str],
     permutation: Permutation,
+    permuted_leg: Leg,
 ) -> Option<String> {
     let name = label
         .chars()
@@ -447,10 +464,11 @@ fn compare(
     let (canonical, root) = observe_clean(&format!("perm_{name}"), platform, files);
     let canonical = normalize(&canonical, &root, None);
     let permuted = permute(files, opaque, permutation)?;
-    let (rendering, root) = observe_clean(
+    let (rendering, root) = observe_leg(
         &format!("perm_{name}_{permutation:?}"),
         platform,
         &permuted.files,
+        permuted_leg,
     );
     let rendering = normalize(&rendering, &root, Some(&permuted));
     (canonical != rendering).then(|| {
@@ -465,13 +483,25 @@ fn compare(
 /// Every state of `fixture`, under every permutation; `skip` names the states
 /// (by a substring of the edit's label) the gate leaves to a pin of their own.
 fn compare_fixture(fixture: &Fixture, skip: &[&str]) -> Vec<String> {
+    compare_fixture_on(fixture, skip, Leg::Clean)
+}
+
+/// [`compare_fixture`], the permuted package analyzed on `permuted_leg`.
+fn compare_fixture_on(fixture: &Fixture, skip: &[&str], permuted_leg: Leg) -> Vec<String> {
     let mut divergences = Vec::new();
     for (label, files) in fixture.states() {
         if skip.iter().any(|needle| label.contains(needle)) {
             continue;
         }
         for permutation in PERMUTATIONS {
-            divergences.extend(compare(&label, fixture.platform, &files, &[], permutation));
+            divergences.extend(compare(
+                &label,
+                fixture.platform,
+                &files,
+                &[],
+                permutation,
+                permuted_leg,
+            ));
         }
     }
     divergences
@@ -493,6 +523,39 @@ fn the_classes_package_answers_the_same_under_every_permutation() {
         "{} state(s) of the classes package depend on the modules' load order:\n{}",
         divergences.len(),
         divergences.join("\n")
+    );
+}
+
+/// **std-prefix P1's leg** (`std-prefix.md` §13): the classes package and
+/// M121's served impls again, the PERMUTED package now analyzed incrementally
+/// with the in-process std-only prefix forced on — so std's world is built
+/// once and served to every permuted package whose std closure it is (each is
+/// a package of its own, which is the cross-package sharing §4.3 keys for), and
+/// the package walks and resolves over it in its permuted order — against the
+/// canonical package's CLEAN analysis.
+#[test]
+fn the_classes_package_answers_the_same_over_the_std_prefix() {
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let mut divergences =
+        compare_fixture_on(&CLASSES_FIXTURE, &[B554_CLASS_EDIT], Leg::Incremental);
+    divergences.extend(compare_fixture_on(
+        &SERVED_IMPL_FIXTURE,
+        &[],
+        Leg::Incremental,
+    ));
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(None);
+    assert!(
+        divergences.is_empty(),
+        "{} state(s) of the classes package answer differently over the std prefix:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let prefix_worlds = PREFIX_WORLDS.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        prefix_worlds >= 8,
+        "the permuted packages must be built over the std prefix ({prefix_worlds} were); the \
+         comparison above is otherwise vacuous about P1"
     );
 }
 
@@ -562,6 +625,7 @@ fn the_corpus_as_modules_answers_the_same_under_every_permutation() {
                                 &files,
                                 &["module.vl"],
                                 permutation,
+                                Leg::Clean,
                             ));
                         }
                     }
@@ -596,7 +660,7 @@ fn b554_an_element_conflicts_blame_is_a_fact_about_the_program() {
         .find(|(label, _)| label.contains(B554_CLASS_EDIT))
         .expect("the classes script has B554's edit");
     for permutation in PERMUTATIONS {
-        divergences.extend(compare(&label, NODE, &files, &[], permutation));
+        divergences.extend(compare(&label, NODE, &files, &[], permutation, Leg::Clean));
     }
     assert!(
         divergences.is_empty(),
@@ -613,7 +677,7 @@ fn b554_an_element_conflicts_blame_is_a_fact_about_the_program() {
 fn the_differential_sees_a_changed_answer_through_the_normalization() {
     let (label, files) = &CLASSES_FIXTURE.states()[0];
     for permutation in PERMUTATIONS {
-        if let Some(divergence) = compare(label, NODE, files, &[], permutation) {
+        if let Some(divergence) = compare(label, NODE, files, &[], permutation, Leg::Clean) {
             panic!("the base classes package must agree with itself: {divergence}");
         }
     }
