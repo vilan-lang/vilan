@@ -13924,6 +13924,120 @@ fn b578_a_view_of_a_call_result_is_a_pair_where_the_pointee_is_a_scalar() {
     );
 }
 
+/// B615: B578's twin at a CONCRETE view parameter — `read(&seven())` with
+/// `fun read(value: &i32)` threw `TypeError: Cannot read properties of
+/// undefined` on JS when native-51 filed it (B578 had not landed). Each shape
+/// hands the callee a `(base, key)` pair: a call, a binary and a unary value,
+/// a method's and a closure's parameter, `&str`/`&bool`/`&f64` returns, a
+/// tuple field, a list and an array element, a struct field of a call's
+/// result, an unwrapped option, a struct literal's field, an interpolation,
+/// two views in one call.
+#[test]
+fn b615_a_view_of_a_scalar_temporary_at_a_concrete_parameter_is_a_pair() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        struct Counter {
+            base: i32,
+        }
+
+        impl Counter {
+            fun take(self, value: &i32): i32 {
+                self.base + *value
+            }
+        }
+
+        fun seven(): i32 {
+            7
+        }
+
+        fun name(): str {
+            "vi"
+        }
+
+        fun yes(): bool {
+            true
+        }
+
+        fun half(): f64 {
+            0.5
+        }
+
+        fun pair(): (i32, str) {
+            (3, "p")
+        }
+
+        fun make(): List<i32> {
+            [10, 20]
+        }
+
+        fun fixed(): [i32; 2] {
+            [30, 40]
+        }
+
+        fun origin(): Point {
+            Point { x = 1, y = 2 }
+        }
+
+        fun maybe(): Option<i32> {
+            Some(9)
+        }
+
+        fun read(value: &i32): i32 {
+            *value + 1
+        }
+
+        fun read_str(value: &str): str {
+            *value + "!"
+        }
+
+        fun read_bool(value: &bool): bool {
+            !*value
+        }
+
+        fun read_f64(value: &f64): f64 {
+            *value * 2.0
+        }
+
+        fun read_two(left: &i32, right: &i32): i32 {
+            *left + *right
+        }
+
+        fun main() {
+            let a = 2;
+            let b = 3;
+            print(read(&seven()));
+            print(read(&(a + b)));
+            print(read(&-seven()));
+            print(read(&(seven())));
+            print(Counter { base = 100 }.take(&seven()));
+            let apply = |value: &i32| *value * 3;
+            print(apply(&seven()));
+            print(read_str(&name()));
+            print(read_bool(&yes()));
+            print(read_f64(&half()));
+            print(read(&pair().0));
+            print(read_str(&pair().1));
+            print(read(&make()[1]));
+            print(read(&fixed()[0]));
+            print(read(&origin().y));
+            print(read(&maybe().unwrap()));
+            print(read(&Point { x = 4, y = 5 }.x));
+            print(read_str(&i"{a}{b}"));
+            print(read_two(&seven(), &(a * b)));
+            print(read(&make().len().as_i32()));
+        }
+        "#,
+        "8\n6\n-6\n8\n107\n21\nvi!\nfalse\n1\n4\np!\n21\n31\n3\n10\n5\n23!\n13\n3\n",
+    );
+}
+
 /// B578, inside a generic body: `&identity(value)` where the call's `T` is the
 /// ENCLOSING instance's — the call's binding names the caller's parameter, and
 /// the active instance resolves it (a number pairs, a `str` pairs, through a

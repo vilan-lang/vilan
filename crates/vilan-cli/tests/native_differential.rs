@@ -9681,6 +9681,26 @@ fn b578_a_view_of_a_call_result_is_identical_on_both_backends() {
     );
 }
 
+/// B615: `&` of a SCALAR temporary handed to a CONCRETE `&i32`/`&str`/
+/// `&bool`/`&f64` parameter — the item's `read(&seven())` threw a TypeError on
+/// JS when filed (before B578 landed); B578's one-slot cell reaches every
+/// shape here, and this pins them beside its generic `&T`.
+#[test]
+fn b615_a_view_of_a_scalar_temporary_at_a_concrete_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_views_of_scalar_temporaries.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/views_of_scalar_temporaries.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a view of a scalar temporary must reach a concrete view parameter as a pair on JS"
+    );
+}
+
 /// A `main` that answers its EXIT CODE (`fun main(): i32`, resource_exit.vl's
 /// shape) emitted its tail followed by the event loop's turn, which rustc
 /// refused ("expected `;`"). It exits with the code natively now, after its
