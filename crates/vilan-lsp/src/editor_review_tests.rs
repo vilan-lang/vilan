@@ -1473,3 +1473,40 @@ fn e300_a_match_arm_hovers_with_its_subject_and_captures() {
         );
     });
 }
+
+/// E301: an inlay hint's tooltip is what its binding's name hovers, as
+/// markdown — kolt `views.vl:187`'s `Some(let root)` capture hint — or a
+/// stage's `… as T` reading; the type it names resolves to its definition.
+#[test]
+fn e301_an_inlay_hint_resolves_to_its_bindings_hover_and_its_type() {
+    on_big_stack(|| {
+        let source = "/// A remote root.\nstruct Remote<P> {\n\tvalue: P,\n}\n\n\
+             fun global(): Option<Remote<str>> {\n\tSome(Remote { value = \"g\" })\n}\n\n\
+             fun main() {\n\tmatch global() {\n\t\tSome(let root) => {\n\t\t\tlet _ = root;\n\t\t}\n\t\tNone => {}\n\t}\n\
+             \tlet doubled = Some(5)\n\t\t.map(|x| x * 2)\n\t\t.is_some();\n\tlet _ = doubled;\n}\n";
+        let package = Package::new("e301", &[("client.vl", source)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let root_end = at(source, "root) =>", 4);
+        let (markdown, location) = document.inlay_hint_detail(root_end, ": Remote<str>", None);
+        assert!(
+            markdown.starts_with("```vilan\nlet root: Remote<str>\n```"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("A remote root."), "{markdown}");
+        let (source_id, span) = location.expect("the type's definition");
+        assert_eq!(source_id, document.focus);
+        assert_eq!(&source[span.into_range()], "Remote");
+        // A stage hint: the stage's reading, then what the type is.
+        let stage_end = at(source, ".map(|x| x * 2)", ".map(|x| x * 2)".len());
+        let (stage, _) = document.inlay_hint_detail(stage_end, " as Option<i32>", None);
+        assert!(
+            stage.starts_with("```vilan\n… as Option<i32>\n```"),
+            "{stage}"
+        );
+    });
+}

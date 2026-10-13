@@ -158,6 +158,11 @@ written down.
 <!-- family: feature -->
 **E300: a match arm's variant hovers with what the match is over and what the leg binds — `Some` in kolt's `match model::global() { Some(let root) => …` answers one fence: `match on Option<RemoteStoreSome<Global>>`, `Option<RemoteStoreSome<Global>>::Some(RemoteStoreSome<Global>)`, `let root: RemoteStoreSome<Global>` — then the variant's `///` (RULED shape).** E241 answered the variant line alone. A tuple payload lists one declaration per capture (`let w: f64`, `mut h: f64`), a payload-less variant or a literal leg lists none, `_` answers `match on Shape` over `_: Shape`, and an `is` test answers the same as a leg; a capture whose inlay hint abbreviates its type (E227) adds "Shown as `~Source<..>`" so the hint and the hover agree. Pins: `editor_review_tests::e300_a_match_arm_hovers_with_its_subject_and_captures`, and E241's five pins with the new lines. Tracker E300.
 
+---
+
+<!-- family: feature -->
+**E301: an inlay hint's tooltip is its binding's hover, highlighted, and its type name is clickable — hovering the `: RemoteStoreSome<Global>` hint after kolt's `Some(let root)` shows the fenced `let root: RemoteStoreSome<Global>`, E237's chunk and the type's `///`, and a click on `RemoteStoreSome` goes to its definition.** The tooltip was a bare string (the full type, and only for an abbreviated hint). The server now offers `inlayHint/resolve`: a hint carries what the resolve needs, and the tooltip (markdown) and the type name's location are computed when the hint is hovered — never on the keystroke path, so the `inlay` row does not move. A hint's label is sent as parts (the `: ` or ` as `, the type's head name, the rest); an abbreviated `~Source<..>` stays one string, and its resolved tooltip leads with the FULL type (E278's rule) above the rest. A stage hint's tooltip reads `… as Option<i32>`, then what the type is. The test helper that panicked on parts and markdown reads both. Pins: `editor_review_tests::e301_an_inlay_hint_resolves_to_its_bindings_hover_and_its_type` (the kolt capture, a stage, the location), and `snapshot_consistency_tests::an_abbreviated_hint_carries_the_full_type_as_its_tooltip_and_no_edit` (resolve: the full type first; the parts' head resolves into std's `iterator.vl`). Tracker E301.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

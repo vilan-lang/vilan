@@ -2601,6 +2601,39 @@ fn attach_twin_legs(documents: &DashMap<Url, Document>, worlds: &DashMap<PathBuf
     }
 }
 
+/// E301: an inlay hint's label as PARTS — the `: ` (or ` as `) prefix, the
+/// type's head name, which resolves to its definition, and the rest — or the
+/// plain string where there is no name to click (an abbreviation's
+/// `~Source<..>`, a primitive written with punctuation first).
+fn inlay_hint_label(label: &str, abbreviated: bool) -> InlayHintLabel {
+    let prefix_length = if label.starts_with(": ") {
+        2
+    } else if label.starts_with(" as ") {
+        4
+    } else {
+        0
+    };
+    let (prefix, rest) = label.split_at(prefix_length);
+    let head_length = rest
+        .find(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .unwrap_or(rest.len());
+    if abbreviated || prefix_length == 0 || head_length == 0 {
+        return InlayHintLabel::String(label.to_string());
+    }
+    let (head, tail) = rest.split_at(head_length);
+    let part = |value: &str| InlayHintLabelPart {
+        value: value.to_string(),
+        tooltip: None,
+        location: None,
+        command: None,
+    };
+    let mut parts = vec![part(prefix), part(head)];
+    if !tail.is_empty() {
+        parts.push(part(tail));
+    }
+    InlayHintLabel::LabelParts(parts)
+}
+
 /// M104: serve the open document at `uri` (whose buffer reads `text`) from a
 /// world another open document already HOLDS, instead of analyzing that
 /// world's entry again — opening `model.vl` beside the client's open files
@@ -4090,7 +4123,13 @@ fn server_capabilities() -> ServerCapabilities {
             trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
             ..Default::default()
         }),
-        inlay_hint_provider: Some(OneOf::Left(true)),
+        // E301: the tooltip and the type name's location resolve lazily.
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            },
+        ))),
         // E2: precision highlighting from the analyzed program. The
         // legend is index-aligned with `document::TokenKind`.
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
@@ -5044,11 +5083,23 @@ impl LanguageServer for Backend {
                 .filter_map(|hint| {
                     let position = document.line_index.position(hint.offset);
                     let visible = position >= range.start && position <= range.end;
+                    // E301: the tooltip and the type name's target are
+                    // resolved when the hint is hovered (`inlayHint/resolve`),
+                    // off this keystroke path; what the resolve needs rides in
+                    // `data`.
+                    let data = serde_json::json!({
+                        "uri": uri.as_str(),
+                        "line": position.line,
+                        "character": position.character,
+                        "label": hint.label,
+                        "full": hint.full,
+                    });
                     visible.then_some(InlayHint {
                         position,
-                        label: InlayHintLabel::String(hint.label),
+                        label: inlay_hint_label(&hint.label, hint.full.is_some()),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
+                        // E227: an abbreviation's full type, until resolved.
                         tooltip: hint.full.map(|full| {
                             // `: T` for a binding, ` as T` for a stage (E278).
                             let full = full.trim_start_matches(": ").trim_start_matches(" as ");
@@ -5056,11 +5107,65 @@ impl LanguageServer for Backend {
                         }),
                         padding_left: Some(false),
                         padding_right: Some(false),
-                        data: None,
+                        data: Some(data),
                     })
                 })
                 .collect::<Vec<_>>();
             Ok(Some(hints))
+        })
+    }
+
+    /// E301: a hovered inlay hint's tooltip — what the binding's NAME would
+    /// hover, as markdown with a fenced block — and its type name's
+    /// definition, from the document's landed analysis.
+    async fn inlay_hint_resolve(&self, mut hint: InlayHint) -> Result<InlayHint> {
+        let unresolved = hint.clone();
+        self.fenced("inlay_hint_resolve", Ok(unresolved), || {
+            let Some(data) = hint.data.as_ref() else {
+                return Ok(hint);
+            };
+            let field = |name: &str| data.get(name);
+            let (Some(uri), Some(line), Some(character), Some(label)) = (
+                field("uri")
+                    .and_then(|value| value.as_str())
+                    .and_then(|uri| Url::parse(uri).ok()),
+                field("line").and_then(serde_json::Value::as_u64),
+                field("character").and_then(serde_json::Value::as_u64),
+                field("label").and_then(|value| value.as_str()),
+            ) else {
+                return Ok(hint);
+            };
+            let full = field("full").and_then(|value| value.as_str());
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(hint);
+            };
+            let position = Position::new(line as u32, character as u32);
+            let Some(offset) = document.request_offset(position) else {
+                return Ok(hint);
+            };
+            let (markdown, target) = document.inlay_hint_detail(offset, label, full);
+            let tooltip = InlayHintTooltip::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown,
+            });
+            let location =
+                target.and_then(|(source, span)| self.location_for(&document, &uri, source, span));
+            if let InlayHintLabel::LabelParts(parts) = &mut hint.label {
+                for part in parts.iter_mut() {
+                    part.tooltip = Some(InlayHintLabelPartTooltip::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: match &tooltip {
+                            InlayHintTooltip::MarkupContent(content) => content.value.clone(),
+                            InlayHintTooltip::String(text) => text.clone(),
+                        },
+                    }));
+                }
+                if let Some(head) = parts.get_mut(1) {
+                    head.location = location;
+                }
+            }
+            hint.tooltip = Some(tooltip);
+            Ok(hint)
         })
     }
 
@@ -6860,13 +6965,17 @@ mod snapshot_consistency_tests {
                 .find(|hint| hint.position.line == 1)
                 .expect("the hint on `taken`")
         };
+        // E301: a label is a string or its parts, read as the text shown; a
+        // tooltip is plain or markdown, read as its text.
         let label = |hint: &InlayHint| match &hint.label {
             InlayHintLabel::String(label) => label.clone(),
-            InlayHintLabel::LabelParts(_) => panic!("a plain label"),
+            InlayHintLabel::LabelParts(parts) => {
+                parts.iter().map(|part| part.value.as_str()).collect()
+            }
         };
         let tooltip = |hint: &InlayHint| match &hint.tooltip {
             Some(InlayHintTooltip::String(tooltip)) => Some(tooltip.clone()),
-            Some(InlayHintTooltip::MarkupContent(_)) => panic!("a plain tooltip"),
+            Some(InlayHintTooltip::MarkupContent(content)) => Some(content.value.clone()),
             None => None,
         };
         let hint = taken(backend.inlay_hint(params.clone()).await.unwrap().unwrap());
@@ -6876,6 +6985,20 @@ mod snapshot_consistency_tests {
             Some("Taken<Mapped<ListIterator<i32>, i32, i32>, i32>")
         );
         assert!(hint.text_edits.is_none());
+        // E301: resolved, the abbreviation's tooltip is markdown whose first
+        // block is the full type (E278's rule), the binding's hover under it.
+        let resolved = backend.inlay_hint_resolve(hint.clone()).await.unwrap();
+        let markdown = tooltip(&resolved).expect("a resolved tooltip");
+        assert!(
+            markdown.starts_with(
+                "```vilan\nTaken<Mapped<ListIterator<i32>, i32, i32>, i32>\n```\n\n```vilan\nlet taken:"
+            ),
+            "{markdown}"
+        );
+        assert!(matches!(
+            resolved.tooltip,
+            Some(InlayHintTooltip::MarkupContent(_))
+        ));
         backend
             .config
             .write()
@@ -6887,6 +7010,25 @@ mod snapshot_consistency_tests {
             ": Taken<Mapped<ListIterator<i32>, i32, i32>, i32>"
         );
         assert!(tooltip(&hint).is_none() && hint.text_edits.is_none());
+        // E301: the full label is parts, and its type NAME resolves to the
+        // type's definition.
+        let InlayHintLabel::LabelParts(parts) = &hint.label else {
+            panic!("a full type's label is parts");
+        };
+        assert_eq!(parts[1].value, "Taken");
+        let resolved = backend.inlay_hint_resolve(hint.clone()).await.unwrap();
+        let InlayHintLabel::LabelParts(parts) = &resolved.label else {
+            panic!("parts, resolved");
+        };
+        let target = parts[1]
+            .location
+            .as_ref()
+            .expect("the type name's definition");
+        assert!(target.uri.path().ends_with("iterator.vl"), "{target:?}");
+        assert!(
+            tooltip(&resolved)
+                .is_some_and(|markdown| markdown.starts_with("```vilan\nlet taken: Taken<"))
+        );
     }
 
     // --- Handler wiring: the S1 index switch, pinned per handler ------------

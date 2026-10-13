@@ -5428,6 +5428,80 @@ impl Document {
             .collect()
     }
 
+    /// E301: what an inlay hint's tooltip says and where its type name
+    /// leads, resolved when the hint is hovered (`inlayHint/resolve`), never
+    /// on the keystroke path. `offset` is the hint's ANALYZED position — the
+    /// end of the name it follows — and `label` its shown label (`: T` for a
+    /// binding, ` as T` for a stage, E278), `full` the full type where the
+    /// label abbreviates it (E227).
+    ///
+    /// The tooltip is markdown: for a binding, what its NAME hovers (the
+    /// fenced `let root: T`, its `///`, E237's chunk); for a stage, the
+    /// stage's reading `… as T`; for an abbreviation, the full type on the
+    /// first line (E278's rule) above the rest; then the type's own `///`
+    /// where the hover does not already carry it. The location is the
+    /// definition of the type the hint names — a struct, an enum or a trait.
+    pub fn inlay_hint_detail(
+        &self,
+        offset: usize,
+        label: &str,
+        full: Option<&str>,
+    ) -> (String, Option<(SourceId, Span)>) {
+        let Some(program) = self.program.as_ref() else {
+            return (fenced(label.trim()), None);
+        };
+        let shown = full.unwrap_or(label);
+        let stage = shown.starts_with(" as ");
+        let type_label = shown.trim_start_matches(": ").trim_start_matches(" as ");
+        // The entity the hint is about: a binding whose name ends here, else
+        // the narrowest entity ending here (a stage).
+        let binding = program
+            .variables
+            .iter()
+            .find(|(id, variable)| {
+                variable.name_span.end == offset && program.source_of(**id) == Some(self.focus)
+            })
+            .map(|(id, variable)| (*id, variable.type_id));
+        let type_id = binding.map(|(_, type_id)| type_id).or_else(|| {
+            self.entity_spans
+                .iter()
+                .filter(|(_, end, _)| *end == offset)
+                .min_by_key(|(start, end, _)| end - start)
+                .and_then(|(_, _, id)| program.expr_type_ids.get(id).copied())
+        });
+        let mut blocks: Vec<String> = Vec::new();
+        if full.is_some() {
+            blocks.push(fenced(type_label));
+        }
+        let hover = match (stage, binding) {
+            (false, Some(_)) => self.hover(offset.saturating_sub(1)),
+            _ => None,
+        };
+        let hover = hover.unwrap_or_else(|| fenced(&format!("… as {type_label}")));
+        blocks.push(hover.clone());
+        let nominal =
+            type_id.and_then(|type_id| match program.type_id_to_type_map.get(&type_id)? {
+                vilan_core::type_::Type::Struct(id, _)
+                | vilan_core::type_::Type::Enum(id, _)
+                | vilan_core::type_::Type::Trait(id, _) => Some(*id),
+                _ => None,
+            });
+        let analysis = self.analysis(program);
+        if let Some(nominal) = nominal
+            && let Some(doc) = analysis.doc_comment_of(nominal)
+            && !hover.contains(&doc)
+        {
+            blocks.push(doc);
+        }
+        let location = nominal.and_then(|nominal| {
+            Some((
+                program.source_of(nominal)?,
+                analysis.definition_name_span(nominal)?,
+            ))
+        });
+        (blocks.join("\n\n"), location)
+    }
+
     /// [`inlay_hints`](Self::inlay_hints) with the binding NAME each hint
     /// follows — what the landed snapshot keeps, so a hint can follow the
     /// edits after it (E232).
@@ -10952,6 +11026,11 @@ fn owned_field_line(program: &Program, struct_id: Id, line: &str) -> String {
         Some(head) if !head.is_empty() => format!("{head}\n{line}"),
         _ => line.to_string(),
     }
+}
+
+/// A fenced `vilan` block.
+fn fenced(code: &str) -> String {
+    format!("```vilan\n{code}\n```")
 }
 
 /// E298: how many names a module hover lists before "and N more".
