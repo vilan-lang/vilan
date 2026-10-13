@@ -35091,10 +35091,25 @@ impl<'src> Analyzer<'src> {
                 *written == cell
                     && !rebinds
                     && self.source_of_id(*write_id) == Some(source)
+                    && self.one_span_space(expr_id, *write_id)
                     && self.span_map.get(write_id).is_some_and(|write_span| {
                         write_span.start >= start && write_span.end <= end
                     })
             })
+    }
+
+    /// Whether two entities' spans are offsets into ONE text, so span
+    /// containment says one lies inside the other. Every `[derive(..)]`
+    /// expansion shares [`DERIVED_SOURCE`] while its spans are offsets into
+    /// its OWN generated template, so two expansions' spans overlap by
+    /// accident: F135 found a derived `hash` "containing" another expansion's
+    /// write, which made every `key.hash()` argument a writer of every
+    /// written cell. Within the derived source, two entities share a text
+    /// only when one `derived_origins` run minted both.
+    fn one_span_space(&self, outer: Id, inner: Id) -> bool {
+        self.source_of_id(outer) != Some(DERIVED_SOURCE)
+            || self.derived_origin_row(outer).map(|row| row.0.clone())
+                == self.derived_origin_row(inner).map(|row| row.0.clone())
     }
 
     /// F135: the cell a `Shared::read()` spine reads out of — the read itself,
@@ -35140,6 +35155,7 @@ impl<'src> Analyzer<'src> {
         calls
             .inside(source, span.start, span.end)
             .into_iter()
+            .filter(|call_id| self.one_span_space(expr_id, *call_id))
             .any(|call_id| {
                 self.call_reaches_an_in_place_write(call_id, cell, calls, &mut summaries)
             })
@@ -35163,7 +35179,7 @@ impl<'src> Analyzer<'src> {
         calls
             .inside(source, span.start, span.end)
             .into_iter()
-            .filter(|call_id| *call_id != expr_id)
+            .filter(|call_id| *call_id != expr_id && self.one_span_space(expr_id, *call_id))
             .any(|call_id| {
                 self.call_reaches_an_in_place_write(call_id, cell, calls, &mut summaries)
             })
@@ -35276,6 +35292,7 @@ impl<'src> Analyzer<'src> {
             calls
                 .inside(source, span.start, span.end)
                 .into_iter()
+                .filter(|call_id| self.one_span_space(function_id, *call_id))
                 .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, calls, summaries))
         };
         summaries.insert(function_id, answer);

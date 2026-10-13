@@ -73,6 +73,11 @@ written down.
 <!-- family: miscompile -->
 **F?3 (JS): a `&mut self` call on a FIELD of a `Shared::read()` wrote the cell on JS — `cell.read().items.push(9)` and `cell.read().rows[0].push(9)` grew the cell's lists (`1`), where the native backend pushed into a copy (`0`), silently.** B274 copied a bare `cell.read()` standing as a `&mut self` receiver, the one position a value reaches a mutable binding implicitly; a spine through the read (a field, a tuple slot, an element) is the same read, and is now copied the same way (spec §6.7: `read()` copies). Mutate through `write()`. Estate: kolt 0, the website's `src` 0, the examples 0, the corpus 0 — no JS output moves. Pin: `borrows::a_mut_self_call_on_a_reads_field_does_not_write_the_cell`. Tracker F?3 (native-52's find).
 
+---
+
+<!-- family: fix -->
+**F135 (slice 2): the write summary a `Shared::read()` copy asks (B457's, and F135's later-argument test) no longer reads one `[derive(..)]` expansion's span as containing ANOTHER expansion's write — a derived `hash` looked like a writer of every written cell, so with F135's slice 1 every `key.hash()` argument beside a read forced a copy (`KeyedCell::locate` copied its whole index per call: M87's pin read `wholes=1`, A54's per-change cost grew 14x over ten times the rows).** Every expansion shares the derived source while its spans are offsets into its OWN generated template; within that source two entities now share a text only when one `derived_origins` run minted both (`one_span_space`, asked by `spans_an_in_place_write` and the three call-index walks). Corpus goldens unchanged. Pins: `ui_rows::m87_keyed_cell_locate_copies_no_whole_list` and `reactive_channels::a_keyed_cell_s_cost_per_change_does_not_grow_with_the_collection` (green again; red at slice 1). Tracker F135.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->
