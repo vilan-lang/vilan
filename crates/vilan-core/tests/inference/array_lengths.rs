@@ -831,6 +831,44 @@ fn s5_fixed_arrays_compare_with_equality_at_every_length() {
     );
 }
 
+/// B609 (lang-50 Q3): an array of `Eq` elements is `Eq` — `impl [type T: Eq;
+/// _] with Eq {}` in std, which B609's conformance fix admits — so a `T: Eq`
+/// takes an array at any length, nested too; a float element is not `Eq`.
+#[test]
+fn b609_a_fixed_array_of_eq_elements_is_eq() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::Eq;
+        fun same<T: Eq>(a: T, b: T): bool {
+            a == b
+        }
+        fun main() {
+            let fixed: [i32; 3] = [1, 2, 3];
+            print(same(fixed, [1, 2, 3]));
+            let words: [str; 2] = ["a", "b"];
+            print(same(words, ["a", "c"]));
+            let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+            print(same(grid, [[1, 2], [3, 4]]));
+        }
+        "#,
+        "true\nfalse\ntrue\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::compare::Eq;
+        fun same<T: Eq>(a: T, b: T): bool {
+            a == b
+        }
+        fun main() {
+            let ratios: [f64; 2] = [1.5, 2.0];
+            let _same = same(ratios, ratios);
+        }
+        "#,
+        "'[f64; 2]' does not implement trait 'Eq'",
+    );
+}
+
 /// `Hashable`: a fixed array keys a `HashMap` and joins a `HashSet`.
 #[test]
 fn s5_a_fixed_array_is_hashable() {
@@ -1004,5 +1042,136 @@ fn s4_a_refused_length_reports_once_and_an_empty_array_says_so() {
         }
         "#,
         "index 0 is out of range: the array is empty",
+    );
+}
+
+// --- B611: a derive over a `<const N>` struct or enum ---------------------------
+
+/// B611: every `[derive(..)]` over a declaration with a length parameter was
+/// refused inside the generated impl — "`N` is a length parameter: give it a
+/// number or another length parameter, not the type `N`" — because macro_std's
+/// `GenericParameter` carried no const flag and `binders` spelled `type N`.
+/// It spells `const N` now: `PartialEq` and `Debug` over a struct and an enum,
+/// `Hashable` over an array of `Hashable`s (a `HashMap` key), and `Storable`.
+#[test]
+fn b611_a_derive_over_a_length_parameter_binds_it_as_const() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::debug::Debug;
+        import std::hash::Hashable;
+        import std::hash_map::HashMap;
+        [derive(PartialEq, Debug)]
+        struct Buf<T, const N> {
+            items: [T; N],
+        }
+        [derive(PartialEq, Debug, Hashable)]
+        struct Key<const N> {
+            parts: [i32; N],
+        }
+        [derive(PartialEq, Debug)]
+        enum Slots<T, const N> {
+            Full([T; N]),
+            Empty,
+        }
+        fun main() {
+            let a: Buf<str, 2> = Buf { items = ["x", "y"] };
+            print(a == Buf { items = ["x", "y"] });
+            print(a.debug());
+            let s: Slots<i32, 2> = Slots::Full([3, 4]);
+            print(s == Slots::Full([3, 4]));
+            print(s.debug());
+            mut seen: HashMap<Key<2>, str> = HashMap::new();
+            seen.insert(Key { parts = [1, 2] }, "a");
+            print(seen.get(Key { parts = [1, 2] }).unwrap_or("none"));
+            print(seen.get(Key { parts = [2, 1] }).unwrap_or("none"));
+        }
+        "#,
+        "true\nBuf { items = [\"x\", \"y\"] }\ntrue\nSlots::Full([3, 4])\na\nnone\n",
+    );
+    assert_compiles(
+        r#"
+        import std::reactive::store::Storable;
+        [derive(Storable)]
+        struct Grid<const N> {
+            cells: [i32; N],
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+/// B611's `Hashable` half: a fixed array of `Hashable` elements is a
+/// `Hashable` FIELD (std's `impl [type T: Hashable; _] with Hashable`, read as
+/// `List`'s element is), at a literal length too; an array of a non-`Hashable`
+/// element keeps the refusal.
+#[test]
+fn b611_an_array_of_hashable_elements_is_a_hashable_field() {
+    assert_compiles(
+        r#"
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        struct Pixel {
+            rgba: [u8; 4],
+        }
+        fun main() {}
+        "#,
+    );
+    assert_fails_with(
+        r#"
+        import std::hash::Hashable;
+        struct Opaque {
+            value: i32,
+        }
+        [derive(Hashable)]
+        struct Wrapper {
+            items: [Opaque; 2],
+        }
+        fun main() {}
+        "#,
+        "field `items` of `[derive(Hashable)]` type `Wrapper` is `[Opaque; 2]`, which is not `Hashable`",
+    );
+}
+
+// --- B616: a fixed array inside a list literal's tuple element -----------------
+
+/// B616: `let pairs: List<([i32; 2], bool)> = [([1, 2], true)]` was refused
+/// "Expected List<([i32; 2], bool)>, but got List<(List<i32>, bool)>" while
+/// the annotated tuple alone and `List<[i32; 2]>` checked: B592 directed a
+/// list literal's element only when the element was itself a list literal.
+/// The direction reaches an array literal through a tuple, a nested list and
+/// a variant constructor's payload.
+#[test]
+fn b616_an_array_literal_inside_a_list_elements_tuple_elaborates_to_the_array() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let pairs: List<([i32; 2], bool)> = [([1, 2], true), ([3, 4], false)];
+            for pair in pairs {
+                print(pair.0[1]);
+            }
+            let flipped: List<(bool, [i32; 2])> = [(true, [9, 10])];
+            print(flipped[0].1[0]);
+            let nested: List<List<[i32; 2]>> = [[[5, 6]]];
+            print(nested[0][0][0]);
+            let maybe: List<Option<[i32; 2]>> = [Some([7, 8]), None];
+            print(maybe.len());
+        }
+        "#,
+        "2\n4\n9\n5\n2\n",
+    );
+}
+
+/// B616's boundary: the direction checks the count as the array arm does.
+#[test]
+fn b616_a_wrong_length_inside_the_tuple_is_refused_by_the_array_rule() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _pairs: List<([i32; 2], bool)> = [([1, 2, 3], true)];
+        }
+        "#,
+        "this array literal has 3 elements, but its type is `[_; 2]`",
     );
 }

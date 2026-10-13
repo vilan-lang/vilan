@@ -86,6 +86,24 @@ thread_local! {
     /// How many impl ROWS the member and trait lookups have examined on this
     /// thread (M107). See [`impl_rows_examined`].
     static IMPL_ROWS_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// M133: the `impl_bounds_hold` questions [`ImplBoundsMemo`] served, and
+    /// the ones it computed and kept, on this thread. See
+    /// [`impl_bounds_memo_counts`].
+    static IMPL_BOUNDS_MEMO_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// M133: `(served, computed)` — the `impl_bounds_hold` questions about a
+/// ground receiver the fixpoint's memo answered from its table, and the ones
+/// it computed and kept, on this thread since the last
+/// [`reset_impl_bounds_memo_counts`]. Only this count sees the memo: an
+/// answer served is the answer computed.
+pub fn impl_bounds_memo_counts() -> (u64, u64) {
+    IMPL_BOUNDS_MEMO_COUNTS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`impl_bounds_memo_counts`].
+pub fn reset_impl_bounds_memo_counts() {
+    IMPL_BOUNDS_MEMO_COUNTS.with(|count| count.set((0, 0)));
 }
 
 /// The impl rows the member lookup (`impl_member_candidates`), the two
@@ -5587,6 +5605,10 @@ pub struct Analyzer<'src> {
     // argument that stays abstract leaves the binder where it was, which is
     // what happened for every shape before the grounding existed.
     bound_argument_grounding_depth: u32,
+    /// M133: [`Analyzer::impl_bounds_hold`]'s answers for a GROUND receiver,
+    /// for the length of one world's fixpoint (`None` outside it) — see
+    /// [`ImplBoundsMemo`].
+    impl_bounds_memo: Option<ImplBoundsMemo>,
     // proposal/lazy.md §1 — the three tables the `lazy` lowering needs, filled
     // by `record_lazy_arguments` once every call has resolved and read by the
     // transformer through their `Program` twins.
@@ -5889,9 +5911,6 @@ pub struct Analyzer<'src> {
     // `auto` — the name the editor's "Add `auto` type" is offered on, and the
     // offset `: auto T` is inserted at.
     auto_fill_points: Vec<(Id, (Span, usize))>,
-    // E284: each call whose generic list was written spaced from its callee
-    // — the callee's, the list's and the arguments' spans.
-    spaced_generic_calls: HashMap<Id, (Span, Span, Span)>,
     // E278: the values that land in a position that already states their type
     // — an annotated `let`'s initializer — so their stage hint would only
     // repeat the annotation.
@@ -7428,6 +7447,45 @@ impl ImplAdmission {
     }
 }
 
+/// M133 — [`Analyzer::impl_bounds_hold`] memoized per (impl, ground
+/// receiver) for one world's fixpoint.
+///
+/// Method resolution asks every candidate impl whether its binders' bounds
+/// hold for the receiver, once per CALL: a `Slot` blanket added to std is
+/// asked again at every `.place(..)` of every view type, and reactive-ui asks
+/// ~2,900 questions about ~300 (impl, receiver) pairs. The answer is a
+/// function of the impl (its subject and binder bounds, fixed once walked),
+/// of the receiver, of the impls in the world (the `impl_count` key: an impl
+/// that joins clears the table) and of which generics are RIGID where the
+/// question is asked (`generic_is_rigid_here`, which `compare_type` reads):
+/// the key carries the innermost scope that can change that set (a scope
+/// declaring a generic, a binder's owner, or a scope whose names could
+/// shadow a generic's name — `boundary_scopes`' reading).
+///
+/// It is consulted only where the answer cannot depend on anything else: a
+/// receiver with no generic, unknown or labelled position (`ground_key`), no
+/// generic open for inference, the outermost grounding step, and no impl
+/// reach log recording (a hit would skip the trait questions the log keeps).
+/// B401's admission is not read by the computation at all (it narrows the
+/// candidate LIST, before this is asked), and it is rebuilt only before a
+/// fixpoint, where the table starts empty.
+#[derive(Clone, Debug, Default)]
+struct ImplBoundsMemo {
+    /// The impl count the answers were computed against.
+    impl_count: usize,
+    /// (impl subject, the receiver's ground key, the boundary scope) -> holds.
+    answers: HashMap<(TypeId, Vec<u32>, Option<Id>), bool>,
+    /// Per scope: whether it is a boundary (see the type's note).
+    boundary_scopes: HashMap<Id, bool>,
+    /// The names every generic parameter goes by, and the scopes that own an
+    /// implicit or anonymous binder — read once, when the table is opened.
+    generic_names: HashSet<String>,
+    binder_owner_scopes: HashSet<Id>,
+    /// Hits and computed answers, for the cost report.
+    hits: u64,
+    misses: u64,
+}
+
 /// B401 — the impl admission the analyzer's OWN method lookup reads, built
 /// before the fixpoint ([`Analyzer::build_lookup_admission`]) from the same
 /// rows [`build_impl_admission`] resolves after it.
@@ -7953,6 +8011,7 @@ impl<'src> Analyzer<'src> {
             own_generic_call_bindings: HashMap::default(),
             spread_packs: HashMap::default(),
             bound_argument_grounding_depth: 0,
+            impl_bounds_memo: None,
             lazy_argument_thunks: IndexMap::default(),
             lazy_argument_forwards: HashSet::default(),
             lazy_cells: HashSet::default(),
@@ -8032,7 +8091,6 @@ impl<'src> Analyzer<'src> {
             auto_written: HashMap::default(),
             auto_inferred: HashMap::default(),
             auto_fill_points: Vec::new(),
-            spaced_generic_calls: HashMap::default(),
             annotated_landings: HashSet::default(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
@@ -21722,6 +21780,10 @@ impl<'src> Analyzer<'src> {
         let (name, arguments) = match &type_ {
             Type::Struct(id, arguments) => (self.structs.get(id).map(|s| s.name), arguments),
             Type::Enum(id, arguments) => (self.enums.get(id).map(|e| e.name), arguments),
+            // B611: a fixed array is `Hashable` when its element is — std's
+            // `impl [type T: Hashable; _] with Hashable`, read as `List`'s
+            // arm below reads `List` — at a literal length or a `const N`.
+            Type::Array(element, _) => return self.resolved_type_is_hashable(*element),
             _ => return false,
         };
         let Some(name) = name else {
@@ -22264,6 +22326,167 @@ impl<'src> Analyzer<'src> {
     /// `Signal<View>` in child position reached `std::web::ui`'s `Source<str>` text
     /// arm and stringified the view.
     fn impl_bounds_hold(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
+        let Some(key) = self.impl_bounds_memo_key(impl_subject, subject_type) else {
+            return self.impl_bounds_hold_computed(impl_subject, subject_type);
+        };
+        if let Some(memo) = self.impl_bounds_memo.as_mut()
+            && let Some(answer) = memo.answers.get(&key).copied()
+        {
+            memo.hits += 1;
+            return answer;
+        }
+        let answer = self.impl_bounds_hold_computed(impl_subject, subject_type);
+        if let Some(memo) = self.impl_bounds_memo.as_mut() {
+            memo.misses += 1;
+            memo.answers.insert(key, answer);
+        }
+        answer
+    }
+
+    /// Opens [`ImplBoundsMemo`] for a fixpoint.
+    fn open_impl_bounds_memo(&mut self) {
+        let generic_names: HashSet<String> = self
+            .generic_constraint_names
+            .values()
+            .map(|name| (*name).to_string())
+            .collect();
+        let binder_owner_scopes: HashSet<Id> = self
+            .implicit_generic_scopes
+            .values()
+            .chain(self.anonymous_binder_scopes.values())
+            .copied()
+            .collect();
+        self.impl_bounds_memo = Some(ImplBoundsMemo {
+            impl_count: self.implementations.len(),
+            generic_names,
+            binder_owner_scopes,
+            ..ImplBoundsMemo::default()
+        });
+    }
+
+    /// Closes [`ImplBoundsMemo`], reporting its counts to the cost report.
+    fn close_impl_bounds_memo(&mut self) {
+        if let Some(memo) = self.impl_bounds_memo.take() {
+            IMPL_BOUNDS_MEMO_COUNTS.with(|count| {
+                let (served, computed) = count.get();
+                count.set((served + memo.hits, computed + memo.misses));
+            });
+        }
+    }
+
+    /// The memo key for this question, or `None` when it must be computed
+    /// ([`ImplBoundsMemo`] says when). Clears the table when an impl joined.
+    fn impl_bounds_memo_key(
+        &mut self,
+        impl_subject: TypeId,
+        subject_type: &Type,
+    ) -> Option<(TypeId, Vec<u32>, Option<Id>)> {
+        if self.impl_bounds_memo.is_none()
+            || self.bound_argument_grounding_depth != 0
+            || !self.inferable_generics.is_empty()
+            || self.impl_reach.borrow().recording
+        {
+            return None;
+        }
+        let mut receiver = Vec::new();
+        if !self.ground_key(subject_type, &mut receiver, 0) {
+            return None;
+        }
+        let impl_count = self.implementations.len();
+        let boundary = self.rigid_boundary_scope();
+        let memo = self.impl_bounds_memo.as_mut()?;
+        if memo.impl_count != impl_count {
+            memo.impl_count = impl_count;
+            memo.answers.clear();
+        }
+        Some((impl_subject, receiver, boundary))
+    }
+
+    /// Writes `type_`'s structure into `out` when it is GROUND — every
+    /// position a nominal, a primitive, an array of a known length, an
+    /// unlabelled tuple or an object over ground arguments. False for
+    /// anything a later write could still move, or that compares by more
+    /// than its structure (a closure, a labelled tuple, a function item).
+    fn ground_key(&self, type_: &Type, out: &mut Vec<u32>, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let arguments = |out: &mut Vec<u32>, tag: u32, id: u32, arguments: &[TypeId]| {
+            out.extend([tag, id, arguments.len() as u32]);
+            arguments
+                .iter()
+                .all(|argument| self.ground_key(&argument.get_type(self), out, depth + 1))
+        };
+        match type_ {
+            Type::Struct(id, items) => arguments(out, 1, id.0, items),
+            Type::Enum(id, items) => arguments(out, 2, id.0, items),
+            Type::Dyn(id, items) => arguments(out, 3, id.0, items),
+            Type::Tuple(items, labels) if *labels == TupleLabels::NONE => {
+                arguments(out, 4, 0, items)
+            }
+            Type::Array(item, length) => match length.get_type(self) {
+                Type::Length(count) => {
+                    out.extend([5, count as u32]);
+                    self.ground_key(&item.get_type(self), out, depth + 1)
+                }
+                _ => false,
+            },
+            Type::Void => {
+                out.push(6);
+                true
+            }
+            Type::Never => {
+                out.push(7);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The innermost scope, from the one the constraint being resolved is
+    /// anchored in outward, that can decide which generics are rigid there:
+    /// one that declares a generic, owns an implicit or anonymous binder, or
+    /// holds a name some generic goes by (which would shadow it). Every scope
+    /// below it passes a generic's name lookup straight through, so two
+    /// questions under one boundary see one rigid set. `None` when no scope
+    /// is one — nothing is rigid.
+    fn rigid_boundary_scope(&mut self) -> Option<Id> {
+        let mut current = self.rigid_binder_scope;
+        while let Some(scope_id) = current {
+            let known = self
+                .impl_bounds_memo
+                .as_ref()
+                .and_then(|memo| memo.boundary_scopes.get(&scope_id).copied());
+            let boundary = match known {
+                Some(boundary) => boundary,
+                None => {
+                    let memo = self.impl_bounds_memo.as_ref()?;
+                    let scope = self.scopes.get(&scope_id)?;
+                    let boundary = memo.binder_owner_scopes.contains(&scope_id)
+                        || scope.name_to_id_map.iter().any(|(name, entity)| {
+                            memo.generic_names.contains(*name)
+                                || matches!(
+                                    self.expr_id_to_expr_map.get(entity),
+                                    Some(Expr::Generic(_))
+                                )
+                        });
+                    self.impl_bounds_memo
+                        .as_mut()?
+                        .boundary_scopes
+                        .insert(scope_id, boundary);
+                    boundary
+                }
+            };
+            if boundary {
+                return Some(scope_id);
+            }
+            current = self.scopes.get(&scope_id).and_then(|scope| scope.parent_id);
+        }
+        None
+    }
+
+    /// [`Self::impl_bounds_hold`], computed.
+    fn impl_bounds_hold_computed(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
         let impl_subject_type = impl_subject.get_type(self);
         let Some((_, bindings)) =
             self.reconcile_declaration(&impl_subject_type, subject_type, &impl_subject_type)
@@ -22736,6 +22959,88 @@ impl<'src> Analyzer<'src> {
                     && self.impl_subject_matches(left_item, right_item)
             }
             (left, right) => left == right,
+        }
+    }
+
+    /// B609: whether an impl over `candidate` provides for EVERY receiver an
+    /// impl over `subject` reaches — the candidate's shape matches the
+    /// subject's ([`Self::impl_subject_matches`], the candidate's binders as
+    /// holes), and each candidate binder's bounds hold for what the subject
+    /// puts there: a subject binder whose own bounds carry the trait (through
+    /// its supertraits), or a concrete type that implements it.
+    ///
+    /// The conformance walk asks it when a subtrait impl leans on a separate
+    /// supertrait impl. `compare_type` already answers a NOMINAL pair — a
+    /// binder inside a nominal's arguments is a hole there — but inside a
+    /// tuple or an array it compares the two binders by their bound traits,
+    /// so `impl (type A: Louder, type B: Louder) with Loud {}` (`trait Louder
+    /// with Display`) did not find `impl (type A: Display, type B: Display)
+    /// with Shown`, and `impl [type T: Eq; _] with Eq {}` did not find std's
+    /// `impl [type T: PartialEq; const N] with PartialEq`. Conservative: a
+    /// parameterized bound or a tuple bound on a candidate binder is not
+    /// read here (the caller's first test stands for those).
+    fn impl_subject_covers(&self, candidate: TypeId, subject: TypeId) -> bool {
+        if !self.impl_subject_matches(candidate, subject) {
+            return false;
+        }
+        let mut aligned: Vec<(TypeId, TypeId)> = Vec::new();
+        if !self.align_subject_binders(candidate, subject, &mut aligned) {
+            return false;
+        }
+        aligned.iter().all(|(binder, placed)| {
+            if self.tuple_bounds.contains_key(binder) {
+                return false;
+            }
+            let placed = placed.get_type(self);
+            self.generic_bound_traits(*binder)
+                .into_iter()
+                .all(|(trait_id, arguments)| {
+                    arguments.is_empty()
+                        && match &placed {
+                            Type::Generic(subject_binder) => {
+                                self.generic_bound_carries_trait(*subject_binder, trait_id)
+                            }
+                            concrete => self.type_implements_trait(concrete, trait_id),
+                        }
+                })
+        })
+    }
+
+    /// The binders `pattern` writes, each with the type id `target` holds at
+    /// the same position — the walk [`Self::impl_subject_matches`] matched.
+    /// False when a binder has no counterpart (an erased `List` target).
+    fn align_subject_binders(
+        &self,
+        pattern: TypeId,
+        target: TypeId,
+        aligned: &mut Vec<(TypeId, TypeId)>,
+    ) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match (pattern.get_type(self), target.get_type(self)) {
+            (Type::Generic(constraint_id), _) => {
+                aligned.push((constraint_id, target));
+                true
+            }
+            (Type::Struct(_, left), Type::Struct(_, right))
+            | (Type::Enum(_, left), Type::Enum(_, right))
+            | (Type::Trait(_, left), Type::Trait(_, right))
+            | (Type::Tuple(left, _), Type::Tuple(right, _)) => {
+                if left.len() != right.len() {
+                    let mut binders = Vec::new();
+                    self.collect_subject_binders(pattern, &mut binders);
+                    return binders.is_empty();
+                }
+                left.iter()
+                    .zip(&right)
+                    .all(|(left, right)| self.align_subject_binders(*left, *right, aligned))
+            }
+            (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
+                self.align_subject_binders(left_item, right_item, aligned)
+                    && self.align_subject_binders(left_length, right_length, aligned)
+            }
+            _ => true,
         }
     }
 
@@ -40375,16 +40680,6 @@ impl<'src> Analyzer<'src> {
         let Node::Call(subject, generic_arguments, arguments) = &node.0 else {
             unreachable!("only the `Node::Call` arm walks here")
         };
-        // E284: a generic list written SPACED after the callee (`a < b
-        // > (c)`) may be two comparisons the parser read as a generic
-        // call; remembered so a callee that turns out not callable
-        // names both readings.
-        if let Some(generics) = generic_arguments
-            && generics.1.start > subject.1.end
-        {
-            self.spaced_generic_calls
-                .insert(id, (subject.1, generics.1, arguments.1));
-        }
         let subject_id = self.walk_expr_node(subject, scope_id);
         // B204: bank the call's subject as the WALK saw it. The pair
         // is what `DivergenceLeaves` reads to find the `panic(…)`
@@ -45314,11 +45609,34 @@ impl<'src> Analyzer<'src> {
             if self.is_unknown_closure_parameter(id) {
                 return true;
             }
+            // B552: a binding not yet grounded is as unready as its
+            // initializer — `e` in `let d = k * 2; let e = d + 1;` waits on
+            // `k` through `d` (B185's rebinding hop, for any initializer).
+            if let Some(initializer) = self.ungrounded_binding_initializer(id) {
+                pending.push(initializer);
+                continue;
+            }
             children.clear();
             self.drop_scan_children(id, &mut children);
             pending.extend(children.iter().copied());
         }
         false
+    }
+
+    /// The initializer of the unannotated binding `expr_id` names (through a
+    /// `Local`), when that binding has not grounded yet.
+    fn ungrounded_binding_initializer(&self, expr_id: Id) -> Option<Id> {
+        let Some(Expr::Local(target_id)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return None;
+        };
+        let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(target_id) else {
+            return None;
+        };
+        let variable = self.variables.get(variable_id)?;
+        if variable.annotated || !matches!(variable.type_id.get_type(self), Type::Unknown) {
+            return None;
+        }
+        variable.initial
     }
 
     /// [`Self::is_unknown_closure_parameter`], answering WHICH parameter: the
@@ -46806,6 +47124,11 @@ impl<'src> Analyzer<'src> {
                     .as_ref()
                     .filter(|expected| matches!(expected, Type::Array(..)))
                     .cloned();
+                // B616's candidate direction (see the item arm below).
+                let determined_element = seeded_element
+                    .as_ref()
+                    .filter(|expected| self.type_is_fully_determined(expected))
+                    .cloned();
                 let mut element_type = match seeded_element {
                     Some(expected @ Type::Dyn(..)) => expected,
                     _ => Type::Unknown,
@@ -46831,6 +47154,20 @@ impl<'src> Analyzer<'src> {
                                 ) =>
                         {
                             array_literal_element.clone().unwrap_or(Type::Unknown)
+                        }
+                        // B616: and B592's direction one level deeper — an
+                        // element whose literal holds an array literal at a
+                        // position the expected element type makes a fixed
+                        // array (`[([1, 2], true)]` against `List<([i32; 2],
+                        // bool)>`, `[[[1, 2]]]` against `List<List<[i32;
+                        // 2]>>`, `[Some([1, 2])]`) takes the whole expected
+                        // element, as the annotated tuple does alone.
+                        (_, Type::Unknown)
+                            if determined_element.as_ref().is_some_and(|expected| {
+                                self.literal_elaborates_an_array(*item_id, expected)
+                            }) =>
+                        {
+                            determined_element.clone().unwrap_or(Type::Unknown)
                         }
                         _ => element_type.clone(),
                     };
@@ -54382,42 +54719,6 @@ impl<'src> Analyzer<'src> {
         )
     }
 
-    /// E284: a callee that is not callable, under a generic list written
-    /// SPACED from it (`a < b > (c)`), may be the two comparisons the author
-    /// meant: the message names the reading the parser took, the comparison
-    /// reading, and its parenthesized spelling — and that a comparison chain
-    /// needs `&&`, since `bool` has no order.
-    fn with_spaced_generic_reading(&self, call_id: Id, message: String) -> String {
-        let Some(&(callee, generics, arguments)) = self.spaced_generic_calls.get(&call_id) else {
-            return message;
-        };
-        let Some(text) = self
-            .source_of_id(call_id)
-            .and_then(|source| self.source_text(source))
-        else {
-            return message;
-        };
-        let (Some(callee), Some(generics), Some(arguments)) = (
-            text.get(callee.start..callee.end),
-            text.get(generics.start..generics.end),
-            text.get(arguments.start..arguments.end),
-        ) else {
-            return message;
-        };
-        let inner = generics
-            .strip_prefix('<')
-            .and_then(|rest| rest.strip_suffix('>'))
-            .unwrap_or(generics)
-            .trim();
-        format!(
-            "{message} — `{callee} < {inner} > {arguments}` is read as the generic call \
-             `{callee}<{inner}>{arguments}`; if you meant two comparisons, parenthesize: \
-             `({callee} < {inner}) > {arguments}` (a comparison answers `bool`, which has no \
-             order — a chain of comparisons is joined with `&&`: `{callee} < {inner} && {inner} > \
-             {arguments}`)"
-        )
-    }
-
     /// The "not callable" message for a call subject that isn't one.
     ///
     /// When the subject IS a function, the bare form ("it is `fn id<T>(T): T`")
@@ -55740,8 +56041,7 @@ impl<'src> Analyzer<'src> {
                     let non_function_message = {
                         let subject_type =
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
-                        let message = self.not_callable_message(&subject_type);
-                        self.with_spaced_generic_reading(call_id, message)
+                        self.not_callable_message(&subject_type)
                     };
                     self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         // The SUBJECT is what isn't callable (A1).
@@ -55773,7 +56073,6 @@ impl<'src> Analyzer<'src> {
             _ => {
                 let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                 let msg = self.not_callable_message(&subject_type);
-                let msg = self.with_spaced_generic_reading(call_id, msg);
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
@@ -57971,14 +58270,16 @@ impl<'src> Analyzer<'src> {
             closure @ Type::Closure(..) => closure,
             _ => Type::Unknown,
         };
+        let mut probe_has_hole = false;
         let first_ready = value_ids
             .first()
             .map(|&value_id| {
-                self.expr_id_to_expr_map.contains_key(&value_id)
-                    && !matches!(
-                        self.infer_type(value_id, &probe_direction, &HashMap::default()),
-                        Type::Unresolved
-                    )
+                if !self.expr_id_to_expr_map.contains_key(&value_id) {
+                    return false;
+                }
+                let probe = self.infer_type(value_id, &probe_direction, &HashMap::default());
+                probe_has_hole = self.type_value_has_hole(&probe);
+                !matches!(probe, Type::Unresolved)
             })
             .unwrap_or(true);
         if !first_ready {
@@ -57997,9 +58298,34 @@ impl<'src> Analyzer<'src> {
         // resolver does on the same condition. An ANNOTATED binding is not
         // waiting on anything: the annotation is its type.
         if matches!(initial_type_id.get_type(self), Type::Unknown)
+            && value_ids.first().is_some_and(|&value_id| {
+                self.is_unknown_closure_parameter(value_id)
+                    // B552: and a value BUILT from one (`let d = k * 2`),
+                    // until the fixpoint stalls — grounded early it is the
+                    // permanent `Unknown` B185 describes, and a block-bodied
+                    // closure's tail read it so: the call's `U` bound to
+                    // nothing (`d`) or to an argument-less `Maybe`.
+                    || (probe_has_hole
+                        && !self.fixpoint_stalled
+                        && self.value_awaits_a_closure_parameter(value_id))
+            })
+        {
+            return Resolution::Deferred;
+        }
+        // B604: and an ANNOTATED one (or a reassignment against a grounded
+        // binding) over a value that still holds such a parameter waits for
+        // the same fill before it CHECKS: against `Unknown` the annotation
+        // reconciles with anything, so `let probe: str = length` inside a
+        // `.filter(|length| ..)` over a `List<usize>` that typed later checked
+        // clean and nothing asked again — while the literal receiver, typed
+        // first, refused it. Until the fixpoint stalls (B372's door): a
+        // parameter nothing fills keeps today's reading.
+        if !matches!(initial_type_id.get_type(self), Type::Unknown)
+            && probe_has_hole
+            && !self.fixpoint_stalled
             && value_ids
                 .first()
-                .is_some_and(|&value_id| self.is_unknown_closure_parameter(value_id))
+                .is_some_and(|&value_id| self.value_awaits_a_closure_parameter(value_id))
         {
             return Resolution::Deferred;
         }
@@ -58107,6 +58433,15 @@ impl<'src> Analyzer<'src> {
             }
             let value_type = self.infer_type(value_id, &variable_type, &substitution_context);
             if matches!(value_type, Type::Unresolved) {
+                deferred_value_ids.push(value_id);
+                continue;
+            }
+            // B604: a reassignment over an unfilled closure parameter waits for
+            // the fill, as the first value does above.
+            if self.type_value_has_hole(&value_type)
+                && !self.fixpoint_stalled
+                && self.value_awaits_a_closure_parameter(value_id)
+            {
                 deferred_value_ids.push(value_id);
                 continue;
             }
@@ -58282,6 +58617,53 @@ impl<'src> Analyzer<'src> {
 
     /// Whether `expr_id` is a tuple literal holding an unsuffixed numeric
     /// literal at any depth (`(0, 3)`, `((1, 2), "x")`) — B447's literal tuple.
+    /// B616: whether the literal `expr_id` holds an array literal at a
+    /// position `expected` makes a fixed array — the one expectation that
+    /// changes what a literal IS (B592) — through list and tuple literals and
+    /// a variant constructor's payload arguments.
+    fn literal_elaborates_an_array(&self, expr_id: Id, expected: &Type) -> bool {
+        let list_id = self.primitive_struct_ids.get("List").copied();
+        match (self.expr_id_to_expr_map.get(&expr_id), expected) {
+            (Some(Expr::List(_)), Type::Array(..)) => true,
+            (Some(Expr::List(item_ids)), Type::Struct(id, arguments))
+                if Some(*id) == list_id && arguments.len() == 1 =>
+            {
+                let element = arguments[0].get_type(self);
+                item_ids
+                    .iter()
+                    .any(|item_id| self.literal_elaborates_an_array(*item_id, &element))
+            }
+            (Some(Expr::Tuple(item_ids)), Type::Tuple(element_ids, _))
+                if item_ids.len() == element_ids.len() =>
+            {
+                item_ids
+                    .iter()
+                    .zip(element_ids)
+                    .any(|(item_id, element_id)| {
+                        self.literal_elaborates_an_array(*item_id, &element_id.get_type(self))
+                    })
+            }
+            (Some(Expr::Call(call_id)), Type::Enum(enum_id, arguments)) => {
+                let Some(call) = self.function_calls.get(call_id) else {
+                    return false;
+                };
+                let mut subject = call.subject_id;
+                while let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&subject) {
+                    subject = *target;
+                }
+                matches!(
+                    self.expr_id_to_expr_map.get(&subject),
+                    Some(Expr::EnumVariant(variant_enum, _)) if variant_enum == enum_id
+                ) && call.argument_ids.iter().any(|argument_id| {
+                    arguments.iter().any(|argument| {
+                        self.literal_elaborates_an_array(*argument_id, &argument.get_type(self))
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
     fn tuple_literal_holds_unsuffixed_numeric(&self, expr_id: Id) -> bool {
         match self.expr_id_to_expr_map.get(&expr_id) {
             Some(Expr::Tuple(element_ids)) => element_ids.iter().any(|element_id| {
@@ -61184,6 +61566,129 @@ impl<'src> Analyzer<'src> {
         kept.iter()
             .any(|candidate| candidate.home_trait.is_some())
             .then_some(kept)
+    }
+
+    /// B608: of `homes` — the traits providing a member a `Type::member` path
+    /// names — the ones the calling file reaches (B598's rule for a method
+    /// call, B515's reach): the trait is declared in a file the caller
+    /// reaches, or a candidate of it is provided from one. `homes` unchanged
+    /// when the call is not in a user file, or when it reaches none of them
+    /// (the refusal then names every provider, as before).
+    fn traits_reached_at(
+        &mut self,
+        call_id: Id,
+        method_candidates: &[ImplMemberCandidate],
+        homes: Vec<Id>,
+    ) -> Vec<Id> {
+        let Some(source) = self.source_of_id(call_id) else {
+            return homes;
+        };
+        if source == DERIVED_SOURCE
+            || self.std_sources.contains(&source)
+            || self.frozen_sources.contains(&source)
+            || self.dependency_sources.contains(&source)
+            || self.derived_origin_file(call_id).is_some()
+        {
+            return homes;
+        }
+        let Some(entry_scope_id) = self.entry_scope_id else {
+            return homes;
+        };
+        let Some(files) = self
+            .trait_reach_by_file(entry_scope_id, Some(source))
+            .remove(&source)
+        else {
+            return homes;
+        };
+        let mut kept: Vec<Id> = Vec::new();
+        for home in &homes {
+            let declared_reached = self
+                .traits
+                .get(home)
+                .and_then(|trait_| self.source_of_id(trait_.id))
+                .is_some_and(|declaring| files.contains(&declaring));
+            let mut reached = declared_reached;
+            for candidate in method_candidates {
+                if reached || candidate.home_trait != Some(*home) {
+                    continue;
+                }
+                reached = self
+                    .impl_member_providing_files(candidate.member_id)
+                    .is_some_and(|(_, providing)| {
+                        providing.iter().any(|file| files.contains(file))
+                    });
+            }
+            if reached {
+                kept.push(*home);
+            }
+        }
+        match kept.is_empty() {
+            true => homes,
+            false => kept,
+        }
+    }
+
+    /// E295: the tail of a static path's not-found refusal when a BLANKET
+    /// (`impl type T: Leaf with Tag`) declares the member and its binder's
+    /// bound does not admit the head the path names: "; `tag` is provided by
+    /// `impl type T: Leaf with Tag`, and `i32` does not implement `Leaf`".
+    /// `None` when no such blanket declares it (B595 resolves a head the
+    /// bound admits; this only explains one it does not).
+    fn blanket_static_bound_note(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<String> {
+        let subject_label = self.pretty_print_type(subject_type, &HashMap::default());
+        let blankets: Vec<(TypeId, Vec<Id>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| implementation.declarations.contains_key(member_name))
+            .filter_map(
+                |implementation| match implementation.subject.get_type(self) {
+                    Type::Generic(binder) => Some((binder, implementation.trait_ids.clone())),
+                    _ => None,
+                },
+            )
+            .collect();
+        for (binder, trait_ids) in blankets {
+            let bounds = self.generic_bound_traits(binder);
+            let mut written: Vec<String> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            for (trait_id, arguments) in &bounds {
+                let Some(label) = self.bound_trait_label(*trait_id, arguments) else {
+                    continue;
+                };
+                if !self.type_implements_trait(subject_type, *trait_id) {
+                    missing.push(format!("`{label}`"));
+                }
+                written.push(label);
+            }
+            if missing.is_empty() {
+                continue;
+            }
+            let binder_name = self
+                .generic_constraint_names
+                .get(&binder)
+                .copied()
+                .unwrap_or("T");
+            let implemented: Vec<String> = trait_ids
+                .iter()
+                .filter_map(|trait_id| {
+                    self.traits
+                        .get(trait_id)
+                        .map(|trait_| trait_.name.to_string())
+                })
+                .collect();
+            return Some(format!(
+                "; `{member_name}` is provided by `impl type {binder_name}: {} with {}`, and \
+                 `{subject_label}` does not implement {}",
+                written.join(" + "),
+                implemented.join(" + "),
+                join_with(&missing, "and"),
+            ));
+        }
+        None
     }
 
     fn check_trait_method_scope(&mut self, global_scope_id: Id) {
@@ -67134,6 +67639,11 @@ impl<'src> Analyzer<'src> {
                                     homes.push(*trait_id);
                                 }
                             }
+                            // B608: B598's narrowing, on the static path — the
+                            // steer names the traits the calling file reaches
+                            // (an unreached one is no candidate there), and
+                            // all of them when it reaches none.
+                            let homes = self.traits_reached_at(id, &method_candidates, homes);
                             let providers: Vec<String> = homes
                                 .iter()
                                 .map(|trait_id| {
@@ -67202,6 +67712,14 @@ impl<'src> Analyzer<'src> {
                                      '{member_name}' in the impl for '{subject_str}' to \
                                      override it"
                                 ))
+                            })
+                            .or_else(|| {
+                                // E295: a BLANKET provides it, and its bound
+                                // does not admit this head — say which.
+                                if subject_is_trait {
+                                    return None;
+                                }
+                                self.blanket_static_bound_note(&subject_type, member_name)
                             })
                             .unwrap_or_default();
                             self.push_anchored(
@@ -67718,7 +68236,7 @@ impl<'src> Analyzer<'src> {
                             &check_subject_type,
                             &candidate_subject,
                             &HashMap::default(),
-                        )
+                        ) || self.impl_subject_covers(*subject_id, check.subject_type_id)
                     }
                 });
                 if provided_elsewhere {
@@ -67943,6 +68461,9 @@ impl<'src> Analyzer<'src> {
         let mut fruitless_backstops = 0u32;
         self.fixpoint_stalled = false;
         self.literal_lets_wait = true;
+        // M133: the bound answers memoize for this fixpoint — the impls are
+        // walked and their subjects resolved by now.
+        self.open_impl_bounds_memo();
 
         for _ in 0..max_iterations {
             let mut progress = self.resolve_constraints();
@@ -68054,6 +68575,7 @@ impl<'src> Analyzer<'src> {
         }
         self.fixpoint_stalled = false;
         self.literal_lets_wait = false;
+        self.close_impl_bounds_memo();
         self.recheck_lenient_subscript_indexes();
         if split_on {
             split.push(("fixpoint", split_mark.elapsed()));
@@ -69655,6 +70177,77 @@ impl<'src> Analyzer<'src> {
                                      operands are `{lhs_label}` and `{rhs_label}`: there are no \
                                      implicit conversions; suffix the literal or convert with \
                                      `as_*`"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
+                    // B607 (R-e, v0.49.0): the bitwise operators. `&`, `|`
+                    // and `^` over two DIFFERENT integer types are B579's
+                    // pair under three more operators — `i32 & usize`
+                    // checked, JS computed it in int32 and the native build
+                    // refused the pair. The shifts stay legal across integer
+                    // types, as in Rust: the right operand is a COUNT, not a
+                    // peer of the left (`a << b.len()` is the usual case).
+                    let integer = |analyzer: &Self, operand: &Type| {
+                        numeric(analyzer, operand) && !float(analyzer, operand)
+                    };
+                    if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor)
+                        && lhs_type != rhs_type
+                        && integer(self, &lhs_type)
+                        && integer(self, &rhs_type)
+                        && !self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
+                    {
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` computes on two values of the same type, but the \
+                                     operands are `{lhs_label}` and `{rhs_label}`: there are no \
+                                     implicit conversions; suffix the literal or convert with \
+                                     `as_*`"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
+                    // And any bitwise operator — shifts included — over a
+                    // FLOAT, on either side: a float has no bits to compute
+                    // on in the language (JS truncated `6.5 & 3.0` to int32
+                    // and printed `2`; rustc has no `BitAnd` for `f64`).
+                    let bitwise = matches!(
+                        op,
+                        BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::Shl
+                            | BinaryOp::Shr
+                            | BinaryOp::UShr
+                    );
+                    let float_operand = if float(self, &lhs_type) {
+                        Some(&lhs_type)
+                    } else if grounded(&rhs_type) && float(self, &rhs_type) {
+                        Some(&rhs_type)
+                    } else {
+                        None
+                    };
+                    if let (true, Some(float_type)) = (bitwise, float_operand) {
+                        let float_label = self.pretty_print_type(float_type, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` computes on the bits of an integer, but an \
+                                     operand is `{float_label}`, a float: there are no implicit \
+                                     conversions; convert with `as_*` (`value.as_i32()`)"
                                 ),
                             },
                             binary_id,

@@ -2203,7 +2203,8 @@ macro fun store_step(type_: TypeExpr): str {
 	}
 }
 
-/// The `<type A, type B>` an inherent impl on `Store<Subject<A, B>>` binds, bare.
+/// The `<type A, type B>` an inherent impl on `Store<Subject<A, B>>` binds, bare (a
+/// length parameter as `const N`, B611).
 macro fun store_bare_binders(generics: List<GenericParameter>): str {
 	import macro_std::build::join;
 
@@ -2212,7 +2213,11 @@ macro fun store_bare_binders(generics: List<GenericParameter>): str {
 	}
 	mut parts: List<str> = [];
 	for parameter in generics {
-		parts.push(i"type {parameter.name}");
+		if parameter.is_const {
+			parts.push(i"const {parameter.name}");
+		} else {
+			parts.push(i"type {parameter.name}");
+		}
 	}
 	"<" + join(parts, ", ") + ">"
 }

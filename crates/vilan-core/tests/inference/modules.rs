@@ -7716,6 +7716,67 @@ fn b598_a_file_reaching_both_traits_keeps_the_ambiguity() {
     );
 }
 
+// --- B608: the static twin — a `Type::member` steer names reached traits ---
+
+/// B608: `List::describe([1, 2])` in a file importing only `pkg::describe::
+/// Describe` was refused naming std's `Wire` too ("'Wire' and 'Describe'
+/// provide it; call 'Wire::describe(..)' or 'Describe::describe(..)'"), a
+/// trait the file does not reach. A trait method is no inherent static either
+/// way; the steer names only the reached trait (B598's rule).
+#[test]
+fn b608_a_static_paths_steer_names_only_the_traits_the_file_reaches() {
+    let main =
+        "import pkg::describe::Describe;\n\nfun main() {\n\tlet _d = List::describe([1, 2]);\n}\n";
+    let outcome = analyze_package(
+        &[("describe.vl", B598_DESCRIBE), ("main.vl", main)],
+        "main.vl",
+    );
+    let messages: Vec<&str> = outcome
+        .diagnostics
+        .iter()
+        .map(|(message, ..)| message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "'describe' is not an inherent member of 'List': 'Describe' provides it; call \
+             'Describe::describe(..)' instead"
+        ],
+    );
+}
+
+/// B608's boundary: a file reaching both traits keeps both in the steer; a
+/// file importing neither reaches std's `Wire` (as its method call would
+/// resolve to it, B598) and not the package's `Describe`.
+#[test]
+fn b608_a_file_reaching_both_names_both_and_one_importing_neither_names_wire() {
+    for (imports, expected) in [
+        (
+            "import std::wire::Wire;\nimport pkg::describe::Describe;\n",
+            "'describe' is not an inherent member of 'List': 'Wire' and 'Describe' provide it",
+        ),
+        (
+            "",
+            "'describe' is not an inherent member of 'List': 'Wire' provides it; call \
+             'Wire::describe(..)' instead",
+        ),
+    ] {
+        let main = format!("{imports}\nfun main() {{\n\tlet _d = List::describe([1, 2]);\n}}\n");
+        let outcome = analyze_package(
+            &[("describe.vl", B598_DESCRIBE), ("main.vl", &main)],
+            "main.vl",
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|(message, ..)| message.starts_with(expected)),
+            "{imports:?}: {:?}",
+            outcome.diagnostics
+        );
+    }
+}
+
 // --- B554: a module binding's cross-file element conflict blames the declaration
 
 /// B554: two modules push `1` and `"two"` into one `export mut bag = []`, and
