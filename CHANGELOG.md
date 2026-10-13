@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**E309: a spaced generic call gets one steer naming the spacing.** Since E291 a `<` spaced from the name before it is a comparison, so `pick <f64>(1, 2)` reads as `(pick < f64) > (1, 2)` and was refused three times — "`<` models `PartialOrd`, and `fn pick<T>(T, T): T` does not implement it", "`bool` has no ordering", "`f64` is a type, not a value" — none of them saying the spacing was the reason. When the name on the left is a generic function or a generic type (`List <i32>(3)`, a generic struct), the three are replaced by one at `pick <f64>`: "`pick <f64>`: a generic list touches its name — `pick<f64>(1, 2)`; spaced, the `<` after a name is a comparison". Two values compared twice (`a < b > (c)`) and a non-generic function keep the comparison's refusals.
+
+---
+
 <!-- family: fix -->
 **B620: an element head admits only the methods that hand the element back.** A chain link written inside an opening tag splices into the element's view chain at its position, so a method returning anything but the element made the whole head that value: `<div .len() />` silently WAS the length, and with children the close of the head failed with `usize has no method 'child'` at a zero-width span. Such a link is now refused at its name — "`len` is a method of `View` (from `Measure`), but an element head takes only methods that hand the element back (`View`); call it on the element instead: `<div />.len()`" — and nothing cascades from it. The rule is about the HEAD alone: `<div />.len()`, the same call on the finished element, is an ordinary postfix call and takes any method; a name no method answers keeps the member error; an admitted link (std's attribute methods, a method returning `View`, a trait default's `Self`) lowers exactly as before. The spec's element paragraph states the rule (§3.6). Estate: 0 (kolt, the website's `src`, the eleven examples, every corpus program).
 

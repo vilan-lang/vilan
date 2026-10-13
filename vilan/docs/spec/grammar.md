@@ -762,7 +762,12 @@ callee, a member call, a `::` path head, a struct literal's head — a `<`
 opens a generic list only when it touches the name, so `a < b > (c)` is two
 comparisons and `f<T>(x)` a generic call; a spaced list no comparison could
 be, one whose `>` is followed by `::` or `{` (`List <i32>::new()`), is
-refused with the tight spelling and read tight. In a type annotation a
+refused with the tight spelling and read tight. A spaced CALL keeps the
+comparison reading — `pick <f64>(1, 2)` is `(pick < f64) > (1, 2)` — but
+when its name is a generic function or a generic type that reading cannot
+be what was meant, and the checker refuses it once, naming the spacing and
+the tight call (`pick<f64>(1, 2)`), in place of the comparisons' own
+refusals (E309). In a type annotation a
 spaced generic list parses as before (and the formatter tightens it). A closure type after
 `as` is read greedily, as everywhere — `f as |i32| i32` — and `vilan fmt`
 prints it parenthesized, `f as (|i32| i32)`.
