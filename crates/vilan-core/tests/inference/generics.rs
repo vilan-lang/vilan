@@ -10032,10 +10032,19 @@ fn b552_a_block_closures_local_built_from_its_parameter_types_the_callers_generi
         );
         assert_fails_once_with(&source, &format!("Expected bool, but got {got} instead."));
     }
+    let program = r#"
+        fun main() {
+            let block = apply(2, |k| {
+                let d = k * 2;
+                Maybe::Just(d)
+            });
+            if block is Maybe::Just(let v) {
+                print(v + 1);
+            }
+        }
+    "#;
     assert_compiles_and_runs(
-        &format!(
-            "import std::io::print;\n{prelude}\nfun main() {{\n    let block = apply(2, |k| {{\n        let d = k * 2;\n        Maybe::Just(d)\n    }});\n    if block is Maybe::Just(let v) {{\n        print(v + 1);\n    }}\n}}\n"
-        ),
+        &format!("import std::io::print;\n{prelude}\n{program}"),
         "5\n",
     );
 }
