@@ -10650,6 +10650,20 @@ impl<'src> Analyzer<'src> {
         {
             return false;
         }
+        // The same rule for B340's call operator: `compare_type` admits a
+        // closure against a `Callable` value whose `call` has its shape,
+        // because that is the coercion (`scale` lands in a `|f64| Length`
+        // slot). Asked of an IMPL SUBJECT it is the wrong question again:
+        // `impl Scale with Callable` is an impl of `Scale`, and answering yes
+        // put a closure receiver in reach of `Scale`'s members — `f.call(5f)`
+        // on a closure `f` compiled to `Scale`'s `call` with the closure as
+        // `self` (NaN at run time), and std's own "is `|T| R` callable?" was
+        // answered by any package's callable struct (kolt's `Scale`, M145).
+        if matches!(subject_type, Type::Closure(..) | Type::Function(_))
+            && matches!(impl_subject, Type::Struct(..) | Type::Enum(..))
+        {
+            return false;
+        }
         // B557: a binder subject's TUPLE bound filters admission as its trait
         // bounds rank it — `impl type T: (2..: Show) with Show` is a blanket
         // over tuples, not over every type. `compare_type` admits anything
