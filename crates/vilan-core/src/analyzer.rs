@@ -39261,17 +39261,6 @@ impl<'src> Analyzer<'src> {
             self.css_scope_depth -= 1;
             return inner_id;
         }
-        // B620: an element head's chain link forwards the same way, and the
-        // mark — the element's tag and the link as written — is what the
-        // method call's resolution reads to admit only the methods that hand
-        // the element back.
-        if let Node::ElementHeadLink(tag, link) = &node.0 {
-            let link_id = self.walk_expr_node(link, scope_id);
-            if let Node::MemberAccessor(_, member) = &link.0 {
-                self.element_head_links.insert(link_id, (*tag, member.1));
-            }
-            return link_id;
-        }
         // A recorded lift-region paren group forwards like `const` does: the
         // region rewrite normally dissolves it, so one reaching the walk sits
         // in a position the rewrite does not descend into — its inner marks
@@ -39308,9 +39297,9 @@ impl<'src> Analyzer<'src> {
             Node::CssScope(..) => {
                 unreachable!("a css block's scope mark forwards to its inner expression")
             }
-            Node::ElementHeadLink(..) => {
-                unreachable!("an element head's link mark forwards to the link it wraps")
-            }
+            // B620's head-link mark is only ever a member, unwrapped by the
+            // member walk; one in expression position is a pass bug.
+            Node::ElementHeadLink(..) => Some(Expr::Error),
             // Likewise: `..e` forwards to its operand and marks it, so a
             // `Spread` node never reaches the entity match.
             Node::Spread(..) => unreachable!("`..` forwards to its operand expression"),
@@ -39701,6 +39690,16 @@ impl<'src> Analyzer<'src> {
         let Node::MemberAccessor(subject, member) = &node.0 else {
             unreachable!("only the `Node::MemberAccessor` arm walks here")
         };
+        // B620: a link an element head wrote is marked on its member; the
+        // mark is recorded against the call (`resolve_method_call` admits
+        // only the methods that hand the element back) and the link walks as
+        // the one written after the element would.
+        let (member, head_tag) = crate::node::unmark_head_link(member);
+        if let Some(tag) = head_tag
+            && matches!(member.0, Node::Call(..))
+        {
+            self.element_head_links.insert(id, (tag, member.1));
+        }
         let subject_id = self.walk_expr_node(subject, scope_id);
         match &member.0 {
             Node::Accessor(name) => {
@@ -40760,13 +40759,8 @@ impl<'src> Analyzer<'src> {
                 type_id
             }
         };
-        // B620's head-link mark forwards to the link it wraps.
-        let value = match &value.0 {
-            Node::ElementHeadLink(_, link) => link,
-            _ => value,
-        };
         let stage = match &value.0 {
-            Node::MemberAccessor(_, member) => match &member.0 {
+            Node::MemberAccessor(_, member) => match &crate::node::unmark_head_link(member).0.0 {
                 Node::Call(callee, _, _) => match &callee.0 {
                     Node::Accessor(name) => Some((*name, member.1)),
                     _ => None,

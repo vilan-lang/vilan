@@ -139,10 +139,8 @@ fn build_chain<'src>(
             // the head's (B620): the analyzer admits there only the methods
             // that hand the element back.
             ElementHeadItem::Chain(link) => {
-                let linked = attach(chain, link);
-                let link_span = linked.1;
-                chain = (Node::ElementHeadLink(tag_text, Box::new(linked)), link_span);
-                continue;
+                let link_span = link.1;
+                (Node::ElementHeadLink(tag_text, Box::new(link)), link_span)
             }
             ElementHeadItem::Event((event, event_span), handler) => {
                 let handler = *handler;
@@ -207,13 +205,6 @@ fn build_chain<'src>(
             child_span,
         );
         chain = attach(chain, member);
-    }
-    // The outermost node takes the element's whole span. A head link forwards
-    // to the link it marks, so the link takes it too: the entity the analyzer
-    // records for the element is that link, and a diagnostic about the element
-    // underlines all of it either way.
-    if let Node::ElementHeadLink(_, link) = &mut chain.0 {
-        link.1 = span;
     }
     (chain.0, span)
 }

@@ -1013,13 +1013,16 @@ pub enum Node<'src> {
     // expression a block can hold sits under this node and the generated
     // scaffolding around them binds no names of its own.
     CssScope(Box<Spanned<Self>>),
-    // B620: one chain link an element HEAD wrote (`<div .f() />`), wrapping
-    // the `MemberAccessor` the desugar built for it, with the element's tag.
-    // It FORWARDS like `CssScope` does — the link is the entity, no wrapper,
-    // so the lowering is the chain's — and exists only to tell the analyzer
-    // which method calls were written inside an opening tag: a head admits
-    // only the methods that hand the element back, where the same call on the
-    // finished element (`<div />.f()`, an ordinary postfix call) takes any.
+    // B620: the MEMBER of one chain link an element HEAD wrote (`<div .f() />`
+    // is `MemberAccessor(view("div"), ElementHeadLink("div", f()))`), with the
+    // element's tag. Only ever a member: the analyzer's member walk unwraps it
+    // — the link is the entity, so the lowering is the chain's — and it exists
+    // only to tell the analyzer which method calls were written inside an
+    // opening tag: a head admits only the methods that hand the element back,
+    // where the same call on the finished element (`<div />.f()`, an ordinary
+    // postfix call) takes any. A mark on the member rather than a wrapper
+    // around the link, so a head costs the walk no frame a written chain does
+    // not (the expression-depth bound counts both alike).
     ElementHeadLink(&'src str, Box<Spanned<Self>>),
     String(&'src str),
     // A triple-quoted string's raw inner text; trimmed to its content by
@@ -1091,6 +1094,19 @@ pub enum Node<'src> {
     // (a module or an enum) into the current scope.
     Use(ImportBranch<'src>),
     Void,
+}
+
+/// B620: a chain link's member with an element head's mark taken off — the
+/// `Call`/`Accessor` the link wrote — and the element's tag when it carried
+/// one. Every reader of a link's member shape goes through this, so a link
+/// written in a head reads as the same link written after the element.
+pub fn unmark_head_link<'a, 'src>(
+    member: &'a Spanned<Node<'src>>,
+) -> (&'a Spanned<Node<'src>>, Option<&'src str>) {
+    match &member.0 {
+        Node::ElementHeadLink(tag, link) => (link, Some(*tag)),
+        _ => (member, None),
+    }
 }
 
 impl<'src> Node<'src> {

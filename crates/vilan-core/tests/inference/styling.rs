@@ -8399,3 +8399,23 @@ fn b620_an_admitted_head_link_lowers_exactly_as_the_written_chain() {
     .expect("the chain compiles");
     assert_eq!(element, chain);
 }
+
+/// The head's mark rides the link's MEMBER, not a wrapper around the link, so
+/// a head nests no deeper than the chain it lowers to: 450 links check clean
+/// either way (a wrapper per link doubled the walk's depth and refused a head
+/// at half the chain's bound, 250 links).
+#[test]
+fn b620_a_long_head_nests_no_deeper_than_its_chain() {
+    let links = 450;
+    let item = ".attr(\"data-x\", \"v\")";
+    let head = vec![item; links].join(" ");
+    let chain = item.repeat(links);
+    let program = |element: &str| {
+        format!(
+            "import std::io::print;\nimport std::web::ui::{{ View, render, view }};\n\n\
+             fun main() {{\n\tprint(render({element}));\n}}\n"
+        )
+    };
+    assert_compiles(&program(&format!("view(\"div\"){chain}")));
+    assert_compiles(&program(&format!("<div {head} />")));
+}

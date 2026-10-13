@@ -98,8 +98,6 @@ fn count_direct_splits(node: &Node) -> usize {
         | Node::Await(inner)
         | Node::Ascribe(inner, _) => count_direct_splits(&inner.0),
         Node::MemberAccessor(subject, _) => count_direct_splits(&subject.0),
-        // B620's head-link mark is transparent: the link it wraps is the chain.
-        Node::ElementHeadLink(_, link) => count_direct_splits(&link.0),
         // A call's or subscript's SUBJECT is flat; the arguments / the index
         // are slots.
         Node::Call(subject, _, _) | Node::Index(subject, _) => count_direct_splits(&subject.0),
@@ -176,10 +174,6 @@ fn linearize<'src>(
         Node::MemberAccessor(subject, member) => {
             let subject = flat_operand(*subject, steps, remaining);
             (Node::MemberAccessor(Box::new(subject), member), span)
-        }
-        Node::ElementHeadLink(tag, link) => {
-            let link = linearize(*link, steps, remaining);
-            (Node::ElementHeadLink(tag, Box::new(link)), span)
         }
         Node::Call(subject, generics, mut arguments) => {
             let subject = flat_operand(*subject, steps, remaining);
@@ -308,7 +302,6 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
         }
         Node::Index(subject, index) => Node::Index(seal_boxed(subject), seal_boxed(index)),
         Node::MemberAccessor(subject, member) => Node::MemberAccessor(seal_boxed(subject), member),
-        Node::ElementHeadLink(tag, link) => Node::ElementHeadLink(tag, seal_boxed(link)),
         Node::List(mut items) => {
             seal_list(&mut items);
             Node::List(items)
