@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**B608: a `Type::member` path that names a trait method steers to the traits the calling file reaches — `List::describe([1, 2])` in a file importing only `pkg::describe::Describe` read "'Wire' and 'Describe' provide it; call 'Wire::describe(..)' or 'Describe::describe(..)'", naming std's `Wire`, which the file does not reach.** B598 narrowed a METHOD call's trait candidates by the calling file's reach (B515's rule); the static path's refusal now applies the same narrowing to the traits it names (`traits_reached_at`) — a trait reached through its declaring file or through the file providing a candidate. A file reaching every provider, or none of them, keeps every name. Pins: `modules::b608_a_static_paths_steer_names_only_the_traits_the_file_reaches`, `modules::b608_a_file_reaching_both_names_both_and_one_importing_neither_names_wire`. Tracker B608.
+
+---
+
 <!-- family: fix -->
 **B552: a block-bodied closure handed to a generic callee types the callee's generic through its locals — `apply(2, |k| { let d = k * 2; Maybe::Just(d) })` with `apply<T, U>(value: T, f: |T| U): U` recorded `U` as `Maybe` with NO arguments (natively the instance met an unbound `T` of `Maybe` and was refused), and `|k| { let d = k * 2; d }` recorded no `U` at all, so a `let probe: bool` over the result checked clean.** The local `d` grounded before the call filled `k` — to the permanent `Unknown` B185 describes for a direct mention of the parameter, which a binding BUILT from one (`k * 2`, a chain `let e = d + 1`) did not get. Such a binding now waits for the fill too (until the fixpoint stalls), and the call reads the block's tail through it. The JS backend needed no change (the corpus is byte-identical); the native build of the filed repro runs. Pin: `generics::b552_a_block_closures_local_built_from_its_parameter_types_the_callers_generic`. Tracker B552.
 

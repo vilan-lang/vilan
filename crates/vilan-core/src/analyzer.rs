@@ -61546,6 +61546,66 @@ impl<'src> Analyzer<'src> {
             .then_some(kept)
     }
 
+    /// B608: of `homes` — the traits providing a member a `Type::member` path
+    /// names — the ones the calling file reaches (B598's rule for a method
+    /// call, B515's reach): the trait is declared in a file the caller
+    /// reaches, or a candidate of it is provided from one. `homes` unchanged
+    /// when the call is not in a user file, or when it reaches none of them
+    /// (the refusal then names every provider, as before).
+    fn traits_reached_at(
+        &mut self,
+        call_id: Id,
+        method_candidates: &[ImplMemberCandidate],
+        homes: Vec<Id>,
+    ) -> Vec<Id> {
+        let Some(source) = self.source_of_id(call_id) else {
+            return homes;
+        };
+        if source == DERIVED_SOURCE
+            || self.std_sources.contains(&source)
+            || self.frozen_sources.contains(&source)
+            || self.dependency_sources.contains(&source)
+            || self.derived_origin_file(call_id).is_some()
+        {
+            return homes;
+        }
+        let Some(entry_scope_id) = self.entry_scope_id else {
+            return homes;
+        };
+        let Some(files) = self
+            .trait_reach_by_file(entry_scope_id, Some(source))
+            .remove(&source)
+        else {
+            return homes;
+        };
+        let mut kept: Vec<Id> = Vec::new();
+        for home in &homes {
+            let declared_reached = self
+                .traits
+                .get(home)
+                .and_then(|trait_| self.source_of_id(trait_.id))
+                .is_some_and(|declaring| files.contains(&declaring));
+            let mut reached = declared_reached;
+            for candidate in method_candidates {
+                if reached || candidate.home_trait != Some(*home) {
+                    continue;
+                }
+                reached = self
+                    .impl_member_providing_files(candidate.member_id)
+                    .is_some_and(|(_, providing)| {
+                        providing.iter().any(|file| files.contains(file))
+                    });
+            }
+            if reached {
+                kept.push(*home);
+            }
+        }
+        match kept.is_empty() {
+            true => homes,
+            false => kept,
+        }
+    }
+
     fn check_trait_method_scope(&mut self, global_scope_id: Id) {
         let reached = self.trait_reach_by_file(global_scope_id, None);
         if reached.is_empty() {
@@ -67494,6 +67554,11 @@ impl<'src> Analyzer<'src> {
                                     homes.push(*trait_id);
                                 }
                             }
+                            // B608: B598's narrowing, on the static path — the
+                            // steer names the traits the calling file reaches
+                            // (an unreached one is no candidate there), and
+                            // all of them when it reaches none.
+                            let homes = self.traits_reached_at(id, &method_candidates, homes);
                             let providers: Vec<String> = homes
                                 .iter()
                                 .map(|trait_id| {
