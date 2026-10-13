@@ -349,6 +349,18 @@ impl<'src> Analyzer<'src> {
             if !split {
                 continue;
             }
+            // E303 (RULED): an element is not a chain the reader wrote. Its
+            // opening tag's items and its children are links the desugar
+            // built off `<tag` (`elements.rs`), each handing the element back,
+            // so neither they nor the tag itself hint — they doubled up at
+            // an element's last line, where the parent's `.child(..)` link and
+            // the element's own last link both end. A chain written AFTER the
+            // finished element (`<div />` then `.f()`) is the reader's and
+            // hints; so does a chain inside an attribute value, which has a
+            // head of its own.
+            if self.element_link(text, stage, head_id) {
+                continue;
+            }
             // The head, when the first link of the chain breaks onto a new
             // line after it.
             if stage.subject_id == head_id
@@ -423,6 +435,33 @@ impl<'src> Analyzer<'src> {
         hints.extend(self.restored_tables.stage_hints.iter().cloned());
         hints.sort_by_key(|hint| (hint.span.start, hint.span.end));
         hints
+    }
+}
+
+impl Analyzer<'_> {
+    /// E303: whether `stage` is a link of an ELEMENT's lowering rather than
+    /// one the reader wrote — its chain's head is an element (the `<tag`
+    /// the desugar's `view(..)` call spans), and it is not a link written
+    /// with a `.` after the finished element (whose subject, the element,
+    /// ends at its `>`). A link inside the opening tag has a subject ending
+    /// at the previous item, never at a `>`; a child's link is written with
+    /// no `.`.
+    fn element_link(&self, text: &str, stage: &ChainStage, head_id: Id) -> bool {
+        let element = self
+            .span_map
+            .get(&head_id)
+            .and_then(|span| text.as_bytes().get(span.start))
+            == Some(&b'<');
+        if !element {
+            return false;
+        }
+        let after_the_element = text
+            .get(..stage.subject_end)
+            .is_some_and(|before| before.trim_end().ends_with('>'))
+            && text
+                .get(..stage.member_start)
+                .is_some_and(|before| before.trim_end().ends_with('.'));
+        !after_the_element
     }
 }
 

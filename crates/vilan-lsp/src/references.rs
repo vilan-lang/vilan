@@ -3002,12 +3002,12 @@ fun main(): i32 {
             (
                 "the value alias at a call",
                 b264_at("\thi();", 1),
-                "```vilan\n(alias) fun hi(): i32\n```",
+                "```vilan\nmod pkg::helper\n(alias) fun hi(): i32\n```",
             ),
             (
                 "the value alias's own `as` name",
                 b264_at("as hi", 3),
-                "```vilan\n(alias) fun hi(): i32\n```",
+                "```vilan\nmod pkg::helper\n(alias) fun hi(): i32\n```",
             ),
         ] {
             assert_eq!(document.hover(offset).as_deref(), Some(expected), "{label}",);

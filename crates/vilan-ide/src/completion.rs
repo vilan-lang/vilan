@@ -109,6 +109,12 @@ pub struct Completion {
     /// characters or more, and the server sorts what survives last and shows
     /// this reason as the candidate's `detail`.
     pub internal: Option<String>,
+    /// B620 (editor half): why this candidate is admitted only to a typed
+    /// prefix — E213's three-character rule, applied for a reason that is not
+    /// a label: a method of an element's type that does not hand the element
+    /// back, offered inside an opening tag. The server shows the reason as the
+    /// candidate's `detail` and sorts it last, as for an internal name.
+    pub admission: Option<String>,
     /// The import this candidate needs before it resolves (E54c) — `None` for
     /// a candidate already reachable without one (every candidate except the
     /// ones [`Analysis::auto_import_completions`] adds). The server
@@ -148,6 +154,7 @@ impl Completion {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: None,
         }
     }
@@ -171,6 +178,7 @@ impl Completion {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: None,
         }
     }
@@ -1717,7 +1725,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 return stamp_replacements(self.macro_name_completions(), replaced);
             }
             CursorContext::ElementHead { chain, tag } => {
-                return stamp_replacements(self.element_head_completions(chain, tag), replaced);
+                // B620: E213's rule, the same function, for a head method
+                // that does not hand the element back.
+                let typed = text.get(start..offset).unwrap_or_default();
+                let mut candidates = self.element_head_completions(chain, tag);
+                candidates.retain(|candidate| typed_prefix_admits(candidate, typed));
+                return stamp_replacements(candidates, replaced);
             }
             CursorContext::CssBlock(position) => {
                 return stamp_replacements(self.css_block_completions(position, offset), replaced);
@@ -1809,10 +1822,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // before this deliberately — a literal must name every field, so
         // hiding one there would hide the way to construct the value.
         let typed = text.get(start..offset).unwrap_or_default();
-        candidates.retain(|candidate| match &candidate.internal {
-            Some(_) => typed.chars().count() >= 3 && candidate.label.starts_with(typed),
-            None => true,
-        });
+        candidates.retain(|candidate| typed_prefix_admits(candidate, typed));
         stamp_replacements(candidates, replaced)
     }
 
@@ -1953,6 +1963,24 @@ impl<'a, 'src> Analysis<'a, 'src> {
         let mut items = Vec::new();
         if let Some(view_id) = self.element_view_nominal_id() {
             self.push_methods(view_id, true, None, &mut items);
+            // B620: an element head admits only the methods that hand the
+            // element back; any other is offered to a typed prefix alone, with
+            // the steer the analyzer's refusal gives.
+            let mut steers: HashMap<&str, String> = HashMap::default();
+            for member in self.index.world.members.methods(view_id, true) {
+                let (nominal, written) = self.method_return(member.id);
+                if nominal != Some(view_id) {
+                    steers.entry(member.name.as_str()).or_insert_with(|| {
+                        format!(
+                            "returns `{written}`, not the element: call it on the element instead, `<{tag} />.{}()`",
+                            member.name
+                        )
+                    });
+                }
+            }
+            for item in &mut items {
+                item.admission = steers.get(item.label.as_str()).cloned();
+            }
             if !chain {
                 // Undotted: the chain form is offered in its own spelling, dot
                 // included, because an undotted `text(…)` is an ATTRIBUTE named
@@ -1968,6 +1996,33 @@ impl<'a, 'src> Analysis<'a, 'src> {
             items.extend(event_completions());
         }
         items
+    }
+
+    /// B620: what a method returns — its nominal, if any, and the return
+    /// type as its declaration writes it (`usize`, `void`).
+    fn method_return(&self, method: Id) -> (Option<Id>, String) {
+        let program = self.program;
+        let return_type_id = match program.functions.get(&method) {
+            Some(function) => function.return_type_id,
+            None => program
+                .external_functions
+                .get(&method)
+                .map(|external| external.return_type_id),
+        };
+        let nominal = return_type_id.and_then(|type_id| nominal_type_id(program, type_id));
+        let written = program
+            .declaration_labels
+            .get(&method)
+            .and_then(|label| label.rsplit_once("): "))
+            .map(|(_, returned)| {
+                returned
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(returned)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "void".to_string());
+        (nominal, written)
     }
 
     /// The struct-initializer field position at `start`, with the head resolved
@@ -3325,6 +3380,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     // have yet; E213's label rides on the declaration and is
                     // read where the candidate is one the program knows.
                     internal: None,
+                    admission: None,
                     filter_text: None,
                     replace_span: None,
                     needs_import: Some(AutoImport {
@@ -3867,6 +3923,19 @@ fn offered_importables<'a>(
         .iter()
         .filter(|row| !curated || row.exported.is_exported())
         .collect()
+}
+
+/// E213's rule, in one place: a candidate carrying an `[internal]` label or a
+/// B620 admission reason is offered only to a typed prefix of three
+/// characters or more that it extends exactly (a head's dotted `.len` is
+/// matched by the name); every other candidate passes.
+fn typed_prefix_admits(candidate: &Completion, typed: &str) -> bool {
+    if candidate.internal.is_none() && candidate.admission.is_none() {
+        return true;
+    }
+    let name = candidate.label.trim_start_matches('.');
+    let typed = typed.trim_start_matches('.');
+    typed.chars().count() >= 3 && name.starts_with(typed)
 }
 
 /// The start of the word ending at `offset` under the HYPHENATED rule (E211):

@@ -90,6 +90,7 @@ that checkout's `std`; N168): to work against a tree you are editing, set
 | `vilan.stdPath` | string | `""` | Path to the `std` source root (`vilan/std/src`). Overrides auto-discovery; sets `VILAN_STD` for the server. |
 | `vilan.inlayHints.enabled` | boolean | `true` | Show inlay type hints. Applies live. |
 | `vilan.inlayHints.abbreviate` | boolean | `true` | Show a type that declares `[hint(Trait<..>)]` by the trait it is used as — `: ~Source<Option<str>>` rather than its whole pipeline type; the full type stays in the tooltip and hover. Applies live. |
+| `vilan.inlayHints.chains` | `every` \| `changes` | `every` | Which stages of a chain split one stage per line carry an ` as T` hint: every stage, or only a stage whose type differs from the stage before it. "Ascribe every stage of this chain" still writes every stage. Applies live. |
 | `vilan.semanticTokens.enabled` | boolean | `true` | Use analyzer-based semantic highlighting; when off, the TextMate grammar is used. Applies live. |
 | `vilan.completion.functionCall` | `none` \| `parensOnly` \| `full` | `full` | How completion inserts a function or method call. |
 | `vilan.organizeImports.onSave` | boolean | `false` | Run Organize Imports before each save. |

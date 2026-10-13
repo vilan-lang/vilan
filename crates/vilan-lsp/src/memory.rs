@@ -264,6 +264,35 @@ pub fn trim() -> bool {
     false
 }
 
+/// N176: how many malloc arenas the server's threads share. glibc gives each
+/// contending thread an arena of its own (up to eight per core), and a
+/// world's analysis allocates on one thread and frees on another: after M142's
+/// item records the single-document leaf row's server VmHWM grew 40–160 MB
+/// from that fragmentation, and `MALLOC_ARENA_MAX=1` closed it. Measured on
+/// a kolt copy over lsp-latency's rows (Order 52): the server's peak VmHWM
+/// 1006 MB with glibc's default, 932 MB at two arenas, 716-732 MB at one;
+/// instructions unchanged.
+pub const ARENA_MAX: i32 = 1;
+
+/// N176: cap the allocator's arenas at [`ARENA_MAX`], first thing in `main`
+/// — unless the environment already says (`MALLOC_ARENA_MAX`, which glibc
+/// reads itself), so a measurement can still run the server without the cap.
+/// Answers whether the cap was set.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn limit_arenas() -> bool {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return false;
+    }
+    // SAFETY: `mallopt` adjusts an allocator parameter; it takes no pointer
+    // and invalidates nothing. Called before the server allocates in earnest.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, ARENA_MAX) == 1 }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn limit_arenas() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
