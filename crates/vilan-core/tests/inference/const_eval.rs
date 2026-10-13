@@ -254,6 +254,39 @@ fn a_const_let_closure_capturing_a_literal_binding_bakes_it() {
     );
 }
 
+/// M141: the explicit pass indexes only the locals that lie inside a `const`
+/// expression's span. A `const` reading a literal binding from OUTSIDE itself,
+/// beside plenty of locals that no `const` contains, must still find it free
+/// (and fold it), and a binding DECLARED inside the expression must still not
+/// count as free.
+#[test]
+fn a_const_expression_finds_its_free_locals_among_locals_outside_every_const() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        fun helper(a: i32, b: i32): i32 {
+            let c = a + b;
+            let d = c * a;
+            d - b
+        }
+
+        fun main() {
+            let base = 10;
+            let noise = helper(base, 2);
+            let scaled = const base * 2 + 1;
+            let inner = const {
+                let local = 3;
+                local + base
+            };
+            print((scaled + inner + noise - noise).to_string());
+        }
+        "#,
+        "34\n",
+    );
+}
+
 // --- `const fun`: the declaration gate ------------------------------------
 
 #[test]

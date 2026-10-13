@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: performance -->
+**M141: the warm const pass sheds ~23 M instructions of non-evaluation work (-11 % of `const_eval::evaluate` on kolt's client, -0.28 % of the whole check) — and the item's premise was half wrong.** Measured (callgrind, kolt's client, the table warm) the pass is 210 M instructions, of which lowering is 42 M and interpretation 32 M; the rest is NOT a rebuilt `ConstWorld` (built once per analysis, 4 M) or a re-walked reach (computed once per site: 169 `reach_from`, no retries), but the whole-program capability check (`check_const_only`, 70 M: the refined dispatch edges 36 M and `candidates_of` 17 M), the `Expr::Local` index (30 M) and the world's drop (6 M). `check_const_only` now asks `candidates_of` once per (import scope, name) instead of once per dispatch site (-13 M) and builds the refined edges only when R has a member to look them up for (a program whose runtime code reaches no channel verb pays none of it; kolt's does, through std's style functions), and the explicit pass indexes only the locals that lie inside a `const` expression (-10 M; the inference sweep keeps the full index). Answers are identical; the rest is filed (M141 residue: the two `refined_edges` calls share their program-wide scans, the local index wants the analyzer to record a const expression's locals, the per-site reach closure wants a memo).
+
+---
+
 <!-- family: tooling -->
 **N173: `vilan test`'s failing test reports its stack in `.vl` lines.** It printed `at check (file:///tmp/vilan-test-1477831.mjs:18:2)` — a place that is gone when the run ends — where `vilan run` of the same code reads `main_test.vl:4:2`. `vilan test` now builds the test's source map (one per test file, about 0.3 % of its build), writes it beside the temp script and hands node `--enable-source-maps`, the way `vilan run` does (E257 S5); the map and the script are removed after the run. std's `assert` frame names std's file.
 
