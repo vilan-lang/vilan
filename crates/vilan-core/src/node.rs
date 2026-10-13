@@ -1013,6 +1013,14 @@ pub enum Node<'src> {
     // expression a block can hold sits under this node and the generated
     // scaffolding around them binds no names of its own.
     CssScope(Box<Spanned<Self>>),
+    // B620: one chain link an element HEAD wrote (`<div .f() />`), wrapping
+    // the `MemberAccessor` the desugar built for it, with the element's tag.
+    // It FORWARDS like `CssScope` does — the link is the entity, no wrapper,
+    // so the lowering is the chain's — and exists only to tell the analyzer
+    // which method calls were written inside an opening tag: a head admits
+    // only the methods that hand the element back, where the same call on the
+    // finished element (`<div />.f()`, an ordinary postfix call) takes any.
+    ElementHeadLink(&'src str, Box<Spanned<Self>>),
     String(&'src str),
     // A triple-quoted string's raw inner text; trimmed to its content by
     // `util::trim_multiline_string` (validated in the analyzer, trimmed in the
@@ -1251,6 +1259,7 @@ impl<'src> Node<'src> {
             | Node::LiftGroup(inner)
             | Node::Spread(inner)
             | Node::CssScope(inner)
+            | Node::ElementHeadLink(_, inner)
             | Node::Unary(_, inner) => visit(inner),
             Node::StaticAccessor(subject, _, generic_arguments) => {
                 visit(subject);

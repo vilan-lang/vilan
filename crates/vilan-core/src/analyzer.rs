@@ -5812,6 +5812,12 @@ pub struct Analyzer<'src> {
     // entry and the literal's labels are its entries' — all of them, or none
     // (the parser refuses a written mix).
     entry_labels: HashMap<Id, &'src str>,
+    // B620: every method call an element HEAD wrote (`<div .f() />`), keyed
+    // by the call's entity: the element's tag and the link's span as written
+    // (`f()`, without the dot). A head admits only a method that hands the
+    // element back (`resolve_method_call`'s `Found` arm reads it); the same
+    // call written after the element is not in here and takes any method.
+    element_head_links: HashMap<Id, (&'src str, Span)>,
     // B569 §4.1: a labelled literal matched BY NAME against a labelled type
     // whose order differs — `let p: (x: f64, y: f64) = (y = 7, x = 5);` —
     // keyed by the literal: the written entry each storage slot takes, and
@@ -8079,6 +8085,7 @@ impl<'src> Analyzer<'src> {
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             entry_labels: HashMap::default(),
+            element_head_links: HashMap::default(),
             tuple_literal_layouts: HashMap::default(),
             tuple_literal_label_problems: HashMap::default(),
             named_arguments: Vec::new(),
@@ -39219,6 +39226,17 @@ impl<'src> Analyzer<'src> {
             self.css_scope_depth -= 1;
             return inner_id;
         }
+        // B620: an element head's chain link forwards the same way, and the
+        // mark — the element's tag and the link as written — is what the
+        // method call's resolution reads to admit only the methods that hand
+        // the element back.
+        if let Node::ElementHeadLink(tag, link) = &node.0 {
+            let link_id = self.walk_expr_node(link, scope_id);
+            if let Node::MemberAccessor(_, member) = &link.0 {
+                self.element_head_links.insert(link_id, (*tag, member.1));
+            }
+            return link_id;
+        }
         // A recorded lift-region paren group forwards like `const` does: the
         // region rewrite normally dissolves it, so one reaching the walk sits
         // in a position the rewrite does not descend into — its inner marks
@@ -39254,6 +39272,9 @@ impl<'src> Analyzer<'src> {
             // Likewise A70's block mark, which forwards the same way.
             Node::CssScope(..) => {
                 unreachable!("a css block's scope mark forwards to its inner expression")
+            }
+            Node::ElementHeadLink(..) => {
+                unreachable!("an element head's link mark forwards to the link it wraps")
             }
             // Likewise: `..e` forwards to its operand and marks it, so a
             // `Spread` node never reaches the entity match.
@@ -40703,6 +40724,11 @@ impl<'src> Analyzer<'src> {
                 self.seed_tail_expectations(value_id, type_id);
                 type_id
             }
+        };
+        // B620's head-link mark forwards to the link it wraps.
+        let value = match &value.0 {
+            Node::ElementHeadLink(_, link) => link,
+            _ => value,
         };
         let stage = match &value.0 {
             Node::MemberAccessor(_, member) => match &member.0 {
@@ -56208,6 +56234,121 @@ impl<'src> Analyzer<'src> {
         });
     }
 
+    /// B620: whether `member_id`, called on `subject_type` under the call's
+    /// `substitution`, returns the receiver's own type — what an element head
+    /// admits (std's attribute methods return `View`, a trait default's
+    /// `Self` is the receiver). A return this call cannot yet decide (an open
+    /// generic, a return still being inferred) is admitted: the ordinary type
+    /// checks downstream see it, and the head's refusal is for the method
+    /// that certainly returns something else.
+    fn hands_back_the_element(
+        &mut self,
+        member_id: Id,
+        subject_type: &Type,
+        substitution: &SubstitutionContext,
+    ) -> bool {
+        let (declared, inferred_of) = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => {
+                let function_id = *function_id;
+                match self
+                    .functions
+                    .get(&function_id)
+                    .map(|function| function.return_type_id)
+                {
+                    Some(Some(declared)) => (Some(declared), None),
+                    Some(None) => (None, Some(function_id)),
+                    None => return true,
+                }
+            }
+            Some(Expr::ExternalFunction(function_id)) => {
+                match self.external_functions.get(function_id) {
+                    Some(function) => (Some(function.return_type_id), None),
+                    None => return true,
+                }
+            }
+            _ => return true,
+        };
+        let returned = match (declared, inferred_of) {
+            (Some(declared), _) => {
+                let declared = declared.get_type(self);
+                self.substitute_type(&declared, substitution)
+            }
+            (None, Some(function_id)) => {
+                match self.inferred_return_type(function_id, substitution, &mut HashSet::default())
+                {
+                    // `never` is also the answer to a re-entrant ask: no
+                    // evidence either way.
+                    Type::Never => return true,
+                    inferred => inferred,
+                }
+            }
+            (None, None) => return true,
+        };
+        match (&returned, subject_type) {
+            (Type::Struct(returned, _), Type::Struct(receiver, _)) => returned == receiver,
+            // A trait default's `Self` is the trait itself.
+            (Type::Trait(..), _) => true,
+            (Type::Generic(_) | Type::Unknown | Type::Unresolved | Type::Any, _) => true,
+            _ => false,
+        }
+    }
+
+    /// B620: the refusal of a head link whose method does not hand the element
+    /// back, at the link's name — naming the method, the type it belongs to
+    /// (and the trait that provides it, when one does), and the call written
+    /// on the finished element, where any method is fine.
+    fn refuse_element_head_link(
+        &mut self,
+        call_id: Id,
+        member_id: Id,
+        member_name: &str,
+        subject_type: &Type,
+        tag: &str,
+        link_span: Span,
+    ) {
+        let owner = self.pretty_print_type(subject_type, &HashMap::default());
+        let providing_trait = self.declaring_trait_of_member(member_id).or_else(|| {
+            let implementation = self.implementation_by_declaration.get(&member_id)?;
+            self.implementations[*implementation]
+                .trait_ids
+                .iter()
+                .copied()
+                .find(|trait_id| {
+                    self.traits.get(trait_id).is_some_and(|trait_| {
+                        trait_
+                            .declared_members
+                            .iter()
+                            .any(|(name, _)| *name == member_name)
+                    })
+                })
+        });
+        let through = providing_trait
+            .and_then(|trait_id| self.traits.get(&trait_id))
+            .map(|trait_| format!(" (from `{}`)", trait_.name))
+            .unwrap_or_default();
+        let written = self
+            .source_of_id(call_id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| text.get(link_span.into_range()))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{member_name}()"));
+        let name_span = self
+            .member_name_spans
+            .get(&call_id)
+            .copied()
+            .unwrap_or(link_span);
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: name_span,
+            msg: format!(
+                "`{member_name}` is a method of `{owner}`{through}, but an element head takes \
+                 only methods that hand the element back (`{owner}`); call it on the element \
+                 instead: `<{tag} />.{written}`"
+            ),
+        });
+    }
+
     fn resolve_method_call(
         &mut self,
         id: Id,
@@ -57102,6 +57243,26 @@ impl<'src> Analyzer<'src> {
                 }
                 // B424, door (b): see `default_own_generics_from_receiver`.
                 self.default_own_generics_from_receiver(member_id, argument_ids, &mut substitution);
+                // B620: a link written inside an element's opening tag must hand
+                // the element back. Decided here, once every own generic the
+                // call can bind is bound, and before the call is wired: a
+                // refused link is an `Expr::Error`, whose unresolved type keeps
+                // the rest of the chain (the next link, a `.child`, the use
+                // site) from fanning a second error out of this one.
+                if let Some(&(tag, link_span)) = self.element_head_links.get(&id)
+                    && !self.hands_back_the_element(member_id, &subject_type, &substitution)
+                {
+                    self.refuse_element_head_link(
+                        id,
+                        member_id,
+                        member_name,
+                        &subject_type,
+                        tag,
+                        link_span,
+                    );
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
                 // Keep the own-generic bindings as ordered values too — the
                 // OnConstraint emission re-targets a concrete impl's method,
                 // whose own-generic IDS differ from this (possibly trait)

@@ -755,3 +755,4 @@ row	flagship	key
 732	-	`{symbol}` computes on the bits of an integer, but an operand is `{float_label}`, a float: there are no implicit conversions; convert with `as_*` (`value.as_i32()`)
 733	-	; `{member_name}` is provided by `impl type {binder_name}: {} with {}`, and `{subject_label}` does not implement {}
 734	-	`{written}` then a spaced `<`: a generic list touches its name, `{tight}` — spaced, the `<` after a name is a comparison
+NEW	-	`{member_name}` is a method of `{owner}`{through}, but an element head takes only methods that hand the element back (`{owner}`); call it on the element instead: `<{tag} />.{written}`

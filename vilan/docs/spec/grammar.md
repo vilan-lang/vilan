@@ -828,6 +828,19 @@ view chain (`view("tag")` with one method call per head item and a
 `.child(…)` per child), and postfix suffixes apply to it
 (`<div />.show(flag)`).
 
+A head's chain link must **hand the element back** (B620): the method it
+calls returns the element's own type — `View`, as every one of std's
+attribute and binding methods does, or `Self` from a trait — so the
+head stays a description of the element it opens. Any other method is
+refused at the link's name, naming the method and where it comes from:
+`<div .len() />` is "`len` is a method of `View`, but an element head
+takes only methods that hand the element back (`View`); call it on the
+element instead: `<div />.len()`". The rule is about the HEAD alone: the
+same call written after the element, `<div />.len()`, is an ordinary
+postfix call on a `View` value and takes any method, whatever it
+returns. A name no method answers keeps the ordinary member error. The
+lowering of an admitted link is unchanged.
+
 A **fragment** `<>…</>` is the nameless head, and it is a different
 lowering rather than an element with no tag: it desugars to a LIST
 LITERAL of its children, so its type is `List<View>`. `<>` and `</>`

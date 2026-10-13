@@ -8247,3 +8247,155 @@ fn a157_an_explicit_attr_call_is_not_steered() {
         "but `autofocus(flag)` has no method spelling to rewrite to"
     );
 }
+
+// --- B620: an element HEAD admits only the methods that hand the element back -
+//
+// A chain link inside an opening tag (`<div .f() />`) splices into the view
+// chain at its written position, so a method returning anything but the
+// element made the head evaluate to that value: `<div .len() />` silently WAS
+// the length, and with children the close of the head said "usize has no
+// method 'child'" at a zero-width span. The owner's rule (2026-10-12): such a
+// link is refused at its name, naming the method and steering to the call on
+// the finished element — `<div /> .len()` is an ordinary postfix call and
+// takes any method. A name no method answers keeps the member error.
+
+const B620_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "import std::web::ui::{ Slot, View, render, view };\n",
+    "\n",
+    "trait Measure {\n",
+    "\tfun len(self): usize;\n",
+    "\tfun tagged(self): View;\n",
+    "\tfun same(self): Self {\n",
+    "\t\tself\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl View with Measure {\n",
+    "\tfun len(self): usize {\n",
+    "\t\t3\n",
+    "\t}\n",
+    "\tfun tagged(self): View {\n",
+    "\t\tself.class(\"t\")\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+);
+
+const B620_REFUSAL: &str = "but an element head takes only methods that hand the element back";
+
+/// `len` in a head: refused ONCE, at the method's name, with the owner, the
+/// trait that provides it and the steer spelled from the element's own tag —
+/// and nothing cascades from it (no "Expected View" at the use site).
+#[test]
+fn b620_a_non_view_method_in_an_element_head_is_refused_at_its_name() {
+    let source = format!("{B620_HEAD}fun main() {{\n\tprint(render(<section .len() />));\n}}\n");
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refusal, no cascade: {diagnostics:#?}"
+    );
+    let (message, range) = &diagnostics[0];
+    assert_eq!(&source[range.clone()], "len", "at the link's name");
+    assert_eq!(
+        message,
+        "`len` is a method of `View` (from `Measure`), but an element head takes only \
+         methods that hand the element back (`View`); call it on the element instead: \
+         `<section />.len()`"
+    );
+}
+
+/// With children the old failure was at the CLOSE of the head (`usize has no
+/// method 'child'`), and a link after the refused one asked its method of
+/// `usize`; both cascades are gone.
+#[test]
+fn b620_the_refusal_replaces_the_cascades_at_the_close_and_the_next_link() {
+    let source = format!(
+        "{B620_HEAD}fun main() {{\n\tprint(render(<div .len()>\"hi\"</div>));\n\
+         \tlet v: View = <span .len() .class(\"x\") />;\n\tprint(render(v));\n}}\n"
+    );
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "one refusal per head: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|(message, _)| message.contains(B620_REFUSAL)),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[1].0.ends_with("`<span />.len()`"),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The SAME method on the finished element is an ordinary call and runs —
+/// `<div />.len()` beside the head's refusal of `<div .len() />` above.
+#[test]
+fn b620_the_same_method_called_on_the_finished_element_is_admitted() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B620_HEAD}fun main() {{\n\tlet n: usize = <div />.len();\n\
+             \tprint(i\"{{n}}\");\n\tlet m = <div class(\"a\") />.len();\n\tprint(i\"{{m}}\");\n}}\n"
+        ),
+        "3\n3\n",
+    );
+}
+
+/// What a head admits: std's attribute methods, an impl's method declared to
+/// return `View`, and a trait default's `Self` — three and more in one head,
+/// mixed with attributes, rendered.
+#[test]
+fn b620_methods_that_hand_the_element_back_are_admitted_in_a_head() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B620_HEAD}fun main() {{\n\
+             \tprint(render(<p id(\"x\") .class(\"a\") .text(\"hi\") .attr(\"title\", \"t\") />));\n\
+             \tprint(render(<b .tagged() .same() .attr(\"k\", \"v\")>\"y\"</b>));\n}}\n"
+        ),
+        "<p id=\"x\" class=\"a\" title=\"t\">hi</p>\n<b class=\"t\" k=\"v\">y</b>\n",
+    );
+}
+
+/// A void method is refused too — std's own `Slot::place` on `View` — and the
+/// trait that provides it is named.
+#[test]
+fn b620_a_void_method_in_a_head_is_refused_naming_its_trait() {
+    let source = format!(
+        "{B620_HEAD}fun main() {{\n\tlet parent = view(\"main\");\n\
+         \tlet _ = <div .place(parent) />;\n}}\n"
+    );
+    assert_fails_once_with(
+        &source,
+        "`place` is a method of `View` (from `Slot`), but an element head takes only \
+         methods that hand the element back (`View`); call it on the element instead: \
+         `<div />.place(parent)`",
+    );
+}
+
+/// A name no method answers keeps the member error, and gets no head sentence.
+#[test]
+fn b620_a_missing_method_in_a_head_keeps_the_member_error() {
+    let source = format!("{B620_HEAD}fun main() {{\n\tprint(render(<div .nope() />));\n}}\n");
+    assert_fails_with(&source, "View has no method 'nope'");
+    assert_fails_without(&source, B620_REFUSAL);
+}
+
+/// The lowering of an admitted link is unchanged: an element head with chain
+/// links emits the same JavaScript as the chain written by hand.
+#[test]
+fn b620_an_admitted_head_link_lowers_exactly_as_the_written_chain() {
+    let element = compile(&format!(
+        "{B620_HEAD}fun main() {{\n\tprint(render(<p .tagged() .same() .text(\"x\") />));\n}}\n"
+    ))
+    .expect("the element compiles");
+    let chain = compile(&format!(
+        "{B620_HEAD}fun main() {{\n\tprint(render(view(\"p\").tagged().same().text(\"x\")));\n}}\n"
+    ))
+    .expect("the chain compiles");
+    assert_eq!(element, chain);
+}
