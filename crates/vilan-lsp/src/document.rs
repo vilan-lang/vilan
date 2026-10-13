@@ -3969,7 +3969,11 @@ impl Document {
             declaration
         };
         let mut out = HoverBlocks::new();
-        out.push_code(Block::Signature, &format!("(alias) {declaration}"));
+        let declaration = match self.function_mod_line(program, target) {
+            Some(line) => format!("{line}\n(alias) {declaration}"),
+            None => format!("(alias) {declaration}"),
+        };
+        out.push_code(Block::Signature, &declaration);
         out.push_some(Block::Doc, self.analysis(program).doc_comment_of(target));
         out.push_some(
             Block::Platform,
@@ -4160,6 +4164,59 @@ impl Document {
         None
     }
 
+    /// E299: the `mod` line above a FUNCTION's fence — its declaring
+    /// module's path ([`Self::declaring_module_path`]). `None` for anything
+    /// that is not a function (a type's, a constant's and a variable's hovers
+    /// keep their shape — E299's scope) and for a derive's generated code,
+    /// which no module declares.
+    fn function_mod_line(&self, program: &Program, declaration: Id) -> Option<String> {
+        if !(program.functions.contains_key(&declaration)
+            || program.external_functions.contains_key(&declaration))
+        {
+            return None;
+        }
+        Some(format!(
+            "mod {}",
+            self.declaring_module_path(program, declaration)?
+        ))
+    }
+
+    /// The path of the module that DECLARES `entity`, as an import spells it
+    /// (E299/E298): `pkg::lib::overlay`, `std::web::dom`, a dependency's
+    /// `name::…`. The entry file is not a module entity; it is the module its
+    /// siblings reach as `pkg::<file>` (`pkg::client`), or `pkg` itself when
+    /// the document belongs to no package.
+    fn declaring_module_path(&self, program: &Program, entity: Id) -> Option<String> {
+        let source = program.source_of(entity)?;
+        if source == DERIVED_SOURCE {
+            return None;
+        }
+        if source == SourceId(0) {
+            let entry = program.canonical_sources.first()?;
+            let Some(relative) = self
+                .package_root()
+                .and_then(|root| entry.strip_prefix(root).ok())
+            else {
+                return Some("pkg".to_string());
+            };
+            let mut segments: Vec<String> = relative
+                .with_extension("")
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            segments.insert(0, "pkg".to_string());
+            return Some(segments.join("::"));
+        }
+        // A file's module is the one module entity attributed to its source
+        // (the bodiless namespaces are attributed to the entry, handled above).
+        let module = program
+            .modules
+            .keys()
+            .copied()
+            .find(|module| program.source_of(*module) == Some(source))?;
+        module_path(program, module)
+    }
+
     /// The hover for a pure namespace: what it HOLDS (E152).
     ///
     /// A namespace has no declaration, so the plain `module ui` the type label
@@ -4241,6 +4298,12 @@ impl Document {
         // `fun` line, inside the same fence: two lines of real syntax.
         let declaration = match program.member_header(declaration_id) {
             Some(header) => format!("{header}\n{declaration}"),
+            None => declaration,
+        };
+        // E299: and above both, WHERE the function lives — `mod pkg::lib::overlay`
+        // — for every function, the document's own module included.
+        let declaration = match self.function_mod_line(program, declaration_id) {
+            Some(line) => format!("{line}\n{declaration}"),
             None => declaration,
         };
         let mut out = HoverBlocks::new();
@@ -10323,6 +10386,52 @@ fn declared_platform_attribute(note: &str) -> Option<&str> {
     attribute.ends_with(")] mod self;").then_some(attribute)
 }
 
+/// E299/E298: a module's path from its origin — `std::reactive::store`,
+/// `pkg::lib::overlay` — walked up the module graph: a root's body scope
+/// holds its top-level modules, and a module's children scope its nested
+/// ones (`Program::module_children_scopes`). The roots are the origins
+/// (`pkg`, `std`, a dependency's name).
+fn module_path(program: &Program, module: Id) -> Option<String> {
+    let roots: Vec<Id> = program.module_id_by_name.values().copied().collect();
+    let parent_of = |child: Id| -> Option<Id> {
+        let name = program.modules.get(&child)?.name;
+        let holds = |scope: &Id| {
+            program
+                .scopes
+                .get(scope)
+                .and_then(|scope| scope.name_to_id_map.get(name))
+                == Some(&child)
+        };
+        roots
+            .iter()
+            .copied()
+            .find(|root| {
+                program
+                    .modules
+                    .get(root)
+                    .is_some_and(|root| holds(&root.body.1))
+            })
+            .or_else(|| {
+                program
+                    .module_children_scopes
+                    .iter()
+                    .find(|(_, scope)| holds(scope))
+                    .map(|(parent, _)| *parent)
+            })
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    let mut current = module;
+    for _ in 0..64 {
+        segments.push(program.modules.get(&current)?.name);
+        if roots.contains(&current) {
+            segments.reverse();
+            return Some(segments.join("::"));
+        }
+        current = parent_of(current)?;
+    }
+    None
+}
+
 /// E221: a variant reached through its enum's PATH (`Side::Auto`) is one
 /// entity spanning the whole path, and that token overlaps the enum's own
 /// type-reference token (`Side`) — so the overlap filter dropped it, and the
@@ -12520,7 +12629,7 @@ pub(crate) mod tests {
         assert_eq!(
             operator_hover_at(OPERATOR_IMPLS, "if a == b", 5),
             Some(
-                "```vilan\nimpl Point with PartialEq\nfun eq(self, other: Point): bool\n```"
+                "```vilan\nmod pkg\nimpl Point with PartialEq\nfun eq(self, other: Point): bool\n```"
                     .to_string()
             ),
         );
@@ -12531,7 +12640,7 @@ pub(crate) mod tests {
         assert_eq!(
             operator_hover_at(OPERATOR_IMPLS, "a + b", 2),
             Some(
-                "```vilan\nimpl Point with Add\nfun add(self, other: Point): Point\n```"
+                "```vilan\nmod pkg\nimpl Point with Add\nfun add(self, other: Point): Point\n```"
                     .to_string()
             ),
         );
@@ -15722,7 +15831,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `add` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait Add<B = Self>\nfun add(self, b: Self): Self\n```"),
+            hover.contains("```vilan\nmod std::operators\ntrait Add<B = Self>\nfun add(self, b: Self): Self\n```"),
             "{hover}"
         );
     }
@@ -15736,7 +15845,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `sub` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait Sub<B = Self>\nfun sub(self, b: Self): Self\n```"),
+            hover.contains("```vilan\nmod std::operators\ntrait Sub<B = Self>\nfun sub(self, b: Self): Self\n```"),
             "{hover}"
         );
     }
@@ -15750,7 +15859,9 @@ pub(crate) mod tests {
         )
         .expect("hover on `plus` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait Adder<B = Self>\nfun plus(self, b: Self): Self\n```"),
+            hover.contains(
+                "```vilan\nmod pkg\ntrait Adder<B = Self>\nfun plus(self, b: Self): Self\n```"
+            ),
             "{hover}"
         );
     }
@@ -15766,7 +15877,7 @@ pub(crate) mod tests {
         .expect("hover on `alike` should produce a label");
         assert!(
             hover.contains(
-                "```vilan\ntrait Same<B = Self>\nfun alike(self, other: Self): bool\n```"
+                "```vilan\nmod pkg\ntrait Same<B = Self>\nfun alike(self, other: Self): bool\n```"
             ),
             "{hover}"
         );
@@ -15783,7 +15894,7 @@ pub(crate) mod tests {
         .expect("hover on `label` should produce a label");
         assert!(
             hover.contains(
-                "```vilan\ntrait Labelled<B = Self>\nfun label(self, times: i32, other: Self): str\n```"
+                "```vilan\nmod pkg\ntrait Labelled<B = Self>\nfun label(self, times: i32, other: Self): str\n```"
             ),
             "{hover}"
         );
@@ -15798,8 +15909,9 @@ pub(crate) mod tests {
         )
         .expect("hover on the impl's `eq` should produce a label");
         assert!(
-            hover
-                .contains("```vilan\nimpl Tag with PartialEq\nfun eq(self, other: Tag): bool\n```"),
+            hover.contains(
+                "```vilan\nmod pkg\nimpl Tag with PartialEq\nfun eq(self, other: Tag): bool\n```"
+            ),
             "{hover}"
         );
     }
@@ -15826,7 +15938,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `eq` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -15838,7 +15950,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `eq` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -15850,7 +15962,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `lt` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -15862,7 +15974,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `lt` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -16475,7 +16587,7 @@ pub(crate) mod tests {
         )
         .expect("hovering the declaration should produce a label");
         assert!(
-            hover.contains("```vilan\nfun describe(count: i32, label: str): str\n```"),
+            hover.contains("```vilan\nmod pkg\nfun describe(count: i32, label: str): str\n```"),
             "{hover}"
         );
     }
@@ -16489,7 +16601,10 @@ pub(crate) mod tests {
             "import std::time::{ sleep_for, Duration };\n\nfun wa|rm() {\n\tsleep_for(Duration::millis(1));\n}\n\nfun main() {\n\twarm();\n}\n",
         )
         .expect("hover on the declaration");
-        assert!(hover.contains("```vilan\nasync fun warm()\n```"), "{hover}");
+        assert!(
+            hover.contains("```vilan\nmod pkg\nasync fun warm()\n```"),
+            "{hover}"
+        );
     }
 
     // E9 (rule4-completion S1): the inferred `borrows` root-set surfaces in the
@@ -24696,7 +24811,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let hover = hover(&document, "memo.get_or_insert", 0, 7);
         assert!(
             hover.starts_with(&fence(
-                "impl Memo<type K: Hashable, type V>\nfun get_or_insert(self, key: K, make: || V): V\n\nfun get_or_insert(self, key: str, make: || i32): i32"
+                "mod std::memo\nimpl Memo<type K: Hashable, type V>\nfun get_or_insert(self, key: K, make: || V): V\n\nfun get_or_insert(self, key: str, make: || i32): i32"
             )),
             "{hover}"
         );
@@ -24708,13 +24823,15 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let pair_read = hover(&document, "pair.read()", 0, 6);
         assert!(
             pair_read.starts_with(
-                "```vilan\nimpl Pair<type A, type B> with Read<A>\nfun read(self): A\n"
+                "```vilan\nmod pkg\nimpl Pair<type A, type B> with Read<A>\nfun read(self): A\n"
             ),
             "{pair_read}"
         );
         let user_greet = hover(&document, "fun greet(self): str {", 0, 5);
         assert!(
-            user_greet.starts_with(&fence("impl User with Greeter\nfun greet(self): str")),
+            user_greet.starts_with(&fence(
+                "mod pkg\nimpl User with Greeter\nfun greet(self): str"
+            )),
             "{user_greet}"
         );
     }
@@ -24725,7 +24842,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let hover = hover(&document, "user.label()", 0, 6);
         assert!(
             hover.starts_with(&fence(
-                "impl type S: Greeter with Named\nfun label(self): str"
+                "mod pkg\nimpl type S: Greeter with Named\nfun label(self): str"
             )),
             "{hover}"
         );
@@ -24736,18 +24853,18 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let default = hover(&document, "user.twice()", 0, 6);
         assert!(
-            default.starts_with(&fence("trait Greeter\nfun twice(self): str")),
+            default.starts_with(&fence("mod pkg\ntrait Greeter\nfun twice(self): str")),
             "{default}"
         );
         let requirement = hover(&document, "greeter.greet()", 0, 9);
         assert!(
-            requirement.starts_with(&fence("trait Greeter\nfun greet(self): str")),
+            requirement.starts_with(&fence("mod pkg\ntrait Greeter\nfun greet(self): str")),
             "{requirement}"
         );
         // A std trait member through a bound: the trait's parameters as declared.
         let generic = hover(&document, "fun read(self): T;", 0, 5);
         assert!(
-            generic.starts_with(&fence("trait Read<T>\nfun read(self): T")),
+            generic.starts_with(&fence("mod pkg\ntrait Read<T>\nfun read(self): T")),
             "{generic}"
         );
     }
@@ -24757,7 +24874,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let free = hover(&document, "print(describe(user))", 0, 7);
         assert!(
-            free.starts_with("```vilan\nfun describe(greeter: Greeter): str\n"),
+            free.starts_with("```vilan\nmod pkg\nfun describe(greeter: Greeter): str\n"),
             "{free}"
         );
     }
@@ -24785,16 +24902,15 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         assert!(
             hover(&document, "user.take()", 0, 6)
-                .starts_with(&fence("impl User\nfun take(own self): str"))
+                .starts_with(&fence("mod pkg\nimpl User\nfun take(own self): str"))
         );
         assert!(
             hover(&document, "user.peek()", 0, 6)
-                .starts_with(&fence("impl User\nfun peek(&self): i32"))
+                .starts_with(&fence("mod pkg\nimpl User\nfun peek(&self): i32"))
         );
-        assert!(
-            hover(&document, "user.rename(", 0, 6)
-                .starts_with(&fence("impl User\nfun rename(&mut self, own name: str)"))
-        );
+        assert!(hover(&document, "user.rename(", 0, 6).starts_with(&fence(
+            "mod pkg\nimpl User\nfun rename(&mut self, own name: str)"
+        )));
     }
 
     #[test]
@@ -24803,7 +24919,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let free = hover(&document, "print(total(", 0, 7);
         assert!(
             free.starts_with(&fence(
-                "fun total(xs: &List<i32>, out: &mut List<i32>, own extra: List<i32>): usize"
+                "mod pkg\nfun total(xs: &List<i32>, out: &mut List<i32>, own extra: List<i32>): usize"
             )),
             "{free}"
         );
@@ -25023,7 +25139,10 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let hover = document.hover(at).expect("a hover");
         let blocks: Vec<&str> = hover.split("\n\n").collect();
         assert_eq!(blocks[0], "**deprecated** — use keep()", "{hover}");
-        assert_eq!(blocks[1], "```vilan\nasync fun save()\n```", "{hover}");
+        assert_eq!(
+            blocks[1], "```vilan\nmod pkg\nasync fun save()\n```",
+            "{hover}"
+        );
         assert_eq!(blocks[2], "Writes the state.", "{hover}");
         assert!(
             blocks[3].starts_with("requires the `@process` platform its file declares"),

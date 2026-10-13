@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::Document;
 use super::tests::{on_big_stack, std_root};
 use vilan_core::analyzer::SourceId;
+use vilan_core::id::Id;
 
 /// The world a kolt module is served from: the client entry analyzed whole,
 /// then the module's view of it — the shape the server answers an open
@@ -840,5 +841,134 @@ fn e311_a_function_reached_through_a_path_paints_as_a_function() {
                 pair("px", "Function")
             ]
         );
+    });
+}
+
+#[test]
+#[ignore = "E299: scratch"]
+fn e299_scratch() {
+    on_big_stack(|| {
+        let client = "import pkg::lib::overlay::show;\nimport std::reactive::store::Store;\n\nfun main() {\n\tshow();\n}\n";
+        let overlay = "/// The overlay.\nexport fun show() {}\n";
+        let package = Package::new("e299s", &[("client.vl", client)]);
+        std::fs::create_dir_all(package.path("lib")).unwrap();
+        std::fs::write(package.path("lib/overlay.vl"), overlay).unwrap();
+        let world = package.world();
+        let program = world.program.as_ref().unwrap();
+        println!("{:?}", world.diagnostics);
+        for (id, module) in &program.modules {
+            let source = program.source_of(*id);
+            println!(
+                "{id:?} {:?} {:?} {:?} children={:?}",
+                module.name,
+                source,
+                source.and_then(|s| program.source_path(s)),
+                program.module_children_scopes.get(id)
+            );
+        }
+        println!(
+            "by name: {:?}",
+            program
+                .module_id_by_name
+                .iter()
+                .take(60)
+                .collect::<Vec<_>>()
+        );
+        for root in [Id(0), Id(1)] {
+            let module = &program.modules[&root];
+            let scope = &program.scopes[&module.body.1];
+            println!(
+                "root {:?} body: {:?}",
+                module.name,
+                scope
+                    .name_to_id_map
+                    .iter()
+                    .filter(|(_, id)| program.modules.contains_key(*id))
+                    .collect::<Vec<_>>()
+            );
+        }
+        for (id, module) in &program.modules {
+            if let Some(children) = program.module_children_scopes.get(id) {
+                let scope = &program.scopes[children];
+                println!(
+                    "children of {:?}: {:?}",
+                    module.name,
+                    scope.name_to_id_map.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+    });
+}
+
+/// E299's package: a nested module with a free function, a method, a trait
+/// requirement and a generic call site; the client calls into it and std.
+const E299_OVERLAY: &str = "/// The overlay.\nexport struct Overlay {\n\topen: bool,\n}\n\n\
+     export impl Overlay {\n\tfun toggle(self): bool {\n\t\t!self.open\n\t}\n}\n\n\
+     export trait Shows {\n\tfun show(self): str;\n}\n\n\
+     export fun pick<T>(value: T): T {\n\tvalue\n}\n\n\
+     export fun dismiss(): Overlay {\n\tOverlay { open = false }\n}\n";
+
+/// E299: every function hover opens with its declaring module's `mod` line —
+/// above E238's header, above E206's two lines.
+#[test]
+fn e299_a_function_hover_opens_with_its_mod_line() {
+    on_big_stack(|| {
+        let client = "import pkg::lib::overlay::{ Overlay, Shows, dismiss, pick };\n\n\
+             fun local(): i32 {\n\t1\n}\n\n\
+             fun main() {\n\tlet overlay = dismiss();\n\tlet _ = overlay.toggle();\n\tlet _ = pick(3);\n\tlet _ = local();\n\tlet _ = [1].len();\n}\n";
+        let package = Package::new("e299", &[("client.vl", client)]);
+        std::fs::create_dir_all(package.path("lib")).unwrap();
+        std::fs::write(package.path("lib/overlay.vl"), E299_OVERLAY).unwrap();
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let hover = |document: &Document, text: &str, needle: &str| {
+            document
+                .hover(at(text, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        // A free function in a nested module, at its call.
+        assert!(
+            hover(&world, client, "dismiss();")
+                .starts_with("```vilan\nmod pkg::lib::overlay\nfun dismiss(): Overlay\n```"),
+            "{}",
+            hover(&world, client, "dismiss();")
+        );
+        // A method: three lines, the mod line on top of E238's header.
+        assert!(
+            hover(&world, client, "toggle()").starts_with(
+                "```vilan\nmod pkg::lib::overlay\nimpl Overlay\nfun toggle(self): bool\n```"
+            ),
+            "{}",
+            hover(&world, client, "toggle()")
+        );
+        // E206's two-line site: the mod line once, on top.
+        let generic = hover(&world, client, "pick(3)");
+        assert!(
+            generic.starts_with("```vilan\nmod pkg::lib::overlay\nfun pick<T>(value: T): T\n\nfun pick(value: i32): i32\n```"),
+            "{generic}"
+        );
+        // A std function, and a function of the document's own module.
+        assert!(
+            hover(&world, client, "len()").starts_with("```vilan\nmod std::list\n"),
+            "{}",
+            hover(&world, client, "len()")
+        );
+        assert!(
+            hover(&world, client, "local();")
+                .starts_with("```vilan\nmod pkg::client\nfun local(): i32\n```"),
+            "{}",
+            hover(&world, client, "local();")
+        );
+        // A trait requirement, at its declaration in a view of the module.
+        let view = package.view(&world, "lib/overlay.vl");
+        assert!(
+            hover(&view, E299_OVERLAY, "show(self)").starts_with(
+                "```vilan\nmod pkg::lib::overlay\ntrait Shows\nfun show(self): str\n```"
+            ),
+            "{}",
+            hover(&view, E299_OVERLAY, "show(self)")
+        );
+        // Out of scope: a type's hover keeps its shape.
+        assert!(hover(&world, client, "Overlay,").starts_with("```vilan\nstruct Overlay"));
     });
 }
