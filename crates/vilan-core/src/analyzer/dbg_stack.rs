@@ -422,8 +422,8 @@ impl<'src> Analyzer<'src> {
             return;
         }
         let calls: Vec<Id> = self.dbg_stack_calls.values().copied().collect();
-        let view_origins = self.compute_view_origins();
-        let mut views = self.compute_view_bindings();
+        let view_origins = self.view_origins().clone();
+        let mut views = self.view_bindings().clone();
         views.extend(view_origins.keys().copied());
         let function_scopes: HashMap<Id, Id> = self
             .functions

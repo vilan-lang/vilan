@@ -328,6 +328,11 @@ impl<'src> Analyzer<'src> {
         let mut hinted: Vec<(Id, Id, Span)> = Vec::new();
         let mut seen: HashSet<Id> = HashSet::default();
         for stage in &stages {
+            // M110 S7b: a restored module's or item's hints come back as rows
+            // (`RestoredTables::stage_hints`), merged below.
+            if self.hint_row_restored(stage.id) {
+                continue;
+            }
             let head_id = heads[&stage.id];
             let Some(source) = self.source_of_id(stage.id) else {
                 continue;
@@ -415,6 +420,7 @@ impl<'src> Analyzer<'src> {
                 written,
             });
         }
+        hints.extend(self.restored_tables.stage_hints.iter().cloned());
         hints.sort_by_key(|hint| (hint.span.start, hint.span.end));
         hints
     }

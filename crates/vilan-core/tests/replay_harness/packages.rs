@@ -637,8 +637,13 @@ pub const CORPUS_EDITS: &[Edit] = &[
 
 pub const PINS_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::hub::base;\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(base());\n}\n";
 
-pub const PINS_VIEWS: &str =
-    "import pkg::hub::base;\n\nexport fun render(): i32 {\n\tbase() + 1\n}\n";
+// M110 S7b: `kept_warning` is an item the leaf's edits never touch, so every
+// served keystroke replays its deprecation WARNING from the item's record —
+// the plant that leaves a served window live for the Class A walk derives it
+// a second time (`the_differential_sees_a_pass_walking_a_served_window`). A
+// warning rather than a refusal: the package must keep emitting, since the
+// differential's JS leg is what sees a prefix served stale (`2` for `3`).
+pub const PINS_VIEWS: &str = "import pkg::hub::base;\n\nexport fun render(): i32 {\n\tbase() + 1\n}\n\n[deprecated(\"use render()\")]\nfun stale(): i32 {\n\t1\n}\n\nfun kept_warning(): i32 {\n\tstale()\n}\n";
 
 pub const PINS_CYCLE_A: &str = "import pkg::cycle_b::bounce;\n\nexport fun ring(n: i32): i32 {\n\tif n > 3 {\n\t\tn\n\t} else {\n\t\tbounce(n + 1)\n\t}\n}\n";
 

@@ -878,6 +878,25 @@ fn the_differential_sees_an_item_record_served_over_a_dirty_dependency() {
     );
 }
 
+/// S7b's plant (M142, Order 52): the Class A LIVE ranges sealed with the
+/// served items' windows left live (`analyzer/live_ranges.rs`). A pass that
+/// walks the live ranges then visits a served item's bodies and derives its
+/// diagnostic a second time beside the replay of its record — a doubled
+/// diagnostic, which a clean analysis reports once.
+#[test]
+fn the_differential_sees_a_pass_walking_a_served_window() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::LiveRangeWalksServed);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("differs from the clean one")),
+        "the served-window plant must turn a doubled diagnostic red; it found: {divergences:#?}"
+    );
+}
+
 /// S1's plant: the hot modules' remembered checks replayed as if they were the
 /// stored prefix's. A Class A refusal typed into a hot module is then served
 /// stale — the gate must see it.
