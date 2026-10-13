@@ -175,7 +175,9 @@ The explicit forms:
 - `async expr` (**spawn**): evaluate `expr`'s suspending computation
   concurrently; the spawn expression itself does not suspend and yields
   `Task<T>` where `T` is `expr`'s type (the task handle is opaque, and
-  copying it refers to the same task). `async { … }` spawns a block.
+  copying it refers to the same task) — in every program, whether or not
+  it imports `std::task`: an `async` loads the module, and `Task` is then
+  in scope as a type name without an import. `async { … }` spawns a block.
 - `await expr`: suspend until the `Task<T>` (or raw host `Promise<T>`)
   operand settles; yields `T`.
 

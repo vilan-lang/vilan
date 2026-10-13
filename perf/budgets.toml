@@ -288,3 +288,17 @@ class = "ci"
 ratio = 1.01
 reason = "the same std growth on the second-smallest example: x1.0044 of its ceiling on CI run 38453647717 against the 0.5% ci tolerance - one more std line would red it. Re-taken at the Order 52 seal."
 item = "M120"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "B618: an `async` now seeds `std::task` (the home of `async e`'s `Task<T>`), and todo spawns without importing it, so it loads `task.vl` and what it imports once: x1.0077 instructions on the lane's box against next @dcfdcba1 (4,209.9 M -> 4,242.3 M); every other row within 0.08 %. Re-taken at the Order 52 seal."
+item = "B618"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.01
+reason = "B618's std::task seed, as the ci row above (x1.0077 on the lane's box)."
+item = "B618"

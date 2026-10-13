@@ -46759,8 +46759,9 @@ impl<'src> Analyzer<'src> {
             Expr::Bool(_) => self.bool_type(),
             // `subject is pattern` is a boolean test.
             Expr::Is(_, _) => self.bool_type(),
-            // `async <body>` is a `Task<T>`, T the type of the body (falling
-            // back to `Promise<T>` against an older std without `std::task`).
+            // `async <body>` is a `Task<T>`, T the type of the body. (The
+            // `Promise<T>` fallback below answers only a std that has no
+            // `task.vl` at all: every program loads `std::task`, B618.)
             // If the expected type is itself `Task<U>` (or `Promise<U>`), the
             // body is checked against U.
             Expr::Async(closure_id) => {
@@ -76891,8 +76892,9 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
 /// that a file holding one `css { … }` block needs `std::web::style`, or that one
 /// `<div />` needs `std::web::ui`. This is that seed, and it is what lets the block
 /// and the element compile with no import written at all. The set is small and
-/// closed — two names today — and empty for the overwhelming majority of files,
-/// which pay one `for_each_child` walk that stops at the first miss.
+/// closed — three names today (B618 added `async`'s `std::task`) — and empty
+/// for the overwhelming majority of files, which pay one `for_each_child` walk
+/// that stops at the first miss.
 fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
     fn walk(node: &Spanned<Node>, found: &mut Vec<String>) {
         match &node.0 {
@@ -76906,6 +76908,16 @@ fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
             // reach it — the same seed, for the same reason.
             Node::CssScope(_) if !found.iter().any(|seen| seen == "web::style::prelude") => {
                 found.push("web::style::prelude".to_string());
+            }
+            // B618: an `async e` is a `Task<T>`, so it seeds `std::task`, the
+            // type's home. Loaded only on an import, a program that never
+            // imported it typed `async work()` as the host `Promise<i32>` — one
+            // expression, two types across programs. Seeded by the syntax
+            // rather than always loaded: the module and what it imports cost
+            // the empty program 15 % of its check (246 M -> 282 M
+            // instructions), and only a program that spawns needs it.
+            Node::Async(_) if !found.iter().any(|seen| seen == "task") => {
+                found.push("task".to_string());
             }
             _ => {}
         }
@@ -81396,6 +81408,8 @@ enum Origin {
 /// `std::number::i32` / `std::string::str` short names; the alias sweep
 /// (prelude.md §10.2) deleted those, so the lang items say so themselves
 /// instead of riding on an alias.) Read by the drain and by [`std_closure`].
+/// (`std::task`, the home of `async e`'s `Task<T>`, is seeded by the `async`
+/// that needs it instead — `collect_std_item_modules`, B618.)
 const ALWAYS_LOADED_STD: [&str; 11] = [
     "boolean",
     "list",

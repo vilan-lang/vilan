@@ -2436,11 +2436,11 @@ fn generic_call_over_a_bounded_transport_decodes() {
         import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
-        import std::js::promise::Promise;
-        trait Wire { fun send(self, msg: str): Promise<str>; }
+        import std::task::Task;
+        trait Wire { fun send(self, msg: str): Task<str>; }
         struct Echo {}
         impl Echo with Wire {
-            fun send(self, msg: str): Promise<str> { async { msg } }   // echoes the request
+            fun send(self, msg: str): Task<str> { async { msg } }   // echoes the request
         }
         [derive(Json)]
         struct Pt { x: i32 }
