@@ -256,6 +256,11 @@
         "source-maps": {
           "type": "boolean",
           "description": "Write a source map beside each script, so a debugger and node's stack traces show `.vl` files and lines (on under `debug`, off under `release`)."
+        },
+        "dbg": {
+          "type": "string",
+          "description": "What `dbg(..)` does in this build: `keep` prints, `strip` hands the value through and prints nothing. Unset, the preset decides: `debug` prints, `release` refuses the build.",
+          "enum": ["keep", "strip"]
         }
       }
     },

@@ -173,6 +173,11 @@ written down.
 <!-- family: feature -->
 **B620 (editor half): completion inside an opening tag offers only the methods that hand the element back — plus attributes and `on:` hooks, as before; a method of the element's type that returns anything else appears only once three characters of its name are typed, with "returns `usize`, not the element: call it on the element instead, `<div />.measured()`" as its detail, sorted last.** The rule is E213's three-character rule — the same function now serves the `[internal]` names and these (`typed_prefix_admits`), and the element head, which returned before E213's filter ran, takes it too (an `[internal]` method of the element's type is gated in a head as everywhere else). Completion after the finished element (`<div />.`) offers every method, as today; the hover on such a method is unchanged. The language's refusal of `<div .len() />` is the analyzer half (solver-52). Every std method of `View` returns `View`, so the estate's heads lose nothing. Pin: `editor_review_tests::b620_an_element_head_offers_a_non_view_method_only_to_three_typed_characters` (nothing typed, two characters, three — the steer — and the member list after `/>`). Tracker B620.
 
+---
+
+<!-- family: tooling -->
+**N172: `[build] dbg = "keep" | "strip"` is in the editor's manifest schema and the language server's manifest completion — VS Code flagged a valid `dbg = "strip"` as an unknown key (`[build]` is `additionalProperties: false`), and completion never offered it.** The key, its two values (offered quoted) and its documentation join both lists, and the gap's cause is pinned: the sync test compared the listing with the schema and neither with what the manifest reads, so a new `Build` field now fails to compile `every_build_field_the_manifest_reads_is_listed` (an exhaustive destructuring of `vilan_core::manifest::Build`) until its key is listed; every offered `dbg` value is one `DbgPolicy::parse` reads. Pins: `manifest_completion::tests::every_build_field_the_manifest_reads_is_listed`, `schema_and_listing_agree_on_the_enumerable_values` (`[build] dbg`). Tracker N172.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->
