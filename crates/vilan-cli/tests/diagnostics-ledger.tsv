@@ -726,7 +726,6 @@ row	flagship	key
 702	-	`auto` writes a return the toolchain infers, and nothing is inferred here: a trait member's return is the trait's, and an `external`'s is the host's — write the type
 703	-	`auto` marks a type annotation, not a value (expected an expression here)
 704	-	{covered} is inferred, and this package asks for its `auto` (`[check] auto = "{setting}"`){fix}
-705	-	{message} — `{callee} < {inner} > {arguments}` is read as the generic call `{callee}<{inner}>{arguments}`; if you meant two comparisons, parenthesize: `({callee} < {inner}) > {arguments}`
 706	-	cannot infer the type of this value: it is `{written}`, and nothing the program does with it settles the `…` that `{member}` is instantiated at. Bind it with its type (`let value: {written} = …;`)
 707	-	cannot infer the element type of this empty list: nothing the program does with it settles it, and `{member}` is instantiated at it. Bind it with its type (`let values: {written} = [];`)
 708	-	index {literal_index} is out of range: the array is empty (its type is `[_; 0]`), so it has no valid index
@@ -755,3 +754,4 @@ row	flagship	key
 731	-	`[derive({name})]` is expanded by the `{name}` macro `{path}` declares, and nothing in this program imports that module: write `import {path}::{name};`
 NEW	-	`{symbol}` computes on the bits of an integer, but an operand is `{float_label}`, a float: there are no implicit conversions; convert with `as_*` (`value.as_i32()`)
 NEW	-	; `{member_name}` is provided by `impl type {binder_name}: {} with {}`, and `{subject_label}` does not implement {}
+NEW	-	`{written}` then a spaced `<`: a generic list touches its name, `{tight}` — spaced, the `<` after a name is a comparison

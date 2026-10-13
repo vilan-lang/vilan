@@ -3487,6 +3487,8 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
                     // B571 §5.1: a spaced generic list after `as` is read as
                     // the tight one, and the reprint is the fix.
                     | crate::parsing::ParseErrorReason::SpacedAscribedGenerics { .. }
+                    // E291: and one after a name in expression position.
+                    | crate::parsing::ParseErrorReason::SpacedGenerics { .. }
             )
         })
     })
