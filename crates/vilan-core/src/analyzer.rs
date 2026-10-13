@@ -58312,6 +58312,22 @@ impl<'src> Analyzer<'src> {
         {
             return Resolution::Deferred;
         }
+        // B604: and an ANNOTATED one (or a reassignment against a grounded
+        // binding) over a value that still holds such a parameter waits for
+        // the same fill before it CHECKS: against `Unknown` the annotation
+        // reconciles with anything, so `let probe: str = length` inside a
+        // `.filter(|length| ..)` over a `List<usize>` that typed later checked
+        // clean and nothing asked again — while the literal receiver, typed
+        // first, refused it. Until the fixpoint stalls (B372's door): a
+        // parameter nothing fills keeps today's reading.
+        if !matches!(initial_type_id.get_type(self), Type::Unknown)
+            && !self.fixpoint_stalled
+            && value_ids
+                .first()
+                .is_some_and(|&value_id| self.value_awaits_a_closure_parameter(value_id))
+        {
+            return Resolution::Deferred;
+        }
 
         let mut substitution_context = HashMap::default();
         let mut variable_type = initial_type_id.get_type(self);
@@ -58411,6 +58427,12 @@ impl<'src> Analyzer<'src> {
         let mut deferred_value_ids = Vec::new();
         for &value_id in value_ids.iter().skip(1) {
             if !self.expr_id_to_expr_map.contains_key(&value_id) {
+                deferred_value_ids.push(value_id);
+                continue;
+            }
+            // B604: a reassignment over an unfilled closure parameter waits for
+            // the fill, as the first value does above.
+            if !self.fixpoint_stalled && self.value_awaits_a_closure_parameter(value_id) {
                 deferred_value_ids.push(value_id);
                 continue;
             }

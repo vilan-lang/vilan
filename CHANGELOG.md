@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B604: an annotated binding over a closure parameter is checked once the parameter fills — `let words = ["a", "bb"].map(|word| word.len()); words.filter(|length| { let probe: str = length; .. })` checked clean (JS ran it; the native build met rustc's E0308), while an annotated `let words: List<usize>` refused it "Expected str, but got usize instead."** The annotation reconciled against the parameter's not-yet `Unknown` — the call site that types it had not run, because its receiver (a `.map` result, a call's result) typed later — and nothing asked again. An annotated binding, a reassignment, and a tuple or list built around the parameter now wait for the fill, as an unannotated binding already did (B185), and refuse at the `let` as the literal receiver always did. A parameter nothing fills (a let-bound closure no call site types) keeps today's reading once the fixpoint stalls. Pins: `generics::b604_an_annotated_binding_over_a_closure_parameter_is_checked_once_it_fills`, `generics::b604_a_matching_annotation_runs_and_an_unfilled_parameter_keeps_its_reading`. Tracker B604.
+
+---
+
+<!-- family: fix -->
 **B611: a `[derive(..)]` over a struct or enum with a length parameter compiles — `[derive(PartialEq, Debug)] struct Buf<T, const N> { items: [T; N] }` (and `Hashable`, `Storable`, an `enum Slots<T, const N>`) was refused inside the generated impl: "`N` is a length parameter: give it a number (`<4>`) or another length parameter, not the type `N`".** macro_std's `GenericParameter` carried no const flag, so `binders` spelled every parameter `type N`; it now carries `is_const` (the compiler fills it at expansion time) and a length parameter binds as `const N` in every derive's impl (and in the `Storable` store's inherent impls). That completes E283's array half: `[derive(Debug)]` over an `[T; N]` field at any length. And a fixed array of `Hashable` elements is a `Hashable` field (`[derive(Hashable)] struct Pixel { rgba: [u8; 4] }` was refused "is not `Hashable`" beside std's own array impl). Pins: `array_lengths::b611_a_derive_over_a_length_parameter_binds_it_as_const`, `array_lengths::b611_an_array_of_hashable_elements_is_a_hashable_field`. Tracker B611.
 
 ---
