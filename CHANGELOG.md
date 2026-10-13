@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**B617: natively, a call through a `dyn` object hands a blanket impl the contexts it reads.** An object's table slot is typed by the trait's DECLARATION, and a body-less declaration (`Flow::start`) carried none of the hidden context parameters its implementations read — so a slot running a blanket over a bounded generic (`impl type S: Src<type T> with Flow<T>`, std's `Source` blanket's `start` reading `turn_scope` and `ambient_nursery`) was handed `None` natively where the JS call passed the value it threaded: `blanket, no scope` natively, `blanket under s` on JS, and a STRICT read there was refused. The context pass now gives such a declaration every hidden parameter its union of implementations reads (`dispatch_refine::object_slot_declaration_unions`; bare when a member reads strictly, and a safe implementation beside it is handed `Some(..)`), and the native table's `None` stand-in (B606) is kept only for a trait DEFAULT's declaration, whose parameters are its own body's. JS output is unchanged.
+
+---
+
 <!-- family: diagnostics -->
 **E309: a spaced generic call gets one steer naming the spacing.** Since E291 a `<` spaced from the name before it is a comparison, so `pick <f64>(1, 2)` reads as `(pick < f64) > (1, 2)` and was refused three times — "`<` models `PartialOrd`, and `fn pick<T>(T, T): T` does not implement it", "`bool` has no ordering", "`f64` is a type, not a value" — none of them saying the spacing was the reason. When the name on the left is a generic function or a generic type (`List <i32>(3)`, a generic struct), the three are replaced by one at `pick <f64>`: "`pick <f64>`: a generic list touches its name — `pick<f64>(1, 2)`; spaced, the `<` after a name is a comparison". Two values compared twice (`a < b > (c)`) and a non-generic function keep the comparison's refusals.
 

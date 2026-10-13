@@ -260,36 +260,105 @@ pub fn candidates_of(program: &Program, file: Option<SourceId>, name: &str) -> V
     let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let mut candidates = Vec::new();
     for trait_ in program.traits.values() {
-        let Some(&declaration_id) = trait_.declarations.get(name) else {
-            continue;
-        };
-        // The trait's own default body, when it has one.
-        if program
-            .functions
-            .get(&declaration_id)
-            .is_some_and(|function| function.has_body)
-        {
-            candidates.push(declaration_id);
-        }
-        // Every implementation's override of this trait's member — every one
-        // the asking FILE admits (B318 S4). An override in a block this file's
-        // imports declined is not one of its candidates, which is the same
-        // narrowing the rest of the module already applies by receiver and by
-        // bound, applied by import instead.
-        for implementation in &program.implementations {
-            if implementation.trait_ids.contains(&trait_.id)
-                && let Some(&member_id) = implementation.declarations.get(name)
-                && scope.is_none_or(|file| {
-                    program
-                        .impl_admission
-                        .admits_member(file, implementation, member_id)
-                })
-            {
-                candidates.push(member_id);
-            }
-        }
+        trait_member_candidates(program, scope, trait_.id, name, &mut candidates);
     }
     candidates
+}
+
+/// The members one trait's `name` can run as: the trait's own default body,
+/// when it has one, and every implementation's override — the blankets over
+/// a bounded generic (`impl type S: Source<type T> with Flow<T>`) among them,
+/// since a blanket's `with` clause lists the trait like any other block's.
+///
+/// `scope` is the asking FILE when its imports restrict which blocks it sees
+/// (B318 S4): an override in a block that file's imports declined is not one
+/// of its candidates, which is the same narrowing the rest of the module
+/// already applies by receiver and by bound, applied by import instead.
+/// `None` admits every block.
+fn trait_member_candidates(
+    program: &Program,
+    scope: Option<SourceId>,
+    trait_id: Id,
+    name: &str,
+    candidates: &mut Vec<Id>,
+) {
+    let Some(&declaration_id) = program
+        .traits
+        .get(&trait_id)
+        .and_then(|trait_| trait_.declarations.get(name))
+    else {
+        return;
+    };
+    if program
+        .functions
+        .get(&declaration_id)
+        .is_some_and(|function| function.has_body)
+    {
+        candidates.push(declaration_id);
+    }
+    for implementation in &program.implementations {
+        if implementation.trait_ids.contains(&trait_id)
+            && let Some(&member_id) = implementation.declarations.get(name)
+            && scope.is_none_or(|file| {
+                program
+                    .impl_admission
+                    .admits_member(file, implementation, member_id)
+            })
+        {
+            candidates.push(member_id);
+        }
+    }
+}
+
+/// B617: every member a `dyn` object's table slot for `member` can run, keyed
+/// by the DECLARATION the slot is typed by — `(declaration, union)` for each
+/// member some call reaches through an object (`dyn_dispatched_members`)
+/// whose declaration has no body of its own.
+///
+/// A call through an object names the trait's declaration, and the table's
+/// slot is typed by it (its parameters, the context pass's hidden ones among
+/// them), while what the slot runs is whichever implementation the erased
+/// value selects — any of them, program-wide, since the object is built
+/// wherever a value is erased and called wherever it travels. So the
+/// declaration must carry every hidden context its union reads: a `Flow`
+/// object's `start` slot runs the `Source` blanket's `start` for every source
+/// erased into it, and that `start` reads `turn_scope` and `ambient_nursery`.
+/// The union is the trait's whole member list ([`trait_member_candidates`]
+/// unscoped), the blanket over a bounded generic included.
+///
+/// A declaration WITH a body is its default's own function: it has callers of
+/// its own, and widening its parameters would ask each of them for a value it
+/// never reads, so it keeps what its body reads (and B606's stand-in covers an
+/// override that reads more).
+pub fn object_slot_declaration_unions(program: &Program) -> Vec<(Id, Vec<Id>)> {
+    let mut members: Vec<(Id, &str)> = program
+        .dyn_dispatched_members
+        .iter()
+        .map(|(trait_id, member)| (*trait_id, *member))
+        .collect();
+    members.sort_unstable_by_key(|(trait_id, member)| (trait_id.0, *member));
+    let mut unions: Vec<(Id, Vec<Id>)> = Vec::new();
+    for (object_trait, member) in members {
+        let Some((declaration, declaring_trait, _)) =
+            crate::mono::object_member_declaration(program, object_trait, member)
+        else {
+            continue;
+        };
+        if unions.iter().any(|(seen, _)| *seen == declaration)
+            || program
+                .functions
+                .get(&declaration)
+                .is_none_or(|function| function.has_body)
+        {
+            continue;
+        }
+        let mut union = Vec::new();
+        trait_member_candidates(program, None, declaring_trait, member, &mut union);
+        if !union.is_empty() {
+            unions.push((declaration, union));
+        }
+    }
+    unions
 }
 
 /// The members a concrete subject type selects for `member`: a declared
@@ -520,31 +589,7 @@ pub fn bound_candidates(program: &Program, call_id: Id) -> Option<Vec<Id>> {
         .filter(|file| program.impl_admission.restricts(*file));
     let mut candidates = Vec::new();
     for trait_id in &traits {
-        let Some(trait_) = program.traits.get(trait_id) else {
-            continue;
-        };
-        let Some(&declaration_id) = trait_.declarations.get(member) else {
-            continue;
-        };
-        if program
-            .functions
-            .get(&declaration_id)
-            .is_some_and(|function| function.has_body)
-        {
-            candidates.push(declaration_id);
-        }
-        for implementation in &program.implementations {
-            if implementation.trait_ids.contains(trait_id)
-                && let Some(&member_id) = implementation.declarations.get(member)
-                && scope.is_none_or(|file| {
-                    program
-                        .impl_admission
-                        .admits_member(file, implementation, member_id)
-                })
-            {
-                candidates.push(member_id);
-            }
-        }
+        trait_member_candidates(program, scope, *trait_id, member, &mut candidates);
     }
     Some(candidates)
 }
