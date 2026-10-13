@@ -609,3 +609,115 @@ fn e305_an_element_heads_written_tokens_answer_for_themselves() {
         }
     });
 }
+
+/// `VILAN_EDITOR_HINTS="file:from-to;…"` (1-based lines): every inlay hint
+/// the file's view lands on those lines, with its anchor.
+#[test]
+#[ignore = "E303: the kolt hint probe - needs VILAN_EDITOR_KOLT and VILAN_EDITOR_HINTS, run deliberately"]
+fn kolt_hint_probe() {
+    let Some(root) = std::env::var_os("VILAN_EDITOR_KOLT").map(PathBuf::from) else {
+        return;
+    };
+    let probes = std::env::var("VILAN_EDITOR_HINTS").unwrap_or_default();
+    on_big_stack(move || {
+        for probe in probes.split(';').filter(|probe| !probe.is_empty()) {
+            let (file, lines) = probe.split_once(':').expect("file:from-to");
+            let (from, to) = lines.split_once('-').expect("from-to");
+            let (from, to): (usize, usize) = (from.parse().unwrap(), to.parse().unwrap());
+            let document = kolt_view(&root, file);
+            let text = document.analyzed_text().to_string();
+            for hint in document.landed_hints() {
+                let line = text[..hint.name.end].matches('\n').count() + 1;
+                if (from..=to).contains(&line) {
+                    let start = hint.name.start;
+                    let shown: String = text[start..hint.name.end].chars().take(50).collect();
+                    println!(
+                        "{file}:{line} after {shown:?} -> {:?} / {:?}",
+                        hint.label, hint.abbreviated
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// The stage hints a document lands, as `(line, label)` (1-based lines).
+fn stage_hint_lines(document: &Document) -> Vec<(usize, String)> {
+    let text = document.analyzed_text();
+    document
+        .landed_hints()
+        .into_iter()
+        .filter(|hint| hint.label.starts_with(" as "))
+        .map(|hint| (text[..hint.name.end].matches('\n').count() + 1, hint.label))
+        .collect()
+}
+
+/// E303 (RULED: hide): kolt `views.vl:110`'s head — an event, a `.styled`
+/// item and a `.child(swap(..))` whose argument is a chain split over lines —
+/// inside a parent element. Neither the tag nor the head's items nor the
+/// children's links hint (they DOUBLED at the element's last line, where the
+/// parent's `.child` link and the element's own last link both end); the
+/// chain inside the attribute value keeps E278's hints; a chain written after
+/// the finished element is the reader's and hints.
+#[test]
+fn e303_an_element_head_mints_no_stage_hints() {
+    on_big_stack(|| {
+        let source = "import std::web::style::Style;\n\n\
+             fun icon_style(): Style {\n\tstyle::style()\n}\n\n\
+             fun label(open: bool): str {\n\tif open { \"a\" } else { \"b\" }\n}\n\n\
+             export fun bar(): View {\n\t<div>\n\t\t<button\n\t\t\ton:contextmenu(|event| {\n\t\t\t\tevent.prevent_default();\n\t\t\t})\n\
+             \t\t\t.styled(icon_style())\n\
+             \t\t\t.child(Some(true)\n\t\t\t\t.map(|x| !x)\n\t\t\t\t.map(|x| label(x))\n\t\t\t\t.unwrap_or(\"c\"))\n\
+             \t\t/>\n\t\t<span />\n\t</div>\n}\n\n\
+             export fun after(): View {\n\t<div />\n\t\t.text(\"later\")\n\t\t.class(\"x\")\n}\n";
+        let client = "import pkg::bar::{ after, bar };\n\nfun main() {\n\tlet _ = bar();\n\tlet _ = after();\n}\n";
+        let package = Package::new("e303", &[("client.vl", client), ("bar.vl", source)]);
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let view = package.view(&world, "bar.vl");
+        let lone = Document::analyze(source, &std_root(), &package.path("bar.vl"));
+        let line = |needle: &str| source[..at(source, needle, 0)].matches('\n').count() + 1;
+        for document in [&view, &lone] {
+            let hints = stage_hint_lines(document);
+            // The inner chain inside `.child(..)`'s argument: two stages,
+            // `.map(|x| !x)` and `.map(|x| label(x))` (the last ends inside
+            // the parentheses of the item, so it ends no line).
+            assert!(
+                hints.contains(&(line(".map(|x| !x)"), " as Option<bool>".to_string())),
+                "{hints:?}"
+            );
+            assert!(
+                hints.contains(&(line(".map(|x| label(x))"), " as Option<str>".to_string())),
+                "{hints:?}"
+            );
+            // Nothing on the element's own lines: the tag, the items, the
+            // closing `/>`, the parent's lines.
+            for needle in [
+                "<button",
+                ".styled(",
+                "\t\t/>",
+                "<span />",
+                "\t<div>",
+                "on:contextmenu",
+            ] {
+                assert!(
+                    !hints.iter().any(|(at_line, _)| *at_line == line(needle)),
+                    "a hint on `{needle}`'s line: {hints:?}"
+                );
+            }
+            // At most one hint per line anywhere.
+            let mut lines: Vec<usize> = hints.iter().map(|(at_line, _)| *at_line).collect();
+            lines.dedup();
+            assert_eq!(lines.len(), hints.len(), "{hints:?}");
+            // The chain written after the finished element is the reader's.
+            assert!(
+                hints.contains(&(line(".text(\"later\")"), " as View".to_string())),
+                "{hints:?}"
+            );
+            assert!(
+                hints.contains(&(line("\t<div />"), " as View".to_string())),
+                "{hints:?}"
+            );
+        }
+    });
+}
