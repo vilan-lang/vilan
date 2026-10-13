@@ -78,6 +78,11 @@ written down.
 <!-- family: fix -->
 **F135 (slice 2): the write summary a `Shared::read()` copy asks (B457's, and F135's later-argument test) no longer reads one `[derive(..)]` expansion's span as containing ANOTHER expansion's write — a derived `hash` looked like a writer of every written cell, so with F135's slice 1 every `key.hash()` argument beside a read forced a copy (`KeyedCell::locate` copied its whole index per call: M87's pin read `wholes=1`, A54's per-change cost grew 14x over ten times the rows).** Every expansion shares the derived source while its spans are offsets into its OWN generated template; within that source two entities now share a text only when one `derived_origins` run minted both (`one_span_space`, asked by `spans_an_in_place_write` and the three call-index walks). Corpus goldens unchanged. Pins: `ui_rows::m87_keyed_cell_locate_copies_no_whole_list` and `reactive_channels::a_keyed_cell_s_cost_per_change_does_not_grow_with_the_collection` (green again; red at slice 1). Tracker F135.
 
+---
+
+<!-- family: fix -->
+**B621: `bool`, `List<T>`, `Option<T>`, `Result<T, E>`, `HashSet<T>` and `HashMap<K, V>` are `Eq` when what they hold is — `fun same<T: Eq>(a: T, b: T)` refused `same(true, true)`, `same([1, 2], [1, 2])`, `same(Some(1), None)` and a tuple holding a `bool` ("'bool' does not implement trait 'Eq'"), although each was `PartialEq` and its equality total.** std's `Eq` covered the integers, `str`, fixed arrays and tuples only. Each type now carries a marker impl beside its `PartialEq` impl (`impl bool with Eq {}`, `impl List<type T: Eq> with Eq {}`, `impl Option<type T: Eq> with Eq {}`, `impl Result<type T: Eq, type E: Eq> with Eq {}`, `impl HashSet<type T: Hashable + Eq> with Eq {}`, `impl HashMap<type K: Hashable + Eq, type V: Eq> with Eq {}`), and B609 makes the generic ones conform through the element bound; an `f64` anywhere inside keeps the container `PartialEq` only. Additive: nothing in the estate wrote these impls itself. The std traits page says so. Pins: `traits::b621_bool_and_the_std_containers_of_eq_elements_are_eq`, `b621_a_container_of_a_non_eq_element_is_not_eq`. Tracker B621.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

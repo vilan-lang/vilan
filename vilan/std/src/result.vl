@@ -1,4 +1,4 @@
-import pkg::compare::PartialEq;
+import pkg::compare::{ Eq, PartialEq };
 import pkg::default::Default;
 import pkg::io::panic;
 import pkg::operators::{ Lift, Try, Verdict };
@@ -232,3 +232,6 @@ impl Result<type T: PartialEq, type E: PartialEq> with PartialEq {
 		}
 	}
 }
+
+/// A result of `Eq` sides is `Eq` (B621).
+impl Result<type T: Eq, type E: Eq> with Eq {}

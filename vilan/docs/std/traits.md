@@ -32,6 +32,10 @@ trait Ord with Eq + PartialOrd {
 
 - `==`/`!=` dispatch through `PartialEq`; `<`/`<=`/`>`/`>=` through
   `PartialOrd`. Numbers, `str`, and `bool` implement them in std.
+- `Eq` marks an equality that is total. The integers, `str` and `bool`
+  are `Eq` (the floats are not: NaN), and `List<T>`, `Option<T>`,
+  `Result<T, E>`, `HashSet<T>` and `HashMap<K, V>` are `Eq` when what
+  they hold is, so a `T: Eq` takes `[1, 2]`, `Some(true)` and `Ok(1)`.
 - A tuple is `PartialEq` when its elements are, compared position by
   position at any arity: `(1, "a") == (1, "a")`, and a `T: PartialEq`
   takes a pair; it is `Eq` when its elements are. Ordering a tuple is not

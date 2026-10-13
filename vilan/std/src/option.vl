@@ -1,4 +1,4 @@
-import pkg::compare::PartialEq;
+import pkg::compare::{ Eq, PartialEq };
 import pkg::default::Default;
 import pkg::io::panic;
 import pkg::operators::{ Lift, Try, Verdict };
@@ -293,6 +293,9 @@ impl Option<type T: PartialEq> with PartialEq {
 		}
 	}
 }
+
+/// An option of an `Eq` payload is `Eq` (B621): `None` equals only itself.
+impl Option<type T: Eq> with Eq {}
 
 // `then_some` lives here rather than in `boolean.vl` so that the always-loaded core
 // `bool` module stays dependency-free (it would otherwise have to import `Option`).
