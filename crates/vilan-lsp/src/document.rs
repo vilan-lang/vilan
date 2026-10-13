@@ -4057,7 +4057,31 @@ impl Document {
             Block::Diagnostic,
             named_trait.and_then(|definition| internal_lead(program, definition)),
         );
-        out.push_code(Block::Signature, &hover.code);
+        // E310: a trait says where it lives (E299's line) above its block.
+        let code = match named_trait
+            .and_then(|definition| self.declaring_module_path(program, definition))
+        {
+            Some(path) => format!("mod {path}\n{}", hover.code),
+            None => hover.code.clone(),
+        };
+        out.push_code(Block::Signature, &code);
+        // E310: and what can be passed where it is written.
+        if !hover.implemented_by.is_empty() {
+            let total = hover.implemented_by.len();
+            let mut shown: Vec<String> = hover
+                .implemented_by
+                .iter()
+                .take(MODULE_PREVIEW_CAP)
+                .map(|subject| format!("`{subject}`"))
+                .collect();
+            if total > MODULE_PREVIEW_CAP {
+                shown.push(format!("and {} more", total - MODULE_PREVIEW_CAP));
+            }
+            out.push(
+                Block::Preview,
+                format!("Implemented by {} ({total} in reach).", shown.join(", ")),
+            );
+        }
         out.push_some(
             Block::SignatureNote,
             hover
@@ -25578,11 +25602,11 @@ fun main() {\n\tlet boxed = Boxed { value = 3 };\n\tprint(pick(boxed));\n\teach(
         // At the arguments written: `Read<U>`'s `read` returns `U`.
         assert_eq!(
             hover("Read<U>>(source", 1),
-            "```vilan\ntrait Read<U> {\n\tfun read(self): U;\n}\n```\n\nSomething that reads a value."
+            "```vilan\nmod pkg\ntrait Read<U> {\n\tfun read(self): U;\n}\n```\n\nSomething that reads a value.\n\n---\n\nImplemented by `Boxed<U>` (1 in reach)."
         );
         assert_eq!(
             hover("with Show {", 6),
-            "```vilan\ntrait Show {\n\tfun show(self): str;\n}\n```"
+            "```vilan\nmod pkg\ntrait Show {\n\tfun show(self): str;\n}\n```"
         );
     }
 }

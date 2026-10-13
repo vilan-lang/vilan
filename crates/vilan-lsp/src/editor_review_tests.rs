@@ -159,7 +159,7 @@ fn kolt_probe() {
                     hover
                         .replace('\n', " / ")
                         .chars()
-                        .take(160)
+                        .take(4000)
                         .collect::<String>()
                 });
                 println!("{column:>4} {character:?} {row:?}\n       hover: {hover:?}");
@@ -1139,6 +1139,63 @@ fn e308_a_generic_impls_member_renders_under_the_receivers_binders() {
         assert_eq!(
             fence("plain(Command"),
             "mod pkg::client\nfun plain(command: Command): str"
+        );
+    });
+}
+
+/// E310 (RULED shape): a trait named in a parameter's type position (kolt
+/// `login_page.vl:72`'s `Signal<str>`) hovers with where it lives, its head
+/// and required members at the written arguments, its `///`, and what can
+/// be passed there — the implementors in reach at those arguments. A bound
+/// and a `with` clause answer the same; a trait with no impl keeps E240's.
+#[test]
+fn e310_a_trait_in_a_parameter_type_hovers_with_its_implementors() {
+    on_big_stack(|| {
+        let shapes = "/// Something that shows a value.\nexport trait Shows<T> {\n\tfun show(self, value: T): str;\n}\n\n\
+             export trait Lonely {\n\tfun alone(self): i32;\n}\n\n\
+             export struct Plain {}\n\nexport impl Plain with Shows<str> {\n\tfun show(self, value: str): str {\n\t\tvalue\n\t}\n}\n\n\
+             export struct Cell<T> {\n\tvalue: T,\n}\n\n\
+             export impl Cell<type T> with Shows<T> {\n\tfun show(self, value: T): str {\n\t\t\"cell\"\n\t}\n}\n\n\
+             export struct Numbers {}\n\nexport impl Numbers with Shows<i32> {\n\tfun show(self, value: i32): str {\n\t\t\"n\"\n\t}\n}\n";
+        let client = "import pkg::shapes::{ Lonely, Plain, Shows };\n\n\
+             fun login(username: Shows<str>, lonely: Lonely): str {\n\tusername.show(\"a\")\n}\n\n\
+             fun bound<S: Shows<str>>(shown: S): str {\n\tshown.show(\"b\")\n}\n\n\
+             fun main() {\n\tlet _ = bound(Plain {});\n}\n";
+        let package = Package::new("e310", &[("client.vl", client), ("shapes.vl", shapes)]);
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let parameter = world
+            .hover(at(client, "Shows<str>, lonely", 0))
+            .expect("`Shows` hovers");
+        assert!(
+            parameter.starts_with("```vilan\nmod pkg::shapes\ntrait Shows<str> {\n\tfun show(self, value: str): str;\n}\n```"),
+            "{parameter}"
+        );
+        assert!(
+            parameter.contains("Something that shows a value."),
+            "{parameter}"
+        );
+        assert!(
+            parameter.ends_with("Implemented by `Cell<str>`, `Plain` (2 in reach)."),
+            "{parameter}"
+        );
+        let bound = world
+            .hover(at(client, "Shows<str>>(", 0))
+            .expect("the bound hovers");
+        assert_eq!(bound, parameter, "a bound answers as a parameter does");
+        let lonely = world
+            .hover(at(client, "Lonely,", 0))
+            .expect("`Lonely` in the import");
+        let lonely_parameter = world
+            .hover(at(client, "Lonely)", 0))
+            .expect("`Lonely` hovers");
+        assert!(
+            !lonely_parameter.contains("Implemented by"),
+            "{lonely_parameter}"
+        );
+        assert!(
+            lonely_parameter.contains("fun alone(self): i32;"),
+            "{lonely_parameter} / {lonely}"
         );
     });
 }

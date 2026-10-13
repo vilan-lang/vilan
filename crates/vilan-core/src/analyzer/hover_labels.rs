@@ -108,6 +108,11 @@ pub struct ReferenceHover {
     pub code: String,
     /// The declaration a type parameter belongs to, as written.
     pub declared_by: Option<String>,
+    /// E310: for a TRAIT, what can be passed where it is written — the
+    /// subjects of the impls the row's file reaches, at the written
+    /// arguments (`SignalCell<str>` for `impl SignalCell<type T> with
+    /// Signal<T>` under `Signal<str>`), sorted. Empty for a type parameter.
+    pub implemented_by: Vec<String>,
 }
 
 /// E313: the files whose hover rows one analysis renders.
@@ -608,6 +613,9 @@ impl<'src> Analyzer<'src> {
         let owners = self.generic_owners(rows);
         let mut hovers: Vec<ReferenceHover> = Vec::new();
         let mut seen: HashSet<(SourceId, Span)> = HashSet::default();
+        // E310: the files each user file reaches (B515/B598's rule), asked
+        // once, and only when a trait row needs it.
+        let mut reach: Option<HashMap<SourceId, HashSet<SourceId>>> = None;
         for (source, span, definition, type_id) in &self.type_references {
             if !self.renders_hover_rows(*source, rows) || seen.contains(&(*source, *span)) {
                 continue;
@@ -615,6 +623,25 @@ impl<'src> Analyzer<'src> {
             match type_id.borrow_type(self) {
                 Type::Generic(constraint_id) => {
                     if self.implicit_generic_scopes.contains_key(constraint_id) {
+                        // E310: an IMPLICIT parameter (`username: Signal<str>`)
+                        // is the trait the reader wrote, and hovers as one —
+                        // its block at the written arguments, and what
+                        // implements it.
+                        if let Type::Trait(trait_id, arguments) = constraint_id.borrow_type(self)
+                            && *definition == Some(*trait_id)
+                            && let Some(block) = self.type_definition_block(*constraint_id)
+                        {
+                            seen.insert((*source, *span));
+                            hovers.push(ReferenceHover {
+                                source: *source,
+                                span: *span,
+                                code: block,
+                                declared_by: None,
+                                implemented_by: self.implementors_in_reach(
+                                    *trait_id, arguments, *source, &mut reach,
+                                ),
+                            });
+                        }
                         continue;
                     }
                     let hover = ReferenceHover {
@@ -622,6 +649,7 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         code: self.type_parameter_line(*constraint_id),
                         declared_by: owners.get(constraint_id).cloned(),
+                        implemented_by: Vec::new(),
                     };
                     // The row's definition is the BINDER — the `U` of
                     // `fun pick<U, ..>` — which no row covers: its declaration
@@ -639,7 +667,7 @@ impl<'src> Analyzer<'src> {
                     seen.insert((*source, *span));
                     hovers.push(hover);
                 }
-                Type::Trait(trait_id, _) if *definition == Some(*trait_id) => {
+                Type::Trait(trait_id, arguments) if *definition == Some(*trait_id) => {
                     let Some(block) = self.type_definition_block(*type_id) else {
                         continue;
                     };
@@ -649,12 +677,80 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         code: block,
                         declared_by: None,
+                        implemented_by: self
+                            .implementors_in_reach(*trait_id, arguments, *source, &mut reach),
                     });
                 }
                 _ => {}
             }
         }
         hovers
+    }
+
+    /// E310: the subjects of `trait_id`'s impls that `source` reaches — an
+    /// impl provided from a file the caller reaches (B598's rule for which
+    /// traits a call sees) — rendered at the WRITTEN arguments: an impl's
+    /// binder in the trait's arguments takes the written argument there, and
+    /// an impl whose concrete argument differs from the written one cannot be
+    /// passed here and is left out. A blanket (`impl type S: ..`) names no
+    /// subject and is left out too.
+    fn implementors_in_reach(
+        &self,
+        trait_id: Id,
+        written: &[TypeId],
+        source: SourceId,
+        reach: &mut Option<HashMap<SourceId, HashSet<SourceId>>>,
+    ) -> Vec<String> {
+        let reach = reach.get_or_insert_with(|| match self.entry_scope_id {
+            Some(entry_scope_id) => self.trait_reach_by_file(entry_scope_id, None),
+            None => HashMap::default(),
+        });
+        let Some(files) = reach.get(&source) else {
+            return Vec::new();
+        };
+        let empty = SubstitutionContext::default();
+        let mut subjects: Vec<String> = Vec::new();
+        for implementation in &self.implementations {
+            if !files.contains(&implementation.source) {
+                continue;
+            }
+            let Some((_, provided)) = implementation
+                .trait_args
+                .iter()
+                .find(|(provided, _)| *provided == trait_id)
+            else {
+                continue;
+            };
+            if matches!(implementation.subject.borrow_type(self), Type::Generic(_)) {
+                continue;
+            }
+            let mut substitution = SubstitutionContext::default();
+            let mut fits = true;
+            for (provided, written) in provided.iter().zip(written) {
+                match provided.borrow_type(self) {
+                    Type::Generic(binder) => {
+                        substitution.insert(*binder, *written);
+                    }
+                    concrete => {
+                        if self.pretty_print_type(concrete, &empty)
+                            != self.pretty_print_type(written.borrow_type(self), &empty)
+                        {
+                            fits = false;
+                        }
+                    }
+                }
+            }
+            if !fits {
+                continue;
+            }
+            let subject =
+                self.pretty_print_type(implementation.subject.borrow_type(self), &substitution);
+            if !subjects.contains(&subject) {
+                subjects.push(subject);
+            }
+        }
+        subjects.sort();
+        subjects
     }
 
     /// `type T`, or `type I: Read<U>` with its bound — a type parameter as its
