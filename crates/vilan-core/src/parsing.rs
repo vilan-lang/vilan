@@ -11238,7 +11238,7 @@ pub(crate) fn is_block_like(node: &Node<'_>) -> bool {
 /// A generic list's text respelled tight (B571 §5.1's refusal): no space
 /// after a `<`, before a `<` or before a `>` — `< i32 >` is `<i32>`, `<str,
 /// List <i32>>` is `<str, List<i32>>`. The separator's space is kept.
-fn tighten_generic_list(list: &str) -> String {
+pub(crate) fn tighten_generic_list(list: &str) -> String {
     let mut tight = String::with_capacity(list.len());
     let mut characters = list.chars().peekable();
     while let Some(character) = characters.next() {

@@ -1,0 +1,112 @@
+// B617: a call through a `dyn` object whose slot runs a blanket impl over a
+// bounded generic hands that impl the contexts it reads. The slot is typed by
+// the trait's DECLARATION (`Flow::start`, no body), which now carries every
+// hidden context its union reads, so the native table forwards the value the
+// call threaded where it used to hand `None` (B606's stand-in); a STRICT
+// reader in the union makes the slot's value bare, and a safe implementation
+// beside it takes it as `Some`.
+import std::context::Context;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+let scope: Context<str> = Context::new();
+
+trait Flow<T> {
+	fun start(own self): str;
+}
+
+trait Src<T> with Flow<T> {
+	fun get(self): T;
+}
+
+impl type S: Src<type T> with Flow<T> {
+	fun start(own self): str {
+		match scope.get_safe() {
+			Some(let value) => i"blanket under {value}",
+			None => "blanket, no scope",
+		}
+	}
+}
+
+struct Cell {
+	value: i32,
+}
+
+impl Cell with Src<i32> {
+	fun get(self): i32 {
+		self.value
+	}
+}
+
+struct Stage {
+	value: i32,
+}
+
+impl Stage with Flow<i32> {
+	fun start(own self): str {
+		"stage"
+	}
+}
+
+fun through_source(flow: dyn Src<i32>): str {
+	flow.start()
+}
+
+fun through_flow(flow: dyn Flow<i32>): str {
+	flow.start()
+}
+
+trait Label {
+	fun label(self): str;
+}
+
+trait Named with Label {
+	fun name(self): str;
+}
+
+impl type N: Named with Label {
+	fun label(self): str {
+		i"{self.name()} under {scope.get()}"
+	}
+}
+
+struct Plain {
+	value: i32,
+}
+
+impl Plain with Label {
+	fun label(self): str {
+		match scope.get_safe() {
+			Some(let value) => i"plain under {value}",
+			None => "plain, no scope",
+		}
+	}
+}
+
+struct Tag {
+	value: i32,
+}
+
+impl Tag with Named {
+	fun name(self): str {
+		"tag"
+	}
+}
+
+fun labelled(item: dyn Label): str {
+	item.label()
+}
+
+fun main() {
+	let cell: dyn Src<i32> = Cell { value = 1 };
+	print(scope.run("s", || through_source(cell)));
+	let erased: dyn Flow<i32> = Cell { value = 2 };
+	print(scope.run("t", || through_flow(erased)));
+	let stage: dyn Flow<i32> = Stage { value = 3 };
+	print(scope.run("u", || through_flow(stage)));
+	print(through_flow(Cell { value = 4 }));
+	let tag: dyn Label = Tag { value = 5 };
+	print(scope.run("v", || labelled(tag)));
+	let plain: dyn Label = Plain { value = 6 };
+	print(scope.run("w", || labelled(plain)));
+}

@@ -135,8 +135,13 @@ fn build_chain<'src>(
     for item in head {
         let member = match item {
             // A chain link splices verbatim — closure literals stay at the
-            // call site, so the context model is untouched.
-            ElementHeadItem::Chain(link) => link,
+            // call site, so the context model is untouched — and is marked as
+            // the head's (B620): the analyzer admits there only the methods
+            // that hand the element back.
+            ElementHeadItem::Chain(link) => {
+                let link_span = link.1;
+                (Node::ElementHeadLink(tag_text, Box::new(link)), link_span)
+            }
             ElementHeadItem::Event((event, event_span), handler) => {
                 let handler = *handler;
                 // Literal arity dispatches: `|| …` is `.on`, `|e| …` is

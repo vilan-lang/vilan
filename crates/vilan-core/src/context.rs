@@ -1603,6 +1603,13 @@ fn analyze(
             dispatch_sites.push((node.id(), call.call_id, candidates));
         }
     }
+    // B617: the declaration a `dyn` object's slot is typed by, with every
+    // member the slot can run — the blanket over a bounded generic among them.
+    // A call through the object threads what its candidates need, but the
+    // slot hands the implementation only what the DECLARATION declares, so a
+    // body-less declaration takes the union's hidden parameters (below, per
+    // context, once `needs` is settled).
+    let object_slot_unions = crate::dispatch_refine::object_slot_declaration_unions(program);
 
     // --- Entry points the call graph cannot see (for the coverage check's
     // dead-code exemption): a function with NO caller edges is either dead —
@@ -3385,6 +3392,23 @@ fn analyze(
 
         if !errors.is_empty() {
             continue;
+        }
+
+        // --- B617: an object slot's declaration holds what its union reads.
+        // A body-less declaration has no callers and no body, so joining
+        // `needs` here — after the propagation, the coverage fixpoint and every
+        // refusal above — changes nothing but its own parameter list: it
+        // takes the hidden parameter, BARE when a member of its union reads
+        // the context strictly, so the slot can hand each implementation the
+        // value the call through the object threaded. ---
+        for (declaration, union) in &object_slot_unions {
+            if needs.contains(declaration) || !union.iter().any(|member| needs.contains(member)) {
+                continue;
+            }
+            needs.insert(*declaration);
+            if union.iter().any(|member| strict.contains(member)) {
+                strict.insert(*declaration);
+            }
         }
 
         // --- Record the rewrite for this context. ---

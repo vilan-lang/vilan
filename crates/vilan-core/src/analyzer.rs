@@ -2747,6 +2747,22 @@ struct PreppedIs<'src> {
     pattern: WalkPattern<'src>,
 }
 
+/// E309: one `L <M>(args)` site — a generic call spaced from its name, which
+/// E291's whitespace rule reads as the comparison chain `(L < M) > (args)`.
+#[derive(Debug, Clone)]
+struct SpacedGenericCall {
+    /// The inner `<` binary.
+    inner: Id,
+    /// `L` and `M`, the name and the would-be generic argument.
+    left: Id,
+    middle: Id,
+    /// `L <M>` as written, and the call respelled tight (`pick<f64>(1, 2)`).
+    written: String,
+    tight: String,
+    /// From `L` through the `>`: what the steer underlines.
+    span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Implementation<'src> {
     pub subject: TypeId,
@@ -5812,6 +5828,28 @@ pub struct Analyzer<'src> {
     // entry and the literal's labels are its entries' — all of them, or none
     // (the parser refuses a written mix).
     entry_labels: HashMap<Id, &'src str>,
+    // B620: every method call an element HEAD wrote (`<div .f() />`), keyed
+    // by the call's entity: the element's tag and the link's span as written
+    // (`f()`, without the dot). A head admits only a method that hands the
+    // element back (`resolve_method_call`'s `Found` arm reads it); the same
+    // call written after the element is not in here and takes any method.
+    element_head_links: HashMap<Id, (&'src str, Span)>,
+    // E309: every `L <M>(args)` the walk met — E291 reads a spaced `<` after
+    // a name as a comparison, so the shape is `(L < M) > (args)` — keyed by
+    // the outer `>` binary. Decided after solving: when `L` names a generic
+    // function or a generic type, the comparison reading is certainly not
+    // what was meant, and one steer naming the spacing replaces its three
+    // refusals (`steer_spaced_generic_calls`).
+    spaced_generic_calls: HashMap<Id, SpacedGenericCall>,
+    // E309: the `L` and `M` operands of those sites, whose "is a type, not a
+    // value" refusal waits for the site's decision — the type a spaced list
+    // names (`f64` in `pick <f64>(1, 2)`) is a type BECAUSE it is a generic
+    // argument, and a generic type's own name (`List <i32>(3)`) is how the
+    // decision knows it is one.
+    spaced_generic_operands: HashSet<Id>,
+    // E309: those refusals, held: the message and the entity the name
+    // resolved to.
+    deferred_not_a_value: HashMap<Id, (String, Id)>,
     // B569 §4.1: a labelled literal matched BY NAME against a labelled type
     // whose order differs — `let p: (x: f64, y: f64) = (y = 7, x = 5);` —
     // keyed by the literal: the written entry each storage slot takes, and
@@ -8079,6 +8117,10 @@ impl<'src> Analyzer<'src> {
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             entry_labels: HashMap::default(),
+            element_head_links: HashMap::default(),
+            spaced_generic_calls: HashMap::default(),
+            spaced_generic_operands: HashSet::default(),
+            deferred_not_a_value: HashMap::default(),
             tuple_literal_layouts: HashMap::default(),
             tuple_literal_label_problems: HashMap::default(),
             named_arguments: Vec::new(),
@@ -39255,6 +39297,9 @@ impl<'src> Analyzer<'src> {
             Node::CssScope(..) => {
                 unreachable!("a css block's scope mark forwards to its inner expression")
             }
+            // B620's head-link mark is only ever a member, unwrapped by the
+            // member walk; one in expression position is a pass bug.
+            Node::ElementHeadLink(..) => Some(Expr::Error),
             // Likewise: `..e` forwards to its operand and marks it, so a
             // `Spread` node never reaches the entity match.
             Node::Spread(..) => unreachable!("`..` forwards to its operand expression"),
@@ -39645,6 +39690,16 @@ impl<'src> Analyzer<'src> {
         let Node::MemberAccessor(subject, member) = &node.0 else {
             unreachable!("only the `Node::MemberAccessor` arm walks here")
         };
+        // B620: a link an element head wrote is marked on its member; the
+        // mark is recorded against the call (`resolve_method_call` admits
+        // only the methods that hand the element back) and the link walks as
+        // the one written after the element would.
+        let (member, head_tag) = crate::node::unmark_head_link(member);
+        if let Some(tag) = head_tag
+            && matches!(member.0, Node::Call(..))
+        {
+            self.element_head_links.insert(id, (tag, member.1));
+        }
         let subject_id = self.walk_expr_node(subject, scope_id);
         match &member.0 {
             Node::Accessor(name) => {
@@ -40705,7 +40760,7 @@ impl<'src> Analyzer<'src> {
             }
         };
         let stage = match &value.0 {
-            Node::MemberAccessor(_, member) => match &member.0 {
+            Node::MemberAccessor(_, member) => match &crate::node::unmark_head_link(member).0.0 {
                 Node::Call(callee, _, _) => match &callee.0 {
                     Node::Accessor(name) => Some((*name, member.1)),
                     _ => None,
@@ -40845,6 +40900,97 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// E309: records `node`, a `>` binary, when it is the comparison reading of
+    /// a spaced generic call — `L <M>(args)`, where `L` and `M` are names or
+    /// paths, a space stands between `L` and the `<`, and a parenthesized list
+    /// follows the `>`. Only the SHAPE is known here; whether `L` names
+    /// something generic is decided after solving
+    /// (`steer_spaced_generic_calls`), so the operands' "is a type" refusals
+    /// wait for it.
+    fn note_spaced_generic_call(&mut self, node: &'src Spanned<Node<'src>>, id: Id, inner_id: Id) {
+        let Node::Binary(_, comparison, arguments) = &node.0 else {
+            return;
+        };
+        let Node::Binary(BinaryOp::Lt, left, middle) = &comparison.0 else {
+            return;
+        };
+        let names_a_path = |node: &Node<'_>| {
+            matches!(
+                node,
+                Node::Accessor(_) | Node::AccessorWithGenerics(..) | Node::StaticAccessor(..)
+            )
+        };
+        if !names_a_path(&left.0) || !names_a_path(&middle.0) {
+            return;
+        }
+        if self.current_source_id == DERIVED_SOURCE {
+            return;
+        }
+        let Some(text) = self.source_text(self.current_source_id) else {
+            return;
+        };
+        let (Some(before_list), Some(after_list)) = (
+            text.get(left.1.end..middle.1.start),
+            text.get(middle.1.end..arguments.1.start),
+        ) else {
+            return;
+        };
+        // `L <`: the `<` stands apart from the name — the spacing E291 reads
+        // as a comparison.
+        if before_list.trim() != "<" || !before_list.starts_with(char::is_whitespace) {
+            return;
+        }
+        // `> (`: the right operand opens a parenthesized list, the call's
+        // arguments (a lone parenthesized operand's span starts inside it).
+        let Some(after_greater) = after_list.trim_start().strip_prefix('>') else {
+            return;
+        };
+        let opens_a_list = match after_greater.trim() {
+            "" => text
+                .get(arguments.1.into_range())
+                .is_some_and(|written| written.starts_with('(')),
+            "(" => true,
+            _ => false,
+        };
+        if !opens_a_list {
+            return;
+        }
+        let Some(Expr::Binary(BinaryOp::Lt, left_id, middle_id)) =
+            self.expr_id_to_expr_map.get(&inner_id)
+        else {
+            return;
+        };
+        let (left_id, middle_id) = (*left_id, *middle_id);
+        let less_start = left.1.end + before_list.find('<').unwrap_or(0);
+        let greater_end = middle.1.end + after_list.find('>').unwrap_or(0) + 1;
+        let (Some(name), Some(written), Some(list), Some(rest)) = (
+            text.get(left.1.into_range()),
+            text.get(left.1.start..greater_end),
+            text.get(less_start..greater_end),
+            text.get(greater_end..node.1.end.max(greater_end)),
+        ) else {
+            return;
+        };
+        let tight = format!(
+            "{name}{}{}",
+            crate::parsing::tighten_generic_list(list),
+            rest.trim_start()
+        );
+        self.spaced_generic_operands.insert(left_id);
+        self.spaced_generic_operands.insert(middle_id);
+        self.spaced_generic_calls.insert(
+            id,
+            SpacedGenericCall {
+                inner: inner_id,
+                left: left_id,
+                middle: middle_id,
+                written: written.to_string(),
+                tight,
+                span: (left.1.start..greater_end).into(),
+            },
+        );
+    }
+
     /// `walk_expr_node_inner`'s `Node::Binary` arm, out of line (N169): its
     /// locals live only while this arm runs, not in the recursion's shared
     /// frame (the `tests/deep_nesting.rs` header measures that frame).
@@ -40900,6 +41046,9 @@ impl<'src> Analyzer<'src> {
             }
         };
         self.condition_polarity = outer_polarity;
+        if matches!(op, BinaryOp::Gt) {
+            self.note_spaced_generic_call(node, id, lhs_id);
+        }
         // Overloadable operators dispatch; orderings and `&&`/`||`
         // aren't overloadable but their operands are checked (B24).
         if is_overloadable_operator(*op)
@@ -56208,6 +56357,121 @@ impl<'src> Analyzer<'src> {
         });
     }
 
+    /// B620: whether `member_id`, called on `subject_type` under the call's
+    /// `substitution`, returns the receiver's own type — what an element head
+    /// admits (std's attribute methods return `View`, a trait default's
+    /// `Self` is the receiver). A return this call cannot yet decide (an open
+    /// generic, a return still being inferred) is admitted: the ordinary type
+    /// checks downstream see it, and the head's refusal is for the method
+    /// that certainly returns something else.
+    fn hands_back_the_element(
+        &mut self,
+        member_id: Id,
+        subject_type: &Type,
+        substitution: &SubstitutionContext,
+    ) -> bool {
+        let (declared, inferred_of) = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => {
+                let function_id = *function_id;
+                match self
+                    .functions
+                    .get(&function_id)
+                    .map(|function| function.return_type_id)
+                {
+                    Some(Some(declared)) => (Some(declared), None),
+                    Some(None) => (None, Some(function_id)),
+                    None => return true,
+                }
+            }
+            Some(Expr::ExternalFunction(function_id)) => {
+                match self.external_functions.get(function_id) {
+                    Some(function) => (Some(function.return_type_id), None),
+                    None => return true,
+                }
+            }
+            _ => return true,
+        };
+        let returned = match (declared, inferred_of) {
+            (Some(declared), _) => {
+                let declared = declared.get_type(self);
+                self.substitute_type(&declared, substitution)
+            }
+            (None, Some(function_id)) => {
+                match self.inferred_return_type(function_id, substitution, &mut HashSet::default())
+                {
+                    // `never` is also the answer to a re-entrant ask: no
+                    // evidence either way.
+                    Type::Never => return true,
+                    inferred => inferred,
+                }
+            }
+            (None, None) => return true,
+        };
+        match (&returned, subject_type) {
+            (Type::Struct(returned, _), Type::Struct(receiver, _)) => returned == receiver,
+            // A trait default's `Self` is the trait itself.
+            (Type::Trait(..), _) => true,
+            (Type::Generic(_) | Type::Unknown | Type::Unresolved | Type::Any, _) => true,
+            _ => false,
+        }
+    }
+
+    /// B620: the refusal of a head link whose method does not hand the element
+    /// back, at the link's name — naming the method, the type it belongs to
+    /// (and the trait that provides it, when one does), and the call written
+    /// on the finished element, where any method is fine.
+    fn refuse_element_head_link(
+        &mut self,
+        call_id: Id,
+        member_id: Id,
+        member_name: &str,
+        subject_type: &Type,
+        tag: &str,
+        link_span: Span,
+    ) {
+        let owner = self.pretty_print_type(subject_type, &HashMap::default());
+        let providing_trait = self.declaring_trait_of_member(member_id).or_else(|| {
+            let implementation = self.implementation_by_declaration.get(&member_id)?;
+            self.implementations[*implementation]
+                .trait_ids
+                .iter()
+                .copied()
+                .find(|trait_id| {
+                    self.traits.get(trait_id).is_some_and(|trait_| {
+                        trait_
+                            .declared_members
+                            .iter()
+                            .any(|(name, _)| *name == member_name)
+                    })
+                })
+        });
+        let through = providing_trait
+            .and_then(|trait_id| self.traits.get(&trait_id))
+            .map(|trait_| format!(" (from `{}`)", trait_.name))
+            .unwrap_or_default();
+        let written = self
+            .source_of_id(call_id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| text.get(link_span.into_range()))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{member_name}()"));
+        let name_span = self
+            .member_name_spans
+            .get(&call_id)
+            .copied()
+            .unwrap_or(link_span);
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: name_span,
+            msg: format!(
+                "`{member_name}` is a method of `{owner}`{through}, but an element head takes \
+                 only methods that hand the element back (`{owner}`); call it on the element \
+                 instead: `<{tag} />.{written}`"
+            ),
+        });
+    }
+
     fn resolve_method_call(
         &mut self,
         id: Id,
@@ -57102,6 +57366,26 @@ impl<'src> Analyzer<'src> {
                 }
                 // B424, door (b): see `default_own_generics_from_receiver`.
                 self.default_own_generics_from_receiver(member_id, argument_ids, &mut substitution);
+                // B620: a link written inside an element's opening tag must hand
+                // the element back. Decided here, once every own generic the
+                // call can bind is bound, and before the call is wired: a
+                // refused link is an `Expr::Error`, whose unresolved type keeps
+                // the rest of the chain (the next link, a `.child`, the use
+                // site) from fanning a second error out of this one.
+                if let Some(&(tag, link_span)) = self.element_head_links.get(&id)
+                    && !self.hands_back_the_element(member_id, &subject_type, &substitution)
+                {
+                    self.refuse_element_head_link(
+                        id,
+                        member_id,
+                        member_name,
+                        &subject_type,
+                        tag,
+                        link_span,
+                    );
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
                 // Keep the own-generic bindings as ordered values too — the
                 // OnConstraint emission re-targets a concrete impl's method,
                 // whose own-generic IDS differ from this (possibly trait)
@@ -65597,7 +65881,14 @@ impl<'src> Analyzer<'src> {
                         .insert(id, Expr::LengthValue(length));
                     return;
                 }
-                if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
+                if let Some(message) = self.bare_name_not_a_value(subject_id, name)
+                    && self.spaced_generic_operands.contains(&id)
+                {
+                    // E309: a spaced generic call's name or argument — held
+                    // for the site's decision (`steer_spaced_generic_calls`).
+                    self.deferred_not_a_value.insert(id, (message, subject_id));
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                } else if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                     let diagnostics_before = self.diagnostics.len();
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
@@ -68556,6 +68847,101 @@ impl<'src> Analyzer<'src> {
     /// exactly once per analysis, after the LAST `resolve_world` — committing
     /// a pre-entry world would freeze std constraints the entry still binds
     /// (the chained-`map` failure that pinned this split).
+    /// E309: decides each spaced generic call the walk noted
+    /// (`note_spaced_generic_call`). When its name is a generic function or a
+    /// generic type, the comparison chain E291 reads it as is not what was
+    /// meant — a function or a type has no ordering, and the `bool` the first
+    /// comparison makes has none either — so ONE steer at `L <M>` names the
+    /// spacing and the tight call, and the three refusals it replaces (the
+    /// two comparisons, the type in value position) are dropped. Any other
+    /// site keeps its refusals, the held ones pushed here. Answers the two
+    /// comparisons of every steered site, which the operator check skips.
+    fn steer_spaced_generic_calls(&mut self) -> HashSet<Id> {
+        let mut steered = HashSet::default();
+        if self.spaced_generic_calls.is_empty() && self.deferred_not_a_value.is_empty() {
+            return steered;
+        }
+        let mut sites: Vec<(Id, SpacedGenericCall)> =
+            std::mem::take(&mut self.spaced_generic_calls)
+                .into_iter()
+                .collect();
+        sites.sort_by_key(|(id, _)| id.0);
+        for (outer, site) in sites {
+            if !self.names_something_generic(site.left) {
+                continue;
+            }
+            self.deferred_not_a_value.remove(&site.left);
+            self.deferred_not_a_value.remove(&site.middle);
+            steered.insert(outer);
+            steered.insert(site.inner);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: site.span,
+                    msg: format!(
+                        "`{}`: a generic list touches its name — `{}`; spaced, the `<` after \
+                         a name is a comparison",
+                        site.written, site.tight
+                    ),
+                },
+                outer,
+            );
+        }
+        let mut held: Vec<(Id, (String, Id))> = std::mem::take(&mut self.deferred_not_a_value)
+            .into_iter()
+            .collect();
+        held.sort_by_key(|(id, _)| id.0);
+        for (id, (message, _)) in held {
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                    msg: message,
+                },
+                id,
+            );
+        }
+        self.spaced_generic_operands.clear();
+        steered
+    }
+
+    /// E309: whether the name `id` resolved to a function with generic
+    /// parameters, or (held as "a type, not a value") a struct or enum with
+    /// them.
+    fn names_something_generic(&self, id: Id) -> bool {
+        let generic_function = |target: &Id| match self.expr_id_to_expr_map.get(target) {
+            Some(Expr::Function(function_id)) => self
+                .functions
+                .get(function_id)
+                .is_some_and(|function| !function.generic_parameter_constraint_ids.is_empty()),
+            Some(Expr::ExternalFunction(function_id)) => self
+                .external_functions
+                .get(function_id)
+                .is_some_and(|function| !function.generic_parameter_constraint_ids.is_empty()),
+            _ => false,
+        };
+        match self.expr_id_to_expr_map.get(&id) {
+            Some(Expr::Local(target)) => generic_function(target),
+            _ => match self.deferred_not_a_value.get(&id) {
+                Some((_, target)) => match self.expr_id_to_expr_map.get(target) {
+                    Some(Expr::Struct(struct_id)) => {
+                        self.structs.get(struct_id).is_some_and(|struct_| {
+                            !struct_.generic_parameter_constraint_ids.is_empty()
+                        })
+                    }
+                    Some(Expr::Enum(enum_id)) => self
+                        .enums
+                        .get(enum_id)
+                        .is_some_and(|enum_| !enum_.generic_parameter_constraint_ids.is_empty()),
+                    _ => false,
+                },
+                None => false,
+            },
+        }
+    }
+
     fn finalize_build(&mut self) {
         // M110 S6: the drains' anchors end here; what `build()` mints past
         // this point is counted unanchored (M134's territory).
@@ -69307,7 +69693,13 @@ impl<'src> Analyzer<'src> {
             );
         }
 
+        let steered_comparisons = self.steer_spaced_generic_calls();
         for (binary_id, op, lhs_id) in std::mem::take(&mut self.prepped_binary_ops) {
+            // E309: the comparison reading of a spaced generic call already
+            // has its one steer.
+            if steered_comparisons.contains(&binary_id) {
+                continue;
+            }
             let mut lhs_type = self.infer_type(lhs_id, &Type::Unknown, &HashMap::default());
             // B389: a literal LEFT operand is typed by its right one, exactly
             // as inference typed it (`1 + n`, `0 < n` over `n: u53`) — read at

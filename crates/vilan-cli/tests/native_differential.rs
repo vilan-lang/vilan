@@ -13544,6 +13544,30 @@ fn b606_a_mirrored_stores_handle_as_a_dyn_source_builds_on_both_backends() {
     );
 }
 
+/// B617: a call through a `dyn` object whose slot runs a blanket impl over a
+/// bounded generic. The table's slot is typed by the trait's body-less
+/// DECLARATION, which threaded none of the contexts the blanket reads, so the
+/// native table handed the blanket `None` (B606's stand-in) where JS passed
+/// the value the call threaded: `blanket, no scope` natively, `blanket under s`
+/// on JS. The declaration now carries its whole union's hidden parameters; a
+/// STRICT reader in the union makes the slot's value bare, and a safe
+/// implementation beside it is handed `Some(..)`.
+#[test]
+fn b617_a_dyn_slot_hands_a_blanket_impl_the_contexts_it_reads() {
+    let staged = stage();
+    let file = "native_probe_b617_dyn_slot_blanket_context.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/dyn_slot_blanket_context.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a blanket impl run through a `dyn` slot must read the threaded context natively"
+    );
+}
+
 /// B605 + B606: A153 S2's `states()` — the remote handle telling Pending,
 /// Ready, Absent and Failed through `TransientSource::states()`, whose pipes
 /// are a generic `combine(..).derive(..)` over the handle as a `dyn Source` —

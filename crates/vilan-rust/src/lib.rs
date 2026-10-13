@@ -14746,13 +14746,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // context. The two lists differ: the pass threads a hidden
             // argument at a trait call when some impl of the member reads the
             // context, so an impl that reads none (`RemoteStoreSome`'s
-            // `attach_observer`) takes fewer, and one the declaration's union
-            // missed (the `Source` blanket's `start`, reading `turn_scope` and
-            // `ambient_nursery` where `Flow::start` threads nothing) takes
-            // more. A missing context of the SAFE flavour is `None` — the
-            // `undefined` the JS table passes, which that flavour reads as
-            // "no ambient value"; a missing STRICT one has no value to stand
-            // in and is refused.
+            // `attach_observer`) takes fewer. A body-less declaration threads
+            // every context its union reads (B617 — the `Source` blanket's
+            // `start`, reading `turn_scope` and `ambient_nursery`, gives
+            // `Flow::start` both), so only a DEFAULT's declaration, whose
+            // parameters are its own body's, can miss one an override reads:
+            // a missing context of the SAFE flavour is `None` there — the
+            // `undefined` the JS table passes, which that flavour reads as "no
+            // ambient value"; a missing STRICT one has no value to stand in
+            // and is refused.
             let forwarded_here = self.object_slot_arguments(slot, &target_parameters);
             let Some(forwarded_here) = forwarded_here else {
                 self.object_impls
@@ -14792,8 +14794,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// B606: the arguments one object slot hands its implementation after the
     /// receiver, matched parameter by parameter — see
     /// [`Self::ensure_object_impl`]. `None` when the implementation's written
-    /// parameters do not line up with the declaration's, or it reads a
-    /// STRICT context the declaration does not thread.
+    /// parameters do not line up with the declaration's, or it reads a context
+    /// the declaration does not thread — any context, for a body-less
+    /// declaration (B617: it threads its whole union's), and a STRICT one for
+    /// a default's.
     fn object_slot_arguments(
         &self,
         slot: &ObjectSlot,
@@ -14805,15 +14809,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .get(parameter)
                 .copied()
         };
-        let declared: Vec<Id> = self
-            .program
-            .functions
-            .get(&slot.declaration)?
-            .parameters
-            .iter()
-            .skip(1)
-            .copied()
-            .collect();
+        let declaration = self.program.functions.get(&slot.declaration)?;
+        // B617: a body-less declaration carries its whole union's hidden
+        // parameters (`dispatch_refine::object_slot_declaration_unions`), so
+        // every context an implementation reads is threaded and the stand-in
+        // below is for a DEFAULT's declaration alone, whose parameters are its
+        // own body's.
+        let union_declared = !declaration.has_body;
+        let declared: Vec<Id> = declaration.parameters.iter().skip(1).copied().collect();
         if declared.len() != slot.forwarded.len() {
             return None;
         }
@@ -14829,18 +14832,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             match hidden(parameter) {
                 None => arguments.push(written.next()?.clone()),
                 Some(context) => {
+                    let optional = |parameter: &Id| {
+                        self.program
+                            .context_optional_hidden_parameters
+                            .contains(parameter)
+                    };
                     let threaded = declared
                         .iter()
                         .zip(&slot.forwarded)
-                        .find(|(declared, _)| hidden(declared) == Some(context))
-                        .map(|(_, name)| name.clone());
+                        .find(|(declared, _)| hidden(declared) == Some(context));
                     match threaded {
-                        Some(name) => arguments.push(name),
-                        None if self
-                            .program
-                            .context_optional_hidden_parameters
-                            .contains(parameter) =>
-                        {
+                        // B617: the union's flavour is strict when any of its
+                        // members reads strictly; a SAFE implementation then
+                        // takes the bare value as present.
+                        Some((declared, name)) if !optional(declared) && optional(parameter) => {
+                            arguments.push(format!("Some({name})"));
+                        }
+                        Some((_, name)) => arguments.push(name.clone()),
+                        None if !union_declared && optional(parameter) => {
                             arguments.push("None".to_string());
                         }
                         None => return None,
