@@ -23,6 +23,29 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**B619: the module drain counts the modules it mints after its first round — `VILAN_COUNTERS` prints `late-round-mints=N` — and the residue B603 left is pinned.** A module that only macro-GENERATED code reaches (a derive's generated `import std::path::basename;`) is discovered once the first round's macro epilogue has expanded, so it mints after every module of the first round, where a redundant written import of it would mint it in the first and move every id after it. No instance exists on the estate (zero on kolt's two legs, the eleven examples and every corpus file); the counter (`counters::late_round_mints`, counted at the drain's minting loop in `analyzer.rs`, outside the macro worlds) makes the first one visible, three pins in `tests/inference/macros.rs` hold the shape (generated-only reaches a later round, the written import does not, both run), and the refusal is the std-prefix P3 key check's when P3 lands (a closure over WRITTEN imports cannot name a world that grew in a later round).
+
+---
+
+<!-- family: performance -->
+**M141: the warm const pass sheds ~23 M instructions of non-evaluation work (-11 % of `const_eval::evaluate` on kolt's client, -0.28 % of the whole check) — and the item's premise was half wrong.** Measured (callgrind, kolt's client, the table warm) the pass is 210 M instructions, of which lowering is 42 M and interpretation 32 M; the rest is NOT a rebuilt `ConstWorld` (built once per analysis, 4 M) or a re-walked reach (computed once per site: 169 `reach_from`, no retries), but the whole-program capability check (`check_const_only`, 70 M: the refined dispatch edges 36 M and `candidates_of` 17 M), the `Expr::Local` index (30 M) and the world's drop (6 M). `check_const_only` now asks `candidates_of` once per (import scope, name) instead of once per dispatch site (-13 M) and builds the refined edges only when R has a member to look them up for (a program whose runtime code reaches no channel verb pays none of it; kolt's does, through std's style functions), and the explicit pass indexes only the locals that lie inside a `const` expression (-10 M; the inference sweep keeps the full index). Answers are identical; the rest is filed (M141 residue: the two `refined_edges` calls share their program-wide scans, the local index wants the analyzer to record a const expression's locals, the per-site reach closure wants a memo).
+
+---
+
+<!-- family: tooling -->
+**N173: `vilan test`'s failing test reports its stack in `.vl` lines.** It printed `at check (file:///tmp/vilan-test-1477831.mjs:18:2)` — a place that is gone when the run ends — where `vilan run` of the same code reads `main_test.vl:4:2`. `vilan test` now builds the test's source map (one per test file, about 0.3 % of its build), writes it beside the temp script and hands node `--enable-source-maps`, the way `vilan run` does (E257 S5); the map and the script are removed after the run. std's `assert` frame names std's file.
+
+---
+
+<!-- family: tooling -->
+**N174: the LSP latency harness SKIPS a scenario whose anchors are missing, by name, and runs the rest — and the two dead E121 rows are re-anchored on the owner's kolt as it is.** `scripts/lsp-latency.py` used to refuse the whole run when any named scenario's edit, hover, completion or References anchor had left the tree, which left Order 51's seal with no LSP rows at all after the mirrored-store exhibit (A153 S5, kolt `dee494ab`) rewrote `model.vl` and `channel.vl`. A scenario that does not land is now skipped with its reason on stderr (`SKIPPED parse break: …`) and in the JSON (`skipped: [..]` with `skipped_reasons`, the `parse repair` row named beside its break), and the run refuses only when nothing is left. `perf_gate.py seal` prints the skipped list beside the measured LSP rows and is RED on a skipped MANDATE row (`mandate = true` in `perf/budgets.toml`: leaf, css, parse break — or a mandate row the BASE side skipped), a note on an informational one; the report carries the skipped rows, the rows measured, and a `series` string per re-anchored row. `model.vl keystroke`'s References probe now asks `fun global()` (the mirrored store's reader, used in `sidebar.vl` and `views.vl`), and `parse break` / `parse repair` edit `channel_name.adopt(channel.current_name());` in `channel.vl` (a statement over a `g.channels()` boundary): the shapes are kept, the figures are NEW series. `VILAN_PERF_LSP_SCENARIOS` stays as the explicit form.
+
+---
+
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

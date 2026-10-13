@@ -52,10 +52,13 @@ every repetition starts from the same text. One document is open at a time.
 to the scratch location; no git is run in it) instead of `--kolt` at a commit:
 across a breaking release the tip's run takes the migrated kolt while the base's
 keeps the release's commit. Every anchor of the chosen scenarios is looked up in
-the copy BEFORE the server starts, and the run refuses — naming each one — when
-an anchor is missing, or when an edit's anchor occurs more than once (the edit
-would land on the first, which may not be the place it means). `--json` records
-which source the run replayed, so the seal can say the two sides differed.
+the copy BEFORE the server starts. A scenario whose anchor is missing, or whose
+edit anchor occurs more than once (the edit would land on the first, which may
+not be the place it means), is SKIPPED by name with the reason in the log
+(N174) and the others run; the run refuses only when no scenario is left.
+`--json` records the skipped names (`skipped`, with `skipped_reasons`) and which
+source the run replayed, so the seal can say a mandate row was not measured and
+that the two sides differed.
 
 A MEASUREMENT OF A BROKEN PROGRAM IS NOT A MEASUREMENT (N165): the server stops
 early on a program with errors, so every row reads a fraction of its true cost.
@@ -159,9 +162,12 @@ SCENARIOS = [
         "hover": ("create_channel(name)", 3),
         "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
         # M104's hybrid: model.vl open ALONE answers Find References from its
-        # entry's world, built on demand after an edit — `messages` is used in
-        # `channel.vl`, which is not open.
-        "references": ("fun messages(self)", 5),
+        # entry's world, built on demand after an edit — `global()` (the mirrored
+        # store's reader) is used in `sidebar.vl` and `views.vl`, which are not
+        # open. N174: the anchor was `fun messages(self)` until the mirrored-store
+        # exhibit (A153 S5, kolt@dee494ab) moved it out of model.vl - the
+        # References figures of this row are a NEW series from Order 52 on.
+        "references": ("fun global()", 5),
     },
     {
         # The same edit with the files that import the model OPEN beside it,
@@ -184,13 +190,18 @@ SCENARIOS = [
         "completion": ('style::element("placeholder")', len("style::")),
     },
     {
+        # N174: a statement over a `g.channels()` boundary in a leaf. The anchors were
+        # `let messages = channel.messages();` until the mirrored-store exhibit
+        # (A153 S5, kolt@dee494ab) rewrote channel.vl; `channel.current_name()` reads
+        # `g.channels().at(self.id).some().name()` (model.vl) - a NEW series from
+        # Order 52 on (the shape is the same: a break in a leaf file, then its repair).
         "name": "parse break",
         "file": "src/channel.vl",
-        "edit": ("\tlet messages = channel.messages();", 1),
+        "edit": ("\t\t\tchannel_name.adopt(channel.current_name());", 3),
         "text": "(",
         "repair": "parse repair",
-        "hover": ("channel.messages();", 10),
-        "completion": ("channel.messages();", len("channel.")),
+        "hover": ("channel.current_name());", 10),
+        "completion": ("channel.current_name());", len("channel.")),
     },
 ]
 
@@ -523,44 +534,63 @@ ANCHOR_KINDS = ("edit", "hover", "completion", "references")
 EDITED_ANCHOR_KINDS = ("hover", "completion")
 
 
-def anchor_problems(root, scenarios):
-    """Every anchor of `scenarios` checked against the tree at `root` before anything runs: a missing
+def scenario_problems(root, scenario):
+    """One scenario's anchors checked against the tree at `root` before anything runs: a missing
     anchor, an EDIT anchor that occurs more than once (the edit lands on the first occurrence, which may
-    not be the place the script means), or a hover/completion anchor the scenario's own edit destroys —
+    not be the place the script means), or a hover/completion anchor the scenario's own edit destroys -
     those are resolved in the EDITED buffer (N150: the `shared.vl` row's completion anchor spanned its
     insertion point, so the preflight passed and every run died mid-scenario). Answers the problems in
     words (empty: every anchor lands)."""
     problems = []
-    for scenario in scenarios:
-        path = root / scenario["file"]
-        try:
-            text = path.read_text()
-        except OSError as error:
-            problems.append(f"{scenario['name']}: cannot read {scenario['file']} ({error.strerror})")
+    path = root / scenario["file"]
+    try:
+        text = path.read_text()
+    except OSError as error:
+        return [f"{scenario['name']}: cannot read {scenario['file']} ({error.strerror})"]
+    for kind in ANCHOR_KINDS:
+        if kind not in scenario:
             continue
-        for kind in ANCHOR_KINDS:
-            if kind not in scenario:
-                continue
-            needle = scenario[kind][0]
-            count = text.count(needle)
-            if count == 0:
-                problems.append(f"{scenario['name']}: the {kind} anchor {needle!r} is not in {scenario['file']}")
-            elif count > 1 and kind == "edit":
-                problems.append(f"{scenario['name']}: the edit anchor {needle!r} occurs {count} times in "
-                                f"{scenario['file']} - the edit would land on the first")
-        edit_needle, edit_delta = scenario["edit"]
-        at = text.find(edit_needle)
-        if at < 0:
+        needle = scenario[kind][0]
+        count = text.count(needle)
+        if count == 0:
+            problems.append(f"{scenario['name']}: the {kind} anchor {needle!r} is not in {scenario['file']}")
+        elif count > 1 and kind == "edit":
+            problems.append(f"{scenario['name']}: the edit anchor {needle!r} occurs {count} times in "
+                            f"{scenario['file']} - the edit would land on the first")
+    edit_needle, edit_delta = scenario["edit"]
+    at = text.find(edit_needle)
+    if at < 0:
+        return problems
+    edited = text[: at + edit_delta] + scenario["text"] + text[at + edit_delta :]
+    for kind in EDITED_ANCHOR_KINDS:
+        if kind not in scenario:
             continue
-        edited = text[: at + edit_delta] + scenario["text"] + text[at + edit_delta :]
-        for kind in EDITED_ANCHOR_KINDS:
-            if kind not in scenario:
-                continue
-            needle = scenario[kind][0]
-            if needle in text and needle not in edited:
-                problems.append(f"{scenario['name']}: the {kind} anchor {needle!r} is not in {scenario['file']} "
-                                f"after the scenario's edit - it is asked against the edited text")
+        needle = scenario[kind][0]
+        if needle in text and needle not in edited:
+            problems.append(f"{scenario['name']}: the {kind} anchor {needle!r} is not in {scenario['file']} "
+                            f"after the scenario's edit - it is asked against the edited text")
     return problems
+
+
+def anchor_problems(root, scenarios):
+    """Every scenario's problems (`scenario_problems`), flat."""
+    return [problem for scenario in scenarios for problem in scenario_problems(root, scenario)]
+
+
+def split_by_anchors(root, scenarios):
+    """N174: (the scenarios whose anchors all land, {name: [reasons]} for the others). A scenario that
+    does not land is SKIPPED by name, not the whole run refused: the rest are still measurements. The
+    skip names the repair row too (`parse break` -> `parse repair`), the seal judges rows by those names."""
+    runnable, skipped = [], {}
+    for scenario in scenarios:
+        problems = scenario_problems(root, scenario)
+        if not problems:
+            runnable.append(scenario)
+            continue
+        for name in (scenario["name"], scenario.get("repair")):
+            if name:
+                skipped[name] = problems
+    return runnable, skipped
 
 
 def end_position(text):
@@ -1134,11 +1164,22 @@ def main():
     scenarios = [s for s in SCENARIOS if not arguments.scenario or s["name"] in arguments.scenario]
     if not scenarios:
         raise SystemExit(f"no scenario named {arguments.scenario}; the names: {[s['name'] for s in SCENARIOS]}")
-    problems = anchor_problems(root, scenarios)
-    if problems:
+    # N174: a scenario whose anchors are missing is SKIPPED by name, with the reason in the log and
+    # `skipped` in the JSON; the others run. (It used to refuse the whole run, which left Order 51's seal
+    # with no LSP rows at all until two scenarios were left out by hand.) The seal reads the list: a
+    # skipped MANDATE row is red there, an informational one a note.
+    skipped = {}
+    for name in arguments.scenario or []:
+        if name not in {s["name"] for s in SCENARIOS}:
+            skipped[name] = [f"{name}: no scenario of that name (the names: {[s['name'] for s in SCENARIOS]})"]
+    scenarios, anchors_missing = split_by_anchors(root, scenarios)
+    skipped.update(anchors_missing)
+    for name, reasons in skipped.items():
+        print(f"SKIPPED {name}: " + "; ".join(reasons), file=sys.stderr)
+    if not scenarios:
         raise SystemExit(
             f"the edit script does not land in {described}:\n  "
-            + "\n  ".join(problems)
+            + "\n  ".join(problem for reasons in skipped.values() for problem in dict.fromkeys(reasons))
             + "\nNothing was run. Pass the commit the script names, or leave the scenario out with --scenario."
         )
 
@@ -1198,9 +1239,22 @@ def main():
         f"{os.cpu_count()} cores"
     )
     print_table(cold_rows, rows, header)
+    if skipped:
+        print()
+        print("SKIPPED (anchors missing in this source; not measured): " + ", ".join(skipped))
     if arguments.json:
         Path(arguments.json).write_text(
-            json.dumps({"header": header, "source": source, "open": cold_rows, "edits": rows}, indent=1)
+            json.dumps(
+                {
+                    "header": header,
+                    "source": source,
+                    "open": cold_rows,
+                    "edits": rows,
+                    "skipped": list(skipped),
+                    "skipped_reasons": skipped,
+                },
+                indent=1,
+            )
         )
     if arguments.callgrind:
         callgrind_report(arguments.callgrind, arguments.top)

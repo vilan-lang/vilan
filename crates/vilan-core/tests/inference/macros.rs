@@ -5910,3 +5910,110 @@ fn b376_a_users_own_derive_macro_is_not_refused() {
         "hello\n",
     );
 }
+
+// --- B619: a module only macro-GENERATED code reaches mints in a LATER round ---
+//
+// B603 made the drain's load order canonical per ROUND: the whole reachable set
+// of a round is discovered, then minted in `load_order_key` order. A module that
+// only a macro's generated code names is not reachable until the round's macro
+// epilogue has expanded, so it mints in the NEXT round, after every module of
+// the first - and a redundant WRITTEN import of the same module would mint it in
+// the first round instead and move every id after it. No instance exists on the
+// estate (kolt's two legs, the eleven examples and all 298 corpus files read
+// zero); `counters::late_round_mints` counts them so a std-prefix P3 key check
+// can refuse a world that grew this way, and so the first instance is seen.
+
+/// A macro whose generated impl imports `std::path`, plus a user of it. The
+/// entry writes no import of `std::path` itself unless `written_import` is set.
+fn generated_std_path_program(written_import: bool) -> String {
+    let import = if written_import {
+        "import std::path::basename;\n        "
+    } else {
+        ""
+    };
+    format!(
+        r#"
+        import std::io::print;
+        {import}
+        macro fun Leafy(item: Item): Source {{
+            import macro_std::source;
+            import macro_std::meta::{{ Item, Source, StructItem }};
+            import macro_std::option::Option::{{ self, Some, None }};
+
+            let target = match item.as_struct() {{
+                Some(let found) => found,
+                None => StructItem {{ name = "?", fields = [], generics = [] }},
+            }};
+            source(
+                "impl " + target.name + " {{\nfun leaf(self): str {{\nimport std::path::basename;\nbasename(\"a/b.txt\")\n}}\n}}\n",
+            )
+        }}
+
+        [derive(Leafy)]
+        struct Widget {{
+            size: i32,
+        }}
+
+        fun main() {{
+            print(Widget {{ size = 3 }}.leaf());
+        }}
+
+        main();
+        "#
+    )
+}
+
+/// The late-round mints one analysis of `source` made, and its diagnostics.
+fn late_round_mints_of(source: &str) -> (u64, Vec<String>) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let before = vilan_core::counters::late_round_mints();
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_program, errors) = vilan_core::analyze_source(
+                leaked,
+                &std_spec(),
+                std::path::Path::new("."),
+                std::path::Path::new("test.vl"),
+                Some(vilan_core::Platform::default()),
+                &vilan_core::Workspace::default(),
+            );
+            (
+                vilan_core::counters::late_round_mints() - before,
+                errors.into_iter().map(|error| error.msg).collect(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn b619_a_module_only_generated_code_reaches_mints_in_a_later_round() {
+    let (late, messages) = late_round_mints_of(&generated_std_path_program(false));
+    assert!(messages.is_empty(), "{messages:#?}");
+    assert!(
+        late >= 1,
+        "`std::path` is named only by the macro's generated impl: the drain finds it in the \
+         round after the macro epilogue, and the counter must say so (got {late})"
+    );
+}
+
+#[test]
+fn b619_the_same_module_imported_in_writing_mints_in_the_first_round() {
+    let (late, messages) = late_round_mints_of(&generated_std_path_program(true));
+    assert!(messages.is_empty(), "{messages:#?}");
+    assert_eq!(
+        late, 0,
+        "a written import puts the module in the first round"
+    );
+}
+
+#[test]
+fn b619_the_programs_run_the_same_with_or_without_the_written_import() {
+    // The residue is about ORDER, not meaning: both spellings run.
+    for written in [false, true] {
+        assert_compiles_and_runs(&generated_std_path_program(written), "b.txt\n");
+    }
+}

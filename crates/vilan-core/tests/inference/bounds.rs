@@ -15134,3 +15134,108 @@ fn m133_a_repeated_ground_receiver_is_served_from_the_memo() {
          the memo ({served_one} -> {served_eleven})"
     );
 }
+
+// --- M141: the capability check refines dispatch only when R has a member -----
+//
+// `check_const_only` read the refined dispatch edges of every runtime dispatch
+// site, but only ever looked one up for a member of R - the functions that reach
+// a channel verb outside a `const`. A program whose runtime code reaches none (kolt's
+// client; the whole estate) paid for enumerating every dispatch site, listing its
+// candidates and refining the program: 54 of the check's 70 M instructions. The
+// edges are now built on the first member popped from R's worklist.
+
+/// The number of times the capability check built the refined edges during one
+/// analysis of `source`, and its diagnostics' messages.
+fn const_only_refinements_of(source: &str) -> (usize, Vec<String>) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_program, errors) = vilan_core::analyze_source(
+                leaked,
+                &std_spec(),
+                std::path::Path::new("."),
+                std::path::Path::new("test.vl"),
+                Some(vilan_core::Platform::default()),
+                &vilan_core::Workspace::default(),
+            );
+            (
+                vilan_core::const_eval::const_only_refinements(),
+                errors.into_iter().map(|error| error.msg).collect(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn m141_a_program_with_no_runtime_path_to_a_channel_verb_never_refines_dispatch() {
+    // `emit` is called inside `const` only, in a program that also dispatches
+    // through a bound at runtime: R is empty, so the refinement has nothing to
+    // look up.
+    let (refinements, messages) = const_only_refinements_of(
+        r#"
+        import std::web::asset::emit;
+        trait Shape {
+            fun area(self): i32;
+        }
+        struct Square { side: i32 }
+        impl Square with Shape {
+            fun area(self): i32 {
+                self.side * self.side
+            }
+        }
+        fun total<S: Shape>(shape: S): i32 {
+            shape.area()
+        }
+        let _style = const {
+            emit("css", ".a{}");
+            1
+        };
+        fun main() {
+            let _n = total(Square { side = 2 });
+        }
+        main();
+        "#,
+    );
+    assert!(messages.is_empty(), "{messages:#?}");
+    assert_eq!(refinements, 0, "the refinement ran with an empty R");
+}
+
+#[test]
+fn m141_a_runtime_path_to_a_channel_verb_still_refines_and_is_refused() {
+    let (refinements, messages) = const_only_refinements_of(
+        r#"
+        import std::web::asset::emit;
+        trait Shape {
+            fun area(self): i32;
+        }
+        struct Square { side: i32 }
+        impl Square with Shape {
+            fun area(self): i32 {
+                emit("css", ".a{}");
+                self.side
+            }
+        }
+        fun total<S: Shape>(shape: S): i32 {
+            shape.area()
+        }
+        fun main() {
+            let _n = total(Square { side = 2 });
+        }
+        main();
+        "#,
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("compile-time-only")),
+        "a dispatch into a member that reaches `emit` is refused: {messages:#?}"
+    );
+    assert_eq!(
+        refinements, 1,
+        "R had a member, so the refined edges were built once"
+    );
+}

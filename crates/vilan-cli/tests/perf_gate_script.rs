@@ -1331,3 +1331,273 @@ perf_gate.main()
     assert!(ok, "the flag beats the environment:\n{text}");
     // The CPU threshold is untouched by it: a 7% CPU rise stays inside 1.10.
 }
+
+// --- N174: a scenario whose anchors are missing is SKIPPED, not the run refused ---
+
+/// A fake `vilan-lsp` for the harness: framed JSON-RPC over stdio, every request answered `null`,
+/// an empty `publishDiagnostics` for each `didOpen` / `didChange`.
+#[cfg(target_os = "linux")]
+fn fake_lsp(scratch: &Scratch) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = scratch.path("fake-vilan-lsp");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json, sys
+if "--version" in sys.argv:
+    print("vilan-lsp fake")
+    sys.exit(0)
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+stream = sys.stdin.buffer
+while True:
+    length = None
+    while True:
+        line = stream.readline()
+        if not line:
+            sys.exit(0)
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1])
+    message = json.loads(stream.read(length))
+    method = message.get("method")
+    if method == "exit":
+        sys.exit(0)
+    if "id" in message:
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+    if method in ("textDocument/didOpen", "textDocument/didChange"):
+        document = message["params"]["textDocument"]
+        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+              "params": {"uri": document["uri"], "diagnostics": []}})
+"#,
+    )
+    .expect("write the fake server");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("make it executable");
+    path
+}
+
+/// N174: Order 51's seal measured NO LSP rows because two scenarios' anchors had left kolt and the
+/// harness refused the whole run. A scenario whose anchors are missing is now skipped by name (the
+/// reason on stderr, `skipped` in the JSON, the `repair` row named too) and the others run.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lsp_harness_skips_a_scenario_whose_anchors_are_missing_and_runs_the_rest() {
+    let scratch = Scratch::new("lsp-skip");
+    let tree = scratch.path("tree");
+    fs::create_dir_all(tree.join("src")).expect("create the tree");
+    fs::write(
+        tree.join("src/views.vl"),
+        "fun a() {\n\tlet theme_modal = create_theme_modal();\n\tget_prefs().theme.derive(1);\n}\n",
+    )
+    .expect("write the views");
+    // channel.vl holds none of the parse-break anchors; styles.vl does not exist.
+    fs::write(tree.join("src/channel.vl"), "fun b() {}\n").expect("write channel.vl");
+    let json = scratch.path("out.json");
+    let (ok, text) = lsp_harness(&[
+        "--source",
+        tree.to_str().expect("utf-8"),
+        "--scratch",
+        scratch.path("work").to_str().expect("utf-8"),
+        "--lsp",
+        fake_lsp(&scratch).to_str().expect("utf-8"),
+        "--vilan",
+        fake_vilan(&scratch).to_str().expect("utf-8"),
+        "--runs",
+        "1",
+        "--scenario",
+        "leaf keystroke",
+        "--scenario",
+        "css keystroke",
+        "--scenario",
+        "parse break",
+        "--json",
+        json.to_str().expect("utf-8"),
+    ]);
+    assert!(ok, "a run with one landing scenario refused:\n{text}");
+    assert!(
+        text.contains("SKIPPED css keystroke: css keystroke: cannot read src/styles.vl")
+            && text.contains("SKIPPED parse break: parse break: the edit anchor")
+            && text.contains("SKIPPED parse repair:"),
+        "each skipped scenario is named with its reason:\n{text}"
+    );
+    assert!(
+        text.contains("SKIPPED (anchors missing in this source; not measured): css keystroke, parse break, parse repair"),
+        "{text}"
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json).expect("the JSON is written"))
+            .expect("the JSON parses");
+    assert_eq!(
+        written["skipped"],
+        serde_json::json!(["css keystroke", "parse break", "parse repair"])
+    );
+    let edits = written["edits"].as_object().expect("the edits");
+    assert!(
+        edits.contains_key("leaf keystroke"),
+        "the landing scenario ran: {written}"
+    );
+    assert!(
+        !edits.contains_key("css keystroke") && !edits.contains_key("parse break"),
+        "a skipped scenario has no row: {written}"
+    );
+}
+
+/// N174: the seal reads the skipped list. A skipped MANDATE row (`mandate = true`: leaf, css, parse
+/// break) is RED - on the tip's harness run through `e121`, on the base's through the seal - an
+/// informational one a note, and the report prints the skipped rows and a row's series break.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_seal_is_red_on_a_skipped_mandate_row_and_notes_an_informational_one() {
+    let scratch = Scratch::new("lsp-skip-seal");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(
+        &budgets,
+        format!(
+            "{HEADER}\n[[e121]]\nscenario = \"leaf keystroke\"\nmetric = \"diagnostics_cpu_ms\"\ntarget_ms = 500\n\
+             green_seals = 0\nblocking = false\nmandate = true\n\
+             \n[[e121]]\nscenario = \"parse break\"\nmetric = \"diagnostics_cpu_ms\"\ntarget_ms = 500\n\
+             green_seals = 0\nblocking = false\nmandate = true\nseries = \"re-anchored\"\n\
+             \n[[e121]]\nscenario = \"model.vl keystroke\"\nmetric = \"diagnostics_cpu_ms\"\ntarget_ms = 500\n\
+             green_seals = 0\nblocking = false\n"
+        ),
+    )
+    .expect("write the fixture budgets");
+    let harness = |name: &str, skipped: &[&str]| {
+        let path = scratch.path(name);
+        let names = skipped
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reasons = skipped
+            .iter()
+            .map(|n| format!("\"{n}\": [\"{n}: the edit anchor 'x' is not in src/y.vl\"]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = ["leaf keystroke", "parse break", "model.vl keystroke"]
+            .iter()
+            .filter(|n| !skipped.contains(n))
+            .map(|n| format!("\"{n}\": [{{\"diagnostics_cpu_ms\": 100}}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"header": "", "source": {{"kind": "commit", "sha": "aaaa"}}, "open": {{}}, "edits": {{{rows}}}, "skipped": [{names}], "skipped_reasons": {{{reasons}}}}}"#
+            ),
+        )
+        .expect("write a harness JSON");
+        path
+    };
+    // The tip's harness run skipped a mandate row: RED through `e121`.
+    let tip_mandate = harness("tip-mandate.json", &["parse break"]);
+    let (ok, text) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &["e121", "--lsp-json", tip_mandate.to_str().expect("utf-8")],
+    );
+    assert!(
+        !ok && text.contains(
+            "E121 parse break: SKIPPED by the harness, a mandate row that was not measured"
+        ),
+        "a skipped mandate row passed:\n{text}"
+    );
+    // An informational row skipped: the verdict stays green and the row reads `skipped`.
+    let tip_note = harness("tip-note.json", &["model.vl keystroke"]);
+    let (ok, text) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &["e121", "--lsp-json", tip_note.to_str().expect("utf-8")],
+    );
+    assert!(ok, "a skipped informational row went red:\n{text}");
+    assert!(text.contains("skipped"), "{text}");
+    // The seal: the BASE's run skipped a mandate row (nothing to compare the tip's against) is red;
+    // the tip's informational skip is a note beside the rows; the report carries both and the series.
+    let vilan = fake_vilan(&scratch);
+    let base = base_kolt(&scratch, "base", false);
+    let lsp_base = harness("lsp-base.json", &["parse break"]);
+    let lsp_tip = harness("lsp-tip.json", &["model.vl keystroke"]);
+    let verdicts = scratch.path("verdicts");
+    let driver = format!(
+        r#"
+import os, sys
+sys.path.insert(0, {scripts:?})
+import perf_count, perf_gate
+def measure(argv, cwd=None, env=None, counter="auto", log=None):
+    return {{"counter": "instructions:u", "instructions": 1,
+             "peak_rss_kb": 100, "cpu_s": 1.0, "exit": 0}}
+perf_count.measure = measure
+perf_count.hardware_counter_available = lambda: True
+perf_gate.loadavg = lambda: 0.5
+perf_gate.phase_split = lambda vilan, directory: {{"analyze": 1.0}}
+perf_gate.subject_dir = lambda subject, work: work
+sys.argv = ["perf_gate.py", "--budgets", {budgets:?}, "--work", {work:?}, "--scratch", {work:?}, "seal",
+            "--tip", {vilan:?}, "--base", {vilan:?}, "--kolt", {base:?},
+            "--base-std", {work:?}, "--runs", "1", "--threshold", "5", "--verdict-dir", {verdicts:?},
+            "--sha", "0123456789abcdef", "--lsp-json", {lsp_base:?}, {lsp_tip:?}]
+sys.exit(perf_gate.main())
+"#,
+        scripts = repository_root().join("scripts").display().to_string(),
+        budgets = budgets.display().to_string(),
+        work = scratch.0.display().to_string(),
+        vilan = vilan.display().to_string(),
+        base = base.display().to_string(),
+        verdicts = verdicts.display().to_string(),
+        lsp_base = lsp_base.display().to_string(),
+        lsp_tip = lsp_tip.display().to_string(),
+    );
+    let output = Command::new("python3")
+        .args(["-c", &driver])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run the seal driver");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        !output.status.success(),
+        "a base-skipped mandate row passed the seal:\n{text}"
+    );
+    assert!(
+        text.contains("LSP SKIPPED (base) parse break: mandate row - RED")
+            && text.contains("LSP SKIPPED (tip) model.vl keystroke: informational row - a note")
+            && text.contains("LSP rows measured (2): leaf keystroke, parse break"),
+        "the skipped list prints beside the rows:\n{text}"
+    );
+    assert!(
+        text.contains("PERF VERDICT: RED")
+            && text.contains("LSP parse break: SKIPPED on the base side, a mandate row"),
+        "{text}"
+    );
+    let verdict_path = verdicts.join("perf-0123456789abcdef.json");
+    let report_md = scratch.path("report.md");
+    let (ok, written) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "report",
+            "--verdict",
+            verdict_path.to_str().expect("utf-8"),
+            "--out",
+            report_md.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(ok, "{written}");
+    let report = fs::read_to_string(&report_md).expect("the report is written");
+    assert!(
+        report.contains("> **Skipped (tip):** `model.vl keystroke`")
+            && report.contains("> **Skipped (base):** `parse break`"),
+        "{report}"
+    );
+    assert!(
+        report.contains("> **Series break, parse break:** re-anchored"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Rows measured (2): leaf keystroke, parse break."),
+        "{report}"
+    );
+}

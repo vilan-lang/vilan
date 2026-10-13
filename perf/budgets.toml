@@ -30,7 +30,10 @@
 # `[[e121]]` are the editor's targets (Q9) on the seal's LSP harness rows: each reports red until it has
 # been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8). The seals
 # keep that count beside their verdicts (`e121-state.json`), never in this file mid-order; the release
-# commit writes it here (N146).
+# commit writes it here (N146). A row with `mandate = true` (leaf, css, parse break) must be MEASURED:
+# when the harness skipped it (its anchors are missing in the source it replayed, N174) the seal is red;
+# a skipped row without it is a note. A `series` string is printed under the report's E121 table: the
+# row's anchors moved and its figures start a NEW series.
 tolerance = 0.01
 
 # Every subject the gate measures, whether or not this class has a ceiling for it yet.
@@ -231,6 +234,7 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+mandate = true
 
 [[e121]]
 scenario = "shared.vl keystroke"
@@ -245,6 +249,7 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 2
 blocking = true
+series = "Order 52 (N174): the keystroke edit is unchanged; the Find References probe moved from `fun messages(self)` (gone from model.vl) to `fun global()`, the mirrored store reader, so that probe starts a new series."
 
 [[e121]]
 scenario = "model.vl keystroke, importers open"
@@ -259,6 +264,7 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+mandate = true
 
 [[e121]]
 scenario = "parse break"
@@ -266,3 +272,5 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+mandate = true
+series = "Order 52 (N174): re-anchored from `let messages = channel.messages();` (gone with the mirrored-store exhibit, kolt@dee494ab) to `channel_name.adopt(channel.current_name());` in the same channel.vl - a statement over a `g.channels()` boundary; the break and its repair are the same shape, the figures start a new series."
