@@ -302,3 +302,10 @@ class = "reference"
 ratio = 1.01
 reason = "B618's std::task seed, as the ci row above (x1.0077 on the lane's box)."
 item = "B618"
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.02
+reason = "the same std growth as the ci rows above (B621's Eq impls, B623's array impls; B618's seeded std::task is not on math's path), on the reference box's instructions:u: x1.0110 of the v0.49.0 ceiling at the Order 52 seal on 57677552 against the 1% reference tolerance. Re-taken at the cut."
+item = "M120"

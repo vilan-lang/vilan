@@ -271,7 +271,9 @@ pub fn trim() -> bool {
 /// from that fragmentation, and `MALLOC_ARENA_MAX=1` closed it. Measured on
 /// a kolt copy over lsp-latency's rows (Order 52): the server's peak VmHWM
 /// 1006 MB with glibc's default, 932 MB at two arenas, 716-732 MB at one;
-/// instructions unchanged.
+/// instructions unchanged. Declared for glibc alone, as the call that reads it
+/// is - on any other target the constant would be dead code.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub const ARENA_MAX: i32 = 1;
 
 /// N176: cap the allocator's arenas at [`ARENA_MAX`], first thing in `main`
