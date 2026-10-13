@@ -867,6 +867,100 @@ fn emitted_js_is_independent_of_import_order() {
     );
 }
 
+/// B603 (`std-prefix.md` §4.1): the emitted JS must not depend on WHICH module
+/// asks for a module first. WO-1b's drain loaded the smallest key among the
+/// modules KNOWN so far, so a std module first asked for by a package module —
+/// or by another std module — loaded (and minted its ids) after its asker, and
+/// an import that changed nothing reachable moved functions in the output. The
+/// drain now discovers a round's whole reachable set before it mints any of it.
+///
+/// Two shapes, each red under the old drain (measured on 5e17cb59):
+///
+/// - **A package module asks.** `pkg::a` imports `std::path`; the entry adds a
+///   redundant `import std::path;` (the papers-50 repro). `name_of` moved
+///   after std's `basename`.
+/// - **A std module asks.** `std::time` reaches `std::task` through std's own
+///   `pkg::` import; a single-file program adds a redundant `import std::task`.
+///   `task::ambient_signal` moved past `time::sleep` — the single-file case
+///   the paper expected to be unmoved.
+#[test]
+fn emitted_js_is_independent_of_which_module_asks_first() {
+    let work = scratch::root().join(format!("vilan_b603_ask_order_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let build = |directory: &Path, target: &Path, emitted: &Path| -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .arg("build")
+            .arg(target)
+            .current_dir(directory)
+            .env("VILAN_STD", std_dir())
+            .output()
+            .expect("run vilan build");
+        assert!(
+            output.status.success(),
+            "build failed in {directory:?}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(emitted).expect("read emitted js")
+    };
+
+    // A package module asks: the entry's import is redundant.
+    let package = |variant: &str, redundant: &str| -> String {
+        let root = work.join(format!("package_{variant}"));
+        std::fs::create_dir_all(root.join("src")).expect("create package");
+        std::fs::write(
+            root.join("vilan.toml"),
+            "[package]\nname = \"ask_order\"\n[entry.main]\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/a.vl"),
+            "import std::path::{ basename };\n\n\
+             export fun name_of(p: str): str {\n\tbasename(p)\n}\n",
+        )
+        .expect("write module");
+        std::fs::write(
+            root.join("src/main.vl"),
+            format!(
+                "{redundant}import pkg::a::{{ name_of }};\n\n\
+                 fun main() {{\n\tprint(name_of(\"/x/y.txt\"));\n}}\n"
+            ),
+        )
+        .expect("write entry");
+        build(&root, Path::new("."), &root.join("dist/main.mjs"))
+    };
+    let plain = package("plain", "");
+    let redundant = package("redundant", "import std::path;\n");
+    assert_eq!(
+        plain, redundant,
+        "a redundant entry import of a std module a package module already imports \
+         moved the emitted declarations — the drain mints in discovery order again"
+    );
+
+    // A std module asks: `std::time` reaches `std::task` itself.
+    let single = |variant: &str, redundant: &str| -> String {
+        let root = work.join(format!("single_{variant}"));
+        std::fs::create_dir_all(&root).expect("create work dir");
+        let source = root.join("prog.vl");
+        std::fs::write(
+            &source,
+            format!(
+                "{redundant}import std::io::print;\nimport std::time::sleep;\n\n\
+                 async fun main() {{\n\tsleep(1);\n\tprint(\"slept\");\n}}\n"
+            ),
+        )
+        .expect("write source");
+        build(&root, &source, &source.with_extension(GOLDEN_EXTENSION))
+    };
+    let plain = single("plain", "");
+    let redundant = single("redundant", "import std::task::{ CancelSignal };\n");
+    let _ = std::fs::remove_dir_all(&work);
+    assert_eq!(
+        plain, redundant,
+        "a redundant import of a std module another std module already imports moved \
+         the emitted declarations — the drain mints in discovery order again"
+    );
+}
+
 /// E44 — a corpus build is byte-deterministic under CONCURRENCY.
 ///
 /// Two concurrent corpus runs sharing a box once emitted different JavaScript

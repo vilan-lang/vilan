@@ -79930,10 +79930,11 @@ enum Origin {
 /// by module name. Two distinct loaded modules never share a key — std/pkg
 /// names are unique within their package, and a dependency's modules are
 /// distinguished by the package index — so the order is total and stable. The
-/// drain below always loads the smallest key still pending, making the load
-/// order (and thus every entity id, and thus the emitted declaration order) a
-/// function only of WHICH modules are reachable and their packages, never of
-/// the order imports appear in the source.
+/// drain discovers a round's whole reachable set first and then mints it in
+/// this order (B603), making the load order (and thus every entity id, and
+/// thus the emitted declaration order) a function only of WHICH modules are
+/// reachable and their packages — never of the order imports appear in the
+/// source, nor of which module asked for a module first.
 fn load_order_key(entry: (Origin, &str)) -> (u8, usize, &str) {
     let (origin, name) = entry;
     match origin {
@@ -79943,14 +79944,22 @@ fn load_order_key(entry: (Origin, &str)) -> (u8, usize, &str) {
     }
 }
 
-/// [`load_order_key`]'s inverse — the key is injective, which is what
-/// lets the drain's heap hold keys alone (M107).
-fn load_order_entry(key: (u8, usize, &str)) -> (Origin, &str) {
-    match key {
-        (0, _, name) => (Origin::Std, name),
-        (1, index, name) => (Origin::Dep(index), name),
-        (_, _, name) => (Origin::Pkg, name),
-    }
+/// What the canonical drain's DISCOVERY found at one module path (B603,
+/// `std-prefix.md` §4.1), held until the round's whole reachable set is known
+/// and minted in [`load_order_key`] order.
+enum DiscoveredModule {
+    /// A pure namespace: no body under any root, these children beneath it.
+    Namespace(Vec<String>),
+    /// The `pkg::<entry>` re-entry (B226): the entry is the program, so the
+    /// name is aliased onto the entry's own scope and nothing loads.
+    EntryAlias,
+    /// A module with a body: where it resolved, and its parse — `None` for a
+    /// std or dependency file opened directly, which is analyzed from the
+    /// entry's buffer.
+    Body {
+        resolution: ModuleResolution,
+        parsed: Option<LoadedModule>,
+    },
 }
 
 /// A65: the entity a module PATH denotes, created if this analysis has not
@@ -81254,37 +81263,40 @@ fn analyze_inner<'src>(
     let mut generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>> =
         HashMap::default();
     loop {
-        // Canonical drain (WO-1b): load the smallest-key module still pending
-        // rather than the last one pushed. `to_load.pop()` (LIFO) made the load
-        // order — and therefore every entity id and the id-sorted emitted
-        // declarations — depend on the textual order of the file's imports, so a
-        // pure import reorder (e.g. `vilan fmt`'s import sort) churned the JS
-        // bytes though nothing ran differently. Selecting the minimum instead
-        // makes the drain a pure function of the reachable set (min over a set is
-        // independent of insertion order; equal keys are duplicate loads of the
-        // same module, which the dedup below collapses). The set loaded is
-        // unchanged — same seeds, same discovery graph, same `loaded_keys` dedup;
-        // only the traversal order is canonicalized. The always-loaded core
-        // modules (`boolean`, `list`, ...) fold into this rule rather than
-        // keeping their seed-list order.
-        // M107: the resolved module paths waiting to load, as a min-heap on
-        // `load_order_key` (injective over `(origin, path)`, so the heap's
-        // minimum is the one the canonical drain below names). The drain used
-        // to keep them in `to_load`, re-resolve every one and scan them all for
-        // the minimum per module loaded — quadratic in a package's modules.
-        let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<(u8, usize, &str)>> =
-            std::collections::BinaryHeap::new();
-        while !to_load.is_empty() || !ready.is_empty() {
-            // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
-            // the loader loads MODULES. Map every one to the longest prefix that
-            // names a module here — or, failing that, the module DIRECTORY it
-            // addresses — before choosing which to drain, so the canonical
-            // minimum below is taken over module paths rather than over import
-            // paths. A single-segment path answers itself, so a package with no
-            // module directory drains in exactly the order it always did, and
-            // its entity ids and emitted bytes are unmoved.
-            let pending: Vec<(Origin, &str)> = std::mem::take(&mut to_load);
-            for (origin, request) in pending {
+        // Canonical drain (WO-1b, completed by B603 — `std-prefix.md` §4.1): the
+        // load order, and therefore every module node, `SourceId`, scope and walk
+        // id and the id-sorted emitted declarations, is a function only of WHICH
+        // modules are reachable and their packages — never of the order imports
+        // appear in the source, and never of WHO asks for a module first.
+        //
+        // Two phases per round. DISCOVERY follows every request to its module and
+        // parses it (parsing mints nothing: the parse cache is content-addressed
+        // and outside the analyzer), closing over the requests the module writes
+        // and over its ancestor modules, until nothing new is asked for. Then
+        // MINTING registers the discovered set in `load_order_key` order — std
+        // first, then each dependency by manifest index, then the entry package,
+        // by module name within each. WO-1b's drain took the smallest key among
+        // the modules KNOWN so far, so a std module first asked for by a package
+        // module loaded after that module, and a redundant `import std::path;` in
+        // the entry (the reachable set unchanged) moved `pkg::a`'s function in the
+        // emitted module (B603); on kolt's client std's ids fell in nine runs cut
+        // by package ids, which is what kept a std world from being a function of
+        // std. A pure import reorder (`vilan fmt`'s import sort) still churns
+        // nothing, for the same reason it did not under WO-1b.
+        //
+        // A round ends when the macro epilogue below expands the files it minted;
+        // a module that only GENERATED code reaches is discovered in the next
+        // round and mints after this round's. (The registry is built once, from
+        // the first round, by design: macro definitions must be reachable without
+        // expansion.)
+        while !to_load.is_empty() {
+            let mut discovered: Vec<(Origin, &str, DiscoveredModule)> = Vec::new();
+            while let Some((origin, request)) = to_load.pop() {
+                // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
+                // the loader loads MODULES. Map every one to the longest prefix that
+                // names a module here — or, failing that, the module DIRECTORY it
+                // addresses — so the canonical order below is taken over module
+                // paths rather than over import paths.
                 let resolved = *resolved_requests
                     .entry((origin, request))
                     .or_insert_with(|| {
@@ -81322,569 +81334,605 @@ fn analyze_inner<'src>(
                             }
                         })
                     });
-                // A resolved path resolves to itself (it is the longest
-                // prefix naming a module or namespace), so it is resolved once
-                // and waits in `ready`.
-                if let Some(resolved) = resolved {
-                    ready.push(std::cmp::Reverse(load_order_key((origin, resolved))));
+                // A resolved path resolves to itself (it is the longest prefix
+                // naming a module or namespace), so it is resolved once.
+                let Some(name) = resolved else {
+                    continue;
+                };
+                // M110 S1: a hot module waits for `load_hot_modules`, after the store.
+                if origin == Origin::Pkg && hot_deferred.contains(name) {
+                    continue;
                 }
-            }
-            let Some(std::cmp::Reverse(next)) = ready.pop() else {
-                break;
-            };
-            let (origin, name) = load_order_entry(next);
-            // M110 S1: a hot module waits for `load_hot_modules`, after the store.
-            if origin == Origin::Pkg && hot_deferred.contains(name) {
-                continue;
-            }
-            if !loaded_keys.insert((origin, name)) {
-                continue;
-            }
-            // The roots to search for this module. `std`/`pkg` are single-root; a
-            // dependency library is layered — its overlay for the build target, then its
-            // base, then other overlays (so a cross-target module still loads for typing).
-            let search_roots: Vec<&Path> = match origin {
-                Origin::Std => std.search_roots(platform),
-                Origin::Pkg => vec![pkg_root],
-                Origin::Dep(index) => workspace.packages[index].search_roots(platform),
-            };
-            // A65: the origin's own namespace scope — where a top-level module
-            // registers, and where the walk down a nested path starts.
-            let origin_scope_id = match origin {
-                Origin::Std => std_scope_id,
-                Origin::Pkg => pkg_scope_id,
-                Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
-            };
-            // A platform-gated std module (e.g. `std::http` in a browser build) is *not*
-            // skipped here: it loads so its signatures bind and the rest of the file
-            // types cleanly. The cross-target diagnostic is reported once, at the user's
-            // `import`, where the load is seeded (P3/L1).
-            let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
-                // A65: no body under any root — but the path may still name a
-                // module DIRECTORY, a **pure namespace** whose children are
-                // importable through it. Register the namespace (so
-                // `pkg::lib::util` can walk through `lib`) and record what the
-                // directory holds, so an `import pkg::lib` that lands on it is
-                // refused with the children named.
-                let children = submodules_in_roots(&search_roots, name);
-                if !children.is_empty() {
-                    let module_id = ensure_module_node(
-                        &mut analyzer,
-                        &mut module_nodes,
-                        &mut to_load,
-                        origin,
-                        name,
-                        origin_scope_id,
-                        global_scope_id,
-                    );
-                    analyzer.namespace_only_modules.insert(module_id, children);
-                    if origin == Origin::Pkg {
-                        pkg_module_names.insert(name);
+                if !loaded_keys.insert((origin, name)) {
+                    continue;
+                }
+                // The roots to search for this module. `std`/`pkg` are single-root; a
+                // dependency library is layered — its overlay for the build target, then its
+                // base, then other overlays (so a cross-target module still loads for typing).
+                let search_roots: Vec<&Path> = match origin {
+                    Origin::Std => std.search_roots(platform),
+                    Origin::Pkg => vec![pkg_root],
+                    Origin::Dep(index) => workspace.packages[index].search_roots(platform),
+                };
+                // A65: a nested module depends on each of its ANCESTORS (the
+                // minting below ensures the parent's node, and the parent's own
+                // file adopts it), so they are discovered with it — which is what
+                // lets them mint in their canonical place, before their children,
+                // rather than wherever the first child happened to ask for them.
+                for (cut, _) in name.match_indices("::") {
+                    to_load.push((origin, &name[..cut]));
+                }
+                // A platform-gated std module (e.g. `std::http` in a browser build) is *not*
+                // skipped here: it loads so its signatures bind and the rest of the file
+                // types cleanly. The cross-target diagnostic is reported once, at the user's
+                // `import`, where the load is seeded (P3/L1).
+                let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
+                    // A65: no body under any root — but the path may still name a
+                    // module DIRECTORY, a **pure namespace** whose children are
+                    // importable through it. Registered below (so `pkg::lib::util`
+                    // can walk through `lib`) with what the directory holds, so an
+                    // `import pkg::lib` that lands on it is refused with the
+                    // children named.
+                    let children = submodules_in_roots(&search_roots, name);
+                    if !children.is_empty() {
+                        discovered.push((origin, name, DiscoveredModule::Namespace(children)));
+                    }
+                    // Not a module file here (a non-module name, or a missing import
+                    // the resolver below will report) — skip, as the previous loader
+                    // did.
+                    continue;
+                };
+                // This module file IS the entry buffer. Two unrelated situations
+                // reach that equality and only the ORIGIN tells them apart (B226):
+                // a library file opened directly in an editor (`Std`/`Dep`), and a
+                // `pkg::<entry>` reference that walks back into the program's own
+                // entry.
+                let is_entry_file = crate::util::canonical_path(&resolution.path)
+                    == crate::util::canonical_path(entry_path);
+                if is_entry_file && origin == Origin::Pkg {
+                    // The `pkg::` re-entry (B226): aliased below, never loaded, and
+                    // its requests are the entry's own, seeded before the drain.
+                    discovered.push((origin, name, DiscoveredModule::EntryAlias));
+                    continue;
+                }
+                // A std or dependency file opened directly (the editor case below)
+                // is analyzed from the entry's buffer; every other module parses
+                // from disk.
+                let parsed = match is_entry_file {
+                    true => None,
+                    false => match load_package_module(&resolution.path) {
+                        Some(parsed) => Some(parsed),
+                        None => continue,
+                    },
+                };
+                let ast: &Spanned<NodeList> = parsed.map_or(nodes, |parsed| parsed.ast);
+                // A module's `pkg::` siblings inherit its package; a user/dependency
+                // module's `std::` imports are std, and its `<dep>::` references seed that
+                // dependency. (Std modules reference each other via `pkg::` only, so
+                // collecting their `std::` imports would be a no-op — skip it to keep the
+                // std load byte-for-byte unchanged.)
+                to_load.extend(
+                    collect_module_paths(&ast.0, "pkg")
+                        .into_iter()
+                        .map(|(sibling, _)| (origin, sibling)),
+                );
+                // A `[service]` item means the std `service` macro (hosted in
+                // `std::rpc`, too heavy to always-load) must be in the prelude.
+                for seed in service_seeds(&ast.0) {
+                    to_load.push((Origin::Std, seed));
+                }
+                // B270, the entry's twin: a loaded module's own `css` blocks and
+                // elements seed their std modules, whatever package it belongs to.
+                to_load.extend(
+                    collect_std_item_modules(&ast.0)
+                        .into_iter()
+                        .map(|module| (Origin::Std, module)),
+                );
+                // Seed the module's `std::` and `<dep>::` references. Only the *building*
+                // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
+                // (`Dep`) are its internals, loaded for typing without a gate (the
+                // dependency's compatibility was checked at the user's import). Std modules
+                // reference each other only via `pkg::`, so they seed nothing here.
+                match origin {
+                    Origin::Std => {}
+                    Origin::Pkg => {
+                        let std_refs = collect_module_paths(&ast.0, "std");
+                        to_load.extend(
+                            std_refs
+                                .into_iter()
+                                .map(|(module, _)| (Origin::Std, module)),
+                        );
+                        for (name, index) in &workspace.entry_dependencies {
+                            let refs = collect_module_paths(&ast.0, name);
+                            to_load.extend(
+                                refs.into_iter()
+                                    .map(|(module, _)| (Origin::Dep(*index), module)),
+                            );
+                        }
+                    }
+                    Origin::Dep(index) => {
+                        to_load.extend(
+                            collect_module_paths(&ast.0, "std")
+                                .into_iter()
+                                .map(|(module, _)| (Origin::Std, module)),
+                        );
+                        for (name, dependency_index) in &workspace.packages[index].dependencies {
+                            to_load.extend(
+                                collect_module_paths(&ast.0, name)
+                                    .into_iter()
+                                    .map(|(module, _)| (Origin::Dep(*dependency_index), module)),
+                            );
+                        }
                     }
                 }
-                // Not a module file here (a non-module name, or a missing import the
-                // resolver below will report) — skip, as the previous loader did.
-                continue;
-            };
-            // B331: whether this module's own directory holds a `lib.vl`. True
-            // for the nested body (`a/lib.vl` IS `a`), and true for `a.vl`
-            // beside an `a/lib.vl` (the ambiguity's tree, where the flat file
-            // won) — either way the segment `lib` under this module would name
-            // a body file, and the walk's miss says so rather than "cannot
-            // find".
-            let directory_holds_a_lib_body = resolution.ambiguous
-                || (resolution.relative.file_name() == Some(std::ffi::OsStr::new("lib.vl"))
-                    && resolution
-                        .relative
-                        .parent()
-                        .is_some_and(|parent| !parent.as_os_str().is_empty()));
-            let module_path = resolution.path;
-            if resolution.ambiguous {
-                analyzer.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: EMPTY_SPAN,
-                    msg: {
-                        let file = module_path_display(name);
-                        format!(
-                            "module `{name}` is ambiguous: both `{file}.vl` and `{file}/lib.vl` \
-                         exist; keep only one"
-                        )
-                    },
-                });
+                discovered.push((origin, name, DiscoveredModule::Body { resolution, parsed }));
             }
-            // Exact case is part of the resolution (`windows-support.md` §5, call
-            // (c)): a case-insensitive filesystem answers `import foo` with
-            // `Foo.vl`, and that program then fails to build on Linux. This is the
-            // ONE place it is checked — every origin (std, `pkg::`, a dependency)
-            // reaches its module through this loop, and it runs once per module
-            // actually LOADED, never on a resolution probe.
-            if let Some((requested, on_disk)) =
-                crate::util::case_exact_mismatch(&resolution.root, &resolution.relative)
-            {
-                // A removed std alias outranks the case telling: on a
-                // case-ignoring filesystem `std::Default` resolves to std's
-                // own `default.vl`, and "rename one to match the other"
-                // would point the user at std's tree. This arm is dead on a
-                // case-sensitive filesystem (the resolution never happens),
-                // so its end-to-end check is the Windows CI leg.
-                let removed = match origin {
-                    Origin::Std => removed_std_alias("std", name, true),
-                    _ => None,
+            discovered.sort_unstable_by_key(|(origin, name, _)| load_order_key((*origin, name)));
+            for (origin, name, module) in discovered {
+                // A65: the origin's own namespace scope — where a top-level module
+                // registers, and where the walk down a nested path starts.
+                let origin_scope_id = match origin {
+                    Origin::Std => std_scope_id,
+                    Origin::Pkg => pkg_scope_id,
+                    Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
                 };
-                let msg = removed.unwrap_or_else(|| {
-                    format!(
-                        "module `{name}` resolved to `{on_disk}` on disk, but it is imported as \
-                         `{requested}`: Vilan matches module files by exact case, so this \
-                         builds only where the filesystem ignores case; rename one to match \
-                         the other"
-                    )
-                });
-                analyzer.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: EMPTY_SPAN,
-                    msg,
-                });
-            }
-            // This module file IS the entry buffer. Two unrelated situations
-            // reach that equality and only the ORIGIN tells them apart (B226):
-            // a library file opened directly in an editor (`Std`/`Dep`), and a
-            // `pkg::<entry>` reference that walks back into the program's own
-            // entry.
-            let is_entry_file = crate::util::canonical_path(&module_path)
-                == crate::util::canonical_path(entry_path);
-            // The `pkg::` re-entry: the entry file imports its own module name,
-            // or a cycle of `pkg::` imports comes back to it. The entry is not
-            // a module of its package — it walks as the PROGRAM, in the global
-            // scope, at the end of this function. Loading it here as a module
-            // took that walk away (and with it `main`, and the entry's own
-            // macro/derive expansion, so every `[derive]` on an entry type
-            // vanished). Alias the name to the already-seeded entry scope
-            // instead: `pkg::<entry>::Name` then resolves to the entry's own
-            // declaration, which is exactly what the import asked for, and
-            // nothing is loaded, walked, or typed twice.
-            if is_entry_file && origin == Origin::Pkg {
-                let module_id = analyzer.new_entity_id();
+                let (resolution, parsed) = match module {
+                    DiscoveredModule::Namespace(children) => {
+                        let module_id = ensure_module_node(
+                            &mut analyzer,
+                            &mut module_nodes,
+                            &mut to_load,
+                            origin,
+                            name,
+                            origin_scope_id,
+                            global_scope_id,
+                        );
+                        analyzer.namespace_only_modules.insert(module_id, children);
+                        if origin == Origin::Pkg {
+                            pkg_module_names.insert(name);
+                        }
+                        continue;
+                    }
+                    DiscoveredModule::EntryAlias => {
+                        // The `pkg::` re-entry: the entry file imports its own module name,
+                        // or a cycle of `pkg::` imports comes back to it. The entry is not
+                        // a module of its package — it walks as the PROGRAM, in the global
+                        // scope, at the end of this function. Loading it here as a module
+                        // took that walk away (and with it `main`, and the entry's own
+                        // macro/derive expansion, so every `[derive]` on an entry type
+                        // vanished). Alias the name to the already-seeded entry scope
+                        // instead: `pkg::<entry>::Name` then resolves to the entry's own
+                        // declaration, which is exactly what the import asked for, and
+                        // nothing is loaded, walked, or typed twice.
+                        let module_id = analyzer.new_entity_id();
+                        analyzer.modules.insert(
+                            module_id,
+                            Module {
+                                id: module_id,
+                                name,
+                                body: (Vec::new(), global_scope_id),
+                            },
+                        );
+                        analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+                        analyzer.source_ranges.push(SourceRange {
+                            start: module_id.0,
+                            end: module_id.0 + 1,
+                            source: SourceId(0),
+                        });
+                        analyzer
+                            .expr_id_to_expr_map
+                            .insert(module_id, Expr::Module(module_id));
+                        analyzer
+                            .mut_scope_for_scope_id(pkg_scope_id)
+                            .name_to_id_map
+                            .insert(name, module_id);
+                        // The name is resolvable in `pkg` now, so the entry-expansion
+                        // hoist must not rebuild the world for a generated reference
+                        // to it (M21's "a module this world never loaded" rule).
+                        pkg_module_names.insert(name);
+                        entry_alias_module = Some(name);
+                        // A DIRECT self-import is a no-op the author did not mean to
+                        // write: the entry's own declarations are already in scope. Say
+                        // so, at the import. A cycle that merely comes back through the
+                        // entry has no such import to point at and passes silently.
+                        //
+                        // Only for a DECLARED entry (B239). In file mode this file is a
+                        // MODULE the front end handed us as the entry, and a module that
+                        // imports its own name is the silent no-op it has always been —
+                        // `a_non_entry_self_import_stays_clean` is that control, and the
+                        // editor must not invent a warning the build never prints.
+                        if matches!(workspace.entry_mode, EntryMode::Declared { .. })
+                            && let Some((_, span)) = collect_module_paths(&nodes.0, "pkg")
+                                .into_iter()
+                                // A65: the import names this module, or something under
+                                // it — `pkg::main::Thing` reaches the entry too.
+                                .find(|(module, _)| {
+                                    *module == name
+                                        || module
+                                            .strip_prefix(name)
+                                            .is_some_and(|rest| rest.starts_with("::"))
+                                })
+                        {
+                            analyzer.warnings.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: format!(
+                                    "`pkg::{name}` is this program's own entry file, so this import \
+                                     brings the file into itself: everything it declares is already \
+                                     in scope here. Delete the import"
+                                ),
+                            });
+                            analyzer.warning_sources.push(SourceId(0));
+                        }
+                        continue;
+                    }
+                    DiscoveredModule::Body { resolution, parsed } => (resolution, parsed),
+                };
+                // B331: whether this module's own directory holds a `lib.vl`. True
+                // for the nested body (`a/lib.vl` IS `a`), and true for `a.vl`
+                // beside an `a/lib.vl` (the ambiguity's tree, where the flat file
+                // won) — either way the segment `lib` under this module would name
+                // a body file, and the walk's miss says so rather than "cannot
+                // find".
+                let directory_holds_a_lib_body = resolution.ambiguous
+                    || (resolution.relative.file_name() == Some(std::ffi::OsStr::new("lib.vl"))
+                        && resolution
+                            .relative
+                            .parent()
+                            .is_some_and(|parent| !parent.as_os_str().is_empty()));
+                let module_path = resolution.path;
+                if resolution.ambiguous {
+                    analyzer.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: EMPTY_SPAN,
+                        msg: {
+                            let file = module_path_display(name);
+                            format!(
+                                "module `{name}` is ambiguous: both `{file}.vl` and `{file}/lib.vl` \
+                             exist; keep only one"
+                            )
+                        },
+                    });
+                }
+                // Exact case is part of the resolution (`windows-support.md` §5, call
+                // (c)): a case-insensitive filesystem answers `import foo` with
+                // `Foo.vl`, and that program then fails to build on Linux. This is the
+                // ONE place it is checked — every origin (std, `pkg::`, a dependency)
+                // reaches its module through this loop, and it runs once per module
+                // actually LOADED, never on a resolution probe.
+                if let Some((requested, on_disk)) =
+                    crate::util::case_exact_mismatch(&resolution.root, &resolution.relative)
+                {
+                    // A removed std alias outranks the case telling: on a
+                    // case-ignoring filesystem `std::Default` resolves to std's
+                    // own `default.vl`, and "rename one to match the other"
+                    // would point the user at std's tree. This arm is dead on a
+                    // case-sensitive filesystem (the resolution never happens),
+                    // so its end-to-end check is the Windows CI leg.
+                    let removed = match origin {
+                        Origin::Std => removed_std_alias("std", name, true),
+                        _ => None,
+                    };
+                    let msg = removed.unwrap_or_else(|| {
+                        format!(
+                            "module `{name}` resolved to `{on_disk}` on disk, but it is imported as \
+                             `{requested}`: Vilan matches module files by exact case, so this \
+                             builds only where the filesystem ignores case; rename one to match \
+                             the other"
+                        )
+                    });
+                    analyzer.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: EMPTY_SPAN,
+                        msg,
+                    });
+                }
+                // What is left is the editor case: a std or dependency file opened
+                // directly, analyzed *as* its module from the buffer rather than
+                // loaded a second time from disk — the module discovery left
+                // unparsed. Decided there by the origin gate it is (the `Pkg`
+                // re-entry is the alias above), not by "the paths matched" — that
+                // was B226's whole mistake.
+                // Use the entry's (buffer) AST for its own module; load the rest from
+                // disk. The entry module keeps SourceId 0 so editor features resolve to
+                // the open document.
+                let (ast, module_text, module_source_id): (
+                    &Spanned<NodeList>,
+                    &'src str,
+                    SourceId,
+                ) = match parsed {
+                    None => {
+                        entry_is_module = true;
+                        // B240: and the §6.13 hoist's pre-mark, undone. A cacheable
+                        // analysis marks `SourceId(0)` expanded up front so the
+                        // load loop's ENTRY arm skips it and
+                        // `expand_entry_over_world` can run the entry's expansion
+                        // after the world is built — but that hoist runs only under
+                        // `!entry_is_module`, and the mark was never taken back
+                        // when the entry turned out to BE a module. A dependency
+                        // file opened as the entry (the editor, `vilan check
+                        // <path>`) therefore expanded nowhere and lost every
+                        // `[derive]` it declares. Here the file is a module, and
+                        // the module arm below is what expands it, under its own
+                        // `ModuleKey`. (A std file opened this way never hit it:
+                        // `entry_is_inside_std` makes that analysis uncacheable, so
+                        // there was no mark to undo.)
+                        expanded_sources.remove(&SourceId(0));
+                        // B250: and the remap this arm is about to make, recorded by
+                        // NAME. `package_of_source[SourceId(0)]` starts on the entry
+                        // package and the `Origin::Dep` arm below moves it to the
+                        // dependency, which is what makes `pkg::` the spelling inside
+                        // this file — and what makes an `import <depname>::…` already
+                        // in it stop resolving. The unresolved-root miss reads this to
+                        // say which package the file is being checked as part of.
+                        if let Origin::Dep(dependency_index) = origin {
+                            analyzer.entry_module_package = workspace
+                                .entry_dependencies
+                                .iter()
+                                .find(|(_, index)| *index == dependency_index)
+                                .map(|(name, _)| name.clone())
+                                .or_else(|| {
+                                    workspace.packages.get(dependency_index).and_then(|spec| {
+                                        spec.base_root
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                    })
+                                });
+                        }
+                        (nodes, entry_source, SourceId(0))
+                    }
+                    Some(loaded) => {
+                        let diagnostics_before = analyzer.diagnostics.len();
+                        report_module_parse_errors(
+                            &mut analyzer.diagnostics,
+                            &mut reported_parse_errors,
+                            &module_path,
+                            &loaded,
+                        );
+                        analyzer.attribute_new_diagnostics(
+                            diagnostics_before,
+                            SourceId(sources.len() as u32),
+                        );
+                        report_module_parse_warnings(
+                            &mut analyzer,
+                            &mut reported_parse_errors,
+                            &module_path,
+                            &loaded,
+                            SourceId(sources.len() as u32),
+                        );
+                        // E198: residence and freezing are two facts, recorded
+                        // separately. EVERY std module is std — that is where the
+                        // A99 steer, `chunks.rs`'s "std is never chunked" and the
+                        // std-free-function recognizers key. Only a std module
+                        // loaded from DISK carries frozen definition-site
+                        // diagnostics (S1); an overlaid buffer (open in the editor,
+                        // or the playground's embedded toolchain) does not.
+                        if matches!(origin, Origin::Std) {
+                            analyzer.std_sources.insert(SourceId(sources.len() as u32));
+                            if !document_overlay_contains(&module_path) {
+                                analyzer
+                                    .frozen_sources
+                                    .insert(SourceId(sources.len() as u32));
+                            }
+                        }
+                        // E119: a std module under a platform LAYER root is an
+                        // OVERLAID file — its types are this platform's twin of a
+                        // name the other platform spells differently. Recorded for
+                        // every std layer module, overlaid buffer included: an open
+                        // `ui.vl` is still the process twin. Canonical on both sides
+                        // (`windows-support.md` §5), like every other containment
+                        // test over a library root.
+                        if matches!(origin, Origin::Std) {
+                            let canonical = crate::util::canonical_path(&module_path);
+                            if let Some(layer) = std.layers.iter().find(|layer| {
+                                canonical.starts_with(crate::util::canonical_path(&layer.root))
+                            }) {
+                                analyzer
+                                    .std_layer_sources
+                                    .insert(SourceId(sources.len() as u32), layer.name.clone());
+                                // F27 R6: and the same module as the OTHER layers
+                                // serve it. The relative path is what identifies the
+                                // module inside a layer (`ui.vl`, `nested/lib.vl`),
+                                // so the twin is that same relative path under
+                                // another layer's root — and its label is the module
+                                // path a user writes (`ui`).
+                                let twins: Vec<(String, String, PathBuf, Vec<String>)> = canonical
+                                    .strip_prefix(crate::util::canonical_path(&layer.root))
+                                    .ok()
+                                    .map(|relative| {
+                                        let label = module_label(relative);
+                                        std.layers
+                                            .iter()
+                                            .filter(|other| other.name != layer.name)
+                                            .map(|other| (other, other.root.join(relative)))
+                                            .filter(|(_, path)| path.is_file())
+                                            .map(|(other, path)| {
+                                                (
+                                                    other.name.clone(),
+                                                    label.clone(),
+                                                    path,
+                                                    crate::target::PlatformPattern::spell(
+                                                        &other.patterns,
+                                                    ),
+                                                )
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if !twins.is_empty() {
+                                    analyzer
+                                        .std_layer_twin_files
+                                        .insert(SourceId(sources.len() as u32), twins);
+                                }
+                            }
+                        }
+                        // A dependency package's module is code the user did not
+                        // write (E84, diagnostics-standard.md C3a): the
+                        // context-coverage walk demotes and traces it exactly
+                        // like std's. Same disk-only gate — an overlaid buffer
+                        // (open in the editor) is live user territory and keeps
+                        // anchoring at itself. No S1 freezing rides on this set.
+                        // A workspace MEMBER (`PackageSpec::member`, E90) is the
+                        // user's own code behind a path edge: it never enters
+                        // the set, so its reads anchor and its calls label like
+                        // the entry's own modules.
+                        if let Origin::Dep(package_index) = origin
+                            && !workspace.packages[package_index].member
+                            && !document_overlay_contains(&module_path)
+                        {
+                            analyzer
+                                .dependency_sources
+                                .insert(SourceId(sources.len() as u32));
+                        }
+                        sources.push(module_path);
+                        source_hashes.push(crate::content_hash(loaded.text));
+                        (
+                            loaded.ast,
+                            loaded.text,
+                            SourceId((sources.len() - 1) as u32),
+                        )
+                    }
+                };
+                analyzer.source_texts.push((module_source_id, module_text));
+                analyzer.id_windows.source_keys.push(
+                    sources
+                        .last()
+                        .map_or(0, |path| crate::content_hash(&path.to_string_lossy())),
+                );
+                let module_scope = analyzer.create_scope(Some(global_scope_id));
+                let module_scope_id = analyzer.push_scope(module_scope);
+                // A65: a module already has an entity when a CHILD of it loaded
+                // first (`lib/util.vl` before `lib/lib.vl`) — adopt that node, so
+                // the children already registered under it stay reachable and
+                // `pkg::lib` and `pkg::lib::util` name one `lib`. Otherwise this is
+                // the flat path the loader has always taken, id for id.
+                let adopted = module_nodes.get(&(origin, name)).copied();
+                let module_id = adopted.unwrap_or_else(|| analyzer.new_entity_id());
                 analyzer.modules.insert(
                     module_id,
                     Module {
                         id: module_id,
-                        name,
-                        body: (Vec::new(), global_scope_id),
+                        name: module_leaf_name(name),
+                        body: (Vec::new(), module_scope_id),
                     },
                 );
+                // A body: whatever the directory probe concluded before it loaded is
+                // no longer true.
+                analyzer.namespace_only_modules.remove(&module_id);
+                if directory_holds_a_lib_body {
+                    analyzer.modules_bodied_by_a_lib_file.insert(module_id);
+                }
+                // Give the module entity a location (its file, at the top) so a path
+                // segment naming it can go-to-definition. A one-id range maps it to its
+                // source; the span is the file start.
+                //
+                // B335: an ADOPTED node already HAS a one-id range — the namespace
+                // placeholder `ensure_module_node` attributed to the entry, because
+                // a namespace has no file of its own. Pushing a second range for
+                // the same id left `source_of` (which takes the FIRST range that
+                // contains an id) answering the ENTRY for every module that owns
+                // both `x.vl` and `x/`, so `program.source_of(segment)` named the
+                // importing file — and `import_module_is_used` (E168/E169) asks
+                // exactly that, so Organize Imports was reading the wrong file. It
+                // also made `source_ranges` non-disjoint, which silently demoted
+                // `source_lookup` to the linear scan M27 exists to avoid. Corrected
+                // IN PLACE: the module has a file now, and the placeholder is the
+                // row that should say so.
                 analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                analyzer.source_ranges.push(SourceRange {
-                    start: module_id.0,
-                    end: module_id.0 + 1,
-                    source: SourceId(0),
-                });
+                match analyzer
+                    .source_ranges
+                    .iter_mut()
+                    .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
+                {
+                    Some(placeholder) => placeholder.source = module_source_id,
+                    None => analyzer.source_ranges.push(SourceRange {
+                        start: module_id.0,
+                        end: module_id.0 + 1,
+                        source: module_source_id,
+                    }),
+                }
                 analyzer
                     .expr_id_to_expr_map
                     .insert(module_id, Expr::Module(module_id));
-                analyzer
-                    .mut_scope_for_scope_id(pkg_scope_id)
-                    .name_to_id_map
-                    .insert(name, module_id);
-                // The name is resolvable in `pkg` now, so the entry-expansion
-                // hoist must not rebuild the world for a generated reference
-                // to it (M21's "a module this world never loaded" rule).
-                pkg_module_names.insert(name);
-                entry_alias_module = Some(name);
-                // A DIRECT self-import is a no-op the author did not mean to
-                // write: the entry's own declarations are already in scope. Say
-                // so, at the import. A cycle that merely comes back through the
-                // entry has no such import to point at and passes silently.
+                // Register the module under its package's namespace: entry modules in
+                // `pkg`, `std` modules in `std`, a dependency's in its own — so no
+                // package's modules collide with or shadow another's (E.10: a local
+                // `ui.vl` and `std::web::ui` coexist, each reachable through its root).
                 //
-                // Only for a DECLARED entry (B239). In file mode this file is a
-                // MODULE the front end handed us as the entry, and a module that
-                // imports its own name is the silent no-op it has always been —
-                // `a_non_entry_self_import_stays_clean` is that control, and the
-                // editor must not invent a warning the build never prints.
-                if matches!(workspace.entry_mode, EntryMode::Declared { .. })
-                    && let Some((_, span)) = collect_module_paths(&nodes.0, "pkg")
-                        .into_iter()
-                        // A65: the import names this module, or something under
-                        // it — `pkg::main::Thing` reaches the entry too.
-                        .find(|(module, _)| {
-                            *module == name
-                                || module
-                                    .strip_prefix(name)
-                                    .is_some_and(|rest| rest.starts_with("::"))
-                        })
-                {
-                    analyzer.warnings.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span,
-                        msg: format!(
-                            "`pkg::{name}` is this program's own entry file, so this import \
-                             brings the file into itself: everything it declares is already \
-                             in scope here. Delete the import"
-                        ),
-                    });
-                    analyzer.warning_sources.push(SourceId(0));
-                }
-                continue;
-            }
-            // What is left is the editor case: a std or dependency file opened
-            // directly, analyzed *as* its module from the buffer rather than
-            // loaded a second time from disk. Stated as the origin gate it is,
-            // not as "the paths matched" — that was B226's whole mistake.
-            let is_entry_module = is_entry_file && matches!(origin, Origin::Std | Origin::Dep(_));
-            // Use the entry's (buffer) AST for its own module; load the rest from
-            // disk. The entry module keeps SourceId 0 so editor features resolve to
-            // the open document.
-            let (ast, module_text, module_source_id): (&Spanned<NodeList>, &'src str, SourceId) =
-                if is_entry_module {
-                    entry_is_module = true;
-                    // B240: and the §6.13 hoist's pre-mark, undone. A cacheable
-                    // analysis marks `SourceId(0)` expanded up front so the
-                    // load loop's ENTRY arm skips it and
-                    // `expand_entry_over_world` can run the entry's expansion
-                    // after the world is built — but that hoist runs only under
-                    // `!entry_is_module`, and the mark was never taken back
-                    // when the entry turned out to BE a module. A dependency
-                    // file opened as the entry (the editor, `vilan check
-                    // <path>`) therefore expanded nowhere and lost every
-                    // `[derive]` it declares. Here the file is a module, and
-                    // the module arm below is what expands it, under its own
-                    // `ModuleKey`. (A std file opened this way never hit it:
-                    // `entry_is_inside_std` makes that analysis uncacheable, so
-                    // there was no mark to undo.)
-                    expanded_sources.remove(&SourceId(0));
-                    // B250: and the remap this arm is about to make, recorded by
-                    // NAME. `package_of_source[SourceId(0)]` starts on the entry
-                    // package and the `Origin::Dep` arm below moves it to the
-                    // dependency, which is what makes `pkg::` the spelling inside
-                    // this file — and what makes an `import <depname>::…` already
-                    // in it stop resolving. The unresolved-root miss reads this to
-                    // say which package the file is being checked as part of.
-                    if let Origin::Dep(dependency_index) = origin {
-                        analyzer.entry_module_package = workspace
-                            .entry_dependencies
-                            .iter()
-                            .find(|(_, index)| *index == dependency_index)
-                            .map(|(name, _)| name.clone())
-                            .or_else(|| {
-                                workspace.packages.get(dependency_index).and_then(|spec| {
-                                    spec.base_root
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                })
-                            });
+                // A65: "its package's namespace" is the origin's root scope for a
+                // top-level module and its PARENT module's submodule scope for a
+                // nested one — `lib/util.vl` is a member of `lib`, not of `pkg`.
+                let namespace_scope_id = match name.rfind("::") {
+                    None => origin_scope_id,
+                    Some(cut) => {
+                        let parent_id = ensure_module_node(
+                            &mut analyzer,
+                            &mut module_nodes,
+                            &mut to_load,
+                            origin,
+                            &name[..cut],
+                            origin_scope_id,
+                            global_scope_id,
+                        );
+                        module_children_scope(&mut analyzer, parent_id, global_scope_id)
                     }
-                    (nodes, entry_source, SourceId(0))
-                } else {
-                    let Some(loaded) = load_package_module(&module_path) else {
-                        continue;
-                    };
-                    let diagnostics_before = analyzer.diagnostics.len();
-                    report_module_parse_errors(
-                        &mut analyzer.diagnostics,
-                        &mut reported_parse_errors,
-                        &module_path,
-                        &loaded,
-                    );
-                    analyzer.attribute_new_diagnostics(
-                        diagnostics_before,
-                        SourceId(sources.len() as u32),
-                    );
-                    report_module_parse_warnings(
-                        &mut analyzer,
-                        &mut reported_parse_errors,
-                        &module_path,
-                        &loaded,
-                        SourceId(sources.len() as u32),
-                    );
-                    // E198: residence and freezing are two facts, recorded
-                    // separately. EVERY std module is std — that is where the
-                    // A99 steer, `chunks.rs`'s "std is never chunked" and the
-                    // std-free-function recognizers key. Only a std module
-                    // loaded from DISK carries frozen definition-site
-                    // diagnostics (S1); an overlaid buffer (open in the editor,
-                    // or the playground's embedded toolchain) does not.
-                    if matches!(origin, Origin::Std) {
-                        analyzer.std_sources.insert(SourceId(sources.len() as u32));
-                        if !document_overlay_contains(&module_path) {
-                            analyzer
-                                .frozen_sources
-                                .insert(SourceId(sources.len() as u32));
-                        }
-                    }
-                    // E119: a std module under a platform LAYER root is an
-                    // OVERLAID file — its types are this platform's twin of a
-                    // name the other platform spells differently. Recorded for
-                    // every std layer module, overlaid buffer included: an open
-                    // `ui.vl` is still the process twin. Canonical on both sides
-                    // (`windows-support.md` §5), like every other containment
-                    // test over a library root.
-                    if matches!(origin, Origin::Std) {
-                        let canonical = crate::util::canonical_path(&module_path);
-                        if let Some(layer) = std.layers.iter().find(|layer| {
-                            canonical.starts_with(crate::util::canonical_path(&layer.root))
-                        }) {
-                            analyzer
-                                .std_layer_sources
-                                .insert(SourceId(sources.len() as u32), layer.name.clone());
-                            // F27 R6: and the same module as the OTHER layers
-                            // serve it. The relative path is what identifies the
-                            // module inside a layer (`ui.vl`, `nested/lib.vl`),
-                            // so the twin is that same relative path under
-                            // another layer's root — and its label is the module
-                            // path a user writes (`ui`).
-                            let twins: Vec<(String, String, PathBuf, Vec<String>)> = canonical
-                                .strip_prefix(crate::util::canonical_path(&layer.root))
-                                .ok()
-                                .map(|relative| {
-                                    let label = module_label(relative);
-                                    std.layers
-                                        .iter()
-                                        .filter(|other| other.name != layer.name)
-                                        .map(|other| (other, other.root.join(relative)))
-                                        .filter(|(_, path)| path.is_file())
-                                        .map(|(other, path)| {
-                                            (
-                                                other.name.clone(),
-                                                label.clone(),
-                                                path,
-                                                crate::target::PlatformPattern::spell(
-                                                    &other.patterns,
-                                                ),
-                                            )
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            if !twins.is_empty() {
-                                analyzer
-                                    .std_layer_twin_files
-                                    .insert(SourceId(sources.len() as u32), twins);
-                            }
-                        }
-                    }
-                    // A dependency package's module is code the user did not
-                    // write (E84, diagnostics-standard.md C3a): the
-                    // context-coverage walk demotes and traces it exactly
-                    // like std's. Same disk-only gate — an overlaid buffer
-                    // (open in the editor) is live user territory and keeps
-                    // anchoring at itself. No S1 freezing rides on this set.
-                    // A workspace MEMBER (`PackageSpec::member`, E90) is the
-                    // user's own code behind a path edge: it never enters
-                    // the set, so its reads anchor and its calls label like
-                    // the entry's own modules.
-                    if let Origin::Dep(package_index) = origin
-                        && !workspace.packages[package_index].member
-                        && !document_overlay_contains(&module_path)
-                    {
-                        analyzer
-                            .dependency_sources
-                            .insert(SourceId(sources.len() as u32));
-                    }
-                    sources.push(module_path);
-                    source_hashes.push(crate::content_hash(loaded.text));
-                    (
-                        loaded.ast,
-                        loaded.text,
-                        SourceId((sources.len() - 1) as u32),
-                    )
                 };
-            analyzer.source_texts.push((module_source_id, module_text));
-            analyzer.id_windows.source_keys.push(
-                sources
-                    .last()
-                    .map_or(0, |path| crate::content_hash(&path.to_string_lossy())),
-            );
-            let module_scope = analyzer.create_scope(Some(global_scope_id));
-            let module_scope_id = analyzer.push_scope(module_scope);
-            // A65: a module already has an entity when a CHILD of it loaded
-            // first (`lib/util.vl` before `lib/lib.vl`) — adopt that node, so
-            // the children already registered under it stay reachable and
-            // `pkg::lib` and `pkg::lib::util` name one `lib`. Otherwise this is
-            // the flat path the loader has always taken, id for id.
-            let adopted = module_nodes.get(&(origin, name)).copied();
-            let module_id = adopted.unwrap_or_else(|| analyzer.new_entity_id());
-            analyzer.modules.insert(
-                module_id,
-                Module {
-                    id: module_id,
-                    name: module_leaf_name(name),
-                    body: (Vec::new(), module_scope_id),
-                },
-            );
-            // A body: whatever the directory probe concluded before it loaded is
-            // no longer true.
-            analyzer.namespace_only_modules.remove(&module_id);
-            if directory_holds_a_lib_body {
-                analyzer.modules_bodied_by_a_lib_file.insert(module_id);
-            }
-            // Give the module entity a location (its file, at the top) so a path
-            // segment naming it can go-to-definition. A one-id range maps it to its
-            // source; the span is the file start.
-            //
-            // B335: an ADOPTED node already HAS a one-id range — the namespace
-            // placeholder `ensure_module_node` attributed to the entry, because
-            // a namespace has no file of its own. Pushing a second range for
-            // the same id left `source_of` (which takes the FIRST range that
-            // contains an id) answering the ENTRY for every module that owns
-            // both `x.vl` and `x/`, so `program.source_of(segment)` named the
-            // importing file — and `import_module_is_used` (E168/E169) asks
-            // exactly that, so Organize Imports was reading the wrong file. It
-            // also made `source_ranges` non-disjoint, which silently demoted
-            // `source_lookup` to the linear scan M27 exists to avoid. Corrected
-            // IN PLACE: the module has a file now, and the placeholder is the
-            // row that should say so.
-            analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-            match analyzer
-                .source_ranges
-                .iter_mut()
-                .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
-            {
-                Some(placeholder) => placeholder.source = module_source_id,
-                None => analyzer.source_ranges.push(SourceRange {
-                    start: module_id.0,
-                    end: module_id.0 + 1,
-                    source: module_source_id,
-                }),
-            }
-            analyzer
-                .expr_id_to_expr_map
-                .insert(module_id, Expr::Module(module_id));
-            // Register the module under its package's namespace: entry modules in
-            // `pkg`, `std` modules in `std`, a dependency's in its own — so no
-            // package's modules collide with or shadow another's (E.10: a local
-            // `ui.vl` and `std::web::ui` coexist, each reachable through its root).
-            //
-            // A65: "its package's namespace" is the origin's root scope for a
-            // top-level module and its PARENT module's submodule scope for a
-            // nested one — `lib/util.vl` is a member of `lib`, not of `pkg`.
-            let namespace_scope_id = match name.rfind("::") {
-                None => origin_scope_id,
-                Some(cut) => {
-                    let parent_id = ensure_module_node(
-                        &mut analyzer,
-                        &mut module_nodes,
-                        &mut to_load,
-                        origin,
-                        &name[..cut],
-                        origin_scope_id,
-                        global_scope_id,
-                    );
-                    module_children_scope(&mut analyzer, parent_id, global_scope_id)
+                module_nodes.insert((origin, name), module_id);
+                analyzer
+                    .mut_scope_for_scope_id(namespace_scope_id)
+                    .name_to_id_map
+                    .insert(module_leaf_name(name), module_id);
+                // `module_scopes` indexes std modules by name for the primitive and
+                // `panic` captures below; other packages' modules must not enter it (a
+                // user or dependency module named `string`/`io`/`json`/... would shadow
+                // the real one and break those captures).
+                if origin == Origin::Std {
+                    module_scopes.insert(name, module_scope_id);
                 }
-            };
-            module_nodes.insert((origin, name), module_id);
-            analyzer
-                .mut_scope_for_scope_id(namespace_scope_id)
-                .name_to_id_map
-                .insert(module_leaf_name(name), module_id);
-            // `module_scopes` indexes std modules by name for the primitive and
-            // `panic` captures below; other packages' modules must not enter it (a
-            // user or dependency module named `string`/`io`/`json`/... would shadow
-            // the real one and break those captures).
-            if origin == Origin::Std {
-                module_scopes.insert(name, module_scope_id);
-            }
-            // M21: the entry package's own modules, for the entry-expansion
-            // hoist's "is it already here?" question. A dependency's modules
-            // are not `pkg::` from the entry, so they are not in this set.
-            if origin == Origin::Pkg {
-                pkg_module_names.insert(name);
-                // A65: and the directory it sits under, which is the segment a
-                // generated `pkg::lib::util` reference is checked by.
-                if let Some(cut) = name.find("::") {
-                    pkg_module_names.insert(&name[..cut]);
-                }
-            }
-            // Record which package this module's source belongs to, so its imports
-            // resolve `pkg::`/`<dep>::` relative to that package. Std sources always
-            // map (their `pkg::` siblings are std's); entry sources only when the
-            // program has dependencies (otherwise the legacy global resolution
-            // applies, and the global `pkg` namespace is theirs alone).
-            match origin {
-                Origin::Std => {
-                    analyzer
-                        .package_of_source
-                        .insert(module_source_id, std_package_index);
-                }
-                Origin::Dep(index) => {
-                    analyzer
-                        .package_of_source
-                        .insert(module_source_id, 1 + index);
-                }
-                Origin::Pkg if has_dependencies => {
-                    analyzer.package_of_source.insert(module_source_id, 0);
-                }
-                Origin::Pkg => {}
-            }
-            // A module's `pkg::` siblings inherit its package; a user/dependency
-            // module's `std::` imports are std, and its `<dep>::` references seed that
-            // dependency. (Std modules reference each other via `pkg::` only, so
-            // collecting their `std::` imports would be a no-op — skip it to keep the
-            // std load byte-for-byte unchanged.)
-            to_load.extend(
-                collect_module_paths(&ast.0, "pkg")
-                    .into_iter()
-                    .map(|(sibling, _)| (origin, sibling)),
-            );
-            // A `[service]` item means the std `service` macro (hosted in
-            // `std::rpc`, too heavy to always-load) must be in the prelude.
-            for seed in service_seeds(&ast.0) {
-                to_load.push((Origin::Std, seed));
-            }
-            // B270, the entry's twin: a loaded module's own `css` blocks and
-            // elements seed their std modules, whatever package it belongs to.
-            to_load.extend(
-                collect_std_item_modules(&ast.0)
-                    .into_iter()
-                    .map(|module| (Origin::Std, module)),
-            );
-            // Seed the module's `std::` and `<dep>::` references. Only the *building*
-            // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
-            // (`Dep`) are its internals, loaded for typing without a gate (the
-            // dependency's compatibility was checked at the user's import). Std modules
-            // reference each other only via `pkg::`, so they seed nothing here.
-            match origin {
-                Origin::Std => {}
-                Origin::Pkg => {
-                    let std_refs = collect_module_paths(&ast.0, "std");
-                    to_load.extend(
-                        std_refs
-                            .into_iter()
-                            .map(|(module, _)| (Origin::Std, module)),
-                    );
-                    for (name, index) in &workspace.entry_dependencies {
-                        let refs = collect_module_paths(&ast.0, name);
-                        to_load.extend(
-                            refs.into_iter()
-                                .map(|(module, _)| (Origin::Dep(*index), module)),
-                        );
+                // M21: the entry package's own modules, for the entry-expansion
+                // hoist's "is it already here?" question. A dependency's modules
+                // are not `pkg::` from the entry, so they are not in this set.
+                if origin == Origin::Pkg {
+                    pkg_module_names.insert(name);
+                    // A65: and the directory it sits under, which is the segment a
+                    // generated `pkg::lib::util` reference is checked by.
+                    if let Some(cut) = name.find("::") {
+                        pkg_module_names.insert(&name[..cut]);
                     }
                 }
-                Origin::Dep(index) => {
-                    to_load.extend(
-                        collect_module_paths(&ast.0, "std")
-                            .into_iter()
-                            .map(|(module, _)| (Origin::Std, module)),
-                    );
-                    for (name, dependency_index) in &workspace.packages[index].dependencies {
-                        to_load.extend(
-                            collect_module_paths(&ast.0, name)
-                                .into_iter()
-                                .map(|(module, _)| (Origin::Dep(*dependency_index), module)),
-                        );
+                // Record which package this module's source belongs to, so its imports
+                // resolve `pkg::`/`<dep>::` relative to that package. Std sources always
+                // map (their `pkg::` siblings are std's); entry sources only when the
+                // program has dependencies (otherwise the legacy global resolution
+                // applies, and the global `pkg` namespace is theirs alone).
+                match origin {
+                    Origin::Std => {
+                        analyzer
+                            .package_of_source
+                            .insert(module_source_id, std_package_index);
                     }
+                    Origin::Dep(index) => {
+                        analyzer
+                            .package_of_source
+                            .insert(module_source_id, 1 + index);
+                    }
+                    Origin::Pkg if has_dependencies => {
+                        analyzer.package_of_source.insert(module_source_id, 0);
+                    }
+                    Origin::Pkg => {}
                 }
+                loaded.push((
+                    name,
+                    ast,
+                    module_text,
+                    module_scope_id,
+                    module_source_id,
+                    origin,
+                ));
             }
-            loaded.push((
-                name,
-                ast,
-                module_text,
-                module_scope_id,
-                module_source_id,
-                origin,
-            ));
         }
 
         // --- Macro expansion epilogue (runs once loads settle) ---
