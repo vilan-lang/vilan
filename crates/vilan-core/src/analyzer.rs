@@ -58270,14 +58270,16 @@ impl<'src> Analyzer<'src> {
             closure @ Type::Closure(..) => closure,
             _ => Type::Unknown,
         };
+        let mut probe_has_hole = false;
         let first_ready = value_ids
             .first()
             .map(|&value_id| {
-                self.expr_id_to_expr_map.contains_key(&value_id)
-                    && !matches!(
-                        self.infer_type(value_id, &probe_direction, &HashMap::default()),
-                        Type::Unresolved
-                    )
+                if !self.expr_id_to_expr_map.contains_key(&value_id) {
+                    return false;
+                }
+                let probe = self.infer_type(value_id, &probe_direction, &HashMap::default());
+                probe_has_hole = self.type_value_has_hole(&probe);
+                !matches!(probe, Type::Unresolved)
             })
             .unwrap_or(true);
         if !first_ready {
@@ -58303,7 +58305,9 @@ impl<'src> Analyzer<'src> {
                     // permanent `Unknown` B185 describes, and a block-bodied
                     // closure's tail read it so: the call's `U` bound to
                     // nothing (`d`) or to an argument-less `Maybe`.
-                    || (!self.fixpoint_stalled && self.value_awaits_a_closure_parameter(value_id))
+                    || (probe_has_hole
+                        && !self.fixpoint_stalled
+                        && self.value_awaits_a_closure_parameter(value_id))
             })
         {
             return Resolution::Deferred;
@@ -58317,6 +58321,7 @@ impl<'src> Analyzer<'src> {
         // first, refused it. Until the fixpoint stalls (B372's door): a
         // parameter nothing fills keeps today's reading.
         if !matches!(initial_type_id.get_type(self), Type::Unknown)
+            && probe_has_hole
             && !self.fixpoint_stalled
             && value_ids
                 .first()
@@ -58426,14 +58431,17 @@ impl<'src> Analyzer<'src> {
                 deferred_value_ids.push(value_id);
                 continue;
             }
-            // B604: a reassignment over an unfilled closure parameter waits for
-            // the fill, as the first value does above.
-            if !self.fixpoint_stalled && self.value_awaits_a_closure_parameter(value_id) {
+            let value_type = self.infer_type(value_id, &variable_type, &substitution_context);
+            if matches!(value_type, Type::Unresolved) {
                 deferred_value_ids.push(value_id);
                 continue;
             }
-            let value_type = self.infer_type(value_id, &variable_type, &substitution_context);
-            if matches!(value_type, Type::Unresolved) {
+            // B604: a reassignment over an unfilled closure parameter waits for
+            // the fill, as the first value does above.
+            if self.type_value_has_hole(&value_type)
+                && !self.fixpoint_stalled
+                && self.value_awaits_a_closure_parameter(value_id)
+            {
                 deferred_value_ids.push(value_id);
                 continue;
             }
