@@ -149,3 +149,4 @@ console.log("--");
 loaned();
 console.log("--");
 component_writes();
+//# sourceMappingURL=resource.mjs.map

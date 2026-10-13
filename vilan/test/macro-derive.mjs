@@ -18,3 +18,4 @@ function format3(value) {
 }
 console.log(format2([ 1, 2 ]));
 console.log(format3([ 3, 4 ]));
+//# sourceMappingURL=macro-derive.mjs.map

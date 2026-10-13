@@ -56,3 +56,4 @@ while (true) {
 	squares.push(Math.pow(n, 2));
 }
 console.log(String(squares.length));
+//# sourceMappingURL=range.mjs.map

@@ -36,6 +36,7 @@
 
 mod replay_harness;
 mod scratch;
+mod test_pool;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -233,6 +234,218 @@ fn replay_the_classes() -> Replayed {
     }
 }
 
+/// **std-prefix P1's gate** (`std-prefix.md` §13): every §6 edit class and
+/// every post-pass fixture, applied and undone, with the in-process std-only
+/// prefix FORCED ON — the world stored is std alone, keyed by the std closure,
+/// and every package module walks and resolves over it — answers what the
+/// canonical clean analysis answers, and emits what a clean analysis of the
+/// same shape emits. Non-vacuous on three counts: prefix worlds are built and
+/// SERVED (the second analysis of every state hits the prefix the first one
+/// stored), and §4.2's guard REFUSES the prefix where it must (the classes
+/// package's hot trait impls answer questions std's resolve asked; its `bag`
+/// is a use-inferred binding another module pushes into) — each refusal then
+/// answering canonically too, which the comparison above holds.
+#[test]
+fn every_edit_class_answers_what_a_clean_analysis_answers_over_the_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let Replayed {
+        divergences,
+        censuses,
+        ..
+    } = replay_the_classes();
+    let mut divergences = divergences;
+    let mut censuses = censuses;
+    for fixture in POST_PASS_FIXTURES {
+        let mut package = fixture.write();
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(None);
+    assert!(
+        divergences.is_empty(),
+        "{} step(s) of the edit script observe the std-prefix analysis:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let prefix_worlds = censuses.iter().filter(|census| census.prefix_world).count();
+    let prefix_hits: u64 = censuses.iter().map(|census| census.prefix_hits).sum();
+    let refusals: Vec<&'static str> = censuses
+        .iter()
+        .filter_map(|census| census.prefix_refusal)
+        .collect();
+    eprintln!(
+        "{} analyses: {prefix_worlds} over the std prefix, {prefix_hits} prefix hits, \
+         refusals {refusals:?}",
+        censuses.len()
+    );
+    assert!(
+        prefix_worlds >= 8 && prefix_hits >= 8,
+        "the script must build and serve the std prefix (worlds {prefix_worlds}, hits \
+         {prefix_hits}); the comparison above is otherwise vacuous about P1"
+    );
+    assert!(
+        refusals.is_empty(),
+        "no package of the script writes an impl a std question reaches, so nothing \
+         refuses the prefix: {refusals:?}"
+    );
+}
+
+/// A package impl of a std trait whose member std's own resolve asks about —
+/// kolt's `impl ProxySignal<type T> with Signal<T>` and std's `get` lookups —
+/// for the std-prefix tests below.
+const PREFIX_PROXY: &str = "import std::reactive::{ Signal, Subscriber, Subscription };\n\n\
+export struct ProxySignal<T> {\n\tget: || T,\n\tset: |T| void,\n\
+\ton_settle: |Subscriber| Subscription,\n\tnotify: || void,\n}\n\n\
+export impl ProxySignal<type T> with Signal<T> {\n\tfun get(self): T {\n\t\t(self.get)()\n\t}\n\n\
+\t[must_use]\n\tfun on_settle(self, subscriber: Subscriber): Subscription {\n\
+\t\t(self.on_settle)(subscriber)\n\t}\n\n\tfun notify(self) {\n\t\t(self.notify)();\n\t}\n\n\
+\tfun set(self, value: T) {\n\t\t(self.set)(value);\n\t}\n}\n";
+
+/// The incremental analysis of `package` with the std prefix forced on, and
+/// the canonical clean one, which must agree.
+fn observe_over_the_prefix(package: &Package) -> Observation {
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let incremental = observe(package, Vec::new(), Leg::Incremental);
+    vilan_core::incremental::set_std_prefix(None);
+    let clean = observe(package, Vec::new(), Leg::Clean);
+    assert_eq!(
+        incremental.rendering, clean.rendering,
+        "an analysis over the std prefix answers what the clean one does"
+    );
+    incremental
+}
+
+/// **std-prefix P1, §4.3's key: the std CLOSURE.** Two packages that share no
+/// module and spell their std imports differently (`std::path::{ basename }`
+/// against `std::path` and `std::path::basename` through a module import) but
+/// reach one std set share ONE prefix: the second is served the world the first
+/// stored, and walks its own package over it. A package whose std set is a
+/// SUPERSET is never served the subset's prefix (§4.3: extra std modules can
+/// change answers).
+#[test]
+fn packages_with_one_std_closure_share_one_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let first = Package::write(
+        "prefix_first",
+        NODE,
+        &[
+            (
+                "main.vl",
+                "import pkg::alpha::named;\n\nfun main() {\n\tprint(named());\n}\n",
+            ),
+            (
+                "alpha.vl",
+                "import std::path::{ basename };\n\nexport fun named(): str {\n\tbasename(\"/x/y.txt\")\n}\n",
+            ),
+        ],
+    );
+    let second = Package::write(
+        "prefix_second",
+        NODE,
+        &[
+            (
+                "main.vl",
+                "import pkg::beta::other;\nimport std::path;\n\nfun main() {\n\tprint(other());\n}\n",
+            ),
+            (
+                "beta.vl",
+                "import std::path;\n\nexport fun other(): str {\n\tpath::basename(\"/a/b.txt\")\n}\n",
+            ),
+        ],
+    );
+    let superset = Package::write(
+        "prefix_superset",
+        NODE,
+        &[
+            (
+                "main.vl",
+                "import pkg::gamma::third;\n\nfun main() {\n\tprint(third());\n}\n",
+            ),
+            (
+                "gamma.vl",
+                "import std::path::{ basename };\nimport std::base64;\n\n\
+                 export fun third(): str {\n\tbase64::encode(basename(\"/q/r.txt\").to_utf8())\n}\n",
+            ),
+        ],
+    );
+    let stored = observe_over_the_prefix(&first);
+    let served = observe_over_the_prefix(&second);
+    let missed = observe_over_the_prefix(&superset);
+    for package in [first, second, superset] {
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        stored.census.prefix_world && stored.census.prefix_hits == 0,
+        "the first package builds the prefix: {:?}",
+        stored.census
+    );
+    assert!(
+        served.census.prefix_world && served.census.prefix_hits == 1,
+        "a package with the same std closure is served the stored prefix: {:?}",
+        served.census
+    );
+    assert!(
+        missed.census.prefix_world && missed.census.prefix_hits == 0,
+        "a superset std set builds its own prefix: {:?}",
+        missed.census
+    );
+}
+
+/// **std-prefix P1, §4.2's guard.** A package impl that could answer a
+/// question std's own resolve asked — here a package `impl .. with Signal<T>`
+/// declaring `get`, which std's reactive code looks up — refuses the prefix:
+/// the analysis is built in the shape it would have taken without it (the
+/// canonical one: no hot seed), answers what the clean analysis answers, and
+/// the next analysis of the same package does not try again.
+#[test]
+fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let package = Package::write(
+        "prefix_reached",
+        NODE,
+        &[
+            (
+                "main.vl",
+                "import pkg::proxy::ProxySignal;\n\nfun main() {\n\tprint(\"ok\");\n}\n",
+            ),
+            ("proxy.vl", PREFIX_PROXY),
+        ],
+    );
+    let refused = observe_over_the_prefix(&package);
+    let remembered = observe_over_the_prefix(&package);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        !refused.census.prefix_world
+            && refused.census.prefix_refusals == 1
+            && refused.census.prefix_refusal == Some("impl-reached"),
+        "the package's impl refuses the prefix: {:?}",
+        refused.census
+    );
+    assert_eq!(
+        remembered.census.prefix_refusal,
+        Some("refused-before"),
+        "a refused package is not built over the prefix again: {:?}",
+        remembered.census
+    );
+}
+
 /// **The gate.** Every §6 edit class, applied and undone, answers what a clean
 /// analysis answers — byte for byte over everything an editor reads, and the
 /// emitted JS wherever the program emits.
@@ -389,6 +602,30 @@ fn every_edit_class_answers_what_a_clean_analysis_answers() {
         inherited > 0,
         "the served keystrokes inherit the stored world's windows"
     );
+    // M110 S7 (Order 51): the warm keystrokes SERVED per-item records for
+    // the re-walked files' unchanged items — and found some stale (the
+    // edited item, its dependents) — or the comparison above said nothing
+    // about the records. The effect edits (a context read removed, a sleep
+    // removed, a node call removed, a push into another module's binding)
+    // are among the legs that served.
+    let items_served: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_served)
+        .sum();
+    let items_stale: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_stale)
+        .sum();
+    let items_filed: u64 = censuses
+        .iter()
+        .map(|census| census.item_records_filed)
+        .sum();
+    eprintln!("S7: {items_served} item records served, {items_stale} stale, {items_filed} filed");
+    assert!(
+        items_served > 0 && items_stale > 0 && items_filed > 0,
+        "the classes leg must serve per-item records on its warm keystrokes and find the \
+         edited items stale (served {items_served}, stale {items_stale}, filed {items_filed})"
+    );
     // The stand-down edit (the browser effect package's last edit, replayed
     // last: edit then undo) applies no rewrite, so the recorded post-rewrite
     // graph is NOT served to it — the log guard.
@@ -475,7 +712,7 @@ fn the_corpus_as_modules_answers_what_a_clean_analysis_answers() {
     vilan_core::analyzer::base_cache_clear();
     let results: Vec<(String, Vec<String>, Vec<Census>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = paths
-            .chunks(paths.len().div_ceil(16).max(1))
+            .chunks(paths.len().div_ceil(test_pool::workers(16)).max(1))
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk
@@ -616,6 +853,28 @@ fn a_rewritten_graph_replayed_over_a_stood_down_rewrite_is_counted() {
          now reads a call edge without the tree beside it; make the log guard's plant a \
          differential red: {:#?}",
         replayed.divergences
+    );
+}
+
+/// S7's plant (M110, Order 51): an item's record served on its own text and
+/// walk alone, the dirty closure never asked. A push into another module's
+/// use-inferred binding typed with a different type (the M139 shape: the
+/// pusher's constraint writes the owner item's slot) then leaves the owner
+/// item's label at the previous keystroke's element type; a callee's changed
+/// return leaves its callers' labels and checks — the gate must see it.
+#[test]
+fn the_differential_sees_an_item_record_served_over_a_dirty_dependency() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::ItemRecordUnguarded);
+    assert!(
+        divergences.iter().any(
+            |divergence| divergence.contains("pushed into a module binding")
+                || divergence.contains("push into another module's binding")
+        ),
+        "the unguarded-record plant must turn a push into another module's binding red; \
+         it found: {divergences:#?}"
     );
 }
 

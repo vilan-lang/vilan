@@ -56,3 +56,4 @@ console.log(String(filter(xs, (n) => {
 for_each(xs, (n) => {
 	return console.log(String(n));
 });
+//# sourceMappingURL=list-methods.mjs.map

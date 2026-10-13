@@ -2953,7 +2953,7 @@ fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
             "the Wire boundary",
             "[derive(Wire)]\nstruct Holder {\n\tcallback: |i53| i53,\n}\n".to_string(),
             "import pkg::m::Holder;\nfun main() { }\n",
-            "of `[derive(Wire)]` type `Holder` is `_`, which is not Wire",
+            "of `[derive(Wire)]` type `Holder` is `|i53| i53`, which is not Wire",
         ),
         (
             "the Hashable boundary",

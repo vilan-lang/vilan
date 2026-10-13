@@ -7,3 +7,4 @@ function mix(self, b2) {
 const a = [ 4 ];
 const b = [ 6 ];
 console.log(String(mix(a, b)));
+//# sourceMappingURL=default-generic-param.mjs.map

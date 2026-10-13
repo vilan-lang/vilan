@@ -81,3 +81,4 @@ console.log(String(count[0]));
 let ready = [ false ];
 set([ ready, 0 ], true);
 console.log(ready[0]);
+//# sourceMappingURL=transparent-references.mjs.map

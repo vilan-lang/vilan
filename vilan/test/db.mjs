@@ -75,3 +75,4 @@ try {
 	$f(db);
 }
 process.exit($a);
+//# sourceMappingURL=db.mjs.map

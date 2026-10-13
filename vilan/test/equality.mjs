@@ -51,3 +51,4 @@ console.log(eq2(r, [ 1, "x" ]));
 console.log(5 === 5);
 console.log("a" === "b");
 console.log(true === true);
+//# sourceMappingURL=equality.mjs.map

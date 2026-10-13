@@ -951,6 +951,17 @@ function as_i53(self) {
 	const widened = self;
 	return Number(Math.trunc(widened));
 }
+function ambient_signal($ar) {
+	const $as = $ar;
+	let $at = null;
+	if ($as[0] === 0) {
+		const n = $as[1];
+		$at = [ 0, n.signal_of() ];
+	} else {
+		$at = [ 1 ];
+	}
+	return $at;
+}
 function now() {
 	return [ as_i53(Date.now()) ];
 }
@@ -1065,17 +1076,6 @@ async function sleep_for(duration, $ao) {
 }
 function eq(self, other) {
 	return self[0] === other[0];
-}
-function ambient_signal($ar) {
-	const $as = $ar;
-	let $at = null;
-	if ($as[0] === 0) {
-		const n = $as[1];
-		$at = [ 0, n.signal_of() ];
-	} else {
-		$at = [ 1 ];
-	}
-	return $at;
 }
 function begin_struct5(self, fields) {
 	self[0](fields);
@@ -1269,3 +1269,4 @@ function decode2(codec, frame) {
 	console.error(String($au));
 	process.exit(1);
 });
+//# sourceMappingURL=time.mjs.map

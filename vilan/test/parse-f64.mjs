@@ -30,3 +30,4 @@ console.log(String(unwrap_or(__parse_f64("-2.5"), 0)));
 console.log(String(unwrap_or(__parse_f64("nope"), -(1))));
 console.log(is_some(__parse_f64("3.14")));
 console.log(is_some(__parse_f64("abc")));
+//# sourceMappingURL=parse-f64.mjs.map

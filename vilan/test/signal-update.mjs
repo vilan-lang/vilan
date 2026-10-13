@@ -442,3 +442,4 @@ set_with(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log(String(get(count)));
+//# sourceMappingURL=signal-update.mjs.map

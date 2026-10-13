@@ -146,6 +146,17 @@ function as_i32(self) {
 	const widened = Number(self);
 	return Number(fold_signed(widened, 4294967296, 2147483648));
 }
+function ambient_signal($c) {
+	const $d = $c;
+	let $e = null;
+	if ($d[0] === 0) {
+		const n = $d[1];
+		$e = [ 0, n.signal_of() ];
+	} else {
+		$e = [ 1 ];
+	}
+	return $e;
+}
 async function sleep(ms, $a) {
 	await (__sleep(clamp_delay(ms), ambient_signal($a)));
 }
@@ -157,17 +168,6 @@ function clamp_delay(ms) {
 		$b = ms;
 	}
 	return $b;
-}
-function ambient_signal($c) {
-	const $d = $c;
-	let $e = null;
-	if ($d[0] === 0) {
-		const n = $d[1];
-		$e = [ 0, n.signal_of() ];
-	} else {
-		$e = [ 1 ];
-	}
-	return $e;
 }
 function run(f) {
 	return f() + 100;
@@ -230,3 +230,4 @@ function __show_List_i32(value) {
 	console.error(String($h));
 	process.exit(1);
 });
+//# sourceMappingURL=adapt.mjs.map

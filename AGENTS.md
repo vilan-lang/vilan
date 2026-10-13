@@ -156,6 +156,14 @@ Rust workspace, eleven crates, plus the language's own tree:
 - **`.vl` probe files outside a package resolve no std** (no `Some`/`None`, no
   imports). Put probes in `vilan/test/` or a scratch directory carrying a
   `vilan.toml`.
+- **A binary's std is its own, never the nearest checkout's (N168).** `vilan` and
+  `vilan-lsp` compile against `$VILAN_STD` when it is set and otherwise against the std
+  EMBEDDED at build time (materialized to `~/.vilan/std-cache/<hash>/`); they no longer
+  walk a program's ancestors for `vilan/std`. A build re-embeds on every std edit, so
+  `cargo run`/nextest see an edit after their build step; to run a binary against a tree
+  you are editing without rebuilding, say so: `VILAN_STD=<checkout>/vilan/std`. A probe
+  for a base compiler therefore needs no special place, and a std edit made while a suite
+  runs changes nothing the running binaries read.
 - **Writing vilan:** match arms need a trailing comma even after `{}` block bodies;
   pattern bindings use `let` (`Some(let x)`); `.vl` indentation is tabs — the
   formatter (`target/debug/vilan fmt`) is authoritative.

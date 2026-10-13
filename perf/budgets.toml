@@ -236,7 +236,7 @@ blocking = false
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
+green_seals = 3
 blocking = true
 
 [[e121]]

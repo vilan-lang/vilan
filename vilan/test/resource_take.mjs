@@ -255,3 +255,4 @@ try {
 	}
 }
 console.log("after drop");
+//# sourceMappingURL=resource_take.mjs.map

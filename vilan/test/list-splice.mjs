@@ -37,3 +37,4 @@ console.log(String(__remove_at(xs, 1, "list-splice.vl:24:11")));
 console.log(String(__at(xs, 1, "list-splice.vl:25:8")));
 console.log(String(__at(xs, 2, "list-splice.vl:26:8")));
 console.log(String(xs.length));
+//# sourceMappingURL=list-splice.mjs.map

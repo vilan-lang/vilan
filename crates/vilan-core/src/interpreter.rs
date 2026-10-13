@@ -23,7 +23,7 @@
 //! - String ops use UTF-16 code-unit semantics like JS; lone surrogates from
 //!   slicing are replaced (`from_utf16_lossy`) rather than preserved.
 
-use crate::fx::FxHashMap as HashMap;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::node::BinaryOp;
 use crate::transformer::{ConstSite, JsProgram, js};
 use indexmap::IndexMap;
@@ -171,7 +171,15 @@ pub enum ConstValue {
 /// `snapshots` admits G24's closure result: a `const let` binding takes one,
 /// every other const site keeps §1's "plain data" rule and the refusal that
 /// steers to `const let`.
-fn value_to_const(value: &Value, snapshots: bool) -> Result<ConstValue, &'static str> {
+///
+/// `method_tables` are the trait-object tables this run built (G25), by
+/// address: an object among them is a `dyn` value's half, which is code the
+/// program builds and no data a build can write down.
+fn value_to_const(
+    value: &Value,
+    snapshots: bool,
+    method_tables: &HashSet<usize>,
+) -> Result<ConstValue, &'static str> {
     Ok(match value {
         Value::Undefined => ConstValue::Undefined,
         Value::Null => ConstValue::Null,
@@ -183,14 +191,14 @@ fn value_to_const(value: &Value, snapshots: bool) -> Result<ConstValue, &'static
             items
                 .borrow()
                 .iter()
-                .map(|item| value_to_const(item, snapshots))
+                .map(|item| value_to_const(item, snapshots, method_tables))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Set(items) => ConstValue::Set(
             items
                 .borrow()
                 .values()
-                .map(|item| value_to_const(item, snapshots))
+                .map(|item| value_to_const(item, snapshots, method_tables))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Map(entries) => ConstValue::Map(
@@ -199,12 +207,20 @@ fn value_to_const(value: &Value, snapshots: bool) -> Result<ConstValue, &'static
                 .values()
                 .map(|(key, value)| {
                     Ok::<_, &'static str>((
-                        value_to_const(key, snapshots)?,
-                        value_to_const(value, snapshots)?,
+                        value_to_const(key, snapshots, method_tables)?,
+                        value_to_const(value, snapshots, method_tables)?,
                     ))
                 })
                 .collect::<Result<_, _>>()?,
         ),
+        Value::Object(object) if method_tables.contains(&(Rc::as_ptr(object) as usize)) => {
+            return Err(
+                "a trait object (a `dyn` value), whose method table is code the \
+                        program builds rather than data a build can write down — keep the \
+                        concrete type here and let the value meet the `dyn` type where it is \
+                        used",
+            );
+        }
         Value::Object(_) => return Err("a `Shared` cell"),
         Value::Closure(closure) => {
             if !snapshots {
@@ -218,7 +234,7 @@ fn value_to_const(value: &Value, snapshots: bool) -> Result<ConstValue, &'static
             };
             ConstValue::Callable {
                 body,
-                captures: closure_captures(closure, snapshots)?,
+                captures: closure_captures(closure, snapshots, method_tables)?,
             }
         }
     })
@@ -237,6 +253,7 @@ fn value_to_const(value: &Value, snapshots: bool) -> Result<ConstValue, &'static
 fn closure_captures(
     closure: &ClosureData<'_>,
     snapshots: bool,
+    method_tables: &HashSet<usize>,
 ) -> Result<Vec<(String, ConstValue)>, &'static str> {
     let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     crate::transformer::collect_references(closure.body, &mut referenced);
@@ -260,7 +277,10 @@ fn closure_captures(
             let found = borrowed.vars.get(name.as_str()).cloned();
             drop(borrowed);
             if let Some(value) = found {
-                captures.push((name.clone(), value_to_const(&value, snapshots)?));
+                captures.push((
+                    name.clone(),
+                    value_to_const(&value, snapshots, method_tables)?,
+                ));
                 break;
             }
             scope = Some(parent);
@@ -898,6 +918,9 @@ struct Interpreter<'a> {
     /// serves the whole const pass, so two reached functions can never share
     /// one emitted name (`ConstWorld::resolve_trace` rests on the same fact).
     scheduled: Vec<Rc<str>>,
+    /// G25: every trait-object table this run built, by address — so a result
+    /// holding one is refused as the `dyn` value it is, not as an object.
+    method_tables: HashSet<usize>,
     /// The per-run scope registry (leak-soak.md §7.8): every scope this run
     /// created, weakly held. A hoisted or expression-position function is a
     /// `Value::Closure` whose `env` is the scope holding it — a reference
@@ -933,6 +956,7 @@ impl<'a> Interpreter<'a> {
             snapshots,
             reader: None,
             scheduled: Vec::new(),
+            method_tables: HashSet::default(),
             scopes: Vec::new(),
             next_shared_identity: 1.0,
             dbg_inside: Vec::new(),
@@ -1013,7 +1037,7 @@ impl<'a> Interpreter<'a> {
                 "the const result binding was not emitted",
             ));
         };
-        value_to_const(&result, self.snapshots).map_err(|what| {
+        value_to_const(&result, self.snapshots, &self.method_tables).map_err(|what| {
             Failure::new(
                 FailureKind::Unsupported,
                 format!("a `const` result must be plain data; this evaluates to {what}"),
@@ -1344,7 +1368,9 @@ impl<'a> Interpreter<'a> {
                     let value = self.eval(value, env)?;
                     object.insert(Rc::from(name.as_str()), value);
                 }
-                Ok(Value::Object(Rc::new(RefCell::new(object))))
+                let table = Rc::new(RefCell::new(object));
+                self.method_tables.insert(Rc::as_ptr(&table) as usize);
+                Ok(Value::Object(table))
             }
             js::Node::Spread(_) => Err(Failure::internal("spread outside an array literal")),
             js::Node::Local(name) => self.eval_local(name, env),
@@ -2457,6 +2483,33 @@ impl<'a> Interpreter<'a> {
                     Err(index_out_of_bounds(length, index))
                 }
             }
+            // B577: the option a call handing back a shared scalar view is
+            // consumed as, matching the emitted helper: the `variant`'s
+            // payload pair `[base, key]` is replaced by `base[key]`, in a new
+            // array; any other variant passes through.
+            "__payload_view_read" => {
+                let value = take(0);
+                let variant = take(1);
+                let pair = match &value {
+                    Value::Array(items) => {
+                        let items = items.borrow();
+                        match (items.first(), items.get(1)) {
+                            (Some(tag), Some(pair)) if strict_equals(tag, &variant) => {
+                                Some(pair.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(pair) = pair else {
+                    return Ok(value);
+                };
+                let base = self.read_index(&pair, &Value::Number(0.0))?;
+                let key = self.read_index(&pair, &Value::Number(1.0))?;
+                let read = self.read_index(&base, &key)?;
+                Ok(Value::Array(Rc::new(RefCell::new(vec![variant, read]))))
+            }
             // The checked slice, matching the emitted `__substring` helper: a
             // range outside `0 <= start <= end <= len` is a panic (`Thrown`),
             // so a const-time violation fails the build with the same message a
@@ -2984,6 +3037,18 @@ impl<'a> Interpreter<'a> {
                 }
                 str_result(s.replace(&*from, &to))
             }
+            // `str::index_of` / `last_index_of` over the host's `indexOf` /
+            // `lastIndexOf` (G26): the position in UTF-16 code units — the
+            // unit `len` and `substring` count — or `-1` when absent; an empty
+            // needle is at 0 and at the length, as the host places it.
+            "indexOf" => {
+                let needle = expect_str(&argument(0))?;
+                Ok(Value::Number(utf16_position(s, &needle, false)))
+            }
+            "lastIndexOf" => {
+                let needle = expect_str(&argument(0))?;
+                Ok(Value::Number(utf16_position(s, &needle, true)))
+            }
             "split" => {
                 let separator = expect_str(&argument(0))?;
                 let parts: Vec<Value> = if separator.is_empty() {
@@ -3425,6 +3490,24 @@ fn truthy(value: &Value) -> bool {
 }
 
 /// JS `===`: same-type value equality; reference identity for containers.
+/// The host's `indexOf` (`last` false) or `lastIndexOf` (`last` true) of
+/// `needle` in `text`, in UTF-16 code units, `-1` when absent.
+fn utf16_position(text: &str, needle: &str, last: bool) -> f64 {
+    let text: Vec<u16> = text.encode_utf16().collect();
+    let needle: Vec<u16> = needle.encode_utf16().collect();
+    if needle.len() > text.len() {
+        return -1.0;
+    }
+    let starts = 0..=text.len() - needle.len();
+    let matches_at = |start: &usize| text[*start..*start + needle.len()] == needle[..];
+    let found = if last {
+        starts.rev().find(matches_at)
+    } else {
+        starts.into_iter().find(matches_at)
+    };
+    found.map_or(-1.0, |start| start as f64)
+}
+
 fn strict_equals<'a>(a: &Value<'a>, b: &Value<'a>) -> bool {
     match (a, b) {
         (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,

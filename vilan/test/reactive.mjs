@@ -893,3 +893,4 @@ take(owner, sub2(__clone(count), (n, $aN) => {
 	return console.log(String(n));
 }), [ 1 ]);
 set(count, 20, [ 1 ]);
+//# sourceMappingURL=reactive.mjs.map

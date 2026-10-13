@@ -47,3 +47,4 @@ async function labelled(label) {
 	console.error(String($a));
 	process.exit(1);
 });
+//# sourceMappingURL=async-await.mjs.map

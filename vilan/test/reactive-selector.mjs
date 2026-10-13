@@ -540,3 +540,4 @@ batch(($af) => {
 }, [ 1 ]);
 console.log("hits=" + hits);
 dispose(watch, [ 1 ]);
+//# sourceMappingURL=reactive-selector.mjs.map

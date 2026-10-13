@@ -156,8 +156,13 @@ fn the_report_carries_the_measured_verdict() {
     );
     // The numbers are real: whatever it claims the whole build weighs is what
     // this very build wrote, since `--print-chunks` does not split.
-    let whole = std::fs::metadata(staged.join("app.js"))
-        .expect("the flag must not suppress the build")
+    // Its JavaScript, that is: the line naming its source map (E257 S5) is
+    // the build's, written after the emission the verdict weighs.
+    let written = std::fs::read_to_string(staged.join("app.js"))
+        .expect("the flag must not suppress the build");
+    let whole = written
+        .strip_suffix("//# sourceMappingURL=app.js.map\n")
+        .unwrap_or(&written)
         .len();
     assert!(
         verdict.contains(&format!("{whole} whole")),

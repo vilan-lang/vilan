@@ -6129,6 +6129,90 @@ fn b302_a_path_of_three_segments_renders_whole() {
     );
 }
 
+// --- B597 / E296: a tuple, array, closure or view type is QUOTED, and refused once -------
+// `render_type` answered `_` for every annotation form it did not know - a tuple, a fixed
+// array, a closure type, a view - so `parameter `message` of `[rpc]` method `echo` is `_`,
+// which is not Wire` named nothing the author had written; and the refusal of an array or
+// tuple `[rpc]` parameter was said TWICE, the second time by the generated code ("[u8; 4]
+// has no method 'describe'") at the attribute. The messages now quote through
+// `render_type_quoted` (the codegen renderer is untouched: the derive generators emit what
+// it returns), and the generated-code restatement stands down like B490's.
+
+fn rpc_service_with(method: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        [service(StoreClient)]
+        struct Store {{ name: str }}
+        impl Store {{
+            [rpc]
+            {method}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+    )
+}
+
+#[track_caller]
+fn assert_refused_once_naming(method: &str, quoted: &str) {
+    let errors =
+        compile(&rpc_service_with(method)).expect_err("a non-Wire signature must be refused");
+    assert_eq!(errors.len(), 1, "one cause, one refusal; got: {errors:#?}");
+    assert!(
+        errors[0].contains(&format!("is `{quoted}`, which is not Wire")),
+        "the refusal must quote {quoted:?}; got: {errors:#?}"
+    );
+    assert!(!errors[0].contains("is `_`"), "{errors:#?}");
+}
+
+#[test]
+fn e296_an_array_rpc_parameter_is_refused_once_and_names_its_type() {
+    assert_refused_once_naming("fun first(self, rgba: [u8; 4]): u8 { rgba[0] }", "[u8; 4]");
+}
+
+#[test]
+fn b597_a_tuple_rpc_parameter_is_refused_once_and_names_its_type() {
+    assert_refused_once_naming(
+        "fun echo(self, message: (i32, i32)): i32 { message.0 }",
+        "(i32, i32)",
+    );
+}
+
+#[test]
+fn b597_a_labelled_tuple_and_a_tuple_return_quote_their_labels() {
+    assert_refused_once_naming(
+        "fun at(self, point: (x: i32, y: i32)): i32 { point.x }",
+        "(x: i32, y: i32)",
+    );
+    assert_refused_once_naming("fun pair(self): (i32, str) { (1, \"a\") }", "(i32, str)");
+}
+
+#[test]
+fn b597_a_closure_rpc_parameter_is_refused_once_and_names_its_type() {
+    assert_refused_once_naming(
+        "fun call(self, callback: |i32| i32): i32 { 1 }",
+        "|i32| i32",
+    );
+}
+
+#[test]
+fn b597_a_derive_wire_field_quotes_its_tuple_array_and_nested_forms() {
+    for (field, quoted) in [
+        ("both: (i32, i32)", "(i32, i32)"),
+        ("rgba: [u8; 4]", "[u8; 4]"),
+        ("some: Option<(i32, i32)>", "Option<(i32, i32)>"),
+        ("grid: List<[u8; 2]>", "List<[u8; 2]>"),
+    ] {
+        assert_fails_with(
+            &format!(
+                "[derive(Wire)]\nstruct Holder {{\n\t{field},\n}}\nfun main() {{ }}\nmain();\n"
+            ),
+            &format!("is `{quoted}`, which is not Wire"),
+        );
+    }
+}
+
 /// B329: the `[expose]` ELEMENT refusal quotes the annotation as written.
 ///
 /// The element it tests comes off the field's `Source` impl and is a resolved
@@ -9987,5 +10071,170 @@ fn b595_a_head_outside_the_blankets_bound_has_no_such_static() {
         }
         "#,
         "cannot find 'tag' in i32",
+    );
+}
+
+// --- B609: a subtrait impl over a STRUCTURAL subject reaches its supertrait
+//     impl through an element's sub-bound ------------------------------------
+
+/// B609: `impl (type A: Louder, type B: Louder) with Loud {}` under `trait
+/// Loud with Shown` and `trait Louder with Display` leans on `impl (type A:
+/// Display, type B: Display) with Shown` — every pair the subtrait impl
+/// reaches is a pair of `Display`s. It was refused "'(A, B)' does not
+/// implement trait 'Loud': missing 'shown'", where the nominal twin compiled:
+/// inside a tuple the conformance walk compared the two binders by their
+/// bound traits, and `Louder` is not `Display`.
+#[test]
+fn b609_a_tuple_subtrait_impl_reaches_its_supertrait_impl_through_a_sub_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        trait Shown {
+            fun shown(self): str;
+        }
+        trait Loud with Shown {
+            fun loud(self): str {
+                self.shown() + "!"
+            }
+        }
+        trait Louder with Display {}
+        impl i32 with Louder {}
+        impl (type A: Display, type B: Display) with Shown {
+            fun shown(self): str {
+                self.0.to_string() + "," + self.1.to_string()
+            }
+        }
+        impl (type A: Louder, type B: Louder) with Loud {}
+        fun main() {
+            print((1, 2).loud());
+        }
+        "#,
+        "1,2!\n",
+    );
+}
+
+/// B609's array half: `impl [type T: Louder; const N] with Loud {}` leans on
+/// `impl [type T: Shown; const N] with Shown` when `Louder` requires `Shown`,
+/// and a `_` length binder is the same hole as `const N`.
+#[test]
+fn b609_an_array_subtrait_impl_reaches_its_supertrait_impl_through_a_sub_bound() {
+    for length in ["const N", "_"] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            trait Shown {{
+                fun shown(self): str;
+            }}
+            trait Loud with Shown {{
+                fun loud(self): str {{
+                    self.shown() + "!"
+                }}
+            }}
+            trait Louder with Shown {{}}
+            impl i32 with Shown {{
+                fun shown(self): str {{ "i" }}
+            }}
+            impl i32 with Louder {{}}
+            impl [type T: Shown; const N] with Shown {{
+                fun shown(self): str {{
+                    mut out = "";
+                    for item in self {{
+                        out = out + item.shown();
+                    }}
+                    out
+                }}
+            }}
+            impl [type T: Louder; {length}] with Loud {{}}
+            fun main() {{
+                let xs: [i32; 2] = [1, 2];
+                print(xs.loud());
+            }}
+            "#
+        );
+        assert_compiles_and_runs(&source, "ii!\n");
+    }
+}
+
+/// B609's boundary: an element bound that does NOT entail the supertrait
+/// impl's bound reaches nothing — some pair the subtrait impl covers has no
+/// `shown` — so the refusal stands, for a tuple and for an array.
+#[test]
+fn b609_an_unrelated_element_bound_still_owes_the_supertrait_member() {
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+        trait Shown {
+            fun shown(self): str;
+        }
+        trait Loud with Shown {}
+        trait Quiet {}
+        impl (type A: Display, type B: Display) with Shown {
+            fun shown(self): str {
+                self.0.to_string() + "," + self.1.to_string()
+            }
+        }
+        impl (type A: Quiet, type B: Quiet) with Loud {}
+        fun main() {}
+        "#,
+        "'(A, B)' does not implement trait 'Loud': missing 'shown'",
+    );
+    assert_fails_with(
+        r#"
+        trait Shown {
+            fun shown(self): str;
+        }
+        trait Loud with Shown {}
+        trait Quiet {}
+        impl [type T: Shown; const N] with Shown {
+            fun shown(self): str { "arr" }
+        }
+        impl [type T: Quiet; const N] with Loud {}
+        fun main() {}
+        "#,
+        "does not implement trait 'Loud': missing 'shown'",
+    );
+}
+
+// --- E295: a blanket's static named on a head its bound does not admit ---
+
+/// E295: `i32::tag(1)` over `impl type T: Leaf with Tag` said only "cannot
+/// find 'tag' in i32". It names the blanket that provides `tag` and the bound
+/// `i32` misses — of two bounds, only the missing one.
+#[test]
+fn e295_a_blankets_static_on_an_unadmitted_head_names_the_missing_bound() {
+    assert_fails_once_with(
+        r#"
+        trait Leaf {}
+        trait Tag {
+            fun tag(value: i32): str;
+        }
+        impl type T: Leaf with Tag {
+            fun tag(value: i32): str { "tag" }
+        }
+        fun main() {
+            let _t = i32::tag(1);
+        }
+        "#,
+        "cannot find 'tag' in i32; `tag` is provided by `impl type T: Leaf with Tag`, and \
+         `i32` does not implement `Leaf`",
+    );
+    assert_fails_once_with(
+        r#"
+        trait Leaf {}
+        trait Named {}
+        trait Tag {
+            fun tag(value: i32): str;
+        }
+        impl i32 with Named {}
+        impl type T: Leaf + Named with Tag {
+            fun tag(value: i32): str { "tag" }
+        }
+        fun main() {
+            let _t = i32::tag(1);
+        }
+        "#,
+        "`tag` is provided by `impl type T: Leaf + Named with Tag`, and `i32` does not \
+         implement `Leaf`",
     );
 }

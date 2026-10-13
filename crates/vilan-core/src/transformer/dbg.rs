@@ -706,6 +706,7 @@ impl<'src> Transformer<'src> {
                 }],
                 body,
                 is_async: false,
+                origin: None,
             }));
     }
 }

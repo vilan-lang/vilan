@@ -340,3 +340,4 @@ console.log(render(mixed));
 const pair = [ text(view("i"), "a"), text(view("b"), "b") ];
 console.log(render(child6(view("p"), pair)));
 console.log(render(text(child4(view("p"), "gone"), "kept")));
+//# sourceMappingURL=ssr-render.mjs.map

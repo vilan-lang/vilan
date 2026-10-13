@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
 
+mod test_pool;
+
 fn std_spec() -> PackageSpec {
     vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
@@ -226,7 +228,7 @@ fn every_doc_example_compiles() {
     // in spawn order, so a failure report reads the same as the serial loop's.
     let failures: Vec<String> = std::thread::scope(|scope| {
         let workers: Vec<_> = examples
-            .chunks(examples.len().div_ceil(8).max(1))
+            .chunks(examples.len().div_ceil(test_pool::workers(8)).max(1))
             .map(|chunk| {
                 scope.spawn(move || {
                     let mut failures = Vec::new();

@@ -10,3 +10,4 @@ $b(guard);
 console.log("body");
 $a = 7;
 process.exit($a);
+//# sourceMappingURL=resource_exit.mjs.map

@@ -170,6 +170,10 @@ impl [type T: PartialEq; const N] with PartialEq {
 	}
 }
 
+/// An array of `Eq` elements is `Eq` (B609): its `eq` is the `PartialEq` impl
+/// above, which every `Eq` element meets.
+impl [type T: Eq; _] with Eq {}
+
 // `str` carries the full ordering family (lexicographic, the native `<`), so
 // generic `T: Ord` code (sorting, `math::min`/`max`, `clamp`) accepts it. The
 // numeric primitives' ordering impls live with their other trait impls in
@@ -315,3 +319,7 @@ export impl type T: (2..: PartialEq) with PartialEq {
 		true
 	}
 }
+
+/// A tuple of `Eq` elements is `Eq` (B609's twin): its `eq` is the `PartialEq`
+/// blanket above.
+export impl type T: (2..: Eq) with Eq {}

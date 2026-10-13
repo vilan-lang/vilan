@@ -185,3 +185,4 @@ console.log(String(cell[0]));
 let counter = [ 3 ];
 console.log(String(scalar_forward([ counter, 0 ])));
 elements_are_independent();
+//# sourceMappingURL=element-clones.mjs.map

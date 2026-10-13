@@ -54,6 +54,9 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../../vilan-core/tests/test_pool/mod.rs"]
+mod test_pool;
+
 const B473_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
@@ -1392,9 +1395,11 @@ fn worker_target(tag: &str, worker: usize) -> PathBuf {
 /// smaller machine. A leg is a vilan compile, a cargo build, two runs: half
 /// the cores keeps a test from starving the suite's others.
 fn leg_workers() -> usize {
-    std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|cores| (cores.get() / 2).clamp(1, 4))
-        .unwrap_or(1)
+        .unwrap_or(1);
+    // N159: and no wider than the suite's pool cap (`VILAN_TEST_POOL`, two under nextest).
+    test_pool::workers(cores)
 }
 
 /// N158: `leg` over every item, at most [`leg_workers`] at once
@@ -7308,40 +7313,66 @@ const ASYNC_PANIC_PROBE: &str = concat!(
 /// honest and one release too late — what node prints there is its own object
 /// inspection (`Promise { <pending> }`, `[Function (anonymous)]`), so the
 /// program cannot work and nothing is gained by letting it build.
+///
+/// F130: the same refusal for a task whose callee never SUSPENDS — `async
+/// work()` there is typed `Promise<i32>` (no `std::task` in the program),
+/// which has no native rendering, so the rendered test never saw it: the
+/// build went through and the run panicked. It is refused by its vilan type.
 #[test]
 fn printing_a_host_handle_is_refused_at_compile_time() {
     let staged = stage();
-    let (file, source, needle) = (
-        "native_probe_print_task.vl",
-        PRINT_HANDLE_PROBE,
-        "`print` of the host handle `Task`",
-    );
-    std::fs::write(staged.join(file), source).expect("write the probe program");
-    let output = vilan(&staged)
-        .args(["build", "--backend", "rust", "--stdout", file])
-        .output()
-        .expect("build the probe");
-    let message = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "{file} must be refused rather than built"
-    );
-    assert!(
-        message.contains(needle),
-        "{file} must be refused by name (`{needle}`); it said:\n{message}"
-    );
-    // Non-vacuous: the JS backend BUILDS the same program, so the refusal
-    // is the native backend's answer and not a defect in the probe.
-    let javascript = vilan(&staged)
-        .args(["build", file])
-        .output()
-        .expect("build the probe on the JS backend");
-    assert!(
-        javascript.status.success(),
-        "{file} must be a program the JS backend accepts:\n{}",
-        String::from_utf8_lossy(&javascript.stderr)
-    );
+    for (file, source, needle) in [
+        (
+            "native_probe_print_task.vl",
+            PRINT_HANDLE_PROBE,
+            "`print` of the host handle `Task`",
+        ),
+        (
+            "native_probe_f130_print_ready_task.vl",
+            PRINT_READY_TASK_PROBE,
+            "`print` of the host handle `Promise`",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let output = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", file])
+            .output()
+            .expect("build the probe");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{file} must be refused rather than built"
+        );
+        assert!(
+            message.contains(needle),
+            "{file} must be refused by name (`{needle}`); it said:\n{message}"
+        );
+        // Non-vacuous: the JS backend BUILDS the same program, so the refusal
+        // is the native backend's answer and not a defect in the probe.
+        let javascript = vilan(&staged)
+            .args(["build", file])
+            .output()
+            .expect("build the probe on the JS backend");
+        assert!(
+            javascript.status.success(),
+            "{file} must be a program the JS backend accepts:\n{}",
+            String::from_utf8_lossy(&javascript.stderr)
+        );
+    }
 }
+
+const PRINT_READY_TASK_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "async fun work(): i32 {\n",
+    "\t7\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet task = async work();\n",
+    "\tprint(task);\n",
+    "}\n",
+);
 
 const PRINT_HANDLE_PROBE: &str = concat!(
     "import std::io::print;\n",
@@ -9491,11 +9522,45 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// `push_many([])`, and B600 refuses the `Option::None.is_some()` that
 /// replaced it at `vilan check` — "cannot infer the type of this value" at the
 /// user's call — so the library-body probe now proves that the refusal comes
-/// from the CHECK, at the call, before any body is instantiated; the
-/// in-body note has no reachable std probe left, filed with B600's report.)
+/// from the CHECK, at the call, before any body is instantiated.) N167: the
+/// in-body note's std probe is `std::fs::copy_dir`, which checks clean and
+/// whose body reaches a host binding the native backend does not emit
+/// (`new_fs_options`): the refusal is drawn at the user's call and names the
+/// body and its file.
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
+    let file = "native_probe_n167_std_body_refusal.vl";
+    std::fs::write(
+        staged.join(file),
+        "import std::fs::copy_dir;\n\nfun main() {\n\tcopy_dir(\"a\", \"b\");\n}\n",
+    )
+    .expect("write the probe");
+    let checked = vilan(&staged)
+        .args(["check", file])
+        .output()
+        .expect("check the probe");
+    assert!(
+        checked.status.success(),
+        "the std-body probe must check clean, so the refusal is the native backend's:\n{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let output = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the std-body probe is refused natively"
+    );
+    assert!(
+        stderr.contains(&format!("{file}:4:2"))
+            && stderr.contains(
+                "The construct is in `copy_dir`'s body (`fs.vl`), which this call instantiates.",
+            ),
+        "the refusal inside std's body is drawn at the user's call and names the body:\n{stderr}"
+    );
     let file = "native_probe_f108_open_option.vl";
     std::fs::write(
         staged.join(file),
@@ -9571,6 +9636,48 @@ fn an_option_of_a_shared_view_consumed_in_place_is_identical_on_both_backends() 
         compare(&staged, "arena.vl"),
         Verdict::Identical,
         "arena.vl: F99 was its first wall"
+    );
+}
+
+/// B577: an `Option<&str>` whose payload views a LIST ELEMENT or a scalar
+/// field (`Some(&self.items[index])`) handed the `(base, key)` pair to every
+/// consumer but a capturing `match` on JS — `unwrap_or`, `map`, `+ 1`, a user
+/// function taking the option — where natively F99 reads the payload out.
+/// The JS emitter reads it out at the same positions now.
+#[test]
+fn b577_an_option_viewing_a_list_element_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_payload_view_element_reads.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/payload_view_element_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an `Option<&str>` over a list element must read its payload out on both backends"
+    );
+}
+
+/// B578: `&` of a call's result (or a value `if`/`match`/block) handed to a
+/// `&usize` or a generic `&T` at a scalar instance — the callee reads the
+/// `(base, key)` pair the view machinery makes of a scalar, and JS passed the
+/// bare value (`shown(&xs.len())` threw a TypeError); natively a reference
+/// to a temporary. The JS emitter gives the temporary its own cell now.
+#[test]
+fn b578_a_view_of_a_call_result_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_views_of_call_results.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/views_of_call_results.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a view of a call result must reach a scalar `&T` as a pair on JS"
     );
 }
 
@@ -11500,8 +11607,8 @@ fn a153_s2_a_store_mirror_behaves_the_same_on_both_backends() {
 
 /// A153 S2: a patch's ops land in ONE client turn on both backends — an observer
 /// woken by the first op reads the second op's field already landed — and a key
-/// the server does not hold is seeded `null`. (`states()` itself stays on the JS
-/// pin, `reactive_channels`: natively a generic `dyn Pipe` is not emitted yet.)
+/// the server does not hold is seeded `null`. (`states()` itself is
+/// `b606_a_mirrored_stores_states_tell_the_same_on_both_backends`.)
 #[test]
 fn a153_s2_a_patch_lands_in_one_client_turn_on_both_backends() {
     let staged = stage();
@@ -13037,6 +13144,264 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
         1,
         "only the user key's lookup copies its set out of the cell:\n{main}"
     );
+}
+
+/// F129 (R-h): an argument that copies out of a cell — a spine through a
+/// `Shared` view (`has(cell.read().items, grow(cell))`, a user-hashed
+/// `cell.read().probes.contains(mark(cell))`, a subscript `cell.read().
+/// rows[0]`, a written `&cell.read().items` beside a computed `&grown(cell)`)
+/// or a captured `mut` binding's cell (`words.measured(more())`) — was copied
+/// where it stood, so a LATER argument that wrote the cell in place was not
+/// seen by the callee natively (`false` against JS's `true`, silently). The
+/// copy is now taken last, after the other arguments are settled in their
+/// own order (`first` still prints before `second`). A scalar, a `str` and an
+/// `own` argument (which the JS backend copies at the call) are read where
+/// they stand on both. The emission pin: six deferred copies.
+#[test]
+fn f129_a_copy_out_of_a_cell_is_taken_after_the_later_arguments_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f129_shared_view_argument_order.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_argument_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a later argument's in-place write of a cell must be seen by the callee natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert_eq!(
+        main.matches("let __copied").count(),
+        6,
+        "the six copies out of a cell wait for the later arguments:\n{main}"
+    );
+}
+
+/// F129's residue: a later argument that REPLACES the copied place whole
+/// (`cell.write().items = [..]`, `words = Words { .. }`) is not seen on JS,
+/// whose argument is the object the place held when it was evaluated, and is
+/// seen by the native copy taken last. Neither order of a copy answers both
+/// shapes; the in-place write is the one F129 ruled.
+#[test]
+#[ignore = "F135 (F129's residue, filed by native-51): a later argument that replaces the copied place whole is seen natively and not on JS"]
+fn f129_a_later_argument_that_replaces_the_copied_place_answers_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f129_shared_view_argument_replaced.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_view_argument_replaced.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(compare(&staged, file), Verdict::Identical);
+}
+
+/// F132: an array literal whose position is a fixed array `[T; n]` one level
+/// inside another literal — a tuple slot of a struct field
+/// (`Holder { pair = ([5, 6, 7], true) }`), of an annotated `let` handed to a
+/// call, of a call's own argument, of a tuple matched by name — or inside a
+/// `print` argument (a variant payload in a list, a variant alone, a list of
+/// arrays) was emitted `vec![..]`, which rustc refused ("expected `[i32; 3]`,
+/// found `Vec<i32>`"). A tuple literal now hands each element its SLOT's
+/// type, and a `print` argument is positioned at the type the analysis
+/// settled for it.
+#[test]
+fn f132_an_array_literal_inside_a_tuple_or_a_printed_value_builds_the_array_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f132_array_literal_nested_positions.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_literal_nested_positions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a nested array literal must build the fixed array its position declares"
+    );
+}
+
+/// F131: an array literal handed to a callee generic over its own binders —
+/// the operands of `grid == [[1, 2], [3, 4]]` (std's `impl [type T:
+/// PartialEq; const N]`, whose `b: [T; N]` is the argument's position), and
+/// the argument of a member reached through a bound (`m.matches([[1, 2], [3,
+/// 4]])` in a generic `check`) — met the callee's binders unbound, so its
+/// inner (or whole) literal rendered `vec![..]` and rustc refused it. The
+/// operator's and the dispatched call's arguments are now positioned under
+/// the instance's binding, as a direct call's are.
+#[test]
+fn f131_an_array_literal_against_a_generic_callees_binders_builds_the_array_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f131_array_literal_generic_callee.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_literal_generic_callee.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an array literal against a generic callee's `[T; N]` must build the array"
+    );
+}
+
+/// F133: a fixed array of closures held in an aggregate — `struct Callbacks {
+/// fns: [|i32| i32; 2] }` under `[derive(Debug)]`, an enum payload, an
+/// `Option` and a `List` of such arrays, one past the inline threshold — was
+/// refused natively ("which has no reference equality — `Option` and `List`
+/// of one do"): the emitted aggregate's equality had no impl for `[Rc<dyn
+/// Fn>; N]`. `vilan_rt::ReferenceEq` now covers a fixed array (inline and
+/// heap) element by element, and an enum's equality leg compares a payload
+/// slot through the reference it binds — an `Option` of a closure in a
+/// payload had been a rustc refusal (`&Option<..>: ReferenceEq`). A map of
+/// closures is still refused by name.
+#[test]
+fn f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f133_closure_arrays.vl";
+    std::fs::write(staged.join(file), include_str!("native/closure_arrays.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an array of closures held in an aggregate must build natively"
+    );
+    let file = "native_probe_f133_closure_map.vl";
+    std::fs::write(
+        staged.join(file),
+        "import std::hash_map::HashMap;\nimport std::io::print;\n\nstruct Table {\n\thandlers: HashMap<str, |i32| i32>,\n}\n\nfun main() {\n\tmut table = Table { handlers = HashMap::new() };\n\ttable.handlers.insert(\"inc\", |x: i32| x + 1);\n\tprint(table.handlers.len());\n}\n",
+    )
+    .expect("write the probe program");
+    match compare(&staged, file) {
+        Verdict::Refused(message) => assert!(
+            message.contains("which has no reference equality")
+                && message.contains("a fixed array of one do"),
+            "refused, but not by this name: {message}"
+        ),
+        other => panic!("a map of closures must be refused by name, was {other:?}"),
+    }
+}
+
+/// B605: a generic function returning an object built over its own
+/// parameter — `pipe_of<P>(value: dyn Source<Option<P>>): dyn Pipe<Option<P>>
+/// { value.derive(|v| v) }` — was refused natively "a value of an unbound
+/// generic type parameter (parameter 1 of `pipe_of`)". The call's object
+/// result (`pipe_of(a).effect(..)`) was read at its record, which names the
+/// callee's `P` (an object type counted as closed whatever its arguments),
+/// and the argument erased into `dyn Source<Option<P>>` built its table at
+/// the parameter's own `P`. Both now read the call's binding: two instances
+/// (`P = str`, `P = i32`) and a generic `derive` to a concrete pipe.
+#[test]
+fn b605_a_generic_function_over_a_dyn_pipe_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b605_generic_dyn_pipe.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_dyn_pipe.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic `dyn Pipe` must build and answer the same natively"
+    );
+}
+
+/// B606: a mirrored store's handle as a `dyn Source` — `let motd: dyn
+/// Source<Option<str>> = g.motd()` — was refused natively "`attach_observer`
+/// through a `dyn` object on `RemoteStoreSome_…` (the implementation takes 3
+/// parameters where the declaration takes 5)". The object table forwarded the
+/// declaration's parameters positionally; it now forwards each hidden context
+/// parameter by the context it threads — dropping the two `attach_observer`'s
+/// declaration threads and `RemoteStoreSome`'s impl reads none of, and handing
+/// `None` (the JS table's `undefined`) for the two safe contexts the `Source`
+/// blanket's `start` reads where `Flow::start` threads none.
+#[test]
+fn b606_a_mirrored_stores_handle_as_a_dyn_source_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b606_remote_store_as_dyn_source.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/remote_store_as_dyn_source.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a mirrored store's handle as a `dyn Source` must answer the same natively"
+    );
+}
+
+/// B605 + B606: A153 S2's `states()` — the remote handle telling Pending,
+/// Ready, Absent and Failed through `TransientSource::states()`, whose pipes
+/// are a generic `combine(..).derive(..)` over the handle as a `dyn Source` —
+/// had been held to the JS pin (`reactive_channels`' MIRROR_STATES); it now
+/// prints the same bytes natively.
+#[test]
+fn b606_a_mirrored_stores_states_tell_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b606_store_mirror_states.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/store_mirror_states.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a mirrored store's `states()` must tell the same natively"
+    );
+}
+
+/// F91: an `is` capture in a `&&` chain of an `if` CONDITION, read in the
+/// BODY — `if held is Some(let name) && name.len() > 0 { print(name) }` — was
+/// rustc E0425 natively: the chain emitted the `match` a value position
+/// takes, which scopes the capture to its arm. An `if` condition is now a
+/// let-chain (`if let Some(name) = .. && (..)`): two captures, a capture right
+/// of a plain conjunct, a `||` inside a conjunct, a chain that fails late, an
+/// `else if` chain and a capture of a field. The emission pin: no `match`
+/// stands in for a condition.
+#[test]
+fn f91_an_is_capture_in_an_if_conditions_conjunction_reaches_the_body_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f91_is_capture_conjunction_body.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/is_capture_conjunction_body.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a capture left of `&&` in an `if` condition must reach the body natively"
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        main.contains("if let Some(") && !main.contains("_ => false"),
+        "the conditions are let-chains:\n{main}"
+    );
+}
+
+/// F134: a LITERAL leg (`Some("first") =>`) of a `match` whose subject is a
+/// call handing back `Option<&str>` — a payload view, carried through the
+/// subject as a reference natively (F21) — emitted `&*__literal0 == "first"`
+/// over a `&Rc<str>` binder, which rustc refused (E0277). The literal guard
+/// now reaches the `str` through either binder. The native run is held to the
+/// answer itself: the JS backend gives it from B577 (fix-51, Order 51), and
+/// this pin becomes a `compare` once both are on one tree.
+#[test]
+fn f134_a_literal_leg_over_a_view_subject_matches_natively() {
+    let staged = stage();
+    let file = "native_probe_f134_literal_leg_over_a_view_subject.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/literal_leg_over_a_view_subject.vl"),
+    )
+    .expect("write the probe program");
+    let run = run_on(&staged, Some("rust"), file);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, "lit\nsecond\nnone\nonly literal\n");
 }
 
 /// F122 (array-lengths.md Q12, R-e): a fixed array past 1 KiB keeps its

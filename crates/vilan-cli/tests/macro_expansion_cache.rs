@@ -226,15 +226,17 @@ fn a_toolchain_stamp_that_is_not_this_compilers_is_not_read() {
     assert_eq!(worlds_compiled(&dir), 1, "cold");
     assert_eq!(worlds_compiled(&dir), 0, "warm");
     // The key covers the macro and its input; it does not and cannot cover the
-    // COMPILER, so the file carries the toolchain version and a hash of
-    // `macro_std`'s sources in a header. Either moving discards the whole file
-    // rather than any single entry, because no entry under an old stamp can be
-    // trusted.
+    // COMPILER, so the file carries the toolchain version, the BUILD (a hash of
+    // vilan-core's sources, G28) and a hash of `macro_std`'s sources in a
+    // header. Any of them moving discards the whole file rather than any single
+    // entry, because no entry under an old stamp can be trusted.
     let path = cache_file(&dir);
     let written = std::fs::read_to_string(&path).expect("the written table");
     assert!(
-        written.contains("toolchain ") && written.contains("macro_std "),
-        "the header must name both stamps: {written}"
+        written.contains("toolchain ")
+            && written.contains("macro_std ")
+            && written.contains("\nbuild "),
+        "the header must name all three stamps: {written}"
     );
     let bumped: String = written
         .lines()
@@ -252,6 +254,39 @@ fn a_toolchain_stamp_that_is_not_this_compilers_is_not_read() {
         worlds_compiled(&dir),
         1,
         "a table written by another toolchain must be discarded, not read"
+    );
+
+    // G28: the BUILD half. Two dev builds between releases share a version, so a
+    // table another build wrote - a changed interpreter, a changed expansion
+    // engine - must miss. The header names THIS build's id, and a different one
+    // discards the file.
+    let written = std::fs::read_to_string(&path).expect("the rewritten table");
+    let build_line = written
+        .lines()
+        .find(|line| line.starts_with("build "))
+        .expect("the header's build line")
+        .to_string();
+    assert_eq!(
+        build_line,
+        format!("build {}", vilan_core::BUILD_ID),
+        "the stamp is the analyzer's build identity"
+    );
+    let rebuilt: String = written
+        .lines()
+        .map(|line| {
+            if line.starts_with("build ") {
+                "build 0123456789abcdef".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+    std::fs::write(&path, format!("{rebuilt}\n")).expect("the restamped table");
+    assert_eq!(
+        worlds_compiled(&dir),
+        1,
+        "a table written by another BUILD of the same version must be discarded (G28)"
     );
 
     // The `macro_std` half of the stamp, the same way. It is hashed rather than
@@ -292,7 +327,7 @@ fn a_corrupt_table_is_ignored_rather_than_fatal() {
     // recompile — `worlds_compiled` asserts the exit status, so a fatal read
     // would fail here rather than return a number.
     let stamped = std::fs::read_to_string(&path).expect("the written table");
-    let header: String = stamped.lines().take(3).collect::<Vec<&str>>().join("\n");
+    let header: String = stamped.lines().take(4).collect::<Vec<&str>>().join("\n");
     for (label, damaged) in [
         (
             "not the format",

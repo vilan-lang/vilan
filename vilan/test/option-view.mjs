@@ -101,3 +101,4 @@ if ($k[0] === 0) {
 	$l = undefined;
 }
 process.exit($l);
+//# sourceMappingURL=option-view.mjs.map

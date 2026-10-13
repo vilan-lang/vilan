@@ -1114,6 +1114,113 @@ fn b602_a_literal_a_literal_binding_and_a_conversion_still_compute() {
     );
 }
 
+// --- B607: the bitwise operators over two integer widths, or a float -------
+
+/// B607 (R-e, v0.49.0): `&`, `|` and `^` over two DIFFERENT integer types are
+/// refused with B579's sentence — `i32 & usize` checked, JS computed it in
+/// int32, and the native build refused the pair.
+#[test]
+fn b607_a_bitwise_operator_over_two_integer_widths_is_refused() {
+    for symbol in ["&", "|", "^"] {
+        for (left, right) in [
+            ("i32", "usize"),
+            ("usize", "i32"),
+            ("u8", "u32"),
+            ("u32", "i53"),
+        ] {
+            let source = format!(
+                r#"
+                fun main() {{
+                    let a: {left} = 6;
+                    let b: {right} = 3;
+                    let _c = a {symbol} b;
+                }}
+                "#
+            );
+            assert_fails_once_with(
+                &source,
+                &format!(
+                    "`{symbol}` computes on two values of the same type, but the operands are \
+                     `{left}` and `{right}`: there are no implicit conversions; suffix the \
+                     literal or convert with `as_*`"
+                ),
+            );
+        }
+    }
+}
+
+/// B607: any bitwise operator — the shifts included — over a FLOAT, on either
+/// side and over two floats alike: JS truncated `6.5 & 3.0` to int32 and
+/// printed `2`, and rustc has no `BitAnd` for `f64`.
+#[test]
+fn b607_a_bitwise_operator_over_a_float_is_refused() {
+    for symbol in ["&", "|", "^", "<<", ">>"] {
+        for (left, right, float) in [
+            ("f64", "f64", "f64"),
+            ("f64", "i32", "f64"),
+            ("i32", "f64", "f64"),
+            ("f32", "u32", "f32"),
+        ] {
+            let source = format!(
+                r#"
+                fun main() {{
+                    let a: {left} = 6;
+                    let b: {right} = 3;
+                    let _c = a {symbol} b;
+                }}
+                "#
+            );
+            assert_fails_once_with(
+                &source,
+                &format!(
+                    "`{symbol}` computes on the bits of an integer, but an operand is \
+                     `{float}`, a float: there are no implicit conversions; convert with `as_*`"
+                ),
+            );
+        }
+    }
+    // A literal beside a float is the float's (B389), so it is refused too.
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let x: f64 = 6.5;
+            let _y = x << 1;
+        }
+        "#,
+        "`<<` computes on the bits of an integer, but an operand is `f64`, a float",
+    );
+}
+
+/// B607's boundary: the shifts stay legal across integer types (as in Rust —
+/// the right operand is a count, not a peer), one width on both sides
+/// computes, a literal takes the other operand's width, and a converted
+/// operand computes.
+#[test]
+fn b607_mixed_shifts_one_width_a_literal_and_a_conversion_still_compute() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let a: i32 = 6;
+            let b: usize = 3;
+            let mask: u8 = 12;
+            print(a << b);
+            print(a >> b);
+            print(mask >> b);
+            print(a & 3);
+            print(1 | a);
+            let n = 5;
+            print(a ^ n);
+            print(a & b.as_i32());
+            print(b | a.as_usize());
+            let x: f64 = 6.5;
+            print(x.as_i32() & 3);
+        }
+        "#,
+        "48\n0\n1\n2\n7\n3\n2\n7\n2\n",
+    );
+}
+
 // --- B591: a subscript's index typed after the subscript resolves -----------
 
 /// B591: the `usize` check passed an index whose type was not known when the

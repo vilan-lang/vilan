@@ -52,6 +52,17 @@ class __Task {
 function __task(run, origin, nursery) {
 	return new __Task(run, origin, nursery);
 }
+function ambient_signal($d) {
+	const $e = $d;
+	let $f = null;
+	if ($e[0] === 0) {
+		const n = $e[1];
+		$f = [ 0, n.signal_of() ];
+	} else {
+		$f = [ 1 ];
+	}
+	return $f;
+}
 async function sleep(ms, $b) {
 	await (__sleep(clamp_delay(ms), ambient_signal($b)));
 }
@@ -63,17 +74,6 @@ function clamp_delay(ms) {
 		$c = ms;
 	}
 	return $c;
-}
-function ambient_signal($d) {
-	const $e = $d;
-	let $f = null;
-	if ($e[0] === 0) {
-		const n = $e[1];
-		$f = [ 0, n.signal_of() ];
-	} else {
-		$f = [ 1 ];
-	}
-	return $f;
 }
 function doubled(self) {
 	return self[0] * 2;
@@ -114,3 +114,4 @@ async function fetch_maker($h) {
 	console.error(String($j));
 	process.exit(1);
 });
+//# sourceMappingURL=await-postfix.mjs.map

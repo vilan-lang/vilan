@@ -767,29 +767,25 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
-/// Locate the `std` package directory: `$VILAN_STD`, else the nearest ancestor
-/// of the document containing `vilan/std/vilan.toml` (a checkout — documents in
-/// this repo resolve the working tree). `resolve_std` reads its `[library]`
-/// manifest (or falls back to the layer convention if the path is a bare source
-/// root).
-fn discover_std_dir(start: &Path) -> PathBuf {
+/// Locate the `std` package directory: `$VILAN_STD` (a vilan checkout's `vilan/std`
+/// is reached ONLY this way - or the editor's `vilan.stdPath` - never by walking the
+/// document's ancestors, N168), else the server's own embedded std. `resolve_std`
+/// reads its `[library]` manifest (or falls back to the layer convention if the path
+/// is a bare source root).
+///
+/// The `start` is kept for the signature's callers: a document no longer chooses its
+/// toolchain. The ancestor walk for `vilan/std` ran an INSTALLED server against the
+/// nearest checkout's (possibly edited) std - a v0.47.0 probe written under a worktree
+/// compiled against the worktree's std - and made every std edit during a running
+/// suite change what each later-spawned compile read.
+fn discover_std_dir(_start: &Path) -> PathBuf {
     if let Some(path) = std::env::var_os("VILAN_STD") {
         return PathBuf::from(path);
     }
-    let mut directory = start.parent();
-    while let Some(current) = directory {
-        let candidate = current.join("vilan").join("std");
-        if candidate.join("vilan.toml").is_file() {
-            return candidate;
-        }
-        directory = current.parent();
-    }
-    // No ancestor carries a checkout — a project OUTSIDE the vilan repo (the
-    // kolt shape, and every installed binary). Materialize the server's own
-    // embedded std (real files, so definitions into std keep resolving); the
-    // CLI does the same, so both tools see the identical std from any
-    // directory. On a materialization failure (no writable home OR temp dir)
-    // the path is left nonexistent and imports diagnose it.
+    // Materialize the server's own embedded std (real files, so definitions into
+    // std keep resolving); the CLI does the same, so both tools see the identical
+    // std from any directory. On a materialization failure (no writable home OR
+    // temp dir) the path is left nonexistent and imports diagnose it.
     vilan_embedded::materialize()
         .unwrap_or_else(|_| PathBuf::from("<the embedded std could not be materialized>"))
 }
@@ -797,6 +793,28 @@ fn discover_std_dir(start: &Path) -> PathBuf {
 #[cfg(test)]
 mod std_discovery_tests {
     use super::discover_std_dir;
+
+    /// N168: a checkout above the document is NOT the server's std. The ancestor walk for
+    /// `vilan/std` used to take the nearest one, so an installed server opened on a worktree's
+    /// file served that worktree's (possibly edited) std; `$VILAN_STD` / `vilan.stdPath` is the
+    /// explicit way now. The stand-in checkout carries an empty std; the answer must still be
+    /// the materialized embedded one.
+    #[test]
+    fn a_checkout_above_the_document_is_not_the_servers_std() {
+        let root = std::env::temp_dir().join(format!("vilan-lsp-n168-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let std = root.join("vilan").join("std");
+        std::fs::create_dir_all(std.join("src")).unwrap();
+        std::fs::write(std.join("vilan.toml"), "[library]\nname = \"std\"\n").unwrap();
+        let document = root.join("target").join("probe").join("main.vl");
+        let discovered = discover_std_dir(&document);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_ne!(discovered, std, "the nearest checkout's std was taken");
+        assert!(
+            discovered.join("src/lib.vl").is_file(),
+            "expected the materialized embedded std, got {discovered:?}"
+        );
+    }
 
     #[test]
     fn a_document_outside_any_checkout_falls_back_to_the_embedded_std() {
@@ -2874,7 +2892,8 @@ fn enforce_program_retention(
 }
 
 /// M67: tell the base cache which documents are LIVE, so its byte budget never
-/// evicts a world one of them is analyzed from.
+/// evicts a world one of them is analyzed from — and (E294) which entries are
+/// the session's, so the budget is sized by their worlds.
 ///
 /// The retained set, rendered as entry paths. A URI with no file path (an
 /// untitled buffer) contributes none: it is not an entry the analyzer can key
@@ -2893,6 +2912,28 @@ fn declare_live_entries(retained: &[Url], documents: &DashMap<Url, Document>) {
         })
         .collect();
     vilan_core::analyzer::set_base_cache_live_entries(&entries);
+    // E294: and the session's entries — every declared entry of every package
+    // a document is open in, the worlds the dead-code clock analyzes at each
+    // pause (`schedule_package_union`) whether or not their entry is open.
+    // The base cache sizes its budget by them instead of letting the pause's
+    // legs evict each other. Read from the manifests here, at the same seam,
+    // so the set follows the open documents: a package whose last document
+    // closed stops sizing the budget when its close re-declares.
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for document in documents.iter() {
+        if let Some(dir) = document.manifest_dir()
+            && !packages.iter().any(|known| known == dir)
+        {
+            packages.push(dir.to_path_buf());
+        }
+    }
+    let session: Vec<PathBuf> = packages
+        .iter()
+        .filter_map(|dir| dead_items::entry_paths(dir))
+        .flatten()
+        .map(|(_, path)| path)
+        .collect();
+    vilan_core::analyzer::set_base_cache_session_entries(&session);
 }
 
 /// Land a completed analysis on the open document at `uri`
@@ -10955,6 +10996,51 @@ mod dead_item_clock_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// E294: the server declares its package's ENTRIES to the base cache, so
+    /// the budget is sized by the worlds the clock's legs are served from —
+    /// and withdraws them when the package's last document closes. Only
+    /// `shared.vl` is open: neither entry is live (M67's exemption cannot
+    /// reach them), which is the shape that evicted kolt's server world on 4
+    /// of 6 pauses.
+    #[tokio::test]
+    async fn the_packages_entries_size_the_base_cache_while_a_document_is_open() {
+        let (directory, shared) = workspace();
+        let (service, _socket) = backend();
+        let server = service.inner();
+        assert_eq!(
+            vilan_core::analyzer::base_cache_session_entries(),
+            (0, 0),
+            "nothing declared before a document opens",
+        );
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union — both entries' legs analyzed",
+        );
+        assert_eq!(
+            vilan_core::analyzer::base_cache_session_entries(),
+            (2, 2),
+            "the package's two declared entries are the session's, and each \
+             leg's admission taught the cache its key",
+        );
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: shared.clone(),
+                },
+            })
+            .await;
+        assert_eq!(
+            vilan_core::analyzer::base_cache_session_entries(),
+            (0, 0),
+            "the package's last document closed: its entries stop sizing the \
+             budget in the same breath",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// E140: **the withdrawal is the cone, not the package.** An edit to a file

@@ -151,3 +151,4 @@ console.log("sflnbwj sgdl28p sw0ajwn s9bu6v3 s16sw83c s1e7dqf5 s17s8g64");
 console.log("s1hbuywq s1dwvy7w s3s9k3d scur295 sxzag36 skr9oll");
 const wider = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
 console.log(class_list(add(block, wider)));
+//# sourceMappingURL=css-block.mjs.map

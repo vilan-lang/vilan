@@ -759,6 +759,10 @@ pub struct Build {
     /// `"strip"` drops the printing. Unset, the preset decides: `debug`
     /// prints, `release` refuses the build.
     pub dbg: Option<String>,
+    /// Write a source map beside the emitted JavaScript (debugging.md Q9,
+    /// E257 S5): on under `debug`, off under `release`.
+    #[serde(rename = "source-maps")]
+    pub source_maps: Option<bool>,
 }
 
 impl Package {
@@ -1560,6 +1564,7 @@ impl Manifest {
         options.readable_names = build.readable_names.unwrap_or(options.readable_names);
         options.debug_names = build.debug_names.unwrap_or(options.debug_names);
         options.infer_const = build.infer_const.unwrap_or(options.infer_const);
+        options.source_maps = build.source_maps.unwrap_or(options.source_maps);
         if let Some(name) = &build.dbg {
             options.dbg = crate::options::DbgPolicy::parse(name).ok_or_else(|| {
                 format!("unknown `[build] dbg` value `{name}` (expected `keep` or `strip`)")

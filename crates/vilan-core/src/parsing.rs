@@ -215,6 +215,13 @@ pub enum ParseErrorReason {
     /// and `vilan fmt` writes it so. `written` is the type as written up to
     /// the name, `tight` the type respelled.
     SpacedAscribedGenerics { written: String, tight: String },
+    /// E291: a generic list written SPACED after a name in EXPRESSION
+    /// position (`List <i32>::new()`). There, too, a `<` opens a generic list
+    /// only when it touches the name; this one could not be the comparison
+    /// the rule reads it as (a `::` or a `{` follows its `>`), so the parse
+    /// went on as if it had been written tight, and `vilan fmt` writes it so.
+    /// `written` is the name, `tight` the name with its list respelled.
+    SpacedGenerics { written: String, tight: String },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1795,6 +1802,10 @@ pub fn render(error: &ParseError) -> String {
                  discards it: to assign, write `{label} = {value};`"
             )
         }
+        ParseErrorReason::SpacedGenerics { written, tight } => format!(
+            "`{written}` then a spaced `<`: a generic list touches its name, `{tight}` — \
+             spaced, the `<` after a name is a comparison"
+        ),
         ParseErrorReason::SpacedAscribedGenerics { written, tight } => format!(
             "`as {written}` then `<`: a generic list after `as` touches its type, `{tight}` — \
              spaced, the `<` after an ascribed type is a comparison"
@@ -5709,6 +5720,48 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some(arguments)
     }
 
+    /// E291: the generic list after a name in EXPRESSION position — a call's
+    /// callee, a member call, a `::` path head, a struct literal's head. The
+    /// ascribed-type rule (B571 §5.1) for the whole language: a `<` opens a
+    /// generic list only when it TOUCHES what precedes it (`f<T>(x)`,
+    /// `List<i32>::new()`), so a spaced `<` is a comparison and `a < b > (c)`
+    /// reads as two. Where no comparison could stand — the list's `>` is
+    /// followed by `::` or `{` — the spaced list is refused with the tight
+    /// spelling and read as written tight (the formatter's fix), so the
+    /// analysis sees what the author meant.
+    fn parse_expression_generic_arguments(
+        &mut self,
+        written_start: usize,
+    ) -> Option<GenericArguments<'src>> {
+        if !self.peek_is_ctrl('<') {
+            return None;
+        }
+        let touching = self.position > 0
+            && self.tokens[self.position - 1].1.end == self.tokens[self.position].1.start;
+        if touching {
+            return self.parse_generic_arguments();
+        }
+        let start = self.position;
+        let arguments = self.attempt(|parser| {
+            let arguments = parser.parse_generic_arguments()?;
+            (parser.peek_is_op("::") || parser.peek_is_ctrl('{')).then_some(arguments)
+        })?;
+        let source = self.source;
+        let written_span = self.tokens[written_start].1.start..self.tokens[start - 1].1.end;
+        let written = source[written_span].to_string();
+        let list = &source[self.tokens[start].1.start..self.tokens[self.position - 1].1.end];
+        self.errors.push(ParseError {
+            span: self.span_from(start),
+            reason: ParseErrorReason::SpacedGenerics {
+                tight: format!("{written}{}", tighten_generic_list(list)),
+                written,
+            },
+            context: self.context_stack.clone(),
+            hint: None,
+        });
+        Some(arguments)
+    }
+
     /// A member after `.`/`?.`: a tuple index (`.0`), or a name with at most ONE
     /// fused call (`.method(args)`, optionally `.method<T>(args)`). Further
     /// `(args)` suffixes are left to the `DirectCall` postfix (the `.read()(a)`
@@ -5727,7 +5780,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // but no `(` follows, they are backtracked and the bare accessor is kept.
         let save = self.position;
         let error_count = self.errors.len();
-        let generic_arguments = self.parse_generic_arguments();
+        let generic_arguments = self.parse_expression_generic_arguments(start);
         if self.peek_is_ctrl('(') {
             let arguments = self.parse_argument_list()?;
             Some((
@@ -5752,7 +5805,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         loop {
             let save = self.position;
             let error_count = self.errors.len();
-            let generic_arguments = self.parse_generic_arguments();
+            let generic_arguments = self.parse_expression_generic_arguments(start);
             if self.peek_is_ctrl('(') {
                 let arguments = self.parse_argument_list()?;
                 callee = (
@@ -5940,7 +5993,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.attempt(|parser| {
             let start = parser.position;
             let name = parser.eat_ident()?;
-            let generic_arguments = parser.parse_generic_arguments()?;
+            let generic_arguments = parser.parse_expression_generic_arguments(start)?;
             if !parser.peek_is_op("::") {
                 return None;
             }
@@ -6045,7 +6098,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 name = parser.eat_ident().expect("peeked as an identifier");
             }
             let name_span = parser.span_from(name_start);
-            let generic_arguments = parser.parse_generic_arguments();
+            let generic_arguments = parser.parse_expression_generic_arguments(start);
             if !parser.peek_is_ctrl('{') {
                 return None;
             }
@@ -15837,11 +15890,28 @@ mod ascription_tests {
     }
 
     #[test]
-    fn outside_an_ascription_a_spaced_generic_list_parses_as_before() {
-        // The paper's a04/a05: type and expression positions keep reading a
-        // spaced list (Q3 RULED: expression position is its own later item).
+    fn a_type_annotation_keeps_reading_a_spaced_generic_list() {
+        // The paper's a04: a type annotation keeps reading a spaced list (the
+        // whitespace rule binds in ascribed types and, since E291, in
+        // expression position).
         assert!(rendered_errors("fun main() { let xs: List <i32> = []; }").is_empty());
-        assert!(rendered_errors("fun main() { let xs = List <i32>::new(); }").is_empty());
+    }
+
+    #[test]
+    fn in_expression_position_a_spaced_less_than_is_a_comparison() {
+        // E291: `a < b > (c)` is two comparisons, not the call `a<b>(c)`.
+        assert_eq!(expression("a < b > (c)"), "(Gt (Lt a b) c)");
+        assert_eq!(expression("a<b>(c)"), "(call a [c])");
+        // The paper's a05: a spaced list no comparison could be is refused
+        // with the tight spelling and read tight.
+        assert_eq!(
+            rendered_errors("fun main() { let xs = List <i32>::new(); }"),
+            vec![
+                "`List` then a spaced `<`: a generic list touches its name, `List<i32>` — \
+                 spaced, the `<` after a name is a comparison"
+                    .to_string()
+            ]
+        );
     }
 
     #[test]

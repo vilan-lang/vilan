@@ -162,3 +162,4 @@ let empty = new2();
 console.log(is_empty(empty));
 console.log(String(entries(empty).length));
 console.log(contains_value(empty, 0));
+//# sourceMappingURL=map.mjs.map

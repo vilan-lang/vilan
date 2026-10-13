@@ -740,6 +740,11 @@ function has_spawned(self) {
 function detached_nursery() {
 	return __nursery_new_detached();
 }
+function on_teardown(cleanup) {
+	if (__hmr_active()) {
+		__hmr_register_teardown(cleanup);
+	}
+}
 function ensure_wired($b) {
 	if (!(wired.v)) {
 		wired.v = true;
@@ -981,11 +986,6 @@ function mount_root(id, body) {
 		});
 	}
 	return root;
-}
-function on_teardown(cleanup) {
-	if (__hmr_active()) {
-		__hmr_register_teardown(cleanup);
-	}
 }
 function parse(path) {
 	const parts = segments(path);

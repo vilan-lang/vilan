@@ -1023,6 +1023,9 @@ count + "n="                 // error: only a `str` LEFT operand concatenates
 index - count                // error: usize and i32 — `-`, `*`, `/`, `%` as `+`
 count * true                 // error: `*` computes on two numbers, and `bool` is not one
 count * "2"                  // error: the same, for `str`
+flags & index                // error: i32 and usize — `&`, `|`, `^` take one integer type
+count << index               // a shift: the right operand is a count, any integer type
+ratio & 1                    // error: a bitwise operator over a float
 ```
 
 ```vilan,fragment
@@ -1200,7 +1203,11 @@ a trait bound cannot make a parameter be one particular enum.
 ## 5.8 Conversions and coercions
 
 There are **no implicit conversions** between numeric types; use the
-`as_*` methods (value-converting, Rust-`as` semantics). There is **one
+`as_*` methods (value-converting, Rust-`as` semantics). Every binary
+operator over two numbers takes one type on both sides, with one
+exception taken from Rust: a shift's right operand (`<<`, `>>`) is a
+count and may be any integer type. A bitwise operator never takes a
+float. There is **one
 implicit coercion**: a reference to a plain named function coerces to a
 matching closure type:
 

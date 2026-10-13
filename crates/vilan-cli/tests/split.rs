@@ -661,6 +661,8 @@ fn a_build_owns_its_legs_chunk_namespace() {
         .filter(|name| {
             name.starts_with("app.")
                 && name != "app.js"
+                // The bundle's source map (E257 S5): the bundle's, not a chunk.
+                && name != "app.js.map"
                 && name != "app.vl"
                 && name != "app.chunks.json"
         })
@@ -760,7 +762,11 @@ fn chunk_artifacts(dist: &Path) -> Vec<String> {
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| {
-            name.starts_with("client.") && name != "client.js" && name != "client.chunks.json"
+            name.starts_with("client.")
+                && name != "client.js"
+                // The bundle's source map (E257 S5): the bundle's, not a chunk.
+                && name != "client.js.map"
+                && name != "client.chunks.json"
         })
         .collect();
     names.sort();

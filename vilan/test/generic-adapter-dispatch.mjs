@@ -56,3 +56,4 @@ while (true) {
 }
 console.log(String(sum_of(taken([ 0, 5 ], 3))));
 console.log(String(count_them(taken([ 0, 9 ], 4))));
+//# sourceMappingURL=generic-adapter-dispatch.mjs.map

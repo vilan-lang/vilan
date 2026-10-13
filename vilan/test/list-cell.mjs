@@ -1407,3 +1407,4 @@ if (walk_calls.v + chain_calls.v >= naive) {
 	})();
 }
 console.log("walk: turns=300 silent=" + silent + " length=" + get(walk).length + " g=" + walk_calls.v + " h=" + chain_calls.v + " rerun=" + naive);
+//# sourceMappingURL=list-cell.mjs.map

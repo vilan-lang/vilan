@@ -254,3 +254,4 @@ set(live, "second", [ 1 ]);
 holder(live);
 describe([ [  ] ]);
 describe2([ [  ] ]);
+//# sourceMappingURL=blanket-impl.mjs.map

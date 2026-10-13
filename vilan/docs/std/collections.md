@@ -189,6 +189,7 @@ every length, so `[u8; 4]` and `[str; 100]` get the same surface:
 - **`==` / `!=`** when the element is `PartialEq` — equal when every position
   is. Two arrays of different lengths are different types, so `==` never
   meets them; a `[derive(PartialEq)]` struct with an array field derives.
+  The array is `Eq` when the element is, so a `T: Eq` takes an `[i32; 4]`.
 - **`Hashable`** when the element is — an array keys a `HashMap` or joins a
   `HashSet`.
 - **`Debug`** when the element is — `T: Debug` takes an array, and it prints

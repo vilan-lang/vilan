@@ -121,3 +121,4 @@ tally.v = 0;
 console.log(String(over_a_literal([ 1, 2, 3 ])));
 tally.v = 0;
 console.log(String(chained([ 4, 5, 6 ])));
+//# sourceMappingURL=side-effect-let.mjs.map

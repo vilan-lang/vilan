@@ -757,8 +757,13 @@ list; `as (T)` is the escape, `n as (usize) < limit`. A spaced list no
 comparison could be — inside another generic list, or one whose `>` is
 followed by `;`, `,`, a closer or `.` (`xs as List <i32>;`) — is refused
 with the tight spelling, read as written tight, and `vilan fmt` writes it
-so. The rule binds in ascribed types only; elsewhere a spaced generic list
-parses as before (and the formatter tightens it). A closure type after
+so. The rule binds in expression position too (E291): after a name — a
+callee, a member call, a `::` path head, a struct literal's head — a `<`
+opens a generic list only when it touches the name, so `a < b > (c)` is two
+comparisons and `f<T>(x)` a generic call; a spaced list no comparison could
+be, one whose `>` is followed by `::` or `{` (`List <i32>::new()`), is
+refused with the tight spelling and read tight. In a type annotation a
+spaced generic list parses as before (and the formatter tightens it). A closure type after
 `as` is read greedily, as everywhere — `f as |i32| i32` — and `vilan fmt`
 prints it parenthesized, `f as (|i32| i32)`.
 

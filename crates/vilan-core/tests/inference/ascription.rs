@@ -745,13 +745,15 @@ fn b571_tuple_labels_through_an_ascription_read_as_at_a_binding() {
     );
 }
 
-// --- E284: a spaced `a < b > (c)` names both readings -------------------------
+// --- E291: a spaced `<` after a name never opens a generic list --------------
 
-/// The parser reads `a < b > (c)` as the generic call `a<b>(c)` (expression
-/// position keeps that reading, Q3 RULED); when `a` is no function the refusal
-/// says so and gives the comparison spelling.
+/// E291 (B571 Q3's separable half): in expression position, as in an ascribed
+/// type, a `<` opens a generic list only when it touches the name before it.
+/// `a < b > (c)` is two comparisons — refused as the comparison it is, since
+/// `bool` has no order — where it was read as the generic call `a<b>(c)` and
+/// E284 explained the reading (E284 is retired with it).
 #[test]
-fn e284_a_spaced_generic_call_on_a_value_names_both_readings() {
+fn e291_a_spaced_less_than_after_a_name_is_a_comparison() {
     assert_fails_with(
         r#"
         fun main() {
@@ -762,39 +764,80 @@ fn e284_a_spaced_generic_call_on_a_value_names_both_readings() {
             let _ = chained;
         }
         "#,
-        "cannot call this as a function: it is i32 — `a < b > (c)` is read as the generic call \
-         `a<b>(c)`; if you meant two comparisons, parenthesize: `(a < b) > (c)`",
+        "`bool` has no ordering: `>` models `PartialOrd`, which `bool` does not implement",
     );
-}
-
-/// A spaced generic call on a real generic function stays a generic call
-/// (the paper's a14), and a tight one says nothing new.
-#[test]
-fn e284_a_spaced_generic_call_on_a_function_is_still_a_call() {
-    assert_compiles_and_runs(
+    // A function on the left of a spaced `<` is compared, not called.
+    assert_fails_with(
         r#"
-        import std::io::print;
-
         fun pick<T>(first: T, second: T): T {
             first
         }
-
         fun main() {
-            print(pick <f64>(1, 2));
-            print(pick<f64>(3, 4));
+            let _p = pick <f64>(1, 2);
         }
         "#,
-        "1\n3\n",
+        "`<` models `PartialOrd`, and `fn pick<T>(T, T): T` does not implement it",
     );
-    assert_fails_without(
+}
+
+/// E291: where no comparison could stand — the list's `>` is followed by `::`
+/// or `{` — a spaced list is refused with the tight spelling and read tight,
+/// for a `::` path head and a struct literal's head.
+#[test]
+fn e291_a_spaced_list_no_comparison_could_be_is_refused_with_the_tight_spelling() {
+    for (statement, written, tight) in [
+        ("let xs = List <i32>::new();", "List", "List<i32>"),
+        (
+            "let h = Holder <i32> { value = 1 };",
+            "Holder",
+            "Holder<i32>",
+        ),
+        (
+            "let m = HashMap <str, List<i32>>::new();",
+            "HashMap",
+            "HashMap<str, List<i32>>",
+        ),
+    ] {
+        let source = format!(
+            "import std::hash_map::HashMap;\nstruct Holder<T> {{\n    value: T,\n}}\nfun main() {{\n    {statement}\n}}\n"
+        );
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`{written}` then a spaced `<`: a generic list touches its name, `{tight}` — \
+                 spaced, the `<` after a name is a comparison"
+            ),
+        );
+    }
+}
+
+/// E291's boundary: a TIGHT list reads as always — a generic call, a member
+/// call's, a path head's, a struct literal's — and comparisons stay
+/// comparisons.
+#[test]
+fn e291_a_tight_list_and_a_spaced_comparison_read_as_before() {
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
+        import std::display::Display;
+        struct Holder<T> {
+            value: T,
+        }
+        fun pick<T>(first: T, second: T): T {
+            first
+        }
         fun main() {
-            let a = 1;
-            let b = a<i32>(2);
-            let _ = b;
+            print(pick<f64>(1, 2));
+            let xs = List<i32>::new();
+            print(xs.len());
+            let h = Holder<i32> { value = 7 };
+            print(h.value);
+            let n = 2;
+            print(n < 3 && 4 > n);
+            print([1, 2].map<str>(|item| item.to_string())[1]);
         }
         "#,
-        "is read as the generic call",
+        "1\n0\n7\ntrue\n2\n",
     );
 }
 

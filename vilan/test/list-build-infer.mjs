@@ -34,3 +34,4 @@ numbers.push(10);
 numbers.push(20);
 numbers.push(30);
 console.log(String(sum2(numbers)));
+//# sourceMappingURL=list-build-infer.mjs.map

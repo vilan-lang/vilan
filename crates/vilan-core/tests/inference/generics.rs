@@ -9900,3 +9900,151 @@ fn b589_only_a_fully_annotated_closure_binds_first() {
         "Expected",
     );
 }
+
+// --- B604: an ANNOTATED binding over an unfilled closure parameter waits ------
+
+/// B604: inside `.filter(|length| ..)` over a `List<usize>` that types LATER
+/// (a `.map` result, a call's), `let probe: str = length` checked clean: the
+/// annotation reconciled against the parameter's not-yet `Unknown`, and
+/// nothing asked again once the call site filled it (natively rustc refused
+/// E0308). The annotated binding now waits for the fill, as the unannotated
+/// one does (B185), and refuses as the literal receiver always did — through
+/// a `.map` result, a call's result, a reassignment, a tuple and a list.
+#[test]
+fn b604_an_annotated_binding_over_a_closure_parameter_is_checked_once_it_fills() {
+    for (receiver, body, message) in [
+        (
+            r#"["a", "bb"].map(|word| word.len())"#,
+            "let probe: str = length; probe == \"x\"",
+            "Expected str, but got usize instead.",
+        ),
+        (
+            "make()",
+            "let probe: str = length; probe == \"x\"",
+            "Expected str, but got usize instead.",
+        ),
+        (
+            "make()",
+            "mut probe: str = \"a\"; probe = length; probe == \"x\"",
+            "Expected str, but got usize instead.",
+        ),
+        (
+            "make()",
+            "let pair: (str, i32) = (length, 1); pair.1 > 0",
+            "Expected (str, i32), but got (usize, i32) instead.",
+        ),
+        (
+            "make()",
+            "let texts: List<str> = [length]; texts.len() > 0",
+            "Expected List<str>, but got List<usize> instead.",
+        ),
+    ] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            fun make(): List<usize> {{
+                [1, 2]
+            }}
+            fun main() {{
+                let words = {receiver};
+                let kept = words.filter(|length| {{
+                    {body}
+                }});
+                print(kept.len());
+            }}
+            "#
+        );
+        assert_fails_once_with(&source, message);
+    }
+}
+
+/// B604's boundary: the binding checks against what the parameter filled
+/// with, so a matching annotation runs; and a parameter only the annotated
+/// binding can type — a let-bound closure no call site fills — keeps today's
+/// reading once the fixpoint stalls (B372's door), as before.
+#[test]
+fn b604_a_matching_annotation_runs_and_an_unfilled_parameter_keeps_its_reading() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun make(): List<usize> {
+            [1, 2, 3]
+        }
+        fun main() {
+            let words = ["a", "bb", "ccc"].map(|word| word.len());
+            let long = words.filter(|length| {
+                let size: usize = length;
+                size > 1
+            });
+            print(long.len());
+            let made = make().filter(|length| {
+                mut size: usize = 0;
+                size = length;
+                size > 2
+            });
+            print(made.len());
+        }
+        "#,
+        "2\n1\n",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let shout = |text| {
+                let loud: str = text;
+                loud.to_uppercase()
+            };
+            print(shout("hi"));
+        }
+        "#,
+        "HI\n",
+    );
+}
+
+// --- B552: a block-bodied closure's local, built from its parameter ----------
+
+/// B552: `apply(2, |k| { let d = k * 2; Maybe::Just(d) })` with `apply<T,
+/// U>(value: T, f: |T| U): U` recorded the call's `U` as `Maybe` with NO
+/// arguments (natively the instance met an unbound `T` of `Maybe`), and
+/// `{ let d = k * 2; d }` recorded no `U` at all — a `let probe: bool` over
+/// it checked clean. The local `d` grounded before the call filled `k`, to
+/// the permanent `Unknown` B185 describes; a binding BUILT from an unfilled
+/// parameter now waits for the fill as a direct mention does.
+#[test]
+fn b552_a_block_closures_local_built_from_its_parameter_types_the_callers_generic() {
+    let prelude = r#"
+        enum Maybe<T> {
+            Just(T),
+            Nothing,
+        }
+        fun apply<T, U>(value: T, f: |T| U): U {
+            f(value)
+        }
+    "#;
+    for (body, got) in [
+        ("{ let d = k * 2; Maybe::Just(d) }", "Maybe<i32>"),
+        ("{ let d = k * 2; d }", "i32"),
+        ("{ let d = k * 2; let e = d + 1; (d, e) }", "(i32, i32)"),
+    ] {
+        let source = format!(
+            "{prelude}\nfun main() {{\n    let r = apply(2, |k| {body});\n    let probe: bool = r;\n}}\n"
+        );
+        assert_fails_once_with(&source, &format!("Expected bool, but got {got} instead."));
+    }
+    let program = r#"
+        fun main() {
+            let block = apply(2, |k| {
+                let d = k * 2;
+                Maybe::Just(d)
+            });
+            if block is Maybe::Just(let v) {
+                print(v + 1);
+            }
+        }
+    "#;
+    assert_compiles_and_runs(
+        &format!("import std::io::print;\n{prelude}\n{program}"),
+        "5\n",
+    );
+}

@@ -123,3 +123,4 @@ console.log(String(rem(3000000000, 7)));
 console.log(String(Math.pow(2, 3)));
 console.log(String(Math.sqrt(2.25)));
 console.log(String(Math.abs(0 - 1.5)));
+//# sourceMappingURL=math.mjs.map

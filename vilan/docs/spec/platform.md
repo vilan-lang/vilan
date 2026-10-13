@@ -186,7 +186,10 @@ The manifest declares what a directory builds. Sections:
   not among them. `dbg` (`"keep"` | `"strip"`) says what a `dbg(..)`
   or `dbg_stack()` call does: the `debug` preset keeps it (it prints), the `release`
   preset refuses the build at each call, `"strip"` makes the call its
-  argument and prints nothing, and `"keep"` prints in release too. `run` is a command line (or a list of them) executed
+  argument and prints nothing, and `"keep"` prints in release too.
+  `source-maps` (a bool) writes a source map beside each script: on under
+  `debug`, off under `release`; it changes no byte of the script but the
+  comment that names the map. `run` is a command line (or a list of them) executed
   through the host shell **before** each build (each `--watch` round
   included), in the manifest's directory, in order; a non-zero exit
   fails the build. It runs with the invoking user's privileges and

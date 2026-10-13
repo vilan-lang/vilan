@@ -16,3 +16,4 @@ deep[1] = $a[1];
 console.log(String(deep[0] + deep[1] + deep[2]));
 deep[1] = 7;
 console.log(String(deep[1]));
+//# sourceMappingURL=tuple-access.mjs.map

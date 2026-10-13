@@ -2110,6 +2110,50 @@ fn a_one_shot_check_stores_a_base_world_only_when_two_members_could_share_it() {
     );
 }
 
+/// N169: `VILAN_COUNTERS` prints the walk's per-level stack frame ONCE per
+/// process — `[vilan walk-frame] per-level=<bytes>B` — however many analyses
+/// the process runs (three members here, each its own analysis). The figure is
+/// a property of the build, not the program, so one line says it; a positive
+/// one, because a nested level always sits below its parent. What it must not
+/// exceed is held where the frame is a stack claim: `deep_nesting`'s canary,
+/// on the dev profile.
+#[test]
+fn the_walks_per_level_frame_is_printed_once_under_the_counters() {
+    let mut files = vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        ("src/store.vl", "struct Store {\n\tname: str,\n}\n"),
+    ];
+    files.extend(three_entries());
+    let dir = temp_files("walk_frame", &files);
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(&dir)
+        .args(["check", "."])
+        .env("VILAN_COUNTERS", "1")
+        .output()
+        .expect("run vilan");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "the fixture must check cleanly: {stderr}"
+    );
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[vilan walk-frame]"))
+        .collect();
+    assert_eq!(lines.len(), 1, "one line per process: {stderr}");
+    let bytes: usize = lines[0]
+        .strip_prefix("[vilan walk-frame] per-level=")
+        .and_then(|rest| rest.strip_suffix('B'))
+        .and_then(|figure| figure.parse().ok())
+        .unwrap_or_else(|| panic!("the line's shape: {}", lines[0]));
+    assert!(bytes > 0, "a nested level sits below its parent: {bytes}");
+    assert!(
+        stderr.matches("[vilan counters] world ").count() > 1,
+        "the pin is vacuous unless the process ran more than one analysis: {stderr}"
+    );
+}
+
 /// A three-entry package with a mistake in the module all three reach AND one
 /// mistake of its own per entry — the shape that makes both halves of the
 /// ordering observable: the shared error is claimed by exactly one member, and

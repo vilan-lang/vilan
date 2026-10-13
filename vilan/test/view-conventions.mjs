@@ -8,3 +8,4 @@ let c = [ 10 ];
 bump(c);
 console.log(String(c[0]));
 console.log(String(peek(c)));
+//# sourceMappingURL=view-conventions.mjs.map

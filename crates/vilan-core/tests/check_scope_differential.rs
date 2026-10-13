@@ -16,6 +16,7 @@
 
 mod replay_harness;
 mod scratch;
+mod test_pool;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -267,7 +268,7 @@ fn corpus_agrees_between_scoped_and_full_scan_checks() {
     let observe_all = || -> Vec<(String, String, Option<String>)> {
         std::thread::scope(|scope| {
             let workers: Vec<_> = paths
-                .chunks(paths.len().div_ceil(8).max(1))
+                .chunks(paths.len().div_ceil(test_pool::workers(8)).max(1))
                 .map(|chunk| {
                     scope.spawn(move || {
                         chunk
@@ -1001,7 +1002,7 @@ fn module_corpus() -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
 fn observe_corpus(packages: &[(PathBuf, PathBuf)]) -> Vec<ReuseObservation> {
     std::thread::scope(|scope| {
         let workers: Vec<_> = packages
-            .chunks(packages.len().div_ceil(16).max(1))
+            .chunks(packages.len().div_ceil(test_pool::workers(16)).max(1))
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk
@@ -1019,6 +1020,62 @@ fn observe_corpus(packages: &[(PathBuf, PathBuf)]) -> Vec<ReuseObservation> {
             .flat_map(|worker| worker.join().expect("worker panicked"))
             .collect()
     })
+}
+
+/// **std-prefix P1's leg** (`std-prefix.md` §13): the corpus-as-modules sweep
+/// analyzed with the in-process std-only prefix forced on — std's world built
+/// once and served to every package (each re-hosted program is a package of its
+/// own, with one std closure or another), every package module walked and
+/// resolved over it, std's checks replayed from its record and tables restored
+/// — against the same sweep without the prefix. Diagnostics, per-file
+/// attribution and the emitted JavaScript agree byte for byte: the prefix moves
+/// the package's modules past std's lib surface in walk order and nothing an
+/// emitter or an editor reads.
+#[test]
+fn corpus_agrees_with_and_without_the_std_prefix() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (paths, packages) = module_corpus();
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::set_world_table_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+    let canonical = observe_corpus(&packages);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let prefixed = observe_corpus(&packages);
+    vilan_core::incremental::set_std_prefix(None);
+    vilan_core::analyzer::base_cache_clear();
+    for (directory, _) in &packages {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    let mut divergences = Vec::new();
+    for ((path, prefixed), canonical) in paths.iter().zip(&prefixed).zip(&canonical) {
+        let name = path.file_name().unwrap().to_string_lossy();
+        if prefixed.0 != canonical.0 {
+            divergences.push(format!(
+                "{name}: diagnostics differ\n  prefixed:  {}\n  canonical: {}",
+                prefixed.0, canonical.0
+            ));
+        }
+        if prefixed.1 != canonical.1 {
+            divergences.push(format!("{name}: warnings or per-file attribution differ"));
+        }
+        if prefixed.2 != canonical.2 {
+            divergences.push(format!("{name}: emitted JS differs over the std prefix"));
+        }
+    }
+    assert!(
+        divergences.is_empty(),
+        "{} corpus programs observe the std prefix:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let emitting = prefixed.iter().filter(|row| row.2.is_some()).count();
+    assert!(
+        emitting >= 30,
+        "the prefixed sweep must emit to be a witness ({emitting} programs did)"
+    );
 }
 
 /// **M19 T1b's own differential leg** (`per-module-analysis-reuse.md` §3.3,

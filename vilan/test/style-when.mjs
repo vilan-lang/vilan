@@ -177,3 +177,4 @@ while (cell < 4) {
 	console.log("cell " + cell + " same=" + (chain === sum) + " classes=" + chain);
 	cell = cell + 1;
 }
+//# sourceMappingURL=style-when.mjs.map

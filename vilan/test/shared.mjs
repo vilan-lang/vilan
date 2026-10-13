@@ -12,3 +12,4 @@ const other = __shared_new([ 100 ]);
 other.v[0] = 50;
 console.log(String(other.v[0]));
 console.log(String(s.v[0]));
+//# sourceMappingURL=shared.mjs.map

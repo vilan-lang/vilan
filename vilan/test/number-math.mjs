@@ -61,3 +61,4 @@ console.log(String(clamp(y, 0, 3)));
 console.log(String(clamp(y, 4, 10)));
 console.log(String(clamp(y, 0, 10)));
 console.log(String(clamp2(as_f32(16), as_f32(0), as_f32(4))));
+//# sourceMappingURL=number-math.mjs.map

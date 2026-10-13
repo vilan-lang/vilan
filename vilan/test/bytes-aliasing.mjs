@@ -123,3 +123,4 @@ for (const holder of holders) {
 	console.log(to_hex(holder));
 }
 console.log("" + shared.at(1));
+//# sourceMappingURL=bytes-aliasing.mjs.map

@@ -12,12 +12,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// A fresh temp directory for one test's project tree.
 ///
 /// `std::env::temp_dir()` and NOT the support scratch root, for the reason
-/// these pins exist (N102): `CARGO_TARGET_TMPDIR` is `<worktree>/target/tmp`,
-/// INSIDE a vilan checkout, and these tests turn on which checkout the
-/// ancestor walk for `vilan/std` reaches. Under a scratch root it reaches the
-/// worktree's own and the stand-in checkout staged here decides nothing.
-/// Recorded in `harness_scratch.rs`'s `PATHS_THE_BINARY_OWNS`: not waiting to
-/// be ported, unable to be.
+/// these pins were written (N102): `CARGO_TARGET_TMPDIR` is `<worktree>/target/tmp`,
+/// INSIDE a vilan checkout, and they turned on which checkout the ancestor walk
+/// for `vilan/std` reached. The walk is gone (N168) - the stand-in checkouts staged
+/// here now prove a checkout above a program is NOT consulted - so the scratch
+/// root would serve; the files stay on the system temp dir until the exemption in
+/// `harness_scratch.rs` is retired.
 fn temp_root(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -311,9 +311,9 @@ fn a_std_root_that_is_not_utf8_still_loads_and_still_steers() {
 // `macro PartialEq's definition did not compile` from here, 0 from the
 // application's own directory, on one unchanged file. `file_project` has
 // resolved the PACKAGE from the file's own location since G20; these pin that
-// the std comes from the same place, and that the one case where the working
-// directory still legitimately answers — a bare file belonging to no package —
-// is the case that keeps it.
+// the std comes from the same place. (N168 then retired the one case N56 kept —
+// a bare file belonging to no package taking the shell's checkout: no location
+// picks a std now, `$VILAN_STD` does.)
 
 /// A second checkout, standing in for another clone of the toolchain: a
 /// `vilan/std` package with no modules at all, so anything compiled against it
@@ -384,11 +384,13 @@ fn a_file_in_a_package_takes_its_own_toolchains_std_from_any_directory() {
 }
 
 #[test]
-fn a_bare_file_belonging_to_no_package_still_takes_the_working_directorys_checkout() {
-    // The case the rule KEEPS, and the control that makes the pin above a claim
-    // rather than a tautology: it is the same stand-in checkout, and it does
-    // change the answer — for a scratch program with no `vilan.toml` at or above
-    // it, which has no toolchain of its own for the shell's to override.
+fn a_bare_file_belonging_to_no_package_takes_the_binarys_own_std_not_the_checkout_it_stands_in() {
+    // N168 retired the one case N56 kept: a bare scratch program (no `vilan.toml`
+    // at or above it) used to take the checkout the SHELL stood in. A checkout is
+    // not a toolchain for anyone but the binary built from it, so the working
+    // directory answers for nothing now; `$VILAN_STD` is the explicit way, and the
+    // control below shows the stand-in checkout is reachable and does decide
+    // verdicts - this pin is a claim, not a tautology.
     let root = temp_root("std-bare-file");
     let bare = root.join("bare");
     std::fs::create_dir_all(&bare).unwrap();
@@ -408,12 +410,23 @@ fn a_bare_file_belonging_to_no_package_still_takes_the_working_directorys_checko
         combined(&from_its_own_directory)
     );
     let from_the_checkout = vilan_without_std_env(&other, &["check", path]);
+    assert_eq!(
+        combined(&from_the_checkout),
+        combined(&from_its_own_directory),
+        "the shell standing in a checkout does not change the toolchain"
+    );
+    assert!(from_the_checkout.status.success());
+    let explicit = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(&bare)
+        .env("NO_COLOR", "1")
+        .env("VILAN_STD", other.join("vilan").join("std"))
+        .args(["check", path])
+        .output()
+        .expect("run vilan");
     assert!(
-        !from_the_checkout.status.success(),
-        "a bare file compiles against the checkout the shell is standing in, and \
-         this one has an empty std — so the stand-in checkout above is reachable \
-         and it does decide verdicts: {}",
-        combined(&from_the_checkout)
+        !explicit.status.success(),
+        "the stand-in checkout has an empty std, so naming it through $VILAN_STD fails the program: {}",
+        combined(&explicit)
     );
     let _ = std::fs::remove_dir_all(&root);
 }
