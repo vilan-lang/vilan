@@ -315,9 +315,9 @@ struct ImplReachLog {
     questions: u64,
     /// Member name -> the receivers it was looked up on, each with whether a
     /// PACKAGE source asked (as opposed to only std's).
-    members: HashMap<Box<str>, HashMap<Type, bool>>,
+    members: HashMap<Box<str>, HashMap<Type, Asked>>,
     /// Trait -> the receivers it was asked of, likewise.
-    traits: HashMap<Id, HashMap<Type, bool>>,
+    traits: HashMap<Id, HashMap<Type, Asked>>,
     /// Whether the constraint now resolving is anchored in a std source. A
     /// question std's own code asks does not make an ENTRY impl reach: the
     /// two-phase order has always resolved std before the entry walked, and
@@ -360,14 +360,14 @@ impl ImplReachLog {
     fn absorb(&mut self, other: ImplReachLog) {
         for (name, receivers) in other.members {
             let into = self.members.entry(name).or_default();
-            for (receiver, by_package) in receivers {
-                note_receiver(into, &receiver, by_package);
+            for (receiver, asked) in receivers {
+                note_receiver(into, &receiver, asked);
             }
         }
         for (trait_id, receivers) in other.traits {
             let into = self.traits.entry(trait_id).or_default();
-            for (receiver, by_package) in receivers {
-                note_receiver(into, &receiver, by_package);
+            for (receiver, asked) in receivers {
+                note_receiver(into, &receiver, asked);
             }
         }
     }
@@ -475,11 +475,35 @@ impl ReachFilter {
 
 /// [`ImplReachLog`]'s insert: `receiver` joins the set, and a package asker
 /// marks it so whoever asked first.
-fn note_receiver(receivers: &mut HashMap<Type, bool>, receiver: &Type, by_package: bool) {
-    match receivers.get_mut(receiver) {
-        Some(asked_by_package) => *asked_by_package |= by_package,
-        None => {
-            receivers.insert(receiver.clone(), by_package);
+/// How one receiver was asked about ([`ImplReachLog`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Asked {
+    /// A PACKAGE source asked (as opposed to only std's).
+    by_package: bool,
+    /// M145: the rigid-binder scopes the lookups asking about it ran under
+    /// (`rigid_binder_scope`; `None` for a lookup with no declaration's
+    /// generics rigid, or one inferring some at a call site), each once. The
+    /// verdict re-asks the admission under each: a lookup on `T` inside `fun
+    /// f<T: Signal<U>>` — a parameter its declaration owns, RIGID in the body
+    /// — admits no impl on a concrete head, while the verdict, read after the
+    /// resolve with nothing rigid, read that `T` as a hole every impl
+    /// declaring the name fills. kolt's client refused the std prefix twice
+    /// over that way: its `impl ProxySignal<type T> with Signal<T>` against
+    /// std's `get` on a rigid `T`, and its `impl Scale with Callable` against
+    /// std's "is `|T| U` callable?" (a callable's closure type compared with
+    /// the closure's rigid `T`).
+    scopes: Vec<Option<Id>>,
+}
+
+fn note_receiver(receivers: &mut HashMap<Type, Asked>, receiver: &Type, asked: Asked) {
+    let entry = match receivers.get_mut(receiver) {
+        Some(entry) => entry,
+        None => receivers.entry(receiver.clone()).or_default(),
+    };
+    entry.by_package |= asked.by_package;
+    for scope in asked.scopes {
+        if !entry.scopes.contains(&scope) {
+            entry.scopes.push(scope);
         }
     }
 }
@@ -52768,12 +52792,15 @@ impl<'src> Analyzer<'src> {
             return;
         }
         log.questions += 1;
-        let by_package = !log.asked_by_std;
+        let asked = Asked {
+            by_package: !log.asked_by_std,
+            scopes: vec![self.reach_scope()],
+        };
         let receivers = match log.members.get_mut(member_name) {
             Some(receivers) => receivers,
             None => log.members.entry(member_name.into()).or_default(),
         };
-        note_receiver(receivers, subject_type, by_package);
+        note_receiver(receivers, subject_type, asked);
     }
 
     /// Records that `trait_id` was asked of `subject_type`, when a pre-store
@@ -52786,12 +52813,19 @@ impl<'src> Analyzer<'src> {
             return;
         }
         log.questions += 1;
-        let by_package = !log.asked_by_std;
-        note_receiver(
-            log.traits.entry(trait_id).or_default(),
-            subject_type,
-            by_package,
-        );
+        let asked = Asked {
+            by_package: !log.asked_by_std,
+            scopes: vec![self.reach_scope()],
+        };
+        note_receiver(log.traits.entry(trait_id).or_default(), subject_type, asked);
+    }
+
+    /// M145: the rigidity a lookup asking now runs under ([`Asked::scopes`]).
+    fn reach_scope(&self) -> Option<Id> {
+        match self.inferable_generics.is_empty() {
+            true => self.rigid_binder_scope,
+            false => None,
+        }
     }
 
     /// M121 / B553: whether an impl that joined this world AFTER its recorded
@@ -52817,19 +52851,13 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         let mut reached = ImplReached::default();
-        for implementation in &self.implementations[floor..] {
+        for index in floor..self.implementations.len() {
+            let implementation = &self.implementations[index];
             let subject = implementation.subject.get_type(self);
             // An impl the ENTRY walked answers only what a package source
             // asked ([`ImplReachLog::asked_by_std`]); a hot module's answers
             // what anyone asked.
             let entry_side = !hot_sources.contains(&implementation.source.0);
-            let admits = |receivers: &HashMap<Type, bool>| {
-                receivers.iter().any(|(receiver, by_package)| {
-                    (*by_package || !entry_side)
-                        && (matches!(receiver, Type::Unknown)
-                            || self.impl_subject_admits(receiver, &subject, &HashMap::default()))
-                })
-            };
             let mut traits: Vec<Id> = Vec::new();
             for (trait_id, _) in implementation
                 .provided_trait_args
@@ -52842,19 +52870,33 @@ impl<'src> Analyzer<'src> {
                     }
                 }
             }
-            let declared = implementation.declarations.keys().copied();
-            let inherited = traits
-                .iter()
-                .filter_map(|trait_id| self.traits.get(trait_id))
-                .flat_map(|trait_| trait_.declarations.keys().copied());
-            let mut hit = declared
-                .chain(inherited)
-                .find(|name| log.members.get(*name).is_some_and(admits))
+            let names: Vec<&'src str> = implementation
+                .declarations
+                .keys()
+                .copied()
+                .chain(
+                    traits
+                        .iter()
+                        .filter_map(|trait_id| self.traits.get(trait_id))
+                        .flat_map(|trait_| trait_.declarations.keys().copied()),
+                )
+                .collect();
+            let mut hit = names
+                .into_iter()
+                .find(|name| {
+                    log.members
+                        .get(*name)
+                        .is_some_and(|receivers| self.reach_admits(receivers, &subject, entry_side))
+                })
                 .map(|name| format!("member `{name}`"));
             if hit.is_none() {
                 hit = traits
                     .iter()
-                    .find(|trait_id| log.traits.get(trait_id).is_some_and(admits))
+                    .find(|trait_id| {
+                        log.traits.get(trait_id).is_some_and(|receivers| {
+                            self.reach_admits(receivers, &subject, entry_side)
+                        })
+                    })
                     .map(|trait_id| {
                         let name = self.traits.get(trait_id).map_or("?", |trait_| trait_.name);
                         format!("trait `{name}`")
@@ -52876,6 +52918,42 @@ impl<'src> Analyzer<'src> {
             }
         }
         (reached.by_hot || reached.by_entry).then_some(reached)
+    }
+
+    /// Whether an impl whose subject is `subject` answers a logged question
+    /// about any of `receivers` — the lookup's own admission
+    /// (`impl_subject_admits`), asked under the RIGIDITY the lookup was asked
+    /// under (M145, [`Asked::scopes`]): a generic the asking declaration owns
+    /// stays rigid here as it was there, so `T` inside `fun f<T: Signal<U>>`
+    /// (or a closure `|T| U` over it) is not read as a hole that every
+    /// concrete impl fills. An entry-side impl answers only a package's
+    /// question.
+    fn reach_admits(
+        &mut self,
+        receivers: &HashMap<Type, Asked>,
+        subject: &Type,
+        entry_side: bool,
+    ) -> bool {
+        let saved_scope = self.rigid_binder_scope;
+        let mut admitted = false;
+        'receivers: for (receiver, asked) in receivers {
+            if !(asked.by_package || !entry_side) {
+                continue;
+            }
+            if matches!(receiver, Type::Unknown) {
+                admitted = true;
+                break;
+            }
+            for scope in &asked.scopes {
+                self.rigid_binder_scope = *scope;
+                if self.impl_subject_admits(receiver, subject, &HashMap::default()) {
+                    admitted = true;
+                    break 'receivers;
+                }
+            }
+        }
+        self.rigid_binder_scope = saved_scope;
+        admitted
     }
 
     /// M110 S1's third guard: which of `modules` (name, scope) declare a

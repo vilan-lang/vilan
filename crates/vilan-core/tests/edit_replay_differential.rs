@@ -538,12 +538,20 @@ fn packages_with_one_std_closure_share_one_std_prefix() {
     );
 }
 
+/// A package impl on a std CONCRETE type std's own resolve asks about —
+/// `SignalCell<T>`'s `get`, asked of `SignalCell<T>` itself — for the guard's
+/// refusing case.
+const PREFIX_PEEK: &str = "import std::reactive::SignalCell;\n\n\
+export trait Peek {\n\tfun get(self): i32;\n}\n\n\
+export impl SignalCell<type T> with Peek {\n\tfun get(self): i32 {\n\t\t0\n\t}\n}\n";
+
 /// **std-prefix P1, §4.2's guard.** A package impl that could answer a
-/// question std's own resolve asked — here a package `impl .. with Signal<T>`
-/// declaring `get`, which std's reactive code looks up — refuses the prefix:
-/// the analysis is built in the shape it would have taken without it (the
-/// canonical one: no hot seed), answers what the clean analysis answers, and
-/// the next analysis of the same package does not try again.
+/// question std's own resolve asked — here a trait impl on std's
+/// `SignalCell<T>` declaring `get`, which std's reactive code looks up on
+/// `SignalCell<T>` — refuses the prefix: the analysis is built in the shape it
+/// would have taken without it (the canonical one: no hot seed), answers what
+/// the clean analysis answers, and the next analysis of the same package does
+/// not try again.
 #[test]
 fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
     let _switch = SWITCH_LOCK
@@ -557,9 +565,9 @@ fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
         &[
             (
                 "main.vl",
-                "import pkg::proxy::ProxySignal;\n\nfun main() {\n\tprint(\"ok\");\n}\n",
+                "import pkg::peek::Peek;\n\nfun main() {\n\tprint(\"ok\");\n}\n",
             ),
-            ("proxy.vl", PREFIX_PROXY),
+            ("peek.vl", PREFIX_PEEK),
         ],
     );
     let refused = observe_over_the_prefix(&package);
@@ -578,6 +586,66 @@ fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
         Some("refused-before"),
         "a refused package is not built over the prefix again: {:?}",
         remembered.census
+    );
+}
+
+/// kolt's `src/lib/scale_step.vl`: a package struct made callable (B340).
+/// std asks whether its closure types are `Callable`, and the call operator's
+/// coercion admitted this impl for them (M145's second refusal on kolt).
+const PREFIX_SCALE: &str = "import std::operators::Callable;\n\n\
+export struct Scale {\n\tunit: f64,\n}\n\n\
+export impl Scale with Callable {\n\tfun call(self, n: f64): f64 {\n\t\tself.unit * n\n\t}\n}\n";
+
+/// **M145: the guard asks what the LOOKUP asked.** kolt's `impl
+/// ProxySignal<type T> with Signal<T>` declares `get`, and std's reactive code
+/// looks `get` up on its own generic `T` (`fun f<T: Signal<U>>`, a parameter
+/// the declaration owns and the body's comparison holds RIGID). That lookup
+/// admits no impl on a concrete head — only a blanket could answer it — yet the
+/// verdict, read after the resolve with no rigidity in force, read `T` as a
+/// hole and refused kolt's client. The question now remembers the rigidity it
+/// was asked under and the verdict re-asks the admission under it. And kolt's
+/// callable `Scale` (B340): std asks whether `|T| R` is `Callable`, and the
+/// call operator's COERCION admitted `impl Scale with Callable` for a closure
+/// receiver — an impl subject never coerces now. The package is SERVED over
+/// the prefix, answering what the clean analysis answers.
+#[test]
+fn m145_a_package_impl_on_its_own_type_is_served_over_the_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let package = Package::write(
+        "prefix_proxy",
+        NODE,
+        &[
+            (
+                "main.vl",
+                "import pkg::proxy::ProxySignal;\nimport pkg::scale::Scale;\n\
+                 import std::reactive::{ Signal, SignalCell, Subscriber, Source };\n\n\
+                 fun main() {\n\tprint(Scale { unit = 2f }(3f));\n\tlet cell = SignalCell::new(1);\n\
+                 \tlet proxy = ProxySignal {\n\t\tget = || cell.get(),\n\
+                 \t\tset = |value: i32| cell.set(value),\n\
+                 \t\ton_settle = |subscriber: Subscriber| cell.on_settle(subscriber),\n\
+                 \t\tnotify = || cell.notify(),\n\t};\n\tproxy.set(2);\n\tprint(proxy.get());\n}\n",
+            ),
+            ("proxy.vl", PREFIX_PROXY),
+            ("scale.vl", PREFIX_SCALE),
+        ],
+    );
+    let served = observe_over_the_prefix(&package);
+    let again = observe_over_the_prefix(&package);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        served.census.prefix_world && served.census.prefix_refusals == 0,
+        "the package's impl on its own type is served over the prefix: {:?}",
+        served.census
+    );
+    assert!(
+        again.census.prefix_world && again.census.prefix_hits == 1,
+        "and the next analysis is served the stored prefix: {:?}",
+        again.census
     );
 }
 
