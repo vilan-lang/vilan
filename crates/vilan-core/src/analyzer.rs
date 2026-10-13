@@ -81985,9 +81985,9 @@ fn finish_layered_world(
         namespaces: Vec::new(),
         ..prefix_hot
     });
-    // A world with no package module and no hot set IS the prefix under
-    // another key: storing it would hold std twice, and the next analysis of
-    // it is a prefix hit anyway.
+    // A world with no package module and no hot set is never layered (the
+    // caller builds it canonically); were one here, storing it would hold std
+    // twice.
     if store && (adds_package || layered.hot.is_some()) {
         base_cache_store(layered.world_key.clone(), world);
         if !crate::macros::in_macro_world() {
@@ -82531,8 +82531,14 @@ fn analyze_inner<'src>(
     // A hit on the world's key is untouched: S1's hot sets stay what the
     // keystroke is served from. Refusals fall back to the world's own build
     // (`AnalysisShape::without_prefix`), remembered per package as P1's are.
+    // A DECLARED entry's world only (the editor's world mode, S1's hot sets,
+    // the pause's union legs): a file open on its own is its own entry, its
+    // world misses on the first open and after an edit elsewhere and is hit
+    // on every keystroke in between, and a layered one measured +2.3 % per
+    // hit on kolt's leaf row — more than its misses save.
     let layering_wanted = !std_prefix_wanted
         && crate::incremental::std_prefix_layering()
+        && matches!(workspace.entry_mode, EntryMode::Declared { .. })
         && shape.std_prefix
         && hot_shape_allowed
         && !crate::macros::in_macro_world();
@@ -82546,15 +82552,24 @@ fn analyze_inner<'src>(
             Ok(mut set) => {
                 let (prefix_key, package_refusal_key) =
                     std_prefix_keys(&base_cache_key, &set, std, platform, workspace);
-                if hot_world_refused(&package_refusal_key) {
+                // The world's own package modules: S1's hot set walks after the
+                // store, as it does over a canonical prefix.
+                if let Some(hot) = &hot_world {
+                    set.modules.retain(|module| !hot.modules.contains(module));
+                }
+                if set.modules.is_empty() && hot_world.is_none() {
+                    // Nothing to build over the prefix: the world IS std, which
+                    // the canonical miss stores under the world's own key and
+                    // the next analysis HITS (its checks replayed from M19's
+                    // records). Layered, it would be stored nowhere and rebuilt
+                    // over the prefix on every keystroke, its records never
+                    // read (measured: kolt's `shared.vl` keystroke 1.33 ->
+                    // 2.13 G).
+                    (None, build_claim, hot_world)
+                } else if hot_world_refused(&package_refusal_key) {
                     note_prefix_refusal("refused-before");
                     (None, build_claim, hot_world)
                 } else {
-                    // The world's own package modules: S1's hot set walks after
-                    // the store, as it does over a canonical prefix.
-                    if let Some(hot) = &hot_world {
-                        set.modules.retain(|module| !hot.modules.contains(module));
-                    }
                     layered = Some(Layered {
                         world_key: std::mem::replace(&mut base_cache_key, prefix_key),
                         world_refusal_key: std::mem::replace(&mut refusal_key, package_refusal_key),

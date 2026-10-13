@@ -11244,11 +11244,12 @@ mod dead_item_clock_tests {
     /// std-prefix P2 (E294's pinned half): **a world the session must rebuild
     /// takes std from the prefix its entries pin.** The package clock's union
     /// analyzes both declared entries; with the prefix layered under the
-    /// world build, each entry's world is built over the std-only prefix and
-    /// the entries PIN it (sized into the budget, never its victim). An edit
-    /// to `shared.vl` stales both entries' worlds, and the union that lands
-    /// again rebuilt them over the pinned prefix — std was not drained a
-    /// second time. The pins go with the package's last document.
+    /// world build, the client's world (std + `shared.vl`) is built over the
+    /// std-only prefix and the entry PINS it (sized into the budget, never its
+    /// victim; the server's std-only world is std itself, built and stored as
+    /// before). An edit to `shared.vl` stales the client's world, and the
+    /// union that lands again rebuilt it over the pinned prefix — std was not
+    /// drained a second time. The pins go with the package's last document.
     #[tokio::test]
     async fn a_world_rebuilt_after_an_edit_takes_std_from_the_pinned_prefix() {
         vilan_core::incremental::set_std_prefix_layering(Some(true));
@@ -11269,8 +11270,8 @@ mod dead_item_clock_tests {
         );
         let (builds_before, hits_before) = vilan_core::analyzer::base_cache_prefix_stats();
         assert!(
-            builds_before >= 2,
-            "both legs were layered builds: {builds_before}"
+            builds_before >= 1,
+            "the client leg (std + `shared.vl`) was a layered build: {builds_before}"
         );
 
         server
