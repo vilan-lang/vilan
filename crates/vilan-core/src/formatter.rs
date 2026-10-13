@@ -4117,6 +4117,27 @@ struct Printer<'src> {
     /// Set by [`Printer::end_attribute_line`], taken by
     /// [`Printer::begin_split_reprint`].
     head_start: Option<usize>,
+    /// E314: true while a call's arguments print in their INLINE attempt, and
+    /// while the operands of a binary chain of three or more print. A call met
+    /// there never breaks its own arguments: the outer construct (the call whose
+    /// inline attempt this is; the chain, which breaks at its operators) owns
+    /// the first refusal, which is what keeps every layout the formatter had
+    /// before argument lists could break.
+    arguments_blocked: bool,
+    /// E314: how many element-body holes (`{ … }`) enclose the expression being
+    /// printed. A call's arguments break one per line only inside one — outside
+    /// markup a call keeps its last-argument layout (the estate would move by
+    /// ~1,800 lines; filed as an owner question, not taken here).
+    hole_depth: usize,
+    /// E314: set by a split list just before it prints a tuple element that
+    /// must come apart because a sibling tuple did; taken by the tuple's arm.
+    tuple_forced: bool,
+    /// E314: how many element literals have fallen back to their split layout
+    /// because the LINE ran out (not because they hold several children). A
+    /// call's inline attempt reads the counter around each non-final argument:
+    /// an element cut mid-literal there is the overflow the argument list
+    /// breaks to answer, even when the first line stays inside the budget.
+    width_element_splits: usize,
 }
 
 /// `[resource]`, on a line of its own above the declaration like every other
@@ -4156,6 +4177,10 @@ impl<'src> Printer<'src> {
             atomic_elements: false,
             options,
             head_start: None,
+            arguments_blocked: false,
+            hole_depth: 0,
+            tuple_forced: false,
+            width_element_splits: 0,
         }
     }
 
@@ -6795,6 +6820,34 @@ impl<'src> Printer<'src> {
             .is_some_and(|argument| matches!(argument.0, Node::Closure(_)))
     }
 
+    /// Whether a chain's subject, printed inline where the printer stands, runs
+    /// the line out or has an element literal cut mid-literal inside it (E314).
+    /// A probe: the output, the comment cursor and the counters come back as
+    /// they were.
+    fn subject_needs_split(&mut self, subject: &Spanned<Node<'src>>) -> bool {
+        let start = self.out.len();
+        let cursor = self.cursor;
+        let declined = self.declined.clone();
+        let splits_before = self.width_element_splits;
+        let split = self.split;
+        self.print_postfix_subject(subject);
+        let needs = self.first_line_over_budget(start) || self.width_element_splits > splits_before;
+        self.out.truncate(start);
+        self.cursor = cursor;
+        self.declined = declined;
+        self.width_element_splits = splits_before;
+        self.split = split;
+        needs
+    }
+
+    /// Whether the chain's subject is a call that takes arguments (E314): the
+    /// shape whose first line can be run out by the SUBJECT's arguments, which
+    /// no link of its own can relieve.
+    fn has_call_subject(expr: &Spanned<Node<'src>>) -> bool {
+        let (subject, _) = Self::postfix_spine(expr);
+        matches!(&subject.0, Node::Call(_, _, arguments) if !arguments.0.is_empty())
+    }
+
     /// Whether a spine step is a `.name(…)` call link — the unit the split form
     /// gives its own line. Every other postfix (`.field`, `[i]`, `?`, `!`) glues
     /// to the segment printed before it.
@@ -6994,6 +7047,16 @@ impl<'src> Printer<'src> {
         // inline — a `.member`/`[index]` subject through the lift-wrapping rule,
         // a `?`/`!` subject through the plain operand rule.
         match &spine[0].0 {
+            // E314: a call subject whose own line runs out breaks its arguments
+            // one per line; the links then follow on lines of their own.
+            Node::MemberAccessor(_, _) | Node::Index(_, _)
+                if self.hole_depth > 0 && Self::has_call_subject(expr) =>
+            {
+                if self.subject_needs_split(subject) {
+                    self.split = Split::Tail;
+                }
+                self.print_postfix_subject(subject);
+            }
             Node::MemberAccessor(_, _) | Node::Index(_, _) => self.print_postfix_subject(subject),
             // A block-like form ascribed after its brace (B571 Q4) prints bare.
             Node::Ascribe(..) if crate::parsing::is_block_like(&subject.0) => {
@@ -7392,6 +7455,7 @@ impl<'src> Printer<'src> {
             }
             self.out.truncate(element_start);
             self.cursor = comment_cursor;
+            self.width_element_splits += 1;
         }
         self.print_element_split(body, &order);
     }
@@ -7490,8 +7554,14 @@ impl<'src> Printer<'src> {
             self.flush_element_comments(child_span.start, prev_end);
             self.line();
             let line_start = self.out.len();
+            let splits_before = self.width_element_splits;
             self.print_element_child(child);
-            if self.over_line_budget(line_start) {
+            // E314: a hole whose expression cut an element mid-literal asks for
+            // the permission too, though the first line it left stayed inside
+            // the budget.
+            let cut_inside_hole = matches!(child, crate::node::ElementChild::Hole(_))
+                && self.width_element_splits > splits_before;
+            if self.over_line_budget(line_start) || cut_inside_hole {
                 self.out.truncate(child_start);
                 self.cursor = child_cursor;
                 self.flush_element_comments(child_span.start, prev_end);
@@ -7536,7 +7606,14 @@ impl<'src> Printer<'src> {
         match child {
             crate::node::ElementChild::Hole(inner) => {
                 self.out.push('{');
+                // A hole is a formatting context of its own: an enclosing call's
+                // inline attempt does not forbid the calls inside it from
+                // breaking their arguments.
+                let blocked = std::mem::replace(&mut self.arguments_blocked, false);
+                self.hole_depth += 1;
                 self.print_expr(inner);
+                self.hole_depth -= 1;
+                self.arguments_blocked = blocked;
                 self.out.push('}');
             }
             crate::node::ElementChild::Bare(inner) => self.print_expr(inner),
@@ -7544,31 +7621,90 @@ impl<'src> Printer<'src> {
     }
 
     fn print_split_list(&mut self, elements: &[Spanned<Node<'src>>], open: usize) {
-        self.out.push('[');
+        self.print_split_elements(elements, open, ('[', ']'));
+    }
+
+    /// The split layout [`Self::print_split_list`] describes, over any bracket
+    /// pair — a tuple (E314) breaks the same way a list does.
+    fn print_split_elements(
+        &mut self,
+        elements: &[Spanned<Node<'src>>],
+        open: usize,
+        brackets: (char, char),
+    ) {
+        // E314: SIBLING tuples are laid out alike — when one of them has to
+        // come apart, every one does (a tuple is never cut open while its
+        // sibling stays whole), so the list is printed again with them forced.
+        let start = self.out.len();
+        let comment_cursor = self.cursor;
+        let mut broke_a_tuple = false;
+        self.print_split_elements_once(elements, open, brackets, false, &mut broke_a_tuple);
+        let tuples = elements
+            .iter()
+            .filter(|element| matches!(element.0, Node::Tuple(_)))
+            .count();
+        if broke_a_tuple && tuples > 1 {
+            self.out.truncate(start);
+            self.cursor = comment_cursor;
+            self.print_split_elements_once(elements, open, brackets, true, &mut broke_a_tuple);
+        }
+    }
+
+    fn print_split_elements_once(
+        &mut self,
+        elements: &[Spanned<Node<'src>>],
+        open: usize,
+        (opening, closing): (char, char),
+        tuples_forced: bool,
+        broke_a_tuple: &mut bool,
+    ) {
+        // A tuple expression takes no trailing comma (the grammar has none);
+        // a list does.
+        let comma_after = |at: usize| opening == '[' || at + 1 < elements.len();
+        self.out.push(opening);
         self.indent += 1;
         let mut prev_end = open;
-        for element in elements {
+        for (at, element) in elements.iter().enumerate() {
             let element_start = self.out.len();
             let comment_cursor = self.cursor;
+            let is_tuple = matches!(element.0, Node::Tuple(_));
             self.flush_element_comments(element.1.into_range().start, prev_end);
             prev_end = element.1.into_range().end;
             self.line();
             let line_start = self.out.len();
+            self.tuple_forced = tuples_forced && is_tuple;
             self.print_expr(element);
-            self.out.push(',');
+            if comma_after(at) {
+                self.out.push(',');
+            }
             if self.over_line_budget(line_start) {
                 self.out.truncate(element_start);
                 self.cursor = comment_cursor;
                 self.flush_element_comments(element.1.into_range().start, prev_end);
                 self.line();
                 self.split = Split::Tail;
+                self.tuple_forced = tuples_forced && is_tuple;
                 self.print_expr(element);
-                self.out.push(',');
+                if comma_after(at) {
+                    self.out.push(',');
+                }
+                if is_tuple && self.out[element_start..].contains('\n') {
+                    // Only a tuple that actually came apart counts.
+                    *broke_a_tuple |= self.tuple_came_apart(&self.out[element_start..]);
+                }
             }
         }
         self.indent -= 1;
         self.line();
-        self.out.push(']');
+        self.out.push(closing);
+    }
+
+    /// Whether a rendered tuple element (with its comma) was printed in split
+    /// form: its second line is an element line, not the closing paren of
+    /// something else — the text starts `(` and ends `),`.
+    fn tuple_came_apart(&self, rendered: &str) -> bool {
+        let trimmed = rendered.trim_start_matches(['\n', '\t']);
+        trimmed.starts_with("(\n") && trimmed.ends_with("),")
     }
 
     /// Prints a struct literal in split form: `{` closes the line that opened
@@ -7998,6 +8134,7 @@ impl<'src> Printer<'src> {
         precedence: u8,
         follows: bool,
     ) {
+        let blocked = std::mem::replace(&mut self.arguments_blocked, false);
         self.indent += 1;
         for (index, (operator, operand)) in operands.iter().enumerate() {
             if let Some(operator) = operator {
@@ -8033,6 +8170,7 @@ impl<'src> Printer<'src> {
             }
         }
         self.indent -= 1;
+        self.arguments_blocked = blocked;
     }
 
     /// Whether a member chain's last link is a CALL (`a.b()`, `a.b.c()`), so
@@ -8202,11 +8340,15 @@ impl<'src> Printer<'src> {
         arguments: &[Spanned<Node<'src>>],
         split: Split,
         head: Option<&[&Spanned<Node<'src>>]>,
-    ) {
+    ) -> (Vec<usize>, Option<usize>) {
+        let mut starts = Vec::with_capacity(arguments.len());
+        let mut cut = None;
         for (index, argument) in arguments.iter().enumerate() {
             if index > 0 {
                 self.out.push_str(", ");
             }
+            starts.push(self.out.len());
+            let splits_before = self.width_element_splits;
             // Either permission descends through the LAST argument
             // (`proposal/argument-tail-descent.md`). Only the last: R5 stands,
             // so an earlier argument that is the over-budget cause still leaves
@@ -8226,7 +8368,86 @@ impl<'src> Printer<'src> {
                 }
                 _ => self.print_expr(argument),
             }
+            // An element literal cut mid-literal inside an argument that is not
+            // the descent's own (the last, under a permission).
+            let descends = split != Split::Off && index + 1 == arguments.len();
+            if cut.is_none() && !descends && self.width_element_splits > splits_before {
+                cut = Some(index);
+            }
         }
+        (starts, cut)
+    }
+
+    /// The output offset where the FIRST line of the rendering containing `from`
+    /// passes [`LINE_BUDGET`], or `usize::MAX` when it never does. Names the
+    /// construct that ran the line out (E314).
+    fn budget_crossing(&self, from: usize) -> usize {
+        let line_start = self.out[..from]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let mut width = 0;
+        for (at, character) in self.out[line_start..].char_indices() {
+            if character == '\n' {
+                break;
+            }
+            width += if character == '\t' { TAB_COLUMNS } else { 1 };
+            if width > LINE_BUDGET {
+                return line_start + at;
+            }
+        }
+        usize::MAX
+    }
+
+    /// Whether the first argument line of a split argument list that began at
+    /// output offset `from` is over budget.
+    fn split_arguments_overflow(&self, from: usize) -> bool {
+        self.out[from..]
+            .split('\n')
+            .nth(1)
+            .is_some_and(|line| display_width(line) > LINE_BUDGET)
+    }
+
+    /// A call's arguments in split form (E314): `(` closes the line that opened
+    /// the call, every argument takes its own line one level in with a trailing
+    /// comma, and `)` returns to the call's indent. Each argument's line is
+    /// measured in turn, and over budget the argument rolls back and reprints
+    /// with [`Split::Tail`] armed, exactly as a split list's elements do.
+    /// `cause` is the argument that ran the inline line out: it breaks whether
+    /// or not its own line fits, so the construct that overflowed is the one
+    /// that opens up (a list literal breaks one element per line).
+    fn print_split_call_arguments(
+        &mut self,
+        arguments: &Spanned<Vec<Spanned<Node<'src>>>>,
+        cause: Option<usize>,
+    ) {
+        let blocked = std::mem::replace(&mut self.arguments_blocked, false);
+        self.indent += 1;
+        let mut prev_end = arguments.1.into_range().start;
+        for (index, argument) in arguments.0.iter().enumerate() {
+            let argument_start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.flush_element_comments(argument.1.into_range().start, prev_end);
+            self.line();
+            let line_start = self.out.len();
+            if cause == Some(index) {
+                self.split = Split::Tail;
+            }
+            self.print_expr(argument);
+            self.out.push(',');
+            if cause != Some(index) && self.over_line_budget(line_start) {
+                self.out.truncate(argument_start);
+                self.cursor = comment_cursor;
+                self.flush_element_comments(argument.1.into_range().start, prev_end);
+                self.line();
+                self.split = Split::Tail;
+                self.print_expr(argument);
+                self.out.push(',');
+            }
+            prev_end = argument.1.into_range().end;
+        }
+        self.indent -= 1;
+        self.line();
+        self.arguments_blocked = blocked;
     }
 
     /// If `expr`'s source span is an `i"..."` interpolated string — which the
@@ -8324,16 +8545,32 @@ impl<'src> Printer<'src> {
         // way — 105 columns with the closure broken — and takes the link's own
         // line, which is what finally gives the closure body somewhere to indent
         // into.
-        if split != Split::Off && call_links == 1 && Self::breaks_as_a_single_link(expr) {
-            let (_, spine) = Self::postfix_spine(expr);
+        if split != Split::Off
+            && call_links == 1
+            && (Self::breaks_as_a_single_link(expr)
+                || (self.hole_depth > 0 && Self::has_call_subject(expr)))
+        {
+            let (subject, spine) = Self::postfix_spine(expr);
             let start = self.out.len();
             let comment_cursor = self.cursor;
-            self.print_inline_chain(expr, &spine, split);
-            if !self.first_line_over_budget(start) {
-                return;
+            // E314: a call subject that is itself cut (over the budget, or an
+            // element in its arguments broken mid-literal) takes the split
+            // chain at once — its arguments break, the link follows below.
+            let subject_cut = self.hole_depth > 0
+                && Self::has_call_subject(expr)
+                && self.subject_needs_split(subject);
+            if !subject_cut {
+                // The link's own arguments do not break inside this attempt:
+                // the chain's split is the first refusal (E314).
+                let blocked = std::mem::replace(&mut self.arguments_blocked, true);
+                self.print_inline_chain(expr, &spine, split);
+                self.arguments_blocked = blocked;
+                if !self.first_line_over_budget(start) {
+                    return;
+                }
+                self.out.truncate(start);
+                self.cursor = comment_cursor;
             }
-            self.out.truncate(start);
-            self.cursor = comment_cursor;
             self.print_split_chain(expr);
             return;
         }
@@ -8413,6 +8650,7 @@ impl<'src> Printer<'src> {
                 self.out.push(']');
             }
             Node::Call(callee, generic_arguments, arguments) => {
+                let call_start = self.out.len();
                 // A call binds tighter than `.`, so `a.b(c)` parses as
                 // `a.(b(c))`. To call the *result* of a member access the
                 // callee must be parenthesized — `(a.b)(c)` — or it reparses wrong.
@@ -8457,8 +8695,41 @@ impl<'src> Printer<'src> {
                     .flatten()
                     .and_then(|first| self.sorted_condition_values(first));
                 self.out.push('(');
-                self.print_call_arguments(&arguments.0, split, head.as_deref());
+                let arguments_start = self.out.len();
+                let arguments_cursor = self.cursor;
+                let blocked = std::mem::replace(&mut self.arguments_blocked, true);
+                let (starts, cut) = self.print_call_arguments(&arguments.0, split, head.as_deref());
+                self.arguments_blocked = blocked;
                 self.out.push(')');
+                // E314: the last argument carries the inline descent, so an
+                // EARLIER argument that runs the line out used to leave the line
+                // long. When the first line is still over budget after the
+                // descent, the arguments take a line each instead.
+                if split != Split::Off
+                    && !blocked
+                    && self.hole_depth > 0
+                    && head.is_none()
+                    && !arguments.0.is_empty()
+                    && (cut.is_some() || self.first_line_over_budget(call_start))
+                {
+                    let crossing = self.budget_crossing(call_start);
+                    let cause = cut.or_else(|| starts.iter().rposition(|start| *start <= crossing));
+                    let inline_text = self.out[arguments_start..].to_string();
+                    let inline_cursor = self.cursor;
+                    self.out.truncate(arguments_start);
+                    self.cursor = arguments_cursor;
+                    self.print_split_call_arguments(arguments, cause);
+                    // A lone argument that is still too wide on a line of its
+                    // own gained nothing from the split (`pt("<a paragraph>")`):
+                    // the inline rendering stands.
+                    if arguments.0.len() == 1 && self.split_arguments_overflow(arguments_start) {
+                        self.out.truncate(arguments_start);
+                        self.out.push_str(&inline_text);
+                        self.cursor = inline_cursor;
+                    } else {
+                        self.out.push(')');
+                    }
+                }
             }
             Node::Binary(operator, left, right) => {
                 let follows = std::mem::take(&mut self.operand_follows_operator);
@@ -8466,6 +8737,14 @@ impl<'src> Printer<'src> {
                 let chain_start = self.out.len();
                 let chain_cursor = self.cursor;
                 let left_start = self.out.len();
+                // E314: a chain of three or more operands breaks at its own
+                // operators before any call among them breaks its arguments.
+                let blocked = self.arguments_blocked;
+                if split != Split::Off && !blocked {
+                    let mut operands = Vec::new();
+                    Self::flatten_binary_chain(expr, precedence, &mut operands);
+                    self.arguments_blocked = operands.len() >= 3;
+                }
                 self.print_left_operand(left, precedence, split, follows);
                 // A split that broke the left operand across lines continues
                 // here: the operator and the right operand take their own line
@@ -8484,6 +8763,7 @@ impl<'src> Printer<'src> {
                 self.out.push_str(binary_operator_symbol(*operator));
                 self.out.push(' ');
                 self.print_split_right(right, precedence + 1, split);
+                self.arguments_blocked = blocked;
                 if continued {
                     self.indent -= 1;
                 }
@@ -8847,9 +9127,26 @@ impl<'src> Printer<'src> {
                 self.out.push(']');
             }
             Node::Tuple(elements) => {
+                let forced = std::mem::take(&mut self.tuple_forced) && elements.len() >= 2;
+                let start = self.out.len();
+                let comment_cursor = self.cursor;
                 self.out.push('(');
                 self.print_expression_list(elements);
                 self.out.push(')');
+                // E314: a tuple slot that runs the line out takes the tuple
+                // apart, one element per line, so an element literal inside it
+                // splits whole at its own line rather than mid-line.
+                if forced
+                    || (split != Split::Off
+                        && self.hole_depth > 0
+                        && elements.len() >= 2
+                        && !self.probing
+                        && self.first_line_over_budget(start))
+                {
+                    self.out.truncate(start);
+                    self.cursor = comment_cursor;
+                    self.print_split_elements(elements, expr.1.into_range().start, ('(', ')'));
+                }
             }
             // B569: `x = 5` — a labelled tuple entry, spaced as a struct
             // literal's field.
@@ -18165,5 +18462,213 @@ mod comment_wrapping {
              so nothing was rewritten (`[fmt] wrap_comments`, and the formatter's own \
              safety net): `// the comment this would have rewritten`"
         );
+    }
+}
+
+#[cfg(test)]
+mod hole_call_layout {
+    //! E314: a long CALL inside an element-body hole. The arguments take a
+    //! line each with a trailing comma and the `)` at the hole's indent; a list
+    //! literal's tuples come apart together, never one cut open while its
+    //! sibling stays whole; an element literal is never cut mid-literal because
+    //! the line ran out; the chain link after a call that broke goes on its own
+    //! line one level under the hole's indent, the `css { .. }` operand keeping
+    //! its block layout. Outside markup a call keeps its last-argument layout
+    //! (the estate would move by ~1,800 lines; an owner question).
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+    use super::format;
+
+    /// The kolt `prefs.vl` shape (rules 1-5): arguments one per line, the list
+    /// one tuple per line with each element literal whole, `)` at the hole's
+    /// indent, the `.styled(..)` link on its own line one level under it.
+    #[test]
+    fn a_long_call_in_a_hole_breaks_one_argument_per_line() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t<div .styled(css { .ghost(); })>\"Sidebar visibility\"</div>\n\
+             \t\t{select_component(\"sidebar_collapsed\", ListCell::of([(<span>\"Shown\"</span>, false), (<span>\"Hidden\"</span>, true)]), get_prefs().sidebar_collapsed.commit_signal()).styled(const button_style(Theme::primary_a()) + css {\n\
+             \t\t\tappearance(\"none\");\n\
+             \t\t\twidth(size(32));\n\
+             \t\t\t.paint_ink1();\n\
+             \t\t})}\n\
+             \t</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t<div .styled(css { .ghost(); })>\"Sidebar visibility\"</div>\n\
+             \t\t{select_component(\n\
+             \t\t\t\"sidebar_collapsed\",\n\
+             \t\t\tListCell::of([\n\
+             \t\t\t\t(<span>\"Shown\"</span>, false),\n\
+             \t\t\t\t(<span>\"Hidden\"</span>, true),\n\
+             \t\t\t]),\n\
+             \t\t\tget_prefs().sidebar_collapsed.commit_signal(),\n\
+             \t\t)\n\
+             \t\t\t.styled(const button_style(Theme::primary_a()) + css {\n\
+             \t\t\t\tappearance(\"none\");\n\
+             \t\t\t\twidth(size(32));\n\
+             \t\t\t\t.paint_ink1();\n\
+             \t\t\t})}\n\
+             \t</div>\n\
+             }\n",
+        );
+    }
+
+    /// A call in a hole that fits the line stays inline.
+    #[test]
+    fn a_hole_call_that_fits_the_line_stays_inline() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{select_component(\"sidebar\", ListCell::of([(<span>\"Shown\"</span>, false)]), sig())}\n\
+             \t\t{pick(\"a\", [(<b>\"x\"</b>, 1), (<b>\"y\"</b>, 2)]).styled(button)}\n\
+             \t</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{select_component(\"sidebar\", ListCell::of([(<span>\"Shown\"</span>, false)]), sig())}\n\
+             \t\t{pick(\"a\", [(<b>\"x\"</b>, 1), (<b>\"y\"</b>, 2)]).styled(button)}\n\
+             \t</div>\n\
+             }\n",
+        );
+    }
+
+    /// When only the chain link pushes the line over, the link takes its own line
+    /// and the call keeps its arguments inline.
+    #[test]
+    fn a_link_that_only_just_overflows_takes_its_own_line_and_no_argument_breaks() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{select_component(\"sidebar\", ListCell::of([(<span>\"Shown\"</span>, false)]), sig()).styled(button)}\n\
+             \t\t{pick(\"a\", [(<b>\"x\"</b>, 1), (<b>\"y\"</b>, 2)])}\n\
+             \t</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{select_component(\"sidebar\", ListCell::of([(<span>\"Shown\"</span>, false)]), sig())\n\
+             \t\t\t.styled(button)}\n\
+             \t\t{pick(\"a\", [(<b>\"x\"</b>, 1), (<b>\"y\"</b>, 2)])}\n\
+             \t</div>\n\
+             }\n",
+        );
+    }
+
+    /// Not a chain: the call alone breaks its arguments.
+    #[test]
+    fn a_plain_long_call_in_a_hole_breaks_without_a_chain() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{install_row(\"macOS / Linux\", \"curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh\", copy)}\n\
+             \t</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{install_row(\n\
+             \t\t\t\"macOS / Linux\",\n\
+             \t\t\t\"curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh\",\n\
+             \t\t\tcopy,\n\
+             \t\t)}\n\
+             \t</div>\n\
+             }\n",
+        );
+    }
+
+    /// Siblings alike: when one tuple has to come apart, its sibling does too.
+    #[test]
+    fn sibling_tuples_come_apart_together() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{pick(\"a\", ListCell::of([(<span>\"Shown\"</span>, false), (<span>\"Hidden with a label that is quite a bit longer than its sibling,\"</span>, true)]), more())}\n\
+             \t</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{pick(\n\
+             \t\t\t\"a\",\n\
+             \t\t\tListCell::of([\n\
+             \t\t\t\t(\n\
+             \t\t\t\t\t<span>\"Shown\"</span>,\n\
+             \t\t\t\t\tfalse\n\
+             \t\t\t\t),\n\
+             \t\t\t\t(\n\
+             \t\t\t\t\t<span>\"Hidden with a label that is quite a bit longer than its sibling,\"</span>,\n\
+             \t\t\t\t\ttrue\n\
+             \t\t\t\t),\n\
+             \t\t\t]),\n\
+             \t\t\tmore(),\n\
+             \t\t)}\n\
+             \t</div>\n\
+             }\n",
+        );
+    }
+
+    /// A comment among the arguments attaches above the argument it precedes.
+    #[test]
+    fn a_comment_between_arguments_attaches_to_the_next_argument() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{select_component(\"sidebar_collapsed_with_a_long_name\", ListCell::of([(<span>\"Shown\"</span>, false), (<span>\"Hidden\"</span>, true)]), // note\n\
+             \t\tget_prefs().sidebar_collapsed.commit_signal())}\n\
+             \t</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t{select_component(\n\
+             \t\t\t\"sidebar_collapsed_with_a_long_name\",\n\
+             \t\t\tListCell::of([\n\
+             \t\t\t\t(<span>\"Shown\"</span>, false),\n\
+             \t\t\t\t(<span>\"Hidden\"</span>, true),\n\
+             \t\t\t]),\n\
+             \t\t\t// note\n\
+             \t\t\tget_prefs().sidebar_collapsed.commit_signal(),\n\
+             \t\t)}\n\
+             \t</div>\n\
+             }\n",
+        );
+    }
+
+    /// A lone argument that is still too wide on a line of its own gains nothing
+    /// from the split: the call stays as written.
+    #[test]
+    fn a_lone_wide_argument_does_not_split() {
+        let source = "fun demo(): View {\n\t<div>\n\t\t{pt(\"A single long string argument that cannot fit on any line whatsoever, it is just far far far too wide for the budget\")}\n\t</div>\n}\n";
+        assert_over_budget(source.lines().nth(2).unwrap().trim());
+        assert_construct(source, source);
+    }
+
+    /// Outside markup the same call keeps today's layout: breaking a call's
+    /// arguments is the hole's alone (`a_single_link_and_a_plain_long_call_stay_inline`).
+    #[test]
+    fn the_same_call_outside_markup_stays_inline() {
+        let source = "fun demo() {\n\tlet picked = select_component(\"sidebar_collapsed\", ListCell::of([(1, false), (2, true), (3, true)]), get_prefs().sidebar_collapsed.commit_signal());\n}\n";
+        assert_over_budget(source.lines().nth(1).unwrap().trim());
+        assert_construct(source, source);
+    }
+
+    /// No element literal is cut with its open tag on one line and its text on
+    /// the next because the LINE ran out, and formatting the result again changes
+    /// nothing.
+    #[test]
+    fn no_element_is_cut_mid_literal_and_the_layout_is_a_fixed_point() {
+        let once = format(
+            "fun demo(): View {\n\
+             \t<div>\n\
+             \t\t<div .styled(css { .ghost(); })>\"Sidebar visibility\"</div>\n\
+             \t\t{select_component(\"sidebar_collapsed\", ListCell::of([(<span>\"Shown\"</span>, false), (<span>\"Hidden\"</span>, true)]), get_prefs().sidebar_collapsed.commit_signal()).styled(const button_style(Theme::primary_a()) + css {\n\
+             \t\t\tappearance(\"none\");\n\
+             \t\t\twidth(size(32));\n\
+             \t\t\t.paint_ink1();\n\
+             \t\t})}\n\
+             \t</div>\n\
+             }\n",
+        );
+        assert!(!once.contains("<span>\n"), "{once}");
+        assert_eq!(format(&once), once);
     }
 }
