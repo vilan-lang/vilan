@@ -3887,6 +3887,11 @@ impl Document {
                 ));
             }
         }
+        // E306: an enum VARIANT in value position (`style::Overflow::Hidden`,
+        // `Shape::Circle(1.0)`'s head): the variant line and the enum's chunk.
+        if let Some(rendered) = self.variant_value_hover(program, id) {
+            return Some(rendered);
+        }
         // A struct/enum name in value position (a constructor, a variant).
         if let Some(definition) = self.type_declaration_target(program, id)
             && let Some(declaration) = program.declaration_labels.get(&definition)
@@ -4445,6 +4450,61 @@ impl Document {
                 .and_then(|text| text.get(span.into_range()).map(|word| word == name))
                 .unwrap_or(false)
         })
+    }
+
+    /// E306: the hover for an enum VARIANT named in value position — the
+    /// variant line as E241 spells a pattern's (`Overflow::Hidden`, the
+    /// value's own type before the `::` where it has arguments,
+    /// `Option<i32>::None`), the variant's `///`, and the enum's chunk (the
+    /// value type's E237 block, else the enum's declaration) — the way a
+    /// struct constructor hovers with its declaration. It answered the bare
+    /// `enum Overflow`. `None` for anything that is not a variant reference.
+    fn variant_value_hover(&self, program: &Program, id: Id) -> Option<String> {
+        let target = match program.entity_map.get(&id)? {
+            Expr::Local(target) => *target,
+            Expr::EnumVariant(..) => id,
+            _ => return None,
+        };
+        let Some(Expr::EnumVariant(enum_id, index)) = program.entity_map.get(&target) else {
+            return None;
+        };
+        let enumeration = program.enums.get(enum_id)?;
+        let variant = enumeration.variants.get(*index)?;
+        let head = program
+            .expr_types
+            .get(&id)
+            .filter(|label| label.starts_with(enumeration.name) && !label.contains("Unknown"))
+            .cloned()
+            .unwrap_or_else(|| enumeration.name.to_string());
+        let mut line = format!("{head}::{}", variant.name);
+        // The payload as declared, where the enum has no parameters to
+        // substitute (a generic one's instantiation is the head's).
+        if enumeration.generic_parameter_constraint_ids.is_empty()
+            && let Some(declared) = program.declaration_labels.get(enum_id).and_then(|label| {
+                label.lines().map(str::trim).find(|row| {
+                    row.strip_prefix(variant.name)
+                        .is_some_and(|rest| rest.starts_with('('))
+                })
+            })
+        {
+            line = format!("{head}::{}", declared.trim_end_matches(','));
+        }
+        let mut out = HoverBlocks::new();
+        out.push_some(Block::Diagnostic, internal_lead(program, target));
+        out.push_code(Block::Signature, &line);
+        out.push_some(Block::Doc, self.analysis(program).doc_comment_of(target));
+        let chunk = program
+            .expr_type_ids
+            .get(&id)
+            .and_then(|type_id| definition_paragraph(program, *type_id))
+            .or_else(|| {
+                program
+                    .declaration_labels
+                    .get(enum_id)
+                    .map(|declaration| format!("```vilan\n{declaration}\n```"))
+            });
+        out.push_some(Block::Preview, chunk);
+        out.rendered()
     }
 
     /// E298: the origin root (`pkg`, `std`, a dependency) whose name is the

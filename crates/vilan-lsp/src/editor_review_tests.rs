@@ -1286,3 +1286,141 @@ fn e312_a_refused_derive_leads_with_the_refusal() {
         assert!(hover.contains("impl Hook with PartialEq"), "{hover}");
     });
 }
+
+/// E306: an enum variant in VALUE position — kolt `views.vl:218:32`'s
+/// `style::Overflow::Hidden` inside a `const` chain is the first pin —
+/// hovers with its variant line and the enum's chunk; a payload variant and a
+/// generic enum's variant likewise; and the enum-typed bindings E237's table
+/// missed in a view (a call's result, a parameter, a capture, a `mut`)
+/// carry the chunk.
+#[test]
+fn e306_a_variant_in_value_position_hovers_with_its_enum() {
+    on_big_stack(|| {
+        let shapes = "import std::web::style::Style;\n\n\
+             /// How a shape is drawn.\nexport enum Shape {\n\t/// A round one.\n\tCircle(f64),\n\tEmpty,\n}\n\n\
+             export fun styled(): Style {\n\tconst style::style()\n\t\t.overflow(style::Overflow::Hidden)\n}\n\n\
+             export fun made(): Shape {\n\tShape::Circle(1.0)\n}\n\n\
+             export fun area(shape: Shape): f64 {\n\tmut current = made();\n\tcurrent = shape;\n\
+             \tlet maybe = Some(current);\n\tmatch maybe {\n\t\tSome(let inner) => {\n\t\t\tlet _ = inner;\n\t\t\t1.0\n\t\t}\n\t\tNone => 0.0,\n\t}\n}\n\n\
+             export fun nothing(): Option<i32> {\n\tNone\n}\n";
+        let client = "import pkg::shapes::{ area, made, nothing, styled };\n\n\
+             fun main() {\n\tlet _ = styled();\n\tlet _ = area(made());\n\tlet _ = nothing();\n}\n";
+        let package = Package::new("e306", &[("client.vl", client), ("shapes.vl", shapes)]);
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let view = package.view(&world, "shapes.vl");
+        let hover = |needle: &str, delta: usize| {
+            view.hover(at(shapes, needle, delta))
+                .unwrap_or_else(|| panic!("{needle:?}+{delta} hovers"))
+        };
+        let hidden = hover("Hidden)", 0);
+        assert!(
+            hidden.starts_with("```vilan\nOverflow::Hidden\n```"),
+            "{hidden}"
+        );
+        assert!(
+            hidden.contains("enum Overflow {\n\tVisible,\n\tHidden,"),
+            "{hidden}"
+        );
+        let circle = hover("Circle(1.0)", 0);
+        assert!(
+            circle.starts_with("```vilan\nShape::Circle(f64)\n```\n\nA round one."),
+            "{circle}"
+        );
+        assert!(circle.contains("enum Shape {"), "{circle}");
+        let none = hover("None\n}", 0);
+        // A generic enum's variant: its instantiation where the value's type
+        // was tabled, the bare enum where not (a returned `None`), and the
+        // enum's chunk either way.
+        assert!(
+            none.starts_with("```vilan\nOption") && none.contains("::None\n```"),
+            "{none}"
+        );
+        assert!(none.contains("enum Option<T> {"), "{none}");
+        // The bindings: a parameter, a `mut` from a call, a capture.
+        for (needle, delta) in [("shape: Shape", 0), ("current = made", 0), ("inner) =>", 0)] {
+            let binding = hover(needle, delta);
+            assert!(binding.contains("enum Shape {"), "{needle}: {binding}");
+        }
+    });
+}
+
+/// E306's kolt sweep: every enum-typed binding and parameter of kolt's own
+/// files, served as views, hovers with its enum's chunk.
+#[test]
+#[ignore = "E306: the kolt enum-binding sweep - needs VILAN_EDITOR_KOLT, run deliberately"]
+fn kolt_every_enum_binding_hovers_with_its_chunk() {
+    let Some(root) = std::env::var_os("VILAN_EDITOR_KOLT").map(PathBuf::from) else {
+        return;
+    };
+    on_big_stack(move || {
+        let entry = root.join("src/client.vl");
+        let entry_text = std::fs::read_to_string(&entry).expect("kolt's client entry");
+        let world = Document::analyze(&entry_text, &std_root(), &entry);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(root.join("src"))
+            .expect("kolt's src")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        files.sort();
+        let (mut checked, mut missing) = (0, Vec::new());
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("a kolt file");
+            let view;
+            let document = if path == entry {
+                &world
+            } else {
+                match Document::view_of(&world, &root, &path, &text, Vec::new()) {
+                    Some(served) => {
+                        view = served;
+                        &view
+                    }
+                    None => continue,
+                }
+            };
+            let program = document.program.as_ref().expect("a program");
+            let source_of = program.source_lookup();
+            let bindings = program
+                .variables
+                .iter()
+                .map(|(id, variable)| (*id, variable.name_span, variable.type_id))
+                .chain(program.parameters.iter().filter_map(|(id, parameter)| {
+                    program
+                        .span_map
+                        .get(id)
+                        .map(|span| (*id, **span, parameter.type_id))
+                }));
+            for (id, span, type_id) in bindings {
+                if source_of.of(id) != Some(document.focus) || span.start >= span.end {
+                    continue;
+                }
+                let Some(vilan_core::type_::Type::Enum(enum_id, _)) =
+                    program.type_id_to_type_map.get(&type_id)
+                else {
+                    continue;
+                };
+                // `bool` is an enum underneath, and hovers as the primitive.
+                if program.bool_enum_id == Some(*enum_id)
+                    || program
+                        .enums
+                        .get(enum_id)
+                        .is_none_or(|enumeration| enumeration.variants.is_empty())
+                {
+                    continue;
+                }
+                checked += 1;
+                let hover = document.hover(span.start).unwrap_or_default();
+                if !hover.contains("enum ") {
+                    let line = text[..span.start].matches('\n').count() + 1;
+                    missing.push(format!(
+                        "{}:{line} {:?}: {hover:?}",
+                        path.display(),
+                        &text[span.into_range()]
+                    ));
+                }
+            }
+        }
+        println!("E306 sweep: {checked} enum-typed bindings checked");
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+    });
+}
