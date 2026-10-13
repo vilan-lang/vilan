@@ -94,6 +94,48 @@ pub fn fingerprinting() -> bool {
     mode() != Mode::Off
 }
 
+// --- std-prefix P1: the in-process std-only prefix ---------------------------
+
+/// 0 = read the environment; 1 = off; 2 = on.
+static STD_PREFIX_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether a cacheable analysis builds over the in-process STD-ONLY PREFIX
+/// (`std-prefix.md` §4.2–4.4, P1): a world holding std alone, keyed by the std
+/// module closure rather than by the package, with every package module walked
+/// over it the way M110 S1 walks a hot set. [`set_std_prefix`]'s override, else
+/// `VILAN_STD_PREFIX=on` (read once). Off by default in P1 — the language
+/// server's adoption is P2 — and always off under `VILAN_HASH_SHUFFLE` and in
+/// a canonical [`clean_analysis`] (Q11: the differentials compare a prefixed
+/// analysis against a clean one, which must not read it).
+pub fn std_prefix() -> bool {
+    let wanted = match STD_PREFIX_OVERRIDE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static FROM_ENV: OnceLock<bool> = OnceLock::new();
+            *FROM_ENV.get_or_init(|| {
+                matches!(std::env::var("VILAN_STD_PREFIX").as_deref(), Ok("on" | "1"))
+            })
+        }
+    };
+    // A clean analysis that keeps the hot-set SHAPE builds the prefix's shape
+    // too (without reading or writing the cache): the differential compares
+    // emitted JS against it.
+    wanted && (!clean_requested() || clean_keeps_hot_shape()) && !crate::fx::shuffling()
+}
+
+/// Overrides `VILAN_STD_PREFIX` for this process (`None` restores it) — the
+/// test surface.
+#[doc(hidden)]
+pub fn set_std_prefix(on: Option<bool>) {
+    let value = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    STD_PREFIX_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
 // --- Q3: the clean analysis -------------------------------------------------
 
 /// What a clean analysis on this thread keeps of the incremental machinery.
@@ -336,6 +378,15 @@ pub struct Census {
     pub item_records_served: u64,
     pub item_records_stale: u64,
     pub item_records_filed: u64,
+    /// std-prefix P1: whether this analysis's world was built over (or as) the
+    /// std-only prefix, the prefix worlds the base cache SERVED it, and the
+    /// times the prefix was REFUSED (the canonical analysis built instead),
+    /// with the last refusal's reason — `dependencies`, `package-prelude`,
+    /// `reaches-the-entry`, `defines-a-macro`, `impl-reached`, ….
+    pub prefix_world: bool,
+    pub prefix_hits: u64,
+    pub prefix_refusals: u64,
+    pub prefix_refusal: Option<&'static str>,
 }
 
 thread_local! {
@@ -369,6 +420,10 @@ thread_local! {
             item_records_served: 0,
             item_records_stale: 0,
             item_records_filed: 0,
+            prefix_world: false,
+            prefix_hits: 0,
+            prefix_refusals: 0,
+            prefix_refusal: None,
         })
     };
 }
@@ -696,10 +751,13 @@ pub fn report(program: &Program) {
         };
         eprintln!(
             "[vilan phase] hot-set {hot_set} interface-moved {interfaces} global-moved {global} \
-             unknown-interfaces {unknown} hot-world {} hot-refusal {} resolve-deferred {}",
+             unknown-interfaces {unknown} hot-world {} hot-refusal {} resolve-deferred {} \
+             prefix-world {} prefix-refusal {}",
             u8::from(census.hot_world),
             census.hot_refusal.unwrap_or("-"),
             u8::from(census.resolve_deferred),
+            u8::from(census.prefix_world),
+            census.prefix_refusal.unwrap_or("-"),
         );
         if let Some((_, Some((_, moved)))) = &movement
             && !moved.is_empty()
@@ -726,7 +784,8 @@ pub fn report(program: &Program) {
              bound-sites-checked={} graphs-replayed={} context-log-replayed={} \
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
-             records-served={} records-stale={} records-filed={}",
+             records-served={} records-stale={} records-filed={} prefix-world={} \
+             prefix-hits={} prefix-refusals={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -751,6 +810,9 @@ pub fn report(program: &Program) {
             census.item_records_served,
             census.item_records_stale,
             census.item_records_filed,
+            u8::from(census.prefix_world),
+            census.prefix_hits,
+            census.prefix_refusals,
         );
     }
 }

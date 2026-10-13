@@ -158,7 +158,7 @@ pub fn enable_seed_shuffle() {
 
 /// Whether new tables get a per-table seed.
 #[inline]
-fn shuffling() -> bool {
+pub(crate) fn shuffling() -> bool {
     FORCED_SHUFFLE.load(Ordering::Relaxed)
         || *ENV_SHUFFLE
             .get_or_init(|| std::env::var("VILAN_HASH_SHUFFLE").is_ok_and(|value| value != "0"))
