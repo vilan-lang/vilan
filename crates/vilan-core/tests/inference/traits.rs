@@ -10195,3 +10195,46 @@ fn b609_an_unrelated_element_bound_still_owes_the_supertrait_member() {
         "does not implement trait 'Loud': missing 'shown'",
     );
 }
+
+// --- E295: a blanket's static named on a head its bound does not admit ---
+
+/// E295: `i32::tag(1)` over `impl type T: Leaf with Tag` said only "cannot
+/// find 'tag' in i32". It names the blanket that provides `tag` and the bound
+/// `i32` misses — of two bounds, only the missing one.
+#[test]
+fn e295_a_blankets_static_on_an_unadmitted_head_names_the_missing_bound() {
+    assert_fails_once_with(
+        r#"
+        trait Leaf {}
+        trait Tag {
+            fun tag(value: i32): str;
+        }
+        impl type T: Leaf with Tag {
+            fun tag(value: i32): str { "tag" }
+        }
+        fun main() {
+            let _t = i32::tag(1);
+        }
+        "#,
+        "cannot find 'tag' in i32; `tag` is provided by `impl type T: Leaf with Tag`, and \
+         `i32` does not implement `Leaf`",
+    );
+    assert_fails_once_with(
+        r#"
+        trait Leaf {}
+        trait Named {}
+        trait Tag {
+            fun tag(value: i32): str;
+        }
+        impl i32 with Named {}
+        impl type T: Leaf + Named with Tag {
+            fun tag(value: i32): str { "tag" }
+        }
+        fun main() {
+            let _t = i32::tag(1);
+        }
+        "#,
+        "`tag` is provided by `impl type T: Leaf + Named with Tag`, and `i32` does not \
+         implement `Leaf`",
+    );
+}

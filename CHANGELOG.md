@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**E295: a blanket's static named on a head its bound does not admit says which bound — `i32::tag(1)` over `impl type T: Leaf with Tag` read only "cannot find 'tag' in i32"; it now continues "; `tag` is provided by `impl type T: Leaf with Tag`, and `i32` does not implement `Leaf`" (of several bounds, the missing ones).** After B595 a head the bound admits resolves (`str::tag(1)`); the candidate scan dropped the blanket by its bound for any other, and the refusal said nothing of it. Pin: `traits::e295_a_blankets_static_on_an_unadmitted_head_names_the_missing_bound`. Tracker E295.
+
+---
+
+<!-- family: diagnostics -->
 **B608: a `Type::member` path that names a trait method steers to the traits the calling file reaches — `List::describe([1, 2])` in a file importing only `pkg::describe::Describe` read "'Wire' and 'Describe' provide it; call 'Wire::describe(..)' or 'Describe::describe(..)'", naming std's `Wire`, which the file does not reach.** B598 narrowed a METHOD call's trait candidates by the calling file's reach (B515's rule); the static path's refusal now applies the same narrowing to the traits it names (`traits_reached_at`) — a trait reached through its declaring file or through the file providing a candidate. A file reaching every provider, or none of them, keeps every name. Pins: `modules::b608_a_static_paths_steer_names_only_the_traits_the_file_reaches`, `modules::b608_a_file_reaching_both_names_both_and_one_importing_neither_names_wire`. Tracker B608.
 
 ---

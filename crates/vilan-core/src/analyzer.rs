@@ -61606,6 +61606,69 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E295: the tail of a static path's not-found refusal when a BLANKET
+    /// (`impl type T: Leaf with Tag`) declares the member and its binder's
+    /// bound does not admit the head the path names: "; `tag` is provided by
+    /// `impl type T: Leaf with Tag`, and `i32` does not implement `Leaf`".
+    /// `None` when no such blanket declares it (B595 resolves a head the
+    /// bound admits; this only explains one it does not).
+    fn blanket_static_bound_note(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<String> {
+        let subject_label = self.pretty_print_type(subject_type, &HashMap::default());
+        let blankets: Vec<(TypeId, Vec<Id>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| implementation.declarations.contains_key(member_name))
+            .filter_map(
+                |implementation| match implementation.subject.get_type(self) {
+                    Type::Generic(binder) => Some((binder, implementation.trait_ids.clone())),
+                    _ => None,
+                },
+            )
+            .collect();
+        for (binder, trait_ids) in blankets {
+            let bounds = self.generic_bound_traits(binder);
+            let mut written: Vec<String> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            for (trait_id, arguments) in &bounds {
+                let Some(label) = self.bound_trait_label(*trait_id, arguments) else {
+                    continue;
+                };
+                if !self.type_implements_trait(subject_type, *trait_id) {
+                    missing.push(format!("`{label}`"));
+                }
+                written.push(label);
+            }
+            if missing.is_empty() {
+                continue;
+            }
+            let binder_name = self
+                .generic_constraint_names
+                .get(&binder)
+                .copied()
+                .unwrap_or("T");
+            let implemented: Vec<String> = trait_ids
+                .iter()
+                .filter_map(|trait_id| {
+                    self.traits
+                        .get(trait_id)
+                        .map(|trait_| trait_.name.to_string())
+                })
+                .collect();
+            return Some(format!(
+                "; `{member_name}` is provided by `impl type {binder_name}: {} with {}`, and \
+                 `{subject_label}` does not implement {}",
+                written.join(" + "),
+                implemented.join(" + "),
+                join_with(&missing, "and"),
+            ));
+        }
+        None
+    }
+
     fn check_trait_method_scope(&mut self, global_scope_id: Id) {
         let reached = self.trait_reach_by_file(global_scope_id, None);
         if reached.is_empty() {
@@ -67627,6 +67690,14 @@ impl<'src> Analyzer<'src> {
                                      '{member_name}' in the impl for '{subject_str}' to \
                                      override it"
                                 ))
+                            })
+                            .or_else(|| {
+                                // E295: a BLANKET provides it, and its bound
+                                // does not admit this head — say which.
+                                if subject_is_trait {
+                                    return None;
+                                }
+                                self.blanket_static_bound_note(&subject_type, member_name)
                             })
                             .unwrap_or_default();
                             self.push_anchored(
