@@ -22,8 +22,13 @@
 //! The level is the owner's (debug-50's measurement, ruled for Order 51):
 //! statements, calls, closures and function heads — where a breakpoint
 //! binds and a frame reports — and not every expression. `sourcesContent`
-//! carries the user's files only; a std source is named by its path in the
-//! std cache and listed in `ignoreList`, so "step into" skips it.
+//! carries the user's files only, each up to [`SOURCES_CONTENT_CAP`] (a
+//! larger one — kolt's generated icon table — goes by its path, debug-51's
+//! Q1); a std source is named by its path in the std cache and listed in
+//! `ignoreList`, so "step into" skips it. The runtime helpers the script
+//! opens with (`__at`, `__panic`, …) are one more source, synthetic
+//! ([`RUNTIME_SOURCE`]): their own text, ignore-listed, so a frame inside
+//! one names it and "step into" passes over it (E257 S6).
 //!
 //! [`js::Node::Mark`]: crate::transformer::js::Node::Mark
 //! [`js::Node::At`]: crate::transformer::js::Node::At
@@ -43,6 +48,20 @@ pub(crate) const MARK: char = '\u{FDD0}';
 
 /// [`MARK`] as the text the printer writes.
 pub(crate) const MARK_TEXT: &str = "\u{FDD0}";
+
+/// The largest user file a map carries in `sourcesContent` (debug-51's Q1,
+/// ruled as recommended): past it the file goes by its path, relative to the
+/// map, which a local debugger reads from disk. A hand-written module is far
+/// below it; what crosses it is generated (kolt's `src/lucide/lib.vl`, 636 KB,
+/// made its client's map 978 KB against a 590 KB script).
+pub const SOURCES_CONTENT_CAP: usize = 256 * 1024;
+
+/// The synthetic source the runtime helpers map into (E257 S6): the helper
+/// text the script opens with, carried in `sourcesContent` line for line and
+/// listed in `ignoreList`. Not a file — a debugger shows the carried text, and
+/// node's `--enable-source-maps` names a helper's frame by it
+/// (`at __panic (vilan:///runtime.js:3:8)`).
+pub const RUNTIME_SOURCE: &str = "vilan:///runtime.js";
 
 /// What a mark stands for, which decides where in the entity's span the
 /// map points.
@@ -80,14 +99,18 @@ pub struct SourceMap {
 /// One source the map points into.
 #[derive(Clone, Debug)]
 pub struct MapSource {
-    /// The file, as the build read it (canonical where it exists).
+    /// The file, as the build read it (canonical where it exists); empty for
+    /// a synthetic source, which `url` names instead.
     pub path: PathBuf,
-    /// The file's text — the user's own files. `None` for std, which a
-    /// debugger reads from `path` in the std cache (the owner's ruling on
-    /// debug-50's measurement: std is 1.85 MB against kolt's 184 KB).
+    /// A synthetic source's URL, written as it is: [`RUNTIME_SOURCE`].
+    pub url: Option<&'static str>,
+    /// The file's text — the user's own files up to [`SOURCES_CONTENT_CAP`],
+    /// and the runtime's. `None` for std, which a debugger reads from `path`
+    /// in the std cache (the owner's ruling on debug-50's measurement: std is
+    /// 1.85 MB against kolt's 184 KB), and for a user file past the cap.
     pub content: Option<String>,
-    /// std: listed in `ignoreList`, so a debugger's "step into" stays in
-    /// the user's code.
+    /// std and the runtime: listed in `ignoreList`, so a debugger's "step
+    /// into" stays in the user's code.
     pub ignored: bool,
 }
 
@@ -109,10 +132,15 @@ pub struct MapSource {
 /// mark it did not record (or the reverse) is a compiler bug, and the map
 /// then stops at the first unpaired character rather than pairing the rest
 /// wrongly.
+///
+/// `runtime` is the byte range of the runtime helpers' text in `text`, when
+/// the script carries any: the prelude, ahead of every mark. Each of its
+/// lines maps to the same line of [`RUNTIME_SOURCE`].
 pub(crate) fn strip_marks(
     program: &Program,
     text: &str,
     marks: &[SourceMark],
+    runtime: Option<std::ops::Range<usize>>,
 ) -> (String, SourceMap) {
     let mut clean = String::with_capacity(text.len());
     let mut placed: Vec<(Position, SourceMark)> = Vec::with_capacity(marks.len());
@@ -137,6 +165,19 @@ pub(crate) fn strip_marks(
     );
     let originals = locate(program, &placed);
     let mut writer = MapWriter::new(program);
+    // The prelude comes before the first mark, so its segments come first in
+    // generated order, as `mappings` must list them.
+    if let Some(range) = runtime
+        && let Some(helpers) = text.get(range.clone())
+        && !helpers.is_empty()
+    {
+        debug_assert!(
+            !text[..range.end].contains(MARK),
+            "the runtime prelude precedes every mark (E257 S6)"
+        );
+        let (first_line, _) = line_breaks(&text.as_bytes()[..range.start]);
+        writer.runtime(first_line, helpers);
+    }
     for ((generated, mark), original) in placed.iter().zip(originals) {
         if let Some(original) = original {
             writer.segment(*generated, *mark, original);
@@ -327,6 +368,41 @@ impl<'program, 'src> MapWriter<'program, 'src> {
                 .map(|function| self.name_slot(function.name)),
             _ => None,
         };
+        self.write(generated, source, original.line, original.column, name);
+    }
+
+    /// The runtime helpers' text, starting on generated line `first_line`:
+    /// one source of its own, and each non-empty line mapped at its start to
+    /// the same line of it.
+    fn runtime(&mut self, first_line: u32, helpers: &str) {
+        self.map.sources.push(MapSource {
+            path: PathBuf::new(),
+            url: Some(RUNTIME_SOURCE),
+            content: Some(helpers.to_string()),
+            ignored: true,
+        });
+        let source = (self.map.sources.len() - 1) as u32;
+        for (index, line) in helpers.split('\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let generated = Position {
+                line: first_line + index as u32,
+                column: 0,
+            };
+            self.write(generated, source, index as u32, 0, None);
+        }
+    }
+
+    /// One segment, each field relative to the one before it.
+    fn write(
+        &mut self,
+        generated: Position,
+        source: u32,
+        original_line: u32,
+        original_column: u32,
+        name: Option<u32>,
+    ) {
         let line_changed = match self.last_generated {
             Some(last) => last.line != generated.line,
             None => true,
@@ -351,11 +427,11 @@ impl<'program, 'src> MapWriter<'program, 'src> {
         );
         vlq(
             mappings,
-            i64::from(original.line) - i64::from(self.previous_line),
+            i64::from(original_line) - i64::from(self.previous_line),
         );
         vlq(
             mappings,
-            i64::from(original.column) - i64::from(self.previous_column),
+            i64::from(original_column) - i64::from(self.previous_column),
         );
         if let Some(name) = name {
             vlq(mappings, i64::from(name) - i64::from(self.previous_name));
@@ -363,8 +439,8 @@ impl<'program, 'src> MapWriter<'program, 'src> {
         }
         self.previous_generated_column = generated.column;
         self.previous_source = source;
-        self.previous_line = original.line;
-        self.previous_column = original.column;
+        self.previous_line = original_line;
+        self.previous_column = original_column;
         self.last_generated = Some(generated);
     }
 
@@ -383,7 +459,8 @@ impl<'program, 'src> MapWriter<'program, 'src> {
             let is_std = program.std_sources.contains(&source);
             self.map.sources.push(MapSource {
                 path,
-                content: (!is_std).then(|| text.to_string()),
+                url: None,
+                content: (!is_std && text.len() <= SOURCES_CONTENT_CAP).then(|| text.to_string()),
                 ignored: is_std,
             });
             (self.map.sources.len() - 1) as u32
@@ -465,6 +542,20 @@ fn vlq(out: &mut String, value: i64) {
 }
 
 impl SourceMap {
+    /// This map for its script with `lines` lines written in front of it —
+    /// the HMR shim before a browser bundle (E257 S6): every segment moves down
+    /// by that many lines and nothing else changes, since a segment's
+    /// generated column is relative only within its own line.
+    pub fn shift_lines(&mut self, lines: usize) {
+        if lines == 0 || self.mappings.is_empty() {
+            return;
+        }
+        let mut shifted = String::with_capacity(self.mappings.len() + lines);
+        shifted.extend(std::iter::repeat_n(';', lines));
+        shifted.push_str(&self.mappings);
+        self.mappings = shifted;
+    }
+
     /// The map's JSON for the generated file `file` (its name, as the
     /// `sourceMappingURL` comment beside it names the map).
     ///
@@ -500,8 +591,9 @@ impl SourceMap {
             if index > 0 {
                 json.push(',');
             }
-            let spelled = match (&directory, source.ignored) {
-                (Some(directory), false) => {
+            let spelled = match (&directory, source.ignored, source.url) {
+                (_, _, Some(url)) => url.to_string(),
+                (Some(directory), false, None) => {
                     relative_url(directory, &source.path).unwrap_or_else(|| file_url(&source.path))
                 }
                 _ => file_url(&source.path),
@@ -724,6 +816,43 @@ mod tests {
             file_url(Path::new("/opt/vilan/std/src/io.vl")),
             "file:///opt/vilan/std/src/io.vl"
         );
+    }
+
+    #[test]
+    fn shifting_a_map_moves_every_segment_down_and_nothing_else() {
+        let mut map = SourceMap {
+            mappings: "AAAA,EAAE;AACA".to_string(),
+            ..SourceMap::default()
+        };
+        map.shift_lines(3);
+        assert_eq!(map.mappings, ";;;AAAA,EAAE;AACA");
+        map.shift_lines(0);
+        assert_eq!(map.mappings, ";;;AAAA,EAAE;AACA");
+        // A map with no segments stays empty: there is nothing to move.
+        let mut empty = SourceMap::default();
+        empty.shift_lines(5);
+        assert!(empty.mappings.is_empty());
+    }
+
+    #[test]
+    fn a_synthetic_source_is_spelled_by_its_url() {
+        let map = SourceMap {
+            sources: vec![MapSource {
+                path: PathBuf::new(),
+                url: Some(RUNTIME_SOURCE),
+                content: Some("function __at() {}".to_string()),
+                ignored: true,
+            }],
+            ..SourceMap::default()
+        };
+        for directory in [None, Some(Path::new("/p/dist"))] {
+            let json = map.to_json("main.mjs", directory);
+            assert!(
+                json.contains("\"sources\":[\"vilan:///runtime.js\"]")
+                    && json.contains("\"ignoreList\":[0]"),
+                "{json}"
+            );
+        }
     }
 
     #[test]

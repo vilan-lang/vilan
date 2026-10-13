@@ -22,7 +22,7 @@ use std::rc::Rc;
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options)
         .transform_entry()
-        .map(|(javascript, _)| javascript)
+        .map(|printed| printed.text)
 }
 
 /// [`transform`] with the source map for its output (debugging.md §5.1,
@@ -43,9 +43,50 @@ pub fn transform_with_source_map<'src>(
     let mut transformer = Transformer::new(program, options);
     transformer.source_marks = true;
     transformer.formatter = transformer.formatter.with_marks();
-    let (marked, marks) = transformer.transform_entry()?;
-    let (javascript, map) = crate::source_map::strip_marks(program, &marked, &marks);
+    let printed = transformer.transform_entry()?;
+    let (javascript, map) =
+        crate::source_map::strip_marks(program, &printed.text, &printed.marks, printed.runtime);
     Ok((javascript, Some(map)))
+}
+
+/// One printed script: its text, the source-map marks the printing recorded
+/// (none unless the printer records them), and where the runtime helpers'
+/// text sits in it (E257 S6's synthetic source).
+struct Printed {
+    text: String,
+    marks: Vec<SourceMark>,
+    runtime: Option<std::ops::Range<usize>>,
+}
+
+/// A script's prelude — the host imports, then the runtime helpers' sources —
+/// in front of its `body`, with the byte range the helpers took.
+fn with_prelude(
+    imports: &[String],
+    helpers: &[&'static str],
+    body: String,
+) -> (String, Option<std::ops::Range<usize>>) {
+    let imports = imports.join("\n");
+    let helpers = helpers
+        .iter()
+        .map(|name| helper_source(name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let runtime_start = if imports.is_empty() {
+        0
+    } else {
+        imports.len() + 1
+    };
+    let runtime = (!helpers.is_empty()).then(|| runtime_start..runtime_start + helpers.len());
+    let prelude = [imports, helpers]
+        .into_iter()
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if prelude.is_empty() {
+        (body, runtime)
+    } else {
+        (format!("{prelude}\n{body}"), runtime)
+    }
 }
 
 /// Emission run for its DIAGNOSTICS alone — what `vilan check` of an ENTRY
@@ -3313,29 +3354,18 @@ impl<'src> Transformer<'src> {
 
     /// The entry's JavaScript, with the source-map marks its printing
     /// recorded (none unless the printer records them).
-    fn transform_entry(self) -> Result<(String, Vec<SourceMark>), Error> {
+    fn transform_entry(self) -> Result<Printed, Error> {
         let formatter = self.formatter.clone();
         let line_break = formatter.line_break;
         let program = self.transform_entry_ast()?;
         let body = formatter.file(&program.nodes);
-        let imports = program.imports.join("\n");
-        let helpers = program
-            .helpers
-            .iter()
-            .map(|name| helper_source(name))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prelude = [imports, helpers]
-            .into_iter()
-            .filter(|section| !section.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let output = if prelude.is_empty() {
-            body
-        } else {
-            format!("{}\n{}", prelude, body)
-        };
-        Ok((format!("{}{}", output, line_break), formatter.take_marks()))
+        let (mut text, runtime) = with_prelude(&program.imports, &program.helpers, body);
+        text.push_str(line_break);
+        Ok(Printed {
+            text,
+            marks: formatter.take_marks(),
+            runtime,
+        })
     }
 
     fn transform_entry_ast(self) -> Result<JsProgram<'src>, Error> {
