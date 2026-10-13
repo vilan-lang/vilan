@@ -8186,6 +8186,8 @@ async fn main() {
         println!("{}", version_line());
         return;
     }
+    // N176: one malloc arena, not eight per core (glibc only).
+    memory::limit_arenas();
     apply_base_cache_budget_from_env();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();

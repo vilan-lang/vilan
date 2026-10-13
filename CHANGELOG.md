@@ -178,6 +178,11 @@ written down.
 <!-- family: tooling -->
 **N172: `[build] dbg = "keep" | "strip"` is in the editor's manifest schema and the language server's manifest completion — VS Code flagged a valid `dbg = "strip"` as an unknown key (`[build]` is `additionalProperties: false`), and completion never offered it.** The key, its two values (offered quoted) and its documentation join both lists, and the gap's cause is pinned: the sync test compared the listing with the schema and neither with what the manifest reads, so a new `Build` field now fails to compile `every_build_field_the_manifest_reads_is_listed` (an exhaustive destructuring of `vilan_core::manifest::Build`) until its key is listed; every offered `dbg` value is one `DbgPolicy::parse` reads. Pins: `manifest_completion::tests::every_build_field_the_manifest_reads_is_listed`, `schema_and_listing_agree_on_the_enumerable_values` (`[build] dbg`). Tracker N172.
 
+---
+
+<!-- family: tooling -->
+**N176: the language server caps glibc's malloc arenas at one (`mallopt(M_ARENA_MAX, 1)` first thing in `main`, glibc targets only) — the server's peak resident memory over lsp-latency's rows on a kolt copy reads 716–732 MB where glibc's default (eight arenas per core) read 1006 MB, and two arenas 932 MB; the single-document leaf row 533 MB against 652 MB.** M142's item records allocate on the analysis thread and free on others, and every contending thread's own arena kept its fragments: the leaf row's VmHWM grew 40–160 MB at S7b, which `MALLOC_ARENA_MAX=1` closed. Instructions to idle are unchanged (leaf 3.45 G / 3.43 G; css 5.76 G / 5.71 G); the keystroke columns stay under 5 ms. A `MALLOC_ARENA_MAX` the environment sets is left to glibc, so a measurement can still run without the cap. Measured on a loaded box (load 8–16), the seven rows and the opening rows, 3 runs each. Tracker N176.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->
