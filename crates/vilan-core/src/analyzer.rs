@@ -45623,11 +45623,34 @@ impl<'src> Analyzer<'src> {
             if self.is_unknown_closure_parameter(id) {
                 return true;
             }
+            // B552: a binding not yet grounded is as unready as its
+            // initializer — `e` in `let d = k * 2; let e = d + 1;` waits on
+            // `k` through `d` (B185's rebinding hop, for any initializer).
+            if let Some(initializer) = self.ungrounded_binding_initializer(id) {
+                pending.push(initializer);
+                continue;
+            }
             children.clear();
             self.drop_scan_children(id, &mut children);
             pending.extend(children.iter().copied());
         }
         false
+    }
+
+    /// The initializer of the unannotated binding `expr_id` names (through a
+    /// `Local`), when that binding has not grounded yet.
+    fn ungrounded_binding_initializer(&self, expr_id: Id) -> Option<Id> {
+        let Some(Expr::Local(target_id)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return None;
+        };
+        let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(target_id) else {
+            return None;
+        };
+        let variable = self.variables.get(variable_id)?;
+        if variable.annotated || !matches!(variable.type_id.get_type(self), Type::Unknown) {
+            return None;
+        }
+        variable.initial
     }
 
     /// [`Self::is_unknown_closure_parameter`], answering WHICH parameter: the
@@ -58306,9 +58329,15 @@ impl<'src> Analyzer<'src> {
         // resolver does on the same condition. An ANNOTATED binding is not
         // waiting on anything: the annotation is its type.
         if matches!(initial_type_id.get_type(self), Type::Unknown)
-            && value_ids
-                .first()
-                .is_some_and(|&value_id| self.is_unknown_closure_parameter(value_id))
+            && value_ids.first().is_some_and(|&value_id| {
+                self.is_unknown_closure_parameter(value_id)
+                    // B552: and a value BUILT from one (`let d = k * 2`),
+                    // until the fixpoint stalls — grounded early it is the
+                    // permanent `Unknown` B185 describes, and a block-bodied
+                    // closure's tail read it so: the call's `U` bound to
+                    // nothing (`d`) or to an argument-less `Maybe`.
+                    || (!self.fixpoint_stalled && self.value_awaits_a_closure_parameter(value_id))
+            })
         {
             return Resolution::Deferred;
         }

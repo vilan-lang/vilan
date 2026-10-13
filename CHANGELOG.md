@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B552: a block-bodied closure handed to a generic callee types the callee's generic through its locals — `apply(2, |k| { let d = k * 2; Maybe::Just(d) })` with `apply<T, U>(value: T, f: |T| U): U` recorded `U` as `Maybe` with NO arguments (natively the instance met an unbound `T` of `Maybe` and was refused), and `|k| { let d = k * 2; d }` recorded no `U` at all, so a `let probe: bool` over the result checked clean.** The local `d` grounded before the call filled `k` — to the permanent `Unknown` B185 describes for a direct mention of the parameter, which a binding BUILT from one (`k * 2`, a chain `let e = d + 1`) did not get. Such a binding now waits for the fill too (until the fixpoint stalls), and the call reads the block's tail through it. The JS backend needed no change (the corpus is byte-identical); the native build of the filed repro runs. Pin: `generics::b552_a_block_closures_local_built_from_its_parameter_types_the_callers_generic`. Tracker B552.
+
+---
+
+<!-- family: fix -->
 **B604: an annotated binding over a closure parameter is checked once the parameter fills — `let words = ["a", "bb"].map(|word| word.len()); words.filter(|length| { let probe: str = length; .. })` checked clean (JS ran it; the native build met rustc's E0308), while an annotated `let words: List<usize>` refused it "Expected str, but got usize instead."** The annotation reconciled against the parameter's not-yet `Unknown` — the call site that types it had not run, because its receiver (a `.map` result, a call's result) typed later — and nothing asked again. An annotated binding, a reassignment, and a tuple or list built around the parameter now wait for the fill, as an unannotated binding already did (B185), and refuse at the `let` as the literal receiver always did. A parameter nothing fills (a let-bound closure no call site types) keeps today's reading once the fixpoint stalls. Pins: `generics::b604_an_annotated_binding_over_a_closure_parameter_is_checked_once_it_fills`, `generics::b604_a_matching_annotation_runs_and_an_unfilled_parameter_keeps_its_reading`. Tracker B604.
 
 ---

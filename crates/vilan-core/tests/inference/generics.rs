@@ -10001,3 +10001,41 @@ fn b604_a_matching_annotation_runs_and_an_unfilled_parameter_keeps_its_reading()
         "HI\n",
     );
 }
+
+// --- B552: a block-bodied closure's local, built from its parameter ----------
+
+/// B552: `apply(2, |k| { let d = k * 2; Maybe::Just(d) })` with `apply<T,
+/// U>(value: T, f: |T| U): U` recorded the call's `U` as `Maybe` with NO
+/// arguments (natively the instance met an unbound `T` of `Maybe`), and
+/// `{ let d = k * 2; d }` recorded no `U` at all — a `let probe: bool` over
+/// it checked clean. The local `d` grounded before the call filled `k`, to
+/// the permanent `Unknown` B185 describes; a binding BUILT from an unfilled
+/// parameter now waits for the fill as a direct mention does.
+#[test]
+fn b552_a_block_closures_local_built_from_its_parameter_types_the_callers_generic() {
+    let prelude = r#"
+        enum Maybe<T> {
+            Just(T),
+            Nothing,
+        }
+        fun apply<T, U>(value: T, f: |T| U): U {
+            f(value)
+        }
+    "#;
+    for (body, got) in [
+        ("{ let d = k * 2; Maybe::Just(d) }", "Maybe<i32>"),
+        ("{ let d = k * 2; d }", "i32"),
+        ("{ let d = k * 2; let e = d + 1; (d, e) }", "(i32, i32)"),
+    ] {
+        let source = format!(
+            "{prelude}\nfun main() {{\n    let r = apply(2, |k| {body});\n    let probe: bool = r;\n}}\n"
+        );
+        assert_fails_once_with(&source, &format!("Expected bool, but got {got} instead."));
+    }
+    assert_compiles_and_runs(
+        &format!(
+            "import std::io::print;\n{prelude}\nfun main() {{\n    let block = apply(2, |k| {{\n        let d = k * 2;\n        Maybe::Just(d)\n    }});\n    if block is Maybe::Just(let v) {{\n        print(v + 1);\n    }}\n}}\n"
+        ),
+        "5\n",
+    );
+}
