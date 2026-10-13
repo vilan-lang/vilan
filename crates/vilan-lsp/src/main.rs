@@ -315,6 +315,12 @@ fn to_completion_item(
         item.detail = Some(format!("internal — {reason}"));
         item.sort_text = Some(format!("~~{}", item.label));
     }
+    // B620: a head method that does not hand the element back survived the
+    // same prefix rule; it is shown last, saying where it belongs.
+    if let Some(reason) = completion.admission {
+        item.detail = Some(reason);
+        item.sort_text = Some(format!("~~{}", item.label));
+    }
     // E211: state the prefix this candidate replaces, and the text to filter it
     // by. E194 fixed the hyphenated case from the CLIENT's side, in VS Code's
     // `wordPattern`; every other LSP client has its own word rules and no such
@@ -1086,6 +1092,7 @@ mod completion_item_tests {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: None,
         }
     }
@@ -1227,6 +1234,7 @@ mod completion_item_tests {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: None,
         }
     }
@@ -1247,6 +1255,7 @@ mod completion_item_tests {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: Some(AutoImport {
                 module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },

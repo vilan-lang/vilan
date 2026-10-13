@@ -1568,3 +1568,74 @@ fn e302_changes_hints_only_a_stage_whose_type_moves() {
         assert_eq!(same.len(), 1, "{changes:?}");
     });
 }
+
+/// B620's editor half: inside an opening tag, completion offers the methods
+/// that hand the element back (and attributes and `on:` hooks); a method that
+/// does not appears only to a typed prefix of three characters that it
+/// extends — E213's rule, the same function — with the steer as its detail.
+/// After the finished element (`<div />.`) every method is offered.
+#[test]
+fn b620_an_element_head_offers_a_non_view_method_only_to_three_typed_characters() {
+    on_big_stack(|| {
+        let base = "impl View {\n\tfun measured(self): usize {\n\t\t0\n\t}\n}\n\n\
+             fun main() {\n\tlet _ = <div ¦ />;\n}\n";
+        let labels = |typed: &str| -> Vec<(String, Option<String>)> {
+            let text = base.replace('¦', typed);
+            let offset = text.find(" />").expect("the tag's end");
+            let package = Package::new("b620", &[("client.vl", &text)]);
+            let document = package.world();
+            document
+                .completion(offset)
+                .into_iter()
+                .map(|candidate| (candidate.label, candidate.admission))
+                .collect()
+        };
+        let view_returning = |items: &[(String, Option<String>)], name: &str| {
+            items
+                .iter()
+                .any(|(label, admission)| label == name && admission.is_none())
+        };
+        // Nothing typed: `.styled` (returns View) offered, `.measured`
+        // (returns usize) not; attributes and hooks are.
+        let bare = labels("");
+        assert!(view_returning(&bare, ".styled"), "{bare:?}");
+        assert!(
+            !bare.iter().any(|(label, _)| label == ".measured"),
+            "{bare:?}"
+        );
+        assert!(bare.iter().any(|(label, _)| label == "title"), "{bare:?}");
+        assert!(
+            bare.iter().any(|(label, _)| label.starts_with("on:")),
+            "{bare:?}"
+        );
+        // Two characters: still hidden.
+        let two = labels(".me");
+        assert!(!two.iter().any(|(label, _)| label == "measured"), "{two:?}");
+        // Three: offered, with the steer.
+        let three = labels(".mea");
+        let offered = three
+            .iter()
+            .find(|(label, _)| label == "measured")
+            .unwrap_or_else(|| panic!("offered at three characters: {three:?}"));
+        assert_eq!(
+            offered.1.as_deref(),
+            Some(
+                "returns `usize`, not the element: call it on the element instead, `<div />.measured()`"
+            )
+        );
+        // After the finished element, the ordinary member list: offered.
+        let after = "impl View {\n\tfun measured(self): usize {\n\t\t0\n\t}\n}\n\n\
+             fun main() {\n\tlet _ = <div />.;\n}\n";
+        let package = Package::new("b620-after", &[("client.vl", after)]);
+        let document = package.world();
+        let members: Vec<String> = document
+            .completion(after.find("/>.").unwrap() + 3)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            members.iter().any(|label| label == "measured"),
+            "{members:?}"
+        );
+    });
+}

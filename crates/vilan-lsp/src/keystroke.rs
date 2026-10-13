@@ -1283,6 +1283,7 @@ pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
             filter_text: None,
             replace_span: None,
             internal: entry.internal.clone(),
+            admission: None,
             needs_import: None,
         })
         .collect()
