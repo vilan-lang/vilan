@@ -153,6 +153,11 @@ written down.
 <!-- family: fix -->
 **E306: an enum variant in VALUE position hovers with its variant line and the enum's chunk — `Hidden` in kolt's `.overflow(style::Overflow::Hidden)` (`views.vl:218:32`, inside a `const` chain) answers `Overflow::Hidden` over `enum Overflow { Visible, Hidden, Auto, Scroll }`, and `Shape::Circle(1.0)`'s head answers `Shape::Circle(f64)` with the variant's `///`.** It answered the bare `enum Overflow` (the reference's plain type label); the `const` chain changed nothing — the variant reference is an ordinary entity there. A generic enum's variant spells the value's instantiation where its type was tabled (`Option<i32>::None`), the bare enum where not. The item's other half — enum-typed BINDINGS answering with no chunk on kolt — was E313's cause (E237's table was the entry's alone, and kolt's files are served as views); the kolt sweep `kolt_every_enum_binding_hovers_with_its_chunk` (ignored, `VILAN_EDITOR_KOLT`) now reads 57 of 57 enum-typed bindings and parameters with their chunk. Pin: `editor_review_tests::e306_a_variant_in_value_position_hovers_with_its_enum` (the kolt shape in a `const` chain, a payload variant, a generic variant, a parameter, a `mut` from a call, a capture — as a view). Tracker E306.
 
+---
+
+<!-- family: feature -->
+**E300: a match arm's variant hovers with what the match is over and what the leg binds — `Some` in kolt's `match model::global() { Some(let root) => …` answers one fence: `match on Option<RemoteStoreSome<Global>>`, `Option<RemoteStoreSome<Global>>::Some(RemoteStoreSome<Global>)`, `let root: RemoteStoreSome<Global>` — then the variant's `///` (RULED shape).** E241 answered the variant line alone. A tuple payload lists one declaration per capture (`let w: f64`, `mut h: f64`), a payload-less variant or a literal leg lists none, `_` answers `match on Shape` over `_: Shape`, and an `is` test answers the same as a leg; a capture whose inlay hint abbreviates its type (E227) adds "Shown as `~Source<..>`" so the hint and the hover agree. Pins: `editor_review_tests::e300_a_match_arm_hovers_with_its_subject_and_captures`, and E241's five pins with the new lines. Tracker E300.
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->

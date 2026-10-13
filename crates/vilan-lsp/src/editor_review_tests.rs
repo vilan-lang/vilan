@@ -1424,3 +1424,52 @@ fn kolt_every_enum_binding_hovers_with_its_chunk() {
         assert!(missing.is_empty(), "{}", missing.join("\n"));
     });
 }
+
+/// E300 (RULED shape): a match arm's variant hovers with what the match is
+/// over, the variant as the leg binds it, and the captures as declarations —
+/// kolt `views.vl:187`'s `Some(let root)` over an `Option` of a nominal with
+/// arguments; a tuple payload with two captures; `_`; an `is`; a variant
+/// with a `///`.
+#[test]
+fn e300_a_match_arm_hovers_with_its_subject_and_captures() {
+    on_big_stack(|| {
+        let source = "struct Remote<P> {\n\tvalue: P,\n}\n\n\
+             enum Shape {\n\t/// Two sides.\n\tRect(f64, f64),\n\tEmpty,\n}\n\n\
+             fun global(): Option<Remote<str>> {\n\tSome(Remote { value = \"g\" })\n}\n\n\
+             fun main() {\n\tmatch global() {\n\t\tSome(let root) => {\n\t\t\tlet _ = root;\n\t\t}\n\t\tNone => {}\n\t}\n\
+             \tmatch Shape::Rect(1.0, 2.0) {\n\t\tShape::Rect(let w, mut h) => {\n\t\t\th = h + w;\n\t\t\tlet _ = h;\n\t\t}\n\t\t_ => {}\n\t}\n\
+             \tif global() is Some(let found) {\n\t\tlet _ = found;\n\t}\n}\n";
+        let package = Package::new("e300", &[("client.vl", source)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let hover = |needle: &str, delta: usize| {
+            document
+                .hover(at(source, needle, delta))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        assert_eq!(
+            hover("Some(let root)", 1),
+            "```vilan\nmatch on Option<Remote<str>>\nOption<Remote<str>>::Some(Remote<str>)\nlet root: Remote<str>\n```"
+        );
+        assert_eq!(
+            hover("Rect(let w", 1),
+            "```vilan\nmatch on Shape\nShape::Rect(f64, f64)\nlet w: f64\nmut h: f64\n```\n\nTwo sides."
+        );
+        assert_eq!(
+            hover("_ => {}", 0),
+            "```vilan\nmatch on Shape\n_: Shape\n```"
+        );
+        assert_eq!(
+            hover("Some(let found)", 1),
+            "```vilan\nmatch on Option<Remote<str>>\nOption<Remote<str>>::Some(Remote<str>)\nlet found: Remote<str>\n```"
+        );
+        assert_eq!(
+            hover("None => {}", 0),
+            "```vilan\nmatch on Option<Remote<str>>\nOption<Remote<str>>::None\n```"
+        );
+    });
+}

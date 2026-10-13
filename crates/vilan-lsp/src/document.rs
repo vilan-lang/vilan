@@ -4027,7 +4027,35 @@ impl Document {
             site.source == self.focus && range.start <= offset && offset < range.end
         })?;
         let mut out = HoverBlocks::new();
-        out.push_code(Block::Signature, &site.label);
+        // E300 (RULED shape): one fence of up to three lines — what the
+        // `match` (or `is`) is over, the variant as this leg binds it, and the
+        // bindings the leg introduces, as their declarations read.
+        let subject = if site.matched {
+            match site.label.strip_prefix("_: ") {
+                Some(whole) => Some(whole.to_string()),
+                None => site
+                    .label
+                    .split_once("::")
+                    .map(|(head, _)| head.to_string()),
+            }
+        } else {
+            None
+        };
+        let captures = self.pattern_captures(program, site.name_span);
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(subject) = &subject {
+            lines.push(format!("match on {subject}"));
+        }
+        lines.push(site.label.clone());
+        lines.extend(captures.iter().map(|(line, _)| line.clone()));
+        out.push_code(Block::Signature, &lines.join("\n"));
+        // E227: a capture whose inlay hint abbreviates its type says so, so the
+        // hint and the hover agree.
+        for (_, capture) in &captures {
+            if let Some(hint) = program.hint_labels.get(capture) {
+                out.push(Block::SignatureNote, format!("Shown as `{}`", hint.label));
+            }
+        }
         let variant_entity = site.variant.and_then(|(enum_id, variant_index)| {
             let enumeration = program.enums.get(&enum_id)?;
             let name = enumeration.variants.get(variant_index)?.name;
@@ -4043,6 +4071,60 @@ impl Document {
             variant_entity.and_then(|entity| self.analysis(program).doc_comment_of(entity)),
         );
         out.rendered()
+    }
+
+    /// E300: the bindings a variant pattern introduces — every `let`/`mut`
+    /// capture between the parentheses that follow the variant's name, as its
+    /// declaration reads (`let root: RemoteStoreSome<Global>`), in written
+    /// order, with its binding id. Empty for a variant with no payload, a `_`
+    /// and a literal.
+    fn pattern_captures(&self, program: &Program, name_span: Span) -> Vec<(String, Id)> {
+        let text = self.analyzed_text();
+        let after = name_span.into_range().end;
+        if text.as_bytes().get(after) != Some(&b'(') {
+            return Vec::new();
+        }
+        let mut depth = 0usize;
+        let mut close = None;
+        for (index, byte) in text.as_bytes()[after..].iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(after + index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Vec::new();
+        };
+        let source_of = program.source_lookup();
+        let mut captures: Vec<(usize, String, Id)> = program
+            .variables
+            .iter()
+            .filter(|(id, variable)| {
+                let range = variable.name_span.into_range();
+                source_of.of(**id) == Some(self.focus) && after < range.start && range.end <= close
+            })
+            .filter_map(|(id, variable)| {
+                let type_label = program.expr_types.get(id)?;
+                let keyword = if variable.mutable { "mut" } else { "let" };
+                Some((
+                    variable.name_span.start,
+                    format!("{keyword} {}: {type_label}", variable.name),
+                    *id,
+                ))
+            })
+            .collect();
+        captures.sort_by_key(|(start, _, _)| *start);
+        captures
+            .into_iter()
+            .map(|(_, line, id)| (line, id))
+            .collect()
     }
 
     /// E240's hover for a type-position name: a TYPE PARAMETER — `type I:
@@ -25893,22 +25975,31 @@ fun main() {\n\tlet x: Option<i32> = Some(3);\n\tmatch x {\n\t\tNone => print(\"
     fn e241_a_bare_variant_hovers_as_the_matched_types_variant() {
         assert_eq!(
             hover("None => print(\"none\"),\n\t\t_", 1),
-            fence("Option<i32>::None")
+            fence("match on Option<i32>\nOption<i32>::None")
         );
     }
 
     #[test]
     fn e241_a_payload_variant_hovers_with_its_payload_substituted() {
-        assert_eq!(hover("Some(let v)", 1), fence("Option<i32>::Some(i32)"));
+        assert_eq!(
+            hover("Some(let v)", 1),
+            fence("match on Option<i32>\nOption<i32>::Some(i32)\nlet v: i32")
+        );
         // The binding inside it hovers as a binding, as it did.
         assert_eq!(hover("Some(let v)", 9), fence("let v: i32"));
         // The same in an `is` test.
-        assert_eq!(hover("is Some(let y)", 4), fence("Option<i32>::Some(i32)"));
+        assert_eq!(
+            hover("is Some(let y)", 4),
+            fence("match on Option<i32>\nOption<i32>::Some(i32)\nlet y: i32")
+        );
     }
 
     #[test]
     fn e241_a_qualified_variant_hovers_on_its_variant_and_its_enum_on_the_enum() {
-        assert_eq!(hover("Option::None", 9), fence("Option<i32>::None"));
+        assert_eq!(
+            hover("Option::None", 9),
+            fence("match on Option<i32>\nOption<i32>::None")
+        );
         // The enum segment keeps its own answer: the enum.
         let enumeration = hover("Option::None", 2).expect("the enum segment hovers");
         assert!(enumeration.contains("enum Option<T>"), "{enumeration}");
@@ -25918,22 +26009,37 @@ fun main() {\n\tlet x: Option<i32> = Some(3);\n\tmatch x {\n\t\tNone => print(\"
     fn e241_a_user_enums_variants_hover_with_their_payload_and_doc() {
         assert_eq!(
             hover("Shape::Rect(let w", 8),
-            fence("Shape::Rect(f64, f64)")
+            fence("match on Shape\nShape::Rect(f64, f64)\nlet w: f64\nlet h: f64")
         );
-        assert_eq!(hover("Shape::Empty =>", 8), fence("Shape::Empty"));
+        assert_eq!(
+            hover("Shape::Empty =>", 8),
+            fence("match on Shape\nShape::Empty")
+        );
         assert_eq!(
             hover("Pair::Both(let a", 7),
-            Some("```vilan\nPair<str, i32>::Both(str, i32)\n```\n\nBoth present.".to_string())
+            Some(
+                "```vilan\nmatch on Pair<str, i32>\nPair<str, i32>::Both(str, i32)\nlet a: str\nlet b: i32\n```\n\nBoth present."
+                    .to_string()
+            )
         );
-        assert_eq!(hover("Pair::Neither", 7), fence("Pair<str, i32>::Neither"));
+        assert_eq!(
+            hover("Pair::Neither", 7),
+            fence("match on Pair<str, i32>\nPair<str, i32>::Neither")
+        );
     }
 
     #[test]
     fn e241_a_wildcard_hovers_as_what_it_matches_and_a_literal_as_nothing() {
         // `_` answered the enclosing match's type (`void`), which was wrong:
         // it answers what it matches whole.
-        assert_eq!(hover("_ => print(\"some\")", 0), fence("_: Option<i32>"));
-        assert_eq!(hover("_ => print(\"x\")", 0), fence("_: Shape"));
+        assert_eq!(
+            hover("_ => print(\"some\")", 0),
+            fence("match on Option<i32>\n_: Option<i32>")
+        );
+        assert_eq!(
+            hover("_ => print(\"x\")", 0),
+            fence("match on Shape\n_: Shape")
+        );
         // A literal is its own value and names nothing.
         assert_eq!(hover("3 => print(\"three\")", 0), None);
     }
