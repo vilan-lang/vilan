@@ -1639,3 +1639,55 @@ fn b620_an_element_head_offers_a_non_view_method_only_to_three_typed_characters(
         );
     });
 }
+
+/// E313 under the incremental path (S1's hot set, S7b's served items): after
+/// a keystroke in ONE module re-analyzes the world with that module hot, a
+/// COLD module served as a view still answers its own pattern, call-label
+/// and definition rows.
+#[test]
+fn e313_a_cold_view_keeps_its_rows_on_a_served_keystroke() {
+    on_big_stack(|| {
+        let cold = "export struct Boxed<T> {\n\tvalue: T,\n}\n\n\
+             impl Boxed<type T> {\n\tfun get(self): T {\n\t\tself.value\n\t}\n}\n\n\
+             export fun pick(value: Option<i32>): usize {\n\tlet boxed = Boxed { value = [1] };\n\
+             \tmatch value {\n\t\tNone => boxed.get().len(),\n\t\tSome(let inner) => {\n\t\t\tlet _ = inner;\n\t\t\t1\n\t\t}\n\t}\n}\n";
+        let hot = "export fun count(): i32 {\n\t1\n}\n";
+        let client = "import pkg::cold::pick;\nimport pkg::hot::count;\n\n\
+             fun main() {\n\tlet _ = pick(None);\n\tlet _ = count();\n}\n";
+        let package = Package::new(
+            "e313-served",
+            &[("client.vl", client), ("cold.vl", cold), ("hot.vl", hot)],
+        );
+        let entry = package.path("client.vl");
+        let seeds = vec![vilan_core::util::canonical_path(package.path("hot.vl"))];
+        let analyze = || {
+            Document::analyze_cancellable_editing(
+                client,
+                &std_root(),
+                &entry,
+                seeds.clone(),
+                &vilan_core::cancel::CancelToken::new(),
+            )
+            .expect("an analysis")
+        };
+        // The first stores the world; the keystroke's is served from it.
+        let _stored = analyze();
+        std::fs::write(
+            package.path("hot.vl"),
+            "export fun count(): i32 {\n\t2\n}\n",
+        )
+        .unwrap();
+        let served = analyze();
+        assert!(served.diagnostics.is_empty(), "{:?}", served.diagnostics);
+        let view = package.view(&served, "cold.vl");
+        let none = view.hover(at(cold, "None =>", 1)).expect("the leg hovers");
+        assert!(none.contains("Option<i32>::None"), "{none}");
+        let get = view.hover(at(cold, "get().len", 0)).expect("`get` hovers");
+        assert!(get.contains("fun get(self): List<i32>"), "{get}");
+        let boxed = view.hover(at(cold, "boxed = ", 0)).expect("`boxed` hovers");
+        assert!(
+            boxed.contains("struct Boxed<List<i32>> {") || boxed.contains("value: List<i32>"),
+            "{boxed}"
+        );
+    });
+}
