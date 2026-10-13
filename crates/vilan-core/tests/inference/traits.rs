@@ -10073,3 +10073,125 @@ fn b595_a_head_outside_the_blankets_bound_has_no_such_static() {
         "cannot find 'tag' in i32",
     );
 }
+
+// --- B609: a subtrait impl over a STRUCTURAL subject reaches its supertrait
+//     impl through an element's sub-bound ------------------------------------
+
+/// B609: `impl (type A: Louder, type B: Louder) with Loud {}` under `trait
+/// Loud with Shown` and `trait Louder with Display` leans on `impl (type A:
+/// Display, type B: Display) with Shown` — every pair the subtrait impl
+/// reaches is a pair of `Display`s. It was refused "'(A, B)' does not
+/// implement trait 'Loud': missing 'shown'", where the nominal twin compiled:
+/// inside a tuple the conformance walk compared the two binders by their
+/// bound traits, and `Louder` is not `Display`.
+#[test]
+fn b609_a_tuple_subtrait_impl_reaches_its_supertrait_impl_through_a_sub_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        trait Shown {
+            fun shown(self): str;
+        }
+        trait Loud with Shown {
+            fun loud(self): str {
+                self.shown() + "!"
+            }
+        }
+        trait Louder with Display {}
+        impl i32 with Louder {}
+        impl (type A: Display, type B: Display) with Shown {
+            fun shown(self): str {
+                self.0.to_string() + "," + self.1.to_string()
+            }
+        }
+        impl (type A: Louder, type B: Louder) with Loud {}
+        fun main() {
+            print((1, 2).loud());
+        }
+        "#,
+        "1,2!\n",
+    );
+}
+
+/// B609's array half: `impl [type T: Louder; const N] with Loud {}` leans on
+/// `impl [type T: Shown; const N] with Shown` when `Louder` requires `Shown`,
+/// and a `_` length binder is the same hole as `const N`.
+#[test]
+fn b609_an_array_subtrait_impl_reaches_its_supertrait_impl_through_a_sub_bound() {
+    for length in ["const N", "_"] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            trait Shown {{
+                fun shown(self): str;
+            }}
+            trait Loud with Shown {{
+                fun loud(self): str {{
+                    self.shown() + "!"
+                }}
+            }}
+            trait Louder with Shown {{}}
+            impl i32 with Shown {{
+                fun shown(self): str {{ "i" }}
+            }}
+            impl i32 with Louder {{}}
+            impl [type T: Shown; const N] with Shown {{
+                fun shown(self): str {{
+                    mut out = "";
+                    for item in self {{
+                        out = out + item.shown();
+                    }}
+                    out
+                }}
+            }}
+            impl [type T: Louder; {length}] with Loud {{}}
+            fun main() {{
+                let xs: [i32; 2] = [1, 2];
+                print(xs.loud());
+            }}
+            "#
+        );
+        assert_compiles_and_runs(&source, "ii!\n");
+    }
+}
+
+/// B609's boundary: an element bound that does NOT entail the supertrait
+/// impl's bound reaches nothing — some pair the subtrait impl covers has no
+/// `shown` — so the refusal stands, for a tuple and for an array.
+#[test]
+fn b609_an_unrelated_element_bound_still_owes_the_supertrait_member() {
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+        trait Shown {
+            fun shown(self): str;
+        }
+        trait Loud with Shown {}
+        trait Quiet {}
+        impl (type A: Display, type B: Display) with Shown {
+            fun shown(self): str {
+                self.0.to_string() + "," + self.1.to_string()
+            }
+        }
+        impl (type A: Quiet, type B: Quiet) with Loud {}
+        fun main() {}
+        "#,
+        "'(A, B)' does not implement trait 'Loud': missing 'shown'",
+    );
+    assert_fails_with(
+        r#"
+        trait Shown {
+            fun shown(self): str;
+        }
+        trait Loud with Shown {}
+        trait Quiet {}
+        impl [type T: Shown; const N] with Shown {
+            fun shown(self): str { "arr" }
+        }
+        impl [type T: Quiet; const N] with Loud {}
+        fun main() {}
+        "#,
+        "does not implement trait 'Loud': missing 'shown'",
+    );
+}

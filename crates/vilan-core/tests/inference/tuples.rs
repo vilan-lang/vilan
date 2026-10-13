@@ -8723,6 +8723,37 @@ fn b443_a_pack_bounded_partial_eq_holds_a_pair() {
     );
 }
 
+/// B609's twin (lang-50 Q3): a tuple of `Eq` elements is `Eq` — std's
+/// `impl type T: (2..: Eq) with Eq {}` beside the `PartialEq` blanket — and a
+/// float element keeps it out.
+#[test]
+fn b609_a_tuple_of_eq_elements_is_eq() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::Eq;
+        fun same<T: Eq>(a: T, b: T): bool { a == b }
+        fun main() {
+            print(same((1, "a"), (1, "a")));
+            print(same((1, "a", 2), (1, "a", 3)));
+            print(same(((1, 2), (3, 4)), ((1, 2), (3, 4))));
+        }
+        "#,
+        "true\nfalse\ntrue\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::compare::Eq;
+        fun same<T: Eq>(a: T, b: T): bool { a == b }
+        fun main() {
+            let pair: (i32, f64) = (1, 2.5);
+            let _same = same(pair, pair);
+        }
+        "#,
+        "does not implement trait 'Eq'",
+    );
+}
+
 #[test]
 fn b443_a_non_tuple_reaching_eq_through_a_generic_body_is_unaffected() {
     // solver-47's regression: with the blanket in std, `==` on an

@@ -22739,6 +22739,88 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B609: whether an impl over `candidate` provides for EVERY receiver an
+    /// impl over `subject` reaches — the candidate's shape matches the
+    /// subject's ([`Self::impl_subject_matches`], the candidate's binders as
+    /// holes), and each candidate binder's bounds hold for what the subject
+    /// puts there: a subject binder whose own bounds carry the trait (through
+    /// its supertraits), or a concrete type that implements it.
+    ///
+    /// The conformance walk asks it when a subtrait impl leans on a separate
+    /// supertrait impl. `compare_type` already answers a NOMINAL pair — a
+    /// binder inside a nominal's arguments is a hole there — but inside a
+    /// tuple or an array it compares the two binders by their bound traits,
+    /// so `impl (type A: Louder, type B: Louder) with Loud {}` (`trait Louder
+    /// with Display`) did not find `impl (type A: Display, type B: Display)
+    /// with Shown`, and `impl [type T: Eq; _] with Eq {}` did not find std's
+    /// `impl [type T: PartialEq; const N] with PartialEq`. Conservative: a
+    /// parameterized bound or a tuple bound on a candidate binder is not
+    /// read here (the caller's first test stands for those).
+    fn impl_subject_covers(&self, candidate: TypeId, subject: TypeId) -> bool {
+        if !self.impl_subject_matches(candidate, subject) {
+            return false;
+        }
+        let mut aligned: Vec<(TypeId, TypeId)> = Vec::new();
+        if !self.align_subject_binders(candidate, subject, &mut aligned) {
+            return false;
+        }
+        aligned.iter().all(|(binder, placed)| {
+            if self.tuple_bounds.contains_key(binder) {
+                return false;
+            }
+            let placed = placed.get_type(self);
+            self.generic_bound_traits(*binder)
+                .into_iter()
+                .all(|(trait_id, arguments)| {
+                    arguments.is_empty()
+                        && match &placed {
+                            Type::Generic(subject_binder) => {
+                                self.generic_bound_carries_trait(*subject_binder, trait_id)
+                            }
+                            concrete => self.type_implements_trait(concrete, trait_id),
+                        }
+                })
+        })
+    }
+
+    /// The binders `pattern` writes, each with the type id `target` holds at
+    /// the same position — the walk [`Self::impl_subject_matches`] matched.
+    /// False when a binder has no counterpart (an erased `List` target).
+    fn align_subject_binders(
+        &self,
+        pattern: TypeId,
+        target: TypeId,
+        aligned: &mut Vec<(TypeId, TypeId)>,
+    ) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match (pattern.get_type(self), target.get_type(self)) {
+            (Type::Generic(constraint_id), _) => {
+                aligned.push((constraint_id, target));
+                true
+            }
+            (Type::Struct(_, left), Type::Struct(_, right))
+            | (Type::Enum(_, left), Type::Enum(_, right))
+            | (Type::Trait(_, left), Type::Trait(_, right))
+            | (Type::Tuple(left, _), Type::Tuple(right, _)) => {
+                if left.len() != right.len() {
+                    let mut binders = Vec::new();
+                    self.collect_subject_binders(pattern, &mut binders);
+                    return binders.is_empty();
+                }
+                left.iter()
+                    .zip(&right)
+                    .all(|(left, right)| self.align_subject_binders(*left, *right, aligned))
+            }
+            (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
+                self.align_subject_binders(left_item, right_item, aligned)
+                    && self.align_subject_binders(left_length, right_length, aligned)
+            }
+            _ => true,
+        }
+    }
+
     /// Argument lists for [`impl_subject_matches`]. An ERASED side — a subject
     /// written `List` with no arguments — carries no shape to compare, so the
     /// heads alone decide, exactly as `compare_argument_types` treats it.
@@ -67718,7 +67800,7 @@ impl<'src> Analyzer<'src> {
                             &check_subject_type,
                             &candidate_subject,
                             &HashMap::default(),
-                        )
+                        ) || self.impl_subject_covers(*subject_id, check.subject_type_id)
                     }
                 });
                 if provided_elsewhere {

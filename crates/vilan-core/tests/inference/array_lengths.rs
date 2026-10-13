@@ -831,6 +831,44 @@ fn s5_fixed_arrays_compare_with_equality_at_every_length() {
     );
 }
 
+/// B609 (lang-50 Q3): an array of `Eq` elements is `Eq` — `impl [type T: Eq;
+/// _] with Eq {}` in std, which B609's conformance fix admits — so a `T: Eq`
+/// takes an array at any length, nested too; a float element is not `Eq`.
+#[test]
+fn b609_a_fixed_array_of_eq_elements_is_eq() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::Eq;
+        fun same<T: Eq>(a: T, b: T): bool {
+            a == b
+        }
+        fun main() {
+            let fixed: [i32; 3] = [1, 2, 3];
+            print(same(fixed, [1, 2, 3]));
+            let words: [str; 2] = ["a", "b"];
+            print(same(words, ["a", "c"]));
+            let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+            print(same(grid, [[1, 2], [3, 4]]));
+        }
+        "#,
+        "true\nfalse\ntrue\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::compare::Eq;
+        fun same<T: Eq>(a: T, b: T): bool {
+            a == b
+        }
+        fun main() {
+            let ratios: [f64; 2] = [1.5, 2.0];
+            let _same = same(ratios, ratios);
+        }
+        "#,
+        "'[f64; 2]' does not implement trait 'Eq'",
+    );
+}
+
 /// `Hashable`: a fixed array keys a `HashMap` and joins a `HashSet`.
 #[test]
 fn s5_a_fixed_array_is_hashable() {
