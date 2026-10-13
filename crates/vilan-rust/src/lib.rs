@@ -13577,10 +13577,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let subscripts_run_code = steps.iter().any(
             |step| matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript)),
         );
+        // A `&` of a scalar place (a number, `bool`, `str`) is a `(base, key)`
+        // pair on JS, read through when the callee reads it — after the later
+        // arguments, as spec §6.9's view of the binding is — so it waits as an
+        // aggregate does. (A `&` of an enum or a tuple is the value JS held
+        // when it was evaluated, as natively.)
+        let read_late_on_js = self.type_of(place).is_some_and(|type_id| {
+            self.aliases_on_the_js_backend(type_id)
+                || (!by_value && self.views_as_a_pair_on_the_js_backend(type_id))
+        });
         if subscripts_run_code
-            || !self
-                .type_of(place)
-                .is_some_and(|type_id| self.aliases_on_the_js_backend(type_id))
+            || !read_late_on_js
             || (by_value && self.copy_applies(self.program.clone_sites.get(&argument)))
         {
             return false;
@@ -13621,6 +13628,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     })
             }
             Some(Type::Array(..) | Type::Dyn(..)) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the JS backend's `&` of a place of `type_id` is a `(base, key)`
+    /// PAIR over the place, read through when it is read — the scalar
+    /// primitives (`SCALAR_PRIMITIVE_NAMES`, `str` among them) and `bool`,
+    /// the transformer's `resolves_to_scalar_view_pointee`.
+    fn views_as_a_pair_on_the_js_backend(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, _)) => {
+                self.program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        vilan_core::type_::SCALAR_PRIMITIVE_NAMES.contains(&declaration.name)
+                    })
+            }
+            Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id == Some(*enum_id),
             _ => false,
         }
     }

@@ -13272,6 +13272,30 @@ fn f135_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same
     assert_eq!(compare(&staged, file), Verdict::Identical);
 }
 
+/// A `&` of a captured `mut` binding's SCALAR place (`count_of(&log.count,
+/// bump())`, a `bool`, a `str`, the binding itself) beside a later argument
+/// that writes the binding read the value where it stood natively (`0`),
+/// where the JS `(base, key)` pair reads it when the callee does (`1`) —
+/// spec §6.9's view, taken after the other arguments. The native copy of a
+/// scalar the JS backend views as a pair now waits as F129's aggregate copy
+/// does; an `Option`, a tuple and an enum (JS hands the value it held) are
+/// the controls and stay where they stand.
+#[test]
+fn a_scalar_view_of_a_captured_binding_is_taken_after_the_later_arguments_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_captured_binding_scalar_view.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_scalar_view.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "1\ntrue\nnew\nNone\n(1, \"b\")\ntrue\n5\n2\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// F132: an array literal whose position is a fixed array `[T; n]` one level
 /// inside another literal — a tuple slot of a struct field
 /// (`Holder { pair = ([5, 6, 7], true) }`), of an annotated `let` handed to a
