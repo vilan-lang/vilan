@@ -12,8 +12,10 @@
 
 #![cfg(unix)]
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod support;
@@ -78,6 +80,7 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
 
     let status = watcher.wait().expect("reap the watcher");
     let _ = std::fs::remove_dir_all(&dir);
+    let map = std::env::temp_dir().join(format!("vilan-watch-{}.mjs.map", watcher.id()));
 
     // Exiting *with a code* is itself the discriminator: without the handler
     // the default SIGINT disposition terminates the process by signal, so
@@ -92,6 +95,8 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
         "the session's temp script must not outlive it: {}",
         script.display()
     );
+    // E257 S6: nor its source map.
+    assert!(!map.exists(), "nor its map: {}", map.display());
 }
 
 /// A9: the `[build] run` hooks belong to the *round*, not to the session — a
@@ -134,5 +139,111 @@ fn build_hooks_run_once_per_watch_round() {
         .args(["-INT", &watcher.id().to_string()])
         .status();
     let _ = watcher.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every line the watcher writes, stdout and stderr together, as it writes it.
+fn lines_of(watcher: &mut std::process::Child) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    let stdout = watcher.stdout.take().expect("piped stdout");
+    let stderr = watcher.stderr.take().expect("piped stderr");
+    for stream in [
+        Box::new(stdout) as Box<dyn std::io::Read + Send>,
+        Box::new(stderr),
+    ] {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    receiver
+}
+
+/// Waits (bounded) for a line matching `wanted`, keeping every line read.
+fn wait_for_line(
+    lines: &mpsc::Receiver<String>,
+    seen: &mut Vec<String>,
+    label: &str,
+    wanted: impl Fn(&str) -> bool,
+) {
+    let deadline = Instant::now() + support::WATCH_LIVENESS;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) => {
+                let matched = wanted(&line);
+                seen.push(line);
+                if matched {
+                    return;
+                }
+            }
+            Err(_) => panic!("timed out waiting for {label}:\n{}", seen.join("\n")),
+        }
+    }
+}
+
+/// E257 S6: `vilan run --watch --inspect` — every round's program starts
+/// under node's inspector again (node announces it once per process), with
+/// the round's source map beside its script, so a panic in a later round
+/// reports `.vl` lines as `vilan run`'s does.
+#[test]
+fn inspect_under_watch_reopens_the_inspector_each_round() {
+    let dir = temp_package("inspect");
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args([
+            "run",
+            "--watch",
+            "--inspect=127.0.0.1:0",
+            dir.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the watcher");
+    let lines = lines_of(&mut watcher);
+    let mut seen = Vec::new();
+    let listening = |line: &str| line.starts_with("Debugger listening on ws://127.0.0.1:");
+    wait_for_line(&lines, &mut seen, "round one's inspector", listening);
+    wait_for_line(&lines, &mut seen, "round one's output", |line| {
+        line == "round"
+    });
+    let script = std::env::temp_dir().join(format!("vilan-watch-{}.mjs", watcher.id()));
+    let map = std::env::temp_dir().join(format!("vilan-watch-{}.mjs.map", watcher.id()));
+    assert!(
+        map.exists(),
+        "the round's script has its map: {}",
+        map.display()
+    );
+    let text = std::fs::read_to_string(&script).expect("the round's script");
+    assert!(
+        text.ends_with(&format!(
+            "//# sourceMappingURL=vilan-watch-{}.mjs.map\n",
+            watcher.id()
+        )),
+        "{text}"
+    );
+
+    // Round two panics: the inspector opens again, and the stack is `.vl`.
+    std::fs::write(
+        dir.join("src/main.vl"),
+        "import std::io::print;\n\nfun pick(rows: List<i32>, at: usize): i32 {\n\trows[at]\n}\n\nfun main() {\n\tprint(pick([1, 2], 5));\n}\n",
+    )
+    .unwrap();
+    wait_for_line(&lines, &mut seen, "round two's inspector", listening);
+    wait_for_line(&lines, &mut seen, "round two's frame", |line| {
+        line.trim_start().starts_with("at pick (") && line.contains("main.vl:4:")
+    });
+    assert_eq!(
+        seen.iter().filter(|line| listening(line)).count(),
+        2,
+        "one inspector per round:\n{}",
+        seen.join("\n")
+    );
+    support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
 }

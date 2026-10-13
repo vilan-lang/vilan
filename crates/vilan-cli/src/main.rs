@@ -260,7 +260,8 @@ enum Command {
         /// `127.0.0.1:9229`) with the program's source map, so a debugger
         /// that attaches — chrome://inspect, VS Code's "Attach to Node" —
         /// sets breakpoints in `.vl` files and shows `.vl` lines. Writes the
-        /// map whatever the preset says.
+        /// map whatever the preset says. Under `--watch` every round's server
+        /// starts under it again, at the same address.
         #[arg(long, value_name = "[HOST:]PORT", num_args = 0..=1, require_equals = true)]
         inspect: Option<Option<String>>,
         /// `--inspect`, paused before the program's first line until a
@@ -566,13 +567,6 @@ fn run_cli() -> ExitCode {
             inspect_brk,
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error::<ExitCode>(&message),
-            Ok(_) if watch && (inspect.is_some() || inspect_brk.is_some()) => {
-                report_error::<ExitCode>(concat!(
-                    "`--inspect` has no `--watch` yet: a watch round restarts the node ",
-                    "process, and the debugger attached to it with it. Run ",
-                    "`vilan run --inspect` and re-run it after an edit."
-                ))
-            }
             Ok(Backend::Rust) if inspect.is_some() || inspect_brk.is_some() => {
                 report_error::<ExitCode>(concat!(
                     "`--inspect` starts node's inspector, and `--backend rust` runs no node: ",
@@ -594,7 +588,7 @@ fn run_cli() -> ExitCode {
                     FORCE_SOURCE_MAPS.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 if watch {
-                    run_watch(file, args, no_hmr, hmr_port, entry)
+                    run_watch(file, args, no_hmr, hmr_port, entry, inspect)
                 } else {
                     run_once(file, &args, entry.as_deref(), backend, inspect.as_ref())
                 }
@@ -1354,6 +1348,8 @@ fn install_watch_interrupt_hook() {
     // (or a second install) refused.
     let _ = ctrlc::set_handler(|| {
         let _ = fs::remove_file(watch_script_path());
+        // The round's source map (E257 S6) goes with its script.
+        let _ = fs::remove_file(source_map_path(&watch_script_path()));
         std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
     });
 }
@@ -1556,12 +1552,18 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> Ex
 /// child only when the server bundle changed, and pushing `swap` / `css` / `error`
 /// to the browser instead of bouncing it. Otherwise this is the plain
 /// restart-the-server loop, byte-for-byte as before.
+///
+/// `inspect` (E257 S6): each round's Node child starts under the inspector,
+/// so a debugger re-attaches to the restarted server (VS Code's `restart`
+/// attach, or the `vilan` debug type's child-process attach) at the same
+/// address — the previous child is reaped first, so its port is free.
 fn run_watch(
     file: Option<PathBuf>,
     args: Vec<String>,
     no_hmr: bool,
     hmr_port: u16,
     entry: Option<String>,
+    inspect: Option<Inspect>,
 ) -> ExitCode {
     let roots = watch_roots(&file);
     let mut child: Option<ManagedChild> = None;
@@ -1581,6 +1583,7 @@ fn run_watch(
                     &mut state,
                     child.take(),
                     entry.as_deref(),
+                    inspect.as_ref(),
                 );
             }
             None => {
@@ -1595,7 +1598,8 @@ fn run_watch(
                     // writes it.
                     remove_watch_script();
                 }
-                child = build_and_spawn_run(file.clone(), &args, entry.as_deref());
+                child =
+                    build_and_spawn_run(file.clone(), &args, entry.as_deref(), inspect.as_ref());
             }
         }
         // **This path has no failure verdict to give**, so it reports none, and
@@ -1704,6 +1708,7 @@ fn hmr_round(
     state: &mut WatchState,
     child: Option<ManagedChild>,
     entry: Option<&str>,
+    inspect: Option<&Inspect>,
 ) -> Option<ManagedChild> {
     let (root, members, default_entry, hooks) = match resolve_project(file) {
         Ok(Project::Workspace {
@@ -1808,10 +1813,11 @@ fn hmr_round(
     // as a swap).
     let mut next = Vec::new();
     let mut other_assets: Vec<(String, BTreeMap<String, String>)> = Vec::new();
-    // E257 S5: each leg compiled this round with its source map (a node leg
-    // in the `debug` preset; an HMR-instrumented browser leg builds none), so
-    // a watch round writes the server's `dist/` script exactly as a one-shot
-    // `vilan build` does — the map beside it, the comment naming it.
+    // E257 S5: each leg compiled this round with its source map (the `debug`
+    // preset), so a watch round writes the server's `dist/` script exactly as a
+    // one-shot `vilan build` does — the map beside it, the comment naming it.
+    // A browser leg's map (S6) is shifted down by the shim's lines and named
+    // at the dev channel (`DevChannel::map_url`).
     let mut source_maps: Vec<(String, Option<vilan_core::source_map::SourceMap>)> = Vec::new();
     // B203's order: a leg whose artifact another leg reads compiles first, so
     // `next` — and therefore `dist/` — is written producer before consumer.
@@ -1887,12 +1893,23 @@ fn hmr_round(
         other_assets.push((unit.name.clone(), assembled));
         let bundle_path =
             dist_directory.join(format!("{}.{}", unit.name, platform.script_extension()));
-        let bundle = with_mapping_comment(
-            &bundle_path,
-            compiled.javascript,
-            compiled.source_map.is_some(),
-        );
-        source_maps.push((unit.name.clone(), compiled.source_map));
+        let mut source_map = compiled.source_map;
+        let bundle = if matches!(platform, Platform::Browser) {
+            // The shim goes in front of this bundle when `dist/` is written
+            // (`hmr::instrument`), so its map moves down by the shim's lines.
+            // The comment names the map absolutely, at the dev channel: the
+            // page's server does not serve maps, and a swap evaluates text.
+            // The URL is constant for the session, so the classifier's raw
+            // bytes still change only when the program does.
+            let url = source_map.as_mut().map(|map| {
+                map.shift_lines(hmr::shim_lines());
+                channel.map_url(&unit.name)
+            });
+            with_mapping_url(compiled.javascript, url.as_deref())
+        } else {
+            with_mapping_comment(&bundle_path, compiled.javascript, source_map.is_some())
+        };
+        source_maps.push((unit.name.clone(), source_map));
         next.push(hmr::LegArtifact {
             name: unit.name.clone(),
             is_browser: matches!(platform, Platform::Browser),
@@ -2088,7 +2105,10 @@ fn hmr_round(
                     ("VILAN_HMR_PORT", channel.port().to_string()),
                     ("VILAN_HMR_TOKEN", channel.token().to_string()),
                 ];
-                match spawn_watched_node(&script, args, Some(&root), &extra) {
+                // The round wrote the server's map beside it, or removed one.
+                let mapped = source_map_path(&root.join(&script)).is_file();
+                let flags = node_flags(mapped, inspect);
+                match spawn_watched_node(&script, &flags, args, Some(&root), &extra) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
                         eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
@@ -2181,6 +2201,8 @@ fn watch_script_path() -> PathBuf {
 /// (`windows-support.md` §5). A missing file is success.
 fn remove_watch_script() {
     let script = watch_script_path();
+    // Its map (E257 S6) goes with it; most rounds have one.
+    let _ = fs::remove_file(source_map_path(&script));
     if let Err(error) = fs::remove_file(&script)
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -2199,6 +2221,7 @@ fn build_and_spawn_run(
     file: Option<PathBuf>,
     args: &[String],
     entry: Option<&str>,
+    inspect: Option<&Inspect>,
 ) -> Option<ManagedChild> {
     let project = match resolve_project(file) {
         Ok(project) => project,
@@ -2211,14 +2234,21 @@ fn build_and_spawn_run(
     if run_build_hooks(&project, false).is_err() {
         return None;
     }
-    let launch =
-        |script: &Path, cwd: Option<&Path>| match spawn_watched_node(script, args, cwd, &[]) {
-            Ok(child) => Some(child),
-            Err(error) => {
-                eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
-                None
-            }
-        };
+    // `mapped`: the round wrote the script's map (E257 S6), so node reports
+    // a stack in `.vl` lines as `vilan run`'s does.
+    let launch = |script: &Path, cwd: Option<&Path>, mapped: bool| match spawn_watched_node(
+        script,
+        &node_flags(mapped, inspect),
+        args,
+        cwd,
+        &[],
+    ) {
+        Ok(child) => Some(child),
+        Err(error) => {
+            eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
+            None
+        }
+    };
     match project {
         Project::Single { unit, platform, .. } => {
             let platform = platform.unwrap_or_default();
@@ -2262,16 +2292,25 @@ fn build_and_spawn_run(
                 BuildReport::Stderr,
             )
             .ok()?;
+            // The script with its map beside it (E257 S6), the sources named by
+            // absolute URL as `vilan run`'s temp script names them.
             let script = watch_script_path();
-            if let Err(error) = write_run_script(&script, &compiled.javascript) {
-                eprintln!(
-                    "{} cannot write {}: {error}",
-                    paint::error_prefix(),
-                    script.display()
-                );
-                return None;
-            }
-            launch(&script, None)
+            let mapped = match write_run_script_with_map(
+                &script,
+                &compiled.javascript,
+                compiled.source_map.as_ref(),
+            ) {
+                Ok(mapped) => mapped,
+                Err(error) => {
+                    eprintln!(
+                        "{} cannot write {}: {error}",
+                        paint::error_prefix(),
+                        script.display()
+                    );
+                    return None;
+                }
+            };
+            launch(&script, None, mapped)
         }
         Project::Workspace {
             root,
@@ -2298,10 +2337,9 @@ fn build_and_spawn_run(
             {
                 return None;
             }
-            launch(
-                &artifact_path(Path::new("dist"), &server.name, NODE_LEG),
-                Some(&root),
-            )
+            let script = artifact_path(Path::new("dist"), &server.name, NODE_LEG);
+            let mapped = source_map_path(&root.join(&script)).is_file();
+            launch(&script, Some(&root), mapped)
         }
         Project::Library { name, .. } => {
             not_buildable_library(&name);
@@ -4686,12 +4724,6 @@ fn compile_unit(
     options.hmr = hmr;
     if FORCE_SOURCE_MAPS.load(std::sync::atomic::Ordering::Relaxed) {
         options.source_maps = true;
-    }
-    // An HMR-instrumented browser bundle is rewritten after the build (the dev
-    // shim goes in front of it), so a map of the build's text would point a
-    // debugger at the wrong lines; the watch loop writes none yet (E257's S6).
-    if hmr {
-        options.source_maps = false;
     }
     let split = chunks.filter(|_| unit.split);
     compile_to_js(
@@ -7873,13 +7905,28 @@ fn with_mapping_comment(script: &Path, javascript: String, map: bool) -> String 
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut javascript = javascript;
+    with_comment_line(
+        javascript,
+        &vilan_core::source_map::mapping_url_comment(&map_name),
+    )
+}
+
+/// `javascript` naming its map at an absolute `url` (E257 S6: an HMR browser
+/// bundle's, at the dev channel), or unchanged when there is none.
+fn with_mapping_url(javascript: String, url: Option<&str>) -> String {
+    match url {
+        Some(url) => with_comment_line(javascript, &format!("//# sourceMappingURL={url}\n")),
+        None => javascript,
+    }
+}
+
+fn with_comment_line(mut javascript: String, comment: &str) -> String {
     // A release build ends without a line break; the comment takes a line of
     // its own either way, after every line the map describes.
     if !javascript.is_empty() && !javascript.ends_with('\n') {
         javascript.push('\n');
     }
-    javascript.push_str(&vilan_core::source_map::mapping_url_comment(&map_name));
+    javascript.push_str(comment);
     javascript
 }
 
@@ -8063,13 +8110,14 @@ const WATCHING_ENV: &str = "VILAN_WATCHING";
 /// it is named for.
 fn spawn_watched_node(
     script: &Path,
+    node_flags: &[String],
     args: &[String],
     cwd: Option<&Path>,
     extra: &[(&str, String)],
 ) -> std::io::Result<ManagedChild> {
     let mut env: Vec<(&str, String)> = vec![(WATCHING_ENV, "1".to_string())];
     env.extend(extra.iter().map(|(name, value)| (*name, value.clone())));
-    spawn_node_with_env(script, &[], args, cwd, &env)
+    spawn_node_with_env(script, node_flags, args, cwd, &env)
 }
 
 fn spawn_node_with_env(

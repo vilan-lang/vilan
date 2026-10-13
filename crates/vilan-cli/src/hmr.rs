@@ -123,6 +123,15 @@ fn mint_token() -> String {
 /// The token rides here and nowhere else on the browser side (backlog E93): the
 /// bundle reaches the page over the page's OWN origin, which is exactly the
 /// property that keeps a hostile page from reading it.
+/// How many lines [`instrument`] writes in front of a bundle: the shim's own,
+/// and the line break after it. The substitutions are a port, a token, a
+/// version and a leg name, none of which holds a line break, so the count is
+/// the template's — and a browser leg's source map is shifted down by it
+/// (E257 S6) so its mappings land on the instrumented file's lines.
+pub fn shim_lines() -> usize {
+    SHIM.matches('\n').count() + 1
+}
+
 pub fn instrument(bundle: &str, port: u16, token: &str, version: u64, leg: &str) -> String {
     let shim = SHIM
         .replace("__VILAN_HMR_PORT__", &port.to_string())
@@ -240,8 +249,8 @@ pub struct DevChannel {
     port: u16,
     /// This run's token (backlog E93), minted at [`DevChannel::bind`] and
     /// required on every route. Shared with the accept loop's per-connection
-    /// threads; never written anywhere but the instrumented bundle and the Node
-    /// child's environment, and never printed.
+    /// threads; never written anywhere but the instrumented bundle (its shim, and
+    /// its source map's URL) and the Node child's environment, and never printed.
     token: Arc<str>,
     version: Arc<AtomicU64>,
     clients: Arc<Clients>,
@@ -291,6 +300,19 @@ impl DevChannel {
     /// reaches `POST /refresh`.
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Where a browser leg's source map is served (E257 S6): this channel's
+    /// `/bundle/<leg>.js.map`, the token on it as every route requires. The
+    /// instrumented bundle names it absolutely because the page's own server
+    /// serves the build's artifacts, not its maps (`serve_build` routes what
+    /// the build manifest lists), and because the swap re-evaluates the
+    /// bundle's TEXT, where a relative URL has nothing to resolve against.
+    pub fn map_url(&self, leg: &str) -> String {
+        format!(
+            "http://127.0.0.1:{}/bundle/{leg}.js.map?token={}",
+            self.port, self.token
+        )
     }
 
     /// This build's version — the counter embedded in the browser shim.
@@ -466,7 +488,14 @@ fn handle(
         return;
     }
     if let Some(name) = path.strip_prefix("/bundle/") {
-        serve_asset(&mut stream, &dist, name, "js");
+        // A bundle's source map beside it (E257 S6), which is what
+        // [`DevChannel::map_url`] names.
+        let ext = if name.ends_with(".js.map") {
+            "js.map"
+        } else {
+            "js"
+        };
+        serve_asset(&mut stream, &dist, name, ext);
         return;
     }
     if let Some(name) = path.strip_prefix("/asset/") {
@@ -634,10 +663,10 @@ fn serve_asset(stream: &mut TcpStream, dist: &std::path::Path, name: &str, ext: 
     }
     match std::fs::read(dist.join(name)) {
         Ok(bytes) => {
-            let content_type = if ext == "js" {
-                "text/javascript"
-            } else {
-                "text/css"
+            let content_type = match ext {
+                "js" => "text/javascript",
+                "js.map" => "application/json",
+                _ => "text/css",
             };
             let header = format!(
                 "HTTP/1.1 200 OK\r\n\
@@ -2173,6 +2202,20 @@ mod tests {
         let previous = recorded(&[("client.vl", 1), ("gone.vl", 2)]);
         let disk = on_disk(&[("client.vl", 1)]);
         assert!(!leg_is_current(&previous, disk));
+    }
+
+    #[test]
+    fn the_shim_lines_are_the_lines_instrument_writes_before_the_bundle() {
+        // E257 S6: a browser leg's source map is shifted by exactly this.
+        let instrumented = instrument("BUNDLE_FIRST_LINE\nrest", 54321, "a-token", 42, "client");
+        let before = &instrumented[..instrumented
+            .find("BUNDLE_FIRST_LINE")
+            .expect("the bundle follows the shim")];
+        assert_eq!(before.matches('\n').count(), shim_lines());
+        assert!(
+            before.ends_with('\n'),
+            "the bundle starts on a line of its own"
+        );
     }
 
     #[test]

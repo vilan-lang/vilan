@@ -251,27 +251,14 @@ fn a_failing_test_names_vl_lines_in_its_stack() {
     );
 }
 
-/// `--watch`, handed to a `vilan run --inspect` that refuses it before a
-/// round starts. A constant, not a literal in the test: `build_hooks`'s
-/// `every_test_that_drives_a_watch_session_is_in_the_group` reads a
-/// `"--watch"` in a test body as a live session, and this one never opens.
-const WATCH_REFUSED: &str = "--watch";
-
+/// `--inspect` starts node's inspector, so `--backend rust` (no node) refuses
+/// it. Under `--watch` it is accepted since E257 S6 — every round's server
+/// starts under the inspector again (`watch_lifecycle`'s
+/// `inspect_under_watch_reopens_the_inspector_each_round`).
 #[test]
-fn inspect_is_refused_with_watch_and_with_the_native_backend() {
+fn inspect_is_refused_with_the_native_backend() {
     let directory = project("refusals");
     write(&directory, "main.vl", PROGRAM);
-    let watched = vilan()
-        .args(["run", WATCH_REFUSED, "--inspect", "main.vl"])
-        .current_dir(&directory)
-        .output()
-        .expect("run vilan");
-    assert!(!watched.status.success());
-    assert!(
-        String::from_utf8_lossy(&watched.stderr).contains("`--inspect` has no `--watch` yet"),
-        "{}",
-        String::from_utf8_lossy(&watched.stderr)
-    );
     let native = vilan()
         .args(["run", "--backend", "rust", "--inspect", "main.vl"])
         .current_dir(&directory)
