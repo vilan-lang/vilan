@@ -34011,10 +34011,12 @@ impl<'src> Analyzer<'src> {
                         // thing `read()`'s value signature says it cannot do.
                         // Narrow on purpose: only a read is admitted here, never a
                         // place, because `c.push(9)` on a local is the in-place
-                        // mutation the whole convention exists for.
+                        // mutation the whole convention exists for. A read's
+                        // SPINE is the same read (F?3: `cell.read().items.
+                        // push(9)` grew the cell's list on JS, not natively).
                         let is_shared_read_receiver = parameter.convention == Convention::RefMut
                             && parameter.name == "self"
-                            && self.is_shared_read(*argument_id);
+                            && self.shared_read_spine_cell(*argument_id).is_some();
                         // B457 (R-e door (a)): a `Shared::read()` handed BY VALUE
                         // to a callee that can reach an in-place write of that
                         // cell would read its own write through the argument

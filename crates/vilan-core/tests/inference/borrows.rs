@@ -10913,6 +10913,34 @@ fn f135_a_read_beside_arguments_that_write_no_cell_of_its_own_is_not_copied() {
     );
 }
 
+#[test]
+fn a_mut_self_call_on_a_reads_field_does_not_write_the_cell() {
+    // B274 copied a bare `cell.read()` standing as a `&mut self` receiver;
+    // a SPINE through the read (`cell.read().items.push(9)`, an element
+    // `cell.read().rows[0].push(9)`) is the same read and had grown the
+    // cell's list on JS (1), not natively (0). Spec §6.7: `read()` copies.
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "struct Bag {\n",
+            "\titems: List<i32>,\n",
+            "\trows: List<List<i32>>,\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet cell = Shared::new(Bag { items = [], rows = [[]] });\n",
+            "\tcell.read().items.push(9);\n",
+            "\tcell.read().rows[0].push(9);\n",
+            "\tprint(cell.read().items.len());\n",
+            "\tprint(cell.read().rows[0].len());\n",
+            "\tcell.write().items.push(9);\n",
+            "\tprint(cell.read().items.len());\n",
+            "}\n",
+        ),
+        "0\n0\n1\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // B418 — a place or a `Shared` read reaching a binding THROUGH a branch copies
 // ---------------------------------------------------------------------------

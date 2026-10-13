@@ -68,6 +68,11 @@ written down.
 <!-- family: fix -->
 **F137 (native): a GENERIC enum's derived `PartialEq` builds — `[derive(PartialEq)] enum Slots<T> { Full(List<T>), Empty }` then `s == t` was refused "the rust backend does not emit a generic type instantiated at `any`"; JS printed `true`.** The generator's body is `match (self, other) { .. }`, and a tuple LITERAL records no type of its own (the item's bisect: the analyzer's record is absent, not open), so each variant pattern under it read the enum's arguments off the declaration's own parameters, which the impl's substitution does not bind. The native emitter now types a tuple-literal subject by its elements' settled types — which also covers a generic function's own `match (left, right)` over two generic enums. Pin: `f137_a_generic_enums_derived_equality_builds_on_both_backends` (`native/generic_enum_derived_equality.vl`, new: two parameters, a nested generic payload, a unit variant, a generic function's tuple match). Tracker F137.
 
+---
+
+<!-- family: miscompile -->
+**F?3 (JS): a `&mut self` call on a FIELD of a `Shared::read()` wrote the cell on JS — `cell.read().items.push(9)` and `cell.read().rows[0].push(9)` grew the cell's lists (`1`), where the native backend pushed into a copy (`0`), silently.** B274 copied a bare `cell.read()` standing as a `&mut self` receiver, the one position a value reaches a mutable binding implicitly; a spine through the read (a field, a tuple slot, an element) is the same read, and is now copied the same way (spec §6.7: `read()` copies). Mutate through `write()`. Estate: kolt 0, the website's `src` 0, the examples 0, the corpus 0 — no JS output moves. Pin: `borrows::a_mut_self_call_on_a_reads_field_does_not_write_the_cell`. Tracker F?3 (native-52's find).
+
 ## v0.49.0 — 2026-10-13
 
 <!-- family: breaking -->
