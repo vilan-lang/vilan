@@ -91,6 +91,9 @@ struct Config {
     /// trait it is used as (`: ~Source<i32>`). On by default; read per
     /// request, so it switches live.
     inlay_hints_abbreviate: bool,
+    /// E302: `vilan.inlayHints.chains` — `"every"` (the default) or
+    /// `"changes"`. Read per request, so it switches live.
+    inlay_hints_chains: keystroke::ChainHints,
     semantic_tokens_enabled: bool,
     completion_function_call: CompletionFunctionCall,
     /// E222: the client pairs a generic `<` ITSELF — it asked
@@ -109,6 +112,7 @@ impl Default for Config {
         Config {
             inlay_hints_enabled: true,
             inlay_hints_abbreviate: true,
+            inlay_hints_chains: keystroke::ChainHints::Every,
             semantic_tokens_enabled: true,
             completion_function_call: CompletionFunctionCall::Full,
             client_closes_generics: false,
@@ -136,6 +140,11 @@ impl Config {
             .and_then(|v| v.as_bool())
         {
             config.inlay_hints_abbreviate = abbreviate;
+        }
+        match root.pointer("/inlayHints/chains").and_then(|v| v.as_str()) {
+            Some("changes") => config.inlay_hints_chains = keystroke::ChainHints::Changes,
+            Some("every") => config.inlay_hints_chains = keystroke::ChainHints::Every,
+            _ => {}
         }
         if let Some(enabled) = root
             .pointer("/semanticTokens/enabled")
@@ -304,6 +313,12 @@ fn to_completion_item(
     // matters about this candidate is not its shape.
     if let Some(reason) = completion.internal {
         item.detail = Some(format!("internal — {reason}"));
+        item.sort_text = Some(format!("~~{}", item.label));
+    }
+    // B620: a head method that does not hand the element back survived the
+    // same prefix rule; it is shown last, saying where it belongs.
+    if let Some(reason) = completion.admission {
+        item.detail = Some(reason);
         item.sort_text = Some(format!("~~{}", item.label));
     }
     // E211: state the prefix this candidate replaces, and the text to filter it
@@ -851,6 +866,30 @@ mod config_tests {
     use serde_json::json;
 
     // Defaults preserve today's behavior: every provider on, full completion.
+    /// E302: `vilan.inlayHints.chains` reads `"every"` (the default) or
+    /// `"changes"`.
+    #[test]
+    fn config_parses_inlay_hints_chains() {
+        use crate::keystroke::ChainHints;
+        assert_eq!(Config::default().inlay_hints_chains, ChainHints::Every);
+        assert_eq!(
+            Config::from_settings(&json!({ "inlayHints": { "chains": "changes" } }))
+                .inlay_hints_chains,
+            ChainHints::Changes
+        );
+        assert_eq!(
+            Config::from_settings(&json!({ "vilan": { "inlayHints": { "chains": "every" } } }))
+                .inlay_hints_chains,
+            ChainHints::Every
+        );
+        // An unknown spelling keeps the default rather than flipping anything.
+        assert_eq!(
+            Config::from_settings(&json!({ "inlayHints": { "chains": "some" } }))
+                .inlay_hints_chains,
+            ChainHints::Every
+        );
+    }
+
     /// E227 (Q4): `vilan.inlayHints.abbreviate` is on unless a client says
     /// otherwise, in either payload shape, and a wrong-typed value keeps the
     /// default rather than flipping it.
@@ -1053,6 +1092,7 @@ mod completion_item_tests {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: None,
         }
     }
@@ -1194,6 +1234,7 @@ mod completion_item_tests {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: None,
         }
     }
@@ -1214,6 +1255,7 @@ mod completion_item_tests {
             filter_text: None,
             replace_span: None,
             internal: None,
+            admission: None,
             needs_import: Some(AutoImport {
                 module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },
@@ -2599,6 +2641,39 @@ fn attach_twin_legs(documents: &DashMap<Url, Document>, worlds: &DashMap<PathBuf
             document.install_twin_legs(legs);
         }
     }
+}
+
+/// E301: an inlay hint's label as PARTS — the `: ` (or ` as `) prefix, the
+/// type's head name, which resolves to its definition, and the rest — or the
+/// plain string where there is no name to click (an abbreviation's
+/// `~Source<..>`, a primitive written with punctuation first).
+fn inlay_hint_label(label: &str, abbreviated: bool) -> InlayHintLabel {
+    let prefix_length = if label.starts_with(": ") {
+        2
+    } else if label.starts_with(" as ") {
+        4
+    } else {
+        0
+    };
+    let (prefix, rest) = label.split_at(prefix_length);
+    let head_length = rest
+        .find(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .unwrap_or(rest.len());
+    if abbreviated || prefix_length == 0 || head_length == 0 {
+        return InlayHintLabel::String(label.to_string());
+    }
+    let (head, tail) = rest.split_at(head_length);
+    let part = |value: &str| InlayHintLabelPart {
+        value: value.to_string(),
+        tooltip: None,
+        location: None,
+        command: None,
+    };
+    let mut parts = vec![part(prefix), part(head)];
+    if !tail.is_empty() {
+        parts.push(part(tail));
+    }
+    InlayHintLabel::LabelParts(parts)
 }
 
 /// M104: serve the open document at `uri` (whose buffer reads `text`) from a
@@ -4090,7 +4165,13 @@ fn server_capabilities() -> ServerCapabilities {
             trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
             ..Default::default()
         }),
-        inlay_hint_provider: Some(OneOf::Left(true)),
+        // E301: the tooltip and the type name's location resolve lazily.
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            },
+        ))),
         // E2: precision highlighting from the analyzed program. The
         // legend is index-aligned with `document::TokenKind`.
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
@@ -4442,7 +4523,8 @@ impl LanguageServer for Backend {
                     .config
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let moved = current.inlay_hints_abbreviate != config.inlay_hints_abbreviate;
+                let moved = current.inlay_hints_abbreviate != config.inlay_hints_abbreviate
+                    || current.inlay_hints_chains != config.inlay_hints_chains;
                 *current = config;
                 moved
             };
@@ -5017,50 +5099,122 @@ impl LanguageServer for Backend {
             {
                 return Ok(None);
             }
-            let abbreviate = self
-                .config
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .inlay_hints_abbreviate;
+            let (abbreviate, chains) = {
+                let config = self
+                    .config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (config.inlay_hints_abbreviate, config.inlay_hints_chains)
+            };
             let uri = params.text_document.uri;
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
             let range = params.range;
-            let hints = document
-                // E232 (door 2): the landed hints, each following the edits
-                // since its analysis — the edited line's included, so the line
-                // no longer jumps the moment typing starts (E121 withheld them
-                // there). The offsets are already live-space, so one index
-                // answers both the hint's position and the viewport compare.
-                //
-                // E227: a `[hint]`ed type shows by the trait it is used as
-                // (`: ~Source<i32>`), with the full type as its tooltip. The
-                // abbreviated hint carries no `text_edits`, ever: an editor that
-                // inserts a hint on double-click must never write `~Source<..>`
-                // into a file — it does not lex.
-                .keystroke_hints_served(self.schedule.dependency_moved(&uri), abbreviate)
-                .into_iter()
-                .filter_map(|hint| {
-                    let position = document.line_index.position(hint.offset);
-                    let visible = position >= range.start && position <= range.end;
-                    visible.then_some(InlayHint {
-                        position,
-                        label: InlayHintLabel::String(hint.label),
-                        kind: Some(InlayHintKind::TYPE),
-                        text_edits: None,
-                        tooltip: hint.full.map(|full| {
-                            // `: T` for a binding, ` as T` for a stage (E278).
-                            let full = full.trim_start_matches(": ").trim_start_matches(" as ");
-                            InlayHintTooltip::String(full.to_string())
-                        }),
-                        padding_left: Some(false),
-                        padding_right: Some(false),
-                        data: None,
-                    })
+            let hints = keystroke::chain_hints(
+                document
+                    // E232 (door 2): the landed hints, each following the edits
+                    // since its analysis — the edited line's included, so the line
+                    // no longer jumps the moment typing starts (E121 withheld them
+                    // there). The offsets are already live-space, so one index
+                    // answers both the hint's position and the viewport compare.
+                    //
+                    // E227: a `[hint]`ed type shows by the trait it is used as
+                    // (`: ~Source<i32>`), with the full type as its tooltip. The
+                    // abbreviated hint carries no `text_edits`, ever: an editor that
+                    // inserts a hint on double-click must never write `~Source<..>`
+                    // into a file — it does not lex.
+                    .keystroke_hints_served(self.schedule.dependency_moved(&uri), abbreviate),
+                // E302: `"changes"` keeps a chain's stage only where its type moves.
+                chains,
+            )
+            .into_iter()
+            .filter_map(|hint| {
+                let position = document.line_index.position(hint.offset);
+                let visible = position >= range.start && position <= range.end;
+                // E301: the tooltip and the type name's target are
+                // resolved when the hint is hovered (`inlayHint/resolve`),
+                // off this keystroke path; what the resolve needs rides in
+                // `data`.
+                let data = serde_json::json!({
+                    "uri": uri.as_str(),
+                    "line": position.line,
+                    "character": position.character,
+                    "label": hint.label,
+                    "full": hint.full,
+                });
+                visible.then_some(InlayHint {
+                    position,
+                    label: inlay_hint_label(&hint.label, hint.full.is_some()),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    // E227: an abbreviation's full type, until resolved.
+                    tooltip: hint.full.map(|full| {
+                        // `: T` for a binding, ` as T` for a stage (E278).
+                        let full = full.trim_start_matches(": ").trim_start_matches(" as ");
+                        InlayHintTooltip::String(full.to_string())
+                    }),
+                    padding_left: Some(false),
+                    padding_right: Some(false),
+                    data: Some(data),
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
             Ok(Some(hints))
+        })
+    }
+
+    /// E301: a hovered inlay hint's tooltip — what the binding's NAME would
+    /// hover, as markdown with a fenced block — and its type name's
+    /// definition, from the document's landed analysis.
+    async fn inlay_hint_resolve(&self, mut hint: InlayHint) -> Result<InlayHint> {
+        let unresolved = hint.clone();
+        self.fenced("inlay_hint_resolve", Ok(unresolved), || {
+            let Some(data) = hint.data.as_ref() else {
+                return Ok(hint);
+            };
+            let field = |name: &str| data.get(name);
+            let (Some(uri), Some(line), Some(character), Some(label)) = (
+                field("uri")
+                    .and_then(|value| value.as_str())
+                    .and_then(|uri| Url::parse(uri).ok()),
+                field("line").and_then(serde_json::Value::as_u64),
+                field("character").and_then(serde_json::Value::as_u64),
+                field("label").and_then(|value| value.as_str()),
+            ) else {
+                return Ok(hint);
+            };
+            let full = field("full").and_then(|value| value.as_str());
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(hint);
+            };
+            let position = Position::new(line as u32, character as u32);
+            let Some(offset) = document.request_offset(position) else {
+                return Ok(hint);
+            };
+            let (markdown, target) = document.inlay_hint_detail(offset, label, full);
+            let tooltip = InlayHintTooltip::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown,
+            });
+            let location =
+                target.and_then(|(source, span)| self.location_for(&document, &uri, source, span));
+            if let InlayHintLabel::LabelParts(parts) = &mut hint.label {
+                for part in parts.iter_mut() {
+                    part.tooltip = Some(InlayHintLabelPartTooltip::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: match &tooltip {
+                            InlayHintTooltip::MarkupContent(content) => content.value.clone(),
+                            InlayHintTooltip::String(text) => text.clone(),
+                        },
+                    }));
+                }
+                if let Some(head) = parts.get_mut(1) {
+                    head.location = location;
+                }
+            }
+            hint.tooltip = Some(tooltip);
+            Ok(hint)
         })
     }
 
@@ -6860,13 +7014,17 @@ mod snapshot_consistency_tests {
                 .find(|hint| hint.position.line == 1)
                 .expect("the hint on `taken`")
         };
+        // E301: a label is a string or its parts, read as the text shown; a
+        // tooltip is plain or markdown, read as its text.
         let label = |hint: &InlayHint| match &hint.label {
             InlayHintLabel::String(label) => label.clone(),
-            InlayHintLabel::LabelParts(_) => panic!("a plain label"),
+            InlayHintLabel::LabelParts(parts) => {
+                parts.iter().map(|part| part.value.as_str()).collect()
+            }
         };
         let tooltip = |hint: &InlayHint| match &hint.tooltip {
             Some(InlayHintTooltip::String(tooltip)) => Some(tooltip.clone()),
-            Some(InlayHintTooltip::MarkupContent(_)) => panic!("a plain tooltip"),
+            Some(InlayHintTooltip::MarkupContent(content)) => Some(content.value.clone()),
             None => None,
         };
         let hint = taken(backend.inlay_hint(params.clone()).await.unwrap().unwrap());
@@ -6876,6 +7034,20 @@ mod snapshot_consistency_tests {
             Some("Taken<Mapped<ListIterator<i32>, i32, i32>, i32>")
         );
         assert!(hint.text_edits.is_none());
+        // E301: resolved, the abbreviation's tooltip is markdown whose first
+        // block is the full type (E278's rule), the binding's hover under it.
+        let resolved = backend.inlay_hint_resolve(hint.clone()).await.unwrap();
+        let markdown = tooltip(&resolved).expect("a resolved tooltip");
+        assert!(
+            markdown.starts_with(
+                "```vilan\nTaken<Mapped<ListIterator<i32>, i32, i32>, i32>\n```\n\n```vilan\nlet taken:"
+            ),
+            "{markdown}"
+        );
+        assert!(matches!(
+            resolved.tooltip,
+            Some(InlayHintTooltip::MarkupContent(_))
+        ));
         backend
             .config
             .write()
@@ -6887,6 +7059,25 @@ mod snapshot_consistency_tests {
             ": Taken<Mapped<ListIterator<i32>, i32, i32>, i32>"
         );
         assert!(tooltip(&hint).is_none() && hint.text_edits.is_none());
+        // E301: the full label is parts, and its type NAME resolves to the
+        // type's definition.
+        let InlayHintLabel::LabelParts(parts) = &hint.label else {
+            panic!("a full type's label is parts");
+        };
+        assert_eq!(parts[1].value, "Taken");
+        let resolved = backend.inlay_hint_resolve(hint.clone()).await.unwrap();
+        let InlayHintLabel::LabelParts(parts) = &resolved.label else {
+            panic!("parts, resolved");
+        };
+        let target = parts[1]
+            .location
+            .as_ref()
+            .expect("the type name's definition");
+        assert!(target.uri.path().ends_with("iterator.vl"), "{target:?}");
+        assert!(
+            tooltip(&resolved)
+                .is_some_and(|markdown| markdown.starts_with("```vilan\nlet taken: Taken<"))
+        );
     }
 
     // --- Handler wiring: the S1 index switch, pinned per handler ------------
@@ -7995,7 +8186,14 @@ async fn main() {
         println!("{}", version_line());
         return;
     }
+    // N176: one malloc arena, not eight per core (glibc only).
+    memory::limit_arenas();
     apply_base_cache_budget_from_env();
+    // std-prefix P2: a world this server must BUILD (an S1 hot-set or
+    // canonical miss — a keystroke in another file, a pause's union leg)
+    // takes std from the prefix the session's entries pin, instead of
+    // draining it again. `VILAN_STD_PREFIX=off` turns it off.
+    vilan_core::incremental::set_std_prefix_layering_default(true);
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     // E222: the one custom request, beside the standard surface.
@@ -11040,6 +11238,78 @@ mod dead_item_clock_tests {
             "the package's last document closed: its entries stop sizing the \
              budget in the same breath",
         );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// std-prefix P2 (E294's pinned half): **a world the session must rebuild
+    /// takes std from the prefix its entries pin.** The package clock's union
+    /// analyzes both declared entries; with the prefix layered under the
+    /// world build, the client's world (std + `shared.vl`) is built over the
+    /// std-only prefix and the entry PINS it (sized into the budget, never its
+    /// victim; the server's std-only world is std itself, built and stored as
+    /// before). An edit to `shared.vl` stales the client's world, and the
+    /// union that lands again rebuilt it over the pinned prefix — std was not
+    /// drained a second time. The pins go with the package's last document.
+    #[tokio::test]
+    async fn a_world_rebuilt_after_an_edit_takes_std_from_the_pinned_prefix() {
+        vilan_core::incremental::set_std_prefix_layering(Some(true));
+        let (directory, shared) = workspace();
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union — both entries' legs analyzed",
+        );
+        let (pinned, held) = vilan_core::analyzer::base_cache_pinned_prefixes();
+        assert!(
+            pinned >= 1 && held == pinned,
+            "the entries pin the prefix their worlds were built over: {pinned} pinned, \
+             {held} held",
+        );
+        let (builds_before, hits_before) = vilan_core::analyzer::base_cache_prefix_stats();
+        assert!(
+            builds_before >= 1,
+            "the client leg (std + `shared.vl`) was a layered build: {builds_before}"
+        );
+
+        server
+            .did_change(whole_file_change(
+                &shared,
+                2,
+                &format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n"),
+            ))
+            .await;
+        assert!(
+            wait_for_grays(server, &shared, false).await,
+            "the edit withdraws the paint",
+        );
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "and the union lands again",
+        );
+        let (builds_after, hits_after) = vilan_core::analyzer::base_cache_prefix_stats();
+        assert!(
+            builds_after > builds_before && hits_after > hits_before,
+            "the entries' worlds, stale after the edit, were rebuilt over the pinned \
+             prefix: builds {builds_before} -> {builds_after}, prefix hits {hits_before} \
+             -> {hits_after}",
+        );
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: shared.clone(),
+                },
+            })
+            .await;
+        assert_eq!(
+            vilan_core::analyzer::base_cache_pinned_prefixes().0,
+            0,
+            "the package's last document closed: its entries unpin their prefixes",
+        );
+        vilan_core::incremental::set_std_prefix_layering(None);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

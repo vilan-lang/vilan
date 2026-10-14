@@ -316,6 +316,10 @@ fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
         // only what `pkg::<the open file>` means; a file the manifest declares is
         // a program whichever file the editor happens to be showing.
         let declared_entries = vilan_core::platform_color::declared_entry_module_names(&manifest);
+        // E313: a hook's output renders no per-file hover rows.
+        workspace.generated_root = manifest
+            .generated_root()
+            .map(|generated| vilan_core::util::canonical_path(root.join(generated)));
         workspace.entry_mode =
             if vilan_core::platform_color::is_package_module(&pkg_root, &manifest, entry_path) {
                 vilan_core::EntryMode::OpenFile { declared_entries }
@@ -371,7 +375,10 @@ fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
             .max_by_key(|layer| layer.root.as_os_str().len())
             .map(|layer| layer.root.clone())
             .unwrap_or(spec.base_root);
-        let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        let (mut workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        workspace.generated_root = manifest
+            .generated_root()
+            .map(|generated| vilan_core::util::canonical_path(root.join(generated)));
         return ProjectContext {
             platform: None,
             shared_platforms: Vec::new(),
@@ -3787,6 +3794,17 @@ impl Document {
         if let Some(rendered) = self.namespace_hover(program, offset) {
             return Some(rendered);
         }
+        // E298: any other module segment answers for ITS module — and an
+        // ORIGIN (`pkg::`, a dependency's name) that resolution records no
+        // reference for, read off the word before its `::`.
+        if let Some(module) = self
+            .type_reference_at(program, offset)
+            .and_then(|(module, _)| module)
+            .or_else(|| self.origin_segment_at(program, offset))
+            && let Some(rendered) = self.module_hover(program, module)
+        {
+            return Some(rendered);
+        }
         // A variant PATTERN in a `match` leg or an `is`: the variant of the
         // matched value's type (E241), not the bare enum's name.
         if let Some(rendered) = self.pattern_hover(program, offset) {
@@ -3798,6 +3816,12 @@ impl Document {
         // enclosing struct's whole block — the answer for the type's NAME, and
         // a restatement of the screen for a caret on one of its fields.
         if let Some(rendered) = self.field_declaration_hover(program, offset) {
+            return Some(rendered);
+        }
+        // E312: a MACRO — a derive in `[derive(..)]` answers what it writes
+        // for this item and the trait it implements; any other macro its
+        // signature, under its `mod` line.
+        if let Some(rendered) = self.macro_hover(program, offset) {
             return Some(rendered);
         }
         // A type PARAMETER or a TRAIT named in type position (E240): the
@@ -3834,6 +3858,17 @@ impl Document {
             return Some(rendered);
         }
         let id = self.entity_at(offset)?;
+        // E305: an element head's NAME — the event of `on:click(..)`, the
+        // attribute of `title(..)` — is a string the desugar minted from the
+        // written token, and answers for the link it lowers to.
+        let id = self.markup_name_link(program, id).unwrap_or(id);
+        // E298: a module segment in VALUE position (`model::global()`'s
+        // `model`) answers as it does in an import.
+        if let Some(Expr::Module(module)) = program.entity_map.get(&id)
+            && let Some(rendered) = self.module_hover(program, *module)
+        {
+            return Some(rendered);
+        }
         // A function (or requirement-carrying binding): the full signature —
         // and, at a GENERIC call site, the signature that call reached under it
         // (E206). The site's label is keyed by the id under the cursor, so no
@@ -3851,6 +3886,11 @@ impl Document {
                     resolved.map(String::as_str),
                 ));
             }
+        }
+        // E306: an enum VARIANT in value position (`style::Overflow::Hidden`,
+        // `Shape::Circle(1.0)`'s head): the variant line and the enum's chunk.
+        if let Some(rendered) = self.variant_value_hover(program, id) {
+            return Some(rendered);
         }
         // A struct/enum name in value position (a constructor, a variant).
         if let Some(definition) = self.type_declaration_target(program, id)
@@ -3898,6 +3938,32 @@ impl Document {
         blocks.rendered()
     }
 
+    /// E305: the head LINK a markup name lowers to. `on:click(|e| ..)` is
+    /// `.on_event("click", |e| ..)` and `title("Search")` is
+    /// `.attr("title", "Search")` (`elements.rs`), and the name's string
+    /// literal spans the written NAME — no quote opens it, which is what
+    /// tells it from a string the reader wrote. Its hover is the method's:
+    /// the event hook or `attr`, with its `///`, exactly as the `on:` before
+    /// it answers. `None` for anything else.
+    fn markup_name_link(&self, program: &Program, id: Id) -> Option<Id> {
+        let Some(Expr::String(_)) = program.entity_map.get(&id) else {
+            return None;
+        };
+        let span = program.span_map.get(&id)?.into_range();
+        let first = self.analyzed_text().as_bytes().get(span.start).copied()?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        let analysis = self.analysis(program);
+        self.entity_spans
+            .iter()
+            .filter(|(start, end, link)| *link != id && *start <= span.start && span.end <= *end)
+            .filter(|(_, _, link)| matches!(program.entity_map.get(link), Some(Expr::Call(_))))
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(_, _, link)| *link)
+            .filter(|link| analysis.function_target(*link).is_some())
+    }
+
     /// The hover for an identifier that spells an `as` alias — its own name
     /// carrying the target's signature, TypeScript's `(alias) …` line (B264,
     /// ruled 2026-09-07 with TS as the reference; `tsserver` answers
@@ -3932,7 +3998,11 @@ impl Document {
             declaration
         };
         let mut out = HoverBlocks::new();
-        out.push_code(Block::Signature, &format!("(alias) {declaration}"));
+        let declaration = match self.function_mod_line(program, target) {
+            Some(line) => format!("{line}\n(alias) {declaration}"),
+            None => format!("(alias) {declaration}"),
+        };
+        out.push_code(Block::Signature, &declaration);
         out.push_some(Block::Doc, self.analysis(program).doc_comment_of(target));
         out.push_some(
             Block::Platform,
@@ -3950,12 +4020,42 @@ impl Document {
     /// bare enum (`Option`, unfenced): the enum's name for a caret on the
     /// variant, and without the arguments the match is over.
     fn pattern_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        // E313: this document's rows only — a view of a world reads the
+        // world's program, whose rows are every file's.
         let site = program.pattern_labels.iter().find(|site| {
             let range = site.name_span.into_range();
-            range.start <= offset && offset < range.end
+            site.source == self.focus && range.start <= offset && offset < range.end
         })?;
         let mut out = HoverBlocks::new();
-        out.push_code(Block::Signature, &site.label);
+        // E300 (RULED shape): one fence of up to three lines — what the
+        // `match` (or `is`) is over, the variant as this leg binds it, and the
+        // bindings the leg introduces, as their declarations read.
+        let subject = if site.matched {
+            match site.label.strip_prefix("_: ") {
+                Some(whole) => Some(whole.to_string()),
+                None => site
+                    .label
+                    .split_once("::")
+                    .map(|(head, _)| head.to_string()),
+            }
+        } else {
+            None
+        };
+        let captures = self.pattern_captures(program, site.name_span);
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(subject) = &subject {
+            lines.push(format!("match on {subject}"));
+        }
+        lines.push(site.label.clone());
+        lines.extend(captures.iter().map(|(line, _)| line.clone()));
+        out.push_code(Block::Signature, &lines.join("\n"));
+        // E227: a capture whose inlay hint abbreviates its type says so, so the
+        // hint and the hover agree.
+        for (_, capture) in &captures {
+            if let Some(hint) = program.hint_labels.get(capture) {
+                out.push(Block::SignatureNote, format!("Shown as `{}`", hint.label));
+            }
+        }
         let variant_entity = site.variant.and_then(|(enum_id, variant_index)| {
             let enumeration = program.enums.get(&enum_id)?;
             let name = enumeration.variants.get(variant_index)?.name;
@@ -3973,6 +4073,60 @@ impl Document {
         out.rendered()
     }
 
+    /// E300: the bindings a variant pattern introduces — every `let`/`mut`
+    /// capture between the parentheses that follow the variant's name, as its
+    /// declaration reads (`let root: RemoteStoreSome<Global>`), in written
+    /// order, with its binding id. Empty for a variant with no payload, a `_`
+    /// and a literal.
+    fn pattern_captures(&self, program: &Program, name_span: Span) -> Vec<(String, Id)> {
+        let text = self.analyzed_text();
+        let after = name_span.into_range().end;
+        if text.as_bytes().get(after) != Some(&b'(') {
+            return Vec::new();
+        }
+        let mut depth = 0usize;
+        let mut close = None;
+        for (index, byte) in text.as_bytes()[after..].iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(after + index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Vec::new();
+        };
+        let source_of = program.source_lookup();
+        let mut captures: Vec<(usize, String, Id)> = program
+            .variables
+            .iter()
+            .filter(|(id, variable)| {
+                let range = variable.name_span.into_range();
+                source_of.of(**id) == Some(self.focus) && after < range.start && range.end <= close
+            })
+            .filter_map(|(id, variable)| {
+                let type_label = program.expr_types.get(id)?;
+                let keyword = if variable.mutable { "mut" } else { "let" };
+                Some((
+                    variable.name_span.start,
+                    format!("{keyword} {}: {type_label}", variable.name),
+                    *id,
+                ))
+            })
+            .collect();
+        captures.sort_by_key(|(start, _, _)| *start);
+        captures
+            .into_iter()
+            .map(|(_, line, id)| (line, id))
+            .collect()
+    }
+
     /// E240's hover for a type-position name: a TYPE PARAMETER — `type I:
     /// Read<U>`, then the declaration that introduces it — or a TRAIT, as its
     /// required members at the arguments written, then its `///`. Both used
@@ -3983,7 +4137,7 @@ impl Document {
             .iter()
             .filter(|hover| {
                 let range = hover.span.into_range();
-                range.start <= offset && offset < range.end
+                hover.source == self.focus && range.start <= offset && offset < range.end
             })
             .min_by_key(|hover| hover.span.into_range().len())?;
         let named_trait = self
@@ -3996,7 +4150,31 @@ impl Document {
             Block::Diagnostic,
             named_trait.and_then(|definition| internal_lead(program, definition)),
         );
-        out.push_code(Block::Signature, &hover.code);
+        // E310: a trait says where it lives (E299's line) above its block.
+        let code = match named_trait
+            .and_then(|definition| self.declaring_module_path(program, definition))
+        {
+            Some(path) => format!("mod {path}\n{}", hover.code),
+            None => hover.code.clone(),
+        };
+        out.push_code(Block::Signature, &code);
+        // E310: and what can be passed where it is written.
+        if !hover.implemented_by.is_empty() {
+            let total = hover.implemented_by.len();
+            let mut shown: Vec<String> = hover
+                .implemented_by
+                .iter()
+                .take(MODULE_PREVIEW_CAP)
+                .map(|subject| format!("`{subject}`"))
+                .collect();
+            if total > MODULE_PREVIEW_CAP {
+                shown.push(format!("and {} more", total - MODULE_PREVIEW_CAP));
+            }
+            out.push(
+                Block::Preview,
+                format!("Implemented by {} ({total} in reach).", shown.join(", ")),
+            );
+        }
         out.push_some(
             Block::SignatureNote,
             hover
@@ -4008,6 +4186,19 @@ impl Document {
             Block::Doc,
             named_trait.and_then(|definition| self.analysis(program).doc_comment_of(definition)),
         );
+        // E312: an IMPORT leaf that names a trait AND the derive macro of
+        // that name binds both; the second facet is said under the first.
+        if let Some(definition) = named_trait
+            && self.in_an_import(offset)
+            && let Some(name) = crate::references::name_of(program, Definition::Entity(definition))
+            && let Some(macro_id) = self.macro_named(program, name)
+        {
+            let mut also = format!("Also a derive macro: `[derive({name})]`.");
+            if let Some(doc) = self.analysis(program).doc_comment_of(macro_id) {
+                also.push_str(&format!("\n\n{doc}"));
+            }
+            out.push(Block::Doc, also);
+        }
         out.rendered()
     }
 
@@ -4121,6 +4312,440 @@ impl Document {
         None
     }
 
+    /// E299: the `mod` line above a FUNCTION's fence — its declaring
+    /// module's path ([`Self::declaring_module_path`]). `None` for anything
+    /// that is not a function (a type's, a constant's and a variable's hovers
+    /// keep their shape — E299's scope) and for a derive's generated code,
+    /// which no module declares.
+    fn function_mod_line(&self, program: &Program, declaration: Id) -> Option<String> {
+        if !(program.functions.contains_key(&declaration)
+            || program.external_functions.contains_key(&declaration))
+        {
+            return None;
+        }
+        Some(format!(
+            "mod {}",
+            self.declaring_module_path(program, declaration)?
+        ))
+    }
+
+    /// The path of the module that DECLARES `entity`, as an import spells it
+    /// (E299/E298): `pkg::lib::overlay`, `std::web::dom`, a dependency's
+    /// `name::…`. The entry file is not a module entity; it is the module its
+    /// siblings reach as `pkg::<file>` (`pkg::client`), or `pkg` itself when
+    /// the document belongs to no package.
+    fn declaring_module_path(&self, program: &Program, entity: Id) -> Option<String> {
+        let source = program.source_of(entity)?;
+        if source == DERIVED_SOURCE {
+            return None;
+        }
+        if source == SourceId(0) {
+            let entry = program.canonical_sources.first()?;
+            let Some(relative) = self
+                .package_root()
+                .and_then(|root| entry.strip_prefix(root).ok())
+            else {
+                return Some("pkg".to_string());
+            };
+            let mut segments: Vec<String> = relative
+                .with_extension("")
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            segments.insert(0, "pkg".to_string());
+            return Some(segments.join("::"));
+        }
+        // A file's module is the one module entity attributed to its source
+        // (the bodiless namespaces are attributed to the entry, handled above).
+        let module = program
+            .modules
+            .keys()
+            .copied()
+            .find(|module| program.source_of(*module) == Some(source))?;
+        module_path(program, module)
+    }
+
+    /// E312: the hover for a MACRO named under `offset` — a derive in
+    /// `[derive(X)]`, a macro attribute, an import leaf naming only a macro, a
+    /// macro call. A derive answers with what it WRITES for this item: its
+    /// `mod` line and the generated impls' heads (`impl Account with
+    /// Storable`, one line each), the implemented trait's `///` and the
+    /// macro's own, and the macro facet as a note (`derive macro: macro fun
+    /// Storable(item: Item): Source`); a derive whose expansion was refused
+    /// leads with the refusal. Any other macro answers its signature under its
+    /// `mod` line, and its `///`.
+    fn macro_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (Some(macro_id), signature) = self.type_reference_at(program, offset)? else {
+            return None;
+        };
+        if !matches!(program.entity_map.get(&macro_id), Some(Expr::Macro)) {
+            return None;
+        }
+        let analysis = self.analysis(program);
+        let mod_line = self
+            .declaring_module_path(program, macro_id)
+            .map(|path| format!("mod {path}\n"))
+            .unwrap_or_default();
+        // The derive's own expansion: the generated runs whose attribute is
+        // the name under the caret, in this file.
+        let origins: Vec<(&std::ops::Range<u32>, Span)> = program
+            .derived_origins
+            .iter()
+            .filter(|(_, span, source)| {
+                *source == self.focus && span.start <= offset && offset < span.end
+            })
+            .map(|(range, span, _)| (range, *span))
+            .collect();
+        let generated: Vec<&vilan_core::analyzer::Implementation> = program
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                origins
+                    .iter()
+                    .any(|(range, _)| range.contains(&implementation.impl_id.0))
+            })
+            .collect();
+        let mut out = HoverBlocks::new();
+        // A refused derive leads with what refused it (E213's rule): the
+        // file's diagnostics at the derive's name.
+        if let Some(name_span) = origins
+            .first()
+            .map(|(_, span)| *span)
+            .or_else(|| self.text_word_span(offset))
+            && self
+                .analyzed_text()
+                .get(..name_span.start)
+                .is_some_and(|before| {
+                    before.trim_end().ends_with("derive(") || before.trim_end().ends_with(',')
+                })
+        {
+            for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+                if self
+                    .diagnostic_sources
+                    .get(index)
+                    .copied()
+                    .unwrap_or(SourceId(0))
+                    == self.focus
+                    && spans_overlap(diagnostic.span, name_span)
+                {
+                    out.push(Block::Diagnostic, diagnostic.msg.clone());
+                }
+            }
+        }
+        if generated.is_empty() {
+            out.push_code(Block::Signature, &format!("{mod_line}{signature}"));
+            out.push_some(Block::Doc, analysis.doc_comment_of(macro_id));
+            return out.rendered();
+        }
+        let heads: Vec<String> = generated
+            .iter()
+            .filter_map(|implementation| {
+                program.member_headers.get(&implementation.impl_id).cloned()
+            })
+            .collect();
+        out.push_code(Block::Signature, &format!("{mod_line}{}", heads.join("\n")));
+        out.push(Block::SignatureNote, format!("derive macro: `{signature}`"));
+        // The trait the reader is opting into: the generated impl's trait of
+        // the derive's own name, else the first it implements.
+        let name = self
+            .analyzed_text()
+            .get(origins[0].1.into_range())
+            .unwrap_or_default();
+        let implemented = generated
+            .iter()
+            .flat_map(|implementation| implementation.trait_ids.iter().copied())
+            .find(|trait_id| {
+                program
+                    .traits
+                    .get(trait_id)
+                    .is_some_and(|trait_| trait_.name == name)
+            })
+            .or_else(|| {
+                generated
+                    .iter()
+                    .flat_map(|implementation| implementation.trait_ids.iter().copied())
+                    .next()
+            });
+        out.push_some(
+            Block::Doc,
+            implemented.and_then(|trait_id| analysis.doc_comment_of(trait_id)),
+        );
+        out.push_some(Block::Doc, analysis.doc_comment_of(macro_id));
+        out.rendered()
+    }
+
+    /// The identifier span under `offset` in the analyzed text.
+    fn text_word_span(&self, offset: usize) -> Option<Span> {
+        let text = self.analyzed_text();
+        if !text
+            .as_bytes()
+            .get(offset)
+            .is_some_and(|byte| is_identifier_char(char::from(*byte)))
+        {
+            return None;
+        }
+        let start = text[..offset]
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |at| at + 1);
+        let end = text[offset..]
+            .find(|character: char| !is_identifier_char(character))
+            .map_or(text.len(), |at| offset + at);
+        Some(Span::from(start..end))
+    }
+
+    /// Whether `offset` sits inside an `import` statement — from the line's
+    /// `import` keyword to its `;`.
+    fn in_an_import(&self, offset: usize) -> bool {
+        let text = self.analyzed_text();
+        let Some(start) = text[..offset].rfind("import ") else {
+            return false;
+        };
+        !text[start..offset].contains(';')
+            && text[..start]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|head| head.trim().is_empty() || head.trim() == "export")
+    }
+
+    /// E312: the macro declared under `name` — read off each macro's name
+    /// span in its file. Asked only for an import leaf that names a trait.
+    fn macro_named(&self, program: &Program, name: &str) -> Option<Id> {
+        let mut macros: Vec<Id> = program
+            .entity_map
+            .iter()
+            .filter(|(_, expr)| matches!(expr, Expr::Macro))
+            .map(|(id, _)| *id)
+            .collect();
+        macros.sort_by_key(|id| id.0);
+        macros.into_iter().find(|id| {
+            let Some(span) = program.span_map.get(id) else {
+                return false;
+            };
+            let Some(path) = program
+                .source_of(*id)
+                .and_then(|source| program.source_path(source))
+            else {
+                return false;
+            };
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.get(span.into_range()).map(|word| word == name))
+                .unwrap_or(false)
+        })
+    }
+
+    /// E306: the hover for an enum VARIANT named in value position — the
+    /// variant line as E241 spells a pattern's (`Overflow::Hidden`, the
+    /// value's own type before the `::` where it has arguments,
+    /// `Option<i32>::None`), the variant's `///`, and the enum's chunk (the
+    /// value type's E237 block, else the enum's declaration) — the way a
+    /// struct constructor hovers with its declaration. It answered the bare
+    /// `enum Overflow`. `None` for anything that is not a variant reference.
+    fn variant_value_hover(&self, program: &Program, id: Id) -> Option<String> {
+        let target = match program.entity_map.get(&id)? {
+            Expr::Local(target) => *target,
+            Expr::EnumVariant(..) => id,
+            _ => return None,
+        };
+        let Some(Expr::EnumVariant(enum_id, index)) = program.entity_map.get(&target) else {
+            return None;
+        };
+        let enumeration = program.enums.get(enum_id)?;
+        let variant = enumeration.variants.get(*index)?;
+        let head = program
+            .expr_types
+            .get(&id)
+            .filter(|label| label.starts_with(enumeration.name) && !label.contains("Unknown"))
+            .cloned()
+            .unwrap_or_else(|| enumeration.name.to_string());
+        let mut line = format!("{head}::{}", variant.name);
+        // The payload as declared, where the enum has no parameters to
+        // substitute (a generic one's instantiation is the head's).
+        if enumeration.generic_parameter_constraint_ids.is_empty()
+            && let Some(declared) = program.declaration_labels.get(enum_id).and_then(|label| {
+                label.lines().map(str::trim).find(|row| {
+                    row.strip_prefix(variant.name)
+                        .is_some_and(|rest| rest.starts_with('('))
+                })
+            })
+        {
+            line = format!("{head}::{}", declared.trim_end_matches(','));
+        }
+        let mut out = HoverBlocks::new();
+        out.push_some(Block::Diagnostic, internal_lead(program, target));
+        out.push_code(Block::Signature, &line);
+        out.push_some(Block::Doc, self.analysis(program).doc_comment_of(target));
+        let chunk = program
+            .expr_type_ids
+            .get(&id)
+            .and_then(|type_id| definition_paragraph(program, *type_id))
+            .or_else(|| {
+                program
+                    .declaration_labels
+                    .get(enum_id)
+                    .map(|declaration| format!("```vilan\n{declaration}\n```"))
+            });
+        out.push_some(Block::Preview, chunk);
+        out.rendered()
+    }
+
+    /// E298: the origin root (`pkg`, `std`, a dependency) whose name is the
+    /// word under `offset`, written as a path's head (`pkg::lib`).
+    fn origin_segment_at(&self, program: &Program, offset: usize) -> Option<Id> {
+        let text = self.analyzed_text();
+        let bytes = text.as_bytes();
+        if !bytes
+            .get(offset)
+            .is_some_and(|byte| is_identifier_char(char::from(*byte)))
+        {
+            return None;
+        }
+        let start = text[..offset]
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |at| at + 1);
+        let end = text[offset..]
+            .find(|character: char| !is_identifier_char(character))
+            .map_or(text.len(), |at| offset + at);
+        if !text[end..].starts_with("::") || text[..start].ends_with("::") {
+            return None;
+        }
+        program.module_id_by_name.get(&text[start..end]).copied()
+    }
+
+    /// E298: the hover for a MODULE — its `mod` line (E299's path), its
+    /// `///` doc (the block that opens its file), what an import of it may
+    /// take ("Exports …", B318's offered names, a dozen then "and N more"),
+    /// and where it lives (its file, and the platform it is gated to). An
+    /// origin root (`pkg`, `std`, a dependency) answers with its package and
+    /// the top-level modules it holds. `None` for a module E152's bodiless
+    /// namespace hover answers, and for anything that is not a module.
+    fn module_hover(&self, program: &Program, module: Id) -> Option<String> {
+        if !program.modules.contains_key(&module) || self.is_namespace_module(program, module) {
+            return None;
+        }
+        let path = module_path(program, module)?;
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &format!("mod {path}"));
+        let names = |names: Vec<String>| {
+            let shown: Vec<String> = names
+                .iter()
+                .take(MODULE_PREVIEW_CAP)
+                .map(|name| format!("`{name}`"))
+                .collect();
+            let more = names.len().saturating_sub(MODULE_PREVIEW_CAP);
+            if more > 0 {
+                format!("{}, and {more} more", shown.join(", "))
+            } else {
+                shown.join(", ")
+            }
+        };
+        if program
+            .module_id_by_name
+            .values()
+            .any(|root| *root == module)
+        {
+            // An origin: the package it names, and its top-level modules.
+            if path == "pkg"
+                && let Some(manifest_dir) = self.manifest_dir()
+                && let Ok(text) = std::fs::read_to_string(manifest_dir.join("vilan.toml"))
+                && let Ok((manifest, _)) = vilan_core::manifest::Manifest::parse(&text)
+                && let Some(package) = manifest.package.as_ref()
+            {
+                let mut line = String::new();
+                if let Some(name) = &package.name {
+                    line.push_str(&format!("The package `{name}`."));
+                }
+                if let Some(description) = &package.description {
+                    line.push_str(&format!(" {description}"));
+                }
+                out.push(Block::Doc, line.trim().to_string());
+            }
+            let scope = program.modules.get(&module)?.body.1;
+            let mut held: Vec<String> = program
+                .scopes
+                .get(&scope)
+                .map(|scope| {
+                    scope
+                        .name_to_id_map
+                        .iter()
+                        .filter(|(_, child)| program.modules.contains_key(*child))
+                        .map(|(name, _)| (*name).to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            held.sort();
+            if !held.is_empty() {
+                out.push(Block::Preview, format!("Holds {}.", names(held)));
+            }
+            return out.rendered();
+        }
+        let source = program.source_of(module)?;
+        let file = program.source_path(source)?;
+        // The module's own `///`: the block that opens its file, set off
+        // from the first item by a blank line.
+        let text = if source == self.focus {
+            Some(self.analyzed_text().to_string())
+        } else {
+            std::fs::read_to_string(file).ok()
+        };
+        out.push_some(Block::Doc, text.as_deref().and_then(module_doc));
+        // What an import of it may take: B318's offered rows.
+        let importables = vilan_core::analyzer::module_importables(file);
+        let curated = vilan_core::analyzer::module_is_curated(&importables);
+        let mut exported: Vec<String> = importables
+            .iter()
+            .filter(|row| !curated || row.exported.is_exported())
+            .map(|row| row.name.to_string())
+            .collect();
+        exported.dedup();
+        if !exported.is_empty() {
+            out.push(Block::Preview, format!("Exports {}.", names(exported)));
+        }
+        // Where it lives: the file under its package, and its platform.
+        let canonical = program.canonical_sources.get(source.0 as usize)?;
+        // Relative to its package's manifest, or — for a document in no
+        // package — to the directory `pkg::` is rooted at, the entry's.
+        let package = canonical
+            .ancestors()
+            .skip(1)
+            .find(|directory| directory.join("vilan.toml").is_file())
+            .or_else(|| {
+                program
+                    .canonical_sources
+                    .first()
+                    .and_then(|entry| entry.parent())
+            });
+        let shown = match package.and_then(|package| canonical.strip_prefix(package).ok()) {
+            Some(relative) if program.std_sources.contains(&source) => {
+                format!("std/{}", relative.to_string_lossy().replace('\\', "/"))
+            }
+            Some(relative) => relative.to_string_lossy().replace('\\', "/"),
+            None => canonical.to_string_lossy().into_owned(),
+        };
+        out.push(Block::Platform, format!("`{shown}`"));
+        if let Some(platforms) = program.module_platforms.get(&source) {
+            let names: Vec<String> = platforms
+                .iter()
+                .map(|(name, _)| format!("\"{name}\""))
+                .collect();
+            out.push(
+                Block::Platform,
+                format!("declares `[platform({})] mod self;`", names.join(", ")),
+            );
+        } else if let Some(layer) = program
+            .source_layers
+            .get(source.0 as usize)
+            .and_then(|layer| layer.requiring)
+            && let Some((_, library, label, _)) = program.layer_platforms.get(layer as usize)
+        {
+            out.push(
+                Block::Platform,
+                format!("in the `{label}` layer of `{library}`"),
+            );
+        }
+        out.rendered()
+    }
+
     /// The hover for a pure namespace: what it HOLDS (E152).
     ///
     /// A namespace has no declaration, so the plain `module ui` the type label
@@ -4202,6 +4827,12 @@ impl Document {
         // `fun` line, inside the same fence: two lines of real syntax.
         let declaration = match program.member_header(declaration_id) {
             Some(header) => format!("{header}\n{declaration}"),
+            None => declaration,
+        };
+        // E299: and above both, WHERE the function lives — `mod pkg::lib::overlay`
+        // — for every function, the document's own module included.
+        let declaration = match self.function_mod_line(program, declaration_id) {
+            Some(line) => format!("{line}\n{declaration}"),
             None => declaration,
         };
         let mut out = HoverBlocks::new();
@@ -4410,7 +5041,26 @@ impl Document {
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
         let mut out = HoverBlocks::new();
-        out.push_code(Block::Signature, &format!("{name}: {type_label}"));
+        // E307: a FIELD read names the struct it belongs to, as its
+        // declaration and an initializer key do.
+        let line = format!("{name}: {type_label}");
+        let line = match program.entity_map.get(&id) {
+            Some(Expr::Field(_, struct_id, index)) => {
+                // And leads with an internal field's reason, as they do (E213).
+                out.push_some(
+                    Block::Diagnostic,
+                    program
+                        .structs
+                        .get(struct_id)
+                        .and_then(|structure| structure.fields.get(*index))
+                        .and_then(|field| field.internal)
+                        .map(internal_line),
+                );
+                owned_field_line(program, *struct_id, &line)
+            }
+            _ => line,
+        };
+        out.push_code(Block::Signature, &line);
         // E204: a FIELD's own `///`, where the read resolves to one. A field
         // carries no entity id, so `doc_comment_of` has nothing to look up —
         // `Expr::Field`'s (struct, index) key is what names the declaration,
@@ -4474,7 +5124,10 @@ impl Document {
         // E213: a FIELD is the case visibility cannot serve at all, and the
         // one the item was filed about.
         out.push_some(Block::Diagnostic, field.internal.map(internal_line));
-        out.push_code(Block::Signature, &format!("{}: {type_label}", field.name));
+        out.push_code(
+            Block::Signature,
+            &owned_field_line(program, struct_id, &format!("{}: {type_label}", field.name)),
+        );
         out.push_some(
             Block::Doc,
             self.struct_field_docs(program, struct_id, index),
@@ -4775,6 +5428,80 @@ impl Document {
             .collect()
     }
 
+    /// E301: what an inlay hint's tooltip says and where its type name
+    /// leads, resolved when the hint is hovered (`inlayHint/resolve`), never
+    /// on the keystroke path. `offset` is the hint's ANALYZED position — the
+    /// end of the name it follows — and `label` its shown label (`: T` for a
+    /// binding, ` as T` for a stage, E278), `full` the full type where the
+    /// label abbreviates it (E227).
+    ///
+    /// The tooltip is markdown: for a binding, what its NAME hovers (the
+    /// fenced `let root: T`, its `///`, E237's chunk); for a stage, the
+    /// stage's reading `… as T`; for an abbreviation, the full type on the
+    /// first line (E278's rule) above the rest; then the type's own `///`
+    /// where the hover does not already carry it. The location is the
+    /// definition of the type the hint names — a struct, an enum or a trait.
+    pub fn inlay_hint_detail(
+        &self,
+        offset: usize,
+        label: &str,
+        full: Option<&str>,
+    ) -> (String, Option<(SourceId, Span)>) {
+        let Some(program) = self.program.as_ref() else {
+            return (fenced(label.trim()), None);
+        };
+        let shown = full.unwrap_or(label);
+        let stage = shown.starts_with(" as ");
+        let type_label = shown.trim_start_matches(": ").trim_start_matches(" as ");
+        // The entity the hint is about: a binding whose name ends here, else
+        // the narrowest entity ending here (a stage).
+        let binding = program
+            .variables
+            .iter()
+            .find(|(id, variable)| {
+                variable.name_span.end == offset && program.source_of(**id) == Some(self.focus)
+            })
+            .map(|(id, variable)| (*id, variable.type_id));
+        let type_id = binding.map(|(_, type_id)| type_id).or_else(|| {
+            self.entity_spans
+                .iter()
+                .filter(|(_, end, _)| *end == offset)
+                .min_by_key(|(start, end, _)| end - start)
+                .and_then(|(_, _, id)| program.expr_type_ids.get(id).copied())
+        });
+        let mut blocks: Vec<String> = Vec::new();
+        if full.is_some() {
+            blocks.push(fenced(type_label));
+        }
+        let hover = match (stage, binding) {
+            (false, Some(_)) => self.hover(offset.saturating_sub(1)),
+            _ => None,
+        };
+        let hover = hover.unwrap_or_else(|| fenced(&format!("… as {type_label}")));
+        blocks.push(hover.clone());
+        let nominal =
+            type_id.and_then(|type_id| match program.type_id_to_type_map.get(&type_id)? {
+                vilan_core::type_::Type::Struct(id, _)
+                | vilan_core::type_::Type::Enum(id, _)
+                | vilan_core::type_::Type::Trait(id, _) => Some(*id),
+                _ => None,
+            });
+        let analysis = self.analysis(program);
+        if let Some(nominal) = nominal
+            && let Some(doc) = analysis.doc_comment_of(nominal)
+            && !hover.contains(&doc)
+        {
+            blocks.push(doc);
+        }
+        let location = nominal.and_then(|nominal| {
+            Some((
+                program.source_of(nominal)?,
+                analysis.definition_name_span(nominal)?,
+            ))
+        });
+        (blocks.join("\n\n"), location)
+    }
+
     /// [`inlay_hints`](Self::inlay_hints) with the binding NAME each hint
     /// follows — what the landed snapshot keeps, so a hint can follow the
     /// edits after it (E232).
@@ -4807,6 +5534,7 @@ impl Document {
                     .hint_labels
                     .get(id)
                     .map(|hint| format!(": {}", hint.label)),
+                chain: None,
             });
         }
         // B570 S3 (§4.3): after a STALE `auto`, the type it would become —
@@ -4827,6 +5555,7 @@ impl Document {
                     name: diagnostic.span,
                     label: format!(" ⟶ {becomes}"),
                     abbreviated: None,
+                    chain: None,
                 });
             }
         }
@@ -4844,6 +5573,9 @@ impl Document {
                     .abbreviated
                     .as_ref()
                     .map(|abbreviated| format!(" as {abbreviated}")),
+                // E302: the chain's HEAD is not a stage — it is hinted as
+                // always and is no stage's predecessor.
+                chain: (stage.id != stage.chain).then_some(stage.chain.0),
             });
         }
         hints.sort_by_key(|hint| hint.name.end);
@@ -5164,7 +5896,7 @@ impl Document {
                             _ => 0,
                         };
                         tokens.push((
-                            variant_leaf(program, *target, span),
+                            path_leaf(program, self.analyzed_text(), *target, span),
                             classify_target(*target),
                             readonly | internal_modifier(*target),
                         ));
@@ -10284,28 +11016,140 @@ fn declared_platform_attribute(note: &str) -> Option<&str> {
     attribute.ends_with(")] mod self;").then_some(attribute)
 }
 
+/// E307: a field's `name: T` line under the struct it belongs to — the
+/// owner's head as its declaration writes it (`struct Ring<T>`, E238's
+/// header shape), on its own line in the same fence. The three positions a
+/// field hovers at (its declaration, an initializer key, a member read) all
+/// print through this one function.
+fn owned_field_line(program: &Program, struct_id: Id, line: &str) -> String {
+    let head = program
+        .declaration_labels
+        .get(&struct_id)
+        .and_then(|label| label.lines().next())
+        .map(|first| first.trim_end().trim_end_matches('{').trim_end());
+    match head {
+        Some(head) if !head.is_empty() => format!("{head}\n{line}"),
+        _ => line.to_string(),
+    }
+}
+
+/// A fenced `vilan` block.
+fn fenced(code: &str) -> String {
+    format!("```vilan\n{code}\n```")
+}
+
+/// E298: how many names a module hover lists before "and N more".
+const MODULE_PREVIEW_CAP: usize = 12;
+
+/// E298: a module's `///` doc — the block of `///` lines that OPENS its file
+/// (blank lines before it allowed), set off from what follows by a blank line
+/// or the end of the file; a block that runs straight into a declaration is
+/// that declaration's own doc, not the module's.
+fn module_doc(text: &str) -> Option<String> {
+    let mut lines = text
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .peekable();
+    let mut docs: Vec<&str> = Vec::new();
+    while let Some(line) = lines.peek() {
+        let Some(comment) = line.trim().strip_prefix("///") else {
+            break;
+        };
+        docs.push(comment.strip_prefix(' ').unwrap_or(comment));
+        lines.next();
+    }
+    if docs.is_empty() || lines.peek().is_some_and(|next| !next.trim().is_empty()) {
+        return None;
+    }
+    Some(docs.join("\n"))
+}
+
+/// E299/E298: a module's path from its origin — `std::reactive::store`,
+/// `pkg::lib::overlay` — walked up the module graph: a root's body scope
+/// holds its top-level modules, and a module's children scope its nested
+/// ones (`Program::module_children_scopes`). The roots are the origins
+/// (`pkg`, `std`, a dependency's name).
+fn module_path(program: &Program, module: Id) -> Option<String> {
+    let roots: Vec<Id> = program.module_id_by_name.values().copied().collect();
+    let parent_of = |child: Id| -> Option<Id> {
+        let name = program.modules.get(&child)?.name;
+        let holds = |scope: &Id| {
+            program
+                .scopes
+                .get(scope)
+                .and_then(|scope| scope.name_to_id_map.get(name))
+                == Some(&child)
+        };
+        roots
+            .iter()
+            .copied()
+            .find(|root| {
+                program
+                    .modules
+                    .get(root)
+                    .is_some_and(|root| holds(&root.body.1))
+            })
+            .or_else(|| {
+                program
+                    .module_children_scopes
+                    .iter()
+                    .find(|(_, scope)| holds(scope))
+                    .map(|(parent, _)| *parent)
+            })
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    let mut current = module;
+    for _ in 0..64 {
+        segments.push(program.modules.get(&current)?.name);
+        if roots.contains(&current) {
+            segments.reverse();
+            return Some(segments.join("::"));
+        }
+        current = parent_of(current)?;
+    }
+    None
+}
+
 /// E221: a variant reached through its enum's PATH (`Side::Auto`) is one
 /// entity spanning the whole path, and that token overlaps the enum's own
 /// type-reference token (`Side`) — so the overlap filter dropped it, and the
 /// variant was never painted at all, let alone dimmed. Its token is the LEAF:
 /// the variant's name at the end of the span, when the span is longer than it.
-/// Every other reference keeps its span.
-fn variant_leaf(program: &Program, target: Id, span: Span) -> Span {
-    let Some(Expr::EnumVariant(enum_id, index)) = program.entity_map.get(&target) else {
-        return span;
-    };
-    let Some(variant) = program
-        .enums
-        .get(enum_id)
-        .and_then(|enumeration| enumeration.variants.get(*index))
-    else {
-        return span;
-    };
+///
+/// E311: the same for every declaration a path reaches — an associated
+/// function through its type (`Theme::stroke1()`, `Color::hex(..)`), which
+/// went unpainted everywhere (the owner met it in a `css` block's chain link,
+/// kolt `login_page.vl:97`), and a module-qualified function or constant: the
+/// leaf is the name after the last `::` of the written path. Every other
+/// reference keeps its span.
+fn path_leaf(program: &Program, text: &str, target: Id, span: Span) -> Span {
     let range = span.into_range();
-    if range.end - range.start <= variant.name.len() {
+    let name = match program.entity_map.get(&target) {
+        Some(Expr::EnumVariant(enum_id, index)) => program
+            .enums
+            .get(enum_id)
+            .and_then(|enumeration| enumeration.variants.get(*index))
+            .map(|variant| variant.name),
+        _ => crate::references::name_of(program, crate::references::Definition::Entity(target)),
+    };
+    let Some(name) = name else {
+        return span;
+    };
+    if range.end - range.start <= name.len() {
         return span;
     }
-    Span::from(range.end - variant.name.len()..range.end)
+    let leaf = range.end - name.len();
+    let written_path = text
+        .get(range.start..leaf)
+        .is_some_and(|head| head.ends_with("::"))
+        && text.get(leaf..range.end) == Some(name);
+    // A variant's span is its path whatever the text says (E221's rule).
+    let variant = matches!(program.entity_map.get(&target), Some(Expr::EnumVariant(..)));
+    if written_path || variant {
+        Span::from(leaf..range.end)
+    } else {
+        span
+    }
 }
 
 /// How the label reads in the editor, in ONE place: hover's lead line and the
@@ -12463,7 +13307,7 @@ pub(crate) mod tests {
         assert_eq!(
             operator_hover_at(OPERATOR_IMPLS, "if a == b", 5),
             Some(
-                "```vilan\nimpl Point with PartialEq\nfun eq(self, other: Point): bool\n```"
+                "```vilan\nmod pkg\nimpl Point with PartialEq\nfun eq(self, other: Point): bool\n```"
                     .to_string()
             ),
         );
@@ -12474,7 +13318,7 @@ pub(crate) mod tests {
         assert_eq!(
             operator_hover_at(OPERATOR_IMPLS, "a + b", 2),
             Some(
-                "```vilan\nimpl Point with Add\nfun add(self, other: Point): Point\n```"
+                "```vilan\nmod pkg\nimpl Point with Add\nfun add(self, other: Point): Point\n```"
                     .to_string()
             ),
         );
@@ -15665,7 +16509,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `add` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait Add<B = Self>\nfun add(self, b: Self): Self\n```"),
+            hover.contains("```vilan\nmod std::operators\ntrait Add<B = Self>\nfun add(self, b: Self): Self\n```"),
             "{hover}"
         );
     }
@@ -15679,7 +16523,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `sub` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait Sub<B = Self>\nfun sub(self, b: Self): Self\n```"),
+            hover.contains("```vilan\nmod std::operators\ntrait Sub<B = Self>\nfun sub(self, b: Self): Self\n```"),
             "{hover}"
         );
     }
@@ -15693,7 +16537,9 @@ pub(crate) mod tests {
         )
         .expect("hover on `plus` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait Adder<B = Self>\nfun plus(self, b: Self): Self\n```"),
+            hover.contains(
+                "```vilan\nmod pkg\ntrait Adder<B = Self>\nfun plus(self, b: Self): Self\n```"
+            ),
             "{hover}"
         );
     }
@@ -15709,7 +16555,7 @@ pub(crate) mod tests {
         .expect("hover on `alike` should produce a label");
         assert!(
             hover.contains(
-                "```vilan\ntrait Same<B = Self>\nfun alike(self, other: Self): bool\n```"
+                "```vilan\nmod pkg\ntrait Same<B = Self>\nfun alike(self, other: Self): bool\n```"
             ),
             "{hover}"
         );
@@ -15726,7 +16572,7 @@ pub(crate) mod tests {
         .expect("hover on `label` should produce a label");
         assert!(
             hover.contains(
-                "```vilan\ntrait Labelled<B = Self>\nfun label(self, times: i32, other: Self): str\n```"
+                "```vilan\nmod pkg\ntrait Labelled<B = Self>\nfun label(self, times: i32, other: Self): str\n```"
             ),
             "{hover}"
         );
@@ -15741,8 +16587,9 @@ pub(crate) mod tests {
         )
         .expect("hover on the impl's `eq` should produce a label");
         assert!(
-            hover
-                .contains("```vilan\nimpl Tag with PartialEq\nfun eq(self, other: Tag): bool\n```"),
+            hover.contains(
+                "```vilan\nmod pkg\nimpl Tag with PartialEq\nfun eq(self, other: Tag): bool\n```"
+            ),
             "{hover}"
         );
     }
@@ -15769,7 +16616,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `eq` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -15781,7 +16628,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `eq` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialEq<B = Self>\nfun eq(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -15793,7 +16640,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `lt` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -15805,7 +16652,7 @@ pub(crate) mod tests {
         )
         .expect("hover on `lt` should produce a label");
         assert!(
-            hover.contains("```vilan\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
+            hover.contains("```vilan\nmod std::compare\ntrait PartialOrd<B = Self> with PartialEq<Self>\nfun lt(self, b: Self): bool\n```"),
             "{hover}"
         );
     }
@@ -16418,7 +17265,7 @@ pub(crate) mod tests {
         )
         .expect("hovering the declaration should produce a label");
         assert!(
-            hover.contains("```vilan\nfun describe(count: i32, label: str): str\n```"),
+            hover.contains("```vilan\nmod pkg\nfun describe(count: i32, label: str): str\n```"),
             "{hover}"
         );
     }
@@ -16432,7 +17279,10 @@ pub(crate) mod tests {
             "import std::time::{ sleep_for, Duration };\n\nfun wa|rm() {\n\tsleep_for(Duration::millis(1));\n}\n\nfun main() {\n\twarm();\n}\n",
         )
         .expect("hover on the declaration");
-        assert!(hover.contains("```vilan\nasync fun warm()\n```"), "{hover}");
+        assert!(
+            hover.contains("```vilan\nmod pkg\nasync fun warm(): void\n```"),
+            "{hover}"
+        );
     }
 
     // E9 (rule4-completion S1): the inferred `borrows` root-set surfaces in the
@@ -17364,7 +18214,7 @@ pub(crate) mod tests {
             "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet n = p.|x;\n}\n",
         )
         .expect("hovering the field should produce a label");
-        assert_eq!(hover, "```vilan\nx: i32\n```");
+        assert_eq!(hover, "```vilan\nstruct Point\nx: i32\n```");
     }
 
     // --- E211: every candidate states the prefix it replaces ----------------
@@ -17581,7 +18431,8 @@ pub(crate) mod tests {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.x +", "p.¦x +"), '¦')
             .expect("hover on the field read");
         assert_eq!(
-            hover, "```vilan\nx: i32\n```\n\nThe abscissa.\n\nMeasured from the left edge.",
+            hover,
+            "```vilan\nstruct Point\nx: i32\n```\n\nThe abscissa.\n\nMeasured from the left edge.",
             "the whole `///` block, as a function's hover shows a function's"
         );
     }
@@ -17590,10 +18441,13 @@ pub(crate) mod tests {
     fn e204_hover_on_a_field_declaration_answers_the_field_and_not_the_struct() {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("\tx: i32,", "\t¦x: i32,"), '¦')
             .expect("hover on the field declaration");
-        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(
+            hover.starts_with("```vilan\nstruct Point\nx: i32\n```"),
+            "{hover}"
+        );
         assert!(hover.contains("The abscissa."), "{hover}");
         assert!(
-            !hover.contains("struct Point"),
+            !hover.contains("struct Point {"),
             "the struct's block is the answer for the struct's NAME: {hover}"
         );
     }
@@ -17602,9 +18456,12 @@ pub(crate) mod tests {
     fn e204_hover_on_an_initializer_field_key_answers_the_field() {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("{ x = 1", "{ ¦x = 1"), '¦')
             .expect("hover on the initializer key");
-        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(
+            hover.starts_with("```vilan\nstruct Point\nx: i32\n```"),
+            "{hover}"
+        );
         assert!(hover.contains("The abscissa."), "{hover}");
-        assert!(!hover.contains("struct Point"), "{hover}");
+        assert!(!hover.contains("struct Point {"), "{hover}");
     }
 
     #[test]
@@ -17624,7 +18481,7 @@ pub(crate) mod tests {
     fn e204_an_undocumented_field_hovers_exactly_as_before() {
         let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.y;", "p.¦y;"), '¦')
             .expect("hover on the undocumented field");
-        assert_eq!(hover, "```vilan\ny: i32\n```");
+        assert_eq!(hover, "```vilan\nstruct Point\ny: i32\n```");
     }
 
     #[test]
@@ -24515,11 +25372,21 @@ fun main() {
         // read as a namespace only because the entry-attributed placeholder
         // from its namespace mint outlived the body that adopted the node.
         let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
-        assert_eq!(document.hover(above).as_deref(), Some("module lib"),);
+        // E298: and as a module it answers with its `mod` line, what it
+        // exports and where it lives.
+        assert_eq!(
+            document.hover(above).as_deref(),
+            Some("```vilan\nmod pkg::lib\n```\n\n---\n\nExports `surface`.\n\n`lib/lib.vl`"),
+        );
         // A module with a file of its own is unmoved: it has a declaration,
         // and `namespace` is not what it is.
         let leaf = E152_ENTRY.find("::widget").expect("the `widget` segment") + 2;
-        assert_eq!(document.hover(leaf).as_deref(), Some("module widget"));
+        assert_eq!(
+            document.hover(leaf).as_deref(),
+            Some(
+                "```vilan\nmod pkg::lib::ui::widget\n```\n\n---\n\nExports `label`, `wide`.\n\n`lib/ui/widget.vl`"
+            ),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -24639,7 +25506,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let hover = hover(&document, "memo.get_or_insert", 0, 7);
         assert!(
             hover.starts_with(&fence(
-                "impl Memo<type K: Hashable, type V>\nfun get_or_insert(self, key: K, make: || V): V\n\nfun get_or_insert(self, key: str, make: || i32): i32"
+                "mod std::memo\nimpl Memo<type K: Hashable, type V>\nfun get_or_insert(self, key: K, make: || V): V\n\nfun get_or_insert(self, key: str, make: || i32): i32"
             )),
             "{hover}"
         );
@@ -24651,13 +25518,15 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let pair_read = hover(&document, "pair.read()", 0, 6);
         assert!(
             pair_read.starts_with(
-                "```vilan\nimpl Pair<type A, type B> with Read<A>\nfun read(self): A\n"
+                "```vilan\nmod pkg\nimpl Pair<type A, type B> with Read<A>\nfun read(self): A\n"
             ),
             "{pair_read}"
         );
         let user_greet = hover(&document, "fun greet(self): str {", 0, 5);
         assert!(
-            user_greet.starts_with(&fence("impl User with Greeter\nfun greet(self): str")),
+            user_greet.starts_with(&fence(
+                "mod pkg\nimpl User with Greeter\nfun greet(self): str"
+            )),
             "{user_greet}"
         );
     }
@@ -24668,7 +25537,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let hover = hover(&document, "user.label()", 0, 6);
         assert!(
             hover.starts_with(&fence(
-                "impl type S: Greeter with Named\nfun label(self): str"
+                "mod pkg\nimpl type S: Greeter with Named\nfun label(self): str"
             )),
             "{hover}"
         );
@@ -24679,18 +25548,18 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let default = hover(&document, "user.twice()", 0, 6);
         assert!(
-            default.starts_with(&fence("trait Greeter\nfun twice(self): str")),
+            default.starts_with(&fence("mod pkg\ntrait Greeter\nfun twice(self): str")),
             "{default}"
         );
         let requirement = hover(&document, "greeter.greet()", 0, 9);
         assert!(
-            requirement.starts_with(&fence("trait Greeter\nfun greet(self): str")),
+            requirement.starts_with(&fence("mod pkg\ntrait Greeter\nfun greet(self): str")),
             "{requirement}"
         );
         // A std trait member through a bound: the trait's parameters as declared.
         let generic = hover(&document, "fun read(self): T;", 0, 5);
         assert!(
-            generic.starts_with(&fence("trait Read<T>\nfun read(self): T")),
+            generic.starts_with(&fence("mod pkg\ntrait Read<T>\nfun read(self): T")),
             "{generic}"
         );
     }
@@ -24700,7 +25569,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let free = hover(&document, "print(describe(user))", 0, 7);
         assert!(
-            free.starts_with("```vilan\nfun describe(greeter: Greeter): str\n"),
+            free.starts_with("```vilan\nmod pkg\nfun describe(greeter: Greeter): str\n"),
             "{free}"
         );
     }
@@ -24728,16 +25597,15 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         assert!(
             hover(&document, "user.take()", 0, 6)
-                .starts_with(&fence("impl User\nfun take(own self): str"))
+                .starts_with(&fence("mod pkg\nimpl User\nfun take(own self): str"))
         );
         assert!(
             hover(&document, "user.peek()", 0, 6)
-                .starts_with(&fence("impl User\nfun peek(&self): i32"))
+                .starts_with(&fence("mod pkg\nimpl User\nfun peek(&self): i32"))
         );
-        assert!(
-            hover(&document, "user.rename(", 0, 6)
-                .starts_with(&fence("impl User\nfun rename(&mut self, own name: str)"))
-        );
+        assert!(hover(&document, "user.rename(", 0, 6).starts_with(&fence(
+            "mod pkg\nimpl User\nfun rename(&mut self, own name: str): void"
+        )));
     }
 
     #[test]
@@ -24746,7 +25614,7 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let free = hover(&document, "print(total(", 0, 7);
         assert!(
             free.starts_with(&fence(
-                "fun total(xs: &List<i32>, out: &mut List<i32>, own extra: List<i32>): usize"
+                "mod pkg\nfun total(xs: &List<i32>, out: &mut List<i32>, own extra: List<i32>): usize"
             )),
             "{free}"
         );
@@ -24860,11 +25728,14 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let document = analyzed();
         let block = fence("struct UserId {\n\tvalue: i32,\n}");
         let read = hover(&document, "print(user.id.value)", 0, 11);
-        assert_eq!(read, format!("{}\n\n---\n\n{block}", fence("id: UserId")));
+        assert_eq!(
+            read,
+            format!("{}\n\n---\n\n{block}", fence("struct User\nid: UserId"))
+        );
         let declared = hover(&document, "\tid: UserId,", 0, 1);
         assert_eq!(
             declared,
-            format!("{}\n\n---\n\n{block}", fence("id: UserId"))
+            format!("{}\n\n---\n\n{block}", fence("struct User\nid: UserId"))
         );
     }
 
@@ -24966,7 +25837,10 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         let hover = document.hover(at).expect("a hover");
         let blocks: Vec<&str> = hover.split("\n\n").collect();
         assert_eq!(blocks[0], "**deprecated** — use keep()", "{hover}");
-        assert_eq!(blocks[1], "```vilan\nasync fun save()\n```", "{hover}");
+        assert_eq!(
+            blocks[1], "```vilan\nmod pkg\nasync fun save(): void\n```",
+            "{hover}"
+        );
         assert_eq!(blocks[2], "Writes the state.", "{hover}");
         assert!(
             blocks[3].starts_with("requires the `@process` platform its file declares"),
@@ -25052,7 +25926,10 @@ fun main() {\n\tmut user = User { id = UserId { value = 1 }, name = \"a\", tags 
         ] {
             assert_eq!(
                 hovered,
-                format!("{}\n\nWhere it is.\n\n---\n\n{shape}", fence("at: Point")),
+                format!(
+                    "{}\n\nWhere it is.\n\n---\n\n{shape}",
+                    fence("struct Holder\nat: Point")
+                ),
                 "{position}"
             );
         }
@@ -25112,7 +25989,10 @@ fun main() {\n\tlet boxed = Boxed { value = 3 };\n\tprint(pick(boxed));\n\teach(
     fn e240_a_type_parameter_inside_a_closure_type_hovers_as_the_parameter() {
         assert_eq!(
             hover("observer: |T| void", 11),
-            parameter("type T", "fun each<T>(items: List<T>, observer: |T| void)")
+            parameter(
+                "type T",
+                "fun each<T>(items: List<T>, observer: |T| void): void"
+            )
         );
     }
 
@@ -25136,11 +26016,11 @@ fun main() {\n\tlet boxed = Boxed { value = 3 };\n\tprint(pick(boxed));\n\teach(
         // At the arguments written: `Read<U>`'s `read` returns `U`.
         assert_eq!(
             hover("Read<U>>(source", 1),
-            "```vilan\ntrait Read<U> {\n\tfun read(self): U;\n}\n```\n\nSomething that reads a value."
+            "```vilan\nmod pkg\ntrait Read<U> {\n\tfun read(self): U;\n}\n```\n\nSomething that reads a value.\n\n---\n\nImplemented by `Boxed<U>` (1 in reach)."
         );
         assert_eq!(
             hover("with Show {", 6),
-            "```vilan\ntrait Show {\n\tfun show(self): str;\n}\n```"
+            "```vilan\nmod pkg\ntrait Show {\n\tfun show(self): str;\n}\n```"
         );
     }
 }
@@ -25179,22 +26059,31 @@ fun main() {\n\tlet x: Option<i32> = Some(3);\n\tmatch x {\n\t\tNone => print(\"
     fn e241_a_bare_variant_hovers_as_the_matched_types_variant() {
         assert_eq!(
             hover("None => print(\"none\"),\n\t\t_", 1),
-            fence("Option<i32>::None")
+            fence("match on Option<i32>\nOption<i32>::None")
         );
     }
 
     #[test]
     fn e241_a_payload_variant_hovers_with_its_payload_substituted() {
-        assert_eq!(hover("Some(let v)", 1), fence("Option<i32>::Some(i32)"));
+        assert_eq!(
+            hover("Some(let v)", 1),
+            fence("match on Option<i32>\nOption<i32>::Some(i32)\nlet v: i32")
+        );
         // The binding inside it hovers as a binding, as it did.
         assert_eq!(hover("Some(let v)", 9), fence("let v: i32"));
         // The same in an `is` test.
-        assert_eq!(hover("is Some(let y)", 4), fence("Option<i32>::Some(i32)"));
+        assert_eq!(
+            hover("is Some(let y)", 4),
+            fence("match on Option<i32>\nOption<i32>::Some(i32)\nlet y: i32")
+        );
     }
 
     #[test]
     fn e241_a_qualified_variant_hovers_on_its_variant_and_its_enum_on_the_enum() {
-        assert_eq!(hover("Option::None", 9), fence("Option<i32>::None"));
+        assert_eq!(
+            hover("Option::None", 9),
+            fence("match on Option<i32>\nOption<i32>::None")
+        );
         // The enum segment keeps its own answer: the enum.
         let enumeration = hover("Option::None", 2).expect("the enum segment hovers");
         assert!(enumeration.contains("enum Option<T>"), "{enumeration}");
@@ -25204,22 +26093,37 @@ fun main() {\n\tlet x: Option<i32> = Some(3);\n\tmatch x {\n\t\tNone => print(\"
     fn e241_a_user_enums_variants_hover_with_their_payload_and_doc() {
         assert_eq!(
             hover("Shape::Rect(let w", 8),
-            fence("Shape::Rect(f64, f64)")
+            fence("match on Shape\nShape::Rect(f64, f64)\nlet w: f64\nlet h: f64")
         );
-        assert_eq!(hover("Shape::Empty =>", 8), fence("Shape::Empty"));
+        assert_eq!(
+            hover("Shape::Empty =>", 8),
+            fence("match on Shape\nShape::Empty")
+        );
         assert_eq!(
             hover("Pair::Both(let a", 7),
-            Some("```vilan\nPair<str, i32>::Both(str, i32)\n```\n\nBoth present.".to_string())
+            Some(
+                "```vilan\nmatch on Pair<str, i32>\nPair<str, i32>::Both(str, i32)\nlet a: str\nlet b: i32\n```\n\nBoth present."
+                    .to_string()
+            )
         );
-        assert_eq!(hover("Pair::Neither", 7), fence("Pair<str, i32>::Neither"));
+        assert_eq!(
+            hover("Pair::Neither", 7),
+            fence("match on Pair<str, i32>\nPair<str, i32>::Neither")
+        );
     }
 
     #[test]
     fn e241_a_wildcard_hovers_as_what_it_matches_and_a_literal_as_nothing() {
         // `_` answered the enclosing match's type (`void`), which was wrong:
         // it answers what it matches whole.
-        assert_eq!(hover("_ => print(\"some\")", 0), fence("_: Option<i32>"));
-        assert_eq!(hover("_ => print(\"x\")", 0), fence("_: Shape"));
+        assert_eq!(
+            hover("_ => print(\"some\")", 0),
+            fence("match on Option<i32>\n_: Option<i32>")
+        );
+        assert_eq!(
+            hover("_ => print(\"x\")", 0),
+            fence("match on Shape\n_: Shape")
+        );
         // A literal is its own value and names nothing.
         assert_eq!(hover("3 => print(\"three\")", 0), None);
     }
@@ -32367,3 +33271,7 @@ mod auto_editor_tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 }
+
+#[cfg(test)]
+#[path = "editor_review_tests.rs"]
+mod editor_review_tests;

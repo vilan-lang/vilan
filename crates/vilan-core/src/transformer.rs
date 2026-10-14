@@ -22,7 +22,7 @@ use std::rc::Rc;
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options)
         .transform_entry()
-        .map(|(javascript, _)| javascript)
+        .map(|printed| printed.text)
 }
 
 /// [`transform`] with the source map for its output (debugging.md §5.1,
@@ -43,9 +43,50 @@ pub fn transform_with_source_map<'src>(
     let mut transformer = Transformer::new(program, options);
     transformer.source_marks = true;
     transformer.formatter = transformer.formatter.with_marks();
-    let (marked, marks) = transformer.transform_entry()?;
-    let (javascript, map) = crate::source_map::strip_marks(program, &marked, &marks);
+    let printed = transformer.transform_entry()?;
+    let (javascript, map) =
+        crate::source_map::strip_marks(program, &printed.text, &printed.marks, printed.runtime);
     Ok((javascript, Some(map)))
+}
+
+/// One printed script: its text, the source-map marks the printing recorded
+/// (none unless the printer records them), and where the runtime helpers'
+/// text sits in it (E257 S6's synthetic source).
+struct Printed {
+    text: String,
+    marks: Vec<SourceMark>,
+    runtime: Option<std::ops::Range<usize>>,
+}
+
+/// A script's prelude — the host imports, then the runtime helpers' sources —
+/// in front of its `body`, with the byte range the helpers took.
+fn with_prelude(
+    imports: &[String],
+    helpers: &[&'static str],
+    body: String,
+) -> (String, Option<std::ops::Range<usize>>) {
+    let imports = imports.join("\n");
+    let helpers = helpers
+        .iter()
+        .map(|name| helper_source(name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let runtime_start = if imports.is_empty() {
+        0
+    } else {
+        imports.len() + 1
+    };
+    let runtime = (!helpers.is_empty()).then(|| runtime_start..runtime_start + helpers.len());
+    let prelude = [imports, helpers]
+        .into_iter()
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if prelude.is_empty() {
+        (body, runtime)
+    } else {
+        (format!("{prelude}\n{body}"), runtime)
+    }
 }
 
 /// Emission run for its DIAGNOSTICS alone — what `vilan check` of an ENTRY
@@ -178,6 +219,9 @@ pub struct EmittedChunk {
     /// it is also the measurement that says whether a partition introduced a
     /// cross-chunk edge.
     pub cross_chunk_references: usize,
+    /// The chunk's own source map when the build writes maps (E257 S6): each
+    /// chunk is printed apart, so its marks are stripped apart.
+    pub map: Option<SourceMap>,
 }
 
 /// A split entry's artifacts (`bundle-splitting.md` §3): the eager bundle plus
@@ -185,6 +229,8 @@ pub struct EmittedChunk {
 /// split, and `main` is then byte-identical to [`transform`]'s output.
 pub struct SplitProgram {
     pub main: String,
+    /// `main`'s source map when the build writes maps (E257 S6).
+    pub map: Option<SourceMap>,
     pub chunks: Vec<EmittedChunk>,
     /// The same entry emitted as ONE file — the denominator of the split's
     /// verdict (`bundle-splitting.md` §S3, item 5). Measured rather than
@@ -245,10 +291,11 @@ pub fn transform_split_with_plan<'src>(
     if plan.chunks.is_empty() {
         // Nothing splittable: the entry is a single file, exactly as if the
         // flag were absent. Reported by `--print-chunks`, not by a failure.
-        let main = transform(program, options)?;
+        let (main, map) = transform_with_source_map(program, options)?;
         return Ok(SplitProgram {
             whole_bytes: main.len(),
             main,
+            map,
             chunks: Vec::new(),
         });
     }
@@ -267,6 +314,14 @@ pub fn transform_split_with_plan<'src>(
         calls: gate.calls.iter().copied().collect::<HashSet<Id>>(),
     });
     transformer.used_helpers.insert("__chunk_registry");
+    // E257 S6: the split build maps as the single-file one does — marks in
+    // the tree, a mark character per mark in each printed file, each file's
+    // marks stripped out of it alone.
+    let mapped = options.source_maps;
+    if mapped {
+        transformer.source_marks = true;
+        transformer.formatter = transformer.formatter.with_marks();
+    }
     let formatter = transformer.formatter.clone();
     let line_break = formatter.line_break;
     let mut assembled = transformer.assemble()?;
@@ -301,7 +356,7 @@ pub fn transform_split_with_plan<'src>(
         }
     }
     // …and registers everything a chunk reads back out of it.
-    let mut chunk_sources: Vec<String> = Vec::new();
+    let mut chunk_sources: Vec<(String, Option<SourceMap>)> = Vec::new();
     let mut crossings: Vec<usize> = Vec::new();
     for (index, nodes) in assembled.chunks.iter().enumerate() {
         // A name a SIBLING chunk owns cannot be read at evaluation time: the
@@ -355,7 +410,14 @@ pub fn transform_split_with_plan<'src>(
                 Box::new(js::Node::Local(name.clone())),
             ));
         }
-        chunk_sources.push(format!("{}{}", formatter.file(&chunk_nodes), line_break));
+        let text = format!("{}{}", formatter.file(&chunk_nodes), line_break);
+        chunk_sources.push(if mapped {
+            let marks = formatter.take_marks();
+            let (clean, map) = crate::source_map::strip_marks(program, &text, &marks, None);
+            (clean, Some(map))
+        } else {
+            (text, None)
+        });
     }
 
     // The eager bundle's own glue: the registry handle first (nothing runs
@@ -399,39 +461,35 @@ pub fn transform_split_with_plan<'src>(
     );
 
     let body = formatter.file(&assembled.nodes);
-    let imports = assembled.imports.join("\n");
-    let helpers = assembled
-        .helpers
-        .iter()
-        .map(|name| helper_source(name))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prelude = [imports, helpers]
-        .into_iter()
-        .filter(|section| !section.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let main = if prelude.is_empty() {
-        format!("{body}{line_break}")
+    let (mut main, runtime) = with_prelude(&assembled.imports, &assembled.helpers, body);
+    main.push_str(line_break);
+    let (main, map) = if mapped {
+        let marks = formatter.take_marks();
+        let (clean, map) = crate::source_map::strip_marks(program, &main, &marks, runtime);
+        (clean, Some(map))
     } else {
-        format!("{prelude}\n{body}{line_break}")
+        (main, None)
     };
 
     Ok(SplitProgram {
         main,
+        map,
         whole_bytes,
         chunks: plan
             .chunks
             .iter()
             .zip(chunk_sources)
             .zip(crossings)
-            .map(|((chunk, source), cross_chunk_references)| EmittedChunk {
-                arm: chunk.arm.clone(),
-                tag: chunk.tag,
-                file: crate::chunks::chunk_file_name(leg, &chunk.arm),
-                source,
-                cross_chunk_references,
-            })
+            .map(
+                |((chunk, (source, map)), cross_chunk_references)| EmittedChunk {
+                    arm: chunk.arm.clone(),
+                    tag: chunk.tag,
+                    file: crate::chunks::chunk_file_name(leg, &chunk.arm),
+                    source,
+                    cross_chunk_references,
+                    map,
+                },
+            )
             .collect(),
     })
 }
@@ -3313,29 +3371,18 @@ impl<'src> Transformer<'src> {
 
     /// The entry's JavaScript, with the source-map marks its printing
     /// recorded (none unless the printer records them).
-    fn transform_entry(self) -> Result<(String, Vec<SourceMark>), Error> {
+    fn transform_entry(self) -> Result<Printed, Error> {
         let formatter = self.formatter.clone();
         let line_break = formatter.line_break;
         let program = self.transform_entry_ast()?;
         let body = formatter.file(&program.nodes);
-        let imports = program.imports.join("\n");
-        let helpers = program
-            .helpers
-            .iter()
-            .map(|name| helper_source(name))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prelude = [imports, helpers]
-            .into_iter()
-            .filter(|section| !section.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let output = if prelude.is_empty() {
-            body
-        } else {
-            format!("{}\n{}", prelude, body)
-        };
-        Ok((format!("{}{}", output, line_break), formatter.take_marks()))
+        let (mut text, runtime) = with_prelude(&program.imports, &program.helpers, body);
+        text.push_str(line_break);
+        Ok(Printed {
+            text,
+            marks: formatter.take_marks(),
+            runtime,
+        })
     }
 
     fn transform_entry_ast(self) -> Result<JsProgram<'src>, Error> {
@@ -5392,6 +5439,14 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
         let zero = || js::Node::Number("0".to_string(), None);
+        // F135 (spec §6.7): a scalar read OUT OF A CELL (`&x.read().count`)
+        // is a value, copied where it is evaluated — a fresh holder, as an
+        // rvalue's, rather than a pair over the cell's live storage that a
+        // later write of the cell would show through.
+        if self.is_a_shared_read_spine(operand) {
+            let value = self.walk_entity(operand, block).unwrap_or(js::Node::Void);
+            return js::Node::Array(vec![js::Node::Array(vec![value]), zero()]);
+        }
         let (base, key) = match self.program.entity_map.get(&operand) {
             Some(Expr::Field(subject, _, field_index)) => (
                 self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
@@ -5458,6 +5513,36 @@ impl<'src> Transformer<'src> {
             ),
         };
         js::Node::Array(vec![base, key])
+    }
+
+    /// F135: whether `place` reads out of a `Shared::read()` — the read itself
+    /// or a field, tuple slot or subscript over one.
+    fn is_a_shared_read_spine(&self, place: Id) -> bool {
+        let mut current = place;
+        loop {
+            current = match self.program.entity_map.get(&current) {
+                Some(
+                    &Expr::Field(subject, _, _)
+                    | &Expr::TupleIndex(subject, _, _)
+                    | &Expr::Index(subject, _)
+                    | &Expr::Ascribe(subject),
+                ) => subject,
+                Some(Expr::Call(call_id)) => {
+                    return self
+                        .program
+                        .function_calls
+                        .get(call_id)
+                        .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                            Some(Expr::Local(function_id)) => {
+                                self.program.intrinsics.get(function_id)
+                            }
+                            _ => None,
+                        })
+                        .is_some_and(|intrinsic| matches!(intrinsic, Intrinsic::SharedValue));
+                }
+                _ => return false,
+            };
+        }
     }
 
     /// Whether this intrinsic call is a `Shared::write()` whose pointee resolves
@@ -6234,6 +6319,18 @@ impl<'src> Transformer<'src> {
                                 && this.value_resolves_to_scalar(arg)
                             {
                                 return Some(this.scalar_view_of_place(arg, block));
+                            }
+                            // F135 (spec §6.7: `read()` copies where it is
+                            // evaluated): a `&` of a cell's read that a later
+                            // argument writes in place lends a COPY — the
+                            // analyzer marks the read place, under the `&`.
+                            if let Some(&Expr::Reference(operand, false)) =
+                                this.program.entity_map.get(&arg)
+                                && this.program.clone_sites.contains_key(&operand)
+                                && !this.emits_scalar_view_ref(arg, operand)
+                            {
+                                let node = this.walk_entity(operand, block)?;
+                                return Some(this.maybe_clone(operand, node));
                             }
                             // An argument to an `own` parameter is copied (marked in
                             // `clone_sites`), like a binding copy.

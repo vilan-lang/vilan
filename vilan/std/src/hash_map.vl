@@ -10,7 +10,7 @@
 // native map; the original key is stored alongside the value so `keys()`
 // returns real `K`s, and mutating the original afterward can't desync the map
 // (value semantics snapshot it on insert).
-import pkg::compare::PartialEq;
+import pkg::compare::{ Eq, PartialEq };
 import pkg::debug::Debug;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
@@ -148,6 +148,10 @@ impl HashMap<type K: Hashable, type V: PartialEq> with PartialEq {
 		true
 	}
 }
+
+/// A map of `Eq` keys and values is `Eq` (B621): its `eq` is the `PartialEq`
+/// impl above, keys by their canonical `Hash`.
+impl HashMap<type K: Hashable + Eq, type V: Eq> with Eq {}
 
 /// The map half of the explicit termination family: a list of `(key, value)`
 /// pairs becomes a `HashMap`, so an iterator chain ends

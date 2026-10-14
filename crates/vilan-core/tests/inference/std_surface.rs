@@ -8027,3 +8027,51 @@ fn b559_a_written_nested_task_is_the_inner_task() {
         "1\n42\ns\n",
     );
 }
+
+// === B618: `async e` is always `Task<T>` ======================================
+//
+// `promise_struct_id` and `task_struct_id` were both registered, and the async
+// value took `Task` only when `std::task` had loaded — so a program that never
+// imported it typed `async work()` as `Promise<i32>`, an annotation to that
+// effect checked clean, and hover, annotations and the native backend's
+// host-handle rules saw two types for one expression. `std::task` is always
+// loaded now (`ALWAYS_LOADED_STD`), like the other lang-item homes.
+
+/// The premise, inverted: without `import std::task`, `async work()` is a
+/// `Task<i32>` — a `Promise<i32>` annotation is refused.
+#[test]
+fn b618_an_async_call_is_a_task_without_importing_std_task() {
+    assert_fails_with(
+        r#"
+        fun work(): i32 {
+            1
+        }
+
+        fun main() {
+            let again: Promise<i32> = async work();
+        }
+        "#,
+        "Task<i32>",
+    );
+}
+
+/// And it runs: the handle awaits to the value, and `Task` names it in an
+/// annotation, with no import of `std::task` in the program.
+#[test]
+fn b618_a_task_needs_no_import_to_be_annotated_or_awaited() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun work(): i32 {
+            7
+        }
+
+        fun main() {
+            let handle: Task<i32> = async work();
+            print(await handle);
+        }
+        "#,
+        "7\n",
+    );
+}

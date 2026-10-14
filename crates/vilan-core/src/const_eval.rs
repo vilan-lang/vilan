@@ -111,6 +111,17 @@ thread_local! {
     /// measured (`VILAN_PHASE_TIMING` prints it as `const-fuel-max`). Reset by
     /// [`evaluate`] with the timing cells.
     static FUEL_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// How many times [`State::check_const_only`] built the program's refined
+    /// dispatch edges this analysis (M141): once if R had a member to look up,
+    /// never for a program whose runtime code reaches no channel verb. Reset by
+    /// [`evaluate`]; read by the pin that holds the laziness.
+    static CONST_ONLY_REFINEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the capability check built the refined dispatch edges in the
+/// last [`evaluate`] (M141) - `0` unless a runtime path reaches a channel verb.
+pub fn const_only_refinements() -> usize {
+    CONST_ONLY_REFINEMENTS.with(std::cell::Cell::get)
 }
 
 /// (lowering, interpreting) — what [`evaluate`] spent since its last call, for
@@ -856,6 +867,7 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     PHASE_LOWER.with(|cell| cell.set(crate::PhaseSpan::ZERO));
     PHASE_INTERP.with(|cell| cell.set(crate::PhaseSpan::ZERO));
     FUEL_MAX.with(|cell| cell.set(0));
+    CONST_ONLY_REFINEMENTS.with(|cell| cell.set(0));
     crate::const_cache::reset_counts();
     // A program that already failed analysis skips evaluation entirely: the
     // transformer's entity lookups (used to lower the const world) assume
@@ -1435,11 +1447,16 @@ impl SpanRegions {
         let (Some(source), Some(span)) = (program.source_of(id), program.span_map.get(&id)) else {
             return false;
         };
+        self.covers(source, span.start, span.end)
+    }
+
+    /// Whether `start..end` lies inside one of the regions of `source`.
+    fn covers(&self, source: SourceId, start: usize, end: usize) -> bool {
         let Some(regions) = self.by_source.get(&source.0) else {
             return false;
         };
-        let index = regions.partition_point(|(start, _)| *start <= span.start);
-        index > 0 && regions[index - 1].1 >= span.end
+        let index = regions.partition_point(|(region_start, _)| *region_start <= start);
+        index > 0 && regions[index - 1].1 >= end
     }
 }
 
@@ -1550,13 +1567,22 @@ impl LocalIndex {
     /// attributed to `State::new` because the scan inlines into it. M27 built
     /// the hoisted twin for exactly this shape: one validation of the ranges,
     /// then a binary search per row, answer-identical by construction.
-    fn build(program: &Program) -> Self {
+    ///
+    /// `within` narrows the index to the references that lie inside one of its
+    /// regions (M141): the explicit pass asks `references_within` only of `const`
+    /// expressions, and a reference inside such an expression's span lies in the
+    /// merged region that covers it, so the answer is the same while the index
+    /// holds a few hundred rows instead of every local of the world - kolt's
+    /// client pushed and sorted ~100 thousand of them to answer 166 queries. The
+    /// inference sweep asks about arbitrary initializers, so it passes `None`.
+    fn build(program: &Program, within: Option<&SpanRegions>) -> Self {
         let lookup = program.source_lookup();
         let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::default();
         for (id, expr) in &program.entity_map {
             if let Expr::Local(binding) = expr
                 && let Some(source) = lookup.of(*id)
                 && let Some(span) = program.span_map.get(id)
+                && within.is_none_or(|regions| regions.covers(source, span.start, span.end))
             {
                 by_source
                     .entry(source.0)
@@ -1685,7 +1711,12 @@ impl<'p, 'src> State<'p, 'src> {
 
     /// The `Expr::Local` index, built on first use (M53).
     fn locals(&self) -> &LocalIndex {
-        self.locals.get_or_init(|| LocalIndex::build(self.program))
+        self.locals.get_or_init(|| {
+            // The explicit pass only ever asks about `const` expressions (and the
+            // sites that scheduled a finaliser, themselves `const` expressions).
+            let within = (self.mode == Mode::Explicit).then_some(&self.const_regions);
+            LocalIndex::build(self.program, within)
+        })
     }
 
     /// Records a diagnostic — or, in [`Mode::Inferred`], does not.
@@ -2249,119 +2280,14 @@ impl<'p, 'src> State<'p, 'src> {
                 }
             }
         }
-        // The dispatch sites the graph deliberately leaves indirect (B143): a
-        // bounded generic's member call, a trait re-dispatch onto a concrete
-        // receiver, or an iterator-protocol `for` edge. Enumerate every
-        // non-const one — node-owned, initializer-owned, and bare top-level —
-        // and let `dispatch_refine` resolve each to the callees its recorded
-        // dispatch actually selects; the reverse map joins the fixpoint below
-        // as extra caller edges.
-        let dispatched_name = |call_id: Id| -> Option<&str> {
-            match crate::async_infer::dispatch_at(self.program, call_id) {
-                Some(GenericDispatch::OnConstraint(_, name))
-                | Some(GenericDispatch::OnType(_, name)) => Some(name),
-                None => None,
-            }
-        };
-        let is_dispatch_target = |target: CallTarget| {
-            matches!(
-                target,
-                CallTarget::Indirect(IndirectReason::TraitDispatch | IndirectReason::GenericMember)
-            )
-        };
-        // The candidate lists below are NAME-KEYED and program-wide
-        // (`candidates_of`, B279's sweep): every override of every trait
-        // declaring the dispatched name, whatever the receiver. They are
-        // deliberately NOT narrowed here, and the reason is the DIRECTION this
-        // check reads an edge in. An edge is a REFUSAL — a runtime path that
-        // reaches a `[const_only]` capability is rejected — so a candidate
-        // this site could never select can only make the check refuse MORE.
-        // Over-refusing costs an author a diagnostic they can see and argue
-        // with; under-refusing ships the capability into a runtime path in
-        // silence, which is the whole failure this check exists to prevent.
-        // The context pass narrows the same lists because it reads an edge as
-        // a property of the site (B258); nothing here narrows by RECEIVER.
-        //
-        // B318 S4's file scope is the one narrowing this check does take, and
-        // it survives the direction argument above because it is not a guess
-        // about what a site selects: an `impl` the calling file's imports did
-        // not admit is one that file CANNOT reach at all, so no runtime path
-        // through it exists here to refuse. Dropping it removes a refusal that
-        // could only ever have been about another file's program.
-        let mut refinement_sites: Vec<DispatchSite> = Vec::new();
-        for node in graph.nodes() {
-            for call in graph.calls_of(node.id()) {
-                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
-                    continue;
-                }
-                let Some(name) = dispatched_name(call.call_id) else {
-                    continue;
-                };
-                refinement_sites.push(DispatchSite {
-                    owner: RefinedCaller::Node(node.id()),
-                    call: call.call_id,
-                    candidates: crate::dispatch_refine::candidates_of(
-                        self.program,
-                        self.program.admitting_file(call.call_id),
-                        name,
-                    ),
-                });
-            }
-        }
-        // Module-level initializers own no graph node; a dispatch site there
-        // is TopLevel-owned, so an R-selecting resolution is a boundary by
-        // itself. (A `const`-marked initializer never appears here — the
-        // graph skips it, and the const-subtree cut would drop it anyway.)
-        let mut initializer_call_ids: HashSet<Id> = HashSet::default();
-        for binding in self.program.module_level_bindings() {
-            for call in graph.initializer_calls_of(binding) {
-                initializer_call_ids.insert(call.call_id);
-                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
-                    continue;
-                }
-                let Some(name) = dispatched_name(call.call_id) else {
-                    continue;
-                };
-                refinement_sites.push(DispatchSite {
-                    owner: RefinedCaller::TopLevel,
-                    call: call.call_id,
-                    candidates: crate::dispatch_refine::candidates_of(
-                        self.program,
-                        self.program.admitting_file(call.call_id),
-                        name,
-                    ),
-                });
-            }
-        }
-        // Top-level statement calls own neither a node nor an initializer
-        // record, so the dispatch record itself is the gate.
-        for (call_id, _) in &self.program.function_calls {
-            if owned_calls.contains(call_id)
-                || initializer_call_ids.contains(call_id)
-                || self.in_const_subtree(*call_id)
-            {
-                continue;
-            }
-            let Some(name) = dispatched_name(*call_id) else {
-                continue;
-            };
-            refinement_sites.push(DispatchSite {
-                owner: RefinedCaller::TopLevel,
-                call: *call_id,
-                candidates: crate::dispatch_refine::candidates_of(
-                    self.program,
-                    self.program.admitting_file(*call_id),
-                    name,
-                ),
-            });
-        }
-        let mut refined_callers: HashMap<Id, Vec<(RefinedCaller, Id)>> = HashMap::default();
-        for edge in crate::dispatch_refine::refined_edges(self.program, graph, &refinement_sites) {
-            refined_callers
-                .entry(edge.callee)
-                .or_default()
-                .push((edge.caller, edge.anchor));
-        }
+        // The refined dispatch edges (B143) are read in ONE place, the worklist
+        // below, and only for a member that is in R. A program whose runtime
+        // code calls no channel verb has an empty worklist, and the whole
+        // refinement - every dispatch site enumerated, its candidates listed,
+        // the refinement run over the program - answers a question nobody asks
+        // (M141: 54 of the 70 M instructions of this check on kolt's client,
+        // a quarter of the warm const pass). It is built on the first pop.
+        let mut refined_callers: Option<HashMap<Id, Vec<(RefinedCaller, Id)>>> = None;
         // Propagate to callers through non-const sites; roots never join.
         while let Some(member) = worklist.pop() {
             for caller in graph.callers_of(member) {
@@ -2398,7 +2324,9 @@ impl<'p, 'src> State<'p, 'src> {
             // selected the member, or the dispatch site on a conservative
             // fallback — so the const-subtree cut applies to it exactly as to
             // a direct site.
-            for (caller, anchor) in refined_callers.get(&member).into_iter().flatten() {
+            let refined = refined_callers
+                .get_or_insert_with(|| self.refined_runtime_callers(graph, &owned_calls));
+            for (caller, anchor) in refined.get(&member).into_iter().flatten() {
                 if self.in_const_subtree(*anchor) {
                     continue;
                 }
@@ -2458,6 +2386,139 @@ impl<'p, 'src> State<'p, 'src> {
         }
 
         self.check_value_escapes(graph, &in_r, &reaches, &scheduled_arguments);
+    }
+
+    /// The refined dispatch edges of the program's RUNTIME call sites, keyed by
+    /// callee (B143): for every non-`const` dispatch site the graph leaves
+    /// indirect - node-owned, initializer-owned, and bare top-level - the callees
+    /// [`crate::dispatch_refine`] says its recorded dispatch selects, as
+    /// `(who makes the call, the runtime crossing it charges)`. Built lazily by
+    /// [`State::check_const_only`], and only once R has a member to look up.
+    fn refined_runtime_callers(
+        &self,
+        graph: &CallGraph,
+        owned_calls: &HashSet<Id>,
+    ) -> HashMap<Id, Vec<(RefinedCaller, Id)>> {
+        CONST_ONLY_REFINEMENTS.with(|cell| cell.set(cell.get() + 1));
+        // The dispatch sites the graph deliberately leaves indirect (B143): a
+        // bounded generic's member call, a trait re-dispatch onto a concrete
+        // receiver, or an iterator-protocol `for` edge. Enumerate every
+        // non-const one — node-owned, initializer-owned, and bare top-level —
+        // and let `dispatch_refine` resolve each to the callees its recorded
+        // dispatch actually selects; the reverse map joins the fixpoint below
+        // as extra caller edges.
+        let dispatched_name = |call_id: Id| -> Option<&str> {
+            match crate::async_infer::dispatch_at(self.program, call_id) {
+                Some(GenericDispatch::OnConstraint(_, name))
+                | Some(GenericDispatch::OnType(_, name)) => Some(name),
+                None => None,
+            }
+        };
+        let is_dispatch_target = |target: CallTarget| {
+            matches!(
+                target,
+                CallTarget::Indirect(IndirectReason::TraitDispatch | IndirectReason::GenericMember)
+            )
+        };
+        // The candidate lists below are NAME-KEYED and program-wide
+        // (`candidates_of`, B279's sweep): every override of every trait
+        // declaring the dispatched name, whatever the receiver. They are
+        // deliberately NOT narrowed here, and the reason is the DIRECTION this
+        // check reads an edge in. An edge is a REFUSAL — a runtime path that
+        // reaches a `[const_only]` capability is rejected — so a candidate
+        // this site could never select can only make the check refuse MORE.
+        // Over-refusing costs an author a diagnostic they can see and argue
+        // with; under-refusing ships the capability into a runtime path in
+        // silence, which is the whole failure this check exists to prevent.
+        // The context pass narrows the same lists because it reads an edge as
+        // a property of the site (B258); nothing here narrows by RECEIVER.
+        //
+        // B318 S4's file scope is the one narrowing this check does take, and
+        // it survives the direction argument above because it is not a guess
+        // about what a site selects: an `impl` the calling file's imports did
+        // not admit is one that file CANNOT reach at all, so no runtime path
+        // through it exists here to refuse. Dropping it removes a refusal that
+        // could only ever have been about another file's program.
+        // `candidates_of` is O(traits x implementations) and a pure function of
+        // (the asking file's import scope, the dispatched name): hundreds of
+        // sites share a few dozen names, and the scope is `None` for every file
+        // that wrote no restriction (B318 S4). Asked once per distinct pair.
+        let candidate_cache: RefCell<HashMap<(Option<SourceId>, String), Vec<Id>>> =
+            RefCell::new(HashMap::default());
+        let candidates = |call_id: Id, name: &str| -> Vec<Id> {
+            let scope = self
+                .program
+                .admitting_file(call_id)
+                .filter(|file| self.program.impl_admission.restricts(*file));
+            candidate_cache
+                .borrow_mut()
+                .entry((scope, name.to_string()))
+                .or_insert_with(|| crate::dispatch_refine::candidates_of(self.program, scope, name))
+                .clone()
+        };
+        let mut refinement_sites: Vec<DispatchSite> = Vec::new();
+        for node in graph.nodes() {
+            for call in graph.calls_of(node.id()) {
+                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
+                    continue;
+                }
+                let Some(name) = dispatched_name(call.call_id) else {
+                    continue;
+                };
+                refinement_sites.push(DispatchSite {
+                    owner: RefinedCaller::Node(node.id()),
+                    call: call.call_id,
+                    candidates: candidates(call.call_id, name),
+                });
+            }
+        }
+        // Module-level initializers own no graph node; a dispatch site there
+        // is TopLevel-owned, so an R-selecting resolution is a boundary by
+        // itself. (A `const`-marked initializer never appears here — the
+        // graph skips it, and the const-subtree cut would drop it anyway.)
+        let mut initializer_call_ids: HashSet<Id> = HashSet::default();
+        for binding in self.program.module_level_bindings() {
+            for call in graph.initializer_calls_of(binding) {
+                initializer_call_ids.insert(call.call_id);
+                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
+                    continue;
+                }
+                let Some(name) = dispatched_name(call.call_id) else {
+                    continue;
+                };
+                refinement_sites.push(DispatchSite {
+                    owner: RefinedCaller::TopLevel,
+                    call: call.call_id,
+                    candidates: candidates(call.call_id, name),
+                });
+            }
+        }
+        // Top-level statement calls own neither a node nor an initializer
+        // record, so the dispatch record itself is the gate.
+        for (call_id, _) in &self.program.function_calls {
+            if owned_calls.contains(call_id)
+                || initializer_call_ids.contains(call_id)
+                || self.in_const_subtree(*call_id)
+            {
+                continue;
+            }
+            let Some(name) = dispatched_name(*call_id) else {
+                continue;
+            };
+            refinement_sites.push(DispatchSite {
+                owner: RefinedCaller::TopLevel,
+                call: *call_id,
+                candidates: candidates(*call_id, name),
+            });
+        }
+        let mut refined_callers: HashMap<Id, Vec<(RefinedCaller, Id)>> = HashMap::default();
+        for edge in crate::dispatch_refine::refined_edges(self.program, graph, &refinement_sites) {
+            refined_callers
+                .entry(edge.callee)
+                .or_default()
+                .push((edge.caller, edge.anchor));
+        }
+        refined_callers
     }
 
     /// The value-escape half of §2's rule. Two shapes make a runtime function

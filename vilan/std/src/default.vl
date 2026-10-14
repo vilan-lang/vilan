@@ -19,6 +19,21 @@ impl bool with Default {
 	}
 }
 
+/// A fixed array's default is its element's at every position (array-lengths'
+/// second std wave, B623): `[i32; 3]` is `[0, 0, 0]`.
+impl [type T: Default; const N] with Default {
+	fun default(): [T; N] {
+		[T::default(); N]
+	}
+}
+
+/// `T::default()` spelled as a call every type can make: a fixed array cannot head
+/// a path (`[i32; 2]::default()` is no expression), so `[derive(Default)]` spells
+/// such a field through this (B623).
+fun default_of<T: Default>(): T {
+	T::default()
+}
+
 // The `Default` derive: a prelude macro (this module is always loaded).
 
 macro fun Default(item: Item): Source {
@@ -26,17 +41,25 @@ macro fun Default(item: Item): Source {
 	import macro_std::build::{ impl_of, fun_of, init_of };
 
 	if item.as_struct() is Some(let target) {
-		// `{ a = i32::default(), b = Point::default() }`.
+		// `{ a = i32::default(), b = Point::default() }`. A field whose type cannot
+		// head a path (a fixed array) calls `default_of<[i32; 2]>()`, and only then
+		// does the output import it (B623).
 		mut literal = init_of(target.name);
+		mut imports = "Default";
 		for field in target.fields {
-			literal = literal.field(field.name, i"{field.type_.render()}::default()");
+			if field.type_.is_path_head() {
+				literal = literal.field(field.name, i"{field.type_.render()}::default()");
+			} else {
+				literal = literal.field(field.name, i"default_of<{field.type_.render()}>()");
+				imports = "{ Default, default_of }";
+			}
 		}
 		// The subject is spelled as an application of its own parameters
 		// (`Holder<T>`) where a TYPE is wanted, and the impl binds them under
 		// `Default` (B194's rule); the struct literal's head names a namespace and
 		// stays bare.
 		let constructor = fun_of("default").returns(target.subject()).expr(literal.render());
-		ret source("import std::default::Default;\n" + impl_of(target.name)
+		ret source(i"import std::default::{imports};\n" + impl_of(target.name)
 			.generics(target.binders("Default"))
 			.implements("Default")
 			.method(constructor)

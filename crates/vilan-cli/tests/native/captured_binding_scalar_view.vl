@@ -1,0 +1,88 @@
+// A `&` of a captured `mut` binding's scalar place — a number, a `bool`, a
+// `str`, as a field or as the binding itself — beside a LATER argument that
+// writes the binding: the view is taken after the other arguments (spec
+// §6.9's native note), so the callee reads the written value, as the JS pair
+// does; natively the value had been read where it stood. A `&` of an
+// `Option`, a tuple or an enum is the value both backends held when the
+// argument was evaluated (the controls).
+import std::io::print;
+
+enum Mode {
+	Off,
+	On(i32),
+}
+
+struct Log {
+	count: i32,
+	ready: bool,
+	name: str,
+	maybe: Option<i32>,
+	pair: (i32, str),
+	mode: Mode,
+}
+
+fun count_of(count: &i32, value: i32): i32 {
+	*count + value
+}
+
+fun ready_of(ready: &bool, value: i32): bool {
+	*ready
+}
+
+fun name_of(name: &str, value: i32): str {
+	*name
+}
+
+fun maybe_of(maybe: &Option<i32>, value: i32): Option<i32> {
+	*maybe
+}
+
+fun pair_of(pair: &(i32, str), value: i32): (i32, str) {
+	*pair
+}
+
+fun mode_of(mode: &Mode, value: i32): bool {
+	*mode is Mode::On(_)
+}
+
+fun main() {
+	mut log = Log {
+		count = 0,
+		ready = false,
+		name = "old",
+		maybe = None,
+		pair = (0, "a"),
+		mode = Mode::Off,
+	};
+	let bump = || {
+		log.count += 1;
+		0
+	};
+	let arm = || {
+		log.ready = true;
+		0
+	};
+	let rename = || {
+		log.name = "new";
+		0
+	};
+	let fill = || {
+		log.maybe = Some(1);
+		log.pair = (1, "b");
+		log.mode = Mode::On(1);
+		0
+	};
+	print(count_of(&log.count, bump()));
+	print(ready_of(&log.ready, arm()));
+	print(name_of(&log.name, rename()));
+	print(maybe_of(&log.maybe, fill()));
+	print(pair_of(&log.pair, 0));
+	print(mode_of(&log.mode, 0));
+	mut total = 0;
+	let add = || {
+		total += 5;
+		0
+	};
+	print(count_of(&total, add()));
+	print(count_of(&log.count, 1));
+}

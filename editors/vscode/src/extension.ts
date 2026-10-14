@@ -28,6 +28,7 @@ import {
     Uri,
 } from 'vscode';
 import { PlacedClosers } from './closers';
+import { registerDebugging } from './debugging';
 import {
     FileStatus,
     MenuRow,
@@ -233,6 +234,8 @@ function readFeatureConfig(): object {
             enabled: config.get<boolean>('inlayHints.enabled', true),
             // E227: a `[hint]`ed type by the trait it is used as (`~Source<T>`).
             abbreviate: config.get<boolean>('inlayHints.abbreviate', true),
+            // E302: `every` stage of a split chain, or only where the type `changes`.
+            chains: config.get<string>('inlayHints.chains', 'every'),
         },
         semanticTokens: { enabled: config.get<boolean>('semanticTokens.enabled', true) },
         completion: { functionCall: config.get<string>('completion.functionCall', 'full') },
@@ -900,6 +903,9 @@ export function activate(context: ExtensionContext): void {
     );
 
     void startClient(context).then(() => schedulePlatformRefresh());
+
+    // E257 S6: the `vilan` debug type and the "Debug" lens on `fun main`.
+    registerDebugging(context);
 
     context.subscriptions.push(
         commands.registerCommand('vilan.restartServer', async () => {

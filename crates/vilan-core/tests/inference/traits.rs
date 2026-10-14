@@ -10238,3 +10238,69 @@ fn e295_a_blankets_static_on_an_unadmitted_head_names_the_missing_bound() {
          implement `Leaf`",
     );
 }
+
+/// B621: std's `Eq` covered the numbers, `str`, fixed arrays and tuples only —
+/// `bool`, `List<T: Eq>`, `Option<T: Eq>`, `Result<T: Eq, E: Eq>`,
+/// `HashSet<T: Eq>` and `HashMap<K: Eq, V: Eq>` were `PartialEq` and not `Eq`,
+/// so a `T: Eq` refused `true`, `[1, 2]` and `Some(1)`. Each is now one marker
+/// impl beside its `PartialEq` impl, and B609 makes the generic ones conform
+/// through the element bound.
+#[test]
+fn b621_bool_and_the_std_containers_of_eq_elements_are_eq() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::Eq;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+        fun same<T: Eq>(a: T, b: T): bool { a == b }
+        fun main() {
+            print(same(true, true));
+            print(same([1, 2], [1, 2]));
+            print(same(["a"], ["b"]));
+            print(same(Some(1), None));
+            print(same(Some([true]), Some([true])));
+            let ok: Result<i32, str> = Ok(1);
+            print(same(ok, Ok(1)));
+            print(same(ok, Err("no")));
+            print(same((1, "a", true), (1, "a", true)));
+            let set: HashSet<i32> = [1, 2].to_set();
+            print(same(set, [2, 1].to_set()));
+            mut map: HashMap<str, bool> = HashMap::new();
+            map.insert("a", true);
+            print(same(map, HashMap::new()));
+        }
+        "#,
+        "true\ntrue\nfalse\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\n",
+    );
+}
+
+/// B621's boundary: a container is `Eq` only through its element's `Eq` — an
+/// `f64` (deliberately not `Eq`: NaN) anywhere inside keeps it `PartialEq`.
+#[test]
+fn b621_a_container_of_a_non_eq_element_is_not_eq() {
+    for (annotation, value) in [
+        ("List<f64>", "[1.5]"),
+        ("Option<f64>", "Some(1.5)"),
+        ("Result<i32, f64>", "Ok(1)"),
+        ("Result<f64, i32>", "Err(1)"),
+        ("HashSet<f64>", "[1.5].to_set()"),
+        ("HashMap<str, f64>", "HashMap::new()"),
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                import std::compare::Eq;
+                import std::hash_map::HashMap;
+                import std::hash_set::HashSet;
+                fun same<T: Eq>(a: T, b: T): bool {{ a == b }}
+                fun main() {{
+                    let value: {annotation} = {value};
+                    let _same = same(value, value);
+                }}
+                "#
+            ),
+            "does not implement trait 'Eq'",
+        );
+    }
+}

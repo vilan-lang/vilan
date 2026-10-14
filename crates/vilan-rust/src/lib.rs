@@ -2191,6 +2191,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.mint(rebuilt)
     }
 
+    /// F137: a tuple LITERAL records no type of its own — `match (self,
+    /// other)`, the derived `PartialEq` of an enum, is the shape — so its
+    /// patterns had no element types to read a variant's arguments off, and
+    /// a generic enum's variant pattern fell back to the DECLARATION's own
+    /// parameters, which the impl's substitution does not bind (`Slots<any>`,
+    /// refused). The tuple of its elements' settled types, minted.
+    fn tuple_literal_type(&mut self, id: Id) -> Option<TypeId> {
+        let Some(Expr::Tuple(elements)) = self.program.entity_map.get(&id).cloned() else {
+            return None;
+        };
+        let mut types = Vec::with_capacity(elements.len());
+        for element in elements {
+            types.push(self.settled_value_type(element)?);
+        }
+        Some(self.mint(Type::Tuple(types, TupleLabels::NONE)))
+    }
+
     /// F101: the element types of a tuple-family type in this instance — a
     /// tuple's own elements, or a mapped tuple's `(U in T: F<U>)` template
     /// with `U` bound to each element of `T` (itself a family, so a mapped
@@ -3900,9 +3917,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// Refuses a closure-reaching field whose shape `vilan_rt::ReferenceEq` has
     /// no impl for, BY NAME, rather than emitting Rust that rustc will refuse.
     ///
-    /// The trait covers an `Rc` at any depth under an `Option` or a `Vec`, which
-    /// is every shape std writes. A `Map<K, || void>` is not one of them and
-    /// says so here.
+    /// The trait covers an `Rc` at any depth under an `Option`, a `Vec`, a
+    /// fixed array (F133) and a map's values (F136), which is every shape std
+    /// writes. A tuple of three holding one is not among them and says so
+    /// here.
     fn check_reference_equality(rendered: &str, owner: &str, span: Span) -> Result<(), Error> {
         if !mentions_a_closure(rendered)
             || compares_by_cell_identity(rendered)
@@ -3913,7 +3931,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Err(unsupported(
             &format!(
                 "a closure held inside `{rendered}` (in `{owner}`), which has no reference \
-                 equality — `Option`, `List` and a fixed array of one do"
+                 equality — `Option`, `List`, a fixed array, a map and a key-closure pair of \
+                 one do"
             ),
             span,
         ))
@@ -3945,7 +3964,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .and_then(|inner| inner.strip_suffix('>'))
                     .and_then(|inner| inner.rsplit_once(", "))
             });
-        array_element.is_some_and(|(element, _)| Self::reference_equality_reaches(element))
+        if array_element.is_some_and(|(element, _)| Self::reference_equality_reaches(element)) {
+            return true;
+        }
+        // F136: a map of closures (`vilan_rt::Map<K, V>`, std's `NativeMap`)
+        // compares its values by reference, and a value that is the map's
+        // `(key, value)` entry compares its key by value — a key holds no
+        // closure (it is hashable).
+        if let Some((key, value)) = rendered
+            .strip_prefix("vilan_rt::Map<")
+            .and_then(|inner| inner.strip_suffix('>'))
+            .and_then(split_at_the_top_level_comma)
+        {
+            return !mentions_a_closure(key) && Self::reference_equality_reaches(value);
+        }
+        rendered
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+            .and_then(split_at_the_top_level_comma)
+            .is_some_and(|(key, value)| {
+                !mentions_a_closure(key) && Self::reference_equality_reaches(value)
+            })
     }
 
     /// One emitted aggregate's `impl vilan_rt::Json`.
@@ -8635,7 +8674,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `let`. A field subject asks only for the head, without minting
     /// ([`Self::call_value_head`], F92).
     fn settled_value_type(&mut self, id: Id) -> Option<TypeId> {
-        let recorded = self.type_of(id)?;
+        let Some(recorded) = self.type_of(id) else {
+            return self.tuple_literal_type(id);
+        };
         let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id).cloned() else {
             return Some(recorded);
         };
@@ -12935,13 +12976,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F123: a std lookup that runs no user code (`HashSet::contains`,
         // `HashMap::get`/`contains_key` over a key whose `hash` is std's)
         // reads a `Shared` view's field receiver through the cell, as F114's
-        // reading intrinsics do, instead of copying the collection out.
+        // reading intrinsics do, instead of copying the collection out — unless
+        // the key argument writes the cell (F135: the read is a copy taken
+        // where it stands, spec §6.7, which the analyzer's `clone_sites` marks
+        // for the JS backend too).
         let reads_a_shared_receiver = views_allowed
             && matches!(conventions.first(), Some(Receiving::Ref))
             && self.std_lookup_runs_no_user_code(target, argument_ids)
-            && argument_ids
-                .first()
-                .is_some_and(|receiver| self.is_a_cell_read_place(*receiver));
+            && argument_ids.first().is_some_and(|receiver| {
+                self.is_a_cell_read_place(*receiver)
+                    && !self.copy_applies(self.program.clone_sites.get(receiver))
+            });
         let takes_a_view: Vec<bool> = argument_ids
             .iter()
             .enumerate()
@@ -12953,12 +12998,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
             .collect();
         let views_a_cell = takes_a_view.contains(&true);
-        // F129: an argument that COPIES out of a cell — a spine through a
-        // `Shared` view or over a boxed binding, of a type the JS backend
-        // hands on by reference — while a later argument runs code is copied
-        // LAST, after the other arguments are settled, so a later argument
-        // that writes the cell in place is seen by the callee as on JS (spec
-        // §6.9's native note, the order F49's views and F123's lookups have).
+        // F129: an argument that COPIES out of a captured binding's cell — a
+        // spine over a boxed binding, of a type the JS backend hands on by
+        // reference — while a later argument runs code is copied LAST, after
+        // the other arguments are settled, so a later argument that writes
+        // the binding in place is seen by the callee as on JS (spec §6.9's
+        // native note, the order F49's views have). A `Shared` read is copied
+        // where it stands (F135: spec §6.7).
         let defers_a_copy: Vec<bool> = (0..argument_ids.len())
             .map(|index| {
                 self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
@@ -13514,19 +13560,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         !self.is_natively_copy(place) && self.cell_spine(place).is_some()
     }
 
-    /// F129: whether the argument at `index` is a copy out of a cell that the
-    /// call takes LAST — after every other argument has been settled — rather
-    /// than where it stands.
+    /// F129: whether the argument at `index` is a copy out of a captured
+    /// `mut` binding's cell that the call takes LAST — after every other
+    /// argument has been settled — rather than where it stands.
     ///
-    /// A spine through a `Shared` view or over a boxed binding (`cell.read().
-    /// items`, `log.lines`) is natively a copy out of the cell's scoped borrow
-    /// (F62, F103), and the copy had been taken in argument order: a LATER
-    /// argument that wrote the cell in place (`has(cell.read().items,
-    /// grow(cell))`, `grow` pushing into `items`) was not seen by the callee,
-    /// where the JS backend — whose argument is the collection itself —
-    /// printed the written answer. Taking the copy after the later arguments
-    /// is the order spec §6.9's native note gives a view, and the one F123's
-    /// lookups read in.
+    /// A spine over a boxed binding (`log.lines`, the binding itself) is
+    /// natively a copy out of the cell's scoped borrow (F62, F103), and the
+    /// copy had been taken in argument order: a LATER argument that wrote the
+    /// binding in place (`words.measured(more())`, `more` pushing into
+    /// `words.items`) was not seen by the callee, where the JS backend —
+    /// whose argument is the binding's object itself — printed the written
+    /// answer. Taking the copy after the later arguments is the order spec
+    /// §6.9's native note gives a view of the binding.
+    ///
+    /// A spine through a `Shared` view is NOT deferred (F135, R-a door (1)):
+    /// it is a `read()`, which copies where it is evaluated (spec §6.7), and
+    /// the JS backend copies such an argument when a later one writes the
+    /// cell (the analyzer's `clone_sites`).
     ///
     /// The copy waits only where the wait is the JS answer and changes no
     /// other: the value is one JS hands on BY REFERENCE (a struct, a `List`,
@@ -13535,9 +13585,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// takes no copy of it at the call (`clone_sites`), a later argument runs
     /// code, and every other argument that runs code can be settled ahead of
     /// it in its own order: a by-value one, a `&` one that computes its value,
-    /// or a view. The cell's handle must be a binding, and each subscript
-    /// index must run no code, so deferring the read moves nothing but the
-    /// copy itself.
+    /// or a view. Each subscript index must run no code, so deferring the
+    /// read moves nothing but the copy itself.
     fn defers_its_cell_copy(
         &self,
         conventions: &[Receiving],
@@ -13559,21 +13608,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some((root, steps)) = self.cell_spine(place) else {
             return false;
         };
-        if let CellRoot::View(handle) = root
-            && !matches!(
-                self.program.entity_map.get(&handle),
-                Some(Expr::Local(_) | Expr::Parameter(_))
-            )
-        {
+        // F135 (R-a, door (1)): a spine through a `Shared` view is a
+        // `read()`, which COPIES where it is evaluated (spec §6.7) — on JS
+        // too, which copies such an argument when a later one writes the cell
+        // (the analyzer's `clone_sites`) — so it is read where it stands.
+        if matches!(root, CellRoot::View(_)) {
             return false;
         }
         let subscripts_run_code = steps.iter().any(
             |step| matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript)),
         );
+        // A `&` of a scalar place (a number, `bool`, `str`) is a `(base, key)`
+        // pair on JS, read through when the callee reads it — after the later
+        // arguments, as spec §6.9's view of the binding is — so it waits as an
+        // aggregate does. (A `&` of an enum or a tuple is the value JS held
+        // when it was evaluated, as natively.)
+        let read_late_on_js = self.type_of(place).is_some_and(|type_id| {
+            self.aliases_on_the_js_backend(type_id)
+                || (!by_value && self.views_as_a_pair_on_the_js_backend(type_id))
+        });
         if subscripts_run_code
-            || !self
-                .type_of(place)
-                .is_some_and(|type_id| self.aliases_on_the_js_backend(type_id))
+            || !read_late_on_js
             || (by_value && self.copy_applies(self.program.clone_sites.get(&argument)))
         {
             return false;
@@ -13614,6 +13669,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     })
             }
             Some(Type::Array(..) | Type::Dyn(..)) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the JS backend's `&` of a place of `type_id` is a `(base, key)`
+    /// PAIR over the place, read through when it is read — the scalar
+    /// primitives (`SCALAR_PRIMITIVE_NAMES`, `str` among them) and `bool`,
+    /// the transformer's `resolves_to_scalar_view_pointee`.
+    fn views_as_a_pair_on_the_js_backend(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, _)) => {
+                self.program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        vilan_core::type_::SCALAR_PRIMITIVE_NAMES.contains(&declaration.name)
+                    })
+            }
+            Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id == Some(*enum_id),
             _ => false,
         }
     }
@@ -14672,13 +14746,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // context. The two lists differ: the pass threads a hidden
             // argument at a trait call when some impl of the member reads the
             // context, so an impl that reads none (`RemoteStoreSome`'s
-            // `attach_observer`) takes fewer, and one the declaration's union
-            // missed (the `Source` blanket's `start`, reading `turn_scope` and
-            // `ambient_nursery` where `Flow::start` threads nothing) takes
-            // more. A missing context of the SAFE flavour is `None` — the
-            // `undefined` the JS table passes, which that flavour reads as
-            // "no ambient value"; a missing STRICT one has no value to stand
-            // in and is refused.
+            // `attach_observer`) takes fewer. A body-less declaration threads
+            // every context its union reads (B617 — the `Source` blanket's
+            // `start`, reading `turn_scope` and `ambient_nursery`, gives
+            // `Flow::start` both), so only a DEFAULT's declaration, whose
+            // parameters are its own body's, can miss one an override reads:
+            // a missing context of the SAFE flavour is `None` there — the
+            // `undefined` the JS table passes, which that flavour reads as "no
+            // ambient value"; a missing STRICT one has no value to stand in
+            // and is refused.
             let forwarded_here = self.object_slot_arguments(slot, &target_parameters);
             let Some(forwarded_here) = forwarded_here else {
                 self.object_impls
@@ -14718,8 +14794,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// B606: the arguments one object slot hands its implementation after the
     /// receiver, matched parameter by parameter — see
     /// [`Self::ensure_object_impl`]. `None` when the implementation's written
-    /// parameters do not line up with the declaration's, or it reads a
-    /// STRICT context the declaration does not thread.
+    /// parameters do not line up with the declaration's, or it reads a context
+    /// the declaration does not thread — any context, for a body-less
+    /// declaration (B617: it threads its whole union's), and a STRICT one for
+    /// a default's.
     fn object_slot_arguments(
         &self,
         slot: &ObjectSlot,
@@ -14731,15 +14809,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .get(parameter)
                 .copied()
         };
-        let declared: Vec<Id> = self
-            .program
-            .functions
-            .get(&slot.declaration)?
-            .parameters
-            .iter()
-            .skip(1)
-            .copied()
-            .collect();
+        let declaration = self.program.functions.get(&slot.declaration)?;
+        // B617: a body-less declaration carries its whole union's hidden
+        // parameters (`dispatch_refine::object_slot_declaration_unions`), so
+        // every context an implementation reads is threaded and the stand-in
+        // below is for a DEFAULT's declaration alone, whose parameters are its
+        // own body's.
+        let union_declared = !declaration.has_body;
+        let declared: Vec<Id> = declaration.parameters.iter().skip(1).copied().collect();
         if declared.len() != slot.forwarded.len() {
             return None;
         }
@@ -14755,18 +14832,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             match hidden(parameter) {
                 None => arguments.push(written.next()?.clone()),
                 Some(context) => {
+                    let optional = |parameter: &Id| {
+                        self.program
+                            .context_optional_hidden_parameters
+                            .contains(parameter)
+                    };
                     let threaded = declared
                         .iter()
                         .zip(&slot.forwarded)
-                        .find(|(declared, _)| hidden(declared) == Some(context))
-                        .map(|(_, name)| name.clone());
+                        .find(|(declared, _)| hidden(declared) == Some(context));
                     match threaded {
-                        Some(name) => arguments.push(name),
-                        None if self
-                            .program
-                            .context_optional_hidden_parameters
-                            .contains(parameter) =>
-                        {
+                        // B617: the union's flavour is strict when any of its
+                        // members reads strictly; a SAFE implementation then
+                        // takes the bare value as present.
+                        Some((declared, name)) if !optional(declared) && optional(parameter) => {
+                            arguments.push(format!("Some({name})"));
+                        }
+                        Some((_, name)) => arguments.push(name.clone()),
+                        None if !union_declared && optional(parameter) => {
                             arguments.push("None".to_string());
                         }
                         None => return None,
@@ -16069,6 +16152,29 @@ fn is_closure_type(rendered: &str) -> bool {
 /// either side (node prints `[Function: <name>]` off a name this backend cannot
 /// reproduce, and `JSON.stringify` omits the key), so an aggregate that reaches
 /// one refuses at run time by name rather than guessing bytes.
+/// F136: a rendered two-part list (`K, V`) split at its one comma outside
+/// every bracket — `None` when there is no such comma, or more than one.
+fn split_at_the_top_level_comma(rendered: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut split = None;
+    for (index, character) in rendered.char_indices() {
+        match character {
+            '<' | '(' | '[' => depth += 1,
+            '>' if rendered[..index].ends_with('-') => {}
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if split.is_some() {
+                    return None;
+                }
+                split = Some(index);
+            }
+            _ => {}
+        }
+    }
+    let index = split?;
+    Some((rendered[..index].trim(), rendered[index + 1..].trim()))
+}
+
 fn mentions_a_closure(rendered: &str) -> bool {
     rendered.contains("dyn Fn")
 }

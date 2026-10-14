@@ -2436,11 +2436,11 @@ fn generic_call_over_a_bounded_transport_decodes() {
         import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
-        import std::js::promise::Promise;
-        trait Wire { fun send(self, msg: str): Promise<str>; }
+        import std::task::Task;
+        trait Wire { fun send(self, msg: str): Task<str>; }
         struct Echo {}
         impl Echo with Wire {
-            fun send(self, msg: str): Promise<str> { async { msg } }   // echoes the request
+            fun send(self, msg: str): Task<str> { async { msg } }   // echoes the request
         }
         [derive(Json)]
         struct Pt { x: i32 }
@@ -6060,6 +6060,176 @@ fn b194_a_parameter_reached_only_through_a_generic_argument_is_bound() {
         main();
         "#,
         "Slot { held = Inner { v = 4 } }\n",
+    );
+}
+
+/// B622: `[derive(Hashable)]` over a generic struct refused its generic
+/// fields — "field `item` ... is `T`, which is not `Hashable`" — although the
+/// derive binds every reached parameter `type T: Hashable` in the impl it
+/// writes. The boundary now reads each field under the derived impl's own
+/// binders: a bare `T`, a `List<T>`, an `Option<T>`, a `[T; N]`, another
+/// derived `Inner<T>` and a hand-written conditional impl's `Wrapper<T>`, at
+/// a struct and an enum, a phantom parameter beside a reached one.
+#[test]
+fn b622_derive_hashable_reads_a_generic_field_under_its_binder() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash::{ Hash, Hashable, canonical_hash };
+
+        struct Opaque { tag: i32 }
+
+        [derive(Hashable)]
+        struct Inner<T> {
+            v: T,
+        }
+
+        struct Wrapper<U> {
+            u: U,
+        }
+
+        impl Wrapper<type U: Hashable> with Hashable {
+            fun hash(self): Hash {
+                self.u.hash()
+            }
+        }
+
+        [derive(Hashable)]
+        struct Holder<T, P> {
+            item: T,
+            items: List<T>,
+            maybe: Option<T>,
+            inner: Inner<T>,
+            wrapped: Wrapper<T>,
+        }
+
+        [derive(Hashable)]
+        struct Buf<T, const N> {
+            items: [T; N],
+        }
+
+        [derive(Hashable)]
+        enum Either<L, R> {
+            Left(L),
+            Right(List<R>),
+        }
+
+        fun holder(value: i32): Holder<i32, Opaque> {
+            Holder {
+                item = value,
+                items = [value],
+                maybe = Some(value),
+                inner = Inner { v = value },
+                wrapped = Wrapper { u = value },
+            }
+        }
+
+        fun main() {
+            print(holder(1).hash() == holder(1).hash());
+            print(holder(1).hash() == holder(2).hash());
+            let a: Buf<str, 2> = Buf { items = ["x", "y"] };
+            print(a.hash() == Buf { items = ["x", "y"] }.hash());
+            let left: Either<i32, str> = Either::Left(3);
+            let right: Either<i32, str> = Either::Right(["r"]);
+            print(left.hash() == right.hash());
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\n",
+    );
+}
+
+/// B622's boundary: reading the bound does not relax the field check — a
+/// field the derive's binder cannot make `Hashable` (a `HashMap` of `T`, a
+/// closure over `T`) is refused at the declaration as before, and an
+/// instantiation at a non-`Hashable` argument is refused at the use.
+#[test]
+fn b622_a_generic_field_no_binder_makes_hashable_is_still_refused() {
+    assert_fails_with(
+        r#"
+        import std::hash::Hashable;
+        import std::hash_map::HashMap;
+        [derive(Hashable)]
+        struct Table<T> {
+            rows: HashMap<str, T>,
+        }
+        fun main() {}
+        "#,
+        "field `rows` of `[derive(Hashable)]` type `Table` is `HashMap<str, T>`, which is not `Hashable`",
+    );
+    assert_fails_with(
+        r#"
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        struct Callback<T> {
+            run: |T| i32,
+        }
+        fun main() {}
+        "#,
+        "which is not `Hashable`",
+    );
+    assert_fails_with(
+        r#"
+        import std::hash::Hashable;
+        import std::hash_set::HashSet;
+        struct Opaque { tag: i32 }
+        [derive(Hashable)]
+        struct Holder<T> {
+            item: T,
+        }
+        fun main() {
+            let held = Holder { item = Opaque { tag = 1 } };
+            let _key = held.hash();
+        }
+        "#,
+        "'Opaque' does not implement trait 'Hashable'",
+    );
+}
+
+/// B622's other half: a GENERIC derived type was `Hashable` by its NAME
+/// alone, whatever its arguments — harmless while a generic derive could
+/// not be declared, a silently broken key once it can (`Holder<|| i32>`
+/// hashed two different closures alike). The name answers for a
+/// non-generic derive only; a generic one asks its impl, whose binder
+/// refuses the closure at the boundary. (Wire keeps the name answer: its
+/// derive refuses a parameter-typed field outright, C7's guard, so a Wire
+/// type's parameters are phantom and its arguments never matter.)
+#[test]
+fn b622_a_generic_derived_field_type_is_judged_by_its_arguments() {
+    assert_fails_with(
+        r#"
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        struct Holder<T> {
+            item: T,
+        }
+        [derive(Hashable)]
+        struct Outer {
+            inner: Holder<|| i32>,
+        }
+        fun main() {}
+        "#,
+        "field `inner` of `[derive(Hashable)]` type `Outer` is `Holder<|| i32>`, which is not `Hashable`",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::hash::Hashable;
+        import std::io::print;
+        [derive(Hashable)]
+        struct Holder<T> {
+            item: T,
+        }
+        [derive(Hashable)]
+        struct Outer<U> {
+            inner: Holder<U>,
+            fixed: Holder<str>,
+        }
+        fun main() {
+            let a = Outer { inner = Holder { item = 1 }, fixed = Holder { item = "f" } };
+            let b = Outer { inner = Holder { item = 2 }, fixed = Holder { item = "f" } };
+            print(a.hash() == b.hash());
+        }
+        "#,
+        "false\n",
     );
 }
 

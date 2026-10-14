@@ -10781,6 +10781,167 @@ fn b457_a_read_passed_to_a_callee_that_writes_nothing_is_not_copied() {
 }
 
 // ---------------------------------------------------------------------------
+// F135 — a read beside a LATER argument that writes its cell (R-a, door (1))
+// ---------------------------------------------------------------------------
+//
+// Spec §6.7: `read()` copies at the moment it is evaluated, on both backends.
+// B457's copy of a read argument (the callee writes the cell) extended to a
+// later ARGUMENT of the same call that writes it: the read is the cell's own
+// storage on JS, so the callee saw the later write there and not natively.
+// Every position (a bare read, a spine, a receiver, a `&` operand) and every
+// callee (a closure value's call too); the later argument writes the cell
+// itself or reaches a write through its calls.
+
+#[test]
+fn f135_a_read_beside_a_later_argument_that_writes_its_cell_is_a_copy() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "struct Bag {\n",
+            "\titems: List<i32>,\n",
+            "}\n",
+            "fun grow(cell: Shared<Bag>): i32 {\n",
+            "\tcell.write().items.push(9);\n",
+            "\t9\n",
+            "}\n",
+            "fun deeper(cell: Shared<Bag>): i32 {\n",
+            "\tgrow(cell)\n",
+            "}\n",
+            "fun whole(bag: Bag, value: i32): bool {\n",
+            "\tbag.items.contains(value)\n",
+            "}\n",
+            "fun has(items: List<i32>, value: i32): bool {\n",
+            "\titems.contains(value)\n",
+            "}\n",
+            "fun lent(items: &List<i32>, value: i32): bool {\n",
+            "\titems.contains(value)\n",
+            "}\n",
+            "fun fresh(): Shared<Bag> {\n",
+            "\tShared::new(Bag { items = [] })\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet a = fresh();\n",
+            "\tprint(whole(a.read(), grow(a)));\n",
+            "\tlet b = fresh();\n",
+            "\tprint(has(b.read().items, deeper(b)));\n",
+            "\tlet c = fresh();\n",
+            "\tprint(c.read().items.contains(grow(c)));\n",
+            "\tlet d = fresh();\n",
+            "\tprint(lent(&d.read().items, grow(d)));\n",
+            "\tlet e = fresh();\n",
+            "\tlet check = |items: List<i32>, value: i32| items.contains(value);\n",
+            "\tprint(check(e.read().items, grow(e)));\n",
+            "\tlet f = fresh();\n",
+            "\tprint(has(f.read().items, {\n",
+            "\t\tf.write().items.push(9);\n",
+            "\t\t9\n",
+            "\t}));\n",
+            "}\n",
+        ),
+        "false\nfalse\nfalse\nfalse\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn f135_a_scalar_view_of_a_read_holds_the_value_read_where_it_stands() {
+    // A `&` of a read's scalar field had been a `(base, key)` pair over the
+    // cell's live storage on JS, read through after the later argument wrote
+    // it (1); it is a fresh holder of the value read where it stands (0).
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "struct Bag {\n",
+            "\tcount: i32,\n",
+            "}\n",
+            "fun bump(cell: Shared<Bag>): i32 {\n",
+            "\tcell.write().count += 1;\n",
+            "\t0\n",
+            "}\n",
+            "fun seen(count: &i32, value: i32): i32 {\n",
+            "\t*count + value\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet cell = Shared::new(Bag { count = 0 });\n",
+            "\tprint(seen(&cell.read().count, bump(cell)));\n",
+            "\tprint(cell.read().count);\n",
+            "}\n",
+        ),
+        "0\n1\n",
+    );
+}
+
+#[test]
+fn f135_a_read_beside_arguments_that_write_no_cell_of_its_own_is_not_copied() {
+    // Only a LATER argument that can write THIS cell forces the copy: an
+    // earlier writing argument has run before the read is taken, a later one
+    // that writes another cell (or writes nothing) cannot reach the storage.
+    // (Cells are told apart by the handles that reach them: `quiet` is
+    // written by nothing, so no call can reach a write of it; a cell that IS
+    // written somewhere is asked through the later argument's write summary,
+    // as conservative as B457's.)
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "import std::shared::Shared;\n",
+        "fun grow(cell: Shared<List<i32>>): i32 {\n",
+        "\tcell.write().push(9);\n",
+        "\t9\n",
+        "}\n",
+        "fun fill(cell: Shared<List<i32>>): i32 {\n",
+        "\tcell.write().push(9);\n",
+        "\t9\n",
+        "}\n",
+        "fun peek(cell: Shared<List<i32>>): i32 {\n",
+        "\tcell.read().len().as_i32()\n",
+        "}\n",
+        "fun has(value: i32, items: List<i32>, more: i32): bool {\n",
+        "\titems.contains(value + more)\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tlet other = Shared::new([1, 2]);\n",
+        "\tprint(has(grow(cell), cell.read(), peek(cell)));\n",
+        "\tlet quiet = Shared::new([1, 2]);\n",
+        "\tprint(has(0, quiet.read(), fill(other)));\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a read no later argument can write must not be copied:\n{emitted}"
+    );
+}
+
+#[test]
+fn a_mut_self_call_on_a_reads_field_does_not_write_the_cell() {
+    // B274 copied a bare `cell.read()` standing as a `&mut self` receiver;
+    // a SPINE through the read (`cell.read().items.push(9)`, an element
+    // `cell.read().rows[0].push(9)`) is the same read and had grown the
+    // cell's list on JS (1), not natively (0). Spec §6.7: `read()` copies.
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "struct Bag {\n",
+            "\titems: List<i32>,\n",
+            "\trows: List<List<i32>>,\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet cell = Shared::new(Bag { items = [], rows = [[]] });\n",
+            "\tcell.read().items.push(9);\n",
+            "\tcell.read().rows[0].push(9);\n",
+            "\tprint(cell.read().items.len());\n",
+            "\tprint(cell.read().rows[0].len());\n",
+            "\tcell.write().items.push(9);\n",
+            "\tprint(cell.read().items.len());\n",
+            "}\n",
+        ),
+        "0\n0\n1\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B418 — a place or a `Shared` read reaching a binding THROUGH a branch copies
 // ---------------------------------------------------------------------------
 //
@@ -13760,6 +13921,120 @@ fn b578_a_view_of_a_call_result_is_a_pair_where_the_pointee_is_a_scalar() {
         }
         "#,
         "<2>\n[2]\n[7]\n[5]\n[five]\n[42]\n[8]\n[7]\n8\n[9]\n[1]\n[nine]\n[4]\n5\n",
+    );
+}
+
+/// B615: B578's twin at a CONCRETE view parameter — `read(&seven())` with
+/// `fun read(value: &i32)` threw `TypeError: Cannot read properties of
+/// undefined` on JS when native-51 filed it (B578 had not landed). Each shape
+/// hands the callee a `(base, key)` pair: a call, a binary and a unary value,
+/// a method's and a closure's parameter, `&str`/`&bool`/`&f64` returns, a
+/// tuple field, a list and an array element, a struct field of a call's
+/// result, an unwrapped option, a struct literal's field, an interpolation,
+/// two views in one call.
+#[test]
+fn b615_a_view_of_a_scalar_temporary_at_a_concrete_parameter_is_a_pair() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        struct Counter {
+            base: i32,
+        }
+
+        impl Counter {
+            fun take(self, value: &i32): i32 {
+                self.base + *value
+            }
+        }
+
+        fun seven(): i32 {
+            7
+        }
+
+        fun name(): str {
+            "vi"
+        }
+
+        fun yes(): bool {
+            true
+        }
+
+        fun half(): f64 {
+            0.5
+        }
+
+        fun pair(): (i32, str) {
+            (3, "p")
+        }
+
+        fun make(): List<i32> {
+            [10, 20]
+        }
+
+        fun fixed(): [i32; 2] {
+            [30, 40]
+        }
+
+        fun origin(): Point {
+            Point { x = 1, y = 2 }
+        }
+
+        fun maybe(): Option<i32> {
+            Some(9)
+        }
+
+        fun read(value: &i32): i32 {
+            *value + 1
+        }
+
+        fun read_str(value: &str): str {
+            *value + "!"
+        }
+
+        fun read_bool(value: &bool): bool {
+            !*value
+        }
+
+        fun read_f64(value: &f64): f64 {
+            *value * 2.0
+        }
+
+        fun read_two(left: &i32, right: &i32): i32 {
+            *left + *right
+        }
+
+        fun main() {
+            let a = 2;
+            let b = 3;
+            print(read(&seven()));
+            print(read(&(a + b)));
+            print(read(&-seven()));
+            print(read(&(seven())));
+            print(Counter { base = 100 }.take(&seven()));
+            let apply = |value: &i32| *value * 3;
+            print(apply(&seven()));
+            print(read_str(&name()));
+            print(read_bool(&yes()));
+            print(read_f64(&half()));
+            print(read(&pair().0));
+            print(read_str(&pair().1));
+            print(read(&make()[1]));
+            print(read(&fixed()[0]));
+            print(read(&origin().y));
+            print(read(&maybe().unwrap()));
+            print(read(&Point { x = 4, y = 5 }.x));
+            print(read_str(&i"{a}{b}"));
+            print(read_two(&seven(), &(a * b)));
+            print(read(&make().len().as_i32()));
+        }
+        "#,
+        "8\n6\n-6\n8\n107\n21\nvi!\nfalse\n1\n4\np!\n21\n31\n3\n10\n5\n23!\n13\n3\n",
     );
 }
 

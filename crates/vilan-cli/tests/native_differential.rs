@@ -7315,9 +7315,11 @@ const ASYNC_PANIC_PROBE: &str = concat!(
 /// program cannot work and nothing is gained by letting it build.
 ///
 /// F130: the same refusal for a task whose callee never SUSPENDS — `async
-/// work()` there is typed `Promise<i32>` (no `std::task` in the program),
+/// work()` there was typed `Promise<i32>` (no `std::task` in the program),
 /// which has no native rendering, so the rendered test never saw it: the
-/// build went through and the run panicked. It is refused by its vilan type.
+/// build went through and the run panicked. It is refused by its vilan type —
+/// `Task<i32>` since B618 (an `async` seeds `std::task`), the same refusal
+/// the suspending callee's task gets.
 #[test]
 fn printing_a_host_handle_is_refused_at_compile_time() {
     let staged = stage();
@@ -7330,7 +7332,7 @@ fn printing_a_host_handle_is_refused_at_compile_time() {
         (
             "native_probe_f130_print_ready_task.vl",
             PRINT_READY_TASK_PROBE,
-            "`print` of the host handle `Promise`",
+            "`print` of the host handle `Task`",
         ),
     ] {
         std::fs::write(staged.join(file), source).expect("write the probe program");
@@ -9678,6 +9680,26 @@ fn b578_a_view_of_a_call_result_is_identical_on_both_backends() {
         compare(&staged, file),
         Verdict::Identical,
         "a view of a call result must reach a scalar `&T` as a pair on JS"
+    );
+}
+
+/// B615: `&` of a SCALAR temporary handed to a CONCRETE `&i32`/`&str`/
+/// `&bool`/`&f64` parameter — the item's `read(&seven())` threw a TypeError on
+/// JS when filed (before B578 landed); B578's one-slot cell reaches every
+/// shape here, and this pins them beside its generic `&T`.
+#[test]
+fn b615_a_view_of_a_scalar_temporary_at_a_concrete_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_views_of_scalar_temporaries.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/views_of_scalar_temporaries.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a view of a scalar temporary must reach a concrete view parameter as a pair on JS"
     );
 }
 
@@ -12845,6 +12867,45 @@ fn array_lengths_s5_std_array_impls_answer_on_both_backends() {
     );
 }
 
+/// B623: array-lengths' second std wave — `Default`, `Json` and `FromJson`
+/// over every array length (`0` its own decode impl), the derives over an
+/// array field, an enum's array payload and a length-generic struct, and the
+/// decoder's length check, the same on both backends.
+#[test]
+fn b623_std_array_default_and_json_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_std_second_wave.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/array_std_second_wave.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "std's second array wave must answer the same natively"
+    );
+}
+
+/// B622: `[derive(Hashable)]` over a generic struct's generic fields —
+/// refused at the declaration before, read under the derived impl's binders
+/// now — hashes the same on both backends.
+#[test]
+fn b622_derives_over_generic_fields_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_derive_over_generic_fields.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/derive_over_generic_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a derive over generic fields must answer the same natively"
+    );
+}
+
 /// array-lengths.md S4: a named length — a top-level `const let`, a `let`
 /// chained through it, a local `let` — in a type and in a repeat literal,
 /// resolved to its number before the fixpoint, the same on both backends.
@@ -13119,11 +13180,12 @@ fn f125_a_bigint_as_text_writes_its_digits_on_both_backends() {
 /// cell per call (F114 read the intrinsics only). They run `key.hash()`
 /// and the table's lookup, nothing else, so over a key whose `hash` is
 /// std's (a `str`, an integer, a tuple of those) the receiver is now read
-/// through a view of the cell, taken after the key is evaluated — a key
-/// argument that writes the cell is seen by the lookup, as on JS (the copy
-/// had been taken first, and printed `false` against JS's `true`). A user
-/// key type's written `hash` keeps the copy. The emission pin: one
-/// `read_with(` left in `main`, the user key's.
+/// through a view of the cell. A key argument that writes the cell takes
+/// the copy where the read stands instead (F135, R-a door (1): `read()`
+/// copies where it is evaluated, on both backends — the JS backend copies
+/// that receiver too, and both print `false`). A user key type's written
+/// `hash` keeps the copy. The emission pin: two `read_with(` left in `main`,
+/// the writing key's and the user key's.
 #[test]
 fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends() {
     let staged = stage();
@@ -13141,22 +13203,39 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
     let main = emitted_main(&staged, file);
     assert_eq!(
         main.matches("read_with(").count(),
-        1,
-        "only the user key's lookup copies its set out of the cell:\n{main}"
+        2,
+        "only the writing key's and the user key's lookups copy their set out of the cell:\n{main}"
     );
 }
 
-/// F129 (R-h): an argument that copies out of a cell — a spine through a
-/// `Shared` view (`has(cell.read().items, grow(cell))`, a user-hashed
+/// The stdout of `file` on the JS and on the native backend.
+fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
+    let run = |arguments: &[&str]| {
+        let output = vilan(staged)
+            .args(arguments)
+            .output()
+            .expect("run the probe");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    (
+        run(&["run", file]),
+        run(&["run", "--backend", "rust", file]),
+    )
+}
+
+/// F129, as F135 (R-a, door (1)) ruled it: an argument read out of a
+/// `Shared` cell — `has(cell.read().items, grow(cell))`, a user-hashed
 /// `cell.read().probes.contains(mark(cell))`, a subscript `cell.read().
-/// rows[0]`, a written `&cell.read().items` beside a computed `&grown(cell)`)
-/// or a captured `mut` binding's cell (`words.measured(more())`) — was copied
-/// where it stood, so a LATER argument that wrote the cell in place was not
-/// seen by the callee natively (`false` against JS's `true`, silently). The
-/// copy is now taken last, after the other arguments are settled in their
-/// own order (`first` still prints before `second`). A scalar, a `str` and an
-/// `own` argument (which the JS backend copies at the call) are read where
-/// they stand on both. The emission pin: six deferred copies.
+/// rows[0]`, a written `&cell.read().items` beside a computed `&grown(cell)`
+/// — is a copy taken where it stands (spec §6.7), so a LATER argument that
+/// writes the cell in place is not seen by the callee on either backend: the
+/// JS backend, whose argument had been the cell's own storage, copies it, and
+/// the native copy is no longer taken last (F129's R-h order, reverted for a
+/// read). A captured `mut` binding's receiver (`words.measured(more())`) is
+/// spec §6.9's view, taken after the later arguments on both, and sees the
+/// write. A scalar, a `str` and an `own` argument are read where they stand
+/// on both. The emission pin: the binding's receiver is the one deferred
+/// copy left.
 #[test]
 fn f129_a_copy_out_of_a_cell_is_taken_after_the_later_arguments_on_both_backends() {
     let staged = stage();
@@ -13166,26 +13245,26 @@ fn f129_a_copy_out_of_a_cell_is_taken_after_the_later_arguments_on_both_backends
         include_str!("native/shared_view_argument_order.vl"),
     )
     .expect("write the probe program");
+    let expected = "false\nfalse\nfalse\nfalse\nfalse\n9\nold\nfirst\nsecond\n0\n2\n";
     assert_eq!(
-        compare(&staged, file),
-        Verdict::Identical,
-        "a later argument's in-place write of a cell must be seen by the callee natively"
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "a read out of a cell is copied where it stands, on both backends"
     );
     let main = emitted_main(&staged, file);
     assert_eq!(
         main.matches("let __copied").count(),
-        6,
-        "the six copies out of a cell wait for the later arguments:\n{main}"
+        1,
+        "only the captured binding's receiver waits for the later arguments:\n{main}"
     );
 }
 
-/// F129's residue: a later argument that REPLACES the copied place whole
-/// (`cell.write().items = [..]`, `words = Words { .. }`) is not seen on JS,
-/// whose argument is the object the place held when it was evaluated, and is
-/// seen by the native copy taken last. Neither order of a copy answers both
-/// shapes; the in-place write is the one F129 ruled.
+/// F135 (F129's residue, R-a door (1)): a later argument that REPLACES the
+/// read's place whole (`cell.write().items = [..]`) is not seen by the
+/// callee on either backend — the JS argument is the object the place held
+/// when it was evaluated, and the native copy is taken where it stands (it
+/// had been taken last, and saw the replacement).
 #[test]
-#[ignore = "F135 (F129's residue, filed by native-51): a later argument that replaces the copied place whole is seen natively and not on JS"]
 fn f129_a_later_argument_that_replaces_the_copied_place_answers_the_same_on_both_backends() {
     let staged = stage();
     let file = "native_probe_f129_shared_view_argument_replaced.vl";
@@ -13194,7 +13273,88 @@ fn f129_a_later_argument_that_replaces_the_copied_place_answers_the_same_on_both
         include_str!("native/shared_view_argument_replaced.vl"),
     )
     .expect("write the probe program");
+    assert_eq!(
+        both_stdouts(&staged, file),
+        ("0\n".to_string(), "0\n".to_string())
+    );
+}
+
+/// F135 (R-a, door (1)): B457's copy of a `read()` argument, extended from
+/// "the callee writes the cell" to "a LATER ARGUMENT writes it" — a bare
+/// read handed whole, a scalar `&` view of a read's field (a fresh holder on
+/// JS, not a pair over the cell's storage), a closure value's call, a later
+/// block that writes the cell itself, and a later argument that replaces the
+/// field. Each printed the later write on JS (`true`, `10`) and not natively;
+/// both now print the copy's answer. A read beside a write of ANOTHER cell
+/// takes no copy (the JS pin: four `__clone`s of a read, no fifth).
+#[test]
+fn f135_a_read_argument_is_copied_before_a_later_argument_writes_its_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f135_shared_read_argument_copies.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/shared_read_argument_copies.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "false\n9\nfalse\nfalse\nfalse\nfalse\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let output = vilan(&staged)
+        .args(["build", "--stdout", file])
+        .output()
+        .expect("build the probe");
+    let emitted = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        emitted.contains("has(f.v[0], grow(g))"),
+        "a read beside a write of another cell is not copied:\n{emitted}"
+    );
+}
+
+/// F135's binding half (spec §6.9, outside R-a's `read()`): a later argument
+/// that RE-BINDS a captured `mut` binding whose `&self` view the call takes
+/// (`words.measured(swap())`, `swap` assigning `words` whole). The native
+/// view is taken after the other arguments, as §6.9's native note orders it,
+/// and sees the new binding (3); the JS receiver is the object the binding
+/// held when it was evaluated (1). The in-place write (`more()` pushing) is
+/// the same on both (F129's pin).
+#[test]
+#[ignore = "F138 (F135's binding half, filed by native-52; retarget to its id): a later argument that re-binds a captured binding under a `&self` call is seen natively and not on JS"]
+fn f135_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same_on_both_backends()
+{
+    let staged = stage();
+    let file = "native_probe_f135_captured_binding_argument_replaced.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_argument_replaced.vl"),
+    )
+    .expect("write the probe program");
     assert_eq!(compare(&staged, file), Verdict::Identical);
+}
+
+/// A `&` of a captured `mut` binding's SCALAR place (`count_of(&log.count,
+/// bump())`, a `bool`, a `str`, the binding itself) beside a later argument
+/// that writes the binding read the value where it stood natively (`0`),
+/// where the JS `(base, key)` pair reads it when the callee does (`1`) —
+/// spec §6.9's view, taken after the other arguments. The native copy of a
+/// scalar the JS backend views as a pair now waits as F129's aggregate copy
+/// does; an `Option`, a tuple and an enum (JS hands the value it held) are
+/// the controls and stay where they stand.
+#[test]
+fn a_scalar_view_of_a_captured_binding_is_taken_after_the_later_arguments_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_captured_binding_scalar_view.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_scalar_view.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "1\ntrue\nnew\nNone\n(1, \"b\")\ntrue\n5\n2\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
 }
 
 /// F132: an array literal whose position is a fixed array `[T; n]` one level
@@ -13254,8 +13414,9 @@ fn f131_an_array_literal_against_a_generic_callees_binders_builds_the_array_on_b
 /// Fn>; N]`. `vilan_rt::ReferenceEq` now covers a fixed array (inline and
 /// heap) element by element, and an enum's equality leg compares a payload
 /// slot through the reference it binds — an `Option` of a closure in a
-/// payload had been a rustc refusal (`&Option<..>: ReferenceEq`). A map of
-/// closures is still refused by name.
+/// payload had been a rustc refusal (`&Option<..>: ReferenceEq`). A shape
+/// with no impl (a tuple of three holding a closure, since F136 admitted a
+/// map) is still refused by name.
 #[test]
 fn f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends() {
     let staged = stage();
@@ -13267,20 +13428,72 @@ fn f133_an_array_of_closures_in_an_aggregate_builds_on_both_backends() {
         Verdict::Identical,
         "an array of closures held in an aggregate must build natively"
     );
-    let file = "native_probe_f133_closure_map.vl";
+    let file = "native_probe_f133_closure_triple.vl";
     std::fs::write(
         staged.join(file),
-        "import std::hash_map::HashMap;\nimport std::io::print;\n\nstruct Table {\n\thandlers: HashMap<str, |i32| i32>,\n}\n\nfun main() {\n\tmut table = Table { handlers = HashMap::new() };\n\ttable.handlers.insert(\"inc\", |x: i32| x + 1);\n\tprint(table.handlers.len());\n}\n",
+        "import std::io::print;\n\nstruct Row {\n\tentry: (str, i32, |i32| i32),\n}\n\nfun main() {\n\tlet row = Row { entry = (\"inc\", 1, |x: i32| x + 1) };\n\tlet (name, _, run) = row.entry;\n\tprint(name);\n\tprint(run(1));\n}\n",
     )
     .expect("write the probe program");
     match compare(&staged, file) {
         Verdict::Refused(message) => assert!(
             message.contains("which has no reference equality")
-                && message.contains("a fixed array of one do"),
+                && message.contains("a map and a key-closure pair of one do"),
             "refused, but not by this name: {message}"
         ),
-        other => panic!("a map of closures must be refused by name, was {other:?}"),
+        other => {
+            panic!("a tuple of three holding a closure must be refused by name, was {other:?}")
+        }
     }
+}
+
+/// F136: an aggregate holding a MAP of closures — a handler table, `struct
+/// Table { handlers: HashMap<str, |i32| i32> }`, an enum payload, an
+/// `Option` and a `List` of such maps, a map of `Option`s of closures — and a
+/// `(str, closure)` pair were refused natively by name ("which has no
+/// reference equality"): `vilan_rt::ReferenceEq` had no impl for
+/// `vilan_rt::Map` or its `(key, value)` entry. The map compares as std's
+/// `HashMap` equality does (the same keys, order-insensitive), each value by
+/// reference, and the entry's key by value.
+#[test]
+fn f136_a_map_of_closures_in_an_aggregate_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f136_map_of_closures.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/map_of_closures_in_an_aggregate.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a map of closures held in an aggregate must build natively"
+    );
+}
+
+/// F137: a GENERIC enum's derived `PartialEq` (`[derive(PartialEq)] enum
+/// Slots<T> { Full(List<T>), Empty }`, then `s == t`) was refused natively
+/// "a generic type instantiated at `any`": the generator's body matches the
+/// tuple literal `(self, other)`, which records no type, so each variant
+/// pattern read the enum's arguments off the declaration's own parameters,
+/// which the impl's substitution does not bind. The analyzer's record was
+/// absent, not open (the item's bisect): the native emitter now types a
+/// tuple literal subject by its elements' settled types. Two parameters, a
+/// nested generic payload, and a generic function's own `match` over a tuple
+/// literal of generic enums.
+#[test]
+fn f137_a_generic_enums_derived_equality_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f137_generic_enum_derived_equality.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/generic_enum_derived_equality.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a generic enum's derived equality must build natively at the site's argument"
+    );
 }
 
 /// B605: a generic function returning an object built over its own
@@ -13330,6 +13543,30 @@ fn b606_a_mirrored_stores_handle_as_a_dyn_source_builds_on_both_backends() {
         compare(&staged, file),
         Verdict::Identical,
         "a mirrored store's handle as a `dyn Source` must answer the same natively"
+    );
+}
+
+/// B617: a call through a `dyn` object whose slot runs a blanket impl over a
+/// bounded generic. The table's slot is typed by the trait's body-less
+/// DECLARATION, which threaded none of the contexts the blanket reads, so the
+/// native table handed the blanket `None` (B606's stand-in) where JS passed
+/// the value the call threaded: `blanket, no scope` natively, `blanket under s`
+/// on JS. The declaration now carries its whole union's hidden parameters; a
+/// STRICT reader in the union makes the slot's value bare, and a safe
+/// implementation beside it is handed `Some(..)`.
+#[test]
+fn b617_a_dyn_slot_hands_a_blanket_impl_the_contexts_it_reads() {
+    let staged = stage();
+    let file = "native_probe_b617_dyn_slot_blanket_context.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/dyn_slot_blanket_context.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a blanket impl run through a `dyn` slot must read the threaded context natively"
     );
 }
 

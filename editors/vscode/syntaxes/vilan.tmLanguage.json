@@ -678,8 +678,34 @@
      ]
     },
     {
-     "comment": "A DECLARATION, which since A101 is a CALL: the property name — the span-adjacent name-`-`-name run the grammar reads, custom properties (`--brand-ink`) and vendor prefixes (`-webkit-…`) included — and then its argument list, whose contents are ordinary vilan. begin/end rather than a match, because the arguments are expressions and a value may span lines; the parens carry the scopes the `{expression}` hole used to, since they mark the same thing it did — where CSS stops and vilan starts.",
-     "begin": "(-{0,2}[a-zA-Z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(\\()",
+     "comment": "A CHAIN LINK (A69): `.border(px(1), Theme::stroke1());` calls the `Style` method on the block's style, so the dotted name is a method, and its arguments are ordinary vilan with their parentheses balanced (E311). After the condition rule, whose dotted head is followed by `{`.",
+     "begin": "(\\.)([a-z][a-zA-Z0-9_]*)\\s*(\\()",
+     "beginCaptures": {
+      "1": {
+       "name": "punctuation.accessor.vilan"
+      },
+      "2": {
+       "name": "entity.name.function.vilan"
+      },
+      "3": {
+       "name": "punctuation.section.embedded.begin.vilan"
+      }
+     },
+     "end": "\\)",
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.section.embedded.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "include": "#css-arguments"
+      }
+     ]
+    },
+    {
+     "comment": "A DECLARATION, which since A101 is a CALL: the property name — the span-adjacent name-`-`-name run the grammar reads, custom properties (`--brand-ink`) and vendor prefixes (`-webkit-…`) included — and then its argument list, whose contents are ordinary vilan. begin/end rather than a match, because the arguments are expressions and a value may span lines; the parens carry the scopes the `{expression}` hole used to, since they mark the same thing it did — where CSS stops and vilan starts. E311: a name after `::`, `.` or a word character is not a property (the lookbehind), and the argument list balances its own parentheses (`#css-arguments`), so a nested call's `)` no longer closes the declaration early and leaves `Theme::stroke1()` to be read as one.",
+     "begin": "(?<![\\w.:])(-{0,2}[a-zA-Z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(\\()",
      "beginCaptures": {
       "1": {
        "name": "support.type.property-name.vilan"
@@ -696,7 +722,7 @@
      },
      "patterns": [
       {
-       "include": "$self"
+       "include": "#css-arguments"
       }
      ]
     },
@@ -710,6 +736,23 @@
      "comment": "The declaration terminator, which the grammar requires after every declaration including the last.",
      "match": ";",
      "name": "punctuation.terminator.vilan"
+    }
+   ]
+  },
+  "css-arguments": {
+   "comment": "E311: the arguments of a `css` block's declaration or chain link — ordinary vilan, with a parenthesized group (a nested call's arguments) taken whole so its `)` cannot close the enclosing list.",
+   "patterns": [
+    {
+     "begin": "\\(",
+     "end": "\\)",
+     "patterns": [
+      {
+       "include": "#css-arguments"
+      }
+     ]
+    },
+    {
+     "include": "$self"
     }
    ]
   }

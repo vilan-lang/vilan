@@ -2193,6 +2193,61 @@ fn a101_a_declaration_head_is_a_property_and_its_arguments_are_ordinary_vilan() 
     );
 }
 
+/// E311's exhibit: a chain link (A69) and a property whose arguments hold a
+/// nested call and a `::` path — kolt `login_page.vl:97`'s line among them.
+const CSS_CHAIN_LINK_ARGUMENTS: &str = "\
+fun card() {
+\tcss {
+\t\tpadding(size(4));
+\t\t.border(px(1), Theme::stroke1());
+\t\tcolor(Theme::ink());
+\t\t.hover {
+\t\t\t.outline(px(2), style::Color::hex(\"#fff\"));
+\t\t}
+\t}
+}
+";
+
+#[test]
+fn e311_a_css_blocks_arguments_balance_and_a_path_is_never_a_property() {
+    let Some(painting) = painting(CSS_CHAIN_LINK_ARGUMENTS) else {
+        return;
+    };
+    // The chain link is the `Style` method it calls, not a property.
+    assert_eq!(painting.scope_at("border"), "entity.name.function.vilan");
+    assert_eq!(painting.scope_at("outline"), "entity.name.function.vilan");
+    // A nested call's `)` no longer closes the argument list, so what follows
+    // it is still vilan: the `::` path's type and its function.
+    assert_eq!(
+        painting.scope_at("Theme::stroke1"),
+        "entity.name.type.vilan"
+    );
+    assert_eq!(painting.scope_at("stroke1"), "entity.name.function.vilan");
+    assert_eq!(painting.scope_at("ink"), "entity.name.function.vilan");
+    assert_eq!(painting.scope_at("hex"), "entity.name.function.vilan");
+    // The list closes where it opened: the declaration's own `)` is the
+    // embedded end, the nested one is not.
+    assert_eq!(
+        painting.scopes_over("stroke1());"),
+        vec![
+            "entity.name.function.vilan".to_string(),
+            "source.vilan".to_string(),
+            "source.vilan".to_string(),
+            "punctuation.section.embedded.end.vilan".to_string(),
+            "punctuation.terminator.vilan".to_string(),
+        ]
+    );
+    // The property vocabulary is untouched.
+    assert_eq!(
+        painting.scope_at("padding"),
+        "support.type.property-name.vilan"
+    );
+    assert_eq!(
+        painting.scope_at("color"),
+        "support.type.property-name.vilan"
+    );
+}
+
 #[test]
 fn e161_a_generic_head_is_a_list_a_tag_is_a_tag_and_a_comparison_is_an_operator() {
     let Some(painting) = painting(GENERIC_HEADS_AND_MARKUP) else {

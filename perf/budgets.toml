@@ -30,7 +30,10 @@
 # `[[e121]]` are the editor's targets (Q9) on the seal's LSP harness rows: each reports red until it has
 # been green at two consecutive seals (`green_seals`), then `blocking` flips and it refuses (S8). The seals
 # keep that count beside their verdicts (`e121-state.json`), never in this file mid-order; the release
-# commit writes it here (N146).
+# commit writes it here (N146). A row with `mandate = true` (leaf, css, parse break) must be MEASURED:
+# when the harness skipped it (its anchors are missing in the source it replayed, N174) the seal is red;
+# a skipped row without it is a note. A `series` string is printed under the report's E121 table: the
+# row's anchors moved and its figures start a NEW series.
 tolerance = 0.01
 
 # Every subject the gate measures, whether or not this class has a ceiling for it yet.
@@ -44,8 +47,8 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 250_556_961
-measured_at = "v0.47.0's seal"
+ceiling = 253_309_219
+measured_at = "v0.50.0's seal"
 
 [[row]]
 subject = "example:watch"
@@ -65,8 +68,8 @@ measured_at = "v0.48.0's seal"
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_921_719_082
-measured_at = "v0.47.0's seal"
+ceiling = 2_828_515_825
+measured_at = "v0.50.0's seal"
 
 [[row]]
 subject = "example:router"
@@ -79,8 +82,8 @@ measured_at = "v0.48.0's seal"
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_660_268_336
-measured_at = "v0.48.0's seal"
+ceiling = 1_626_337_835
+measured_at = "v0.50.0's seal"
 
 [[row]]
 subject = "example:ssr"
@@ -107,15 +110,15 @@ measured_at = "v0.48.0's seal"
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_377_861_323
-measured_at = "v0.48.0's seal"
+ceiling = 4_210_143_329
+measured_at = "v0.50.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_475_305_348
-measured_at = "v0.48.0's seal"
+ceiling = 4_315_348_241
+measured_at = "v0.50.0's seal"
 
 [[row]]
 subject = "genapp:46"
@@ -128,16 +131,16 @@ measured_at = "v0.48.0's seal"
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 262_065_107
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 267_222_148
+measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 329_529_096
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 331_406_296
+measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
 tolerance = 0.005
 
 [[row]]
@@ -152,8 +155,8 @@ tolerance = 0.005
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_042_396_360
-measured_at = "v0.47.0's seal (ci rows from CI's perf job at 8338599582)"
+ceiling = 2_951_829_992
+measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
 tolerance = 0.005
 
 [[row]]
@@ -200,16 +203,16 @@ tolerance = 0.005
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_554_363_209
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 4_421_353_089
+measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_655_257_689
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 4_491_333_782
+measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
 tolerance = 0.005
 
 [[row]]
@@ -229,22 +232,24 @@ max_ratio = 2.3
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 0
+green_seals = 1
 blocking = false
+mandate = true
 
 [[e121]]
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 3
+green_seals = 4
 blocking = true
 
 [[e121]]
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
+green_seals = 3
 blocking = true
+series = "Order 52 (N174): the keystroke edit is unchanged; the Find References probe moved from `fun messages(self)` (gone from model.vl) to `fun global()`, the mirrored store reader, so that probe starts a new series."
 
 [[e121]]
 scenario = "model.vl keystroke, importers open"
@@ -259,6 +264,7 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+mandate = true
 
 [[e121]]
 scenario = "parse break"
@@ -266,3 +272,5 @@ metric = "diagnostics_cpu_ms"
 target_ms = 500
 green_seals = 0
 blocking = false
+mandate = true
+series = "Order 52 (N174): re-anchored from `let messages = channel.messages();` (gone with the mirrored-store exhibit, kolt@dee494ab) to `channel_name.adopt(channel.current_name());` in the same channel.vl - a statement over a `g.channels()` boundary; the break and its repair are the same shape, the figures start a new series."

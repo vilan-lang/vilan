@@ -4653,10 +4653,12 @@ fn a_task_is_not_a_promise() {
 }
 
 #[test]
-fn spawn_typing_falls_back_to_promise_without_std_task() {
-    // Compat: a program that loads `std::js::promise` but never `std::task`
-    // keeps the old `Promise<T>` spawn typing (an older std has no task.vl).
-    assert_compiles(
+fn spawn_typing_is_a_task_without_importing_std_task() {
+    // B618: this compat fallback is gone — a program that loads
+    // `std::js::promise` but never imports `std::task` typed `async e` as
+    // `Promise<T>`, so one expression had two types across programs.
+    // `std::task` is always loaded now, and the spawn is a `Task<T>`.
+    assert_fails_with(
         r#"
         import std::io::print;
         import std::js::promise::Promise;
@@ -4666,6 +4668,7 @@ fn spawn_typing_falls_back_to_promise_without_std_task() {
             print(await p);
         }
         "#,
+        "Expected Promise<str>, but got Task<str>",
     );
 }
 

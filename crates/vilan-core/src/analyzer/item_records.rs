@@ -57,7 +57,12 @@ use super::{
 impl RestoredTables {
     /// [`Self::absorb`] for a served ITEM's slice (M110 S7): every row's ids
     /// re-based through `rebase` on the way in — one clone, not two.
-    fn absorb_rebased(&mut self, tables: &ModuleTables, rebase: &dyn Fn(Id) -> Option<Id>) {
+    fn absorb_rebased(
+        &mut self,
+        tables: &ModuleTables,
+        rebase: &dyn Fn(Id) -> Option<Id>,
+        shift: &dyn Fn(Span) -> Span,
+    ) {
         let ids = |rows: &[Id]| {
             rows.iter()
                 .filter_map(|id| rebase(*id))
@@ -81,6 +86,13 @@ impl RestoredTables {
                 }
             }
         }
+        for (_, binding) in &tables.foreign_reads {
+            if let Some(binding) = rebase(*binding) {
+                self.foreign_reads.insert(binding);
+            }
+        }
+        self.r11_seed_calls
+            .extend(tables.r11_seed_calls.iter().filter_map(|id| rebase(*id)));
         for (id, positions) in &tables.bumps {
             if let Some(id) = rebase(*id) {
                 self.bumps.insert(id, positions.clone());
@@ -110,6 +122,21 @@ impl RestoredTables {
                 if let Some(id) = rebase(*id) {
                     into.insert(id, label.clone());
                 }
+            }
+        }
+        if tables.held_recorded {
+            self.held.extend(&tables.held.rebased(rebase));
+        }
+        for hint in &tables.stage_hints {
+            if let (Some(id), Some(chain)) = (rebase(hint.id), rebase(hint.chain)) {
+                self.stage_hints.push(super::StageHint {
+                    id,
+                    chain,
+                    span: shift(hint.span),
+                    full: hint.full.clone(),
+                    abbreviated: hint.abbreviated.clone(),
+                    written: hint.written.clone(),
+                });
             }
         }
         match self.drop_nominals_world {
@@ -202,6 +229,8 @@ pub(super) struct ItemState {
     ranges: Vec<(u32, u32)>,
     table_ranges: Vec<(u32, u32)>,
     label_ranges: Vec<(u32, u32)>,
+    hint_ranges: Vec<(u32, u32)>,
+    held_ranges: Vec<(u32, u32)>,
     /// The Class A output this analysis derived for the laid-out windows it
     /// did NOT serve, per window — the next analysis's records.
     derived: HashMap<usize, ModuleDiagnostics>,
@@ -494,6 +523,14 @@ impl<'src> Analyzer<'src> {
         &self.items.label_ranges
     }
 
+    pub(super) fn item_hint_ranges(&self) -> &[(u32, u32)] {
+        &self.items.hint_ranges
+    }
+
+    pub(super) fn item_held_ranges(&self) -> &[(u32, u32)] {
+        &self.items.held_ranges
+    }
+
     fn relative_entity(&self, id: Id) -> Relative {
         if let Some(window) = self.id_windows.window_of_entity(id) {
             let start = self.id_windows.windows[window].entities.start;
@@ -601,7 +638,11 @@ impl<'src> Analyzer<'src> {
                 {
                     continue;
                 }
-                (span.start, span.end).hash(&mut hash);
+                // Relative to the region (M110 S7b): the absolute offset moves
+                // with every edit EARLIER in the file, which left every later
+                // item that writes a type stale on every keystroke; the
+                // region's text hash already answers for the spelling.
+                (span.start - region_start, span.end - region_start).hash(&mut hash);
                 match target {
                     Some(target) => self.hash_entity(*target, &mut hash, &mut reached),
                     None => u32::MAX.hash(&mut hash),
@@ -649,6 +690,8 @@ impl<'src> Analyzer<'src> {
         self.items.ranges.clear();
         self.items.table_ranges.clear();
         self.items.label_ranges.clear();
+        self.items.hint_ranges.clear();
+        self.items.held_ranges.clear();
         self.items.facts.clear();
         self.items.derived.clear();
         self.items.unrecordable.clear();
@@ -768,6 +811,8 @@ impl<'src> Analyzer<'src> {
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         let mut table_ranges: Vec<(u32, u32)> = Vec::new();
         let mut label_ranges: Vec<(u32, u32)> = Vec::new();
+        let mut hint_ranges: Vec<(u32, u32)> = Vec::new();
+        let mut held_ranges: Vec<(u32, u32)> = Vec::new();
         for &window in &laid {
             let Some(record) = candidate.get(&window) else {
                 continue;
@@ -789,6 +834,12 @@ impl<'src> Analyzer<'src> {
                 if tables.labels_recorded {
                     label_ranges.extend(own.iter().copied());
                 }
+                if tables.hints_recorded {
+                    hint_ranges.extend(own.iter().copied());
+                }
+                if tables.held_recorded {
+                    held_ranges.extend(own.iter().copied());
+                }
             }
             self.items.served_set.insert(window);
             self.items.served.push((window, record.clone()));
@@ -796,9 +847,13 @@ impl<'src> Analyzer<'src> {
         ranges.sort_unstable();
         table_ranges.sort_unstable();
         label_ranges.sort_unstable();
+        hint_ranges.sort_unstable();
+        held_ranges.sort_unstable();
         self.items.ranges = ranges;
         self.items.table_ranges = table_ranges;
         self.items.label_ranges = label_ranges;
+        self.items.hint_ranges = hint_ranges;
+        self.items.held_ranges = held_ranges;
         let served = self.items.served.len() as u64;
         if !crate::macros::in_macro_world() {
             crate::incremental::update_census(|census| {
@@ -915,7 +970,7 @@ impl<'src> Analyzer<'src> {
                     .push((closure_id, reference_id, name));
             }
             if let Some(tables) = &record.module.tables {
-                self.restored_tables.absorb_rebased(tables, &rebase);
+                self.restored_tables.absorb_rebased(tables, &rebase, &shift);
             }
         }
         self.items.served = served;
@@ -1056,6 +1111,7 @@ impl<'src> Analyzer<'src> {
         mut tables: HashMap<u32, ModuleTables>,
         drop_nominals_world: u64,
         labels_recorded: bool,
+        hints_recorded: bool,
     ) -> (Vec<(ItemKey, ItemRecord)>, Vec<ItemKey>) {
         let mut filed = Vec::new();
         let mut purge = Vec::new();
@@ -1111,6 +1167,25 @@ impl<'src> Analyzer<'src> {
             let mut slice = tables.remove(&(window as u32)).unwrap_or_default();
             slice.drop_nominals_world = drop_nominals_world;
             slice.labels_recorded = labels_recorded;
+            slice.hints_recorded = hints_recorded;
+            // The held rows ride only when every id they carry is the item's
+            // own or the prefix's; otherwise the item stays live for the
+            // held passes (`held_tables.rs`) and keeps the rest of its record.
+            slice.held_recorded = slice.held.fits(&|id: Id| {
+                (id.0 >= item.entities.start && id.0 < item.entities.end) || id.0 < prefix_end
+            });
+            if !slice.held_recorded {
+                slice.held = Default::default();
+            }
+            // A cross-file read of another HOT window's binding needs no row:
+            // the item is served only when that window is clean, and a clean
+            // window's binding is restored with it (the dirty closure's read
+            // edge). A prefix binding's row stays — the prefix module can be
+            // dirty while this item is served.
+            slice.foreign_reads.retain(|(_, binding)| {
+                binding.0 < prefix_end
+                    || (binding.0 >= item.entities.start && binding.0 < item.entities.end)
+            });
             module.tables = Some(slice);
             module.container_structures.sort_unstable();
             module.container_structures.dedup();
@@ -1140,6 +1215,16 @@ impl<'src> Analyzer<'src> {
                             .iter()
                             .chain(&tables.declaration_statements)
                             .all(|(id, chain)| own(*id) && chain.iter().all(|id| own(*id)))
+                        && tables
+                            .foreign_reads
+                            .iter()
+                            .all(|(region, binding)| own(*region) && own(*binding))
+                        && tables.r11_seed_calls.iter().all(|id| own(*id))
+                        && tables.resource_slots.is_empty()
+                        && tables
+                            .stage_hints
+                            .iter()
+                            .all(|hint| own(hint.id) && own(hint.chain))
                         && tables.bumps.iter().all(|(id, _)| own(*id))
                         && tables.clone_sites.iter().all(|(id, _)| own(*id))
                         && tables.return_clone_sites.iter().all(|(id, _)| own(*id))

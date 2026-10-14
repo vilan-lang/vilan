@@ -2180,3 +2180,19 @@ fn b601_a_narrowing_at_an_annotated_let_or_an_ascription_is_refused_once() {
         );
     }
 }
+
+// --- B617: a `dyn` slot running a blanket impl reads the threaded context ------
+
+/// The native differential's B617 probe, held on JS: a call through an object
+/// threads what the slot's union reads — the blanket over a bounded generic
+/// (`impl type S: Src<type T> with Flow<T>`) included — safe and strict, under
+/// `run` and outside it. JS was right before B617 (the call site's candidates
+/// held the blanket); the native table was not, and the two legs are compared
+/// in `native_differential`.
+#[test]
+fn b617_a_dyn_slot_running_a_blanket_impl_reads_the_threaded_context() {
+    assert_compiles_and_runs(
+        include_str!("../../../vilan-cli/tests/native/dyn_slot_blanket_context.vl"),
+        "blanket under s\nblanket under t\nstage\nblanket, no scope\ntag under v\nplain under w\n",
+    );
+}

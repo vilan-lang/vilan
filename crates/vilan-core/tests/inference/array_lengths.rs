@@ -1175,3 +1175,150 @@ fn b616_a_wrong_length_inside_the_tuple_is_refused_by_the_array_rule() {
         "this array literal has 3 elements, but its type is `[_; 2]`",
     );
 }
+
+/// B623: array-lengths' second std wave — a fixed array is `Default` when its
+/// element is, the element's default at every position (each its own value: a
+/// push into one `List` position leaves the other), at any length, `0`
+/// included. `[i32; 3]::default()` is no expression (an array cannot head a
+/// path), so std's `default_of<T>()` is the spelling, and the derive's.
+#[test]
+fn b623_a_fixed_array_of_default_elements_is_default() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::{ Default, default_of };
+        fun main() {
+            let zeros: [i32; 3] = default_of<[i32; 3]>();
+            print(zeros[2]);
+            mut rows: [List<i32>; 2] = default_of<[List<i32>; 2]>();
+            rows[0].push(5);
+            print(rows[1].len());
+            let grid: [[str; 2]; 2] = default_of<[[str; 2]; 2]>();
+            print(grid[1][1] == "");
+            let none: [bool; 0] = default_of<[bool; 0]>();
+            print(none.len());
+        }
+        "#,
+        "0\n0\ntrue\n0\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::default::{ Default, default_of };
+        struct Plain {}
+        fun main() {
+            let _plain = default_of<[Plain; 2]>();
+        }
+        "#,
+        "does not implement trait 'Default'",
+    );
+}
+
+/// B623: `[derive(Default)]` over an array field spelled the field's type as
+/// a path head (`[i32; 2]::default()`: "this expression cannot be used as a
+/// type"); the generator calls `default_of<[i32; 2]>()` for a type that cannot
+/// head a path — a literal length and a struct's own `const N` alike — and
+/// keeps `i32::default()` for one that can.
+#[test]
+fn b623_derive_default_over_an_array_field() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        [derive(Default)]
+        struct Grid {
+            cells: [i32; 2],
+            names: [str; 3],
+            count: i32,
+        }
+        [derive(Default)]
+        struct Ring<T, const N> {
+            slots: [T; N],
+            head: usize,
+        }
+        fun main() {
+            let grid = Grid::default();
+            print(grid.cells[1] + grid.count);
+            print(grid.names.len());
+            let ring: Ring<bool, 4> = Ring::default();
+            print(ring.slots[3]);
+        }
+        "#,
+        "0\n3\nfalse\n",
+    );
+}
+
+/// B623: a fixed array is a JSON array both ways, as a `List` is, and a
+/// decode checks the count — another length is an error naming both, a
+/// non-array value is "expected an array", and the empty array decodes at
+/// length `0` (its own impl: no element seeds the repeat).
+#[test]
+fn b623_a_fixed_array_is_json_both_ways() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json, from_json_value_of };
+        fun main() {
+            let pair: [i32; 2] = [1, 2];
+            print(pair.to_json());
+            let words: [[str; 1]; 2] = [["a"], ["b"]];
+            print(words.to_json());
+            let back = from_json_value_of<[i32; 2]>("[7,8]".try_parse_json().unwrap());
+            print(back.unwrap()[1]);
+            let short = from_json_value_of<[i32; 2]>("[7]".try_parse_json().unwrap());
+            print(short.unwrap_err());
+            let shape = from_json_value_of<[i32; 2]>("{}".try_parse_json().unwrap());
+            print(shape.unwrap_err());
+            let leaf = from_json_value_of<[i32; 2]>("[7,\"x\"]".try_parse_json().unwrap());
+            print(leaf.is_err());
+            let empty = from_json_value_of<[str; 0]>("[]".try_parse_json().unwrap());
+            print(empty.unwrap().len());
+            let full = from_json_value_of<[str; 0]>("[\"a\"]".try_parse_json().unwrap());
+            print(full.unwrap_err());
+        }
+        "#,
+        "[1,2]\n[[\"a\"],[\"b\"]]\n8\nexpected an array of 2 elements, found 1\nexpected an array\ntrue\n0\nexpected an array of 0 elements, found 1\n",
+    );
+}
+
+/// B623: `[derive(Json)]` over an array field or an enum's array payload
+/// failed inside the generated code ("[i32; 2] has no method 'to_json'", and
+/// the decoder's `[i32; 2]::from_json_value(..)` path head); both directions
+/// round-trip now, over a struct's own `const N` too.
+#[test]
+fn b623_derive_json_over_array_fields_and_payloads() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        [derive(Json)]
+        struct Grid {
+            cells: [i32; 2],
+            none: [bool; 0],
+        }
+        [derive(Json)]
+        enum Shape {
+            Pair([i32; 2]),
+            Both([f64; 1], [str; 2]),
+        }
+        [derive(Json)]
+        struct Ring<T, const N> {
+            slots: [T; N],
+        }
+        fun main() {
+            let grid = Grid { cells = [3, 4], none = [] };
+            print(grid.to_json());
+            let back: Result<Grid, str> = Grid::from_json(grid.to_json());
+            print(back.unwrap().cells[1]);
+            let wrong: Result<Grid, str> = Grid::from_json("{\"cells\":[1,2,3],\"none\":[]}");
+            print(wrong.unwrap_err());
+            let shape = Shape::Both([1.5], ["x", "y"]);
+            print(shape.to_json());
+            let pair: Result<Shape, str> = Shape::from_json("{\"Pair\":[5,6]}");
+            print(pair.unwrap().to_json());
+            let ring: Result<Ring<str, 2>, str> = Ring::from_json("{\"slots\":[\"p\",\"q\"]}");
+            print(ring.unwrap().to_json());
+        }
+        "#,
+        "{\"cells\":[3,4],\"none\":[]}\n4\nexpected an array of 2 elements, found 3\n{\"Both\":[[1.5],[\"x\",\"y\"]]}\n{\"Pair\":[5,6]}\n{\"slots\":[\"p\",\"q\"]}\n",
+    );
+}

@@ -1,0 +1,55 @@
+// F137: a GENERIC enum's derived `PartialEq` — `match (self, other) { .. }`
+// over a tuple literal, inside an impl generic over the enum's parameters —
+// builds natively at the site's argument. A tuple literal records no type, so
+// its variant patterns had read the enum's arguments off the DECLARATION's
+// own parameters, which the impl's substitution does not bind (`Slots<any>`,
+// refused). Two parameters, a nested generic payload, a unit variant, and a
+// generic function's own `match` over a tuple literal of generic enums.
+import std::io::print;
+
+[derive(PartialEq)]
+enum Slots<T> {
+	Full(List<T>),
+	Empty,
+}
+
+[derive(PartialEq)]
+enum Either<L, R> {
+	Left(L),
+	Right(R),
+	Both(L, R),
+}
+
+[derive(PartialEq)]
+enum Tree<T> {
+	Leaf(T),
+	Branch(Slots<T>, Option<T>),
+}
+
+fun agree<T>(left: Slots<T>, right: Slots<T>): str {
+	match (left, right) {
+		(Slots::Full(_), Slots::Full(_)) => "both full",
+		(Slots::Empty, Slots::Empty) => "both empty",
+		_ => "apart",
+	}
+}
+
+fun main() {
+	let s = Slots::Full([1, 2]);
+	let t = Slots::Full([1, 2]);
+	let u: Slots<i32> = Slots::Empty;
+	print(s == t);
+	print(s == u);
+	print(u == Slots::Empty);
+	let words: Slots<str> = Slots::Full(["a"]);
+	print(words == Slots::Full(["a"]));
+	let left: Either<i32, str> = Either::Left(1);
+	print(left == Either::Left(1));
+	print(left == Either::Right("1"));
+	print(Either::Both(1, "x") == Either::Both(1, "x"));
+	let tree: Tree<i32> = Tree::Branch(Slots::Full([3]), Some(4));
+	print(tree == Tree::Branch(Slots::Full([3]), Some(4)));
+	print(tree == Tree::Leaf(3));
+	print(agree(s, u));
+	print(agree(Slots::Full(["x"]), Slots::Full(["y"])));
+}

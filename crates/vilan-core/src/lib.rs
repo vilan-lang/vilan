@@ -547,6 +547,7 @@ fn infer_platform(
         let mut used: Vec<String> = Vec::new();
         any_node(root, &mut |node| {
             if let Node::MemberAccessor(_, member) = node {
+                let (member, _) = node::unmark_head_link(member);
                 let name = match &member.0 {
                     Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
                     Node::Call(callee, _, _) => match &callee.0 {

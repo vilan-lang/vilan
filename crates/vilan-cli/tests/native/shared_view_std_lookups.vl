@@ -2,8 +2,10 @@
 // `HashMap::contains_key`) over a field of a `Shared` view read the
 // collection through the cell, not a copy of it, when the key hashes by
 // std's impls (`str`, an integer, a tuple of those). A key argument that
-// writes the cell runs before the borrow; a user key type with a written
-// `hash` that reads the cell keeps the copy (its `hash` could reach it).
+// writes the cell takes the copy where the read stands (F135: `read()`
+// copies where it is evaluated, spec §6.7), so the lookup does not see the
+// write; a user key type with a written `hash` that reads the cell keeps the
+// copy (its `hash` could reach it).
 import std::hash::Hash;
 import std::hash::Hashable;
 import std::hash_map::HashMap;

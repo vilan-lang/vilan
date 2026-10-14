@@ -136,6 +136,64 @@ pub fn set_std_prefix(on: Option<bool>) {
     STD_PREFIX_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
+// --- std-prefix P2: the prefix LAYERED under the world build ------------------
+
+/// 0 = the process default; 1 = off; 2 = on.
+static STD_PREFIX_LAYERING_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+/// The process default, set by a front end that holds worlds across
+/// analyses (the language server); off everywhere else.
+static STD_PREFIX_LAYERING_DEFAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a WORLD BUILD — a base-cache miss of an M110 S1 hot-set world or
+/// of a canonical one — runs over the in-process std-only prefix
+/// (`std-prefix.md` §13 P2, incr-51c's Q1 as ruled): std is served from the
+/// prefix pinned per (platform, std closure), the world's own package modules
+/// walk and resolve over it, and the world is stored under its OWN key, so S1's
+/// hot sets and every hit are what they were. The language server turns it on
+/// ([`set_std_prefix_layering_default`]); `VILAN_STD_PREFIX=off` turns it off,
+/// `=layered` on, and `=on` (P1's forced prefix IN PLACE of S1) supersedes it.
+/// Off under `VILAN_HASH_SHUFFLE` and in a canonical [`clean_analysis`], as
+/// [`std_prefix`] is.
+pub fn std_prefix_layering() -> bool {
+    let wanted = match STD_PREFIX_LAYERING_OVERRIDE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static FROM_ENV: OnceLock<Option<bool>> = OnceLock::new();
+            FROM_ENV
+                .get_or_init(|| match std::env::var("VILAN_STD_PREFIX").as_deref() {
+                    Ok("off" | "0") => Some(false),
+                    Ok("layered") => Some(true),
+                    _ => None,
+                })
+                .unwrap_or_else(|| STD_PREFIX_LAYERING_DEFAULT.load(Ordering::Relaxed))
+        }
+    };
+    wanted
+        && !std_prefix()
+        && (!clean_requested() || clean_keeps_hot_shape())
+        && !crate::fx::shuffling()
+}
+
+/// The process default of [`std_prefix_layering`] — the language server sets it
+/// at start.
+pub fn set_std_prefix_layering_default(on: bool) {
+    STD_PREFIX_LAYERING_DEFAULT.store(on, Ordering::Relaxed);
+}
+
+/// Overrides [`std_prefix_layering`] for this process (`None` restores the
+/// environment and the default) — the test surface.
+#[doc(hidden)]
+pub fn set_std_prefix_layering(on: Option<bool>) {
+    let value = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    STD_PREFIX_LAYERING_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
 // --- Q3: the clean analysis -------------------------------------------------
 
 /// What a clean analysis on this thread keeps of the incremental machinery.
@@ -263,6 +321,11 @@ pub enum Plant {
     /// previous keystroke's answer; a callee's changed return leaves its
     /// callers'.
     ItemRecordUnguarded,
+    /// S7b (M142, Order 52): the Class A live ranges are sealed with the
+    /// served ITEMS' windows left live — a pass that walks the live ranges
+    /// then visits a served item's bodies and derives its output a second
+    /// time beside the replay of its record (a doubled diagnostic).
+    LiveRangeWalksServed,
 }
 
 impl Plant {
@@ -281,6 +344,7 @@ impl Plant {
             Plant::ContextLogUnguarded => 12,
             Plant::PostSeedFromSettled => 13,
             Plant::ItemRecordUnguarded => 14,
+            Plant::LiveRangeWalksServed => 15,
         }
     }
 }
@@ -378,12 +442,22 @@ pub struct Census {
     pub item_records_served: u64,
     pub item_records_stale: u64,
     pub item_records_filed: u64,
+    /// M110 S7b (Order 52): the Class A LIVE ranges this analysis sealed
+    /// (`analyzer/live_ranges.rs`) and the entity ids they cover — the
+    /// complement of the frozen, reused and served ranges, which is what a
+    /// whole-program pass walks in place of the table.
+    pub live_ranges: u64,
+    pub live_entities: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
     /// with the last refusal's reason — `dependencies`, `package-prelude`,
     /// `reaches-the-entry`, `defines-a-macro`, `impl-reached`, ….
     pub prefix_world: bool,
+    /// std-prefix P2: whether the world was LAYERED over the prefix — a world
+    /// build (an S1 or canonical miss) that took std from the prefix and
+    /// stored the world under its own key (`prefix_world` is set too).
+    pub prefix_layered: bool,
     pub prefix_hits: u64,
     pub prefix_refusals: u64,
     pub prefix_refusal: Option<&'static str>,
@@ -420,7 +494,10 @@ thread_local! {
             item_records_served: 0,
             item_records_stale: 0,
             item_records_filed: 0,
+            live_ranges: 0,
+            live_entities: 0,
             prefix_world: false,
+            prefix_layered: false,
             prefix_hits: 0,
             prefix_refusals: 0,
             prefix_refusal: None,
@@ -784,8 +861,9 @@ pub fn report(program: &Program) {
              bound-sites-checked={} graphs-replayed={} context-log-replayed={} \
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
-             records-served={} records-stale={} records-filed={} prefix-world={} \
-             prefix-hits={} prefix-refusals={}",
+             records-served={} records-stale={} records-filed={} live-ranges={} \
+             live-entities={} prefix-world={} prefix-layered={} prefix-hits={} \
+             prefix-refusals={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -810,7 +888,10 @@ pub fn report(program: &Program) {
             census.item_records_served,
             census.item_records_stale,
             census.item_records_filed,
+            census.live_ranges,
+            census.live_entities,
             u8::from(census.prefix_world),
+            u8::from(census.prefix_layered),
             census.prefix_hits,
             census.prefix_refusals,
         );

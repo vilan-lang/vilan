@@ -2,7 +2,7 @@
   "name": "vilan",
   "displayName": "Vilan",
   "description": "Language support for Vilan: live diagnostics, completion with signatures, hover, inlay hints, semantic highlighting, go to definition, find references, rename, formatting, and Organize Imports.",
-  "version": "0.49.0",
+  "version": "0.50.0",
   "publisher": "vilan-lang",
   "license": "MIT OR Apache-2.0",
   "icon": "icon.png",
@@ -33,7 +33,8 @@
   ],
   "activationEvents": [
     "onLanguage:vilan",
-    "workspaceContains:**/vilan.toml"
+    "workspaceContains:**/vilan.toml",
+    "onDebugResolve:vilan"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -48,6 +49,110 @@
           ".vl"
         ],
         "configuration": "./language-configuration.json"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "vilan"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "vilan",
+        "label": "Vilan",
+        "languages": [
+          "vilan"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The .vl file or project directory `vilan run` is given. Default: the active .vl file.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments passed to the program (`process::args()`).",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "The working directory `vilan run` starts in. Default: the workspace folder.",
+                "default": "${workspaceFolder}"
+              },
+              "entry": {
+                "type": "string",
+                "description": "Which node leg of a workspace runs (`vilan run --entry`)."
+              },
+              "watch": {
+                "type": "boolean",
+                "description": "`vilan run --watch`: rebuild and restart on every change, the debugger re-attaching to each round's server.",
+                "default": false
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause on the program's first line.",
+                "default": false
+              },
+              "vilanPath": {
+                "type": "string",
+                "description": "The `vilan` executable. Default: found beside the language server (an in-repo build, ~/.cargo/bin, ~/.vilan/bin, then the PATH)."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Environment variables for `vilan run` and the program."
+              },
+              "console": {
+                "type": "string",
+                "enum": [
+                  "integratedTerminal",
+                  "internalConsole",
+                  "externalTerminal"
+                ],
+                "description": "Where the program's input and output go. The terminal keeps stdin (`scan()`).",
+                "default": "integratedTerminal"
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "vilan",
+            "request": "launch",
+            "name": "Debug vilan program",
+            "program": "${file}"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Vilan: Launch",
+            "description": "Debug a vilan program: `vilan run --inspect-brk` with its source map, breakpoints in .vl files.",
+            "body": {
+              "type": "vilan",
+              "request": "launch",
+              "name": "Debug vilan program",
+              "program": "^\"\\${file}\""
+            }
+          },
+          {
+            "label": "Vilan: Launch with --watch",
+            "description": "Debug a vilan server under `vilan run --watch`, re-attaching to each round's restart.",
+            "body": {
+              "type": "vilan",
+              "request": "launch",
+              "name": "Debug vilan server (watch)",
+              "program": "^\"\\${workspaceFolder}\"",
+              "watch": true
+            }
+          }
+        ]
       }
     ],
     "grammars": [
@@ -127,6 +232,19 @@
           "type": "boolean",
           "default": true,
           "description": "Show a type that declares [hint(Trait<..>)] by the trait it is used as, marked with ~ (a pipeline node reads ': ~Source<Option<str>>', not its whole upstream). The full type stays in the hint's tooltip and in hover. Applies live."
+        },
+        "vilan.inlayHints.chains": {
+          "type": "string",
+          "enum": [
+            "every",
+            "changes"
+          ],
+          "enumDescriptions": [
+            "Hint every stage of a chain split one stage per line.",
+            "Hint a stage only where its type differs from the stage before it (the first stage always)."
+          ],
+          "default": "every",
+          "description": "Which stages of a chain split one stage per line carry an ` as T` inlay hint. 'Ascribe every stage of this chain' still writes every stage. Applies live."
         },
         "vilan.semanticTokens.enabled": {
           "type": "boolean",

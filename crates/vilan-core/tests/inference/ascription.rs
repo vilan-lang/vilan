@@ -766,17 +766,19 @@ fn e291_a_spaced_less_than_after_a_name_is_a_comparison() {
         "#,
         "`bool` has no ordering: `>` models `PartialOrd`, which `bool` does not implement",
     );
-    // A function on the left of a spaced `<` is compared, not called.
+    // A function on the left of a spaced `<` is compared, not called — and
+    // a NON-generic one keeps the comparison's refusals (a generic one gets
+    // E309's steer instead, below).
     assert_fails_with(
         r#"
-        fun pick<T>(first: T, second: T): T {
+        fun pick(first: f64, second: f64): f64 {
             first
         }
         fun main() {
             let _p = pick <f64>(1, 2);
         }
         "#,
-        "`<` models `PartialOrd`, and `fn pick<T>(T, T): T` does not implement it",
+        "`<` models `PartialOrd`, and `fn pick(f64, f64): f64` does not implement it",
     );
 }
 
@@ -809,6 +811,94 @@ fn e291_a_spaced_list_no_comparison_could_be_is_refused_with_the_tight_spelling(
             ),
         );
     }
+}
+
+// --- E309: a spaced generic CALL gets one steer naming the spacing ------------
+//
+// After E291 `pick <f64>(1, 2)` is `(pick < f64) > (1, 2)`, refused three
+// times — `fn pick` has no `PartialOrd`, `bool` has no ordering, `f64` is a
+// type — none saying the spacing is the reason. When the name is a generic
+// function or a generic type the comparison reading cannot be what was meant,
+// and one steer at `pick <f64>` replaces the three.
+
+const E309_HEAD: &str = "struct Holder<T> {\n    value: T,\n}\n\
+fun pick<T>(first: T, second: T): T {\n    first\n}\n";
+
+/// A generic function and a generic type, the list spaced either way: ONE
+/// diagnostic, at the name through the `>`, with the tight call.
+#[test]
+fn e309_a_spaced_generic_call_gets_one_steer_naming_the_spacing() {
+    for (statement, written, tight) in [
+        (
+            "let _p = pick <f64>(1, 2);",
+            "pick <f64>",
+            "pick<f64>(1, 2)",
+        ),
+        (
+            "let _p = pick < f64 > (1.0, 2.0);",
+            "pick < f64 >",
+            "pick<f64>(1.0, 2.0)",
+        ),
+        ("let _xs = List <i32>(3);", "List <i32>", "List<i32>(3)"),
+        (
+            "let _h = Holder <str>(\"x\");",
+            "Holder <str>",
+            "Holder<str>(\"x\")",
+        ),
+    ] {
+        let source = format!("{E309_HEAD}fun main() {{\n    {statement}\n}}\n");
+        let diagnostics = failure_diagnostics(&source);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "one steer for {statement:?}: {diagnostics:#?}"
+        );
+        let (message, range) = &diagnostics[0];
+        assert_eq!(
+            &source[range.clone()],
+            written,
+            "spans the name through the `>`"
+        );
+        assert_eq!(
+            message,
+            &format!(
+                "`{written}`: a generic list touches its name — `{tight}`; spaced, the `<` \
+                 after a name is a comparison"
+            )
+        );
+    }
+}
+
+/// The steer is for a name that IS generic: values compared twice keep the
+/// comparison's refusal, and a non-generic function keeps all three — the
+/// held "a type, not a value" among them.
+#[test]
+fn e309_a_spaced_comparison_of_values_or_a_plain_function_keeps_its_refusals() {
+    let values = format!(
+        "{E309_HEAD}fun main() {{\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    \
+         let _z = a < b > (c);\n}}\n"
+    );
+    assert_fails_with(&values, "`bool` has no ordering");
+    assert_fails_without(&values, "a generic list touches its name");
+    let plain = "fun twice(value: f64): f64 {\n    value * 2.0\n}\n\
+                 fun main() {\n    let _t = twice <f64>(1.0);\n}\n";
+    let diagnostics = failure_diagnostics(plain);
+    let messages: Vec<&str> = diagnostics
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("`f64` is a type, not a value"))
+            && messages
+                .iter()
+                .any(|message| message.contains("`bool` has no ordering"))
+            && messages
+                .iter()
+                .all(|message| !message.contains("a generic list touches its name")),
+        "{messages:#?}"
+    );
 }
 
 /// E291's boundary: a TIGHT list reads as always — a generic call, a member

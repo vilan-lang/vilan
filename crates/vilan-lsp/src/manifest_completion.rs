@@ -59,6 +59,8 @@ pub enum ValueSet {
     LintLevel,
     /// A `[check] auto` opt-in (B570 S4): `off`, `exported` or `all`.
     AutoOptIn,
+    /// A `[build] dbg` policy (debugging.md Q4, N172): `keep` or `strip`.
+    DbgPolicy,
 }
 
 impl ValueSet {
@@ -73,6 +75,9 @@ impl ValueSet {
             ValueSet::AutoOptIn => {
                 vec!["off".to_string(), "exported".to_string(), "all".to_string()]
             }
+            // The two a manifest may ask for; the release preset's refusal is
+            // a default, not a value (`DbgPolicy::parse`).
+            ValueSet::DbgPolicy => vec!["keep".to_string(), "strip".to_string()],
             ValueSet::Preset => Preset::all()
                 .iter()
                 .map(|preset| preset.name().to_string())
@@ -437,6 +442,13 @@ pub const TABLES: &[Table] = &[
                                 node's stack traces show `.vl` files and lines (on under \
                                 `debug`, off under `release`).",
                 values: ValueSet::Boolean,
+            },
+            Key {
+                name: "dbg",
+                documentation: "What `dbg(..)` does in this build: `keep` prints, `strip` \
+                                hands the value through and prints nothing. Unset, the \
+                                preset decides: `debug` prints, `release` refuses the build.",
+                values: ValueSet::DbgPolicy,
             },
         ],
     },
@@ -1297,6 +1309,18 @@ mod tests {
             "`[build] preset`"
         );
         assert_eq!(
+            enumerated(&root["build"]["properties"]["dbg"]),
+            sorted(ValueSet::DbgPolicy.values()),
+            "`[build] dbg`"
+        );
+        // N172: and every offered value is one the manifest reads.
+        for value in ValueSet::DbgPolicy.values() {
+            assert!(
+                vilan_core::options::DbgPolicy::parse(&value).is_some(),
+                "`[build] dbg = \"{value}\"` is offered but not read"
+            );
+        }
+        assert_eq!(
             enumerated(&root["lints"]["properties"]["internal_use"]),
             sorted(ValueSet::LintLevel.values()),
             "`[lints] internal_use`"
@@ -1314,5 +1338,45 @@ mod tests {
             sorted(ValueSet::PlatformPattern.values()),
             "`[library.layer.<name>] platform`"
         );
+    }
+
+    /// N172: every key the `[build]` deserializer reads is in the listing.
+    /// The sync test above compares the listing with the schema; neither was
+    /// compared with the struct, so both omitted `dbg`. The destructuring
+    /// names every field and has no `..`: a new `Build` field stops this
+    /// compiling until its key is written here, and then the listing must
+    /// carry it.
+    #[test]
+    fn every_build_field_the_manifest_reads_is_listed() {
+        let (manifest, _) =
+            vilan_core::manifest::Manifest::parse("[package]\nname = \"probe\"\n\n[build]\n")
+                .expect("a manifest");
+        let vilan_core::manifest::Build {
+            run: _,
+            hooks: _,
+            preset: _,
+            indent: _,
+            spaces: _,
+            readable_names: _,
+            debug_names: _,
+            infer_const: _,
+            dbg: _,
+            source_maps: _,
+        } = manifest.build.expect("the [build] table");
+        let read = [
+            "run",
+            "hook",
+            "preset",
+            "indent",
+            "spaces",
+            "readable-names",
+            "debug-names",
+            "infer-const",
+            "dbg",
+            "source-maps",
+        ];
+        let mut read: Vec<String> = read.iter().map(|key| key.to_string()).collect();
+        read.sort();
+        assert_eq!(listed("build"), read);
     }
 }

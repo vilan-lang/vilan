@@ -611,14 +611,27 @@ def t3_compare(options, sources):
 
 def e121_rows(data, lsp_json):
     """E121's targets on the tip's LSP harness rows (Q9). Each row reports red until it has been green at
-    two consecutive seals; from then it blocks. Returns (rows, blocking_red)."""
+    two consecutive seals; from then it blocks. Returns (rows, blocking_red).
+
+    N174: a row the harness SKIPPED (its anchors are missing in the source it replayed) is reported as
+    `skipped`, and a MANDATE row (`mandate = true` in `perf/budgets.toml`: leaf, css, parse break) that was
+    skipped is blocking - the seal measured nothing for it."""
     if not lsp_json:
         return [], []
     with open(lsp_json) as handle:
         harness = json.load(handle)
+    skipped = harness.get("skipped", [])
     rows, blocking = [], []
     for target in data["e121"]:
         samples = harness.get("edits", {}).get(target["scenario"], [])
+        if target["scenario"] in skipped:
+            reasons = harness.get("skipped_reasons", {}).get(target["scenario"], [])
+            rows.append({"scenario": target["scenario"], "state": "skipped", "mandate": bool(target.get("mandate")),
+                         "reasons": reasons})
+            if target.get("mandate"):
+                blocking.append(f"E121 {target['scenario']}: SKIPPED by the harness, a mandate row that was not "
+                                "measured" + (f" ({reasons[0]})" if reasons else ""))
+            continue
         if not samples:
             rows.append({"scenario": target["scenario"], "state": "absent"})
             continue
@@ -628,10 +641,38 @@ def e121_rows(data, lsp_json):
         state = "green" if green else ("RED (blocking)" if target.get("blocking") else "red (reporting)")
         rows.append({"scenario": target["scenario"], "metric": metric, "median_ms": median,
                      "target_ms": target["target_ms"], "state": state,
-                     "green_seals": target.get("green_seals", 0)})
+                     "green_seals": target.get("green_seals", 0),
+                     **({"series": target["series"]} if target.get("series") else {})})
         if not green and target.get("blocking"):
             blocking.append(f"E121 {target['scenario']}: {median:.0f} ms > {target['target_ms']} ms")
     return rows, blocking
+
+
+def lsp_skipped_rows(data, lsp_json):
+    """N174: every scenario either side's harness run skipped, as {side, scenario, mandate, reasons}, and
+    the red for a MANDATE row skipped on the BASE side (the tip's skips are `e121_rows`'s): without the
+    base's figure the tip's row has nothing to be compared against. A skipped row that is not a mandate row
+    is a note."""
+    mandate = {target["scenario"] for target in data["e121"] if target.get("mandate")}
+    lines, red = [], []
+    for side, path in zip(("base", "tip"), lsp_json or []):
+        with open(path) as handle:
+            harness = json.load(handle)
+        for name in harness.get("skipped", []):
+            reasons = harness.get("skipped_reasons", {}).get(name, [])
+            lines.append({"side": side, "scenario": name, "mandate": name in mandate, "reasons": reasons})
+            if side == "base" and name in mandate:
+                red.append(f"LSP {name}: SKIPPED on the base side, a mandate row with nothing to compare against"
+                           + (f" ({reasons[0]})" if reasons else ""))
+    return lines, red
+
+
+def lsp_measured_names(lsp_json):
+    """The scenario rows the tip's harness run measured, in order (E292's stamp names them)."""
+    if not lsp_json:
+        return []
+    with open(lsp_json[1]) as handle:
+        return list(json.load(handle).get("edits", {}))
 
 
 E121_STATE = "e121-state.json"
@@ -752,11 +793,23 @@ def command_seal(options):
                               f"[{' '.join(str(k // 1024) for k in t3[side]['peak_rss_runs_kb'])}]"
                               for side in ("base", "tip")))
         lsp_rows, lsp_red, lsp_notes = ([], [], [])
+        lsp_skipped, lsp_measured = [], []
         if options.lsp_json:
             lsp_rows, lsp_red = lsp_compare(options.lsp_json[0], options.lsp_json[1], options.threshold)
             lsp_notes = lsp_source_notes(options.lsp_json[0], options.lsp_json[1])
             for note in lsp_notes:
                 print(f"  NOTE  {note}")
+            lsp_skipped, skip_red = lsp_skipped_rows(data, options.lsp_json)
+            lsp_red = lsp_red + skip_red
+            lsp_measured = lsp_measured_names(options.lsp_json)
+            print(f"  LSP rows measured ({len(lsp_measured)}): " + ", ".join(lsp_measured))
+            for row in lsp_rows:
+                print(f"  LSP row {row['scenario']}: CPU to diagnostics base {row['base_ms']:.0f} ms, "
+                      f"tip {row['tip_ms']:.0f} ms (x{row['ratio']:.2f})")
+            for skip in lsp_skipped:
+                kind = "mandate row - RED" if skip["mandate"] else "informational row - a note"
+                print(f"  LSP SKIPPED ({skip['side']}) {skip['scenario']}: {kind}"
+                      + (f"; {skip['reasons'][0]}" if skip["reasons"] else ""))
         overlay_e121_state(data, options.verdict_dir)
         e121, e121_red = e121_rows(data, options.lsp_json[1] if options.lsp_json else None)
         # §6.4: the report's first line names the most expensive phase — a SHARE of thread CPU on the
@@ -778,6 +831,7 @@ def command_seal(options):
             "sha": sha, "date": datetime.date.today().isoformat(), "verdict": "red" if red else "green",
             "red": red, "load": loadavg(), "class": options.klass, "counter": counter,
             "t2": {"results": results, "judged": t2_lines}, "t3": t3, "lsp": lsp_rows, "lsp_notes": lsp_notes,
+            "lsp_measured": lsp_measured, "lsp_skipped": lsp_skipped,
             "e121": e121,
             "bumps": bumps, "bumps_for_the_owner": owner_bumps, "genapp_phases_cpu_ms": phases,
             "e121_after": e121_after,
@@ -807,6 +861,10 @@ def command_e121(options):
         if "median_ms" in row:
             print(f"  {row['state']:16} {row['scenario']} ({row['metric']}): {row['median_ms']:.0f} ms "
                   f"against {row['target_ms']} ms (green at {row['green_seals']} consecutive seals)")
+        elif row["state"] == "skipped":
+            print(f"  skipped          {row['scenario']}: the harness skipped it (anchors missing in its source)"
+                  + (" - a MANDATE row" if row.get("mandate") else " - an informational row, a note")
+                  + (f"; {row['reasons'][0]}" if row.get("reasons") else ""))
         else:
             print(f"  absent           {row['scenario']}: the harness has no such row")
     if options.advance:
@@ -922,6 +980,19 @@ def command_report(options):
             if "median_ms" in row:
                 out.append(f"| {row['scenario']} ({row['metric']}) | {row['median_ms']:.0f} ms | "
                            f"{row['target_ms']} ms | {row['state']} |")
+            elif row.get("state") == "skipped":
+                out.append(f"| {row['scenario']} | not measured | | SKIPPED"
+                           + (" (mandate row: RED)" if row.get("mandate") else " (a note)") + " |")
+        measured = verdict.get("lsp_measured") or []
+        if measured:
+            out += ["", f"Rows measured ({len(measured)}): " + ", ".join(measured) + "."]
+        for skip in verdict.get("lsp_skipped") or []:
+            out += ["", f"> **Skipped ({skip['side']}):** `{skip['scenario']}` - the harness's anchors are missing "
+                    "in the source it replayed" + (f" ({skip['reasons'][0]})" if skip.get("reasons") else "")
+                    + (" - a mandate row, RED." if skip.get("mandate") else " - an informational row.")]
+        for row in verdict["e121"]:
+            if row.get("series"):
+                out += ["", f"> **Series break, {row['scenario']}:** {row['series']}"]
     plain = {s: r for s, r in verdict["t2"]["results"].items() if s.startswith("plain:")}
     if len(plain) >= 2:
         (small, a), (large, b) = sorted(plain.items(), key=lambda item: int(item[0].split(":")[1]))[:2]
