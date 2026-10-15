@@ -267,6 +267,8 @@ impl<'src> Analyzer<'src> {
         }
         let mut live_places: HashSet<Id> = HashSet::default();
         for id in places {
+            // M134: a place's classification mints belong to its item.
+            self.id_windows.set_anchor(id);
             if let Some(place_type) = self.place_value_type(id) {
                 let type_id = place_type.get_type_id(self);
                 if self.type_is_resource(type_id) {
@@ -355,6 +357,8 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
+            // M134: the target type's mints belong to the assignment's item.
+            self.id_windows.set_anchor(*assignment_id);
             if *through_name {
                 let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(target_id) else {
                     continue;

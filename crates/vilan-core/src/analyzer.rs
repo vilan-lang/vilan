@@ -15369,6 +15369,8 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             asked += 1;
+            // M134: the gate's classification mints belong to the body's item.
+            self.id_windows.set_anchor(function.id);
             let mut signature: Vec<TypeId> = function
                 .parameters
                 .iter()
@@ -15390,6 +15392,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             asked += 1;
+            self.id_windows.set_anchor(closure.id);
             let signature: Vec<TypeId> = closure.return_type_id.into_iter().collect();
             let mut seeds: Vec<Id> = closure.parameter_destructures.clone();
             seeds.push(closure.return_);
@@ -16859,6 +16862,7 @@ impl<'src> Analyzer<'src> {
             .map(|function| function.id)
             .collect();
         for function_id in function_ids {
+            self.id_windows.set_anchor(function_id);
             let (calls, _, _) = self.r11_body_calls_and_closures(function_id);
             let types = self.drop_sink_types_of_calls(&calls);
             if !types.is_empty() {
@@ -16872,6 +16876,7 @@ impl<'src> Analyzer<'src> {
             .map(|(id, closure)| (*id, closure.return_))
             .collect();
         for (closure_id, return_id) in closures {
+            self.id_windows.set_anchor(closure_id);
             let mut calls = Vec::new();
             let mut nested = Vec::new();
             let mut visited = HashSet::default();
@@ -17005,6 +17010,9 @@ impl<'src> Analyzer<'src> {
             if !seen.insert(type_id) {
                 continue;
             }
+            // M134: a classification's mints belong to the slot's item (M149
+            // moved a restored region's first classification here).
+            self.id_windows.set_check_anchor_type(type_id);
             if !self.type_is_resource(type_id) {
                 continue;
             }
@@ -34618,6 +34626,10 @@ impl<'src> Analyzer<'src> {
         let mut shared: HashSet<Id> = HashSet::default();
         let mut materialized: HashSet<Id> = HashSet::default();
         for &(capture_id, subject_id) in candidates {
+            // M134: the classification's mints belong to the capture's item
+            // (M149 moved the restored regions' first classification here
+            // from the move scan's binding walk, which anchored it).
+            self.id_windows.set_anchor(capture_id);
             let Some((type_id, capture_is_mutable)) = self
                 .variables
                 .get(&capture_id)
