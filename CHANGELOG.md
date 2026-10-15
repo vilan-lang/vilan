@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: feature -->
+**A171: a fixed-array type heads a `::` path — `[i32; 3]::default()`, `[str; 2]::from_json(text)` — as `List<i32>::new()` heads one.** `[T; n]` before `::` is read as the array TYPE (when its element parses as a type; anywhere else `[` still opens a list or repeat literal), and its statics are its impls': the head binds the impl's element and length (`impl [type T: Default; const N] with Default`), through a nested array, a generic element and a `const N` of the enclosing body, and a `self` method is named through it (`[i32; 2]::to_list(xs)`). A list or a repeat of a value before `::` (`[1, 2]::len()`, `[0; 3]::default()`) is refused naming the array spelling. The `Default` and `Json` derives spell an array field through the path (`[u8; 3]::default()`, `[u8; 3]::from_json_value(..)`) where B623 called `default_of`/`from_json_value_of`, which stay as the same calls spelled generically; the `Wire` derive's `{type}::rebuild` reads the same way (arrays are not Wire). Spec: grammar §3.6's `path` production and names §4.6. Pins: the parser's `a171_*`, `array_lengths::a171_*` (2), `native_differential::a171_*` (`native/array_path_head.vl`).
+
+---
+
+<!-- family: feature -->
 **A172: `list.to_array()` — `List::to_array<const N>(self): Option<[T; N]>`, the conversion back from an array's `to_list` (array-lengths.md §9).** `Some` of a copy when the list holds exactly `N` elements, `None` otherwise; `N` comes from the type the result lands in (`let rgb: Option<[u8; 3]> = bytes.to_array();`), a written argument (`xs.to_array<2>()`) or a `const N` of the enclosing body. An intrinsic on both backends: a length check and a slice on JS (`__list_to_array`), `<[_; N]>::try_from(..).ok()` natively. A `to_array` whose `N` nothing binds is B424's "cannot infer the length 'N'" refusal, now read off an `external` member's return as off a bodied one's. std's array `FromJson` decodes into a `List` and converts (B623 seeded a repeat with the first element and overwrote it), and its separate length-0 impl is gone. Pins: `array_lengths::a172_*` (2), `native_differential::a172_*` (`native/list_to_array.vl`).
 
 ---

@@ -43752,6 +43752,26 @@ impl<'src> Analyzer<'src> {
     /// written type APPLICATION either, so `Option` as a head names the enum's
     /// namespace rather than an under-supplied `Option<T>` (B188).
     fn walk_path_head_type_node(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        // A171: a bracket heads a path only as a fixed-array TYPE, which the
+        // parser hands over as `Node::ArrayType` (`[i32; 3]::default()`). A
+        // list literal or a repeat of a value in that place names no type,
+        // and the fence's generic "cannot be used as a type" did not say
+        // which bracket does.
+        if matches!(node.0, Node::List(_) | Node::Repeat(..)) {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: "a bracket heads a `::` path only as a fixed-array type, `[T; n]` \
+                      (`[i32; 3]::default()`): a list or repeat literal is a value and names \
+                      no type to look a member up in; write the element type and the length, \
+                      or `List<T>::` for a list"
+                    .to_string(),
+            });
+            let type_id = Type::Unresolved.get_type_id(self);
+            self.path_head_type_ids.insert(type_id);
+            return type_id;
+        }
         let type_id = self.walk_trait_position_type_node(node, scope_id);
         self.path_head_type_ids.insert(type_id);
         type_id
@@ -67784,8 +67804,12 @@ impl<'src> Analyzer<'src> {
                 // Static access on a nominal type (`Id::new`), a trait
                 // (`Iterator::from_fn`), or an enum (`Option::Some`): look the
                 // member up among the variants (for enums) and the matching
-                // implementations.
-                Type::Struct(_, _) | Type::Trait(_, _) | Type::Enum(_, _) => {
+                // implementations. A171: a fixed array (`[i32; 3]::default()`)
+                // the same way — its members are its impls' (`impl [type T:
+                // Default; const N] with Default`), and the head binds the
+                // impl's element and length below as an application's
+                // arguments do.
+                Type::Struct(_, _) | Type::Trait(_, _) | Type::Enum(_, _) | Type::Array(_, _) => {
                     let variant_id = match &subject_type {
                         Type::Enum(enum_id, _) => {
                             let variants_scope_id =
@@ -67938,10 +67962,14 @@ impl<'src> Analyzer<'src> {
                                 }
                                 _ => subject_type,
                             };
+                            // A171: an array head is always written whole
+                            // (`[i32; 3]`), so its element and length bind
+                            // the impl's `[type T; const N]` as a generic
+                            // application's arguments bind its binders.
                             let has_concrete_args = matches!(
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()
-                            );
+                            ) || matches!(&subject_type, Type::Array(..));
                             // B595: a BLANKET's member named on a concrete head
                             // (`str::tag(1)` answered by `impl type T: Leaf with
                             // Tag`) binds the blanket's subject binder to the

@@ -262,7 +262,10 @@ not a type is an error there rather than a reason to keep looking.
 `Type::member` (§3.6) resolves `member` in `Type`'s namespace: enum
 variants, the static functions of the type's impls (those without `self`),
 and the type's own `self`-methods. Generic statics take their arguments at
-the path head: `List<str>::new()`.
+the path head: `List<str>::new()`. A fixed array's statics are its impls'
+(`impl [type T: Default; const N] with Default`), reached through the array
+type written whole at the head — `[i32; 3]::default()` binds the impl's `T`
+and `N` as `List<str>` binds `List`'s `T`.
 
 A type has **one namespace per importing file**, and receiver position is
 not part of a name. The namespace is the union of the `impl` blocks that

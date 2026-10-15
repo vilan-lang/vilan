@@ -910,9 +910,9 @@ export fun json_codec(): Codec {
 // the `Wire` TRAIT stays in `wire.vl`. Outputs carry their own imports.
 
 // `T::from_json_value(value)` as the generated decoders spell it: a type that heads
-// a path calls its own, and one that cannot (a fixed array:
-// `[i32; 2]::from_json_value(..)` is no expression) calls the generic
-// `from_json_value_of<[i32; 2]>(..)`, which the `Json` derive imports (B623).
+// a path calls its own (`[i32; 2]::from_json_value(..)` among them since A171), and
+// one that cannot (a tuple) calls the generic `from_json_value_of<(i32, str)>(..)`,
+// whose bound reports what the type lacks; the `Json` derive imports it (B623).
 macro fun decoded(type_: TypeExpr, value: str): str {
 	if type_.is_path_head() {
 		i"{type_.render()}::from_json_value({value})"
@@ -1595,9 +1595,10 @@ export impl [type T: Json; _] with Json {
 	}
 }
 
-/// `T::from_json_value(value)` spelled as a call every type can make: a fixed
-/// array cannot head a path (`[i32; 2]::from_json_value(..)` is no expression),
-/// so `[derive(Json)]` decodes such a field through this (B623).
+/// `T::from_json_value(value)` spelled as a generic call every type can make
+/// (B623). A fixed array heads a path itself since A171
+/// (`[i32; 2]::from_json_value(..)`); a tuple does not, so `[derive(Json)]` decodes
+/// such a member through this, and the bound says what it lacks.
 export fun from_json_value_of<T: FromJson>(value: JsonValue): Result<T, str> {
 	T::from_json_value(value)
 }
@@ -1607,7 +1608,7 @@ export fun from_json_value_of<T: FromJson>(value: JsonValue): Result<T, str> {
 export impl [type T: FromJson; const N] with FromJson {
 	fun from_json(text: str): Result<[T; N], str> {
 		match text.try_parse_json() {
-			Some(let value) => from_json_value_of<[T; N]>(value),
+			Some(let value) => [T; N]::from_json_value(value),
 			None => Err("not valid JSON"),
 		}
 	}

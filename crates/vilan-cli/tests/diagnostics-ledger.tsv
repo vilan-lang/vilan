@@ -757,3 +757,5 @@ row	flagship	key
 734	-	`{written}` then a spaced `<`: a generic list touches its name, `{tight}` — spaced, the `<` after a name is a comparison
 735	-	`{member_name}` is a method of `{owner}`{through}, but an element head takes only methods that hand the element back (`{owner}`); call it on the element instead: `<{tag} />.{written}`
 736	-	`{written}`: a generic list touches its name — `{tight}`; spaced, the `<` after a name is a comparison
+NEW	-	a bracket heads a `::` path only as a fixed-array type, `[T; n]` (`[i32; 3]::default()`): a list or repeat literal is a value and names no type to look a member up in; write the element type and the length, or `List<T>::` for a list
+NEW	-	generic parameter '{parameter}' is missing the bound ': {trait_name}' its impl asks of it

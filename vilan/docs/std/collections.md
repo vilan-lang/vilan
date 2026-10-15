@@ -196,9 +196,9 @@ every length, so `[u8; 4]` and `[str; 100]` get the same surface:
 - **`Debug`** when the element is — `T: Debug` takes an array, and it prints
   as a `List` does.
 - **`Default`** when the element is — the element's default at every
-  position, so a `[derive(Default)]` struct with an array field derives. An
-  array type cannot head a path, so the direct spelling is
-  `default_of<[i32; 4]>()` (`std::default`).
+  position, so a `[derive(Default)]` struct with an array field derives.
+  The array type heads the path: `[i32; 4]::default()` (`default_of<[i32;
+  4]>()` in `std::default` is the same call spelled generically).
 - **`Json`/`FromJson`** when the element is — a JSON array, decoded only at
   its own length (see [encoding](encoding.md#json)).
 - **`Items<T>`** — `xs.push_many(fixed)` appends one.

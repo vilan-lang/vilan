@@ -8614,6 +8614,9 @@ impl<'src> Printer<'src> {
                 }
             }
             Node::Accessor(name) => self.out.push_str(name),
+            // A171: `[i32; 3]` heading a `::` path — the one place an
+            // expression holds an array TYPE — prints as the type it is.
+            Node::ArrayType(..) => self.print_type(&expr.0),
             Node::AccessorWithGenerics(name, arguments) => {
                 self.out.push_str(name);
                 self.out.push('<');

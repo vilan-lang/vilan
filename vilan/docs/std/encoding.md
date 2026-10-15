@@ -24,10 +24,10 @@ trait FromJson {                                           // decode
 
 A fixed array `[T; n]` is a JSON array, as a `List` is, and decoding it
 checks the count: `[1]` read as an `[i32; 2]` is the error "expected an
-array of 2 elements, found 1". An array type cannot head a path
-(`[i32; 2]::from_json(..)` is no expression), so a direct decode goes
-through `from_json_value_of<[i32; 2]>(value)`, the call the derive
-writes for an array field.
+array of 2 elements, found 1". The array type heads the decode's path
+as any type does — `[i32; 2]::from_json(text)`, and the derive writes
+`[i32; 2]::from_json_value(..)` for an array field — and
+`from_json_value_of<[i32; 2]>(value)` is the same call spelled generically.
 
 `Result<T, E>` is Json when both arms are, and it is spelled the way the
 codecs spell it: externally tagged by variant NAME, `Ok(7)` as
