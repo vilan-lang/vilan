@@ -1,0 +1,75 @@
+// F138 (R-a, door (1): JS follows spec §6.9): an argument rooted at a captured
+// `mut` binding is read AFTER the call's later arguments when they run code.
+// The later arguments (and the earlier ones that are not settled) are bound
+// to `const`s in their own order first, and the binding is read where the
+// call is made — so `words.measured(swap())`, `swap` re-binding `words`
+// whole, hands the callee the NEW binding (3), as the native view of the
+// binding's cell does, where the JS receiver had been the object `words`
+// held when it was evaluated (1).
+//
+// `size(words, 0)` beside a later argument that runs no code keeps its
+// order and its bytes; a binding no closure captures (`plain`) is read where
+// it stands, spilled ahead of a later block that rebinds it (B452); a scalar
+// (`count`) by value is read where it stands too; and a variant built from
+// settled values (`Some(1)`) runs no code, so nothing waits beside it.
+//
+// witness: const $a = swap(); console.log(String(measured(words, $a)));
+// witness: const $b = note("first"); const $c = swap(); console.log(String(traced($b, words, $c)));
+// witness: console.log(String(size(words, 0)));
+// witness: console.log(String(sized(words, [ 0, 1 ])));
+// witness: const $d = plain;
+// witness-absent: measured(words, swap())
+import std::io::print;
+
+struct Words {
+	items: List<str>,
+}
+
+impl Words {
+	fun measured(&self, extra: i32): usize {
+		self.items.len() + extra.as_usize()
+	}
+}
+
+fun size(words: Words, extra: i32): usize {
+	words.items.len() + extra.as_usize()
+}
+
+fun sized(words: Words, extra: Option<i32>): usize {
+	words.items.len() + extra.unwrap_or(0).as_usize()
+}
+
+fun traced(first: i32, words: Words, extra: i32): usize {
+	words.items.len() + first.as_usize() + extra.as_usize()
+}
+
+fun note(text: str): i32 {
+	print(text);
+	0
+}
+
+fun counted(count: i32, extra: i32): i32 {
+	count + extra
+}
+
+fun main() {
+	mut words = Words { items = ["a"] };
+	mut count = 0;
+	let swap = || {
+		words = Words { items = ["x", "y", "z"] };
+		count += 1;
+		0
+	};
+	print(words.measured(swap()));
+	words = Words { items = ["a"] };
+	print(traced(note("first"), words, swap()));
+	print(size(words, 0));
+	print(sized(words, Some(1)));
+	count = 0;
+	print(counted(count, swap()));
+	mut plain = Words { items = ["a"] };
+	print(size(plain, {
+		plain = Words { items = ["x", "y"] };
+		0
+	}));
+}

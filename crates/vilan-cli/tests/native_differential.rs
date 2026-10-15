@@ -13365,25 +13365,83 @@ fn f135_a_read_argument_is_copied_before_a_later_argument_writes_its_cell_on_bot
     );
 }
 
-/// F135's binding half (spec §6.9, outside R-a's `read()`): a later argument
-/// that RE-BINDS a captured `mut` binding whose `&self` view the call takes
-/// (`words.measured(swap())`, `swap` assigning `words` whole). The native
-/// view is taken after the other arguments, as §6.9's native note orders it,
-/// and sees the new binding (3); the JS receiver is the object the binding
-/// held when it was evaluated (1). The in-place write (`more()` pushing) is
-/// the same on both (F129's pin).
+/// F138 (F135's binding half; R-a door (1): JS follows spec §6.9): a later
+/// argument that RE-BINDS a captured `mut` binding whose `&self` view the call
+/// takes (`words.measured(swap())`, `swap` assigning `words` whole). The view
+/// is taken after the other arguments on both backends, so the callee sees
+/// the new binding (3); the JS receiver had been the object the binding held
+/// when it was evaluated (1). The in-place write (`more()` pushing) was
+/// already the same on both (F129's pin).
 #[test]
-#[ignore = "F138 (F135's binding half, filed by native-52; retarget to its id): a later argument that re-binds a captured binding under a `&self` call is seen natively and not on JS"]
-fn f135_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same_on_both_backends()
+fn f138_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same_on_both_backends()
 {
     let staged = stage();
-    let file = "native_probe_f135_captured_binding_argument_replaced.vl";
+    let file = "native_probe_f138_captured_binding_argument_replaced.vl";
     std::fs::write(
         staged.join(file),
         include_str!("native/captured_binding_argument_replaced.vl"),
     )
     .expect("write the probe program");
-    assert_eq!(compare(&staged, file), Verdict::Identical);
+    assert_eq!(
+        both_stdouts(&staged, file),
+        ("3\n".to_string(), "3\n".to_string())
+    );
+}
+
+/// F138 across the positions spec §6.9 orders: a by-value place JS hands on
+/// by reference (`has(log.items, rep())`, the by-value twin; `size(words,
+/// swap())`, and a later BLOCK that rebinds), a `&` view, a `&self` receiver
+/// through a generic callee and through a `dyn` object, an intrinsic's
+/// receiver (`contains`, `get`, a `str`'s `contains`), and a `&mut`
+/// receiver (`push`, a user `&mut self`) beside a later argument that
+/// rebinds the binding: each is read after the later arguments on both
+/// backends, and the earlier arguments still run first (`first`, `second`).
+/// The controls read where they stand on both: a scalar by value (`9`) and
+/// an `&Option` beside a closure that writes it (`None` — a copy taken in
+/// order), while the same `&Option` beside a block that writes it is a view
+/// taken last (`Some(2)`).
+#[test]
+fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_arguments_on_both_backends()
+ {
+    let staged = stage();
+    let file = "native_probe_f138_captured_binding_argument_rebound.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_argument_rebound.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "an argument rooted at a captured binding waits for the later arguments on both backends"
+    );
+}
+
+/// native-53's find (F129's order through a closure VALUE): `check(items,
+/// push())`, `check` a closure binding and `push` pushing into the captured
+/// `items`, printed `true` on JS (the argument is the binding's object) and
+/// `false` natively (the copy was taken in argument order) — and a `&`
+/// parameter (`measure(&words, more())`, `count_of(&total, add())`) the same.
+/// The copy now waits for the later arguments through a closure binding, a
+/// field holding one and a function item's binding, so an in-place write and
+/// a re-binding are both seen on both backends; a subject that runs code and
+/// a literal applied where it is written keep their order on both.
+#[test]
+fn a_closure_value_call_reads_a_captured_binding_after_the_later_arguments_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_captured_binding_closure_value_call.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_closure_value_call.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\ntrue\ntrue\ntrue\nfalse\nfalse\n2\n3\n3\n5\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "a closure value's argument rooted at a captured binding waits on both backends"
+    );
 }
 
 /// A `&` of a captured `mut` binding's SCALAR place (`count_of(&log.count,

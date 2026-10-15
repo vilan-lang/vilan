@@ -35436,8 +35436,12 @@ impl<'src> Analyzer<'src> {
     /// counted where it is first asked). An external writes no vilan cell
     /// (`Shared::write` IS the write, counted by the span test), and a variant
     /// builds a value. A dispatched member answers for every body of its name.
-    /// A call through a closure VALUE (a subscriber) is unknown statically,
-    /// and answers whether ANY write mutates the cell in place.
+    /// A call through a closure LITERAL — applied where it is written, or
+    /// named by an immutable `let` whose initializer is one (B634) — answers
+    /// for the literal's body, as a function answers for its own. Any other
+    /// call through a closure VALUE (a subscriber, a parameter, a `mut`
+    /// binding, a field) is unknown statically, and answers whether ANY write
+    /// mutates the cell in place.
     fn call_reaches_an_in_place_write(
         &self,
         call_id: Id,
@@ -35484,6 +35488,9 @@ impl<'src> Analyzer<'src> {
                 self.function_reaches_an_in_place_write(member, cell, calls, summaries)
             });
         }
+        if let Some(body) = self.closure_literal_body(function_call.subject_id) {
+            return self.function_reaches_an_in_place_write(body, cell, calls, summaries);
+        }
         match self.expr_id_to_expr_map.get(&function_call.subject_id) {
             Some(Expr::Local(callee)) => {
                 if self.external_functions.contains_key(callee)
@@ -35508,8 +35515,38 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B634: the BODY of the closure literal a call's subject is — the literal
+    /// itself (`(|| ..)()`), or an immutable `let` whose initializer is one,
+    /// through immutable aliases of it (`let g = f;`). A `mut` binding may be
+    /// re-bound to any closure, and a parameter or a field holds one nothing
+    /// here can see, so neither answers.
+    fn closure_literal_body(&self, subject: Id) -> Option<Id> {
+        let mut current = subject;
+        // An alias chain is as long as the `let`s that wrote it; the bound is
+        // belt and braces against a cycle no program can spell.
+        for _ in 0..16 {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Closure(closure_id) => {
+                    return self.closures.get(closure_id).map(|closure| closure.return_);
+                }
+                Expr::Ascribe(inner) => current = *inner,
+                Expr::Local(binding) => {
+                    let variable = self.variables.get(binding)?;
+                    if variable.mutable {
+                        return None;
+                    }
+                    current = variable.initial?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// B457: a function's write summary for `cell` — an in-place write inside
-    /// its span, or a call inside it that reaches one. The calls come from
+    /// its span, or a call inside it that reaches one. B634: a closure
+    /// literal's BODY answers here too (`function_id` is then the body's
+    /// expression, whose span is the body's). The calls come from
     /// `calls`' span index (M96): filtering the whole expression map per
     /// function asked made the summary O(functions × expressions) — 48
     /// summaries, ~95M instructions each, on kolt's client.

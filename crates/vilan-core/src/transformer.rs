@@ -2934,6 +2934,17 @@ struct Transformer<'src> {
     // `const` landed in the statement list, so the emitter can close a
     // `try`/`finally` around everything after it. Empty between statements.
     pending_temporaries: Vec<PendingTemporary>,
+    /// F138: which `mut` bindings a closure captures — per function being
+    /// emitted (a local is captured only by a closure written inside the
+    /// function that declares it: the closures whose spans its span holds),
+    /// and over the whole program for a module-level binding, each computed
+    /// at the first call that could hand one on — see
+    /// `transformer/argument_order.rs`.
+    captured_mut_bindings: std::cell::OnceCell<HashSet<Id>>,
+    function_captures: std::cell::RefCell<HashMap<Id, Rc<HashSet<Id>>>>,
+    closure_captures: std::cell::RefCell<crate::captures::ClosureCaptures>,
+    closure_spans: std::cell::OnceCell<Vec<argument_order::ClosureSpan>>,
+    module_bindings: std::cell::OnceCell<HashSet<Id>>,
     // Route-chunk partition (`bundle-splitting.md` S2): function id -> chunk
     // index, plus how many chunks there are. Empty for every build that did not
     // ask to split, which is what keeps single-file emission byte-identical —
@@ -3365,6 +3376,11 @@ impl<'src> Transformer<'src> {
             unresolved_array_lengths: Vec::new(),
             unrendered_concatenations: Vec::new(),
             pending_temporaries: Vec::new(),
+            captured_mut_bindings: std::cell::OnceCell::new(),
+            function_captures: std::cell::RefCell::default(),
+            closure_captures: std::cell::RefCell::default(),
+            closure_spans: std::cell::OnceCell::new(),
+            module_bindings: std::cell::OnceCell::new(),
             chunk_members: HashMap::default(),
             chunk_count: 0,
             chunk_gate: None,
@@ -5751,6 +5767,26 @@ impl<'src> Transformer<'src> {
         &mut self,
         ids: &[Id],
         block: &mut Vec<js::Node<'src>>,
+        walk_one: F,
+    ) -> Vec<(Id, js::Node<'src>)>
+    where
+        F: FnMut(&mut Self, Id, &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>>,
+    {
+        self.walk_siblings_reading_late(ids, &[], block, walk_one)
+    }
+
+    /// [`Self::walk_siblings_in_order`] with some siblings read LATE (F138: a
+    /// call's argument rooted at a captured `mut` binding, named in `late` —
+    /// see `transformer/argument_order.rs`): a late sibling is never spilled
+    /// ahead of a later sibling's statements, and once every sibling is
+    /// walked, each other one whose value is not settled is bound to a
+    /// `const` in order, so the late ones are read after all of them. With
+    /// no late sibling this is the plain walk.
+    fn walk_siblings_reading_late<F>(
+        &mut self,
+        ids: &[Id],
+        late: &[Id],
+        block: &mut Vec<js::Node<'src>>,
         mut walk_one: F,
     ) -> Vec<(Id, js::Node<'src>)>
     where
@@ -5765,7 +5801,10 @@ impl<'src> Transformer<'src> {
             let node = walk_one(self, id, &mut statements);
             if !statements.is_empty() {
                 for (earlier_id, earlier, spilled) in walked.iter_mut() {
-                    if *spilled || self.sibling_value_is_settled(*earlier_id, earlier) {
+                    if *spilled
+                        || late.contains(earlier_id)
+                        || self.sibling_value_is_settled(*earlier_id, earlier)
+                    {
                         continue;
                     }
                     let temp = self.ng.next_name();
@@ -5788,6 +5827,20 @@ impl<'src> Transformer<'src> {
             }
             if let Some(node) = node {
                 walked.push((id, node, false));
+            }
+        }
+        if !late.is_empty() {
+            for (id, node, spilled) in walked.iter_mut() {
+                if *spilled || late.contains(id) || self.sibling_value_is_settled(*id, node) {
+                    continue;
+                }
+                let temp = self.ng.next_name();
+                let value = std::mem::replace(node, js::Node::Local(temp.clone()));
+                block.push(js::Node::ConstVariable(js::Variable {
+                    name: temp,
+                    value: Box::new(value),
+                }));
+                *spilled = true;
             }
         }
         walked.into_iter().map(|(id, node, _)| (id, node)).collect()
@@ -6345,11 +6398,15 @@ impl<'src> Transformer<'src> {
             Expr::Call(id) => {
                 let function_call = self.program.function_calls.get(id).unwrap().clone();
                 let value_positions = self.by_value_argument_positions(function_call.subject_id);
+                // F138: an argument rooted at a captured `mut` binding is read
+                // after the later arguments, as natively (spec §6.9).
+                let late = self.arguments_read_late(*id, &function_call);
                 // B452: in source order, an argument that needs statements
                 // spilling the ones before it.
                 let args = self
-                    .walk_siblings_in_order(
+                    .walk_siblings_reading_late(
                         &function_call.argument_ids,
+                        &late,
                         block,
                         |this, arg, block| {
                             // lazy.md §1: an argument standing in a `lazy` position
@@ -14764,6 +14821,7 @@ impl<'src> ConstWorld<'src> {
     }
 }
 
+mod argument_order;
 mod dbg;
 
 pub mod js {

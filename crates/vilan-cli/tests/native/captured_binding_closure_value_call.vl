@@ -1,0 +1,73 @@
+// native-53's find (F129's order through a closure VALUE): a call through a
+// closure held by a binding or a field reads an argument rooted at a captured
+// `mut` binding after the later arguments, as a named callee does (spec §6.9).
+// The JS argument is the binding's object, so an in-place write by a later
+// argument (`push()`) was seen there and not natively, where the copy was
+// taken in argument order; a re-binding one (`rebind()`) was seen by neither.
+// Both now see both. A subject that runs code (`make()(..)`) and a literal
+// applied where it is written bind their arguments in order on both.
+import std::io::print;
+
+struct Words {
+	items: List<str>,
+}
+
+struct Hooks {
+	check: |List<i32>, i32| bool,
+}
+
+fun measure_words(w: &Words, extra: i32): usize {
+	w.items.len() + extra.as_usize()
+}
+
+fun make(): |List<i32>, i32| bool {
+	|list: List<i32>, value: i32| list.contains(value)
+}
+
+fun main() {
+	mut items = [1];
+	let push = || {
+		items.push(9);
+		9
+	};
+	let rebind = || {
+		items = [9];
+		9
+	};
+	let check = |list: List<i32>, value: i32| list.contains(value);
+	print(check(items, push()));
+	items = [1];
+	print(check(items, rebind()));
+	items = [1];
+	let hooks = Hooks { check = |list: List<i32>, value: i32| list.contains(value) };
+	print((hooks.check)(items, push()));
+	items = [1];
+	print((hooks.check)(items, rebind()));
+	items = [1];
+	print(make()(items, rebind()));
+	items = [1];
+	print((|list: List<i32>, value: i32| list.contains(value))(items, rebind()));
+	mut words = Words { items = ["a"] };
+	let more = || {
+		words.items.push("b");
+		0
+	};
+	let swap = || {
+		words = Words { items = ["x", "y", "z"] };
+		0
+	};
+	let measure = |w: &Words, extra: i32| w.items.len() + extra.as_usize();
+	print(measure(&words, more()));
+	words = Words { items = ["a"] };
+	print(measure(&words, swap()));
+	words = Words { items = ["a"] };
+	let item = measure_words;
+	print(item(&words, swap()));
+	mut total = 0;
+	let add = || {
+		total += 5;
+		0
+	};
+	let count_of = |count: &i32, value: i32| *count + value;
+	print(count_of(&total, add()));
+}
