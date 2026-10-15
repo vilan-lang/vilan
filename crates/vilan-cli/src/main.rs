@@ -2045,11 +2045,15 @@ fn hmr_round(
         )
         .unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
+        // The map this round wrote, or the one a SKIPPED leg's unchanged
+        // bundle still names — on disk either way, which is the fact.
+        let bundle_map = source_map_path(&bundle_path).exists();
         let _ = write_chunks(
             &bundle_path,
             &[],
             styles.as_deref(),
             &assets,
+            bundle_map,
             leg.is_browser,
         );
     }
@@ -4843,6 +4847,7 @@ fn build_single(
         &chunks,
         styles.as_deref(),
         &assets,
+        compiled.source_map.is_some(),
         matches!(platform, Platform::Browser),
     )
     .is_err()
@@ -5454,6 +5459,7 @@ fn build_workspace_artifacts(
                 &chunks,
                 styles.as_deref(),
                 &assets,
+                compiled.source_map.is_some(),
                 matches!(platform, Platform::Browser),
             )?;
             let mapped = compiled.source_map.is_some();
@@ -6950,7 +6956,11 @@ fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
 ///   `document.currentScript` (§3.5);
 /// - `chunks` — the route chunks, `[]` for a leg that does not split;
 /// - `assets` — the files `const asset::bundle` carried into `dist/`, `[]` for
-///   a leg that bundled none (kolt.local 029).
+///   a leg that bundled none (kolt.local 029);
+/// - `maps` — the source maps written beside the bundle (`bundle_map`) and
+///   each chunk, `[]` for a build that wrote none (B630): what `serve_build`
+///   routes so a built page's DevTools reaches the `.vl` sources the bundle's
+///   last line names.
 ///
 /// That reverses `bundle-splitting.md` §9's "dropping `split` takes the manifest
 /// with it", and STRENGTHENS its invariant rather than weakening it: the
@@ -6984,6 +6994,9 @@ fn write_chunks(
     // order — the manifest's `assets` array, and so what `serve_build` serves
     // without a route of the app's own (kolt.local 029).
     assets: &[String],
+    // Whether the bundle's own `<entry>.map` is written beside it by this
+    // build — the caller's answer, since the bundle is written after this.
+    bundle_map: bool,
     is_browser: bool,
 ) -> Result<(), ExitCode> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
@@ -7060,8 +7073,30 @@ fn write_chunks(
             .join(",\n");
         format!("[\n{rows}\n\t]")
     };
+    // The bundle's map first, then each chunk's, in the chunks' order — the
+    // file names the scripts' last lines name (`write_script`).
+    let map_names: Vec<String> = bundle_map
+        .then(|| format!("{entry}.map"))
+        .into_iter()
+        .chain(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.map.is_some())
+                .map(|chunk| format!("{}.map", chunk.file)),
+        )
+        .collect();
+    let maps = if map_names.is_empty() {
+        "[]".to_string()
+    } else {
+        let rows = map_names
+            .iter()
+            .map(|name| format!("\t\t{}", json_string(name)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("[\n{rows}\n\t]")
+    };
     let manifest = format!(
-        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing},\n\t\"assets\": {bundled}\n}}\n",
+        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing},\n\t\"maps\": {maps},\n\t\"assets\": {bundled}\n}}\n",
         json_string(&leg),
         json_string(&entry),
         styles.map_or_else(|| "null".to_string(), json_string),

@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**B630: `serve_build` serves the build's source maps — a built page's DevTools reaches the `.vl` sources.** A built bundle and each chunk name their map on their last line (`//# sourceMappingURL=client.js.map`, E257 S5/S6), but the build manifest listed only the bundle, styles, chunks and assets, so the request fell through to the app's handler (a SPA catch-all answered HTML) and the page had no sources. The manifest (`<leg>.chunks.json`) now carries a `maps` list — the bundle's map, then each chunk's, exactly the maps the build wrote — `std::build::LegBuild` gains `maps: List<str>` (read where present; an older manifest reads as a build with none) and `artifacts()` routes them as `application/json`. A `release` build writes, and so lists, a map only when `[build] source-maps = true` asks. A hand-built `LegBuild { .. }` literal adds `maps = []` (none in kolt, the website or the examples). Pins: `serve_build::b630_*` (2: a split leg's bundle and chunk maps served; release with and without `source-maps`); the split fixture's manifest golden lists its four maps.
+
+---
+
 <!-- family: feature -->
 **A171: a fixed-array type heads a `::` path — `[i32; 3]::default()`, `[str; 2]::from_json(text)` — as `List<i32>::new()` heads one.** `[T; n]` before `::` is read as the array TYPE (when its element parses as a type; anywhere else `[` still opens a list or repeat literal), and its statics are its impls': the head binds the impl's element and length (`impl [type T: Default; const N] with Default`), through a nested array, a generic element and a `const N` of the enclosing body, and a `self` method is named through it (`[i32; 2]::to_list(xs)`). A list or a repeat of a value before `::` (`[1, 2]::len()`, `[0; 3]::default()`) is refused naming the array spelling. The `Default` and `Json` derives spell an array field through the path (`[u8; 3]::default()`, `[u8; 3]::from_json_value(..)`) where B623 called `default_of`/`from_json_value_of`, which stay as the same calls spelled generically; the `Wire` derive's `{type}::rebuild` reads the same way (arrays are not Wire). Spec: grammar §3.6's `path` production and names §4.6. Pins: the parser's `a171_*`, `array_lengths::a171_*` (2), `native_differential::a171_*` (`native/array_path_head.vl`).
 
