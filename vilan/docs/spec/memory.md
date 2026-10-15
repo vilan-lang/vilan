@@ -1106,6 +1106,38 @@ a value a `let` built), and a closure that arrives any other way stops the
 program with the runtime's reentrancy sentence when it touches the
 binding. JavaScript answers the in-progress value in both cases.
 
+**JavaScript note: the same order.** The JavaScript backend reads such an
+argument where the native one takes its view: an argument rooted at a
+captured `mut` binding — a `&self` or `&mut self` receiver, a `&` view, or a
+by-value place of a value JavaScript hands on by reference (a struct, a
+list, a map, a fixed array, a trait object) — is read after the call's later
+arguments when they run code. Those arguments, and the earlier ones that
+are not settled, are evaluated first, left to right, into temporaries. So a
+later argument that RE-BINDS the binding (`words.measured(swap())`, `swap`
+assigning `words` whole) is seen by the callee on both backends, as an
+in-place write always was:
+
+```vilan
+fun main() {
+	mut words = ["a"];
+	let swap = || {
+		words = ["x", "y", "z"];
+		0
+	};
+	print(words.len() + swap().as_usize());   // 1: `len()` is read first
+	words = ["a"];
+	print(sized(words, swap()));              // 3: the read waits for `swap()`
+}
+
+fun sized(words: List<str>, extra: i32): usize {
+	words.len() + extra.as_usize()
+}
+```
+
+A scalar, `str`, `Option`, tuple or enum argument by value is the value the
+binding held where the argument stands, on both backends, and so is the
+operand of an operator.
+
 ## 6.10 `lazy` — a binding initialized at first use
 
 *(Design: [`lazy`](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lazy.md) §2.)*

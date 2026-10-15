@@ -14,6 +14,7 @@ pub mod async_infer;
 pub mod bindgen;
 pub mod call_graph;
 pub mod cancel;
+pub mod captures;
 pub mod chunks;
 pub mod closest_name;
 pub mod const_cache;
