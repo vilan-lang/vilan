@@ -7049,9 +7049,7 @@ impl<'src> Printer<'src> {
         match &spine[0].0 {
             // E314: a call subject whose own line runs out breaks its arguments
             // one per line; the links then follow on lines of their own.
-            Node::MemberAccessor(_, _) | Node::Index(_, _)
-                if self.hole_depth > 0 && Self::has_call_subject(expr) =>
-            {
+            Node::MemberAccessor(_, _) | Node::Index(_, _) if Self::has_call_subject(expr) => {
                 if self.subject_needs_split(subject) {
                     self.split = Split::Tail;
                 }
@@ -8134,7 +8132,10 @@ impl<'src> Printer<'src> {
         precedence: u8,
         follows: bool,
     ) {
-        let blocked = std::mem::replace(&mut self.arguments_blocked, false);
+        // E321: a chain of three or more breaks at its operators and no more -
+        // an operand that still runs its line out is left long rather than
+        // breaking its own arguments.
+        let blocked = std::mem::replace(&mut self.arguments_blocked, true);
         self.indent += 1;
         for (index, (operator, operand)) in operands.iter().enumerate() {
             if let Some(operator) = operator {
@@ -8356,18 +8357,7 @@ impl<'src> Printer<'src> {
             if split != Split::Off && index + 1 == arguments.len() {
                 self.split = Split::Tail;
             }
-            match head {
-                Some(values) if index == 0 => {
-                    let precedence = Self::binary_precedence(BinaryOp::Add);
-                    for (at, value) in values.iter().enumerate() {
-                        if at > 0 {
-                            self.out.push_str(" + ");
-                        }
-                        self.print_operand(value, precedence + 1);
-                    }
-                }
-                _ => self.print_expr(argument),
-            }
+            self.print_call_argument(index, argument, head);
             // An element literal cut mid-literal inside an argument that is not
             // the descent's own (the last, under a permission).
             let descends = split != Split::Off && index + 1 == arguments.len();
@@ -8376,6 +8366,29 @@ impl<'src> Printer<'src> {
             }
         }
         (starts, cut)
+    }
+
+    /// One call argument. An `on` head's first argument prints its condition
+    /// values in the canonical order (A95 S3), in the inline and the split
+    /// layout alike.
+    fn print_call_argument(
+        &mut self,
+        index: usize,
+        argument: &Spanned<Node<'src>>,
+        head: Option<&[&Spanned<Node<'src>>]>,
+    ) {
+        match head {
+            Some(values) if index == 0 => {
+                let precedence = Self::binary_precedence(BinaryOp::Add);
+                for (at, value) in values.iter().enumerate() {
+                    if at > 0 {
+                        self.out.push_str(" + ");
+                    }
+                    self.print_operand(value, precedence + 1);
+                }
+            }
+            _ => self.print_expr(argument),
+        }
     }
 
     /// The output offset where the FIRST line of the rendering containing `from`
@@ -8396,6 +8409,13 @@ impl<'src> Printer<'src> {
             }
         }
         usize::MAX
+    }
+
+    /// Whether the line holding the output offset `at` is already over the
+    /// budget up to `at` - the text before an argument list's first argument.
+    fn opening_line_over_budget(&self, at: usize) -> bool {
+        let line_start = self.out[..at].rfind('\n').map_or(0, |newline| newline + 1);
+        display_width(&self.out[line_start..at]) > LINE_BUDGET
     }
 
     /// Whether the first argument line of a split argument list that began at
@@ -8419,6 +8439,7 @@ impl<'src> Printer<'src> {
         &mut self,
         arguments: &Spanned<Vec<Spanned<Node<'src>>>>,
         cause: Option<usize>,
+        head: Option<&[&Spanned<Node<'src>>]>,
     ) {
         let blocked = std::mem::replace(&mut self.arguments_blocked, false);
         self.indent += 1;
@@ -8432,7 +8453,7 @@ impl<'src> Printer<'src> {
             if cause == Some(index) {
                 self.split = Split::Tail;
             }
-            self.print_expr(argument);
+            self.print_call_argument(index, argument, head);
             self.out.push(',');
             if cause != Some(index) && self.over_line_budget(line_start) {
                 self.out.truncate(argument_start);
@@ -8440,7 +8461,7 @@ impl<'src> Printer<'src> {
                 self.flush_element_comments(argument.1.into_range().start, prev_end);
                 self.line();
                 self.split = Split::Tail;
-                self.print_expr(argument);
+                self.print_call_argument(index, argument, head);
                 self.out.push(',');
             }
             prev_end = argument.1.into_range().end;
@@ -8548,7 +8569,7 @@ impl<'src> Printer<'src> {
         if split != Split::Off
             && call_links == 1
             && (Self::breaks_as_a_single_link(expr)
-                || (self.hole_depth > 0 && Self::has_call_subject(expr)))
+                || (!self.arguments_blocked && Self::has_call_subject(expr)))
         {
             let (subject, spine) = Self::postfix_spine(expr);
             let start = self.out.len();
@@ -8556,9 +8577,7 @@ impl<'src> Printer<'src> {
             // E314: a call subject that is itself cut (over the budget, or an
             // element in its arguments broken mid-literal) takes the split
             // chain at once — its arguments break, the link follows below.
-            let subject_cut = self.hole_depth > 0
-                && Self::has_call_subject(expr)
-                && self.subject_needs_split(subject);
+            let subject_cut = Self::has_call_subject(expr) && self.subject_needs_split(subject);
             if !subject_cut {
                 // The link's own arguments do not break inside this attempt:
                 // the chain's split is the first refusal (E314).
@@ -8710,8 +8729,6 @@ impl<'src> Printer<'src> {
                 // descent, the arguments take a line each instead.
                 if split != Split::Off
                     && !blocked
-                    && self.hole_depth > 0
-                    && head.is_none()
                     && !arguments.0.is_empty()
                     && (cut.is_some() || self.first_line_over_budget(call_start))
                 {
@@ -8721,11 +8738,17 @@ impl<'src> Printer<'src> {
                     let inline_cursor = self.cursor;
                     self.out.truncate(arguments_start);
                     self.cursor = arguments_cursor;
-                    self.print_split_call_arguments(arguments, cause);
+                    self.print_split_call_arguments(arguments, cause, head.as_deref());
                     // A lone argument that is still too wide on a line of its
                     // own gained nothing from the split (`pt("<a paragraph>")`):
                     // the inline rendering stands.
-                    if arguments.0.len() == 1 && self.split_arguments_overflow(arguments_start) {
+                    //
+                    // Nor does a call whose OPENING line - everything up to the
+                    // `(` - already runs the line out (a closure's parameters, a
+                    // long `let` head): the arguments break for nothing.
+                    if (arguments.0.len() == 1 && self.split_arguments_overflow(arguments_start))
+                        || self.opening_line_over_budget(arguments_start)
+                    {
                         self.out.truncate(arguments_start);
                         self.out.push_str(&inline_text);
                         self.cursor = inline_cursor;
@@ -9141,7 +9164,6 @@ impl<'src> Printer<'src> {
                 // splits whole at its own line rather than mid-line.
                 if forced
                     || (split != Split::Off
-                        && self.hole_depth > 0
                         && elements.len() >= 2
                         && !self.probing
                         && self.first_line_over_budget(start))
@@ -12100,20 +12122,32 @@ mod chain_splitting {
         );
     }
 
-    /// One `.name(…)` link is not a chain — breaking it would buy a line and no
-    /// clarity — and a long call that is not a chain at all never splits
-    /// (argument wrapping is out of scope).
+    /// One `.name(…)` link is not a chain - the link keeps its line - and a
+    /// long call that is not a chain at all breaks its ARGUMENTS, one per line
+    /// (E321).
     #[test]
-    fn a_single_link_and_a_plain_long_call_stay_inline() {
+    fn a_single_link_and_a_plain_long_call_break_their_arguments() {
         let single_link = "let value = subject\
                            .only_one_link_here_but_a_very_long_one_indeed_truly_yes_it_is_here\
                            (1234567890123);\n";
         let plain_call = "let value = plain_function_call_with_no_chain_at_all(argument_one, \
-                          argument_two, argument_three_xyz);\n";
+                          argument_two, argument_three_xyzz);\n";
         assert_over_budget(single_link.trim_end());
         assert_over_budget(plain_call.trim_end());
-        assert_construct(single_link, single_link);
-        assert_construct(plain_call, plain_call);
+        assert_construct(
+            single_link,
+            "let value = subject.only_one_link_here_but_a_very_long_one_indeed_truly_yes_it_is_here(\n\
+             \t1234567890123,\n\
+             );\n",
+        );
+        assert_construct(
+            plain_call,
+            "let value = plain_function_call_with_no_chain_at_all(\n\
+             \targument_one,\n\
+             \targument_two,\n\
+             \targument_three_xyzz,\n\
+             );\n",
+        );
     }
 
     /// E137, the motivating line — from kolt's theme picker, 220 columns and
@@ -12564,28 +12598,29 @@ mod nested_layout {
 
     // --- R5: one argument recurses, siblings stay inline ----------------------
 
-    /// The recorded limitation. Layout hangs off a call's LAST argument — the
-    /// universal builder/DSL convention — so when an EARLIER argument is the
-    /// over-budget cause the line simply stays long. Breaking there needs
-    /// argument-list layout design, which nothing in the code motivates yet.
+    /// E321 (this was R5's recorded limitation): when an EARLIER argument is
+    /// the over-budget cause the link's arguments take a line each, the chain
+    /// having split at its own link first.
     #[test]
-    fn an_earlier_argument_does_not_recurse_and_the_line_stays_long() {
+    fn an_earlier_argument_breaks_the_link_arguments_one_per_line() {
         let padding = "P".repeat(72);
         let split_line = format!("\t.wrap(inner.aa(\"{padding}\").bb(2), tail)");
         assert_over_budget(&split_line);
         assert_construct(
             &format!("let built = subject.wrap(inner.aa(\"{padding}\").bb(2), tail).other(3);\n"),
-            &format!("let built = subject\n{split_line}\n\t.other(3);\n"),
+            &format!(
+                "let built = subject\n\t.wrap(\n\t\tinner\n\t\t\t.aa(\"{padding}\")\n\t\t\t.bb(2),\n\t\ttail,\n\t)\n\t.other(3);\n"
+            ),
         );
     }
 
     // --- R6: closures keep today's printing ----------------------------------
 
-    /// A closure argument is not a layout site: an expression-bodied `|x| …`
-    /// prints as it always has, so a link whose last argument is one stays on
-    /// its long line.
+    /// A closure argument is an argument like any other (E321): an
+    /// expression-bodied `|x| ...` that runs its link out takes a line of its
+    /// own inside the link's argument list.
     #[test]
-    fn an_expression_bodied_closure_argument_stays_inline() {
+    fn an_expression_bodied_closure_argument_takes_a_line_of_its_own() {
         let padding = "P".repeat(56);
         let link = format!("\t.wrap(|event| handle_the_event(event, \"{padding}\"))");
         assert_over_budget(&link);
@@ -12594,7 +12629,9 @@ mod nested_layout {
                 "let built = subject.wrap(|event| handle_the_event(event, \"{padding}\"))\
                  .tail(3);\n"
             ),
-            &format!("let built = subject\n{link}\n\t.tail(3);\n"),
+            &format!(
+                "let built = subject\n\t.wrap(\n\t\t|event| handle_the_event(event, \"{padding}\"),\n\t)\n\t.tail(3);\n"
+            ),
         );
     }
 
@@ -12783,9 +12820,9 @@ mod struct_literal_layout {
         );
     }
 
-    /// An EMPTY literal is never broken: `{⏎}` buys a line and no clarity. Here
-    /// the over-budget cause is an earlier argument, so the armed tail reaches
-    /// the empty literal and declines — the same pin the empty list carries.
+    /// An EMPTY literal is never broken: `{⏎}` buys a line and no clarity. The
+    /// link's arguments (E321) take a line each, and the empty literal stays
+    /// `Empty {}` on its line.
     #[test]
     fn an_empty_struct_literal_at_an_over_budget_tail_stays_inline() {
         let padding = "P".repeat(81);
@@ -12793,7 +12830,9 @@ mod struct_literal_layout {
         assert_over_budget(&split_line);
         assert_construct(
             &format!("let built = subject.wrap(\"{padding}\", Empty {{}}).tail(3);\n"),
-            &format!("let built = subject\n{split_line}\n\t.tail(3);\n"),
+            &format!(
+                "let built = subject\n\t.wrap(\n\t\t\"{padding}\",\n\t\tEmpty {{}},\n\t)\n\t.tail(3);\n"
+            ),
         );
     }
 
@@ -13196,7 +13235,24 @@ mod spanning_renderings {
                          \t\ta_rather_long_line_inside_the_body\n\
                          \t};\n\
                          }\n";
-        assert_construct(long_body, long_body);
+        // E321: the body's own line carries a call, so its arguments break.
+        assert_construct(
+            long_body,
+            "fun demo() {\n\
+             \tlet handler = || {\n\
+             \t\tlet a_rather_long_line_inside_the_body = compute(\n\
+             \t\t\talpha,\n\
+             \t\t\tbeta,\n\
+             \t\t\tgamma,\n\
+             \t\t\tdelta,\n\
+             \t\t\tepsilon,\n\
+             \t\t\tzeta,\n\
+             \t\t\teta,\n\
+             \t\t);\n\
+             \t\ta_rather_long_line_inside_the_body\n\
+             \t};\n\
+             }\n",
+        );
     }
 }
 
@@ -13574,15 +13630,20 @@ mod argument_tail_descent {
         );
     }
 
-    /// R5, unchanged: only the LAST argument is reachable, so an EARLIER
-    /// argument that is the over-budget cause still leaves a long line. This is
-    /// the boundary backlog 43 deliberately did not move.
+    /// E321: an EARLIER argument that is the over-budget cause no longer leaves
+    /// a long line: the arguments take a line each, and the argument that ran
+    /// the line out splits as a chain at its own indentation.
     #[test]
-    fn an_earlier_argument_is_still_not_reachable() {
+    fn an_earlier_argument_that_runs_the_line_out_breaks_the_arguments() {
         let padding = "P".repeat(72);
         let source = format!("let built = wrap(inner.aa(\"{padding}\").bb(2), tail);\n");
         assert_over_budget(source.trim_end());
-        assert_construct(&source, &source);
+        assert_construct(
+            &source,
+            &format!(
+                "let built = wrap(\n\tinner\n\t\t.aa(\"{padding}\")\n\t\t.bb(2),\n\ttail,\n);\n"
+            ),
+        );
     }
 }
 
@@ -14412,15 +14473,18 @@ mod binary_operand_layout {
         );
     }
 
-    /// A right operand that is not a *chain* is not a layout site: one call link
-    /// buys a line and no clarity, so the long line stays long. Nothing about
-    /// the arming is conditional on what it will find — the reprint simply
-    /// reproduces the inline bytes.
+    /// A right operand that is not a *chain* is not a layout site for the
+    /// operator: one call link buys no line. Its argument list is (E321): a
+    /// lone argument that fits a line of its own takes one.
     #[test]
-    fn a_single_link_right_operand_leaves_the_line_long() {
-        let statement = format!("let one = base + s.aa(\"{}\");\n", "P".repeat(90));
+    fn a_single_link_right_operand_breaks_only_its_arguments() {
+        let padding = "P".repeat(90);
+        let statement = format!("let one = base + s.aa(\"{padding}\");\n");
         assert_over_budget(statement.trim_end());
-        assert_construct(&statement, &statement);
+        assert_construct(
+            &statement,
+            &format!("let one = base + s.aa(\n\t\"{padding}\",\n);\n"),
+        );
     }
 
     // --- B3: width only, both directions -------------------------------------
@@ -16563,8 +16627,11 @@ mod on_head_order {
         assert_construct(
             "let s = const style().on(element(\"x\") + hover() + attribute(\"a\") + children() \
              + within(attribute(\"t\")) + md(), inner);\n",
-            "let s = const style().on(md() + within(attribute(\"t\")) + children() \
-             + attribute(\"a\") + hover() + element(\"x\"), inner);\n",
+            "let s = const style().on(\n\
+             \tmd() + within(attribute(\"t\")) + children() + attribute(\"a\") + hover() \
+             + element(\"x\"),\n\
+             \tinner,\n\
+             );\n",
         );
     }
 
@@ -18476,8 +18543,8 @@ mod hole_call_layout {
     //! sibling stays whole; an element literal is never cut mid-literal because
     //! the line ran out; the chain link after a call that broke goes on its own
     //! line one level under the hole's indent, the `css { .. }` operand keeping
-    //! its block layout. Outside markup a call keeps its last-argument layout
-    //! (the estate would move by ~1,800 lines; an owner question).
+    //! its block layout. (E321 later lifted the hole-only gate; the same layout
+    //! now runs everywhere - see `argument_layout`.)
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::assert_over_budget;
     use super::format;
@@ -18645,13 +18712,26 @@ mod hole_call_layout {
         assert_construct(source, source);
     }
 
-    /// Outside markup the same call keeps today's layout: breaking a call's
-    /// arguments is the hole's alone (`a_single_link_and_a_plain_long_call_stay_inline`).
+    /// Outside markup the same call lays out the same way (E321): the
+    /// argument-per-line layout is not the hole's alone.
     #[test]
-    fn the_same_call_outside_markup_stays_inline() {
+    fn the_same_call_outside_markup_breaks_the_same_way() {
         let source = "fun demo() {\n\tlet picked = select_component(\"sidebar_collapsed\", ListCell::of([(1, false), (2, true), (3, true)]), get_prefs().sidebar_collapsed.commit_signal());\n}\n";
         assert_over_budget(source.lines().nth(1).unwrap().trim());
-        assert_construct(source, source);
+        assert_construct(
+            source,
+            "fun demo() {\n\
+             \tlet picked = select_component(\n\
+             \t\t\"sidebar_collapsed\",\n\
+             \t\tListCell::of([\n\
+             \t\t\t(1, false),\n\
+             \t\t\t(2, true),\n\
+             \t\t\t(3, true),\n\
+             \t\t]),\n\
+             \t\tget_prefs().sidebar_collapsed.commit_signal(),\n\
+             \t);\n\
+             }\n",
+        );
     }
 
     /// No element literal is cut with its open tag on one line and its text on
@@ -18673,5 +18753,256 @@ mod hole_call_layout {
         );
         assert!(!once.contains("<span>\n"), "{once}");
         assert_eq!(format(&once), once);
+    }
+}
+
+#[cfg(test)]
+mod argument_layout {
+    //! E321: the argument-per-line layout everywhere, not only in an element
+    //! hole (E314 shipped it hole-only). A call whose first line runs out
+    //! breaks its arguments one per line with a trailing comma and the `)` at
+    //! the call's indent; a tuple slot that runs the line out comes apart. Two
+    //! refusals keep every older layout: a call met inside another call's
+    //! INLINE attempt never breaks (the outer call owns the first refusal), and
+    //! the operands of a binary chain of three or more never break their own
+    //! arguments (the chain breaks at its operators first). Every case runs the
+    //! whole contract through `assert_construct`: the token round trip,
+    //! idempotence and the canonical form's own round trip.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_plain_long_call_breaks_one_argument_per_line() {
+        assert_construct(
+            r####"fun demo() {
+	for command in state_group(next_command_id, "text-selection", const search_dict::expand("UI: Toggle full text selection"), const search_dict::expand("UI: Enable full text selection"), prefs.text_selection_enabled) {
+		commands.push(command);
+	}
+}
+"####,
+            r####"fun demo() {
+	for command in state_group(
+		next_command_id,
+		"text-selection",
+		const search_dict::expand("UI: Toggle full text selection"),
+		const search_dict::expand("UI: Enable full text selection"),
+		prefs.text_selection_enabled,
+	) {
+		commands.push(command);
+	}
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_call_nested_in_a_closure_argument_breaks_outside_in() {
+        assert_construct(
+            r####"fun demo() {
+	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+}
+"####,
+            r####"fun demo() {
+	let g: RemoteStoreSome<Global> = mint_store(
+		client,
+		|| call_reading(
+			local,
+			codec,
+			"global",
+			[],
+			|reply: Deserializer| read_store_reply<Global>(reply, false),
+		),
+	);
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_call_subject_breaks_its_arguments_and_the_link_follows_on_its_own_line() {
+        assert_construct(
+            r####"fun demo() {
+	let modal = overlay::Overlay::modal(overlay::Pin::Center, overlay::Pin::Center).extent(overlay::Extent::Fill(size(256)), overlay::Extent::Fill(size(128)));
+}
+"####,
+            r####"fun demo() {
+	let modal = overlay::Overlay::modal(overlay::Pin::Center, overlay::Pin::Center)
+		.extent(overlay::Extent::Fill(size(256)), overlay::Extent::Fill(size(128)));
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_struct_literal_argument_breaks_whole_when_it_runs_the_line_out() {
+        assert_construct(
+            r####"fun modal(x: Pin, y: Pin): Overlay {
+	Overlay::custom(Anchor::Container, AxisSpec { role = AxisRole::Pinned(x), strategy = Strategy::Slide }, AxisSpec { role = AxisRole::Pinned(y), strategy = Strategy::Slide }, default_panel_style)
+}
+"####,
+            r####"fun modal(x: Pin, y: Pin): Overlay {
+	Overlay::custom(
+		Anchor::Container,
+		AxisSpec {
+			role = AxisRole::Pinned(x),
+			strategy = Strategy::Slide,
+		},
+		AxisSpec { role = AxisRole::Pinned(y), strategy = Strategy::Slide },
+		default_panel_style,
+	)
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_closure_argument_takes_a_line_of_its_own() {
+        assert_construct(
+            r####"fun demo() {
+	let title = draft(seed_title, |value: str| commit_outcome(client.retitle_note(token.get(), note_id, value), note_id));
+}
+"####,
+            r####"fun demo() {
+	let title = draft(
+		seed_title,
+		|value: str| commit_outcome(client.retitle_note(token.get(), note_id, value), note_id),
+	);
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_lone_over_wide_argument_is_left_alone() {
+        assert_construct(
+            r####"fun demo() {
+	print(i"nothing: {maybe.just().patch(3)} {maybe.is_nothing().get()} just={maybe.is_just().get()} and some more text to pass the budget");
+}
+"####,
+            r####"fun demo() {
+	print(i"nothing: {maybe.just().patch(3)} {maybe.is_nothing().get()} just={maybe.is_just().get()} and some more text to pass the budget");
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_lone_argument_that_fits_on_its_own_line_takes_it() {
+        assert_construct(
+            r####"fun demo() {
+	print(i"element: {points.read()[1].x} {tuples.read()[0].1} {grid.read()[0][1]} {names.read()[1]}");
+}
+"####,
+            r####"fun demo() {
+	print(
+		i"element: {points.read()[1].x} {tuples.read()[0].1} {grid.read()[0][1]} {names.read()[1]}",
+	);
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_tuple_slot_that_runs_the_line_out_comes_apart() {
+        assert_construct(
+            r####"fun demo() {
+	let outs = build(|| {
+		(values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count, followed_sum, extras)
+	});
+}
+"####,
+            r####"fun demo() {
+	let outs = build(|| {
+		(
+			values,
+			entries,
+			tens,
+			signed,
+			odd,
+			followed,
+			counted,
+			summed,
+			odd_values,
+			followed_count,
+			followed_sum,
+			extras
+		)
+	});
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn the_operands_of_a_chain_of_three_never_break_their_own_arguments() {
+        assert_construct(
+            r####"fun demo() {
+	for hash in other.table.keys() {
+		if (fed || !changed) && !self.table.contains_key(hash) && store_keyed(node, hash).is_none() && more_condition_here(hash) {
+			changed = true;
+		}
+	}
+	first == 47
+		&& n >= 2
+		&& ((inner.code_at(1) >= 97 && inner.code_at(1) <= 122) || (inner.code_at(1) >= 65 && inner.code_at(1) <= 90))
+}
+"####,
+            r####"fun demo() {
+	for hash in other.table.keys() {
+		if (fed || !changed)
+			&& !self.table.contains_key(hash)
+			&& store_keyed(node, hash).is_none()
+			&& more_condition_here(hash) {
+			changed = true;
+		}
+	}
+	first == 47
+		&& n >= 2
+		&& ((inner.code_at(1) >= 97 && inner.code_at(1) <= 122) || (inner.code_at(1) >= 65 && inner.code_at(1) <= 90))
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_call_met_in_another_calls_inline_attempt_never_breaks() {
+        assert_construct(
+            r####"fun demo() {
+	let view = <div .styled(sidebar_style) .style_var("width", prefs.sidebar_width.signal.derive(|width| style::Length::px(width).css_text()))>"x"</div>;
+	element.style_var("width", prefs.sidebar_width.signal.derive(|width| style::Length::px(width).css_text()), other_argument_xx);
+}
+"####,
+            r####"fun demo() {
+	let view = <div
+		.styled(sidebar_style)
+		.style_var("width", prefs.sidebar_width.signal
+			.derive(|width| style::Length::px(width).css_text()))
+	>
+		"x"
+	</div>;
+	element.style_var(
+		"width",
+		prefs.sidebar_width.signal.derive(|width| style::Length::px(width).css_text()),
+		other_argument_xx,
+	);
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn the_arguments_of_a_hand_wrapped_call_collapse_when_they_fit() {
+        assert_construct(
+            r####"fun demo() {
+	let short = add(
+		1,
+		2,
+	);
+}
+"####,
+            r####"fun demo() {
+	let short = add(1, 2);
+}
+"####,
+        );
     }
 }
