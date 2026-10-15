@@ -837,6 +837,7 @@ fn e311_a_function_reached_through_a_path_paints_as_a_function() {
             vec![
                 pair("padding", "Property"),
                 pair("style", "Namespace"),
+                pair("Length", "Struct"),
                 pair("px", "Function")
             ]
         );
@@ -1329,11 +1330,11 @@ fn e306_a_variant_in_value_position_hovers_with_its_enum() {
         );
         assert!(circle.contains("enum Shape {"), "{circle}");
         let none = hover("None\n}", 0);
-        // A generic enum's variant: its instantiation where the value's type
-        // was tabled, the bare enum where not (a returned `None`), and the
+        // A generic enum's variant: its instantiation where the position
+        // settled one (E317: a returned `None` reads the return slot), and the
         // enum's chunk either way.
         assert!(
-            none.starts_with("```vilan\nOption") && none.contains("::None\n```"),
+            none.starts_with("```vilan\nOption<i32>::None\n```"),
             "{none}"
         );
         assert!(none.contains("enum Option<T> {"), "{none}");
@@ -1689,5 +1690,282 @@ fn e313_a_cold_view_keeps_its_rows_on_a_served_keystroke() {
             boxed.contains("struct Boxed<List<i32>> {") || boxed.contains("value: List<i32>"),
             "{boxed}"
         );
+    });
+}
+
+/// E315: a TYPE in the MIDDLE of a module-qualified value path — `Length` in
+/// `style::Length::px(4)`, `Overflow` in `style::Overflow::Hidden` (kolt
+/// `views.vl:218`), `Overlay` in a three-module `lib::deep::Overlay::fresh()`
+/// — records the type-reference row a head (`Theme::stroke1()`) records: the
+/// segment paints Struct / Enum and hovers with the declaration.
+#[test]
+fn e315_a_type_in_the_middle_of_a_module_path_paints_and_hovers() {
+    on_big_stack(|| {
+        let client = "import std::web::style::Style;\n\
+             import pkg::lib;\n\n\
+             struct Theme {}\n\nimpl Theme {\n\tfun width(): i32 {\n\t\t4\n\t}\n}\n\n\
+             fun main() {\n\
+             \tlet a = style::Length::px(4);\n\
+             \tlet b = style::Overflow::Hidden;\n\
+             \tlet c = lib::deep::Overlay::fresh();\n\
+             \tlet d = lib::deep::Mode::On;\n\
+                          \tlet e = Theme::width();\n\
+             \tlet _ = (a, b, c, d, e);\n}\n";
+        let deep = "/// An overlay.\nexport struct Overlay {\n\topen: bool,\n}\n\n\
+             export impl Overlay {\n\tfun fresh(): Overlay {\n\t\tOverlay { open = false }\n\t}\n}\n\n\
+             /// How it shows.\nexport enum Mode {\n\tOn,\n\tOff,\n}\n";
+        let package = Package::new("e315", &[("client.vl", client)]);
+        std::fs::create_dir_all(package.path("inner")).unwrap();
+        std::fs::write(package.path("inner/deep.vl"), deep).unwrap();
+        std::fs::write(package.path("lib.vl"), "export import pkg::inner::deep;\n").unwrap();
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let pair = |word: &str, kind: &str| (word.to_string(), kind.to_string());
+        assert_eq!(
+            tokens_over(&document, "style::Length::px(4)"),
+            vec![
+                pair("style", "Namespace"),
+                pair("Length", "Struct"),
+                pair("px", "Function")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "style::Overflow::Hidden"),
+            vec![
+                pair("style", "Namespace"),
+                pair("Overflow", "Enum"),
+                pair("Hidden", "EnumMember")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "lib::deep::Overlay::fresh()"),
+            vec![
+                pair("lib", "Namespace"),
+                pair("deep", "Namespace"),
+                pair("Overlay", "Struct"),
+                pair("fresh", "Function")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "lib::deep::Mode::On"),
+            vec![
+                pair("lib", "Namespace"),
+                pair("deep", "Namespace"),
+                pair("Mode", "Enum"),
+                pair("On", "EnumMember")
+            ]
+        );
+        // A head type, as before.
+        assert_eq!(
+            tokens_over(&document, "Theme::width()"),
+            vec![pair("Theme", "Struct"), pair("width", "Function")]
+        );
+        // The segment's hover is the declaration.
+        let hover = |needle: &str| {
+            document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        let length = hover("Length::px");
+        assert!(length.contains("struct Length"), "{length}");
+        let overflow = hover("Overflow::Hidden");
+        assert!(overflow.contains("enum Overflow {"), "{overflow}");
+        let overlay = hover("Overlay::fresh");
+        assert!(overlay.contains("struct Overlay {"), "{overlay}");
+        assert!(overlay.contains("An overlay."), "{overlay}");
+        let mode = hover("Mode::On");
+        assert!(mode.contains("enum Mode {"), "{mode}");
+        // The leaf keeps its own answer.
+        assert!(hover("px(4)").contains("fun px("), "{}", hover("px(4)"));
+        assert!(
+            hover("Hidden;").contains("Overflow::Hidden"),
+            "{}",
+            hover("Hidden;")
+        );
+    });
+}
+
+/// E315's neighbours: the same segment in a TYPE annotation
+/// (`x: style::Length`) paints too, and find-references from the segment
+/// reaches every spelling of the type — the head, the middle of a value path
+/// and an annotation — with rename editing exactly the identifier.
+#[test]
+fn e315_a_middle_segment_is_a_reference_of_its_type() {
+    on_big_stack(|| {
+        let client = "import std::web::style::Style;\n\n\
+             struct Theme {}\n\nimpl Theme {\n\tfun width(): i32 {\n\t\t4\n\t}\n}\n\n\
+             fun measured(x: style::Length): style::Length {\n\tx\n}\n\n\
+             fun main() {\n\
+             \tlet a = style::Length::px(4);\n\
+             \tlet b = Theme::width();\n\
+             \tlet _ = (measured(a), b);\n}\n";
+        let package = Package::new("e315b", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let pair = |word: &str, kind: &str| (word.to_string(), kind.to_string());
+        assert_eq!(
+            tokens_over(&document, "fun measured(x: style::Length): style::Length"),
+            vec![
+                pair("measured", "Function"),
+                pair("x", "Parameter"),
+                pair("style", "Namespace"),
+                pair("Length", "Struct"),
+                pair("style", "Namespace"),
+                pair("Length", "Struct"),
+            ]
+        );
+        // Find-references from the middle segment of the value path: the
+        // two annotations and the path itself, each exactly `Length`.
+        let text = document.analyzed_text().to_string();
+        let found: Vec<String> = document
+            .references(at(client, "Length::px", 0))
+            .into_iter()
+            .filter(|(source, _)| *source == document.focus)
+            .map(|(_, span)| text[span.into_range()].to_string())
+            .collect();
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.iter().all(|word| word == "Length"), "{found:?}");
+    });
+}
+
+/// E316: a function's signature label prints an IMPLICIT parameter's bound -
+/// `username: Signal<str>` - not the binder's bare name (`Signal`). Two
+/// parameters of one trait at different arguments print apart; an explicit
+/// `<S: Shows<str>>` keeps its `S`.
+#[test]
+fn e316_an_implicit_parameter_prints_its_trait_arguments() {
+    on_big_stack(|| {
+        let client = "trait Shows<T> {\n\tfun show(self): T;\n}\n\n\
+             struct Name {}\n\nstruct Count {}\n\n\
+             impl Name with Shows<str> {\n\tfun show(self): str {\n\t\t\"n\"\n\t}\n}\n\n\
+             impl Count with Shows<i32> {\n\tfun show(self): i32 {\n\t\t1\n\t}\n}\n\n\
+             fun login(username: Shows<str>, tries: Shows<i32>): i32 {\n\ttries.show()\n}\n\n\
+             fun single(username: Shows<str>): str {\n\tusername.show()\n}\n\n\
+             fun explicit<S: Shows<str>>(value: S, other: Shows<i32>): str {\n\tvalue.show()\n}\n\n\
+             fun main() {\n\tlet _ = login(Name {}, Count {});\n\tlet _ = single(Name {});\n\
+             \tlet _ = explicit(Name {}, Count {});\n}\n";
+        let package = Package::new("e316", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let hover = |needle: &str| {
+            document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        for needle in ["login(username", "login(Name"] {
+            let label = hover(needle);
+            assert!(
+                label.contains("fun login(username: Shows<str>, tries: Shows<i32>): i32"),
+                "{needle}: {label}"
+            );
+        }
+        let single = hover("single(username");
+        assert!(
+            single.contains("fun single(username: Shows<str>): str"),
+            "{single}"
+        );
+        let explicit = hover("explicit<S");
+        assert!(
+            explicit.contains("fun explicit<S: Shows<str>>(value: S, other: Shows<i32>): str"),
+            "{explicit}"
+        );
+    });
+}
+
+/// E317: a generic enum's variant in value position whose own type was not
+/// tabled reads the EXPECTED type - the return slot, the binding's annotation,
+/// an argument's parameter - as a pattern reads the matched type (E241): a
+/// returned `None` hovers `Option<i32>::None`, as `Some(1)` and a bound
+/// `None` do.
+#[test]
+fn e317_a_returned_variant_hovers_with_the_expected_instantiation() {
+    on_big_stack(|| {
+        let client = "fun nothing(): Option<i32> {\n\tNone\n}\n\n\
+             fun early(flag: bool): Option<str> {\n\tif flag {\n\t\tret None;\n\t}\n\tSome(\"x\")\n}\n\n\
+             fun wrapped(): Result<i32, str> {\n\tOk(1)\n}\n\n\
+             fun failed(): Result<i32, str> {\n\tErr(\"no\")\n}\n\n\
+             fun take(value: Option<f64>): i32 {\n\tmatch value {\n\t\tSome(_) => 1,\n\t\tNone => 0,\n\t}\n}\n\n\
+             fun main() {\n\tlet bound: Option<i32> = None;\n\tlet some = Some(1);\n\
+             \tlet _ = (bound, some, nothing(), early(true), wrapped(), failed());\n\
+             \tlet _ = take(None);\n}\n";
+        let package = Package::new("e317", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let first_line = |needle: &str| {
+            let hover = document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover.lines().nth(1).unwrap_or_default().to_string()
+        };
+        assert_eq!(first_line("None\n}"), "Option<i32>::None");
+        assert_eq!(first_line("None;\n\t}\n\tSome"), "Option<str>::None");
+        assert_eq!(first_line("Some(\"x\")"), "Option<str>::Some");
+        assert_eq!(first_line("None;\n\tlet some"), "Option<i32>::None");
+        assert_eq!(first_line("Some(1);"), "Option<i32>::Some");
+        assert_eq!(first_line("None);\n}"), "Option<f64>::None");
+        assert_eq!(first_line("Ok(1)"), "Result<i32, str>::Ok");
+        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err");
+    });
+}
+
+/// E322: an element's links are told from the reader's by the desugar's own
+/// marks (`element_head_links`, B620) and its scaffolding, not by scanning the
+/// text for a `>` and a `.`: `title(<b />)` ends in a `>` and the head link
+/// after it is written with a `.` (an ascribed value ends in one too), which the text test took for a chain written
+/// after the finished element. The head link hints nothing; the inner element
+/// is untouched; a chain after the whole element still hints.
+#[test]
+fn e322_a_head_link_after_an_element_valued_item_mints_no_hint() {
+    on_big_stack(|| {
+        let source = "export fun nested(): View {\n\t<div\n\t\ttitle(Some(\"a\") as Option<str>)\n\t\t.class(\"x\")\n\t\t.text(\"y\")\n\t/>\n}\n\n\
+             export fun after(): View {\n\t<div />\n\t\t.class(\"x\")\n\t\t.text(\"y\")\n}\n";
+        let client = "import pkg::bar::{ after, nested };\n\nfun main() {\n\tlet _ = nested();\n\tlet _ = after();\n}\n";
+        let package = Package::new("e322", &[("client.vl", client), ("bar.vl", source)]);
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let view = package.view(&world, "bar.vl");
+        let lone = Document::analyze(source, &std_root(), &package.path("bar.vl"));
+        let line = |needle: &str| source[..at(source, needle, 0)].matches('\n').count() + 1;
+        for document in [&view, &lone] {
+            let hints = stage_hint_lines(document);
+            for needle in [
+                "title(Some(\"a\") as Option<str>)",
+                ".class(\"x\")\n\t\t.text",
+                ".text(\"y\")\n\t/>",
+                "\t/>",
+            ] {
+                assert!(
+                    !hints.iter().any(|(at_line, _)| *at_line == line(needle)),
+                    "a hint on `{needle}`'s line: {hints:?}"
+                );
+            }
+            assert!(
+                hints.contains(&(line("\t<div />"), " as View".to_string())),
+                "{hints:?}"
+            );
+            assert!(
+                hints.contains(&(
+                    line(".class(\"x\")\n\t\t.text(\"y\")\n}"),
+                    " as View".to_string()
+                )),
+                "{hints:?}"
+            );
+        }
     });
 }

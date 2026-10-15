@@ -24894,6 +24894,10 @@ impl<'src> Analyzer<'src> {
         subject: Option<&SignatureSubject<'_>>,
         substitution: &SubstitutionContext,
     ) -> String {
+        // E316: an implicit parameter (`username: Signal<str>`) prints its bound.
+        if let Some(bound) = self.implicit_parameter_bound(type_id, substitution) {
+            return self.signature_type_label(bound, subject, substitution);
+        }
         if subject.is_some() {
             return self.declaration_type_label_for(type_id, subject);
         }
@@ -67507,6 +67511,33 @@ impl<'src> Analyzer<'src> {
                                 (Type::Trait(id, _), false) => Type::Trait(id, argument_type_ids),
                                 (other, _) => other,
                             };
+                            // E315: the member is a SEGMENT of the written path
+                            // (`Length` in `style::Length::px(4)`, `deep` in
+                            // `lib::deep::Overlay::fresh()`) and takes the
+                            // reference a path's head takes, so the language
+                            // server paints and hovers it. The segment is the
+                            // path's last: the span ends where the member's
+                            // name does.
+                            let definition_id = match &member_type {
+                                Type::Struct(id, _) | Type::Enum(id, _) | Type::Trait(id, _) => {
+                                    Some(*id)
+                                }
+                                Type::Module(id) => Some(*id),
+                                _ => None,
+                            };
+                            let path_end = span.into_range().end;
+                            if definition_id.is_some()
+                                && span.into_range().len() >= member_name.len()
+                            {
+                                let segment_span: Span =
+                                    (path_end - member_name.len()..path_end).into();
+                                self.type_references.push((
+                                    source_id,
+                                    segment_span,
+                                    definition_id,
+                                    type_id,
+                                ));
+                            }
                             self.write_type_slot(type_id, member_type);
                         }
                         None => {
@@ -86553,6 +86584,11 @@ fn analyze_over_world<'src>(
                 .iter()
                 .map(|(id, label)| (*id, label.clone())),
         );
+    }
+    // E317: a generic enum's variant in value position reads the instantiation
+    // its position wanted (editor-only; empty without the reading aids).
+    for (id, label) in analyzer.variant_use_labels(&hover_rows, &expr_types) {
+        expr_types.insert(id, label);
     }
     // E238: the block each member is declared in, and each block's header.
     crate::phase_pass_mark("the label tables");
