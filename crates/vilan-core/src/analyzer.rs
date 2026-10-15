@@ -24894,6 +24894,10 @@ impl<'src> Analyzer<'src> {
         subject: Option<&SignatureSubject<'_>>,
         substitution: &SubstitutionContext,
     ) -> String {
+        // E316: an implicit parameter (`username: Signal<str>`) prints its bound.
+        if let Some(bound) = self.implicit_parameter_bound(type_id, substitution) {
+            return self.signature_type_label(bound, subject, substitution);
+        }
         if subject.is_some() {
             return self.declaration_type_label_for(type_id, subject);
         }

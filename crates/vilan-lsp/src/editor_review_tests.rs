@@ -1834,3 +1834,51 @@ fn e315_a_middle_segment_is_a_reference_of_its_type() {
         assert!(found.iter().all(|word| word == "Length"), "{found:?}");
     });
 }
+
+/// E316: a function's signature label prints an IMPLICIT parameter's bound -
+/// `username: Signal<str>` - not the binder's bare name (`Signal`). Two
+/// parameters of one trait at different arguments print apart; an explicit
+/// `<S: Shows<str>>` keeps its `S`.
+#[test]
+fn e316_an_implicit_parameter_prints_its_trait_arguments() {
+    on_big_stack(|| {
+        let client = "trait Shows<T> {\n\tfun show(self): T;\n}\n\n\
+             struct Name {}\n\nstruct Count {}\n\n\
+             impl Name with Shows<str> {\n\tfun show(self): str {\n\t\t\"n\"\n\t}\n}\n\n\
+             impl Count with Shows<i32> {\n\tfun show(self): i32 {\n\t\t1\n\t}\n}\n\n\
+             fun login(username: Shows<str>, tries: Shows<i32>): i32 {\n\ttries.show()\n}\n\n\
+             fun single(username: Shows<str>): str {\n\tusername.show()\n}\n\n\
+             fun explicit<S: Shows<str>>(value: S, other: Shows<i32>): str {\n\tvalue.show()\n}\n\n\
+             fun main() {\n\tlet _ = login(Name {}, Count {});\n\tlet _ = single(Name {});\n\
+             \tlet _ = explicit(Name {}, Count {});\n}\n";
+        let package = Package::new("e316", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let hover = |needle: &str| {
+            document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        for needle in ["login(username", "login(Name"] {
+            let label = hover(needle);
+            assert!(
+                label.contains("fun login(username: Shows<str>, tries: Shows<i32>): i32"),
+                "{needle}: {label}"
+            );
+        }
+        let single = hover("single(username");
+        assert!(
+            single.contains("fun single(username: Shows<str>): str"),
+            "{single}"
+        );
+        let explicit = hover("explicit<S");
+        assert!(
+            explicit.contains("fun explicit<S: Shows<str>>(value: S, other: Shows<i32>): str"),
+            "{explicit}"
+        );
+    });
+}

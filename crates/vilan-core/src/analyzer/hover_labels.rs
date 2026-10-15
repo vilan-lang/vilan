@@ -607,6 +607,27 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E316: the BOUND an implicit generic parameter stands for, where a
+    /// signature label should print it instead of the binder. An implicit
+    /// generic (`username: Signal<str>`, B186) has no name the reader wrote -
+    /// its bare rendering is the trait's name without its arguments (B261) -
+    /// so the label prints the bound as written. An explicit parameter
+    /// (`<S: Signal<str>>`) keeps its `S`, and a parameter the call site's
+    /// substitution already binds keeps the substitution's reading.
+    pub(super) fn implicit_parameter_bound(
+        &self,
+        type_id: TypeId,
+        substitution: &SubstitutionContext,
+    ) -> Option<TypeId> {
+        let Type::Generic(constraint_id) = type_id.borrow_type(self) else {
+            return None;
+        };
+        (self.implicit_generic_scopes.contains_key(constraint_id)
+            && !substitution.contains_key(constraint_id)
+            && matches!(constraint_id.borrow_type(self), Type::Trait(..)))
+        .then_some(*constraint_id)
+    }
+
     /// E240: the entry's type-position names that are a type parameter or a
     /// trait, rendered — every other row keeps its plain label.
     pub(super) fn reference_hovers(&self, rows: &HoverRows) -> Vec<ReferenceHover> {
