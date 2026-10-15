@@ -682,11 +682,18 @@ impl<'src> Analyzer<'src> {
             }
         }
         let mut by_parameter: HashMap<Id, TypeId> = HashMap::default();
-        for call in self.function_calls.values() {
-            if call.argument_ids.is_empty()
-                || variant_enum(call.subject_id).is_some()
-                || !in_scope(call.id)
-            {
+        // The variant constructor calls: (callee, its enum, the call).
+        let mut variant_calls: Vec<(Id, Id, Id)> = Vec::new();
+        // The cheap, cache-hot test first: most of the world is std's.
+        for (call_id, call) in &self.function_calls {
+            if !in_scope(call.id) {
+                continue;
+            }
+            if let Some(enum_id) = variant_enum(call.subject_id) {
+                variant_calls.push((call.subject_id, enum_id, *call_id));
+                continue;
+            }
+            if call.argument_ids.is_empty() {
                 continue;
             }
             let Some(function) = self
@@ -728,18 +735,18 @@ impl<'src> Analyzer<'src> {
             }
         };
         // A variant constructor call: the label belongs to the callee.
-        for (call_id, call) in &self.function_calls {
-            if let Some(enum_id) = variant_enum(call.subject_id) {
-                consider(call.subject_id, enum_id, *call_id);
-            }
+        for (callee, enum_id, call_id) in variant_calls {
+            consider(callee, enum_id, call_id);
         }
         // A bare variant reference.
-        for id in self
-            .expected_types
-            .keys()
-            .chain(by_binding.keys())
-            .chain(by_parameter.keys())
-        {
+        for id in self.expected_types.keys() {
+            if in_scope(*id)
+                && let Some(enum_id) = variant_enum(*id)
+            {
+                consider(*id, enum_id, *id);
+            }
+        }
+        for id in by_binding.keys().chain(by_parameter.keys()) {
             if let Some(enum_id) = variant_enum(*id) {
                 consider(*id, enum_id, *id);
             }
