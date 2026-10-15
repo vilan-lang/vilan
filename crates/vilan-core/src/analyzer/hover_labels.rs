@@ -712,7 +712,10 @@ impl<'src> Analyzer<'src> {
         // for: the id the label is keyed by (the reference) and the id the
         // position's facts are keyed by (the reference, or its call).
         let mut by_binding: HashMap<Id, TypeId> = HashMap::default();
-        for variable in self.variables.values() {
+        // M148: the label lane only — a region whose record carried its
+        // label rows restores these with them (`expr_types`).
+        let live = &self.live_labels;
+        for (_, variable) in super::live_ranges::LiveEntries::over(&self.variables, live) {
             if let Some(initial) = variable.initial
                 && in_scope(initial)
             {
@@ -723,7 +726,7 @@ impl<'src> Analyzer<'src> {
         // The variant constructor calls: (callee, its enum, the call).
         let mut variant_calls: Vec<(Id, Id, Id)> = Vec::new();
         // The cheap, cache-hot test first: most of the world is std's.
-        for (call_id, call) in &self.function_calls {
+        for (call_id, call) in super::live_ranges::LiveEntries::over(&self.function_calls, live) {
             if !in_scope(call.id) {
                 continue;
             }
@@ -777,7 +780,7 @@ impl<'src> Analyzer<'src> {
             consider(callee, enum_id, call_id);
         }
         // A bare variant reference.
-        for id in self.expected_types.keys() {
+        for (id, _) in super::live_ranges::LiveEntries::over(&self.expected_types, live) {
             if in_scope(*id)
                 && let Some(enum_id) = variant_enum(*id)
             {

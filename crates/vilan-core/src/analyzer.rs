@@ -4790,6 +4790,10 @@ pub struct Analyzer<'src> {
     // the complement of the ranges whose record carried its rows
     // (`row_families.rs`).
     live_families: row_families::FamilyLanes,
+    // M148: the label rows' lane — the complement of the modules' and
+    // items' ranges whose record carried their S2b label rows. E317's
+    // variant labels walk it (`hover_labels.rs`).
+    live_labels: live_ranges::LiveRanges,
     // M110 S7b: the view bindings and the view origins, computed ONCE per
     // analysis for the five checks and the two tail passes that ask (each
     // was a fixpoint over every binding of the program per ask). Cleared
@@ -7997,6 +8001,7 @@ impl<'src> Analyzer<'src> {
             live_module: live_ranges::LiveRanges::default(),
             live_held: live_ranges::LiveRanges::default(),
             live_families: row_families::FamilyLanes::default(),
+            live_labels: live_ranges::LiveRanges::default(),
             view_bindings_memo: std::cell::OnceCell::new(),
             view_origins_memo: std::cell::OnceCell::new(),
             reused_table_sources: Vec::new(),
@@ -53266,6 +53271,8 @@ impl<'src> Analyzer<'src> {
             }
         }
         self.live_families = row_families::FamilyLanes::complement(&family_restored, high);
+        self.live_labels =
+            live_ranges::LiveRanges::complement(&self.restored_tables.label_ranges, high);
         if !crate::macros::in_macro_world() {
             let ranges = self.live_class_a.ranges().len() as u64;
             let entities = self.live_class_a.count();
