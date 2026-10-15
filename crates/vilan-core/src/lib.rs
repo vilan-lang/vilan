@@ -25,6 +25,7 @@ pub mod counters;
 pub mod css;
 pub mod css_properties;
 pub mod dead_items;
+pub mod debug_info;
 pub(crate) mod depth_stats;
 pub mod dispatch_refine;
 pub mod drop_plan_stats;

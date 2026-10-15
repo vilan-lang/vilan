@@ -33,6 +33,10 @@ builds your project, so the editor and the build never disagree.
   ones, from the Source Action menu or on save.
 - **A `vilan.toml` schema**: completion and validation in the manifest, for
   TOML extensions that consume contributed schemas (Even Better TOML).
+- **Debugging**: F5 on a `.vl` file, or **Debug** above `fun main` —
+  breakpoints and stepping in your `.vl` files, and a Variables pane that
+  prints values the way `dbg` does (`Point { x = 1, y = 2 }`, not `[1, 2]`),
+  under `vilan run --watch` too.
 
 All of it keeps working while the file has errors: the server analyzes the
 recovered parse, so a half-typed line does not take your hovers with it.

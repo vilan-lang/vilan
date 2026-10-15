@@ -661,8 +661,10 @@ fn a_build_owns_its_legs_chunk_namespace() {
         .filter(|name| {
             name.starts_with("app.")
                 && name != "app.js"
-                // The bundle's source map (E257 S5): the bundle's, not a chunk.
+                // The bundle's source map (E257 S5) and its debugger's sidecar
+                // (S7): the bundle's, not a chunk's.
                 && name != "app.js.map"
+                && name != "app.js.vdbg.json"
                 && name != "app.vl"
                 && name != "app.chunks.json"
         })
@@ -769,8 +771,10 @@ fn chunk_artifacts(dist: &Path) -> Vec<String> {
         .filter(|name| {
             name.starts_with("client.")
                 && name != "client.js"
-                // The bundle's source map (E257 S5): the bundle's, not a chunk.
+                // The bundle's source map (E257 S5) and its debugger's sidecar
+                // (S7): the bundle's, not a chunk's.
                 && name != "client.js.map"
+                && name != "client.js.vdbg.json"
                 && name != "client.chunks.json"
         })
         .collect();

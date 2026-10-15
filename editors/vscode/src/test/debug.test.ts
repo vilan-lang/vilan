@@ -1,6 +1,7 @@
-// E257 S6: the `vilan` debug type resolves to the JavaScript debugger's launch
-// configuration, and the "Debug" code lens finds a program's `fun main` — run
-// under plain node by `npm test`.
+// E257 S6/S7: the `vilan` debug type resolves for vilan-dap (S7) — or, with
+// `"adapter": "js-debug"`, to the JavaScript debugger's launch configuration
+// (S6) — and the "Debug" code lens finds a program's `fun main` — run under
+// plain node by `npm test`.
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as path from 'node:path';
@@ -9,6 +10,7 @@ import {
     LaunchContext,
     mainFunctionLines,
     mainLensConfiguration,
+    resolveAdapterLaunch,
     resolveLaunch,
     vilanCandidates,
 } from '../debug';
@@ -27,6 +29,73 @@ function resolved(configuration: Parameters<typeof resolveLaunch>[0], context = 
     return outcome.configuration;
 }
 
+test('a launch stays a `vilan` one, completed for vilan-dap', () => {
+    const outcome = resolveAdapterLaunch(
+        {
+            type: 'vilan',
+            request: 'launch',
+            name: 'Debug it',
+            program: '/work/app/src/main.vl',
+            args: ['--count', '3'],
+        },
+        CONTEXT,
+    );
+    assert.ok(outcome.ok);
+    assert.deepEqual(outcome.configuration, {
+        type: 'vilan',
+        request: 'launch',
+        name: 'Debug it',
+        vilan: '/h/dev/.vilan/bin/vilan',
+        program: '/work/app/src/main.vl',
+        args: ['--count', '3'],
+        cwd: '/work/app',
+        env: undefined,
+        entry: undefined,
+        watch: false,
+        stopOnEntry: false,
+        console: 'integratedTerminal',
+        port: 40123,
+        adapter: 'vilan',
+    });
+});
+
+test('vilan-dap takes the watch shape, the entry and a configured vilanPath', () => {
+    const outcome = resolveAdapterLaunch(
+        { type: 'vilan', request: 'launch', program: '/work/app', watch: true, entry: 'server', vilanPath: '/opt/vilan' },
+        CONTEXT,
+    );
+    assert.ok(outcome.ok);
+    assert.equal(outcome.configuration.watch, true);
+    assert.equal(outcome.configuration.entry, 'server');
+    assert.equal(outcome.configuration.vilan, '/opt/vilan');
+});
+
+test('an empty configuration debugs the active file under vilan-dap', () => {
+    const outcome = resolveAdapterLaunch({ type: 'vilan', request: 'launch' }, CONTEXT);
+    assert.ok(outcome.ok);
+    assert.equal(outcome.configuration.program, '/work/app/src/main.vl');
+});
+
+test('`"adapter": "js-debug"` resolves to the JavaScript debugger, as S6 did', () => {
+    const configuration = { type: 'vilan', request: 'launch', program: '/work/app/src/main.vl', adapter: 'js-debug' };
+    assert.deepEqual(resolveAdapterLaunch(configuration, CONTEXT), resolveLaunch(configuration, CONTEXT));
+    const outcome = resolveAdapterLaunch(configuration, CONTEXT);
+    assert.ok(outcome.ok && outcome.configuration.type === 'node');
+});
+
+test('an unknown adapter, an attach and nothing to debug are refused', () => {
+    const unknown = resolveAdapterLaunch({ type: 'vilan', request: 'launch', adapter: 'gdb' }, CONTEXT);
+    assert.ok(!unknown.ok && /Unknown `adapter`/.test(unknown.message));
+    const attach = resolveAdapterLaunch({ type: 'vilan', request: 'attach' }, CONTEXT);
+    assert.ok(!attach.ok && /`node` attach configuration/.test(attach.message));
+    const nothing = resolveAdapterLaunch(
+        { type: 'vilan', request: 'launch' },
+        { ...CONTEXT, activeFile: undefined, workspaceFolder: undefined },
+    );
+    assert.ok(!nothing.ok && /open a `\.vl` file/.test(nothing.message));
+});
+
+// S6's resolution — what `"adapter": "js-debug"` asks for.
 test('a plain launch runs `vilan run --inspect-brk` and attaches at its port', () => {
     const configuration = resolved({
         type: 'vilan',
@@ -198,6 +267,7 @@ test('package.json contributes the vilan debugger and vilan breakpoints', () => 
     assert.ok(manifest.activationEvents.includes('onDebugResolve:vilan'));
     const properties = Object.keys(debuggerEntry.configurationAttributes.launch.properties).sort();
     assert.deepEqual(properties, [
+        'adapter',
         'args',
         'console',
         'cwd',
@@ -208,10 +278,11 @@ test('package.json contributes the vilan debugger and vilan breakpoints', () => 
         'vilanPath',
         'watch',
     ]);
+    assert.deepEqual(debuggerEntry.configurationAttributes.launch.properties.adapter.enum, ['vilan', 'js-debug']);
     for (const initial of debuggerEntry.initialConfigurations) {
-        assert.equal(resolveLaunch({ ...initial, program: '/work/app/src/main.vl' }, CONTEXT).ok, true);
+        assert.equal(resolveAdapterLaunch({ ...initial, program: '/work/app/src/main.vl' }, CONTEXT).ok, true);
     }
     for (const snippet of debuggerEntry.configurationSnippets) {
-        assert.equal(resolveLaunch({ ...snippet.body, program: '/work/app' }, CONTEXT).ok, true);
+        assert.equal(resolveAdapterLaunch({ ...snippet.body, program: '/work/app' }, CONTEXT).ok, true);
     }
 });

@@ -59,6 +59,7 @@ guide/debugging.md h2 everything-in-scope-dbg_stack
 guide/debugging.md h2 where-panics-name-their-line
 guide/debugging.md h3 track_caller
 guide/debugging.md h2 in-a-debugger
+guide/debugging.md h3 in-vs-code
 guide/dev-loop.md h1 the-dev-loop
 guide/dev-loop.md h2 what-each-edit-does
 guide/dev-loop.md h2 when-a-round-fails

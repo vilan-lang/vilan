@@ -117,8 +117,10 @@ package, `vilan test`), never one file at a time.
 - `--explain`: after the build, print where every output came from — see
   below.
 - `--source-maps`: write a source map beside each script whatever the preset
-  says (`main.mjs.map`, named by the script's last line). The `debug` preset
-  writes one already; this is `[build] source-maps = true` for one build. See
+  says (`main.mjs.map`, named by the script's last line), and the debugger's
+  sidecar with it (`main.mjs.vdbg.json`: each function's bindings by vilan name
+  and type). The `debug` preset writes both already; this is
+  `[build] source-maps = true` for one build. See
   [debugging](../guide/debugging.md#in-a-debugger).
 
 A `dbg(..)` or `dbg_stack()` call prints in a `debug` build, which is the

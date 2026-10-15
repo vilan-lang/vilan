@@ -94,6 +94,10 @@ pub struct SourceMap {
     pub names: Vec<String>,
     /// The `mappings` string: VLQ segments, `;` between generated lines.
     pub mappings: String,
+    /// The `.vdbg.json` sidecar that rides with this map (E257 S7): the
+    /// script's frames and their bindings by static type, written beside the
+    /// map wherever the map is. Not part of the map's own JSON.
+    pub debug: Option<Box<crate::debug_info::DebugInfo>>,
 }
 
 /// One source the map points into.
@@ -208,7 +212,7 @@ impl Position {
     }
 }
 
-fn utf16_length(text: &str) -> u32 {
+pub(crate) fn utf16_length(text: &str) -> u32 {
     if text.is_ascii() {
         text.len() as u32
     } else {
@@ -219,7 +223,7 @@ fn utf16_length(text: &str) -> u32 {
 /// The line breaks in `bytes`: how many, and the offset just past the last
 /// one. Eight bytes at a time — this is the sweep over std's text — and the
 /// last break found by a scan back from the end, which stops within a line.
-fn line_breaks(bytes: &[u8]) -> (u32, Option<usize>) {
+pub(crate) fn line_breaks(bytes: &[u8]) -> (u32, Option<usize>) {
     const LOW_SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HIGH: u64 = 0x8080_8080_8080_8080;
     const NEWLINES: u64 = 0x0a0a_0a0a_0a0a_0a0a;
@@ -640,7 +644,7 @@ pub fn mapping_url_comment(map_file_name: &str) -> String {
     format!("//# sourceMappingURL={}\n", percent_encode(map_file_name))
 }
 
-fn json_string(out: &mut String, text: &str) {
+pub(crate) fn json_string(out: &mut String, text: &str) {
     out.push('"');
     // Runs that need no escape are copied whole; every byte that does is
     // ASCII, so each cut falls on a character boundary.
