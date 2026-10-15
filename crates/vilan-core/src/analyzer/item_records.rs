@@ -62,6 +62,7 @@ impl RestoredTables {
         tables: &ModuleTables,
         rebase: &dyn Fn(Id) -> Option<Id>,
         shift: &dyn Fn(Span) -> Span,
+        source: SourceId,
     ) {
         let ids = |rows: &[Id]| {
             rows.iter()
@@ -144,6 +145,10 @@ impl RestoredTables {
             .contains(super::row_families::RowFamily::Hmr)
         {
             self.hmr.extend(&tables.hmr.rebased(rebase));
+        }
+        if tables.hover_recorded {
+            self.hover
+                .extend(&tables.hover.rebased(rebase, shift, source));
         }
         for hint in &tables.stage_hints {
             if let (Some(id), Some(chain)) = (rebase(hint.id), rebase(hint.chain)) {
@@ -252,6 +257,10 @@ pub(super) struct ItemState {
     /// M149/M150: per conditional row family, the served windows whose
     /// records carry it.
     family_ranges: super::row_families::FamilyRanges,
+    /// M148: the served windows whose records carry hover rows — as
+    /// entity ranges and as windows (the span rows' predicate).
+    hover_ranges: Vec<(u32, u32)>,
+    hover_windows: HashSet<usize>,
     /// The Class A output this analysis derived for the laid-out windows it
     /// did NOT serve, per window — the next analysis's records.
     derived: HashMap<usize, ModuleDiagnostics>,
@@ -556,6 +565,29 @@ impl<'src> Analyzer<'src> {
         &self.items.family_ranges
     }
 
+    pub(super) fn item_hover_ranges(&self) -> &[(u32, u32)] {
+        &self.items.hover_ranges
+    }
+
+    /// M148: whether a served window's record carried its hover rows.
+    pub(super) fn item_hover_restored(&self, window: usize) -> bool {
+        self.items.hover_windows.contains(&window)
+    }
+
+    /// The laid-out window whose item region holds `offset` in `source`, when
+    /// this analysis FILES its record — the span rows' twin of
+    /// [`Self::item_window_of`].
+    pub(super) fn item_window_filed_at(&self, source: SourceId, offset: usize) -> Option<usize> {
+        if !self.items.enabled {
+            return None;
+        }
+        let window = self.item_window_at(source, offset)?;
+        (window >= self.id_windows.inherited
+            && !self.items.served_set.contains(&window)
+            && self.item_source(source))
+        .then_some(window)
+    }
+
     fn relative_entity(&self, id: Id) -> Relative {
         if let Some(window) = self.id_windows.window_of_entity(id) {
             let start = self.id_windows.windows[window].entities.start;
@@ -718,6 +750,8 @@ impl<'src> Analyzer<'src> {
         self.items.hint_ranges.clear();
         self.items.held_ranges.clear();
         self.items.family_ranges.clear();
+        self.items.hover_ranges.clear();
+        self.items.hover_windows.clear();
         self.items.facts.clear();
         self.items.derived.clear();
         self.items.unrecordable.clear();
@@ -840,6 +874,7 @@ impl<'src> Analyzer<'src> {
         let mut hint_ranges: Vec<(u32, u32)> = Vec::new();
         let mut held_ranges: Vec<(u32, u32)> = Vec::new();
         let mut family_ranges = super::row_families::FamilyRanges::default();
+        let mut hover_ranges: Vec<(u32, u32)> = Vec::new();
         for &window in &laid {
             let Some(record) = candidate.get(&window) else {
                 continue;
@@ -872,6 +907,10 @@ impl<'src> Analyzer<'src> {
                         family_ranges.of_mut(family).extend(own.iter().copied());
                     }
                 }
+                if tables.hover_recorded {
+                    hover_ranges.extend(own.iter().copied());
+                    self.items.hover_windows.insert(window);
+                }
             }
             self.items.served_set.insert(window);
             self.items.served.push((window, record.clone()));
@@ -888,6 +927,8 @@ impl<'src> Analyzer<'src> {
         self.items.held_ranges = held_ranges;
         family_ranges.sort();
         self.items.family_ranges = family_ranges;
+        hover_ranges.sort_unstable();
+        self.items.hover_ranges = hover_ranges;
         let served = self.items.served.len() as u64;
         if !crate::macros::in_macro_world() {
             crate::incremental::update_census(|census| {
@@ -1004,7 +1045,8 @@ impl<'src> Analyzer<'src> {
                     .push((closure_id, reference_id, name));
             }
             if let Some(tables) = &record.module.tables {
-                self.restored_tables.absorb_rebased(tables, &rebase, &shift);
+                self.restored_tables
+                    .absorb_rebased(tables, &rebase, &shift, source);
             }
         }
         self.items.served = served;
@@ -1147,6 +1189,7 @@ impl<'src> Analyzer<'src> {
         labels_recorded: bool,
         hints_recorded: bool,
         families: super::row_families::FamilySet,
+        hover_recorded: bool,
     ) -> (Vec<(ItemKey, ItemRecord)>, Vec<ItemKey>) {
         let mut filed = Vec::new();
         let mut purge = Vec::new();
@@ -1204,6 +1247,16 @@ impl<'src> Analyzer<'src> {
             slice.labels_recorded = labels_recorded;
             slice.hints_recorded = hints_recorded;
             slice.families = families;
+            // M148: the hover rows ride only when every entity they name is
+            // the item's own or the prefix's; otherwise the item renders its
+            // hover rows live and keeps the rest of its record.
+            slice.hover_recorded = hover_recorded
+                && slice.hover.fits(&|id: Id| {
+                    (id.0 >= item.entities.start && id.0 < item.entities.end) || id.0 < prefix_end
+                });
+            if !slice.hover_recorded {
+                slice.hover = Default::default();
+            }
             // The held rows ride only when every id they carry is the item's
             // own or the prefix's; otherwise the item stays live for the
             // held passes (`held_tables.rs`) and keeps the rest of its record.

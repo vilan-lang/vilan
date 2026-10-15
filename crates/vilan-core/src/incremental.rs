@@ -452,6 +452,9 @@ pub struct Census {
     /// are not walked, so a served keystroke reads a fraction of a filing
     /// one's.
     pub move_rows_live: u64,
+    /// M148: the hover rows this analysis RESTORED from its records (E206,
+    /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
+    pub hover_rows_restored: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -501,6 +504,7 @@ thread_local! {
             live_ranges: 0,
             live_entities: 0,
             move_rows_live: 0,
+            hover_rows_restored: 0,
             prefix_world: false,
             prefix_layered: false,
             prefix_hits: 0,
@@ -867,7 +871,7 @@ pub fn report(program: &Program) {
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
-             live-entities={} move-rows-live={} prefix-world={} prefix-layered={} prefix-hits={} \
+             live-entities={} move-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={}",
             census.base_hits,
             census.base_misses,
@@ -896,6 +900,7 @@ pub fn report(program: &Program) {
             census.live_ranges,
             census.live_entities,
             census.move_rows_live,
+            census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
             census.prefix_hits,
@@ -1021,6 +1026,76 @@ pub fn render_observation(program: &Program, diagnostics: &[crate::Error]) -> St
             path_of(*source),
             span.into_range(),
             target.and_then(place).unwrap_or_else(|| "?".to_string())
+        ));
+    }
+    // M148: the four per-file hover tables (E206, E237, E240, E241) — every
+    // row at its place. E237's blocks are keyed by a TYPE id, which differs
+    // between worlds, so they are rendered at the package positions a hover
+    // reads them from (a binding, a parameter, a member read, a field);
+    // std's positions share interned types with the package's differently
+    // in two worlds and are left out.
+    for (id, label) in &program.call_signature_labels {
+        if let Some(at) = place(*id) {
+            rows.push(format!("call-label {at} {label}"));
+        }
+    }
+    let package_position = |id: Id| -> Option<String> {
+        let source = lookup.of(id)?;
+        (!program.std_sources.contains(&source)).then_some(())?;
+        place(id)
+    };
+    let definition = |type_id: crate::type_::TypeId| -> String {
+        program
+            .type_definitions
+            .of(type_id)
+            .unwrap_or("-")
+            .replace('\n', "\\n")
+    };
+    for (id, variable) in &program.variables {
+        if let Some(at) = package_position(*id) {
+            rows.push(format!("definition {at} {}", definition(variable.type_id)));
+        }
+    }
+    for (id, parameter) in &program.parameters {
+        if let Some(at) = package_position(*id) {
+            rows.push(format!("definition {at} {}", definition(parameter.type_id)));
+        }
+    }
+    for id in program.member_name_spans.keys() {
+        if let (Some(at), Some(type_id)) = (package_position(*id), program.expr_type_ids.get(id)) {
+            rows.push(format!("definition {at} {}", definition(*type_id)));
+        }
+    }
+    for (id, struct_) in &program.structs {
+        if let Some(at) = package_position(*id) {
+            for (index, field) in struct_.fields.iter().enumerate() {
+                rows.push(format!(
+                    "definition {at} field {index} {}",
+                    definition(field.type_id)
+                ));
+            }
+        }
+    }
+    for row in &program.pattern_labels {
+        rows.push(format!(
+            "pattern {} {:?} {} {} {}",
+            path_of(row.source),
+            row.name_span.into_range(),
+            row.label,
+            row.variant
+                .and_then(|(enum_id, index)| place(enum_id).map(|at| format!("{at}#{index}")))
+                .unwrap_or_else(|| "-".to_string()),
+            row.matched
+        ));
+    }
+    for row in &program.reference_hovers {
+        rows.push(format!(
+            "reference-hover {} {:?} {} | {} | {}",
+            path_of(row.source),
+            row.span.into_range(),
+            row.code.replace('\n', "\\n"),
+            row.declared_by.as_deref().unwrap_or("-"),
+            row.implemented_by.join(", ")
         ));
     }
     rows.sort_unstable();

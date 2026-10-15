@@ -22,6 +22,7 @@ mod dbg_stack;
 mod held_tables;
 mod hint_labels;
 mod hover_labels;
+mod hover_records;
 pub mod id_windows;
 mod item_records;
 mod lazy_tables;
@@ -52687,6 +52688,7 @@ impl<'src> Analyzer<'src> {
         let mut hint_sources: HashSet<SourceId> = HashSet::default();
         let mut held_sources: HashSet<SourceId> = HashSet::default();
         let mut family_sources: [HashSet<SourceId>; row_families::FAMILIES] = Default::default();
+        let mut hover_sources: HashSet<SourceId> = HashSet::default();
         for source in &with_tables {
             if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
                 self.restored_tables.absorb(tables);
@@ -52704,8 +52706,19 @@ impl<'src> Analyzer<'src> {
                         family_sources[family.index()].insert(*source);
                     }
                 }
+                if tables.hover_recorded {
+                    hover_sources.insert(*source);
+                }
             }
         }
+        self.restored_tables.hover_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| hover_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.restored_tables.hover_ranges.sort_unstable();
+        self.restored_tables.hover_sources = hover_sources;
         for family in row_families::RowFamily::ALL {
             *self.restored_tables.family_ranges.of_mut(family) = self
                 .source_ranges
@@ -52760,6 +52773,8 @@ impl<'src> Analyzer<'src> {
             let hint_ranges = std::mem::take(&mut self.restored_tables.hint_ranges);
             let held_ranges = std::mem::take(&mut self.restored_tables.held_ranges);
             let family_ranges = std::mem::take(&mut self.restored_tables.family_ranges);
+            let hover_ranges = std::mem::take(&mut self.restored_tables.hover_ranges);
+            let hover_sources = std::mem::take(&mut self.restored_tables.hover_sources);
             self.restored_tables = RestoredTables {
                 drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
@@ -52767,6 +52782,8 @@ impl<'src> Analyzer<'src> {
                 hint_ranges,
                 held_ranges,
                 family_ranges,
+                hover_ranges,
+                hover_sources,
                 ..RestoredTables::default()
             };
         }
@@ -53203,6 +53220,8 @@ impl<'src> Analyzer<'src> {
             .restored_tables
             .family_ranges
             .merged(self.item_family_ranges());
+        self.restored_tables.hover_ranges =
+            merge(&self.restored_tables.hover_ranges, self.item_hover_ranges());
         // M110 S7b: the complements, over the entity counter's high water —
         // every id this analysis holds lies below it. The Class A lane's
         // plant leaves the served ITEMS' windows live: a pass walking the
@@ -79549,6 +79568,13 @@ struct ModuleTables {
     /// analysis with reading aids computes them); a record written by any
     /// other analysis carries none, and the stages are hinted live.
     hints_recorded: bool,
+    /// M148: the editor's per-file hover rows for this module's regions
+    /// (E206, E237, E240, E241 — `hover_records.rs`), and whether they were
+    /// FILED: only a seeded analysis under the reading aids renders them for
+    /// a module, and a region whose rows name another re-walked window's
+    /// entity files none.
+    hover: hover_records::RecordedHoverRows,
+    hover_recorded: bool,
 }
 
 impl ModuleTables {
@@ -79620,6 +79646,7 @@ impl ModuleTables {
             + self.moves.bytes()
             + self.lazy.bytes()
             + self.hmr.bytes()
+            + self.hover.bytes()
     }
 }
 
@@ -79681,6 +79708,12 @@ struct RestoredTables {
     lazy: lazy_tables::LazyRows,
     hmr: lazy_tables::HmrRows,
     family_ranges: row_families::FamilyRanges,
+    /// M148: the restored hover rows, the entity ranges of the modules and
+    /// items whose record carried them, and the restored MODULES as sources
+    /// (the span-keyed rows' predicate; a served item's is its text region).
+    hover: hover_records::RecordedHoverRows,
+    hover_ranges: Vec<(u32, u32)>,
+    hover_sources: HashSet<SourceId>,
 }
 
 impl Default for RestoredTables {
@@ -79716,6 +79749,9 @@ impl Default for RestoredTables {
             lazy: lazy_tables::LazyRows::default(),
             hmr: lazy_tables::HmrRows::default(),
             family_ranges: row_families::FamilyRanges::default(),
+            hover: hover_records::RecordedHoverRows::default(),
+            hover_ranges: Vec::new(),
+            hover_sources: HashSet::default(),
         }
     }
 }
@@ -79763,6 +79799,9 @@ impl RestoredTables {
         }
         if tables.families.contains(row_families::RowFamily::Hmr) {
             self.hmr.extend(&tables.hmr);
+        }
+        if tables.hover_recorded {
+            self.hover.extend(&tables.hover);
         }
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
@@ -86727,8 +86766,13 @@ fn analyze_over_world<'src>(
     // E313: the files whose hover rows this analysis renders.
     let hover_rows = hover_labels::HoverRows::new(workspace, &sources);
     let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
+    // M148: the hover rows this analysis RENDERS, for the records — only an
+    // analysis whose records carry them (a seeded one under the reading
+    // aids) keeps the copies.
+    let records_hover = !workspace.hot_seeds.is_empty() && workspace.reading_aids;
+    let mut rendered_call_labels: Vec<(Id, String)> = Vec::new();
     for (call_id, substitution) in &analyzer.method_call_substitution {
-        if substitution.is_empty() {
+        if substitution.is_empty() || analyzer.hover_row_restored(*call_id) {
             continue;
         }
         if !analyzer
@@ -86754,8 +86798,15 @@ fn analyze_over_world<'src>(
         if declaration_labels.get(&function_id) == Some(&computed) {
             continue;
         }
+        if records_hover {
+            rendered_call_labels.push((*call_id, computed.clone()));
+            rendered_call_labels.push((subject_id, computed.clone()));
+        }
         call_signature_labels.insert(*call_id, computed.clone());
         call_signature_labels.insert(subject_id, computed);
+    }
+    if !label_rows_planted {
+        call_signature_labels.extend(analyzer.restored_call_labels(&hover_rows));
     }
     for (function_id, external) in &analyzer.external_functions {
         if analyzer.label_row_restored(*function_id) {
@@ -86828,6 +86879,48 @@ fn analyze_over_world<'src>(
     crate::phase_pass_mark("the label tables");
     let (member_owners, member_headers) = analyzer.member_headers();
     crate::phase_pass_mark("analyzer.member_headers()");
+    // E237: the definition under an entry binding's, member's or field's type.
+    // E313: for every file a view can serve, under the editor's reading aids.
+    // M148: a region whose record carried its hover rows is not rendered —
+    // its rows are restored below (the label plant drops them, keeping the
+    // skip).
+    let (mut type_definitions, rendered_definitions) =
+        analyzer.type_definitions(&expr_type_ids, &hover_rows);
+    // E241: a variant pattern's label, rendered once its types have settled.
+    let mut pattern_labels = analyzer.pattern_labels(&hover_rows);
+    // E240: type parameters and traits named in type position.
+    let (mut reference_hovers, recordable_references) = analyzer.reference_hovers(&hover_rows);
+    let rendered_hover = if records_hover {
+        hover_records::RenderedHoverRows {
+            call_labels: rendered_call_labels,
+            definitions: rendered_definitions,
+            blocks: type_definitions.blocks().to_vec(),
+            patterns: pattern_labels.clone(),
+            references: reference_hovers
+                .iter()
+                .zip(&recordable_references)
+                .filter(|(_, recordable)| **recordable)
+                .map(|(row, _)| row.clone())
+                .collect(),
+        }
+    } else {
+        hover_records::RenderedHoverRows::default()
+    };
+    if !label_rows_planted {
+        analyzer.restore_type_definitions(&mut type_definitions, &expr_type_ids, &hover_rows);
+        let (patterns, references) = analyzer.restored_span_rows(&hover_rows);
+        if !crate::macros::in_macro_world() {
+            let restored = &analyzer.restored_tables.hover;
+            let count = (restored.call_labels.len()
+                + restored.definitions.len()
+                + patterns.len()
+                + references.len()) as u64;
+            crate::incremental::update_census(|census| census.hover_rows_restored += count);
+        }
+        pattern_labels.extend(patterns);
+        reference_hovers.extend(references);
+    }
+    crate::phase_pass_mark("the hover rows");
 
     if let Some(key) = &checks_key
         && !entry_is_module
@@ -86985,6 +87078,20 @@ fn analyze_over_world<'src>(
                 .move_rows_live
                 .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M148: the hover rows, per source and per item — the span rows by
+        // their place in the file.
+        let slice_at = |source: SourceId, _: Span| -> Option<u32> {
+            (source.0 != 0 && !skip(source)).then_some(source.0)
+        };
+        rendered_hover.partition_into(&|id| file_of(&analyzer, id), &slice_at, &mut tables);
+        if items_enabled {
+            let item_at = |source: SourceId, span: Span| -> Option<u32> {
+                analyzer
+                    .item_window_filed_at(source, span.start)
+                    .map(|window| window as u32)
+            };
+            rendered_hover.partition_into(&|id| item_of(&analyzer, id), &item_at, &mut item_tables);
+        }
         // M150: the lazy and HMR rows likewise.
         analyzer
             .lazy_rows_live
@@ -87034,6 +87141,7 @@ fn analyze_over_world<'src>(
             slice.hints_recorded = workspace.reading_aids;
             slice.held_recorded = true;
             slice.families = families;
+            slice.hover_recorded = records_hover;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
         // M110 S7: the item records of the re-walked files, with their
@@ -87048,6 +87156,7 @@ fn analyze_over_world<'src>(
                 seeded,
                 workspace.reading_aids,
                 families,
+                records_hover,
             );
             item_records::checked_cache_store_items(
                 key,
@@ -87058,14 +87167,7 @@ fn analyze_over_world<'src>(
         }
     }
 
-    // E237: the definition under an entry binding's, member's or field's type.
-    // E313: for every file a view can serve, under the editor's reading aids.
-    let type_definitions = analyzer.type_definitions(&expr_type_ids, &hover_rows);
     crate::phase_pass_mark("the class D partition and the records");
-    // E241: a variant pattern's label, rendered once its types have settled.
-    let pattern_labels = analyzer.pattern_labels(&hover_rows);
-    // E240: type parameters and traits named in type position.
-    let reference_hovers = analyzer.reference_hovers(&hover_rows);
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();

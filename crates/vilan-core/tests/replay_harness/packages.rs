@@ -134,8 +134,12 @@ pub fn observe(package: &Package, seeds: Vec<PathBuf>, leg: Leg) -> Observation 
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
             let leaked: &'static str = Box::leak(entry_text.into_boxed_str());
+            // The editor's shape (M148): the language server analyzes under
+            // the reading aids, which is what makes every file render — and
+            // record — its hover rows.
             let workspace = Workspace {
                 hot_seeds: seeds,
+                reading_aids: true,
                 ..Workspace::default()
             };
             let analyze = || {
