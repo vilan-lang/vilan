@@ -607,6 +607,146 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E317: the type label of a GENERIC enum's variant named in value
+    /// position, where the reference's own id was tabled none. A bare variant
+    /// reference (`None`, `Option::None`) is typed by the context that wants
+    /// it and records nothing on its own id, so a returned `None` hovered as
+    /// `Option::None` - and `Some` in `Some(1)` likewise, since a call's
+    /// result is tabled only where something asked for it. The reading is the
+    /// type the POSITION settled, as E241 reads a pattern's matched type:
+    ///
+    /// - what the position EXPECTED (`expected_types`: the return slot of a
+    ///   body's tail or a `ret`, a `let` annotation), where it names this very
+    ///   enum at arguments;
+    /// - the type of the BINDING the value initializes (`let some = Some(1)`);
+    /// - the declared parameter of a plain call's argument (`take(None)`), where
+    ///   that type has no open parameter in it.
+    ///
+    /// For a payload variant the label belongs to the CALLEE (`Some` of
+    /// `Some(1)`), read through the call. A label with a hole in it
+    /// (`Unknown`) says nothing and is not tabled. Editor-only: empty without
+    /// the reading aids.
+    pub(super) fn variant_use_labels(
+        &self,
+        rows: &HoverRows,
+        expr_types: &HashMap<Id, String>,
+    ) -> Vec<(Id, String)> {
+        if !rows.every_view {
+            return Vec::new();
+        }
+        // The variant a reference names, where it is a variant of a generic
+        // enum, and which enum that is.
+        let variant_enum = |id: Id| -> Option<Id> {
+            let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&id) else {
+                return None;
+            };
+            let Some(Expr::EnumVariant(enum_id, _)) = self.expr_id_to_expr_map.get(target) else {
+                return None;
+            };
+            self.enums
+                .get(enum_id)
+                .is_some_and(|enum_| !enum_.generic_parameter_constraint_ids.is_empty())
+                .then_some(*enum_id)
+        };
+        let in_scope = |id: Id| -> bool {
+            !self.label_row_restored(id)
+                && self
+                    .source_of_id(id)
+                    .is_some_and(|source| self.renders_hover_rows(source, rows))
+        };
+        let wanted = |id: Id| -> bool { !expr_types.contains_key(&id) && in_scope(id) };
+        let empty = SubstitutionContext::default();
+        // The label of `type_id` where it is an instantiation of `enum_id`.
+        let label_of = |type_id: TypeId, enum_id: Id, ground: bool| -> Option<String> {
+            let Type::Enum(found, arguments) = type_id.borrow_type(self) else {
+                return None;
+            };
+            if *found != enum_id || arguments.is_empty() {
+                return None;
+            }
+            if ground && !self.type_is_ground(type_id) {
+                return None;
+            }
+            let label = self.pretty_print_type(type_id.borrow_type(self), &empty);
+            (!label.contains("Unknown") && !label.contains('?')).then_some(label)
+        };
+        // What a bare variant reference or a variant constructor CALL stands
+        // for: the id the label is keyed by (the reference) and the id the
+        // position's facts are keyed by (the reference, or its call).
+        let mut by_binding: HashMap<Id, TypeId> = HashMap::default();
+        for variable in self.variables.values() {
+            if let Some(initial) = variable.initial
+                && in_scope(initial)
+            {
+                by_binding.insert(initial, variable.type_id);
+            }
+        }
+        let mut by_parameter: HashMap<Id, TypeId> = HashMap::default();
+        for call in self.function_calls.values() {
+            if call.argument_ids.is_empty()
+                || variant_enum(call.subject_id).is_some()
+                || !in_scope(call.id)
+            {
+                continue;
+            }
+            let Some(function) = self
+                .signature_site_callee(call.subject_id)
+                .and_then(|function_id| self.functions.get(&function_id))
+            else {
+                continue;
+            };
+            if function.parameters.len() != call.argument_ids.len() {
+                continue;
+            }
+            for (argument_id, parameter_id) in call.argument_ids.iter().zip(&function.parameters) {
+                if let Some(parameter) = self.parameters.get(parameter_id) {
+                    by_parameter.insert(*argument_id, parameter.type_id);
+                }
+            }
+        }
+        let mut labels: HashMap<Id, String> = HashMap::default();
+        let mut consider = |reference: Id, enum_id: Id, position: Id| {
+            if labels.contains_key(&reference) || !wanted(reference) {
+                return;
+            }
+            let label = self
+                .expected_types
+                .get(&position)
+                .and_then(|expected| label_of(*expected, enum_id, false))
+                .or_else(|| {
+                    by_binding
+                        .get(&position)
+                        .and_then(|bound| label_of(*bound, enum_id, false))
+                })
+                .or_else(|| {
+                    by_parameter
+                        .get(&position)
+                        .and_then(|declared| label_of(*declared, enum_id, true))
+                });
+            if let Some(label) = label {
+                labels.insert(reference, label);
+            }
+        };
+        // A variant constructor call: the label belongs to the callee.
+        for (call_id, call) in &self.function_calls {
+            if let Some(enum_id) = variant_enum(call.subject_id) {
+                consider(call.subject_id, enum_id, *call_id);
+            }
+        }
+        // A bare variant reference.
+        for id in self
+            .expected_types
+            .keys()
+            .chain(by_binding.keys())
+            .chain(by_parameter.keys())
+        {
+            if let Some(enum_id) = variant_enum(*id) {
+                consider(*id, enum_id, *id);
+            }
+        }
+        labels.into_iter().collect()
+    }
+
     /// E316: the BOUND an implicit generic parameter stands for, where a
     /// signature label should print it instead of the binder. An implicit
     /// generic (`username: Signal<str>`, B186) has no name the reader wrote -

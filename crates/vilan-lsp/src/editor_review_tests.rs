@@ -1329,11 +1329,11 @@ fn e306_a_variant_in_value_position_hovers_with_its_enum() {
         );
         assert!(circle.contains("enum Shape {"), "{circle}");
         let none = hover("None\n}", 0);
-        // A generic enum's variant: its instantiation where the value's type
-        // was tabled, the bare enum where not (a returned `None`), and the
+        // A generic enum's variant: its instantiation where the position
+        // settled one (E317: a returned `None` reads the return slot), and the
         // enum's chunk either way.
         assert!(
-            none.starts_with("```vilan\nOption") && none.contains("::None\n```"),
+            none.starts_with("```vilan\nOption<i32>::None\n```"),
             "{none}"
         );
         assert!(none.contains("enum Option<T> {"), "{none}");
@@ -1880,5 +1880,45 @@ fn e316_an_implicit_parameter_prints_its_trait_arguments() {
             explicit.contains("fun explicit<S: Shows<str>>(value: S, other: Shows<i32>): str"),
             "{explicit}"
         );
+    });
+}
+
+/// E317: a generic enum's variant in value position whose own type was not
+/// tabled reads the EXPECTED type - the return slot, the binding's annotation,
+/// an argument's parameter - as a pattern reads the matched type (E241): a
+/// returned `None` hovers `Option<i32>::None`, as `Some(1)` and a bound
+/// `None` do.
+#[test]
+fn e317_a_returned_variant_hovers_with_the_expected_instantiation() {
+    on_big_stack(|| {
+        let client = "fun nothing(): Option<i32> {\n\tNone\n}\n\n\
+             fun early(flag: bool): Option<str> {\n\tif flag {\n\t\tret None;\n\t}\n\tSome(\"x\")\n}\n\n\
+             fun wrapped(): Result<i32, str> {\n\tOk(1)\n}\n\n\
+             fun failed(): Result<i32, str> {\n\tErr(\"no\")\n}\n\n\
+             fun take(value: Option<f64>): i32 {\n\tmatch value {\n\t\tSome(_) => 1,\n\t\tNone => 0,\n\t}\n}\n\n\
+             fun main() {\n\tlet bound: Option<i32> = None;\n\tlet some = Some(1);\n\
+             \tlet _ = (bound, some, nothing(), early(true), wrapped(), failed());\n\
+             \tlet _ = take(None);\n}\n";
+        let package = Package::new("e317", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let first_line = |needle: &str| {
+            let hover = document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover.lines().nth(1).unwrap_or_default().to_string()
+        };
+        assert_eq!(first_line("None\n}"), "Option<i32>::None");
+        assert_eq!(first_line("None;\n\t}\n\tSome"), "Option<str>::None");
+        assert_eq!(first_line("Some(\"x\")"), "Option<str>::Some");
+        assert_eq!(first_line("None;\n\tlet some"), "Option<i32>::None");
+        assert_eq!(first_line("Some(1);"), "Option<i32>::Some");
+        assert_eq!(first_line("None);\n}"), "Option<f64>::None");
+        assert_eq!(first_line("Ok(1)"), "Result<i32, str>::Ok");
+        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err");
     });
 }

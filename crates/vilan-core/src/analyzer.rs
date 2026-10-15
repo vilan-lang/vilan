@@ -86585,6 +86585,11 @@ fn analyze_over_world<'src>(
                 .map(|(id, label)| (*id, label.clone())),
         );
     }
+    // E317: a generic enum's variant in value position reads the instantiation
+    // its position wanted (editor-only; empty without the reading aids).
+    for (id, label) in analyzer.variant_use_labels(&hover_rows, &expr_types) {
+        expr_types.insert(id, label);
+    }
     // E238: the block each member is declared in, and each block's header.
     crate::phase_pass_mark("the label tables");
     let (member_owners, member_headers) = analyzer.member_headers();
