@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**E315: a type in the MIDDLE of a module-qualified path paints and hovers - `Length` in `style::Length::px(4)` and `Overflow` in `style::Overflow::Hidden` (kolt `views.vl:218`, every `style::Length::rem(..)` there) carried no semantic token and no hover, while `Theme` in `Theme::stroke1()` painted Struct.** The path resolution recorded a type-reference row for a type that HEADS a path and for none reached through a module first. The drain of the written `a::B` paths (`prepped_type_static_accessors` in `analyzer.rs`'s type resolution) now records the member segment's (source, span, definition) row beside the type slot it writes - a struct, enum or trait paints Struct or Enum (the token follows the definition), and a module in the middle of a longer path (`deep` in `lib::deep::Overlay::fresh()`) paints Namespace - and the same drain serves a TYPE annotation (`x: style::Length`), which had no row for its last segment either: find-references from any spelling of `Length` now reaches the others, and rename edits exactly the identifier. The segment's hover is the type's declaration. Pins: `editor_review_tests::e315_a_type_in_the_middle_of_a_module_path_paints_and_hovers` (`style::Length::px(4)`, `style::Overflow::Hidden`, a three-module path through a re-exported module, a head type unchanged, the declarations on hover) and `e315_a_middle_segment_is_a_reference_of_its_type` (an annotation's tokens, find-references from the middle segment). Tracker E315.
+
 ## v0.50.0 — 2026-10-13
 
 <!-- family: miscompile -->

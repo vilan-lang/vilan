@@ -1691,3 +1691,146 @@ fn e313_a_cold_view_keeps_its_rows_on_a_served_keystroke() {
         );
     });
 }
+
+/// E315: a TYPE in the MIDDLE of a module-qualified value path — `Length` in
+/// `style::Length::px(4)`, `Overflow` in `style::Overflow::Hidden` (kolt
+/// `views.vl:218`), `Overlay` in a three-module `lib::deep::Overlay::fresh()`
+/// — records the type-reference row a head (`Theme::stroke1()`) records: the
+/// segment paints Struct / Enum and hovers with the declaration.
+#[test]
+fn e315_a_type_in_the_middle_of_a_module_path_paints_and_hovers() {
+    on_big_stack(|| {
+        let client = "import std::web::style::Style;\n\
+             import pkg::lib;\n\n\
+             struct Theme {}\n\nimpl Theme {\n\tfun width(): i32 {\n\t\t4\n\t}\n}\n\n\
+             fun main() {\n\
+             \tlet a = style::Length::px(4);\n\
+             \tlet b = style::Overflow::Hidden;\n\
+             \tlet c = lib::deep::Overlay::fresh();\n\
+             \tlet d = lib::deep::Mode::On;\n\
+                          \tlet e = Theme::width();\n\
+             \tlet _ = (a, b, c, d, e);\n}\n";
+        let deep = "/// An overlay.\nexport struct Overlay {\n\topen: bool,\n}\n\n\
+             export impl Overlay {\n\tfun fresh(): Overlay {\n\t\tOverlay { open = false }\n\t}\n}\n\n\
+             /// How it shows.\nexport enum Mode {\n\tOn,\n\tOff,\n}\n";
+        let package = Package::new("e315", &[("client.vl", client)]);
+        std::fs::create_dir_all(package.path("inner")).unwrap();
+        std::fs::write(package.path("inner/deep.vl"), deep).unwrap();
+        std::fs::write(package.path("lib.vl"), "export import pkg::inner::deep;\n").unwrap();
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let pair = |word: &str, kind: &str| (word.to_string(), kind.to_string());
+        assert_eq!(
+            tokens_over(&document, "style::Length::px(4)"),
+            vec![
+                pair("style", "Namespace"),
+                pair("Length", "Struct"),
+                pair("px", "Function")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "style::Overflow::Hidden"),
+            vec![
+                pair("style", "Namespace"),
+                pair("Overflow", "Enum"),
+                pair("Hidden", "EnumMember")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "lib::deep::Overlay::fresh()"),
+            vec![
+                pair("lib", "Namespace"),
+                pair("deep", "Namespace"),
+                pair("Overlay", "Struct"),
+                pair("fresh", "Function")
+            ]
+        );
+        assert_eq!(
+            tokens_over(&document, "lib::deep::Mode::On"),
+            vec![
+                pair("lib", "Namespace"),
+                pair("deep", "Namespace"),
+                pair("Mode", "Enum"),
+                pair("On", "EnumMember")
+            ]
+        );
+        // A head type, as before.
+        assert_eq!(
+            tokens_over(&document, "Theme::width()"),
+            vec![pair("Theme", "Struct"), pair("width", "Function")]
+        );
+        // The segment's hover is the declaration.
+        let hover = |needle: &str| {
+            document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        let length = hover("Length::px");
+        assert!(length.contains("struct Length"), "{length}");
+        let overflow = hover("Overflow::Hidden");
+        assert!(overflow.contains("enum Overflow {"), "{overflow}");
+        let overlay = hover("Overlay::fresh");
+        assert!(overlay.contains("struct Overlay {"), "{overlay}");
+        assert!(overlay.contains("An overlay."), "{overlay}");
+        let mode = hover("Mode::On");
+        assert!(mode.contains("enum Mode {"), "{mode}");
+        // The leaf keeps its own answer.
+        assert!(hover("px(4)").contains("fun px("), "{}", hover("px(4)"));
+        assert!(
+            hover("Hidden;").contains("Overflow::Hidden"),
+            "{}",
+            hover("Hidden;")
+        );
+    });
+}
+
+/// E315's neighbours: the same segment in a TYPE annotation
+/// (`x: style::Length`) paints too, and find-references from the segment
+/// reaches every spelling of the type — the head, the middle of a value path
+/// and an annotation — with rename editing exactly the identifier.
+#[test]
+fn e315_a_middle_segment_is_a_reference_of_its_type() {
+    on_big_stack(|| {
+        let client = "import std::web::style::Style;\n\n\
+             struct Theme {}\n\nimpl Theme {\n\tfun width(): i32 {\n\t\t4\n\t}\n}\n\n\
+             fun measured(x: style::Length): style::Length {\n\tx\n}\n\n\
+             fun main() {\n\
+             \tlet a = style::Length::px(4);\n\
+             \tlet b = Theme::width();\n\
+             \tlet _ = (measured(a), b);\n}\n";
+        let package = Package::new("e315b", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let pair = |word: &str, kind: &str| (word.to_string(), kind.to_string());
+        assert_eq!(
+            tokens_over(&document, "fun measured(x: style::Length): style::Length"),
+            vec![
+                pair("measured", "Function"),
+                pair("x", "Parameter"),
+                pair("style", "Namespace"),
+                pair("Length", "Struct"),
+                pair("style", "Namespace"),
+                pair("Length", "Struct"),
+            ]
+        );
+        // Find-references from the middle segment of the value path: the
+        // two annotations and the path itself, each exactly `Length`.
+        let text = document.analyzed_text().to_string();
+        let found: Vec<String> = document
+            .references(at(client, "Length::px", 0))
+            .into_iter()
+            .filter(|(source, _)| *source == document.focus)
+            .map(|(_, span)| text[span.into_range()].to_string())
+            .collect();
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.iter().all(|word| word == "Length"), "{found:?}");
+    });
+}
