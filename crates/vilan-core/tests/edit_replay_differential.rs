@@ -1261,8 +1261,16 @@ fn the_differential_sees_a_bound_audit_served_without_its_record() {
     assert!(
         divergences
             .iter()
-            .any(|divergence| divergence.contains("bound refusal")),
+            .any(|divergence| divergence.contains("module's bound refusal")),
         "the unrecorded-audit plant must turn the bound package red; it found: {divergences:#?}"
+    );
+    // M150: the written applications' refusals ride the same record.
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("written-bound refusal")),
+        "the unrecorded-audit plant must turn the written-bound package red; it found: \
+         {divergences:#?}"
     );
 }
 
@@ -1282,8 +1290,16 @@ fn the_differential_sees_a_bound_record_kept_over_a_moved_impl() {
     assert!(
         divergences
             .iter()
-            .any(|divergence| divergence.contains("bound is satisfied through, moved")),
+            .any(|divergence| divergence.contains("module's bound is satisfied through, moved")),
         "the unguarded-record plant must turn the moved-impl edit red; it found: {divergences:#?}"
+    );
+    // M150: and at a written application, under the same guard.
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("written bound is satisfied through, moved")),
+        "the unguarded-record plant must turn the written moved-impl edit red; it found: \
+         {divergences:#?}"
     );
 }
 

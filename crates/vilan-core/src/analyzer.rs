@@ -24,6 +24,7 @@ mod hint_labels;
 mod hover_labels;
 pub mod id_windows;
 mod item_records;
+mod lazy_tables;
 mod live_ranges;
 mod liveness;
 mod move_tables;
@@ -4310,6 +4311,12 @@ pub struct Analyzer<'src> {
     move_rows_live: move_tables::MoveRows,
     move_rows_filed: bool,
     move_sets: Option<move_tables::MoveSets>,
+    /// M150: the live lane's lazy-argument and HMR-site contributions
+    /// (`lazy_tables.rs`), and whether each pass derived them.
+    lazy_rows_live: lazy_tables::LazyRows,
+    lazy_rows_filed: bool,
+    hmr_rows_live: lazy_tables::HmrRows,
+    hmr_rows_filed: bool,
     /// B470: every resource erased into a `dyn` at a coercion site, as
     /// `(site, the value's type, the object type)`, for the post-build
     /// question of whether it may be.
@@ -4698,6 +4705,11 @@ pub struct Analyzer<'src> {
     /// THIS analysis (call, the callee's constraint, the trait), taken into
     /// the module's record by `take_reuse_record`.
     bound_questions_derived: HashMap<u32, Vec<(Id, TypeId, Id)>>,
+    /// M150: the written applications' questions, filed the same way.
+    written_bound_questions_derived: HashMap<u32, Vec<(TypeId, Id)>>,
+    /// M150: the reused sources whose audit re-runs (`bound_recompute_ranges`'
+    /// sources) — the written applications' sites are keyed by source.
+    bound_recompute_sources: HashSet<SourceId>,
     /// M110 S2a: the id ranges of reused sources whose audit must RE-RUN this
     /// analysis — a late impl answers one of their recorded questions, or
     /// their record carries no audit. Sorted, disjoint.
@@ -4773,7 +4785,7 @@ pub struct Analyzer<'src> {
     // M110 S7b: the held table passes' lane — the complement of the modules'
     // and items' ranges whose record carried held rows (`held_tables.rs`).
     live_held: live_ranges::LiveRanges,
-    // M149: the conditionally-filed row families' lanes — per family,
+    // M149/M150: the conditionally-filed row families' lanes — per family,
     // the complement of the ranges whose record carried its rows
     // (`row_families.rs`).
     live_families: row_families::FamilyLanes,
@@ -7891,6 +7903,10 @@ impl<'src> Analyzer<'src> {
             move_rows_live: move_tables::MoveRows::default(),
             move_rows_filed: false,
             move_sets: None,
+            lazy_rows_live: lazy_tables::LazyRows::default(),
+            lazy_rows_filed: false,
+            hmr_rows_live: lazy_tables::HmrRows::default(),
+            hmr_rows_filed: false,
             resource_erasures: Vec::new(),
             variant_coercions: HashMap::default(),
             nested_annotation_owners: HashMap::default(),
@@ -7961,6 +7977,8 @@ impl<'src> Analyzer<'src> {
             bound_provider_memo: None,
             bound_proof_cut_floor: usize::MAX,
             bound_questions_derived: HashMap::default(),
+            written_bound_questions_derived: HashMap::default(),
+            bound_recompute_sources: HashSet::default(),
             bound_recompute_ranges: Vec::new(),
             prefix_impl_count: None,
             prefix_entity_end: None,
@@ -10322,9 +10340,24 @@ impl<'src> Analyzer<'src> {
     /// one report per written spelling (B188) — and neither does a path head,
     /// which applies nothing.
     fn check_written_nominal_bounds(&mut self) {
+        // M150: M143's MODULE lane, the bound audit's — a site of a frozen
+        // (std) source has no refusal to find, and a REUSED module's sites
+        // were judged with its record: their refusals ride the audit's
+        // (`bound_diagnostics`, filed by `record_bound_window` below) and
+        // replay under the same guard, the module's questions here being
+        // `(written argument, required trait)` (`written_bound_questions`) —
+        // re-audited when a late impl answers one. A re-walked file's sites
+        // stay live, as the audit's do.
+        let diagnostics_before = self.diagnostics.len();
         for (owner_id, written_arguments, span, source_id, type_id, generics_exempt) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
+            if self.frozen_sources.contains(&source_id)
+                || (self.reused_sources.binary_search(&source_id).is_ok()
+                    && !self.bound_recompute_sources.contains(&source_id))
+            {
+                continue;
+            }
             // M134: the site's own slot is the anchor (the owner is declared
             // elsewhere); a written type that lives in no window stays unanchored.
             self.id_windows.set_check_anchor_type(type_id);
@@ -10393,6 +10426,12 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
                 for (required_trait_id, required_arguments) in &bound_traits {
+                    if source_id != SourceId(0) && source_id != DERIVED_SOURCE {
+                        self.written_bound_questions_derived
+                            .entry(source_id.0)
+                            .or_default()
+                            .push((*argument_type_id, *required_trait_id));
+                    }
                     let required_arguments: Vec<TypeId> = required_arguments
                         .iter()
                         .map(|argument| {
@@ -10457,6 +10496,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        self.record_bound_window(diagnostics_before);
     }
 
     /// The ways a grounded value violates a tuple bound (`T: (2..: Display)`)
@@ -14614,34 +14654,21 @@ impl<'src> Analyzer<'src> {
     /// reactive cell is rejected. Inert unless `std::web::dev` is loaded (the ids are
     /// `None`), so a program that never touches HMR pays nothing.
     fn check_hmr_transfer_bounds(&mut self) {
+        self.hmr_rows_live = lazy_tables::HmrRows::default();
+        self.hmr_rows_filed = false;
         if self.hmr_stash_fn_id.is_none() && self.hmr_take_fn_id.is_none() {
             return;
         }
-        // Collected read-only; the `&mut self` inference/classification runs
-        // after, as in `check_resource_any_coercion`. A `stash` site carries the
-        // value argument (whose type IS `T`); a `take` site carries the call
-        // (whose resolved type is `Option<T>`).
-        let mut stash_value_ids: Vec<Id> = Vec::new();
-        let mut take_call_ids: HashSet<Id> = HashSet::default();
-        for expr in self.expr_id_to_expr_map.values() {
-            let Expr::Call(call_id) = expr else {
-                continue;
-            };
-            let Some(function_call) = self.function_calls.get(call_id) else {
-                continue;
-            };
-            let callee_id = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
-                Some(Expr::Local(callee_id)) => *callee_id,
-                _ => continue,
-            };
-            if Some(callee_id) == self.hmr_stash_fn_id {
-                if let Some(value_id) = function_call.argument_ids.get(1).copied() {
-                    stash_value_ids.push(value_id);
-                }
-            } else if Some(callee_id) == self.hmr_take_fn_id {
-                take_call_ids.insert(*call_id);
-            }
-        }
+        // M150: the sites are rows (`lazy_tables.rs`) — the restored regions'
+        // and the live lane's — and every site's inference below runs on
+        // every analysis, so nothing minted here is ever served.
+        let live = self.live_hmr_rows();
+        let mut stash_value_ids: Vec<Id> = self.restored_tables.hmr.stash_values.clone();
+        stash_value_ids.extend(live.stash_values.iter().copied());
+        let mut take_bindings: Vec<Id> = self.restored_tables.hmr.take_bindings.clone();
+        take_bindings.extend(live.take_bindings.iter().copied());
+        self.hmr_rows_live = live;
+        self.hmr_rows_filed = true;
         // A `stash` value's type is self-determined (a literal, constructor, or
         // place), so re-inferring it against no expectation yields `T` directly —
         // the generic argument isn't recorded on the call when it was inferred,
@@ -14663,35 +14690,33 @@ impl<'src> Analyzer<'src> {
         // no stored result type, and an unconstrained `T` (a `take` whose element
         // never resolves concretely) stays generic and is left alone, so a good
         // `take` never false-rejects.
-        if !take_call_ids.is_empty() {
-            let mut take_sites: Vec<(Id, TypeId)> = Vec::new();
-            for variable in self.variables.values() {
-                let Some(initial) = variable.initial else {
-                    continue;
-                };
-                if !take_call_ids.contains(&initial) {
-                    continue;
+        let mut take_sites: Vec<(Id, TypeId)> = Vec::new();
+        for binding_id in take_bindings {
+            let Some(variable) = self.variables.get(&binding_id) else {
+                continue;
+            };
+            let Some(initial) = variable.initial else {
+                continue;
+            };
+            let element = match variable.type_id.get_type(self) {
+                Type::Enum(id, arguments)
+                    if Some(id) == self.option_enum_id && arguments.len() == 1 =>
+                {
+                    arguments[0]
                 }
-                let element = match variable.type_id.get_type(self) {
-                    Type::Enum(id, arguments)
-                        if Some(id) == self.option_enum_id && arguments.len() == 1 =>
-                    {
-                        arguments[0]
-                    }
-                    _ => continue,
-                };
-                if matches!(
-                    element.get_type(self),
-                    Type::Unresolved | Type::Unknown | Type::Generic(_)
-                ) {
-                    continue;
-                }
-                take_sites.push((initial, element));
+                _ => continue,
+            };
+            if matches!(
+                element.get_type(self),
+                Type::Unresolved | Type::Unknown | Type::Generic(_)
+            ) {
+                continue;
             }
-            for (call_id, element) in take_sites {
-                if !self.transferable_as_value(element) {
-                    self.report_hmr_transfer(call_id, element);
-                }
+            take_sites.push((initial, element));
+        }
+        for (call_id, element) in take_sites {
+            if !self.transferable_as_value(element) {
+                self.report_hmr_transfer(call_id, element);
             }
         }
     }
@@ -32250,41 +32275,26 @@ impl<'src> Analyzer<'src> {
     /// tables are the lowering's input, not a diagnostic, and a module whose
     /// checks are replayed still has to emit.
     fn record_lazy_arguments(&mut self) {
+        self.lazy_rows_live = lazy_tables::LazyRows::default();
+        self.lazy_rows_filed = false;
         // Every program that writes no `lazy` parameter pays one set lookup.
         if self.lazy_cells.is_empty() {
             return;
         }
-        let calls: Vec<(Id, Vec<Id>)> = self
-            .function_calls
-            .values()
-            .map(|call| (call.subject_id, call.argument_ids.clone()))
-            .collect();
         // M81's first pass: every (lazy parameter, argument) pair this program
         // actually resolved, banked before anything is recorded, because the
         // elision below is a fact about the PARAMETER and the arguments decide
-        // it together.
-        let mut lazy_pairs: Vec<(Id, Id, &'src str)> = Vec::new();
-        for (subject_id, argument_ids) in calls {
-            let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
-                continue;
-            };
-            let Some(parameter_ids) = self
-                .functions
-                .get(callee_id)
-                .map(|function| function.parameters.clone())
-            else {
-                continue;
-            };
-            for (parameter_id, argument_id) in parameter_ids.iter().zip(argument_ids.iter()) {
-                let Some(parameter) = self.parameters.get(parameter_id) else {
-                    continue;
-                };
-                if !parameter.lazy {
-                    continue;
-                }
-                lazy_pairs.push((*parameter_id, *argument_id, parameter.name));
-            }
-        }
+        // it together. M150: the pairs are rows (`lazy_tables.rs`) — the
+        // restored regions' and the live lane's, in the calls' recorded order
+        // — and the decisions below are taken over every one of them.
+        let live = self.live_lazy_rows();
+        let (pairs, lazy_parameters) = self.fold_lazy(&live);
+        self.lazy_rows_live = live;
+        self.lazy_rows_filed = true;
+        let lazy_pairs: Vec<(Id, Id, &'src str)> = pairs
+            .iter()
+            .map(|(parameter_id, argument_id, name, _)| (*parameter_id, *argument_id, *name))
+            .collect();
         // M81 — **a lazy parameter every call site fills INERTLY is eager in
         // this program.** 111 of A103's 114 `__lazy` emissions carried a
         // literal, an enum constant or `[]`, and each one allocated a memo
@@ -32314,12 +32324,7 @@ impl<'src> Analyzer<'src> {
         // `inner` stays a plain pass-through instead of re-wrapping the value
         // in a cell the way a per-pair decision would. Each round only ever
         // removes, so it terminates in at most one round per parameter.
-        let mut eager_parameters: HashSet<Id> = self
-            .parameters
-            .values()
-            .filter(|parameter| parameter.lazy)
-            .map(|parameter| parameter.id)
-            .collect();
+        let mut eager_parameters: HashSet<Id> = lazy_parameters;
         // B362 (RULED) — **a trait's declaration and every impl of it are ONE
         // convention**, so they are eager together or lazy together.
         //
@@ -32384,20 +32389,12 @@ impl<'src> Analyzer<'src> {
             }
         }
         self.lazy_eager_parameters = eager_parameters;
-        // The effects half, in a second loop so the borrow of `self` the walk
-        // takes does not fight the insert above.
-        let thunks: Vec<Id> = self.lazy_argument_thunks.keys().copied().collect();
-        for argument_id in thunks {
-            let mut effects = ThunkEffects::default();
-            self.scan_capture_body(
-                argument_id,
-                &HashSet::default(),
-                &mut HashSet::default(),
-                &mut Vec::new(),
-                &mut HashSet::default(),
-                &mut effects,
-            );
-            self.lazy_thunk_effects.insert(argument_id, effects);
+        // The effects half: each thunk's, read off its pair (M150: a row the
+        // argument's region contributed), in the thunks' order.
+        for (_, argument_id, _, effects) in pairs {
+            if self.lazy_argument_thunks.contains_key(&argument_id) {
+                self.lazy_thunk_effects.insert(argument_id, effects);
+            }
         }
     }
 
@@ -53235,7 +53232,7 @@ impl<'src> Analyzer<'src> {
         self.live_module = live_ranges::LiveRanges::complement(&module_reused, high);
         self.live_held =
             live_ranges::LiveRanges::complement(&self.restored_tables.held_ranges, high);
-        // M149: the conditional families' lanes. The Class A plant
+        // M149/M150: the conditional families' lanes. The Class A plant
         // leaves the served windows live here too — a family's sets are
         // unions, so walking a served window beside its restored rows
         // changes no answer (the stale-table plant is what proves the rows
@@ -53487,14 +53484,60 @@ impl<'src> Analyzer<'src> {
     /// resolve's questions; the audit's are asked after the store, which is
     /// why they need their own.
     fn late_impl_answers(&self, questions: &[(Id, TypeId, Id)]) -> bool {
-        if crate::incremental::planted(crate::incremental::Plant::BoundRecordUnguarded) {
+        if questions.is_empty() {
             return false;
         }
-        let Some(floor) = self.prefix_impl_count else {
+        let Some(late) = self.late_impls() else {
             return false;
         };
-        if floor >= self.implementations.len() || questions.is_empty() {
+        questions.iter().any(|(call_id, constraint_id, trait_id)| {
+            let Some(value_type_id) = self
+                .method_call_substitution
+                .get(call_id)
+                .and_then(|substitution| substitution.get(constraint_id))
+            else {
+                // A site the stored world no longer records: nothing to
+                // compare, so the module is re-audited.
+                return true;
+            };
+            self.late_impl_admits(&late, *value_type_id, *trait_id)
+        })
+    }
+
+    /// M150: [`Self::late_impl_answers`] for the written applications'
+    /// questions, whose value is the written argument itself.
+    fn late_impl_answers_written(&self, questions: &[(TypeId, Id)]) -> bool {
+        if questions.is_empty() {
             return false;
+        }
+        let Some(late) = self.late_impls() else {
+            return false;
+        };
+        questions
+            .iter()
+            .any(|(argument, trait_id)| self.late_impl_admits(&late, *argument, *trait_id))
+    }
+
+    /// Whether one of the `late` impls provides `trait_id` (or a trait whose
+    /// supertraits reach it) with a subject admitting `value`.
+    fn late_impl_admits(&self, late: &[(Type, Vec<Id>)], value: TypeId, trait_id: Id) -> bool {
+        let value_type = value.get_type(self);
+        late.iter().any(|(subject, traits)| {
+            traits.contains(&trait_id)
+                && self.impl_subject_admits(&value_type, subject, &HashMap::default())
+        })
+    }
+
+    /// The impls past the stored world's floor, each with the traits it
+    /// provides (supertraits included) — `None` when there are none, or under
+    /// the plant that leaves the guard off.
+    fn late_impls(&self) -> Option<Vec<(Type, Vec<Id>)>> {
+        if crate::incremental::planted(crate::incremental::Plant::BoundRecordUnguarded) {
+            return None;
+        }
+        let floor = self.prefix_impl_count?;
+        if floor >= self.implementations.len() {
+            return None;
         }
         let late: Vec<(Type, Vec<Id>)> = self.implementations[floor..]
             .iter()
@@ -53514,22 +53557,7 @@ impl<'src> Analyzer<'src> {
                 (implementation.subject.get_type(self), traits)
             })
             .collect();
-        questions.iter().any(|(call_id, constraint_id, trait_id)| {
-            let Some(value_type_id) = self
-                .method_call_substitution
-                .get(call_id)
-                .and_then(|substitution| substitution.get(constraint_id))
-            else {
-                // A site the stored world no longer records: nothing to
-                // compare, so the module is re-audited.
-                return true;
-            };
-            let value_type = value_type_id.get_type(self);
-            late.iter().any(|(subject, traits)| {
-                traits.contains(trait_id)
-                    && self.impl_subject_admits(&value_type, subject, &HashMap::default())
-            })
-        })
+        Some(late)
     }
 
     /// Whether a module's diagnostic points at the ENTRY — a `Note.source` or
@@ -53610,13 +53638,19 @@ impl<'src> Analyzer<'src> {
         // M110 S2a: the audit's questions, and whether its verdicts may be
         // replayed at all — not when a late impl answered one of them now
         // (the plant records the questions and drops the refusals).
-        let questions = std::mem::take(&mut self.bound_questions_derived);
+        let mut questions = std::mem::take(&mut self.bound_questions_derived);
+        let mut written = std::mem::take(&mut self.written_bound_questions_derived);
         let unrecorded_plant =
             crate::incremental::planted(crate::incremental::Plant::BoundAuditUnrecorded);
-        for (source, asked) in questions {
-            let answered = self.late_impl_answers(&asked);
+        let asking: HashSet<u32> = questions.keys().chain(written.keys()).copied().collect();
+        for source in asking {
+            let asked = questions.remove(&source).unwrap_or_default();
+            let asked_written = written.remove(&source).unwrap_or_default();
+            let answered =
+                self.late_impl_answers(&asked) || self.late_impl_answers_written(&asked_written);
             let module = derived.entry(source).or_default();
             module.bound_questions = asked;
+            module.written_bound_questions = asked_written;
             module.bound_recordable = !answered;
             if unrecorded_plant {
                 module.bound_diagnostics.clear();
@@ -53625,7 +53659,10 @@ impl<'src> Analyzer<'src> {
         // A module that asked nothing recorded no questions above: its
         // (empty) audit is replayable.
         for module in derived.values_mut() {
-            if module.bound_questions.is_empty() && module.bound_diagnostics.is_empty() {
+            if module.bound_questions.is_empty()
+                && module.written_bound_questions.is_empty()
+                && module.bound_diagnostics.is_empty()
+            {
                 module.bound_recordable = true;
             }
         }
@@ -53670,13 +53707,17 @@ impl<'src> Analyzer<'src> {
     fn replay_world_diagnostics(&mut self, records: &HashMap<u32, ModuleDiagnostics>) {
         let reused = self.reused_sources.clone();
         self.bound_recompute_ranges.clear();
+        self.bound_recompute_sources.clear();
         for source in reused {
             let Some(record) = records.get(&source.0) else {
                 continue;
             };
             // M110 S2a: the audit's refusals, replayed only while their
             // condition holds; otherwise the module's sites are re-audited.
-            if record.bound_recordable && !self.late_impl_answers(&record.bound_questions) {
+            if record.bound_recordable
+                && !self.late_impl_answers(&record.bound_questions)
+                && !self.late_impl_answers_written(&record.written_bound_questions)
+            {
                 let from = self.diagnostics.len();
                 self.diagnostics
                     .extend(record.bound_diagnostics.iter().cloned());
@@ -53689,6 +53730,7 @@ impl<'src> Analyzer<'src> {
                     .map(|range| (range.start, range.end))
                     .collect();
                 self.bound_recompute_ranges.extend(ranges);
+                self.bound_recompute_sources.insert(source);
             }
             let from = self.diagnostics.len();
             self.diagnostics.extend(record.diagnostics.iter().cloned());
@@ -79389,6 +79431,12 @@ struct ModuleDiagnostics {
     /// when no analysis has recorded the audit for this module yet.
     bound_diagnostics: Vec<crate::error::Error>,
     bound_questions: Vec<(Id, TypeId, Id)>,
+    /// M150: the WRITTEN applications' questions (`check_written_nominal_
+    /// bounds`, B251's twin of the audit) — `(argument type, required trait)`,
+    /// prefix slots identical on every hit. Their refusals ride
+    /// `bound_diagnostics` and replay under the same condition: no late impl
+    /// answers a question of either kind.
+    written_bound_questions: Vec<(TypeId, Id)>,
     bound_recordable: bool,
 }
 
@@ -79444,6 +79492,10 @@ struct ModuleTables {
     /// (`move_tables.rs`), filed only by an analysis that derived them —
     /// [`Self::families`] says which conditional families a slice carries.
     moves: move_tables::MoveRows,
+    /// M150: the module's lazy-argument candidates and HMR transfer sites
+    /// (`lazy_tables.rs`), filed only by an analysis that ran those passes.
+    lazy: lazy_tables::LazyRows,
+    hmr: lazy_tables::HmrRows,
     families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
@@ -79566,6 +79618,8 @@ impl ModuleTables {
             + hints
             + self.held.bytes()
             + self.moves.bytes()
+            + self.lazy.bytes()
+            + self.hmr.bytes()
     }
 }
 
@@ -79624,6 +79678,8 @@ struct RestoredTables {
     /// M149: the restored move rows, and per conditional family the ranges
     /// of the modules and items whose record carried it.
     moves: move_tables::MoveRows,
+    lazy: lazy_tables::LazyRows,
+    hmr: lazy_tables::HmrRows,
     family_ranges: row_families::FamilyRanges,
 }
 
@@ -79657,6 +79713,8 @@ impl Default for RestoredTables {
             held: held_tables::HeldRows::default(),
             held_ranges: Vec::new(),
             moves: move_tables::MoveRows::default(),
+            lazy: lazy_tables::LazyRows::default(),
+            hmr: lazy_tables::HmrRows::default(),
             family_ranges: row_families::FamilyRanges::default(),
         }
     }
@@ -79699,6 +79757,12 @@ impl RestoredTables {
         }
         if tables.families.contains(row_families::RowFamily::Moves) {
             self.moves.extend(&tables.moves);
+        }
+        if tables.families.contains(row_families::RowFamily::Lazy) {
+            self.lazy.extend(&tables.lazy);
+        }
+        if tables.families.contains(row_families::RowFamily::Hmr) {
+            self.hmr.extend(&tables.hmr);
         }
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
@@ -86921,8 +86985,25 @@ fn analyze_over_world<'src>(
                 .move_rows_live
                 .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M150: the lazy and HMR rows likewise.
+        analyzer
+            .lazy_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        analyzer
+            .hmr_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .lazy_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+            analyzer
+                .hmr_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
         let families = row_families::FamilySet::default()
-            .with(row_families::RowFamily::Moves, analyzer.move_rows_filed);
+            .with(row_families::RowFamily::Moves, analyzer.move_rows_filed)
+            .with(row_families::RowFamily::Lazy, analyzer.lazy_rows_filed)
+            .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed);
         // M110 S7b: the resource slots per SOURCE (an item's window is
         // classified live), by the slot's own source stamp.
         {

@@ -1,11 +1,12 @@
-//! M149 (Order 53) — the row FAMILIES a pass files only when it ran.
+//! M149/M150 (Order 53) — the row FAMILIES a pass files only when it ran.
 //!
 //! The class D rows M19 T1b and S7b record are filed by every analysis that
 //! files a slice at all: a slice with no `clone_sites` row says "this module
 //! has no clone site", and the restore is exact. Some passes do not run on
 //! every analysis, though. The move scan's whole-program helper sets
 //! (`move_tables.rs`) are derived only once a program holds a resource
-//! binding — so an empty row from an analysis that never asked
+//! binding, and the lazy tables (M150) only once one writes a `lazy`
+//! parameter or binding — so an empty row from an analysis that never asked
 //! is not "nothing here", it is "not computed". A family is the set of rows
 //! one such pass contributes, and a slice says, per family, whether its rows
 //! were FILED ([`FamilySet`]); the regions whose slices carry a family are its
@@ -21,16 +22,23 @@ use super::live_ranges::LiveRanges;
 pub(super) enum RowFamily {
     /// The move scan's helper sets (M149, `move_tables.rs`).
     Moves,
+    /// The lazy argument tables (M150, `lazy_tables.rs`).
+    Lazy,
+    /// The HMR transfer sites (M150, `lazy_tables.rs`).
+    Hmr,
 }
 
-pub(super) const FAMILIES: usize = 1;
+pub(super) const FAMILIES: usize = 3;
 
 impl RowFamily {
-    pub(super) const ALL: [RowFamily; FAMILIES] = [RowFamily::Moves];
+    pub(super) const ALL: [RowFamily; FAMILIES] =
+        [RowFamily::Moves, RowFamily::Lazy, RowFamily::Hmr];
 
     pub(super) fn index(self) -> usize {
         match self {
             RowFamily::Moves => 0,
+            RowFamily::Lazy => 1,
+            RowFamily::Hmr => 2,
         }
     }
 }

@@ -133,6 +133,18 @@ impl RestoredTables {
         {
             self.moves.extend(&tables.moves.rebased(rebase));
         }
+        if tables
+            .families
+            .contains(super::row_families::RowFamily::Lazy)
+        {
+            self.lazy.extend(&tables.lazy.rebased(rebase));
+        }
+        if tables
+            .families
+            .contains(super::row_families::RowFamily::Hmr)
+        {
+            self.hmr.extend(&tables.hmr.rebased(rebase));
+        }
         for hint in &tables.stage_hints {
             if let (Some(id), Some(chain)) = (rebase(hint.id), rebase(hint.chain)) {
                 self.stage_hints.push(super::StageHint {
@@ -237,7 +249,7 @@ pub(super) struct ItemState {
     label_ranges: Vec<(u32, u32)>,
     hint_ranges: Vec<(u32, u32)>,
     held_ranges: Vec<(u32, u32)>,
-    /// M149: per conditional row family, the served windows whose
+    /// M149/M150: per conditional row family, the served windows whose
     /// records carry it.
     family_ranges: super::row_families::FamilyRanges,
     /// The Class A output this analysis derived for the laid-out windows it
@@ -1245,6 +1257,8 @@ impl<'src> Analyzer<'src> {
                             .all(|(region, binding)| own(*region) && own(*binding))
                         && tables.r11_seed_calls.iter().all(|id| own(*id))
                         && tables.moves.fits(&own)
+                        && tables.lazy.fits(&own)
+                        && tables.hmr.fits(&own)
                         && tables.resource_slots.is_empty()
                         && tables
                             .stage_hints
