@@ -27,9 +27,10 @@ impl [type T: Default; const N] with Default {
 	}
 }
 
-/// `T::default()` spelled as a call every type can make: a fixed array cannot head
-/// a path (`[i32; 2]::default()` is no expression), so `[derive(Default)]` spells
-/// such a field through this (B623).
+/// `T::default()` spelled as a generic call every type can make (B623). A fixed
+/// array heads a path itself since A171 (`[i32; 2]::default()`); a tuple does not,
+/// so `[derive(Default)]` spells such a field through this, and the bound says
+/// what the field's type lacks.
 fun default_of<T: Default>(): T {
 	T::default()
 }
@@ -41,9 +42,11 @@ macro fun Default(item: Item): Source {
 	import macro_std::build::{ impl_of, fun_of, init_of };
 
 	if item.as_struct() is Some(let target) {
-		// `{ a = i32::default(), b = Point::default() }`. A field whose type cannot
-		// head a path (a fixed array) calls `default_of<[i32; 2]>()`, and only then
-		// does the output import it (B623).
+		// `{ a = i32::default(), b = Point::default(), c = [u8; 4]::default() }`. A
+		// field whose type cannot head a path (a tuple) calls `default_of<(i32,
+		// str)>()`, whose bound reports the type's missing `Default` where a
+		// `(i32, str)::default()` would not parse; only then does the output
+		// import it (B623).
 		mut literal = init_of(target.name);
 		mut imports = "Default";
 		for field in target.fields {

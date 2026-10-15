@@ -1322,3 +1322,168 @@ fn b623_derive_json_over_array_fields_and_payloads() {
         "{\"cells\":[3,4],\"none\":[]}\n4\nexpected an array of 2 elements, found 3\n{\"Both\":[[1.5],[\"x\",\"y\"]]}\n{\"Pair\":[5,6]}\n{\"slots\":[\"p\",\"q\"]}\n",
     );
 }
+
+// --- A172: `List::to_array` (§9's conversion back) ---------------------------
+
+/// A172: `list.to_array()` answers `Some` of a fixed array when the list holds
+/// exactly `N` elements and `None` otherwise, `N` from the expected type, the
+/// written argument (`to_array<2>()`), or a `const N` of the enclosing body —
+/// one instance per length. Length 0 is an ordinary length (the empty list is
+/// `Some([])`), and the array is a copy: it and the list grow apart.
+#[test]
+fn a172_list_to_array_answers_some_at_its_length_and_none_otherwise() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Point { x: i32 }
+        fun take<const N>(items: List<str>): Option<[str; N]> {
+            items.to_array()
+        }
+        fun main() {
+            let numbers: List<i32> = [1, 2, 3];
+            let three: Option<[i32; 3]> = numbers.to_array();
+            let two: Option<[i32; 2]> = numbers.to_array();
+            match three {
+                Some(let array) => print(array[0] + array[2]),
+                None => print("none"),
+            }
+            print(two.is_none());
+            print([4, 5].to_array<2>().unwrap()[1]);
+            let words = ["a", "b", "c"];
+            let exact: Option<[str; 3]> = take(words);
+            let longer: Option<[str; 4]> = take(words);
+            print(i"{exact.unwrap()[2]} {longer.is_none()}");
+            let nothing: List<Point> = [];
+            let empty: Option<[Point; 0]> = nothing.to_array();
+            print(empty.is_some());
+            let other: Option<[Point; 1]> = nothing.to_array();
+            print(other.is_none());
+            mut points = [Point { x = 1 }, Point { x = 2 }];
+            mut array = points.to_array<2>().unwrap();
+            array[0].x = 9;
+            points[1].x = 8;
+            print(i"{points[0].x} {array[0].x} {points[1].x} {array[1].x}");
+        }
+        main();
+        "#,
+        "4\ntrue\n5\nc true\ntrue\ntrue\n1 9 8 2\n",
+    );
+}
+
+/// A172: an `N` nothing binds is B424's refusal at an intrinsic, as at a
+/// bodied `zeros<const N>()` — the external's return is read for the
+/// generics it mentions — rather than an emitter's internal error.
+#[test]
+fn a172_a_to_array_whose_length_nothing_binds_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let numbers = [1, 2];
+            let array = numbers.to_array();
+            print(array.is_some());
+        }
+        "#,
+        "cannot infer the length 'N' for this call: nothing it is passed binds it, and its \
+         result is typed by it",
+    );
+}
+
+// --- A171: an array type as a path head (door (a)) ---------------------------
+
+/// A171: `[T; n]` heads a `::` path as `List<i32>` does — its statics are its
+/// impls' (`Default`, `FromJson`), the head binds the impl's element and
+/// length, and the forms an application takes hold: a nested array, a
+/// generic element, a `const N` of the enclosing body, a `self` method named
+/// through the path. B623's generic helpers stay as the same calls spelled
+/// generically.
+#[test]
+fn a171_an_array_type_heads_a_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::{ Default, default_of };
+        import std::json::{ FromJson, from_json_value_of };
+        import std::result::Result::{ self, Ok, Err };
+
+        [derive(Default)]
+        struct Point {
+            x: i32,
+        }
+
+        fun zeros<const N>(): [i32; N] {
+            [i32; N]::default()
+        }
+
+        fun filled<T: Default, const N>(): [T; N] {
+            [T; N]::default()
+        }
+
+        fun main() {
+            let three = [i32; 3]::default();
+            print(i"{three.len()} {three[2]}");
+            let grid = [[u8; 2]; 3]::default();
+            print(grid[2][1]);
+            let lists = [List<i32>; 2]::default();
+            print(lists[1].len());
+            print([Point; 2]::default()[1].x);
+            let four: [i32; 4] = zeros();
+            print(four.len());
+            let words: [str; 2] = filled();
+            print(i"[{words[1]}]");
+            match [str; 2]::from_json("[\"a\", \"b\"]") {
+                Ok(let pair) => print(pair[1]),
+                Err(let reason) => print(reason),
+            }
+            match [i32; 3]::from_json("[1, 2]") {
+                Ok(let triple) => print(triple[0]),
+                Err(let reason) => print(reason),
+            }
+            print([i32; 2]::to_list([7, 8]).len());
+            print(default_of<[i32; 2]>() == [i32; 2]::default());
+            let value = "[5, 6]".try_parse_json().unwrap();
+            print(from_json_value_of<[i32; 2]>(value).unwrap()[1]);
+        }
+        main();
+        "#,
+        "3 0\n0\n0\n0\n4\n[]\nb\nexpected an array of 3 elements, found 2\n2\ntrue\n6\n",
+    );
+}
+
+/// A171's refusals: a bracket heads a path only as an array TYPE — a list or a
+/// repeat of a value before `::` names nothing to look a member up in, and the
+/// refusal names the spelling that does; a member the array's impls do not
+/// declare is the ordinary "cannot find" at the array type.
+#[test]
+fn a171_a_bracket_literal_at_a_path_head_is_refused() {
+    let refusal = "a bracket heads a `::` path only as a fixed-array type, `[T; n]` \
+                   (`[i32; 3]::default()`): a list or repeat literal is a value and names no \
+                   type to look a member up in; write the element type and the length, or \
+                   `List<T>::` for a list";
+    assert_fails_with(
+        r#"
+        fun main() {
+            let count = [1, 2]::len();
+        }
+        "#,
+        refusal,
+    );
+    assert_fails_with(
+        r#"
+        import std::default::Default;
+        fun main() {
+            let zeros = [0; 3]::default();
+        }
+        "#,
+        refusal,
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let nothing = [i32; 3]::nope();
+        }
+        "#,
+        "cannot find 'nope' in [i32; 3]",
+    );
+}

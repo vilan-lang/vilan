@@ -2200,6 +2200,7 @@ struct Parser<'a, 'src> {
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
+#[derive(Clone)]
 struct Failure {
     /// The token index reached (converted to a byte span at emission).
     position: usize,
@@ -5921,7 +5922,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (`List<str>::…`) when a `::` follows generics, else the chain head atom.
     fn parse_static_accessor(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let mut current = match self.parse_generic_static_head() {
+        let mut current = match self
+            .parse_generic_static_head()
+            .or_else(|| self.parse_array_static_head())
+        {
             Some(head) => head,
             None => self.parse_chain_head(no_struct)?,
         };
@@ -6003,6 +6007,62 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parser.span_from(start),
             ))
         })
+    }
+
+    /// Whether the `[` at the cursor closes on a `]` that a `::` follows — the
+    /// token scan that keeps [`Self::parse_array_static_head`]'s type parse off
+    /// every list and repeat literal (nearly every `[` in expression position),
+    /// which a speculative parse per literal made a measurable cost of every
+    /// compile. Brackets of all three kinds nest; a `<` is not one (it is a
+    /// comparison as often as a list), and a generic argument list holds no
+    /// unbalanced bracket of the other kinds, so the matching `]` is found
+    /// either way.
+    fn bracket_closes_before_a_separator(&self) -> bool {
+        if !self.peek_is_ctrl('[') {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut offset = 0;
+        while let Some(token) = self.peek_at(offset) {
+            match token {
+                Token::Ctrl('[' | '(' | '{') => depth += 1,
+                Token::Ctrl(']' | ')' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.peek_at_is_op(offset + 1, "::");
+                    }
+                }
+                _ => {}
+            }
+            offset += 1;
+        }
+        false
+    }
+
+    /// `[T; n]` as a `::`-path head (A171, door (a)): `[i32; 3]::default()`,
+    /// `[str; 2]::from_json(..)` — an array type's associated functions,
+    /// spelled the way `List<i32>::new()` spells a nominal's. Only when a `::`
+    /// follows (a lookahead, not consumed), so `[value; 3]` stays the repeat
+    /// literal everywhere else; and only when the element parses as a TYPE, so
+    /// a bracket of values before a `::` (`[1, 2]::len()`) falls through to the
+    /// chain head and is refused at resolution, naming the array spelling.
+    ///
+    /// The probe leaves no expectation behind when it declines: a bracket that
+    /// is a list or a repeat literal is the expression parse's to report, and a
+    /// type parser's "expected `;`" at its comma would be a wrong sentence.
+    fn parse_array_static_head(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !self.bracket_closes_before_a_separator() {
+            return None;
+        }
+        let farthest = self.farthest_failure.clone();
+        let head = self.attempt(|parser| {
+            let head = parser.parse_array_type()?;
+            parser.peek_is_op("::").then_some(head)
+        });
+        if head.is_none() {
+            self.farthest_failure = farthest;
+        }
+        head
     }
 
     /// B361 (R4) — `Self<..>`, refused with the steer.
@@ -12108,6 +12168,50 @@ mod tests {
                 assert_eq!(legs.0[1].0.len(), 2, "second leg is an or-pattern");
             }
             other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    /// A171: `[T; n]` heads a `::` path as an array TYPE only when `::`
+    /// follows and the element parses as a type; a repeat or list literal
+    /// stays a literal everywhere else, a literal before `::` included (the
+    /// resolver refuses that one, naming the array spelling).
+    #[test]
+    fn a171_an_array_type_heads_a_path_only_before_a_separator() {
+        match &expr("[i32; 3]::default()").0 {
+            Node::Call(callee, _, _) => match &callee.0 {
+                Node::StaticAccessor(head, "default", None) => {
+                    assert!(
+                        matches!(head.0, Node::ArrayType(..)),
+                        "the head is the array type, got {:?}",
+                        head.0
+                    );
+                }
+                other => panic!("expected a static accessor, got {other:?}"),
+            },
+            other => panic!("expected a call, got {other:?}"),
+        }
+        match &expr("[[u8; 2]; N]::default()").0 {
+            Node::Call(callee, _, _) => assert!(matches!(
+                &callee.0,
+                Node::StaticAccessor(head, "default", None) if matches!(head.0, Node::ArrayType(..))
+            )),
+            other => panic!("expected a call, got {other:?}"),
+        }
+        assert!(matches!(expr("[i32; 3]").0, Node::Repeat(..)));
+        match &expr("[0; 3]::default").0 {
+            Node::StaticAccessor(head, "default", None) => {
+                assert!(
+                    matches!(head.0, Node::Repeat(..)),
+                    "a value repeat stays a literal"
+                )
+            }
+            other => panic!("expected a static accessor, got {other:?}"),
+        }
+        match &expr("[1, 2]::len").0 {
+            Node::StaticAccessor(head, "len", None) => {
+                assert!(matches!(head.0, Node::List(..)), "a list stays a literal")
+            }
+            other => panic!("expected a static accessor, got {other:?}"),
         }
     }
 

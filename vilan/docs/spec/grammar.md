@@ -649,6 +649,7 @@ The tightest expression tier, `chain`:
 ```text
 chain   = path { call-suffix | postfix } ;
 path    = ( IDENT generic-args ␣"::"  (* generic static head *)
+          | "[" type ";" array-length "]" ␣"::"   (* array static head *)
           | atom )
           { "::" MEMBER } ;
 call-suffix = [ generic-args ] "(" [ entry { "," entry } [ "," ] ] ")" ;
@@ -724,7 +725,12 @@ with the member still read; a line break after the dot takes nothing from
 the next line.
 
 `Name<Args>` is read as a generic path head only when `::` immediately
-follows (`List<str>::new()`); otherwise `<` is a comparison. A member
+follows (`List<str>::new()`); otherwise `<` is a comparison. A fixed-array
+type heads a path the same way (A171): `[i32; 3]::default()`,
+`[str; 2]::from_json(text)` — `[T; n]` is read as the array TYPE only when
+`::` immediately follows and its element parses as a type, and otherwise
+`[` opens a list or repeat literal. A literal before `::` (`[1, 2]::len()`,
+`[0; 3]::default()`) names no type and is refused. A member
 fuses at most ONE call; a further `(args)` is a **direct call** on the
 chain's result, calling a closure-typed value
 (`self.hook.read()(a, b)`). A `?.` link's **continuation** extends

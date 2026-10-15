@@ -6190,9 +6190,8 @@ fn b622_a_generic_field_no_binder_makes_hashable_is_still_refused() {
 /// not be declared, a silently broken key once it can (`Holder<|| i32>`
 /// hashed two different closures alike). The name answers for a
 /// non-generic derive only; a generic one asks its impl, whose binder
-/// refuses the closure at the boundary. (Wire keeps the name answer: its
-/// derive refuses a parameter-typed field outright, C7's guard, so a Wire
-/// type's parameters are phantom and its arguments never matter.)
+/// refuses the closure at the boundary. (Wire followed with B633:
+/// `b633_a_generic_wire_field_type_is_judged_by_its_arguments`.)
 #[test]
 fn b622_a_generic_derived_field_type_is_judged_by_its_arguments() {
     assert_fails_with(
@@ -6230,6 +6229,142 @@ fn b622_a_generic_derived_field_type_is_judged_by_its_arguments() {
         }
         "#,
         "false\n",
+    );
+}
+
+/// B633: `[derive(Wire)]` reads a generic member under the derived impl's
+/// own binders — B622's shape for `Hashable` — so `T`, `List<T>`,
+/// `Option<T>`, a derived `Page<R>` and an enum payload of a parameter are
+/// all Wire under `impl .. <type T: Wire> with Wire`, and a parameter no
+/// member mentions keeps its bare binder (`Tagged`'s `Phantom` takes a
+/// closure). The round trip runs through both codecs.
+#[test]
+fn b633_derive_wire_reads_a_generic_field_under_its_binder() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::wire::{ Wire, encode, decode };
+        import std::json::json_codec;
+        import std::binary::binary_codec;
+        import std::result::Result::{ self, Ok, Err };
+        import std::option::Option::{ self, Some, None };
+
+        [derive(Wire)]
+        struct Page<T> {
+            items: List<T>,
+            first: Option<T>,
+            count: i32,
+        }
+
+        [derive(Wire)]
+        enum Either<L, R> {
+            Left(L),
+            Right(Page<R>),
+        }
+
+        [derive(Wire)]
+        struct Tagged<T, Phantom> {
+            value: T,
+        }
+
+        [derive(Wire)]
+        struct Book {
+            pages: Page<str>,
+            side: Either<i32, bool>,
+            tag: Tagged<u8, || i32>,
+        }
+
+        fun main() {
+            let book = Book {
+                pages = Page { items = ["a", "b"], first = None, count = 2 },
+                side = Either::Right(Page { items = [true], first = Some(false), count = 9 }),
+                tag = Tagged { value = 7u8 },
+            };
+            let by_json: Result<Book, str> = decode(json_codec(), encode(json_codec(), book));
+            let by_binary: Result<Book, str> = decode(binary_codec(), encode(binary_codec(), book));
+            for carried in [by_json, by_binary] {
+                match carried {
+                    Ok(let back) => match back.side {
+                        Either::Right(let page) => print(i"{back.pages.items.get(1).unwrap()} {page.count} {page.first.unwrap()} {back.tag.value}"),
+                        Either::Left(let number) => print(number),
+                    },
+                    Err(let reason) => print(reason),
+                }
+            }
+        }
+        main();
+        "#,
+        "b 9 false 7\nb 9 false 7\n",
+    );
+}
+
+/// B633's other half, B622's for `Wire`: a GENERIC derived type was Wire by
+/// its NAME alone, whatever its arguments — sound only while C7's guard kept
+/// every Wire parameter phantom. With reached parameters admitted, the name
+/// answers for a non-generic derive only and a generic one asks its impl, so
+/// a closure argument at a reached parameter is refused at the boundary (and
+/// at an `[rpc]` signature, which reads the same predicate).
+#[test]
+fn b633_a_generic_wire_field_type_is_judged_by_its_arguments() {
+    assert_fails_with(
+        r#"
+        import std::wire::Wire;
+        [derive(Wire)]
+        struct Page<T> {
+            items: List<T>,
+        }
+        [derive(Wire)]
+        struct Outer {
+            inner: Page<|| i32>,
+        }
+        fun main() {}
+        "#,
+        "field `inner` of `[derive(Wire)]` type `Outer` is `Page<|| i32>`, which is not Wire",
+    );
+    assert_compiles(
+        r#"
+        import std::wire::Wire;
+        [derive(Wire)]
+        struct Page<T> {
+            items: List<T>,
+        }
+        [derive(Wire)]
+        struct Outer<U> {
+            inner: Page<U>,
+            fixed: Page<str>,
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+/// B633's refusals that stand: a member no `T: Wire` binder makes Wire — a
+/// closure over the parameter, a map keyed by it (`HashMap`'s key must also be
+/// `Hashable`, which its own declaration asks and names).
+#[test]
+fn b633_a_generic_field_no_wire_binder_makes_wire_is_still_refused() {
+    assert_fails_with(
+        r#"
+        import std::wire::Wire;
+        [derive(Wire)]
+        struct Callback<T> {
+            run: |T| i32,
+        }
+        fun main() {}
+        "#,
+        "field `run` of `[derive(Wire)]` type `Callback` is `|T| i32`, which is not Wire",
+    );
+    assert_fails_with(
+        r#"
+        import std::wire::Wire;
+        import std::hash_map::HashMap;
+        [derive(Wire)]
+        struct Table<T> {
+            rows: HashMap<T, str>,
+        }
+        fun main() {}
+        "#,
+        "generic parameter 'T' is missing the bound ': Hashable' required by parameter 'K' of 'HashMap'",
     );
 }
 

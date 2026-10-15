@@ -198,6 +198,7 @@ fun main() {
 				styles = styles,
 				chunks = if splits { ["client.Route_Home.js"] } else { [] },
 				classic_script = splits,
+				maps = [],
 				assets = [],
 			};
 			let (checked, found) = check_every_document(build);
@@ -250,6 +251,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 
@@ -553,6 +555,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let _page = Document::of(unstyled).head("<link rel=\"stylesheet\" href=\"/client.css\" />").html();
@@ -591,6 +594,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let _page = Document::of(build).head("<!--").html();
@@ -628,6 +632,7 @@ fun main() {
 		styles = None,
 		chunks = ["client.Route_Home.js"],
 		classic_script = true,
+		maps = [],
 		assets = [],
 	};
 	let _page = Document::of(split).body("<script type=\"module\" src=\"/client.js\"></script>").html();
@@ -664,6 +669,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	print(Document::of(build).title("Notes").head("<link rel=\"icon\" href=\"/favicon.ico\" />").body("<noscript>needs JavaScript</noscript>").html());
@@ -702,6 +708,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	print(Document::of(build)
@@ -751,6 +758,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let shell = "<!doctype html>\n<html lang=\"en\">\n\t<head>\n\t\t<meta charset=\"utf-8\" />\n\t\t<link rel=\"stylesheet\" href=\"/client.css\" />\n\t</head>\n\t<body>\n\t\t<div id=\"app\"></div>\n\t\t<script type=\"module\" src=\"/client.js\"></script>\n\t</body>\n</html>\n";
@@ -802,6 +810,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	print("===DESCRIBED===");
@@ -873,6 +882,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	print("===PAGE===");
@@ -1099,6 +1109,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let shell = "<!doctype html><html><head></head><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>";
@@ -1152,6 +1163,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let shell = "<!doctype html><html><head><link rel=\"stylesheet\" href=\"/client.css\"></head><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>";
@@ -1211,6 +1223,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let shell = "<!doctype html>\n<html lang=\"en\">\n\t<head>\n\t\t<link rel=\"stylesheet\" href=\"/client.css\" />\n\t</head>\n\t<body>\n\t\t<div id=\"app\"></div>\n\t\t<script type=\"module\" src=\"/client.js\"></script>\n\t</body>\n</html>\n";
@@ -1284,6 +1297,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let shell = "<!doctype html><html><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></html>";
@@ -1331,6 +1345,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	};
 	let shell = "<!doctype html><html><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>";
@@ -1381,6 +1396,7 @@ fun build(): LegBuild {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		maps = [],
 		assets = [],
 	}
 }

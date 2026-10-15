@@ -43,6 +43,11 @@ export struct LegBuild {
 	/// The route chunks' file names, in the build's own order. Empty for a leg that
 	/// does not `split` (`bundle-splitting.md` §4).
 	chunks: List<str>,
+	/// The source maps the build wrote beside the bundle and its chunks —
+	/// `client.js.map`, then each chunk's — so a page's DevTools reaches the `.vl`
+	/// sources through `serve_build` (B630). Empty for a build that wrote none: a
+	/// `release` build writes one only when `[build] source-maps = true` asks.
+	maps: List<str>,
 	/// Whether the bundle must be loaded as a classic script — true exactly when
 	/// the leg splits, because chunk resolution reads `document.currentScript`,
 	/// which is `null` inside a module script.
@@ -59,8 +64,8 @@ export struct LegBuild {
 
 export impl LegBuild {
 	/// Every artifact this build emitted, as `(url, file)` pairs in serving
-	/// order: the bundle, the style sidecar if there is one, the chunks, then
-	/// the bundled resources. The url is `/<name>` — what every shell in this
+	/// order: the bundle, the style sidecar if there is one, the chunks, the
+	/// source maps, then the bundled resources. The url is `/<name>` — what every shell in this
 	/// tree already asks for, so adopting `serve_build` moves no shell — and a
 	/// resource keeps its package-relative name, so `static/logo.png` is
 	/// served at `/static/logo.png` and read from `dist/static/logo.png`.
@@ -77,6 +82,9 @@ export impl LegBuild {
 		}
 		for chunk in self.chunks {
 			names.push(chunk);
+		}
+		for map in self.maps {
+			names.push(map);
 		}
 		for asset in self.assets {
 			names.push(asset);
@@ -176,12 +184,21 @@ fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, B
 			assets.push(coerce_str(asset));
 		}
 	}
+	// `maps` the same way (B630): a manifest written before it was listed describes
+	// a build whose maps were not served, which is still true of it.
+	mut maps: List<str> = [];
+	if manifest.has_field("maps") {
+		for map in manifest.field("maps").elements() {
+			maps.push(coerce_str(map));
+		}
+	}
 	Ok(LegBuild {
 		leg = coerce_str(manifest.field("leg")),
 		dist,
 		bundle = coerce_str(manifest.field("entry")),
 		styles = if styles.is_null() { None } else { Some(coerce_str(styles)) },
 		chunks,
+		maps,
 		classic_script = coerce_bool(manifest.field("classic_script")),
 		assets,
 	})

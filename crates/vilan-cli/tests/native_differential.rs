@@ -12906,6 +12906,59 @@ fn b622_derives_over_generic_fields_answer_on_both_backends() {
     );
 }
 
+/// A171: a fixed-array type as a `::` path head — `[i32; 3]::default()`,
+/// `[str; 2]::from_json(..)`, a nested array, a generic element, a `const N`,
+/// and the `Default`/`Json` derives spelling an array field through it —
+/// answers the same on both backends.
+#[test]
+fn a171_an_array_path_head_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_path_head.vl";
+    std::fs::write(staged.join(file), include_str!("native/array_path_head.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an array path head must answer the same natively"
+    );
+}
+
+/// A172: `List::to_array` — a length check and a slice on JS,
+/// `<[_; N]>::try_from` natively — answers the same at the expected type's
+/// length, a written one, a `const N` instance's and length 0.
+#[test]
+fn a172_list_to_array_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_list_to_array.vl";
+    std::fs::write(staged.join(file), include_str!("native/list_to_array.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "`to_array` must answer the same natively"
+    );
+}
+
+/// B633: `[derive(Wire)]` over a generic struct's and enum's generic fields —
+/// refused at the declaration before (C7's guard), read under the derived
+/// impl's `T: Wire` binders now, a phantom parameter still bare — round-trips
+/// the same on both backends.
+#[test]
+fn b633_wire_derives_over_generic_fields_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_derive_wire_over_generic_fields.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/derive_wire_over_generic_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a Wire derive over generic fields must round-trip the same natively"
+    );
+}
+
 /// array-lengths.md S4: a named length — a top-level `const let`, a `let`
 /// chained through it, a local `let` — in a type and in a repeat literal,
 /// resolved to its number before the fixpoint, the same on both backends.

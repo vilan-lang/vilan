@@ -124,6 +124,19 @@ impl List<type T> {
 	/// last element instead of refusing.
 	[track_caller]
 	external fun remove(&mut self, index: usize): T;
+
+	/// The elements as a fixed array of exactly `N`, or `None` when the list's
+	/// length is not `N` (array-lengths.md §9) — the explicit conversion back from
+	/// an array's `to_list`, fallible because a list's length is not its type. `N`
+	/// comes from the expected type or is written:
+	///
+	///     let rgb: Option<[u8; 3]> = bytes.to_array();
+	///     let pair = items.to_array<2>();
+	///
+	/// A copy, like `to_list`: the array and the list grow apart. An intrinsic
+	/// on both backends (a length check and a slice on JS, `<[T; N]>::try_from`
+	/// natively).
+	external fun to_array<const N>(self): Option<[T; N]>;
 }
 
 // `sum`/`product` seed with the first element and fall back to `T::default()` only

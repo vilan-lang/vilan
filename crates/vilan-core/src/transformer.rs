@@ -2212,6 +2212,12 @@ fn helper_source(name: &str) -> &'static str {
         "__list_sort_by" => {
             "function __list_sort_by(list, compare) {\n\treturn list.slice().sort(compare);\n}"
         }
+        // `List.to_array<const N>(self): Option<[T; N]>` (A172) — `Some` of a
+        // copy when the length is `N`, `None` otherwise. A copy for the reason
+        // `sort_by`'s is one: `self` is by value and the array grows apart.
+        "__list_to_array" => {
+            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.slice() ] : [ 1 ];\n}"
+        }
         // `Option.take(&mut self): Option<T>` — snapshot the slot (a structural
         // copy, not a deep clone: the payload MOVES out), then rewrite it to `None`
         // in place so the caller's binding sees the change. `[0, v]` -> the slot
@@ -5548,6 +5554,49 @@ impl<'src> Transformer<'src> {
     /// Whether this intrinsic call is a `Shared::write()` whose pointee resolves
     /// (under the active monomorphization) to a scalar — the case that lowers to
     /// a `(base, key)` pair rather than to the bare `cell.v` slot access.
+    /// A172: the `N` a `list.to_array()` call converts to under the active
+    /// instance — the external's own `const N` binder, bound by the written
+    /// argument (`to_array<2>()`) or by the analyzer's record for the call
+    /// (the expected type's length), then resolved through the current
+    /// substitution (a `const N` of the enclosing generic body).
+    fn list_to_array_length(&self, call_expr_id: Id) -> Option<usize> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return None;
+        };
+        let function_call = self.program.function_calls.get(call_id)?;
+        let Some(Expr::Local(callee_id)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let binder = *self
+            .program
+            .external_functions
+            .get(callee_id)?
+            .generic_parameter_constraint_ids
+            .first()?;
+        let bound = function_call
+            .generic_argument_ids
+            .first()
+            .copied()
+            .or_else(|| {
+                self.program
+                    .own_generic_call_bindings
+                    .get(call_id)
+                    .and_then(|values| values.first().copied())
+            })
+            .or_else(|| {
+                [call_expr_id, *call_id].iter().find_map(|key| {
+                    self.program
+                        .method_call_substitution
+                        .get(key)
+                        .and_then(|substitution| substitution.get(&binder).copied())
+                })
+            })?;
+        self.program
+            .type_id_to_type_map
+            .array_length(self.resolve_type_id(bound))
+    }
+
     fn emits_scalar_shared_write(&self, intrinsic: Intrinsic, call_expr_id: Id) -> bool {
         matches!(intrinsic, Intrinsic::SharedWrite)
             && self.shared_write_pointee_is_scalar(call_expr_id)
@@ -10282,6 +10331,20 @@ impl<'src> Transformer<'src> {
                 js::Node::Call(
                     Box::new(js::Node::Local("__list_sort_by".to_string())),
                     args.collect(),
+                )
+            }
+            // A172: the length is the call's own `N` under this instance, a
+            // number by the time anything emits (a `const N` binder no
+            // substitution reached is an analyzer bug, not a program).
+            Intrinsic::ListToArray => {
+                self.used_helpers.insert("__list_to_array");
+                let length = call_expr_id
+                    .and_then(|id| self.list_to_array_length(id))
+                    .expect("internal: `to_array`'s `N` is a length under every instance");
+                let receiver = args.next().unwrap_or(js::Node::Void);
+                js::Node::Call(
+                    Box::new(js::Node::Local("__list_to_array".to_string())),
+                    vec![receiver, js::Node::Number(length.to_string(), None)],
                 )
             }
             // `opt.take()` / `opt.replace(v)` (destruction.md §6): the receiver is
@@ -15026,6 +15089,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__list_get",
     "__list_pop",
     "__list_sort_by",
+    "__list_to_array",
     "__option_take",
     "__option_replace",
     "__map_get",

@@ -359,6 +359,109 @@ fn serve_build_answers_every_artifact_and_leaves_the_rest_to_the_app() {
     let _ = std::fs::remove_dir_all(&staged);
 }
 
+/// B630: a built page's DevTools reaches the `.vl` sources. The bundle and each
+/// chunk name their map on their last line (E257 S5/S6); the build manifest now
+/// lists those maps and `serve_build` routes them, so `/client.js.map` answers
+/// the map instead of falling through to the app's catch-all (which answered
+/// HTML, and the page had no sources). A split leg's chunk maps ride the same
+/// list.
+#[test]
+fn b630_a_built_page_reaches_its_source_maps_through_serve_build() {
+    let staged = stage("maps", Client::Router, true);
+    build(&staged);
+    let manifest =
+        std::fs::read_to_string(staged.join("dist/client.chunks.json")).expect("the manifest");
+    let mut scripts = vec!["client.js".to_string()];
+    for line in manifest.lines() {
+        if let Some(rest) = line.split("\"file\": \"").nth(1) {
+            scripts.push(rest.split('"').next().expect("a chunk file").to_string());
+        }
+    }
+    assert!(
+        scripts.len() > 1,
+        "the split fixture emits chunks to map: {manifest}"
+    );
+    let mut server = serve(&staged, &[]);
+    let port = server.port();
+    for script in &scripts {
+        let map = format!("{script}.map");
+        assert!(
+            manifest.contains(&format!("\"{map}\"")),
+            "the manifest lists {map}: {manifest}"
+        );
+        let (_, body) = http_get(port, &format!("/{script}"));
+        assert!(
+            body.trim_end()
+                .ends_with(&format!("//# sourceMappingURL={map}")),
+            "{script} names its map on its last line"
+        );
+        let (head, body) = http_get(port, &format!("/{map}"));
+        assert!(
+            head.contains("Content-Type: application/json"),
+            "{map} is served as the map it is, not the app's HTML:\n{head}\n{body}"
+        );
+        assert_eq!(
+            body,
+            std::fs::read_to_string(staged.join("dist").join(&map)).expect("the map"),
+            "and its bytes are the build's own"
+        );
+    }
+    server.stop();
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+/// B630's release half: a `release` build writes no map unless `[build]
+/// source-maps = true` asks, and the manifest lists exactly what was written —
+/// so a release page's `/client.js.map` is the app's, and an opted-in one's is
+/// the map.
+#[test]
+fn b630_a_release_build_serves_a_map_only_when_it_asks_for_one() {
+    for (tag, build_section, served) in [
+        ("release", "[build]\npreset = \"release\"\n", false),
+        (
+            "release_maps",
+            "[build]\npreset = \"release\"\nsource-maps = true\n",
+            true,
+        ),
+    ] {
+        let staged = stage(tag, Client::Styled, false);
+        let toml = std::fs::read_to_string(staged.join("vilan.toml")).expect("the manifest");
+        std::fs::write(
+            staged.join("vilan.toml"),
+            format!("{toml}\n{build_section}"),
+        )
+        .expect("write the build section");
+        build(&staged);
+        let manifest =
+            std::fs::read_to_string(staged.join("dist/client.chunks.json")).expect("the manifest");
+        assert_eq!(
+            manifest.contains("\"client.js.map\""),
+            served,
+            "{tag}: the manifest lists the map exactly when the build wrote it: {manifest}"
+        );
+        assert_eq!(
+            staged.join("dist/client.js.map").exists(),
+            served,
+            "{tag}: and the build wrote it exactly then"
+        );
+        let mut server = serve(&staged, &[]);
+        let (head, body) = http_get(server.port(), "/client.js.map");
+        if served {
+            assert!(
+                head.contains("Content-Type: application/json"),
+                "{tag}: the opted-in map is served:\n{head}"
+            );
+        } else {
+            assert!(
+                head.contains("Content-Type: text/html") && body.contains("id=\"app\""),
+                "{tag}: no map, so the path is the app's own:\n{head}\n{body}"
+            );
+        }
+        server.stop();
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+}
+
 /// kolt.local 025b, the opted-in half: one `.cache_build(…)` on the chain and
 /// the served artifacts answer conditional requests and carry the policy the
 /// route asked for — the two-tier shape the motivating exhibit hand-rolled and
