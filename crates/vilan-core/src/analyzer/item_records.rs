@@ -127,6 +127,12 @@ impl RestoredTables {
         if tables.held_recorded {
             self.held.extend(&tables.held.rebased(rebase));
         }
+        if tables
+            .families
+            .contains(super::row_families::RowFamily::Moves)
+        {
+            self.moves.extend(&tables.moves.rebased(rebase));
+        }
         for hint in &tables.stage_hints {
             if let (Some(id), Some(chain)) = (rebase(hint.id), rebase(hint.chain)) {
                 self.stage_hints.push(super::StageHint {
@@ -231,6 +237,9 @@ pub(super) struct ItemState {
     label_ranges: Vec<(u32, u32)>,
     hint_ranges: Vec<(u32, u32)>,
     held_ranges: Vec<(u32, u32)>,
+    /// M149: per conditional row family, the served windows whose
+    /// records carry it.
+    family_ranges: super::row_families::FamilyRanges,
     /// The Class A output this analysis derived for the laid-out windows it
     /// did NOT serve, per window — the next analysis's records.
     derived: HashMap<usize, ModuleDiagnostics>,
@@ -531,6 +540,10 @@ impl<'src> Analyzer<'src> {
         &self.items.held_ranges
     }
 
+    pub(super) fn item_family_ranges(&self) -> &super::row_families::FamilyRanges {
+        &self.items.family_ranges
+    }
+
     fn relative_entity(&self, id: Id) -> Relative {
         if let Some(window) = self.id_windows.window_of_entity(id) {
             let start = self.id_windows.windows[window].entities.start;
@@ -692,6 +705,7 @@ impl<'src> Analyzer<'src> {
         self.items.label_ranges.clear();
         self.items.hint_ranges.clear();
         self.items.held_ranges.clear();
+        self.items.family_ranges.clear();
         self.items.facts.clear();
         self.items.derived.clear();
         self.items.unrecordable.clear();
@@ -813,6 +827,7 @@ impl<'src> Analyzer<'src> {
         let mut label_ranges: Vec<(u32, u32)> = Vec::new();
         let mut hint_ranges: Vec<(u32, u32)> = Vec::new();
         let mut held_ranges: Vec<(u32, u32)> = Vec::new();
+        let mut family_ranges = super::row_families::FamilyRanges::default();
         for &window in &laid {
             let Some(record) = candidate.get(&window) else {
                 continue;
@@ -840,6 +855,11 @@ impl<'src> Analyzer<'src> {
                 if tables.held_recorded {
                     held_ranges.extend(own.iter().copied());
                 }
+                for family in super::row_families::RowFamily::ALL {
+                    if tables.families.contains(family) {
+                        family_ranges.of_mut(family).extend(own.iter().copied());
+                    }
+                }
             }
             self.items.served_set.insert(window);
             self.items.served.push((window, record.clone()));
@@ -854,6 +874,8 @@ impl<'src> Analyzer<'src> {
         self.items.label_ranges = label_ranges;
         self.items.hint_ranges = hint_ranges;
         self.items.held_ranges = held_ranges;
+        family_ranges.sort();
+        self.items.family_ranges = family_ranges;
         let served = self.items.served.len() as u64;
         if !crate::macros::in_macro_world() {
             crate::incremental::update_census(|census| {
@@ -1112,6 +1134,7 @@ impl<'src> Analyzer<'src> {
         drop_nominals_world: u64,
         labels_recorded: bool,
         hints_recorded: bool,
+        families: super::row_families::FamilySet,
     ) -> (Vec<(ItemKey, ItemRecord)>, Vec<ItemKey>) {
         let mut filed = Vec::new();
         let mut purge = Vec::new();
@@ -1168,6 +1191,7 @@ impl<'src> Analyzer<'src> {
             slice.drop_nominals_world = drop_nominals_world;
             slice.labels_recorded = labels_recorded;
             slice.hints_recorded = hints_recorded;
+            slice.families = families;
             // The held rows ride only when every id they carry is the item's
             // own or the prefix's; otherwise the item stays live for the
             // held passes (`held_tables.rs`) and keeps the rest of its record.
@@ -1220,6 +1244,7 @@ impl<'src> Analyzer<'src> {
                             .iter()
                             .all(|(region, binding)| own(*region) && own(*binding))
                         && tables.r11_seed_calls.iter().all(|id| own(*id))
+                        && tables.moves.fits(&own)
                         && tables.resource_slots.is_empty()
                         && tables
                             .stage_hints

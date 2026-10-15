@@ -448,6 +448,10 @@ pub struct Census {
     /// whole-program pass walks in place of the table.
     pub live_ranges: u64,
     pub live_entities: u64,
+    /// M149: the move rows this analysis derived by walking its live lane (`analyzer/move_tables.rs`) — the restored regions' rows
+    /// are not walked, so a served keystroke reads a fraction of a filing
+    /// one's.
+    pub move_rows_live: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -496,6 +500,7 @@ thread_local! {
             item_records_filed: 0,
             live_ranges: 0,
             live_entities: 0,
+            move_rows_live: 0,
             prefix_world: false,
             prefix_layered: false,
             prefix_hits: 0,
@@ -862,7 +867,7 @@ pub fn report(program: &Program) {
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
-             live-entities={} prefix-world={} prefix-layered={} prefix-hits={} \
+             live-entities={} move-rows-live={} prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={}",
             census.base_hits,
             census.base_misses,
@@ -890,6 +895,7 @@ pub fn report(program: &Program) {
             census.item_records_filed,
             census.live_ranges,
             census.live_entities,
+            census.move_rows_live,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
             census.prefix_hits,

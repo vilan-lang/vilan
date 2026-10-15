@@ -373,6 +373,16 @@ fn observe_in_package(
     entry_path: &Path,
     entry_source: String,
 ) -> ReuseObservation {
+    observe_in_package_on(pkg_root, entry_path, entry_source, Platform::default())
+}
+
+/// [`observe_in_package`] under `platform`.
+fn observe_in_package_on(
+    pkg_root: &Path,
+    entry_path: &Path,
+    entry_source: String,
+    platform: Platform,
+) -> ReuseObservation {
     // N66: the harness's guard, on this binary's own twin of the helper too —
     // the trap is the ARGUMENT, so it has to be refused wherever the argument
     // is taken.
@@ -388,7 +398,7 @@ fn observe_in_package(
                 &std_spec(),
                 &pkg_root,
                 &entry_path,
-                Some(Platform::default()),
+                Some(platform),
                 &Workspace::default(),
             );
             let diagnostics = format!("{errors:?}");
@@ -1239,6 +1249,84 @@ fn a_stale_restored_table_moves_the_emitted_javascript() {
          tables are not read, and every agreement the differential reports is \
          vacuous"
     );
+}
+
+/// **M149's stale-row plant.** The move scan's helper sets are folded from
+/// the restored modules' rows and the live regions' contributions
+/// (`analyzer/move_tables.rs`); a reused module's bindings are not
+/// classified again. The module here declares a module-level resource the
+/// ENTRY consumes — the §5 loan-only refusal, which the entry's live scan
+/// can only make if the restored rows still say the module's binding is a
+/// resource. With the rows thrown away and the skip kept (the stale-table
+/// plant), the refusal must go: if it stays, the rows are not read and the
+/// fold's agreement with the clean analysis says nothing.
+#[test]
+fn a_stale_restored_move_row_moves_the_diagnostics() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (honest, cold, planted) = honest_cold_planted(
+        "stale_moves",
+        "[resource]\nexport struct Db {\n\tn: i32,\n}\n\nexport let db = Db { n = 1 };\n\nexport fun consume(own handle: Db) {\n\tprint(\"{handle.n}\");\n}\n",
+        &|revision| {
+            format!(
+                "import pkg::module::{{ db, consume }};\n\nfun main() {{\n\tlet revision = {revision};\n\tprint(\"{{revision}}\");\n\tconsume(db);\n}}\n"
+            )
+        },
+        Platform::default(),
+    );
+    assert!(
+        honest.0.contains("is a module-level resource"),
+        "the fixture's entry must be refused for consuming the module's resource: {}",
+        honest.0
+    );
+    assert_eq!(
+        honest.0, cold.0,
+        "the restored move rows must answer what a cold analysis answers"
+    );
+    assert_ne!(
+        honest.0, planted.0,
+        "a reused module whose move rows came back EMPTY left the entry's \
+         refusal standing — the restored rows are not read"
+    );
+}
+
+/// One module package observed warm (a first analysis files the module's
+/// record, the second is served it) under `entry(revision)`, honestly, with
+/// nothing remembered (cold), and under the stale-table plant (the module's
+/// rows thrown away, its skip kept) — the three observations the M149 row
+/// pins compare.
+fn honest_cold_planted(
+    name: &str,
+    module: &str,
+    entry: &dyn Fn(u32) -> String,
+    platform: Platform,
+) -> (ReuseObservation, ReuseObservation, ReuseObservation) {
+    let (directory, entry_path) = write_module_package(name, module);
+    let warm = |directory: &Path, entry_path: &Path| -> ReuseObservation {
+        let _ = observe_in_package_on(directory, entry_path, entry(1), platform);
+        observe_in_package_on(directory, entry_path, entry(2), platform)
+    };
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::set_world_table_reuse(true);
+    vilan_core::analyzer::set_stale_table_plant(false);
+    vilan_core::analyzer::base_cache_clear();
+    let honest = warm(&directory, &entry_path);
+    vilan_core::analyzer::base_cache_clear();
+    let cold = observe_in_package_on(&directory, &entry_path, entry(2), platform);
+    vilan_core::analyzer::set_stale_table_plant(true);
+    vilan_core::analyzer::base_cache_clear();
+    let planted = warm(&directory, &entry_path);
+    vilan_core::analyzer::set_stale_table_plant(false);
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        honest.4 > 0 && planted.4 > 0,
+        "{name}: both legs must have RESTORED the module's tables: honest {}, planted {}",
+        honest.4,
+        planted.4
+    );
+    (honest, cold, planted)
 }
 
 /// **The second soundness pin: a restored table must never describe text the

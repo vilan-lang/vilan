@@ -26,6 +26,8 @@ pub mod id_windows;
 mod item_records;
 mod live_ranges;
 mod liveness;
+mod move_tables;
+mod row_families;
 mod written_types;
 
 pub use dbg_stack::{
@@ -1899,6 +1901,7 @@ struct ArmMoveState {
 /// Conservative by construction: a variant whose payload cannot be classified
 /// completely counts as carrying one, so the failure mode is an over-report,
 /// never a missed leak.
+#[derive(Clone, Copy, Debug)]
 struct IsRefinement {
     /// The place tested — only a bare `Expr::Local` refines anything.
     binding: Id,
@@ -4300,6 +4303,13 @@ pub struct Analyzer<'src> {
     /// B469: chunk 3's admitted field moves (place -> owned root), published
     /// for the whole-program drop plan beside `resource_value_places`.
     partial_move_roots: HashMap<Id, Id>,
+    /// M149: the live lane's contributions to the move scan's helper sets
+    /// (`move_tables.rs`), partitioned into the records at the tail; whether
+    /// this analysis derived them at all (a program with no resource binding
+    /// files no move rows); and the fold, read by R11 and the drop plan.
+    move_rows_live: move_tables::MoveRows,
+    move_rows_filed: bool,
+    move_sets: Option<move_tables::MoveSets>,
     /// B470: every resource erased into a `dyn` at a coercion site, as
     /// `(site, the value's type, the object type)`, for the post-build
     /// question of whether it may be.
@@ -4763,6 +4773,10 @@ pub struct Analyzer<'src> {
     // M110 S7b: the held table passes' lane — the complement of the modules'
     // and items' ranges whose record carried held rows (`held_tables.rs`).
     live_held: live_ranges::LiveRanges,
+    // M149: the conditionally-filed row families' lanes — per family,
+    // the complement of the ranges whose record carried its rows
+    // (`row_families.rs`).
+    live_families: row_families::FamilyLanes,
     // M110 S7b: the view bindings and the view origins, computed ONCE per
     // analysis for the five checks and the two tail passes that ask (each
     // was a fixpoint over every binding of the program per ask). Cleared
@@ -7874,6 +7888,9 @@ impl<'src> Analyzer<'src> {
             resource_value_places: HashSet::default(),
             trait_self_markers: HashMap::default(),
             partial_move_roots: HashMap::default(),
+            move_rows_live: move_tables::MoveRows::default(),
+            move_rows_filed: false,
+            move_sets: None,
             resource_erasures: Vec::new(),
             variant_coercions: HashMap::default(),
             nested_annotation_owners: HashMap::default(),
@@ -7960,6 +7977,7 @@ impl<'src> Analyzer<'src> {
             live_table: live_ranges::LiveRanges::default(),
             live_module: live_ranges::LiveRanges::default(),
             live_held: live_ranges::LiveRanges::default(),
+            live_families: row_families::FamilyLanes::default(),
             view_bindings_memo: std::cell::OnceCell::new(),
             view_origins_memo: std::cell::OnceCell::new(),
             reused_table_sources: Vec::new(),
@@ -14760,93 +14778,6 @@ impl<'src> Analyzer<'src> {
     // moved binding is use-after-move.
     // ---------------------------------------------------------------------
 
-    /// The resource-typed binding entities (variables + parameters), by
-    /// per-instantiation classification. `&mut` because `type_is_resource`
-    /// memoizes; the scan then runs against the returned (owned) set as `&self`.
-    /// Every binding — variable or parameter — whose type is a resource.
-    ///
-    /// **M38, and what MEASURING it decided.** The item asked for a
-    /// per-nominal "can any instantiation of this be a resource" pre-filter
-    /// (M28's `resource_reaching_nominals` / `type_reaches_resource`) ahead of
-    /// the field recursion, on the reading that `type_is_resource` over every
-    /// variable and parameter was ~100 ms on kolt's browser entry. It was
-    /// built, it is answer-identical (M28 proves `type_is_resource(T)` implies
-    /// `type_reaches_resource(T)`), and it was measured: **+2,312,262
-    /// instructions on `vilan check src/client.vl` over the full kolt copy —
-    /// a LOSS, not a win.** It could not be otherwise on a program that
-    /// declares a resource: the filter substitutes one recursive walk over the
-    /// distinct `TypeId`s (`classify_resource`) for another over the same ones
-    /// (`type_mentions_nominal`), and `resource_classification` — the
-    /// analyzer's persistent memo — had already made the first cost once per
-    /// distinct type rather than once per binding. The filter is a wash by
-    /// construction, and pays for the nominals closure on top. It is not here.
-    ///
-    /// **What IS here is the gate the filter was carrying.** A world where
-    /// nothing is declared `resource` has no resource type at all —
-    /// containment bottoms out at a declared leaf — so no binding can be one
-    /// and both sweeps below can be skipped outright. `check_resource_moves`
-    /// tested that only AFTER them, by finding the result empty: two whole-map
-    /// walks and a `type_is_resource` call per binding, on every corpus
-    /// program that owns no resource, for an answer two `.any()` scans give.
-    fn collect_resource_bindings(&mut self) -> HashSet<Id> {
-        let mut bindings = HashSet::default();
-        if !self.declares_a_resource() {
-            return bindings;
-        }
-        let variables: Vec<(Id, TypeId)> =
-            self.variables.values().map(|v| (v.id, v.type_id)).collect();
-        for (id, type_id) in variables {
-            // M134: the planner's mints for a binding belong to its item.
-            self.id_windows.set_anchor(id);
-            if self.type_is_resource(type_id) {
-                bindings.insert(id);
-            }
-        }
-        let parameters: Vec<(Id, TypeId)> = self
-            .parameters
-            .values()
-            .map(|p| (p.id, p.type_id))
-            .collect();
-        for (id, type_id) in parameters {
-            self.id_windows.set_anchor(id);
-            if self.type_is_resource(type_id) {
-                bindings.insert(id);
-            }
-        }
-        bindings
-    }
-
-    /// Every place expression (`Local`, `Field`, `Index`, `TupleIndex`) whose
-    /// value type is a resource. Feeds R5 (a `Field`/element consume is a
-    /// partial move) and — stored on the analyzer — `compute_clone_sites`, which
-    /// must never mark a resource place a clone (R1: resources move, not copy).
-    fn collect_resource_value_places(&mut self) -> HashSet<Id> {
-        let mut places = HashSet::default();
-        let place_ids: Vec<Id> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter(|(_, expr)| {
-                matches!(
-                    expr,
-                    Expr::Local(_)
-                        | Expr::Field(_, _, _)
-                        | Expr::TupleIndex(_, _, _)
-                        | Expr::Index(_, _)
-                )
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in place_ids {
-            if let Some(place_type) = self.place_value_type(id) {
-                let type_id = place_type.get_type_id(self);
-                if self.type_is_resource(type_id) {
-                    places.insert(id);
-                }
-            }
-        }
-        places
-    }
-
     /// Every pattern capture bound by a LOANED subject, mapped to the subject
     /// expression that still owns the payload (B65). R6/§7.2's other half: a
     /// capture of a *consumed* subject owns its payload, but a capture of a
@@ -14861,31 +14792,35 @@ impl<'src> Analyzer<'src> {
     /// Consuming such a capture is the capture-position twin of
     /// `binding_is_loaned_parameter`, and is rejected in `scan_move_touch`.
     fn collect_loaned_pattern_captures(&self) -> HashMap<Id, Id> {
-        let mut loaned: HashMap<Id, Id> = HashMap::default();
+        let mut rows: Vec<(Id, Id)> = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            self.loaned_captures_of(expr, &mut rows);
+        }
+        rows.into_iter().collect()
+    }
+
+    /// One expression's loaned captures, `(capture, subject)` — the per-
+    /// region half of [`Self::collect_loaned_pattern_captures`] (M149).
+    fn loaned_captures_of(&self, expr: &Expr<'src>, into: &mut Vec<(Id, Id)>) {
         let mut record = |pattern: &ExprPattern, subject: Id| {
             let mut captures = Vec::new();
             Self::collect_pattern_captures(pattern, &mut captures);
-            for capture in captures {
-                loaned.insert(capture, subject);
-            }
+            into.extend(captures.into_iter().map(|capture| (capture, subject)));
         };
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                // An `is` test loans unconditionally — `is_some`'s body is
-                // exactly this shape and B60 left it free on a resource.
-                Expr::Is(subject, pattern) => record(pattern, *subject),
-                Expr::Match(subject, legs) if self.pattern_subject_is_loan(*subject) => {
-                    for leg in legs {
-                        record(&leg.pattern, *subject);
-                    }
+        match expr {
+            // An `is` test loans unconditionally — `is_some`'s body is
+            // exactly this shape and B60 left it free on a resource.
+            Expr::Is(subject, pattern) => record(pattern, *subject),
+            Expr::Match(subject, legs) if self.pattern_subject_is_loan(*subject) => {
+                for leg in legs {
+                    record(&leg.pattern, *subject);
                 }
-                Expr::Destructure(subject, pattern) if self.pattern_subject_is_loan(*subject) => {
-                    record(pattern, *subject)
-                }
-                _ => {}
             }
+            Expr::Destructure(subject, pattern) if self.pattern_subject_is_loan(*subject) => {
+                record(pattern, *subject)
+            }
+            _ => {}
         }
-        loaned
     }
 
     /// B67: what every `x is P` test in the program proves about `x`'s payload,
@@ -15052,54 +14987,75 @@ impl<'src> Analyzer<'src> {
     }
 
     fn check_resource_moves(&mut self) {
-        let resource_bindings = self.collect_resource_bindings();
+        // M149: the helper sets are folded from the restored regions' rows
+        // and the live lane's contributions (`move_tables.rs`). The bindings
+        // first: a program holding no resource binding derives nothing else
+        // and files no move rows.
+        self.move_rows_live = move_tables::MoveRows {
+            bindings: self.live_resource_bindings(),
+            ..move_tables::MoveRows::default()
+        };
+        self.move_rows_filed = false;
+        self.move_sets = None;
         // No resource binding => no resource place (a resource-typed field lives
         // only on a resource aggregate, which any owner binds as a resource). Skip
-        // the whole-program place scan on resource-free programs (std / corpus).
-        if resource_bindings.is_empty() {
+        // the place scan on resource-free programs (std / corpus).
+        if self.move_rows_live.bindings.is_empty() && self.restored_tables.moves.bindings.is_empty()
+        {
+            self.move_rows_live = move_tables::MoveRows::default();
             return;
         }
-        let resource_value_places = self.collect_resource_value_places();
+        let mut live = std::mem::take(&mut self.move_rows_live);
+        self.live_move_rows(&mut live);
+        let sets = self.fold_moves(&live);
+        self.move_rows_live = live;
+        self.move_rows_filed = true;
+        if !crate::macros::in_macro_world() {
+            let walked = self.move_rows_live.len() as u64;
+            crate::incremental::update_census(|census| census.move_rows_live += walked);
+        }
         // Published for `compute_clone_sites` (R1: a resource never clones).
-        self.resource_value_places = resource_value_places.clone();
+        self.resource_value_places = sets.places.clone();
         // §5 loan-only corollary: the module-level resources (a subset of the
         // module-level `let`s). Consuming one is rejected wherever a body reads it.
         let module_level_bindings: HashSet<Id> = self
             .module_level_binding_ids()
             .into_iter()
-            .filter(|id| resource_bindings.contains(id))
+            .filter(|id| sets.bindings.contains(id))
             .collect();
-        let loaned_captures = self.collect_loaned_pattern_captures();
-        // The concrete scan knows no generic resources, so the empty constraint
-        // set makes `type_is_resource_with` agree with `type_is_resource`.
-        let is_refinements =
-            self.collect_is_refinements(None, &HashSet::default(), &mut HashMap::default());
-        let value_crossings = self.compute_return_value_crossings();
         // B469: which field moves read as destructures. The concrete scan
         // knows no instantiation, so a generic inside an aggregate's type may
-        // hold a `Drop` and keeps the refusal.
+        // hold a `Drop` and keeps the refusal. Decided over EVERY candidate on
+        // every analysis (M149): the verdict reads the Drop-implementing
+        // nominal set and the root's module-level-ness, which another region
+        // can move.
         let partial_move_roots = self.collect_partial_move_roots(
-            &resource_value_places,
+            &sets.places,
             &module_level_bindings,
-            &loaned_captures,
+            &sets.loaned,
             &HashMap::default(),
         );
         self.partial_move_roots = partial_move_roots.clone();
 
         let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
+        // The concrete scan knows no generic resources, so the empty constraint
+        // set the refinements were classified under makes
+        // `type_is_resource_with` agree with `type_is_resource`.
         let scan = MoveScan {
-            resource_bindings: &resource_bindings,
-            resource_value_places: &resource_value_places,
+            resource_bindings: &sets.bindings,
+            resource_value_places: &sets.places,
             module_level_bindings: &module_level_bindings,
-            loaned_captures: &loaned_captures,
-            is_refinements: &is_refinements,
-            value_crossings: &value_crossings,
+            loaned_captures: &sets.loaned,
+            is_refinements: &sets.is_refinements,
+            value_crossings: &sets.crossings,
             partial_move_roots: &partial_move_roots,
             dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
         self.emit_resource_move_violations(violations);
+        // R11's whole-program sets and the drop plan read the fold too.
+        self.move_sets = Some(sets);
     }
 
     /// The places a by-value return hands back through a VIEW leaf (B109) — the
@@ -15112,7 +15068,7 @@ impl<'src> Analyzer<'src> {
     ///
     /// A view RETURN is excluded — rule 3's sanctioned projection, where the
     /// reference stays a reference and nothing crosses.
-    fn compute_return_value_crossings(&self) -> HashSet<Id> {
+    fn compute_return_value_crossings(&self, include: &dyn Fn(Id) -> bool) -> HashSet<Id> {
         let mut crossings = HashSet::default();
         // Every return position of every by-value function: the tail, and (B116)
         // each `ret`. `return_sites` carries both, for every bodied function —
@@ -15120,6 +15076,7 @@ impl<'src> Analyzer<'src> {
         let seams: Vec<(&Function, Id)> = self
             .return_sites
             .iter()
+            .filter(|(function_id, _)| include(*function_id))
             .filter_map(|(function_id, value_id)| {
                 Some((self.functions.get(function_id)?, *value_id))
             })
@@ -15777,7 +15734,16 @@ impl<'src> Analyzer<'src> {
     /// and the overwrite drops. A resource-free program plans nothing, keeping its
     /// output byte-identical.
     fn plan_resource_drops(&mut self) {
-        let bindings = self.collect_resource_bindings();
+        // M149: the move scan's fold (`move_tables.rs`) — no fold means no
+        // resource binding anywhere, so nothing is owned and no name or
+        // component overwrite can hold a resource.
+        let (bindings, place_overwrites) = match self.move_sets.take() {
+            Some(sets) => {
+                let overwrites = self.decide_place_overwrites(&sets);
+                (sets.bindings, overwrites)
+            }
+            None => (HashSet::default(), HashMap::default()),
+        };
         // A loan owns nothing (B94). References are transparent, so `let v = &mut
         // holder` and a `&mut Holder` parameter both mint resource-TYPED bindings
         // whose value belongs to someone else — enrolling them made a view local's
@@ -15787,8 +15753,6 @@ impl<'src> Analyzer<'src> {
             .copied()
             .filter(|binding| !self.binding_or_param_is_view(*binding))
             .collect();
-        let place_overwrites =
-            self.collect_place_overwrites(&bindings, &self.resource_value_places);
         let explicitly_dropped = self.explicitly_dropped_bindings(&owned_bindings);
         let resources = ResourceOwnership {
             owned_bindings,
@@ -19372,8 +19336,16 @@ impl<'src> Analyzer<'src> {
         while let Some(instance) = worklist.pop_front() {
             if sets.is_none() {
                 sets = Some(R11Sets {
-                    loaned_captures: self.collect_loaned_pattern_captures(),
-                    value_crossings: self.compute_return_value_crossings(),
+                    // M149: the move scan's fold when it ran — the same
+                    // whole-program sets, restored and live.
+                    loaned_captures: match &self.move_sets {
+                        Some(sets) => sets.loaned.clone(),
+                        None => self.collect_loaned_pattern_captures(),
+                    },
+                    value_crossings: match &self.move_sets {
+                        Some(sets) => sets.crossings.clone(),
+                        None => self.compute_return_value_crossings(&|_| true),
+                    },
                     binding_candidates: LexicalCandidates::build(
                         self,
                         self.variables
@@ -52717,6 +52689,7 @@ impl<'src> Analyzer<'src> {
         let mut label_sources: HashSet<SourceId> = HashSet::default();
         let mut hint_sources: HashSet<SourceId> = HashSet::default();
         let mut held_sources: HashSet<SourceId> = HashSet::default();
+        let mut family_sources: [HashSet<SourceId>; row_families::FAMILIES] = Default::default();
         for source in &with_tables {
             if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
                 self.restored_tables.absorb(tables);
@@ -52729,8 +52702,22 @@ impl<'src> Analyzer<'src> {
                 if tables.held_recorded {
                     held_sources.insert(*source);
                 }
+                for family in row_families::RowFamily::ALL {
+                    if tables.families.contains(family) {
+                        family_sources[family.index()].insert(*source);
+                    }
+                }
             }
         }
+        for family in row_families::RowFamily::ALL {
+            *self.restored_tables.family_ranges.of_mut(family) = self
+                .source_ranges
+                .iter()
+                .filter(|range| family_sources[family.index()].contains(&range.source))
+                .map(|range| (range.start, range.end))
+                .collect();
+        }
+        self.restored_tables.family_ranges.sort();
         self.restored_tables.label_ranges = self
             .source_ranges
             .iter()
@@ -52775,12 +52762,14 @@ impl<'src> Analyzer<'src> {
             let label_ranges = std::mem::take(&mut self.restored_tables.label_ranges);
             let hint_ranges = std::mem::take(&mut self.restored_tables.hint_ranges);
             let held_ranges = std::mem::take(&mut self.restored_tables.held_ranges);
+            let family_ranges = std::mem::take(&mut self.restored_tables.family_ranges);
             self.restored_tables = RestoredTables {
                 drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
                 label_ranges,
                 hint_ranges,
                 held_ranges,
+                family_ranges,
                 ..RestoredTables::default()
             };
         }
@@ -53213,6 +53202,10 @@ impl<'src> Analyzer<'src> {
             merge(&self.restored_tables.hint_ranges, self.item_hint_ranges());
         self.restored_tables.held_ranges =
             merge(&self.restored_tables.held_ranges, self.item_held_ranges());
+        self.restored_tables.family_ranges = self
+            .restored_tables
+            .family_ranges
+            .merged(self.item_family_ranges());
         // M110 S7b: the complements, over the entity counter's high water —
         // every id this analysis holds lies below it. The Class A lane's
         // plant leaves the served ITEMS' windows live: a pass walking the
@@ -53242,6 +53235,21 @@ impl<'src> Analyzer<'src> {
         self.live_module = live_ranges::LiveRanges::complement(&module_reused, high);
         self.live_held =
             live_ranges::LiveRanges::complement(&self.restored_tables.held_ranges, high);
+        // M149: the conditional families' lanes. The Class A plant
+        // leaves the served windows live here too — a family's sets are
+        // unions, so walking a served window beside its restored rows
+        // changes no answer (the stale-table plant is what proves the rows
+        // load-bearing).
+        let mut family_restored = self.restored_tables.family_ranges.clone();
+        if served_left_live {
+            for family in row_families::RowFamily::ALL {
+                let items: HashSet<(u32, u32)> = self.item_ranges().iter().copied().collect();
+                family_restored
+                    .of_mut(family)
+                    .retain(|range| !items.contains(range));
+            }
+        }
+        self.live_families = row_families::FamilyLanes::complement(&family_restored, high);
         if !crate::macros::in_macro_world() {
             let ranges = self.live_class_a.ranges().len() as u64;
             let entities = self.live_class_a.count();
@@ -79432,6 +79440,11 @@ struct ModuleTables {
     /// and stays live for those passes.
     held: held_tables::HeldRows,
     held_recorded: bool,
+    /// M149: the module's contributions to the move scan's helper sets
+    /// (`move_tables.rs`), filed only by an analysis that derived them —
+    /// [`Self::families`] says which conditional families a slice carries.
+    moves: move_tables::MoveRows,
+    families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
     return_clone_sites: Vec<(Id, CopyDecision)>,
@@ -79545,7 +79558,14 @@ impl ModuleTables {
                     }
             })
             .sum();
-        flat * id + chains + bumps + decisions + labels + hints + self.held.bytes()
+        flat * id
+            + chains
+            + bumps
+            + decisions
+            + labels
+            + hints
+            + self.held.bytes()
+            + self.moves.bytes()
     }
 }
 
@@ -79601,6 +79621,10 @@ struct RestoredTables {
     /// items whose record carried them (the regions the held passes skip).
     held: held_tables::HeldRows,
     held_ranges: Vec<(u32, u32)>,
+    /// M149: the restored move rows, and per conditional family the ranges
+    /// of the modules and items whose record carried it.
+    moves: move_tables::MoveRows,
+    family_ranges: row_families::FamilyRanges,
 }
 
 impl Default for RestoredTables {
@@ -79632,6 +79656,8 @@ impl Default for RestoredTables {
             hint_ranges: Vec::new(),
             held: held_tables::HeldRows::default(),
             held_ranges: Vec::new(),
+            moves: move_tables::MoveRows::default(),
+            family_ranges: row_families::FamilyRanges::default(),
         }
     }
 }
@@ -79670,6 +79696,9 @@ impl RestoredTables {
         self.stage_hints.extend(tables.stage_hints.iter().cloned());
         if tables.held_recorded {
             self.held.extend(&tables.held);
+        }
+        if tables.families.contains(row_families::RowFamily::Moves) {
+            self.moves.extend(&tables.moves);
         }
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
@@ -86883,6 +86912,17 @@ fn analyze_over_world<'src>(
         if items_enabled {
             held_live.partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M149: the live lane's move rows, per source and per item.
+        analyzer
+            .move_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .move_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
+        let families = row_families::FamilySet::default()
+            .with(row_families::RowFamily::Moves, analyzer.move_rows_filed);
         // M110 S7b: the resource slots per SOURCE (an item's window is
         // classified live), by the slot's own source stamp.
         {
@@ -86912,6 +86952,7 @@ fn analyze_over_world<'src>(
             // module's held rows name nothing outside the stored world.
             slice.hints_recorded = workspace.reading_aids;
             slice.held_recorded = true;
+            slice.families = families;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
         // M110 S7: the item records of the re-walked files, with their
@@ -86920,8 +86961,13 @@ fn analyze_over_world<'src>(
         // a truncated item on every later hit).
         if items_enabled && !crate::cancel::cancelled() {
             let digest = analyzer.drop_nominals_world_digest;
-            let (items, purge) =
-                analyzer.take_item_records(item_tables, digest, seeded, workspace.reading_aids);
+            let (items, purge) = analyzer.take_item_records(
+                item_tables,
+                digest,
+                seeded,
+                workspace.reading_aids,
+                families,
+            );
             item_records::checked_cache_store_items(
                 key,
                 &source_hashes[..prefix_len],
