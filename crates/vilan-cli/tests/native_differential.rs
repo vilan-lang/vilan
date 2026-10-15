@@ -12906,6 +12906,26 @@ fn b622_derives_over_generic_fields_answer_on_both_backends() {
     );
 }
 
+/// B633: `[derive(Wire)]` over a generic struct's and enum's generic fields —
+/// refused at the declaration before (C7's guard), read under the derived
+/// impl's `T: Wire` binders now, a phantom parameter still bare — round-trips
+/// the same on both backends.
+#[test]
+fn b633_wire_derives_over_generic_fields_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_derive_wire_over_generic_fields.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/derive_wire_over_generic_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a Wire derive over generic fields must round-trip the same natively"
+    );
+}
+
 /// array-lengths.md S4: a named length — a top-level `const let`, a `let`
 /// chained through it, a local `let` — in a type and in a repeat literal,
 /// resolved to its number before the fixpoint, the same on both backends.

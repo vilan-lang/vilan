@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**B633: `[derive(Wire)]` over a generic struct or enum admits a field its parameter reaches — `struct Page<T> { items: List<T> }` — and a generic derived type is Wire by its arguments, not its name.** C7's guard refused every parameter-typed Wire field at the declaration so a Wire type's parameters stayed phantom; the derive already binds a reached parameter under `Wire` (`impl Page<type T: Wire> with Wire`, B194's rule) and a phantom one bare, so the boundary now reads each field under the derived impl's own binders (B622's shape for `Hashable`, `member_under_derive_binders`) and the Wire predicate asks the impl table for a generic derived type: `Page<|| i32>` is refused at a field and an `[rpc]` signature while `Handle<Session>` stays sendable. A generic function sending a `Page<T>` at an unbounded `T` is refused with the bound to add ("generic parameter 'T' is missing the bound ': Wire' its impl asks of it" — the steer reads any trait's derived or hand-written impl). Pins: `borrows::b633_*` (2, C7's pin turned positive plus its negative twin), `generics::b633_*` (3), `native_differential::b633_*` (`native/derive_wire_over_generic_fields.vl`); estate: no generic Wire derive in kolt, the website, the examples or std's corpus (std's `Handle<T>` is phantom and unchanged).
+
 ## v0.50.0 — 2026-10-13
 
 <!-- family: miscompile -->

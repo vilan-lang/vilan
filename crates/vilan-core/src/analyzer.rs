@@ -9534,6 +9534,9 @@ impl<'src> Analyzer<'src> {
                             "'{type_label}' does not implement trait '{trait_label}', \
                              required by a generic bound of this call{}",
                             self.total_join_steer(call_id, *required_trait_id)
+                                .or_else(
+                                    || self.argument_bound_steer(&value_type, *required_trait_id)
+                                )
                                 .unwrap_or_default()
                         )
                     };
@@ -10894,7 +10897,16 @@ impl<'src> Analyzer<'src> {
                     );
                     continue;
                 }
-                if !self.resolved_type_is_wire(*field_type_id) {
+                // B633: the member read under the derived impl's own binders,
+                // B622's shape — the derive binds every parameter a member
+                // reaches under `Wire` (`impl Page<type T: Wire> with Wire`),
+                // so a reached `T`, `List<T>` or `Inner<T>` is Wire there.
+                let under_binders = self.member_under_derive_binders(
+                    *declaration_id,
+                    *field_type_id,
+                    self.wire_trait_id,
+                );
+                if !self.resolved_type_is_wire(under_binders) {
                     let rendered = render_type_quoted(type_node);
                     self.push_anchored(
                         Error {
@@ -10996,8 +11008,11 @@ impl<'src> Analyzer<'src> {
                     }, *declaration_id);
                     continue;
                 }
-                let under_binders =
-                    self.hashable_member_under_binders(*declaration_id, *field_type_id);
+                let under_binders = self.member_under_derive_binders(
+                    *declaration_id,
+                    *field_type_id,
+                    self.hashable_trait_id,
+                );
                 if !self.resolved_type_is_hashable(under_binders) {
                     let rendered = render_type_quoted(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
@@ -21844,57 +21859,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Whether a RESOLVED type is Wire — the ONE predicate behind all four
-    /// boundaries: the `[derive(Wire)]` all-fields check, the `[rpc]`
-    /// signature check, that check's handle-element arm, and the `[expose]`
-    /// element check.
-    ///
-    /// Until B289 this was a SYNTACTIC ALLOWLIST — six scalar spellings,
-    /// `List`/`Option`/`HashMap` of Wire, and the `[derive(Wire)]` names — so a
-    /// hand-written `impl Result<type T: Wire, type E: Wire> with Wire` was
-    /// invisible to every one of them: kolt carried forty lines of exactly
-    /// that impl and still could not return a `Result<i53, str>` from an
-    /// `[rpc]` method. What is Wire is what an `impl .. with Wire` APPLIES to,
-    /// so the impl table has the last word here; the name arms stay in front
-    /// of it as the fast path and as the rule for the primitives.
-    ///
-    /// The arms, in order:
-    ///
-    /// 1. **The scalars** ([`WIRE_SCALAR_NAMES`]). They are Wire by the
-    ///    language's own rule and `std::wire`'s impls for them are the leaves
-    ///    the derived code bottoms out in — answering them here keeps them
-    ///    decidable with `std::wire` unloaded.
-    /// 2. **A `[derive(Wire)]` NAME, whatever its arguments** — C7's
-    ///    phantom-parameter condition. A `[derive(Wire)]` type can only ever
-    ///    have PHANTOM parameters, because a field typed by a parameter
-    ///    (`value: T`, or `List<T>`) fails this very check at the type's own
-    ///    declaration. So the arguments cannot reach the payload, and
-    ///    `Handle<Database>` is as sendable as `Handle<i32>` (a name is not the
-    ///    thing it names). B194 made the derive generators generic-aware and
-    ///    this rule is what decides how: a derived impl binds only the
-    ///    parameters the generated body REACHES, and for `Wire` the reached
-    ///    case is unreachable (the declaration check refuses it first), so the
-    ///    phantom parameter takes a bare binder, `impl Handle<type T> with
-    ///    Wire`. Were the declaration rule ever relaxed to admit a
-    ///    parameter-typed field, the argument check would land with it AND
-    ///    `Wire`'s reached parameters would start binding, both on the same day.
-    /// 3. **`List`/`Option`/`HashMap` of Wire**, recursing into the arguments —
-    ///    the fast path for std's own conditional impls (`HashMap` joined the pair
-    ///    with A39, narrating as a list of `{key, value}` pairs; its key must
-    ///    also be `Hashable`, which is `HashMap`'s own declaration bound rather
-    ///    than this predicate's business).
-    /// 4. **The impl table**, via [`Self::satisfies_trait_bound`] — which is
-    ///    what makes arm 3 redundant rather than load-bearing, and what reads
-    ///    a user's own impl. Recursion into the arguments happens exactly
-    ///    where the IMPL's own binder bounds demand it: `impl Result<type T:
-    ///    Wire, type E: Wire>` checks both arguments, `impl Handle<type T>`
-    ///    checks neither — C7's phantom rule expressed by the impl instead of
-    ///    by a special case here.
-    ///
-    /// A type that is not a resolved nominal — a closure, a tuple, a generic
-    /// parameter, an unresolved annotation — is NOT Wire and never reaches the
-    /// impl table: a bare parameter would otherwise answer from its declared
-    /// bound, which is the one answer arm 2 exists to refuse.
     /// Record a type the `[rpc]` Wire-signature refusal has just reported as
     /// not Wire — and every non-Wire component nested inside it — so the
     /// generated client's `call<T: Wire>` failure at the same type stands down
@@ -21949,30 +21913,33 @@ impl<'src> Analyzer<'src> {
             .map(|(_, span, _)| (source, *span))
     }
 
-    /// B622: a `[derive(Hashable)]` member's type read under the derived
-    /// impl's OWN binders — the subject's parameters substituted by the
-    /// arguments of the impl the derive wrote over the declaration.
+    /// B622 (`Hashable`) and B633 (`Wire`): a derived member's type read
+    /// under the derived impl's OWN binders — the subject's parameters
+    /// substituted by the arguments of the impl the derive wrote over the
+    /// declaration for `trait_id`.
     ///
-    /// The derive binds every parameter a member reaches under `Hashable`
-    /// (B194: `impl Holder<type T: Hashable> with Hashable`), so under that
-    /// impl a reached `T` — and a `List<T>`, a `[T; N]`, an `Inner<T>` whose
-    /// impl asks `T: Hashable` — is `Hashable`. Read at the declaration's own
-    /// `T`, whose bound is whatever the struct wrote (most often nothing), the
-    /// boundary refused the very field the derive accounts for. A non-generic
-    /// declaration, or one with no `Hashable` impl over its binders, reads the
-    /// member as declared.
+    /// The derive binds every parameter a member reaches under the derived
+    /// trait (B194: `impl Holder<type T: Hashable> with Hashable`, `impl
+    /// Page<type T: Wire> with Wire`), so under that impl a reached `T` — and
+    /// a `List<T>`, a `[T; N]`, an `Inner<T>` whose impl asks `T: Hashable` —
+    /// carries the trait. Read at the declaration's own `T`, whose bound is
+    /// whatever the struct wrote (most often nothing), the boundary refused
+    /// the very field the derive accounts for. A non-generic declaration, or
+    /// one with no impl of the trait over its binders, reads the member as
+    /// declared.
     ///
-    /// Deliberately NOT the Wire boundary's: there a parameter-typed field is
-    /// refused on purpose (C7's guard, `borrows::
-    /// a_wire_type_with_a_parameter_typed_field_is_rejected`) so a Wire type's
-    /// parameters stay phantom and `resolved_type_is_wire` may answer a
-    /// derived name without its arguments.
-    fn hashable_member_under_binders(
+    /// For `Wire` this retires C7's declaration guard (a parameter-typed field
+    /// refused so a Wire type's parameters stayed phantom): a reached
+    /// parameter now binds `Wire` on the derived impl, and a phantom one keeps
+    /// its bare binder, so `Handle<Session>` stays sendable while `Page<|| i32>`
+    /// is the impl table's refusal ([`Self::resolved_type_is_wire`]'s arm 2).
+    fn member_under_derive_binders(
         &mut self,
         declaration_id: Id,
         member_type_id: TypeId,
+        trait_id: Option<Id>,
     ) -> TypeId {
-        let Some(trait_id) = self.hashable_trait_id else {
+        let Some(trait_id) = trait_id else {
             return member_type_id;
         };
         let parameters = match self.structs.get(&declaration_id) {
@@ -22013,11 +21980,67 @@ impl<'src> Analyzer<'src> {
         self.substitute_type_id(member_type_id, &context)
     }
 
+    /// Whether a RESOLVED type is Wire — the ONE predicate behind all four
+    /// boundaries: the `[derive(Wire)]` all-fields check, the `[rpc]`
+    /// signature check, that check's handle-element arm, and the `[expose]`
+    /// element check.
+    ///
+    /// Until B289 this was a SYNTACTIC ALLOWLIST — six scalar spellings,
+    /// `List`/`Option`/`HashMap` of Wire, and the `[derive(Wire)]` names — so a
+    /// hand-written `impl Result<type T: Wire, type E: Wire> with Wire` was
+    /// invisible to every one of them: kolt carried forty lines of exactly
+    /// that impl and still could not return a `Result<i53, str>` from an
+    /// `[rpc]` method. What is Wire is what an `impl .. with Wire` APPLIES to,
+    /// so the impl table has the last word here; the name arms stay in front
+    /// of it as the fast path and as the rule for the primitives.
+    ///
+    /// The arms, in order:
+    ///
+    /// 1. **The scalars** ([`WIRE_SCALAR_NAMES`]). They are Wire by the
+    ///    language's own rule and `std::wire`'s impls for them are the leaves
+    ///    the derived code bottoms out in — answering them here keeps them
+    ///    decidable with `std::wire` unloaded.
+    /// 2. **A NON-generic `[derive(Wire)]` name.** A generic derived type
+    ///    is judged through the impl table (arm 4) by its ARGUMENTS (B633):
+    ///    the derive binds every parameter a field reaches under `Wire`
+    ///    (`impl Page<type T: Wire> with Wire`) and a PHANTOM one bare
+    ///    (`impl Handle<type T> with Wire`, B194's reached-parameters rule),
+    ///    so `Handle<Database>` is as sendable as `Handle<i32>` (C7: a name is
+    ///    not the thing it names) while `Page<|| i32>` is refused. Until B633
+    ///    the declaration refused a parameter-typed field outright (C7's
+    ///    guard), every Wire parameter was phantom, and the name answered
+    ///    whatever its arguments; the guard and the name shortcut retired on
+    ///    the same day, as the guard's own comment required.
+    /// 3. **`List`/`Option`/`HashMap` of Wire**, recursing into the arguments —
+    ///    the fast path for std's own conditional impls (`HashMap` joined the pair
+    ///    with A39, narrating as a list of `{key, value}` pairs; its key must
+    ///    also be `Hashable`, which is `HashMap`'s own declaration bound rather
+    ///    than this predicate's business).
+    /// 4. **The impl table**, via [`Self::satisfies_trait_bound`] — which is
+    ///    what makes arm 3 redundant rather than load-bearing, and what reads
+    ///    a user's own impl. Recursion into the arguments happens exactly
+    ///    where the IMPL's own binder bounds demand it: `impl Result<type T:
+    ///    Wire, type E: Wire>` checks both arguments, `impl Handle<type T>`
+    ///    checks neither — C7's phantom rule expressed by the impl instead of
+    ///    by a special case here.
+    ///
+    /// A generic parameter is Wire exactly when its bound carries `Wire` —
+    /// the derived impl's binder a member reads under (B633). A type that is
+    /// not a resolved nominal otherwise — a closure, a tuple, an unresolved
+    /// annotation — is NOT Wire and never reaches the impl table.
     fn resolved_type_is_wire(&mut self, type_id: TypeId) -> bool {
         let type_ = type_id.get_type(self);
         let (name, arguments) = match &type_ {
             Type::Struct(id, arguments) => (self.structs.get(id).map(|s| s.name), arguments),
             Type::Enum(id, arguments) => (self.enums.get(id).map(|e| e.name), arguments),
+            // B633: a parameter is Wire when its bound says so — the bound a
+            // derived member reads under `member_under_derive_binders`. The
+            // declaration's own bare `T` carries none and stays refused.
+            Type::Generic(constraint) => {
+                return self
+                    .wire_trait_id
+                    .is_some_and(|wire| self.generic_bound_carries_trait(*constraint, wire));
+            }
             _ => return false,
         };
         let Some(name) = name else {
@@ -22026,7 +22049,11 @@ impl<'src> Analyzer<'src> {
         if WIRE_SCALAR_NAMES.contains(&name) {
             return true;
         }
-        if self.wire_names.contains(name) {
+        // B633: the name answers for a NON-generic derive only. A generic
+        // one's impl binds its reached parameters under `Wire` (and a phantom
+        // one bare), so `Page<|| i32>` is the impl table's question, below —
+        // read by name it would put a closure on the wire.
+        if self.wire_names.contains(name) && arguments.is_empty() {
             return true;
         }
         if matches!(name, "List" | "Option" | "HashMap")
@@ -22056,7 +22083,7 @@ impl<'src> Analyzer<'src> {
             // arm below reads `List` — at a literal length or a `const N`.
             Type::Array(element, _) => return self.resolved_type_is_hashable(*element),
             // B622: a parameter is `Hashable` when its bound says so — the
-            // bound a derived member reads under `hashable_member_under_binders`.
+            // bound a derived member reads under `member_under_derive_binders`.
             Type::Generic(constraint) => {
                 return self.hashable_trait_id.is_some_and(|hashable| {
                     self.generic_bound_carries_trait(*constraint, hashable)
@@ -36796,6 +36823,68 @@ impl<'src> Analyzer<'src> {
              of plain sources is followed with `.switch(|inner| inner)`"
                 .to_string(),
         )
+    }
+
+    /// B633's steer: a generic INSTANCE refused a trait only because one of
+    /// its arguments is a parameter missing a bound the impl's binder asks.
+    /// `fun send<T>(page: Page<T>)` encoding `page` under `[derive(Wire)]
+    /// struct Page<T> { items: List<T> }` meets `impl Page<type T: Wire>
+    /// with Wire` at an unbounded `T`: the instance has an impl, and the fix
+    /// is the bound on the caller's own `T` — the sentence a bare "does not
+    /// implement" left the author to work out. `None` unless some impl of the
+    /// trait over the declaration has every BOUNDED binder met by a
+    /// parameter argument and at least one of those parameters lacks the
+    /// bound.
+    fn argument_bound_steer(&self, value_type: &Type, required_trait_id: Id) -> Option<String> {
+        let (declaration_id, arguments) = match value_type {
+            Type::Struct(id, arguments) | Type::Enum(id, arguments) if !arguments.is_empty() => {
+                (*id, arguments)
+            }
+            _ => return None,
+        };
+        self.implementations.iter().find_map(|implementation| {
+            if !implementation.trait_ids.contains(&required_trait_id) {
+                return None;
+            }
+            let binders = match self.borrow_type_by_type_id(implementation.subject) {
+                Type::Struct(id, binders) | Type::Enum(id, binders)
+                    if *id == declaration_id && binders.len() == arguments.len() =>
+                {
+                    binders
+                }
+                _ => return None,
+            };
+            let mut missing = Vec::new();
+            for (binder, argument) in binders.iter().zip(arguments) {
+                let Type::Generic(binder_constraint) = self.borrow_type_by_type_id(*binder) else {
+                    // A concrete subject argument: not the derive's shape,
+                    // and not a bound a caller can add.
+                    return None;
+                };
+                let argument_type = self.borrow_type_by_type_id(*argument);
+                for bound in self.generic_bound_trait_ids(*binder_constraint) {
+                    match argument_type {
+                        Type::Generic(constraint)
+                            if !self.generic_bound_carries_trait(*constraint, bound) =>
+                        {
+                            let parameter =
+                                self.pretty_print_type(argument_type, &HashMap::default());
+                            let trait_name = self.traits.get(&bound)?.name;
+                            missing.push(format!(
+                                "generic parameter '{parameter}' is missing the bound \
+                                 ': {trait_name}' its impl asks of it"
+                            ));
+                        }
+                        Type::Generic(_) => {}
+                        // A concrete argument at a bounded binder: whether it
+                        // is the one at fault is the impl table's question,
+                        // and the steer names only a fix it is sure of.
+                        _ => return None,
+                    }
+                }
+            }
+            (!missing.is_empty()).then(|| format!("; {}", missing.join("; ")))
+        })
     }
 
     /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for

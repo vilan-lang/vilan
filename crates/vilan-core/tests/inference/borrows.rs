@@ -1248,9 +1248,10 @@ fn a_wire_type_may_carry_a_handle_field() {
 fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
     // A name is not the thing it names: `Handle<T>` is sendable whatever `T` is
     // — the point of the naming layer (the entity stays on the server). The
-    // generic argument is deliberately unconstrained, which is sound only
-    // because a derived type's parameters are necessarily phantom
-    // (`a_wire_type_with_a_parameter_typed_field_is_rejected` is the other half).
+    // generic argument is deliberately unconstrained: `Handle`'s parameter is
+    // phantom (no field mentions it), so its derived impl binds it bare. Since
+    // B633 a REACHED parameter binds `Wire` instead
+    // (`b633_a_wire_type_with_a_parameter_typed_field_binds_its_parameter`).
     //
     // B194 is why this still holds now that derived impls carry bounds: the
     // trait binds only the parameters the generated body REACHES, and a phantom
@@ -1273,20 +1274,70 @@ fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
 }
 
 #[test]
-fn a_wire_type_with_a_parameter_typed_field_is_rejected() {
-    // The guard behind C7's unconstrained generic arguments: a `[derive(Wire)]`
-    // type whose field is typed by a PARAMETER is rejected at its own
-    // declaration, so no derived type can put a generic argument on the wire.
-    // B194 made the generators generic-aware, and this guard is what keeps
-    // `Wire`'s parameters phantom-only, so a `Wire` impl never binds one. If
-    // this rule is ever relaxed, `is_wire_type` must start checking the
-    // arguments on the same day.
-    assert_fails_with(
+fn b633_a_wire_type_with_a_parameter_typed_field_binds_its_parameter() {
+    // C7's guard, retired by B633: a `[derive(Wire)]` type whose field is
+    // typed by a PARAMETER was rejected at its own declaration, so every Wire
+    // parameter was phantom and `resolved_type_is_wire` answered a derived
+    // name whatever its arguments. The derive binds every REACHED parameter
+    // under `Wire` (`impl Pair<type T: Wire> with Wire`), the boundary reads
+    // each field under those binders, and a generic derived type is judged by
+    // its ARGUMENTS through the impl table — the guard and the name answer
+    // retired on the same day, as this pin's old comment required.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
+        import std::wire::Wire;
+        import std::json::{ encode_json, decode_json };
+        import std::result::Result::{ self, Ok, Err };
         [derive(Wire)]
         struct Pair<T> { value: T, count: i32 }
+        fun main() {
+            let carried: Result<Pair<str>, str> =
+                decode_json(encode_json(Pair { value = "v", count = 2 }));
+            match carried {
+                Ok(let pair) => print(i"{pair.value} {pair.count}"),
+                Err(let reason) => print(reason),
+            }
+        }
+        main();
         "#,
-        "which is not Wire",
+        "v 2\n",
+    );
+}
+
+#[test]
+fn b633_an_unbounded_parameter_sending_a_generic_wire_type_is_refused_naming_the_bound() {
+    // The negative twin: the parameter a derived impl binds under `Wire` is
+    // the CALLER's to bound. A generic function sending `Pair<T>` at an
+    // unbounded `T` is refused, and the refusal names the bound to add — the
+    // impl exists, only `T: Wire` is missing.
+    assert_fails_with(
+        r#"
+        import std::wire::Wire;
+        import std::json::encode_json;
+        [derive(Wire)]
+        struct Pair<T> { value: T, count: i32 }
+        fun send<T>(pair: Pair<T>): str {
+            encode_json(pair)
+        }
+        fun main() {}
+        "#,
+        "'Pair<T>' does not implement trait 'Wire', required by a generic bound of this \
+         call; generic parameter 'T' is missing the bound ': Wire' its impl asks of it",
+    );
+    // A concrete argument the binder refuses names the instance, not a bound.
+    assert_fails_with(
+        r#"
+        import std::wire::Wire;
+        import std::json::encode_json;
+        struct Opaque { tag: i32 }
+        [derive(Wire)]
+        struct Pair<T> { value: T, count: i32 }
+        fun main() {
+            let _text = encode_json(Pair { value = Opaque { tag = 1 }, count = 1 });
+        }
+        "#,
+        "'Pair<Opaque>' does not implement trait 'Wire', required by a generic bound of this call",
     );
 }
 

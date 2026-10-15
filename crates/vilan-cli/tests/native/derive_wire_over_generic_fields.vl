@@ -1,0 +1,64 @@
+// B633: `[derive(Wire)]` over a generic struct's and enum's generic fields
+// (`T`, `List<T>`, `Option<T>`, a derived `Page<R>` inside an enum payload),
+// read under the derived impl's own `T: Wire` binders, beside a phantom
+// parameter that stays bare - the same round trip on both backends.
+import std::io::print;
+import std::json::{ decode_json, encode_json };
+import std::option::Option::{ self, None, Some };
+import std::result::Result::{ self, Err, Ok };
+import std::wire::Wire;
+
+[derive(Wire)]
+struct Page<T> {
+	items: List<T>,
+	first: Option<T>,
+	count: i32,
+}
+
+[derive(Wire)]
+enum Either<L, R> {
+	Left(L),
+	Right(Page<R>),
+}
+
+[derive(Wire)]
+struct Tagged<T, Phantom> {
+	value: T,
+}
+
+[derive(Wire)]
+struct Book {
+	pages: Page<str>,
+	side: Either<i32, bool>,
+	tag: Tagged<u8, || i32>,
+}
+
+fun resend<T: Wire>(value: T): Result<T, str> {
+	decode_json(encode_json(value))
+}
+
+fun main() {
+	match resend(Page { items = [1, 2, 3], first = Some(1), count = 3 }) {
+		Ok(let page) => print(i"{page.items.len()} {page.first.unwrap()} {page.count}"),
+		Err(let reason) => print(reason),
+	}
+	let book = Book {
+		pages = Page { items = ["a", "b"], first = None, count = 2 },
+		side = Either::Right(Page { items = [true], first = Some(false), count = 9 }),
+		tag = Tagged { value = 7u8 },
+	};
+	print(encode_json(book));
+	match resend(book) {
+		Ok(let back) => {
+			print(back.pages.items.get(1).unwrap());
+			match back.side {
+				Either::Right(let page) => print(i"{page.count} {page.first.unwrap()}"),
+				Either::Left(let number) => print(number),
+			}
+			print(back.tag.value);
+		},
+		Err(let reason) => print(reason),
+	}
+	let left: Either<str, i32> = Either::Left("left");
+	print(encode_json(left));
+}
