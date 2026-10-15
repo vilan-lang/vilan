@@ -10964,6 +10964,103 @@ fn f135_a_read_beside_arguments_that_write_no_cell_of_its_own_is_not_copied() {
     );
 }
 
+/// B634's program: `cell` IS written in place somewhere (`grow`), so before
+/// B634 any call through a closure value beside a read of it — `touch()`,
+/// whose literal writes nothing — counted as "may write any written cell" and
+/// copied the read. `main` is filled in per pin.
+fn b634_program(main: &str) -> String {
+    format!(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun grow(cell: Shared<List<i32>>): i32 {{\n",
+            "\tcell.write().push(9);\n",
+            "\t9\n",
+            "}}\n",
+            "fun has(items: List<i32>, value: i32): bool {{\n",
+            "\titems.contains(value)\n",
+            "}}\n",
+            "fun probe(cell: Shared<List<i32>>, f: || i32): bool {{\n",
+            "\thas(cell.read(), f())\n",
+            "}}\n",
+            "fun main() {{\n",
+            "{main}",
+            "\tprint(grow(Shared::new([1])));\n",
+            "}}\n",
+        ),
+        main = main
+    )
+}
+
+#[test]
+fn b634_a_read_beside_a_closure_literal_that_writes_nothing_is_not_copied() {
+    // A let-bound literal, an alias of it, and a literal applied where it is
+    // written: each body writes no cell, so the read beside its call is the
+    // cell's own storage, uncopied (B457's summary of the literal's body).
+    let emitted = compile(&b634_program(concat!(
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tlet touch = || 9;\n",
+        "\tlet again = touch;\n",
+        "\tprint(has(cell.read(), touch()));\n",
+        "\tprint(has(cell.read(), again()));\n",
+        "\tprint(has(cell.read(), (|| 9)()));\n",
+        "\tcell.write().push(3);\n",
+    )))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a read beside a closure literal that writes no cell must not be copied:\n{emitted}"
+    );
+}
+
+#[test]
+fn b634_a_read_beside_a_closure_literal_that_writes_its_cell_is_a_copy() {
+    // The literal's body writes the cell in place — directly, and through a
+    // function it calls — so the read is copied where it stands (F135), and
+    // the callee answers from the items before the write on both backends.
+    assert_compiles_and_runs(
+        &b634_program(concat!(
+            "\tlet cell = Shared::new([1, 2]);\n",
+            "\tlet push = || {\n",
+            "\t\tcell.write().push(9);\n",
+            "\t\t9\n",
+            "\t};\n",
+            "\tprint(has(cell.read(), push()));\n",
+            "\tlet other = Shared::new([1, 2]);\n",
+            "\tlet through = || grow(other);\n",
+            "\tprint(has(other.read(), through()));\n",
+            "\tlet third = Shared::new([1, 2]);\n",
+            "\tprint(has(third.read(), (|| grow(third))()));\n",
+        )),
+        "false\nfalse\nfalse\n9\n",
+    );
+}
+
+#[test]
+fn b634_a_read_beside_a_closure_value_of_unknown_origin_is_still_a_copy() {
+    // A closure PARAMETER and a `mut` binding (which may be re-bound to any
+    // closure) are unknown statically: the call answers whether any write
+    // mutates the cell in place, and `cell` is written in place, so the read
+    // is copied — `probe` copies `cell.read()` beside `f()` whatever `f` is.
+    let emitted = compile(&b634_program(concat!(
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tmut later = || 9;\n",
+        "\tprint(has(cell.read(), later()));\n",
+        "\tlater = || grow(cell);\n",
+        "\tprint(probe(cell, later));\n",
+    )))
+    .expect("compiles");
+    for copied in [
+        "has(__clone(cell.v), later())",
+        "has(__clone(cell2.v), f())",
+    ] {
+        assert!(
+            emitted.contains(copied),
+            "a read beside a closure value of unknown origin is copied (`{copied}`):\n{emitted}"
+        );
+    }
+}
+
 #[test]
 fn a_mut_self_call_on_a_reads_field_does_not_write_the_cell() {
     // B274 copied a bare `cell.read()` standing as a `&mut self` receiver;
