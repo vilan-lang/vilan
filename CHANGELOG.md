@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: feature -->
+**A172: `list.to_array()` — `List::to_array<const N>(self): Option<[T; N]>`, the conversion back from an array's `to_list` (array-lengths.md §9).** `Some` of a copy when the list holds exactly `N` elements, `None` otherwise; `N` comes from the type the result lands in (`let rgb: Option<[u8; 3]> = bytes.to_array();`), a written argument (`xs.to_array<2>()`) or a `const N` of the enclosing body. An intrinsic on both backends: a length check and a slice on JS (`__list_to_array`), `<[_; N]>::try_from(..).ok()` natively. A `to_array` whose `N` nothing binds is B424's "cannot infer the length 'N'" refusal, now read off an `external` member's return as off a bodied one's. std's array `FromJson` decodes into a `List` and converts (B623 seeded a repeat with the first element and overwrote it), and its separate length-0 impl is gone. Pins: `array_lengths::a172_*` (2), `native_differential::a172_*` (`native/list_to_array.vl`).
+
+---
+
 <!-- family: fix -->
 **B633: `[derive(Wire)]` over a generic struct or enum admits a field its parameter reaches — `struct Page<T> { items: List<T> }` — and a generic derived type is Wire by its arguments, not its name.** C7's guard refused every parameter-typed Wire field at the declaration so a Wire type's parameters stayed phantom; the derive already binds a reached parameter under `Wire` (`impl Page<type T: Wire> with Wire`, B194's rule) and a phantom one bare, so the boundary now reads each field under the derived impl's own binders (B622's shape for `Hashable`, `member_under_derive_binders`) and the Wire predicate asks the impl table for a generic derived type: `Page<|| i32>` is refused at a field and an `[rpc]` signature while `Handle<Session>` stays sendable. A generic function sending a `Page<T>` at an unbounded `T` is refused with the bound to add ("generic parameter 'T' is missing the bound ': Wire' its impl asks of it" — the steer reads any trait's derived or hand-written impl). Pins: `borrows::b633_*` (2, C7's pin turned positive plus its negative twin), `generics::b633_*` (3), `native_differential::b633_*` (`native/derive_wire_over_generic_fields.vl`); estate: no generic Wire derive in kolt, the website, the examples or std's corpus (std's `Handle<T>` is phantom and unchanged).
 

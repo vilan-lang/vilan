@@ -15333,6 +15333,74 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// the call answers ([`vilan_rt::tuple_get`]: a key is a VALUE, so the
     /// position is read at run time). The receiver is read through a
     /// reference, evaluated once.
+    /// A172: `list.to_array()` — `<[_; N]>::try_from(..).ok()` over a copy of
+    /// the list (Rust's `TryFrom<Vec<T>> for [T; N]`, no `Copy` asked of the
+    /// element), with `N` the call's own `const N` under this instance: the
+    /// written argument (`to_array<2>()`) or the analyzer's record for the
+    /// call (the expected type's length), resolved through the active
+    /// substitution. The element is left to rustc, which reads it off the
+    /// list.
+    fn list_to_array(
+        &mut self,
+        argument_ids: &[Id],
+        call: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some(&receiver) = argument_ids.first() else {
+            return Err(unsupported("a `to_array` with no receiver", span));
+        };
+        let call_id = call.and_then(|call| match self.program.entity_map.get(&call) {
+            Some(&Expr::Call(call_id)) => Some(call_id),
+            _ => None,
+        });
+        let binder = call_id
+            .and_then(|call_id| self.program.function_calls.get(&call_id))
+            .and_then(|function_call| {
+                match self.program.entity_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(callee_id)) => self.program.external_functions.get(callee_id),
+                    _ => None,
+                }
+            })
+            .and_then(|external| external.generic_parameter_constraint_ids.first().copied());
+        let bound = call_id.and_then(|call_id| {
+            let function_call = self.program.function_calls.get(&call_id)?;
+            function_call
+                .generic_argument_ids
+                .first()
+                .copied()
+                .or_else(|| {
+                    self.program
+                        .own_generic_call_bindings
+                        .get(&call_id)
+                        .and_then(|values| values.first().copied())
+                })
+                .or_else(|| {
+                    let binder = binder?;
+                    [call?, call_id].iter().find_map(|key| {
+                        self.program
+                            .method_call_substitution
+                            .get(key)
+                            .and_then(|substitution| substitution.get(&binder).copied())
+                    })
+                })
+        });
+        let Some(length) = bound.and_then(|bound| {
+            let resolved = self.deeply_resolved(bound);
+            self.program.type_id_to_type_map.array_length(resolved)
+        }) else {
+            return Err(unsupported(
+                "a `to_array` whose length is not fixed here",
+                span,
+            ));
+        };
+        let receiver_text =
+            self.expecting_nothing(|emitter| emitter.expression(receiver, depth))?;
+        Ok(format!(
+            "<[_; {length}]>::try_from(({receiver_text}).to_vec()).ok()"
+        ))
+    }
+
     fn tuple_intrinsic(
         &mut self,
         intrinsic: Intrinsic,
@@ -15555,6 +15623,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 | Intrinsic::TupleGet
         ) {
             return self.tuple_intrinsic(intrinsic, argument_ids, call, depth, span);
+        }
+        if matches!(intrinsic, Intrinsic::ListToArray) {
+            return self.list_to_array(argument_ids, call, depth, span);
         }
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest
@@ -15889,6 +15960,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `sort_by` answers a COPY (`own self`), and its comparator arrives
             // as an `Rc<dyn Fn>` — which implements no `Fn` trait itself, so it
             // is bound and CALLED inside a closure the runtime can take.
+            // Rendered whole by `list_to_array`, which reads the call's `N`.
+            Intrinsic::ListToArray => {
+                return Err(unsupported("a `to_array` away from its call", span));
+            }
             Intrinsic::ListSortBy => {
                 let receiver = next();
                 let compare = next();

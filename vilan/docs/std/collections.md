@@ -30,6 +30,7 @@ impl List<type T> {
 	fun for_each(self, fn: |T| void)
 	fun reverse(self): List<T>
 	fun sort_by(own self, compare: |T, T| Ordering): List<T>   // stable
+	fun to_array<const N>(self): Option<[T; N]>   // None unless len() == N
 }
 impl List<type T: Add + Default> { fun sum(self): T }
 impl List<type T: Mul + Default> { fun product(self): T }
@@ -204,6 +205,10 @@ every length, so `[u8; 4]` and `[str; 100]` get the same surface:
 - **`to_list()`**, a `List` copy of the elements, and **`iter()`**, a cursor
   over a snapshot of them that opens the [adapter chain](#adapters). An
   array never coerces to a `List`; these are the conversions.
+- The way back is the list's: **`list.to_array()`** answers
+  `Option<[T; N]>`, a copy when the list holds exactly `N` elements and
+  `None` otherwise. `N` comes from the type the result lands in or is
+  written, `xs.to_array<3>()`.
 
 ```vilan
 import std::{ hash_map::HashMap, iterator::Iterator };
@@ -223,6 +228,10 @@ fun main() {
 	let doubled = rgb.iter().map(|c| c.as_i32() * 2).to_list();
 	print(doubled[0]);                         // 510
 	print(rgb.to_list().len());                // 3
+
+	let back: Option<[i32; 3]> = xs.to_array();
+	print(back.unwrap()[2]);                   // 3
+	print(xs.to_array<2>().is_none());         // true
 }
 ```
 

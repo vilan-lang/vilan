@@ -9643,8 +9643,17 @@ impl<'src> Analyzer<'src> {
             // type can be written. One whose only role is a parameter the
             // result does not carry decides nothing the program can observe,
             // and stays free.
-            let return_generics = self.member_return_generics(member_id);
-            let parameter_generics = self.member_parameter_generics(member_id);
+            // Read only for a member with own generics to refuse: every wired
+            // call reaches here, and most (`push`, `len`, a plain function)
+            // declare none.
+            let (return_generics, parameter_generics) = if own_generics.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    self.member_return_generics(member_id),
+                    self.member_parameter_generics(member_id),
+                )
+            };
             for constraint_id in own_generics.iter().copied() {
                 if !self.generic_bound_traits(constraint_id).is_empty()
                     || !return_generics.contains(&constraint_id)
@@ -64105,15 +64114,24 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B424: the generic parameters `member_id`'s declared return type
-    /// mentions (empty for a member with no written return).
+    /// mentions (empty for a member with no written return). An `external`
+    /// member's too (A172): `List::to_array<const N>(self): Option<[T; N]>`
+    /// is an intrinsic, and an `N` nothing binds is the same refusal a
+    /// bodied `zeros<const N>()` gets — not an emitter's internal error.
     fn member_return_generics(&self, member_id: Id) -> Vec<TypeId> {
         let mut generics = Vec::new();
-        if let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&member_id)
-            && let Some(return_type_id) = self
+        let return_type_id = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => self
                 .functions
                 .get(function_id)
-                .and_then(|function| function.return_type_id)
-        {
+                .and_then(|function| function.return_type_id),
+            Some(Expr::ExternalFunction(function_id)) => self
+                .external_functions
+                .get(function_id)
+                .map(|function| function.return_type_id),
+            _ => None,
+        };
+        if let Some(return_type_id) = return_type_id {
             let return_type = return_type_id.get_type(self);
             self.collect_generics(&return_type, 0, &mut generics);
         }
@@ -72852,6 +72870,11 @@ pub enum Intrinsic {
     // numeric enum lowering to -1/0/1, which is already `sort`'s contract, so
     // the vilan comparator passes through unwrapped.
     ListSortBy,
+    // `List.to_array<const N>(self): Option<[T; N]>` (A172, array-lengths.md
+    // §9) -> a runtime helper that answers `Some` of a COPY when the length is
+    // `N` and `None` otherwise; `N` is the call's own binding under the active
+    // instance, which each emitter reads off the call's result type.
+    ListToArray,
     // `Option.take(&mut self): Option<T>` -> a runtime helper that reads the slot,
     // writes `None` back in place, and returns the old contents (destruction.md §6).
     OptionTake,
@@ -86089,6 +86112,7 @@ fn analyze_over_world<'src>(
                     ("remove", Intrinsic::ListRemove),
                     ("insert", Intrinsic::ListInsert),
                     ("sort_by", Intrinsic::ListSortBy),
+                    ("to_array", Intrinsic::ListToArray),
                 ] {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)

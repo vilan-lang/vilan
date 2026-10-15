@@ -1322,3 +1322,70 @@ fn b623_derive_json_over_array_fields_and_payloads() {
         "{\"cells\":[3,4],\"none\":[]}\n4\nexpected an array of 2 elements, found 3\n{\"Both\":[[1.5],[\"x\",\"y\"]]}\n{\"Pair\":[5,6]}\n{\"slots\":[\"p\",\"q\"]}\n",
     );
 }
+
+// --- A172: `List::to_array` (§9's conversion back) ---------------------------
+
+/// A172: `list.to_array()` answers `Some` of a fixed array when the list holds
+/// exactly `N` elements and `None` otherwise, `N` from the expected type, the
+/// written argument (`to_array<2>()`), or a `const N` of the enclosing body —
+/// one instance per length. Length 0 is an ordinary length (the empty list is
+/// `Some([])`), and the array is a copy: it and the list grow apart.
+#[test]
+fn a172_list_to_array_answers_some_at_its_length_and_none_otherwise() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Point { x: i32 }
+        fun take<const N>(items: List<str>): Option<[str; N]> {
+            items.to_array()
+        }
+        fun main() {
+            let numbers: List<i32> = [1, 2, 3];
+            let three: Option<[i32; 3]> = numbers.to_array();
+            let two: Option<[i32; 2]> = numbers.to_array();
+            match three {
+                Some(let array) => print(array[0] + array[2]),
+                None => print("none"),
+            }
+            print(two.is_none());
+            print([4, 5].to_array<2>().unwrap()[1]);
+            let words = ["a", "b", "c"];
+            let exact: Option<[str; 3]> = take(words);
+            let longer: Option<[str; 4]> = take(words);
+            print(i"{exact.unwrap()[2]} {longer.is_none()}");
+            let nothing: List<Point> = [];
+            let empty: Option<[Point; 0]> = nothing.to_array();
+            print(empty.is_some());
+            let other: Option<[Point; 1]> = nothing.to_array();
+            print(other.is_none());
+            mut points = [Point { x = 1 }, Point { x = 2 }];
+            mut array = points.to_array<2>().unwrap();
+            array[0].x = 9;
+            points[1].x = 8;
+            print(i"{points[0].x} {array[0].x} {points[1].x} {array[1].x}");
+        }
+        main();
+        "#,
+        "4\ntrue\n5\nc true\ntrue\ntrue\n1 9 8 2\n",
+    );
+}
+
+/// A172: an `N` nothing binds is B424's refusal at an intrinsic, as at a
+/// bodied `zeros<const N>()` — the external's return is read for the
+/// generics it mentions — rather than an emitter's internal error.
+#[test]
+fn a172_a_to_array_whose_length_nothing_binds_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let numbers = [1, 2];
+            let array = numbers.to_array();
+            print(array.is_some());
+        }
+        "#,
+        "cannot infer the length 'N' for this call: nothing it is passed binds it, and its \
+         result is typed by it",
+    );
+}
