@@ -1922,3 +1922,49 @@ fn e317_a_returned_variant_hovers_with_the_expected_instantiation() {
         assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err");
     });
 }
+
+/// E322: an element's links are told from the reader's by the desugar's own
+/// marks (`element_head_links`, B620) and its scaffolding, not by scanning the
+/// text for a `>` and a `.`: `title(<b />)` ends in a `>` and the head link
+/// after it is written with a `.` (an ascribed value ends in one too), which the text test took for a chain written
+/// after the finished element. The head link hints nothing; the inner element
+/// is untouched; a chain after the whole element still hints.
+#[test]
+fn e322_a_head_link_after_an_element_valued_item_mints_no_hint() {
+    on_big_stack(|| {
+        let source = "export fun nested(): View {\n\t<div\n\t\ttitle(Some(\"a\") as Option<str>)\n\t\t.class(\"x\")\n\t\t.text(\"y\")\n\t/>\n}\n\n\
+             export fun after(): View {\n\t<div />\n\t\t.class(\"x\")\n\t\t.text(\"y\")\n}\n";
+        let client = "import pkg::bar::{ after, nested };\n\nfun main() {\n\tlet _ = nested();\n\tlet _ = after();\n}\n";
+        let package = Package::new("e322", &[("client.vl", client), ("bar.vl", source)]);
+        let world = package.world();
+        assert!(world.diagnostics.is_empty(), "{:?}", world.diagnostics);
+        let view = package.view(&world, "bar.vl");
+        let lone = Document::analyze(source, &std_root(), &package.path("bar.vl"));
+        let line = |needle: &str| source[..at(source, needle, 0)].matches('\n').count() + 1;
+        for document in [&view, &lone] {
+            let hints = stage_hint_lines(document);
+            for needle in [
+                "title(Some(\"a\") as Option<str>)",
+                ".class(\"x\")\n\t\t.text",
+                ".text(\"y\")\n\t/>",
+                "\t/>",
+            ] {
+                assert!(
+                    !hints.iter().any(|(at_line, _)| *at_line == line(needle)),
+                    "a hint on `{needle}`'s line: {hints:?}"
+                );
+            }
+            assert!(
+                hints.contains(&(line("\t<div />"), " as View".to_string())),
+                "{hints:?}"
+            );
+            assert!(
+                hints.contains(&(
+                    line(".class(\"x\")\n\t\t.text(\"y\")\n}"),
+                    " as View".to_string()
+                )),
+                "{hints:?}"
+            );
+        }
+    });
+}
