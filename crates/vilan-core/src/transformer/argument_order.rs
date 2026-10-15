@@ -58,8 +58,6 @@ impl<'src> Transformer<'src> {
         {
             return Vec::new();
         }
-        // A call through a closure VALUE is not one (F138's scope: the native
-        // emitter renders its arguments in order).
         let target = match self.program.entity_map.get(&call.subject_id) {
             Some(Expr::Local(target))
                 if self.program.functions.contains_key(target)
@@ -67,7 +65,13 @@ impl<'src> Transformer<'src> {
             {
                 *target
             }
-            _ => return Vec::new(),
+            Some(Expr::Local(target))
+                if !self.program.variables.contains_key(target)
+                    && !self.program.parameters.contains_key(target) =>
+            {
+                return Vec::new();
+            }
+            _ => return self.closure_value_arguments_read_late(call),
         };
         let conventions = self.receiving_forms(Some(target));
         if let Some(intrinsic) = self.program.intrinsics.get(&target) {
@@ -84,6 +88,53 @@ impl<'src> Transformer<'src> {
             .collect();
         let late: Vec<bool> = (0..arguments.len())
             .map(|index| self.reads_late(arguments, &conventions, &takes_a_view, index))
+            .collect();
+        if late.contains(&true) {
+            late
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// F138 through a closure VALUE (a binding or a field holding one): no
+    /// argument is a view of the binding's cell and a `&mut` one is taken
+    /// where it stands, so only the deferred copy waits — and only beside a
+    /// subject that runs no code, which would otherwise run after the
+    /// arguments it preceded. A literal applied where it is written binds its
+    /// parameters as `let`s in order natively, so nothing waits there.
+    fn closure_value_arguments_read_late(&self, call: &FunctionCall) -> Vec<bool> {
+        if matches!(
+            self.program.entity_map.get(&call.subject_id),
+            Some(Expr::Closure(_))
+        ) || !self.runs_no_code(call.subject_id)
+        {
+            return Vec::new();
+        }
+        let callee = self
+            .expr_type_id(call.subject_id)
+            .map(|type_id| self.resolve_type_id(type_id))
+            .and_then(|type_id| self.program.type_id_to_type_map.get(&type_id));
+        let conventions: Vec<Receiving> = match callee {
+            Some(Type::Function(function)) => self.receiving_forms(Some(*function)),
+            Some(type_) => self
+                .program
+                .closure_parameter_views(type_)
+                .into_iter()
+                .map(|view| match view {
+                    Some(true) => Receiving::RefMut,
+                    Some(false) => Receiving::Ref,
+                    None => Receiving::ByValue,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let arguments = &call.argument_ids;
+        let no_views = vec![false; arguments.len()];
+        let late: Vec<bool> = (0..arguments.len())
+            .map(|index| {
+                conventions.get(index) != Some(&Receiving::RefMut)
+                    && self.reads_late(arguments, &conventions, &no_views, index)
+            })
             .collect();
         if late.contains(&true) {
             late

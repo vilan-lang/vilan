@@ -13418,6 +13418,32 @@ fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_argumen
     );
 }
 
+/// native-53's find (F129's order through a closure VALUE): `check(items,
+/// push())`, `check` a closure binding and `push` pushing into the captured
+/// `items`, printed `true` on JS (the argument is the binding's object) and
+/// `false` natively (the copy was taken in argument order) — and a `&`
+/// parameter (`measure(&words, more())`, `count_of(&total, add())`) the same.
+/// The copy now waits for the later arguments through a closure binding, a
+/// field holding one and a function item's binding, so an in-place write and
+/// a re-binding are both seen on both backends; a subject that runs code and
+/// a literal applied where it is written keep their order on both.
+#[test]
+fn a_closure_value_call_reads_a_captured_binding_after_the_later_arguments_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_captured_binding_closure_value_call.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_closure_value_call.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\ntrue\ntrue\ntrue\nfalse\nfalse\n2\n3\n3\n5\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "a closure value's argument rooted at a captured binding waits on both backends"
+    );
+}
+
 /// A `&` of a captured `mut` binding's SCALAR place (`count_of(&log.count,
 /// bump())`, a `bool`, a `str`, the binding itself) beside a later argument
 /// that writes the binding read the value where it stood natively (`0`),

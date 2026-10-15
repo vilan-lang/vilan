@@ -1136,7 +1136,10 @@ fun sized(words: List<str>, extra: i32): usize {
 
 A scalar, `str`, `Option`, tuple or enum argument by value is the value the
 binding held where the argument stands, on both backends, and so is the
-operand of an operator.
+operand of an operator. A call through a closure value held by a binding or
+a field orders its arguments the same way; a closure literal applied where
+it is written binds its parameters in order, as `let`s, and so does a call
+whose callee is itself computed (`make()(items, swap())`).
 
 ## 6.10 `lazy` — a binding initialized at first use
 

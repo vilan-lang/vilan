@@ -12352,9 +12352,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // A value call — `(h.f)()`. The subject is a counted closure.
             let subject = self.expression(function_call.subject_id, depth)?;
             let callee_type = self.type_of(function_call.subject_id);
-            let arguments =
-                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
-            return Ok(format!("({subject})({})", arguments.join(", ")));
+            // A subject that runs code is evaluated before its arguments, and
+            // nothing moves ahead of it: the arguments keep their places.
+            let mut prelude = String::new();
+            let arguments = self.closure_call_arguments(
+                callee_type,
+                &function_call.argument_ids,
+                depth,
+                self.runs_no_code(function_call.subject_id)
+                    .then_some(&mut prelude),
+            )?;
+            return Ok(Self::with_argument_prelude(
+                prelude,
+                format!("({subject})({})", arguments.join(", ")),
+            ));
         };
         let target = *target;
 
@@ -12630,10 +12641,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             || self.program.variables.contains_key(&target)
         {
             let callee_type = self.type_of(function_call.subject_id);
-            let arguments =
-                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
+            let mut prelude = String::new();
+            let arguments = self.closure_call_arguments(
+                callee_type,
+                &function_call.argument_ids,
+                depth,
+                Some(&mut prelude),
+            )?;
             let callee = self.read_module_binding_or_local(target, span)?;
-            return Ok(format!("({callee})({})", arguments.join(", ")));
+            return Ok(Self::with_argument_prelude(
+                prelude,
+                format!("({callee})({})", arguments.join(", ")),
+            ));
         }
 
         // An ordinary call, monomorphized against whatever binds it.
@@ -13905,6 +13924,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         callee_type: Option<TypeId>,
         argument_ids: &[Id],
         depth: usize,
+        mut prelude: Option<&mut String>,
     ) -> Result<Vec<String>, Error> {
         let callee = callee_type
             .map(|type_id| self.concrete(type_id))
@@ -13933,13 +13953,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(type_) => self.program.closure_parameter_views(&type_),
             None => Vec::new(),
         };
+        // F?1 (Order 53, F129's order through a closure VALUE): a copy out of a
+        // captured binding's cell that a later argument may write is taken
+        // after the other arguments, as a named callee's is — the JS argument
+        // is the binding's object itself, so `check(items, push())` (`push`
+        // pushing into `items`) printed the pushed list on JS and the copy
+        // taken before the push natively. The arguments that run code are
+        // settled in order ahead of it.
+        let conventions: Vec<Receiving> = (0..argument_ids.len())
+            .map(|index| match views.get(index).copied().flatten() {
+                Some(true) => Receiving::RefMut,
+                Some(false) => Receiving::Ref,
+                None => Receiving::ByValue,
+            })
+            .collect();
+        let no_views = vec![false; argument_ids.len()];
+        let defers_a_copy: Vec<bool> = (0..argument_ids.len())
+            .map(|index| {
+                prelude.is_some()
+                    && self.defers_its_cell_copy(&conventions, argument_ids, &no_views, index)
+            })
+            .collect();
+        let defers_copies = defers_a_copy.contains(&true);
+        let mut deferred_copies = String::new();
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             let already_a_reference = matches!(
                 self.program.entity_map.get(argument),
                 Some(Expr::Reference(_, _))
             );
-            rendered.push(match views.get(index).copied().flatten() {
+            let text = match views.get(index).copied().flatten() {
                 Some(_) if already_a_reference => self.expression(*argument, depth)?,
                 Some(true) => {
                     let place = self.mutable_place(*argument, depth)?;
@@ -13951,7 +13994,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Some(false) => format!("&{}", self.expression(*argument, depth)?),
                 None => self.consumed_value_of(*argument, depth)?,
-            });
+            };
+            if defers_a_copy[index] {
+                let name = format!("__copied{index}");
+                let _ = write!(deferred_copies, "let {name} = {text}; ");
+                rendered.push(name);
+            } else if let Some(prelude) = prelude.as_deref_mut()
+                && defers_copies
+                && conventions[index] != Receiving::RefMut
+                && !self.runs_no_code(*argument)
+            {
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {text}; ");
+                rendered.push(name);
+            } else {
+                rendered.push(text);
+            }
+        }
+        if let Some(prelude) = prelude {
+            prelude.push_str(&deferred_copies);
         }
         Ok(rendered)
     }
