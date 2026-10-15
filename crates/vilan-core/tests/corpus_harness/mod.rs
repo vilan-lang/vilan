@@ -75,6 +75,7 @@ macro_rules! corpus_manifest {
             borrows => "borrows.vl",
             bytes_aliasing => "bytes-aliasing.vl",
             capture_clones => "capture-clones.vl",
+            captured_argument_order => "captured-argument-order.vl",
             closure_param_inference => "closure-param-inference.vl",
             compound_index => "compound-index.vl",
             r#const => "const.vl",

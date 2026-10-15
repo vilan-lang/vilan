@@ -10,19 +10,27 @@
 
 use std::collections::HashSet;
 use std::hash::BuildHasher;
+use std::rc::Rc;
 
 use crate::analyzer::{Closure, Expr, ExprIfBranch, ExprPattern, Intrinsic, Program};
-use crate::fx::FxHashSet;
+use crate::fx::{FxHashMap, FxHashSet};
 use crate::id::Id;
 use crate::node::Convention;
 
 /// Every sub-expression of `expr_id`, in evaluation order — a closure's body
 /// among them — for the walks that only need to recurse.
 pub fn expression_children(program: &Program, expr_id: Id) -> Vec<Id> {
-    let Some(expr) = program.entity_map.get(&expr_id) else {
-        return Vec::new();
-    };
     let mut children = Vec::new();
+    push_expression_children(program, expr_id, &mut children);
+    children
+}
+
+/// [`expression_children`] appended to `children`, so a walk with its own
+/// stack allocates nothing per node.
+pub fn push_expression_children(program: &Program, expr_id: Id, children: &mut Vec<Id>) {
+    let Some(expr) = program.entity_map.get(&expr_id) else {
+        return;
+    };
     match expr {
         Expr::Assignment(a, b) | Expr::Binary(_, a, b) | Expr::Index(a, b) => {
             children.push(*a);
@@ -56,7 +64,7 @@ pub fn expression_children(program: &Program, expr_id: Id) -> Vec<Id> {
             children.extend(statements.iter().copied());
             children.push(*tail);
         }
-        Expr::If(branch) => if_children(branch, &mut children),
+        Expr::If(branch) => if_children(branch, children),
         Expr::Match(subject, legs) => {
             children.push(*subject);
             for leg in legs {
@@ -93,7 +101,6 @@ pub fn expression_children(program: &Program, expr_id: Id) -> Vec<Id> {
         }
         _ => {}
     }
-    children
 }
 
 fn if_children(branch: &ExprIfBranch, children: &mut Vec<Id>) {
@@ -230,45 +237,114 @@ pub fn scan_closure<S: BuildHasher + Default>(
 /// place). The native backend boxes each into a counted cell; both backends
 /// read an argument rooted at one after the call's later arguments (spec
 /// §6.9's view, F129/F138).
+///
+/// The answer [`scan_closure`] gives per closure, in one walk of each body: a
+/// closure captures what its body names, and what the closures nested in it
+/// capture, less what it declares. A nested closure's capture set is computed
+/// once and reused by every closure around it, where a scan per closure walked
+/// each nested body again for every closure enclosing it.
 pub fn captured_mut_bindings(program: &Program) -> FxHashSet<Id> {
+    let mut memo = ClosureCaptures::default();
     let mut captured = FxHashSet::default();
     let mut closures: Vec<Id> = program.closures.keys().copied().collect();
     closures.sort_by_key(|closure| closure.0);
     for closure_id in closures {
-        let Some(closure) = program.closures.get(&closure_id) else {
-            continue;
-        };
-        // The closure's OWN parameters are declared inside it: `|mut v| { v =
-        // v - 1; v }` writes its parameter and captures nothing.
-        let mut declared_inside: FxHashSet<Id> = closure_parameter_bindings(program, closure);
-        let mut referenced = FxHashSet::default();
-        let mut visited = FxHashSet::default();
-        scan_closure(
-            program,
-            closure.return_,
-            &mut declared_inside,
-            &mut referenced,
-            &mut visited,
+        let captures = closure_captures(program, closure_id, &mut memo);
+        captured.extend(
+            captures
+                .iter()
+                .copied()
+                .filter(|binding| is_a_mut_binding(program, *binding)),
         );
-        for binding in referenced {
-            if declared_inside.contains(&binding) {
-                continue;
-            }
-            let mutable_local = program
-                .variables
-                .get(&binding)
-                .is_some_and(|variable| variable.mutable);
-            let mutable_parameter = program.parameters.get(&binding).is_some_and(|parameter| {
-                parameter.mutable
-                    && !parameter.lazy
-                    && matches!(parameter.convention, Convention::Bare | Convention::Own)
-            });
-            if mutable_local || mutable_parameter {
-                captured.insert(binding);
-            }
-        }
     }
     captured
+}
+
+/// A binding a capture can make a shared place: a `mut` local, or a `mut`
+/// parameter received by value (a `lazy` one is a memo cell, not a place).
+pub fn is_a_mut_binding(program: &Program, binding: Id) -> bool {
+    program
+        .variables
+        .get(&binding)
+        .is_some_and(|variable| variable.mutable)
+        || program.parameters.get(&binding).is_some_and(|parameter| {
+            parameter.mutable
+                && !parameter.lazy
+                && matches!(parameter.convention, Convention::Bare | Convention::Own)
+        })
+}
+
+/// Every closure's capture set computed so far, by closure.
+pub type ClosureCaptures = FxHashMap<Id, Rc<FxHashSet<Id>>>;
+
+/// The bindings one closure captures — every binding, `mut` or not — memoized
+/// by closure.
+pub fn closure_captures(
+    program: &Program,
+    closure_id: Id,
+    memo: &mut ClosureCaptures,
+) -> Rc<FxHashSet<Id>> {
+    if let Some(captures) = memo.get(&closure_id) {
+        return captures.clone();
+    }
+    // A closure is never nested in itself, so a re-entry cannot happen; the
+    // empty entry is belt and braces against one.
+    memo.insert(closure_id, Rc::default());
+    let Some(closure) = program.closures.get(&closure_id) else {
+        return Rc::default();
+    };
+    // The closure's OWN parameters are declared inside it: `|mut v| { v = v -
+    // 1; v }` writes its parameter and captures nothing.
+    let mut declared: FxHashSet<Id> = closure_parameter_bindings(program, closure);
+    let mut referenced: FxHashSet<Id> = FxHashSet::default();
+    let mut nested: Vec<Id> = Vec::new();
+    let mut pending: Vec<Id> = vec![closure.return_];
+    while let Some(expr_id) = pending.pop() {
+        match program.entity_map.get(&expr_id) {
+            Some(Expr::Variable(binding)) => {
+                declared.insert(*binding);
+                if let Some(initial) = program
+                    .variables
+                    .get(binding)
+                    .and_then(|variable| variable.initial)
+                {
+                    pending.push(initial);
+                }
+            }
+            Some(Expr::Local(binding)) => {
+                referenced.insert(*binding);
+            }
+            // A nested closure is its own unit: what it captures is what this
+            // one reaches through it.
+            Some(Expr::Closure(nested_id)) => nested.push(*nested_id),
+            Some(other) => {
+                // The names a body declares outside a `let` (see
+                // [`scan_closure`]): a match leg's pattern, an `is` test's
+                // capture, a destructure's pattern, a `for` binder.
+                match other {
+                    Expr::Match(_, legs) => {
+                        for leg in legs {
+                            pattern_bindings_into(&leg.pattern, &mut declared);
+                        }
+                    }
+                    Expr::Is(_, pattern) | Expr::Destructure(_, pattern) => {
+                        pattern_bindings_into(pattern, &mut declared);
+                    }
+                    Expr::ForEach(_, item, _) => declared.extend(item.iter().copied()),
+                    _ => {}
+                }
+                push_expression_children(program, expr_id, &mut pending);
+            }
+            None => {}
+        }
+    }
+    for nested_id in nested {
+        referenced.extend(closure_captures(program, nested_id, memo).iter().copied());
+    }
+    referenced.retain(|binding| !declared.contains(binding));
+    let captures = Rc::new(referenced);
+    memo.insert(closure_id, captures.clone());
+    captures
 }
 
 /// The intrinsics that write their receiver in place (a `List` pop, a map's

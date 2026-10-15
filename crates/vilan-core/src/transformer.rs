@@ -2934,10 +2934,17 @@ struct Transformer<'src> {
     // `const` landed in the statement list, so the emitter can close a
     // `try`/`finally` around everything after it. Empty between statements.
     pending_temporaries: Vec<PendingTemporary>,
-    /// F138: every `mut` binding a closure captures
-    /// ([`crate::captures::captured_mut_bindings`]), computed at the first
-    /// call that could hand one on — see `transformer/argument_order.rs`.
+    /// F138: which `mut` bindings a closure captures — per function being
+    /// emitted (a local is captured only by a closure written inside the
+    /// function that declares it: the closures whose spans its span holds),
+    /// and over the whole program for a module-level binding, each computed
+    /// at the first call that could hand one on — see
+    /// `transformer/argument_order.rs`.
     captured_mut_bindings: std::cell::OnceCell<HashSet<Id>>,
+    function_captures: std::cell::RefCell<HashMap<Id, Rc<HashSet<Id>>>>,
+    closure_captures: std::cell::RefCell<crate::captures::ClosureCaptures>,
+    closure_spans: std::cell::OnceCell<Vec<argument_order::ClosureSpan>>,
+    module_bindings: std::cell::OnceCell<HashSet<Id>>,
     // Route-chunk partition (`bundle-splitting.md` S2): function id -> chunk
     // index, plus how many chunks there are. Empty for every build that did not
     // ask to split, which is what keeps single-file emission byte-identical —
@@ -3370,6 +3377,10 @@ impl<'src> Transformer<'src> {
             unrendered_concatenations: Vec::new(),
             pending_temporaries: Vec::new(),
             captured_mut_bindings: std::cell::OnceCell::new(),
+            function_captures: std::cell::RefCell::default(),
+            closure_captures: std::cell::RefCell::default(),
+            closure_spans: std::cell::OnceCell::new(),
+            module_bindings: std::cell::OnceCell::new(),
             chunk_members: HashMap::default(),
             chunk_count: 0,
             chunk_gate: None,
@@ -5765,8 +5776,8 @@ impl<'src> Transformer<'src> {
     }
 
     /// [`Self::walk_siblings_in_order`] with some siblings read LATE (F138: a
-    /// call's argument rooted at a captured `mut` binding, `late[i]` — see
-    /// `transformer/argument_order.rs`): a late sibling is never spilled
+    /// call's argument rooted at a captured `mut` binding, named in `late` —
+    /// see `transformer/argument_order.rs`): a late sibling is never spilled
     /// ahead of a later sibling's statements, and once every sibling is
     /// walked, each other one whose value is not settled is bound to a
     /// `const` in order, so the late ones are read after all of them. With
@@ -5774,26 +5785,24 @@ impl<'src> Transformer<'src> {
     fn walk_siblings_reading_late<F>(
         &mut self,
         ids: &[Id],
-        late: &[bool],
+        late: &[Id],
         block: &mut Vec<js::Node<'src>>,
         mut walk_one: F,
     ) -> Vec<(Id, js::Node<'src>)>
     where
         F: FnMut(&mut Self, Id, &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>>,
     {
-        let reads_late = |index: usize| late.get(index).copied().unwrap_or(false);
-        // Each entry carries its position, and whether it is already a
-        // `const` of our own, so a third sibling's statements never re-spill
-        // what a second's did.
-        let mut walked: Vec<(usize, Id, js::Node<'src>, bool)> = Vec::with_capacity(ids.len());
-        for (index, &id) in ids.iter().enumerate() {
+        // Each entry carries whether it is already a `const` of our own, so a
+        // third sibling's statements never re-spill what a second's did.
+        let mut walked: Vec<(Id, js::Node<'src>, bool)> = Vec::with_capacity(ids.len());
+        for &id in ids {
             let mut statements = Vec::new();
             let mark = self.pending_temporaries.len();
             let node = walk_one(self, id, &mut statements);
             if !statements.is_empty() {
-                for (earlier_index, earlier_id, earlier, spilled) in walked.iter_mut() {
+                for (earlier_id, earlier, spilled) in walked.iter_mut() {
                     if *spilled
-                        || reads_late(*earlier_index)
+                        || late.contains(earlier_id)
                         || self.sibling_value_is_settled(*earlier_id, earlier)
                     {
                         continue;
@@ -5817,12 +5826,12 @@ impl<'src> Transformer<'src> {
                 block.extend(statements);
             }
             if let Some(node) = node {
-                walked.push((index, id, node, false));
+                walked.push((id, node, false));
             }
         }
-        if late.contains(&true) {
-            for (index, id, node, spilled) in walked.iter_mut() {
-                if *spilled || reads_late(*index) || self.sibling_value_is_settled(*id, node) {
+        if !late.is_empty() {
+            for (id, node, spilled) in walked.iter_mut() {
+                if *spilled || late.contains(id) || self.sibling_value_is_settled(*id, node) {
                     continue;
                 }
                 let temp = self.ng.next_name();
@@ -5834,10 +5843,7 @@ impl<'src> Transformer<'src> {
                 *spilled = true;
             }
         }
-        walked
-            .into_iter()
-            .map(|(_, id, node, _)| (id, node))
-            .collect()
+        walked.into_iter().map(|(id, node, _)| (id, node)).collect()
     }
 
     /// Whether an already-lowered sibling reads the same whenever it is

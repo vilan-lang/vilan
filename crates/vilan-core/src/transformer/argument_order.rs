@@ -30,6 +30,16 @@ use crate::fx::FxHashSet as HashSet;
 use crate::id::Id;
 use crate::node::Convention;
 use crate::type_::{NUMERIC_PRIMITIVE_NAMES, SCALAR_PRIMITIVE_NAMES, Type, TypeId};
+use std::rc::Rc;
+
+/// One closure literal's place in the source, for finding the closures a
+/// function's span holds.
+pub(super) struct ClosureSpan {
+    source: Option<crate::analyzer::SourceId>,
+    start: usize,
+    end: usize,
+    closure: Id,
+}
 
 /// How a callee receives one argument — the native emitter's `Receiving`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,21 +51,27 @@ enum Receiving {
 
 impl<'src> Transformer<'src> {
     /// F138: which of `call`'s arguments are read after its later arguments —
-    /// empty when none is, so the walk is exactly B452's.
-    pub(super) fn arguments_read_late(&self, call_id: Id, call: &FunctionCall) -> Vec<bool> {
+    /// none, almost always, and then the walk is exactly B452's.
+    pub(super) fn arguments_read_late(&self, call_id: Id, call: &FunctionCall) -> Vec<Id> {
         let arguments = &call.argument_ids;
         if arguments.len() < 2 {
             return Vec::new();
         }
-        let captured = self
-            .captured_mut_bindings
-            .get_or_init(|| crate::captures::captured_mut_bindings(self.program));
-        if captured.is_empty()
-            || !arguments.iter().any(|argument| {
-                self.captured_spine_root(self.written_place(*argument))
-                    .is_some()
-            })
-        {
+        // Cheap questions first, since every call with two arguments asks:
+        // the last argument that runs code (none — nothing can wait), then an
+        // argument before it over a `mut` binding, and only then whether a
+        // closure captures that binding.
+        let Some(last_running) = arguments
+            .iter()
+            .rposition(|argument| !self.runs_no_code(*argument))
+        else {
+            return Vec::new();
+        };
+        let could_wait = arguments[..last_running].iter().any(|argument| {
+            self.spine_binding(self.written_place(*argument))
+                .is_some_and(|binding| self.is_a_mut_binding(binding) && self.is_captured(binding))
+        });
+        if !could_wait {
             return Vec::new();
         }
         let target = match self.program.entity_map.get(&call.subject_id) {
@@ -86,14 +102,10 @@ impl<'src> Transformer<'src> {
                     && self.takes_a_cell_view(arguments, index)
             })
             .collect();
-        let late: Vec<bool> = (0..arguments.len())
-            .map(|index| self.reads_late(arguments, &conventions, &takes_a_view, index))
-            .collect();
-        if late.contains(&true) {
-            late
-        } else {
-            Vec::new()
-        }
+        (0..arguments.len())
+            .filter(|index| self.reads_late(arguments, &conventions, &takes_a_view, *index))
+            .map(|index| arguments[index])
+            .collect()
     }
 
     /// F138 through a closure VALUE (a binding or a field holding one): no
@@ -102,7 +114,7 @@ impl<'src> Transformer<'src> {
     /// subject that runs no code, which would otherwise run after the
     /// arguments it preceded. A literal applied where it is written binds its
     /// parameters as `let`s in order natively, so nothing waits there.
-    fn closure_value_arguments_read_late(&self, call: &FunctionCall) -> Vec<bool> {
+    fn closure_value_arguments_read_late(&self, call: &FunctionCall) -> Vec<Id> {
         if matches!(
             self.program.entity_map.get(&call.subject_id),
             Some(Expr::Closure(_))
@@ -130,17 +142,13 @@ impl<'src> Transformer<'src> {
         };
         let arguments = &call.argument_ids;
         let no_views = vec![false; arguments.len()];
-        let late: Vec<bool> = (0..arguments.len())
-            .map(|index| {
-                conventions.get(index) != Some(&Receiving::RefMut)
-                    && self.reads_late(arguments, &conventions, &no_views, index)
+        (0..arguments.len())
+            .filter(|index| {
+                conventions.get(*index) != Some(&Receiving::RefMut)
+                    && self.reads_late(arguments, &conventions, &no_views, *index)
             })
-            .collect();
-        if late.contains(&true) {
-            late
-        } else {
-            Vec::new()
-        }
+            .map(|index| arguments[index])
+            .collect()
     }
 
     /// Whether the argument at `index` waits for the later ones: a view of
@@ -213,7 +221,7 @@ impl<'src> Transformer<'src> {
         intrinsic: crate::analyzer::Intrinsic,
         arguments: &[Id],
         conventions: &[Receiving],
-    ) -> Vec<bool> {
+    ) -> Vec<Id> {
         let receiver = arguments[0];
         let place = self.written_place(receiver);
         let writes = crate::captures::mutates_its_receiver(intrinsic)
@@ -227,13 +235,7 @@ impl<'src> Transformer<'src> {
             && arguments[1..]
                 .iter()
                 .any(|later| !self.runs_no_code(*later));
-        if late {
-            let mut late = vec![false; arguments.len()];
-            late[0] = true;
-            late
-        } else {
-            Vec::new()
-        }
+        if late { vec![receiver] } else { Vec::new() }
     }
 
     /// Whether `place` is a spine over a captured `mut` binding whose
@@ -267,7 +269,114 @@ impl<'src> Transformer<'src> {
     /// The captured `mut` binding `place` is a spine over — through fields,
     /// tuple slots and subscripts — and the spine's subscripts.
     fn captured_spine_root(&self, place: Id) -> Option<(Id, Vec<Id>)> {
-        let captured = self.captured_mut_bindings.get()?;
+        self.spine_root(place)
+            .filter(|(binding, _)| self.is_a_mut_binding(*binding) && self.is_captured(*binding))
+    }
+
+    /// Whether some closure captures `binding` (a `mut` one). A local is
+    /// captured only by a closure written inside the function that declares
+    /// it, so for one of the emitted function's own bindings the question is
+    /// asked of the closures inside that function alone; a module-level
+    /// binding (or code at module level) asks the whole program's table.
+    fn is_captured(&self, binding: Id) -> bool {
+        let module_level = self
+            .module_bindings
+            .get_or_init(|| {
+                self.program
+                    .modules
+                    .values()
+                    .flat_map(|module| module.body.0.iter())
+                    .filter_map(|statement| match self.program.entity_map.get(statement) {
+                        Some(Expr::Variable(binding)) => Some(*binding),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .contains(&binding);
+        if !module_level
+            && let Some(function_id) = self.emitting_stack.last().copied()
+            && let Some(captured) = self.function_capture_table(function_id)
+        {
+            return captured.contains(&binding);
+        }
+        self.captured_mut_bindings
+            .get_or_init(|| crate::captures::captured_mut_bindings(self.program))
+            .contains(&binding)
+    }
+
+    /// The `mut` bindings the closures inside one function capture, computed
+    /// once per function: the closures whose spans lie in the function's own
+    /// (a closure from another `[derive]` expansion that only seems to, in the
+    /// shared derived text, names none of this function's bindings). `None`
+    /// when the function has no span to ask by.
+    fn function_capture_table(&self, function_id: Id) -> Option<Rc<HashSet<Id>>> {
+        if let Some(table) = self.function_captures.borrow().get(&function_id) {
+            return Some(table.clone());
+        }
+        let span = self.program.span_map.get(&function_id)?;
+        let lookup = self.program.source_lookup();
+        let source = lookup.of(function_id)?;
+        let closures = self.closure_spans.get_or_init(|| {
+            let mut spans: Vec<ClosureSpan> = self
+                .program
+                .closures
+                .keys()
+                .map(|closure_id| {
+                    // A closure with no place in a source (none is minted so
+                    // today) is held by every function: sorted first, under
+                    // no source, and always asked.
+                    match (
+                        self.program.span_map.get(closure_id),
+                        lookup.of(*closure_id),
+                    ) {
+                        (Some(span), Some(source)) => ClosureSpan {
+                            source: Some(source),
+                            start: span.start,
+                            end: span.end,
+                            closure: *closure_id,
+                        },
+                        _ => ClosureSpan {
+                            source: None,
+                            start: 0,
+                            end: 0,
+                            closure: *closure_id,
+                        },
+                    }
+                })
+                .collect();
+            spans.sort_by_key(|closure| (closure.source, closure.start, closure.closure.0));
+            spans
+        });
+        let source = Some(source);
+        let placeless = closures.partition_point(|closure| closure.source.is_none());
+        let first = closures
+            .partition_point(|closure| (closure.source, closure.start) < (source, span.start));
+        let mut memo = self.closure_captures.borrow_mut();
+        let mut captured = HashSet::default();
+        for closure in closures[..placeless].iter().chain(
+            closures[first..]
+                .iter()
+                .take_while(|closure| closure.source == source && closure.start < span.end)
+                .filter(|closure| closure.end <= span.end),
+        ) {
+            captured.extend(
+                crate::captures::closure_captures(self.program, closure.closure, &mut memo)
+                    .iter()
+                    .copied()
+                    .filter(|binding| self.is_a_mut_binding(*binding)),
+            );
+        }
+        drop(memo);
+        let table = Rc::new(captured);
+        self.function_captures
+            .borrow_mut()
+            .insert(function_id, table.clone());
+        Some(table)
+    }
+
+    /// The binding `place` is a spine over — through fields, tuple slots and
+    /// subscripts — and the spine's subscripts.
+    fn spine_root(&self, place: Id) -> Option<(Id, Vec<Id>)> {
         let mut subscripts = Vec::new();
         let mut current = place;
         loop {
@@ -277,12 +386,32 @@ impl<'src> Transformer<'src> {
                     subscripts.push(subscript);
                     current = subject;
                 }
-                Expr::Local(binding) | Expr::Parameter(binding) if captured.contains(&binding) => {
+                Expr::Local(binding) | Expr::Parameter(binding) => {
                     return Some((binding, subscripts));
                 }
                 _ => return None,
             }
         }
+    }
+
+    /// [`Self::spine_root`]'s binding alone, collecting nothing.
+    fn spine_binding(&self, place: Id) -> Option<Id> {
+        let mut current = place;
+        loop {
+            match *self.program.entity_map.get(&current)? {
+                Expr::Field(subject, _, _)
+                | Expr::TupleIndex(subject, _, _)
+                | Expr::Index(subject, _) => current = subject,
+                Expr::Local(binding) | Expr::Parameter(binding) => return Some(binding),
+                _ => return None,
+            }
+        }
+    }
+
+    /// A binding the capture table can hold
+    /// ([`crate::captures::is_a_mut_binding`]).
+    fn is_a_mut_binding(&self, binding: Id) -> bool {
+        crate::captures::is_a_mut_binding(self.program, binding)
     }
 
     /// The callee's parameter modes by position (none known: by value).
