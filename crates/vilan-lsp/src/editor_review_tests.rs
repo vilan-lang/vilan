@@ -837,6 +837,7 @@ fn e311_a_function_reached_through_a_path_paints_as_a_function() {
             vec![
                 pair("padding", "Property"),
                 pair("style", "Namespace"),
+                pair("Length", "Struct"),
                 pair("px", "Function")
             ]
         );
