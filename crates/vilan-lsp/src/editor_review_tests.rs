@@ -2020,12 +2020,69 @@ fn e317_a_returned_variant_hovers_with_the_expected_instantiation() {
         };
         assert_eq!(first_line("None\n}"), "Option<i32>::None");
         assert_eq!(first_line("None;\n\t}\n\tSome"), "Option<str>::None");
-        assert_eq!(first_line("Some(\"x\")"), "Option<str>::Some");
+        assert_eq!(first_line("Some(\"x\")"), "Option<str>::Some(str)");
         assert_eq!(first_line("None;\n\tlet some"), "Option<i32>::None");
-        assert_eq!(first_line("Some(1);"), "Option<i32>::Some");
+        assert_eq!(first_line("Some(1);"), "Option<i32>::Some(i32)");
         assert_eq!(first_line("None);\n}"), "Option<f64>::None");
-        assert_eq!(first_line("Ok(1)"), "Result<i32, str>::Ok");
-        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err");
+        assert_eq!(first_line("Ok(1)"), "Result<i32, str>::Ok(i32)");
+        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err(str)");
+    });
+}
+
+/// E328: a generic enum's payload variant in value position spells its
+/// PAYLOAD under the instantiation the position settled - `Option<i32>::Some(i32)`,
+/// as a pattern's label does (E241) - in a return, a binding and an argument; a
+/// variant of a non-generic enum reads its declared payload as before.
+#[test]
+fn e328_a_generic_payload_variant_hovers_with_its_instantiated_payload() {
+    on_big_stack(|| {
+        let client = "enum Shape {\n\tDot,\n\tCircle(f64),\n}\n\n\
+             fun some(): Option<i32> {\n\tSome(1)\n}\n\n\
+             fun ok(): Result<i32, str> {\n\tret Ok(2);\n}\n\n\
+             fun err(): Result<i32, str> {\n\tErr(\"no\")\n}\n\n\
+             fun pairs(): Result<List<i32>, (str, bool)> {\n\tErr((\"x\", true))\n}\n\n\
+             fun take(value: Option<f64>, other: Result<str, i32>): i32 {\n\t\
+             match (value, other) {\n\t\t(Some(_), _) => 1,\n\t\t_ => 0,\n\t}\n}\n\n\
+             fun main() {\n\
+             \tlet bound: Option<str> = Some(\"b\");\n\
+             \tlet inferred = Some(3);\n\
+             \tlet shape = Shape::Circle(1.0);\n\
+             \tlet dot = Shape::Dot;\n\
+             \tlet _ = (bound, inferred, shape, dot, some(), ok(), err(), pairs());\n\
+             \tlet _ = take(Some(1.5), Ok(\"s\"));\n\
+             \tlet _ = take(None, Err(4));\n}\n";
+        let package = Package::new("e328", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let first_line = |needle: &str| {
+            let hover = document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover.lines().nth(1).unwrap_or_default().to_string()
+        };
+        // A return: the tail, a `ret`, and an `Err`.
+        assert_eq!(first_line("Some(1)\n}"), "Option<i32>::Some(i32)");
+        assert_eq!(first_line("Ok(2)"), "Result<i32, str>::Ok(i32)");
+        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err(str)");
+        assert_eq!(
+            first_line("Err((\"x\""),
+            "Result<List<i32>, (str, bool)>::Err((str, bool))"
+        );
+        // A binding: annotated, and inferred from the value.
+        assert_eq!(first_line("Some(\"b\")"), "Option<str>::Some(str)");
+        assert_eq!(first_line("Some(3)"), "Option<i32>::Some(i32)");
+        // An argument: against the declared parameter's instantiation.
+        assert_eq!(first_line("Some(1.5)"), "Option<f64>::Some(f64)");
+        assert_eq!(first_line("Ok(\"s\")"), "Result<str, i32>::Ok(str)");
+        assert_eq!(first_line("Err(4)"), "Result<str, i32>::Err(i32)");
+        assert_eq!(first_line("None, Err"), "Option<f64>::None");
+        // A non-generic enum is unchanged.
+        assert_eq!(first_line("Circle(1.0)"), "Shape::Circle(f64)");
+        assert_eq!(first_line("Dot;"), "Shape::Dot");
     });
 }
 

@@ -31,6 +31,9 @@ written down.
 <!-- family: fix -->
 **E327: the module segments of a qualified pattern and of a qualified struct literal paint, hover and rename like the same path in a value or a type position - `lib` and `deep` in `lib::deep::Mode::On =>` and in `lib::deep::Overlay { open = true }` painted nothing, and find-references or rename from a `deep` elsewhere skipped them.** E315 gave a written `a::B` path in value and type positions a row per module segment; the pattern resolution (`resolve_pattern`'s variant arm) and the struct-literal resolution (`resolve_struct_initializer`) recorded only the enum or struct name. Both now record a Namespace row per MODULE segment (the pattern's walk reports the modules it descended through; a module directly before a bare variant is no longer filed as the enum). Renaming a struct also stopped corrupting a qualified literal: the reference index derived a second row for a literal from its start, `lib::de` for `lib::deep::Overlay { .. }`, which a rename of `Overlay` replaced with the new name; the analyzer's exact row for the name was always there, so the derived row is gone.
 
+<!-- family: fix -->
+**E328: a generic enum's payload variant in value position hovers with its payload under the instantiation its position settled - `Some` in `Some(1)` read `Option<i32>::Some` where a pattern reads `Option<i32>::Some(i32)`, and so did `Ok(1)`, `Err("no")`, a bound `Some("b")` and an argument `take(Some(1.5))`.** E317 settled the instantiation for a variant in value position but the hover spelled the declared payload only for an enum with no parameters. The table that carries the instantiation (`variant_use_labels`) now holds the whole variant line, the payload spelled under the instantiation's arguments the way `pattern_labels` spells a pattern's; the hover reads that line as it stands, and a non-generic enum's hover is unchanged.
+
 ## v0.51.0 — 2026-10-16
 
 <!-- family: miscompile -->
