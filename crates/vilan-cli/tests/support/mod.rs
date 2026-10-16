@@ -268,9 +268,11 @@ pub fn kill_watcher(watcher: &mut Child) {
     let script = std::env::temp_dir().join(format!("vilan-watch-{}.mjs", watcher.id()));
     let _ = watcher.kill();
     let _ = watcher.wait();
-    // And the script's source map beside it (E257 S6).
-    let mut map = script.clone().into_os_string();
-    map.push(".map");
-    let _ = std::fs::remove_file(map);
+    // And the script's source map (E257 S6) and debugger sidecar (S7) beside it.
+    for suffix in [".map", ".vdbg.json"] {
+        let mut beside = script.clone().into_os_string();
+        beside.push(suffix);
+        let _ = std::fs::remove_file(beside);
+    }
     let _ = std::fs::remove_file(script);
 }

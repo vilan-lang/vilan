@@ -1305,7 +1305,11 @@ fun fresh_list<T>(list: List<T>): List<T> {
 fun apply_ops<T>(cell: ListCell<T>, ops: List<SeqOp<T>>) {
 	for op in ops {
 		match op {
-			SeqOp::Splice(let at, let removed, let inserted) => cell.splice(at, removed.len(), inserted),
+			SeqOp::Splice(let at, let removed, let inserted) => cell.splice(
+				at,
+				removed.len(),
+				inserted,
+			),
 			SeqOp::SetAt(let at, let _was, let value) => cell.set_at(at, value),
 			SeqOp::Reset(let items) => cell.set(items),
 			SeqOp::Move(let from, let count, let to) => cell.move_range(from, count, to),
@@ -1717,7 +1721,9 @@ fun resolve<T, V>(core: ElementCore<T, V>, ops: List<SeqOp<T>>): List<ElementEve
 							let before = core.values.read()[at];
 							let now = (hold.pull)();
 							core.values.write()[at] = now;
-							events.push(ElementEvent::Changed(at, (item, before), (item, now), false));
+							events.push(
+								ElementEvent::Changed(at, (item, before), (item, now), false),
+							);
 						}
 					},
 					None => {},
@@ -1946,8 +1952,12 @@ fun mapped_ops<T, U>(events: List<ElementEvent<T, U>>): List<SeqOp<U>> {
 			ElementEvent::Changed(let at, let before, let after, let _rerun) => {
 				ops.push(SeqOp::SetAt(at, before.1, after.1));
 			},
-			ElementEvent::Reset(let _left, let now) => ops.push(SeqOp::Reset(now.map(|pair| pair.1))),
-			ElementEvent::Moved(let from, let count, let to) => ops.push(SeqOp::Move(from, count, to)),
+			ElementEvent::Reset(let _left, let now) => ops.push(
+				SeqOp::Reset(now.map(|pair| pair.1)),
+			),
+			ElementEvent::Moved(let from, let count, let to) => ops.push(
+				SeqOp::Move(from, count, to),
+			),
 		}
 	}
 	ops
@@ -1966,7 +1976,14 @@ export impl CollFlatten<type F: CollFlow<type S>, type S: Source<type U>, U> wit
 		// Each source is started as the `Source` blanket starts one, written out:
 		// read with `get`, attached with `on_settle`, nothing to release.
 		let core: ElementCore<S, U> = element_core(Owner::new(), |source: S| {
-			(ElementRun<U>::Live(Instance<U> { pull = || source.get(), attach = |subscriber: Subscriber| source.on_settle(subscriber), release = || {} }), None)
+			(
+				ElementRun<U>::Live(Instance<U> {
+					pull = || source.get(),
+					attach = |subscriber: Subscriber| source.on_settle(subscriber),
+					release = || {},
+				}),
+				None
+			)
 		});
 		seed(core, (upstream.snapshot)());
 		let drain = upstream.drain;
@@ -2069,7 +2086,13 @@ export impl CollFilterMap<type F: CollFlow<type T>, T, type R: IntoFlow<Option<t
 				out
 			},
 			attach = core_attach(core, upstream),
-			drain = || kept_ops(kept, index, resolve(core, drain()), |pair: (T, Option<U>)| pair.1, true),
+			drain = || kept_ops(
+				kept,
+				index,
+				resolve(core, drain()),
+				|pair: (T, Option<U>)| pair.1,
+				true,
+			),
 			release = core_release(core, upstream),
 		}
 	}
@@ -2433,7 +2456,13 @@ fun keyed_ops<T: SameElement, K: PartialEq + Hashable>(
 	for item in before {
 		old_keys.push(key(item));
 	}
-	let plan = reconcile(old_keys, before, after, |item: T| key(item), |was: T, now: T| was.same_element(now));
+	let plan = reconcile(
+		old_keys,
+		before,
+		after,
+		|item: T| key(item),
+		|was: T, now: T| was.same_element(now),
+	);
 	mut ops: List<SeqOp<T>> = [];
 	// What stands now, as old indices (`None` for an arrival), with its values.
 	mut standing: List<Option<usize>> = [];
@@ -3072,11 +3101,15 @@ fun ranked_ops<K: Hashable, V, U>(
 		match op {
 			MapOp::Put(let key, let was, let now) => {
 				match (face_rank(face, key.hash()), was) {
-					(Some(let rank), Some(let before)) => produced.push(SeqOp::SetAt(rank, out(key, before), out(key, now))),
+					(Some(let rank), Some(let before)) => produced.push(
+						SeqOp::SetAt(rank, out(key, before), out(key, now)),
+					),
 					// A producer that said "new" of a key the face holds: an
 					// in-place change whose old element is not known — the new one
 					// stands in for it.
-					(Some(let rank), None) => produced.push(SeqOp::SetAt(rank, out(key, now), out(key, now))),
+					(Some(let rank), None) => produced.push(
+						SeqOp::SetAt(rank, out(key, now), out(key, now)),
+					),
 					(None, _) => {
 						let rank = face_append(face, key.hash());
 						produced.push(SeqOp::Splice(rank, [], [out(key, now)]));
@@ -3205,7 +3238,14 @@ fun keyed_resolve<K: Hashable, V, U>(
 						// new run is a slot of its own.
 						keyed_retire(keyed, row);
 						let fresh = keyed_admit(keyed, key, input);
-						events.push(KeyEvent::Changed(key, (row.input, row.value), (fresh.input, fresh.value), true));
+						events.push(
+							KeyEvent::Changed(
+								key,
+								(row.input, row.value),
+								(fresh.input, fresh.value),
+								true,
+							),
+						);
 					},
 					None => {
 						let fresh = keyed_admit(keyed, key, input);
@@ -3260,7 +3300,14 @@ fun keyed_resolve<K: Hashable, V, U>(
 										value = now,
 										id = row.id,
 									});
-								events.push(KeyEvent::Changed(row.key, (row.input, row.value), (row.input, now), false));
+								events.push(
+									KeyEvent::Changed(
+										row.key,
+										(row.input, row.value),
+										(row.input, now),
+										false,
+									),
+								);
 							}
 						},
 						None => {},
@@ -3498,11 +3545,15 @@ fun mapped_map_ops<K: Hashable, V, U>(events: List<KeyEvent<K, V, U>>): List<Map
 	mut produced: List<MapOp<K, U>> = [];
 	for event in events {
 		match event {
-			KeyEvent::Arrived(let key, let _input, let value) => produced.push(MapOp::Put(key, None, value)),
+			KeyEvent::Arrived(let key, let _input, let value) => produced.push(
+				MapOp::Put(key, None, value),
+			),
 			KeyEvent::Changed(let key, let before, let after, let _rerun) => {
 				produced.push(MapOp::Put(key, Some(before.1), after.1));
 			},
-			KeyEvent::Left(let key, let _input, let value) => produced.push(MapOp::Delete(key, value)),
+			KeyEvent::Left(let key, let _input, let value) => produced.push(
+				MapOp::Delete(key, value),
+			),
 			KeyEvent::Reset(let rows) => {
 				mut map: HashMap<K, U> = HashMap::new();
 				for row in rows {

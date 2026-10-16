@@ -769,6 +769,74 @@ fn the_extensions_own_tests_pass() {
     );
 }
 
+/// E257 S7's gate (debugging.md §10's S7 row): scripted debug sessions over
+/// vilan-dap against THIS build's `vilan` — the Variables pane compared with
+/// `dbg`'s output for every printer shape, in the plain shape and the watch
+/// shape, plus the frames, the Watch pane's paths and stepping
+/// (`editors/vscode/src/test/session.test.ts`). `the_extensions_own_tests_pass`
+/// runs the same file without a binary, where its sessions skip.
+#[test]
+fn e257_s7_the_debug_adapters_scripted_sessions_pass() {
+    let modules = extension_dir().join("node_modules");
+    if !modules.join("esbuild/package.json").is_file() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must run `npm ci --prefix editors/vscode` before the suite"
+        );
+        eprintln!("skipped: run `npm ci --prefix editors/vscode` to run the debug sessions");
+        return;
+    }
+    let session = extension_dir().join("src/test/session.test.ts");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("vscode-debug-sessions");
+    let _ = std::fs::remove_dir_all(&out);
+    let script = format!(
+        "require({}).buildSync({{ entryPoints: [{}], bundle: true, format: 'cjs', \
+         platform: 'node', outdir: {} }})",
+        json_string(&modules.join("esbuild").to_string_lossy()),
+        json_string(&session.to_string_lossy()),
+        json_string(&out.to_string_lossy()),
+    );
+    let bundled = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("run esbuild");
+    assert!(
+        bundled.status.success(),
+        "bundling the debug sessions: {}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    // The sessions' fixture copies and `vilan run`'s temp scripts go to this
+    // test's own directory, not the tmpfs every worktree shares (N82).
+    let temp = out.join("tmp");
+    std::fs::create_dir_all(&temp).expect("the sessions' temp directory");
+    let run = Command::new("node")
+        .arg("--test")
+        .arg(out.join("session.test.js"))
+        .env("TMPDIR", &temp)
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
+        .env("VILAN_BIN", env!("CARGO_BIN_EXE_vilan"))
+        .env(
+            "VILAN_DAP_FIXTURES",
+            extension_dir().join("src/test/fixtures"),
+        )
+        .output()
+        .expect("run node --test");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.status.success(), "the debug sessions failed:\n{report}");
+    // Run, not skipped: a session that cannot find the binary skips itself.
+    // The watch shape is pinned on unix, as `watch_lifecycle` is.
+    let ran = if cfg!(unix) { 4 } else { 3 };
+    assert!(
+        report.contains(&format!("# pass {ran}")) || report.contains(&format!("ℹ pass {ran}")),
+        "{ran} sessions ran:\n{report}"
+    );
+}
+
 /// `text` as a JSON (and so JavaScript) string literal.
 fn json_string(text: &str) -> String {
     let mut literal = String::from("\"");

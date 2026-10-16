@@ -1,8 +1,9 @@
-// F135's binding half (spec §6.9, not §6.7's `read()`): a `&self` call on a
-// captured `mut` binding whose later argument RE-BINDS the binding whole. The
-// native view of the binding's cell is taken after the other arguments, as
-// §6.9's native note orders it, and sees the new value; the JS receiver is
-// the object the binding held when it was evaluated, and does not.
+// F138 (F135's binding half; spec §6.9, not §6.7's `read()`): a `&self` call
+// on a captured `mut` binding whose later argument RE-BINDS the binding
+// whole. The view of the binding is taken after the other arguments on both
+// backends (§6.9's order; R-a door (1)), so the callee sees the new value;
+// the JS receiver had been the object the binding held when it was
+// evaluated.
 import std::io::print;
 
 struct Words {

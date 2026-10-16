@@ -212,8 +212,14 @@ fun note_editor(
 		Some(let note) => (note.title, note.body),
 		None => ("", ""),
 	};
-	let title = draft(seed_title, |value: str| commit_outcome(client.retitle_note(token.get(), note_id, value), note_id));
-	let body = draft(seed_body, |value: str| commit_outcome(client.rewrite_note(token.get(), note_id, value), note_id));
+	let title = draft(
+		seed_title,
+		|value: str| commit_outcome(client.retitle_note(token.get(), note_id, value), note_id),
+	);
+	let body = draft(
+		seed_body,
+		|value: str| commit_outcome(client.rewrite_note(token.get(), note_id, value), note_id),
+	);
 
 	// Remote edits (another session's typing — or our own echo) fold in.
 	entry.effect(|current| {

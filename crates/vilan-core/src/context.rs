@@ -3915,15 +3915,36 @@ fn apply(program: &mut Program, plan: Plan, canonical: bool) {
     // Each call to a needs-context function gets the value appended as an
     // argument — the caller's parameter, `Some`-wrapped at a covered→safe
     // boundary.
+    //
+    // M137: a bare pass-through is ONE reference entity per (context, node) —
+    // the same `Expr::Local(parameter)` read in every threaded call the node
+    // makes — not a fresh one per call: kolt's client threads 66k arguments
+    // out of ~6.9k hidden parameters, and minting each one doubled the entity
+    // map on every analysis. A read entity carries no position of its own
+    // (no span, no type label, no clone decision — the analyzer's tables were
+    // settled before this pass), and the native backend's last-use walk
+    // exempts a hidden parameter's reads (M151), the one reader that keyed a
+    // decision by the read entity. The node is the CALLER (the graph node the
+    // call sits in), so a closure keeps its own entity even where it reads its
+    // provider's parameter. A `Some(..)` wrap stays per call: it is a CALL,
+    // and a call entity is a position (awaits, dispatch records, spans).
+    // The cold rows come first (`cold_rows_first`), and a cold call's node is
+    // cold, so a shared cold entity is minted by the first cold row that asks
+    // and the cold mint sequence is still a function of the cold rows alone.
+    let mut pass_through: HashMap<(Id, Id), Id> = HashMap::default();
     for &(call_id, context, ref form) in &plan.thread_calls {
         let argument = match *form {
             ThreadForm::Param { owner } => {
                 let Some(&parameter) = source.get(&(context, owner.id())) else {
                     continue;
                 };
-                let reference = fresh();
-                program.entity_map.insert(reference, Expr::Local(parameter));
-                reference
+                *pass_through
+                    .entry((context, owner.id()))
+                    .or_insert_with(|| {
+                        let reference = fresh();
+                        program.entity_map.insert(reference, Expr::Local(parameter));
+                        reference
+                    })
             }
             ThreadForm::WrapSome { owner } => {
                 let Some(&parameter) = source.get(&(context, owner.id())) else {

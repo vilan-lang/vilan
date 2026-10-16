@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use vilan_core::incremental::{
     Census, clean_analysis, clean_analysis_keeping_hot_shape, render_observation,
 };
-use vilan_core::{BuildOptions, Platform, Workspace, analyze_source, transform};
+use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
 
 use super::std_spec;
 
@@ -35,10 +35,31 @@ pub struct Package {
     pub platform: Platform,
     /// The text each file holds NOW (the overlay's, once edited).
     pub texts: Vec<(String, String)>,
+    /// M152: the dependency packages beside it — each one's import name and
+    /// its root, written as a `[library]` (a `lib.vl` surface) outside the
+    /// package's own root. Empty for every fixture but the dependency ones.
+    pub dependencies: Vec<(String, PathBuf)>,
+}
+
+/// M152: a dependency package a fixture imports (`import shapes::Shape`): its
+/// import name and its files, `lib.vl` the surface.
+pub struct Dependency {
+    pub name: &'static str,
+    pub files: &'static [(&'static str, &'static str)],
 }
 
 impl Package {
     pub fn write(name: &str, platform: Platform, files: &[(&str, &str)]) -> Package {
+        Package::write_with(name, platform, files, &[])
+    }
+
+    /// [`Package::write`] with `dependencies` written beside it (M152).
+    pub fn write_with(
+        name: &str,
+        platform: Platform,
+        files: &[(&str, &str)],
+        dependencies: &[Dependency],
+    ) -> Package {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -54,6 +75,29 @@ impl Package {
             }
             std::fs::write(path, text).expect("write a package file");
         }
+        let dependencies = dependencies
+            .iter()
+            .map(|dependency| {
+                let root = directory
+                    .with_file_name(format!(
+                        "{}_deps",
+                        directory
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ))
+                    .join(dependency.name);
+                let _ = std::fs::remove_dir_all(&root);
+                for (file, text) in dependency.files {
+                    let path = root.join(file);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).expect("create a dependency directory");
+                    }
+                    std::fs::write(path, text).expect("write a dependency file");
+                }
+                (dependency.name.to_string(), root)
+            })
+            .collect();
         Package {
             entry: directory.join("main.vl"),
             directory,
@@ -62,6 +106,38 @@ impl Package {
                 .iter()
                 .map(|(file, text)| (file.to_string(), text.to_string()))
                 .collect(),
+            dependencies,
+        }
+    }
+
+    /// The workspace an analysis of this package runs in: its dependencies as
+    /// `[library]` packages (M152), and the editor's shape otherwise.
+    pub fn workspace(&self, seeds: Vec<PathBuf>) -> Workspace {
+        Workspace {
+            packages: self
+                .dependencies
+                .iter()
+                .map(|(_, root)| PackageSpec {
+                    base_root: root.clone(),
+                    layers: Vec::new(),
+                    dependencies: Vec::new(),
+                    surface: true,
+                    member: false,
+                    prelude: Default::default(),
+                })
+                .collect(),
+            entry_dependencies: self
+                .dependencies
+                .iter()
+                .enumerate()
+                .map(|(index, (name, _))| (name.clone(), index))
+                .collect(),
+            hot_seeds: seeds,
+            // The editor's shape (M148): the language server analyzes under
+            // the reading aids, which is what makes every file render — and
+            // record — its hover rows.
+            reading_aids: true,
+            ..Workspace::default()
         }
     }
 
@@ -96,6 +172,11 @@ impl Package {
             vilan_core::analyzer::set_document_overlay(&self.path(file), None);
         }
         let _ = std::fs::remove_dir_all(&self.directory);
+        if let Some((_, root)) = self.dependencies.first()
+            && let Some(deps) = root.parent()
+        {
+            let _ = std::fs::remove_dir_all(deps);
+        }
     }
 }
 
@@ -130,14 +211,11 @@ pub fn observe(package: &Package, seeds: Vec<PathBuf>, leg: Leg) -> Observation 
     let pkg_root = package.directory.clone();
     let entry = package.entry.clone();
     let platform = package.platform;
+    let workspace = package.workspace(seeds);
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
             let leaked: &'static str = Box::leak(entry_text.into_boxed_str());
-            let workspace = Workspace {
-                hot_seeds: seeds,
-                ..Workspace::default()
-            };
             let analyze = || {
                 analyze_source(
                     leaked,
@@ -678,6 +756,8 @@ pub struct Fixture {
     pub platform: Platform,
     pub files: &'static [(&'static str, &'static str)],
     pub edits: &'static [Edit],
+    /// M152: the dependency packages the fixture imports (empty for most).
+    pub dependencies: &'static [Dependency],
 }
 
 impl Fixture {
@@ -709,7 +789,7 @@ impl Fixture {
     }
 
     pub fn write(&self) -> Package {
-        Package::write(self.name, self.platform, self.files)
+        Package::write_with(self.name, self.platform, self.files, self.dependencies)
     }
 }
 
@@ -775,6 +855,7 @@ pub const POST_PASS_FIXTURES: &[Fixture] = &[
             ("views.vl", POST_PASS_VIEWS),
         ],
         edits: POST_PASS_EDITS,
+        dependencies: &[],
     },
     Fixture {
         name: "post_pass_coverage",
@@ -785,6 +866,7 @@ pub const POST_PASS_FIXTURES: &[Fixture] = &[
             ("views.vl", POST_PASS_VIEWS),
         ],
         edits: POST_PASS_EDITS,
+        dependencies: &[],
     },
     Fixture {
         name: "post_pass_platform",
@@ -795,6 +877,7 @@ pub const POST_PASS_FIXTURES: &[Fixture] = &[
             ("views.vl", POST_PASS_VIEWS),
         ],
         edits: POST_PASS_EDITS,
+        dependencies: &[],
     },
     Fixture {
         name: "post_pass_const",
@@ -805,6 +888,7 @@ pub const POST_PASS_FIXTURES: &[Fixture] = &[
             ("views.vl", POST_PASS_VIEWS),
         ],
         edits: POST_PASS_EDITS,
+        dependencies: &[],
     },
 ];
 
@@ -832,6 +916,7 @@ pub const B554_FIXTURE: Fixture = Fixture {
         ),
     ],
     edits: &[],
+    dependencies: &[],
 };
 
 // --- the fixtures as the permutation differential iterates them -------------------
@@ -841,6 +926,7 @@ pub const CLASSES_FIXTURE: Fixture = Fixture {
     platform: NODE,
     files: CLASSES_FILES,
     edits: CLASS_EDITS,
+    dependencies: &[],
 };
 
 pub const SERVED_IMPL_FIXTURE: Fixture = Fixture {
@@ -848,6 +934,7 @@ pub const SERVED_IMPL_FIXTURE: Fixture = Fixture {
     platform: NODE,
     files: CLASSES_FILES,
     edits: SERVED_IMPL_EDITS,
+    dependencies: &[],
 };
 
 pub const ENTRY_IMPL_FIXTURE: Fixture = Fixture {
@@ -859,6 +946,7 @@ pub const ENTRY_IMPL_FIXTURE: Fixture = Fixture {
         ("waver.vl", ENTRY_IMPL_WAVER),
     ],
     edits: ENTRY_IMPL_EDITS,
+    dependencies: &[],
 };
 
 pub const PLATFORM_FIXTURE: Fixture = Fixture {
@@ -870,6 +958,7 @@ pub const PLATFORM_FIXTURE: Fixture = Fixture {
         ("twin.vl", PLATFORM_TWIN),
     ],
     edits: PLATFORM_EDITS,
+    dependencies: &[],
 };
 
 pub const LEAF_FIXTURE: Fixture = Fixture {
@@ -883,6 +972,7 @@ pub const LEAF_FIXTURE: Fixture = Fixture {
         ("hub.vl", PINS_HUB),
     ],
     edits: LEAF_EDITS,
+    dependencies: &[],
 };
 
 // --- M128: answers chosen by first match over a load-ordered table (§5.6) ---------
@@ -957,6 +1047,7 @@ pub const M128_FIXTURES: &[Fixture] = &[
             ("user.vl", M128_CALLABLE_USER),
         ],
         edits: &[],
+        dependencies: &[],
     },
     Fixture {
         name: "m128_macro",
@@ -967,6 +1058,7 @@ pub const M128_FIXTURES: &[Fixture] = &[
             ("z_macros.vl", M128_MACRO_Z),
         ],
         edits: &[],
+        dependencies: &[],
     },
     Fixture {
         name: "m128_import_path",
@@ -977,6 +1069,7 @@ pub const M128_FIXTURES: &[Fixture] = &[
             ("user.vl", M128_IMPORT_PATH_USER),
         ],
         edits: &[],
+        dependencies: &[],
     },
     Fixture {
         name: "m128_for_each",
@@ -997,6 +1090,7 @@ pub const M128_FIXTURES: &[Fixture] = &[
                 "import pkg::p1 only;\nimport pkg::p9;\n",
             )],
         }],
+        dependencies: &[],
     },
 ];
 
@@ -1025,43 +1119,84 @@ const BOUND_BOUNDED: &str = "import pkg::shapes::{ Bar, Foo, Shine };\n\nfun nee
 
 const BOUND_MAIN: &str = "import pkg::bounded::bounded;\nimport pkg::shine;\nimport pkg::views::render;\n\nfun main() {\n\tprint(bounded());\n\tprint(render());\n}\n";
 
-pub const BOUND_FIXTURES: &[Fixture] = &[Fixture {
-    name: "bound_audit",
-    platform: NODE,
-    files: &[
-        ("main.vl", BOUND_MAIN),
-        ("shapes.vl", BOUND_SHAPES),
-        ("shine.vl", BOUND_SHINE),
-        ("bounded.vl", BOUND_BOUNDED),
-        ("views.vl", POST_PASS_VIEWS),
-    ],
-    edits: &[
-        Edit {
-            label: "a statement typed into the leaf beside the prefix module's bound refusal",
-            file: "views.vl",
-            seed: None,
-            replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
-        },
-        Edit {
-            label: "a statement typed into the entry beside the prefix module's bound refusal",
-            file: "main.vl",
-            seed: None,
-            replacements: &[(
-                "\tprint(render());\n",
-                "\tprint(render());\n\tlet extra = 1;\n",
-            )],
-        },
-        Edit {
-            label: "the impl a prefix module's bound is satisfied through, moved to the other type",
-            file: "shine.vl",
-            seed: None,
-            replacements: &[(
-                "export impl Foo with Shine {",
-                "export impl Bar with Shine {",
-            )],
-        },
-    ],
-}];
+pub const BOUND_FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "bound_audit",
+        platform: NODE,
+        files: &[
+            ("main.vl", BOUND_MAIN),
+            ("shapes.vl", BOUND_SHAPES),
+            ("shine.vl", BOUND_SHINE),
+            ("bounded.vl", BOUND_BOUNDED),
+            ("views.vl", POST_PASS_VIEWS),
+        ],
+        edits: &[
+            Edit {
+                label: "a statement typed into the leaf beside the prefix module's bound refusal",
+                file: "views.vl",
+                seed: None,
+                replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+            },
+            Edit {
+                label: "a statement typed into the entry beside the prefix module's bound refusal",
+                file: "main.vl",
+                seed: None,
+                replacements: &[(
+                    "\tprint(render());\n",
+                    "\tprint(render());\n\tlet extra = 1;\n",
+                )],
+            },
+            Edit {
+                label: "the impl a prefix module's bound is satisfied through, moved to the other type",
+                file: "shine.vl",
+                seed: None,
+                replacements: &[(
+                    "export impl Foo with Shine {",
+                    "export impl Bar with Shine {",
+                )],
+            },
+        ],
+        dependencies: &[],
+    },
+    // M150: the same shape at a WRITTEN application (B251, `check_written_
+    // nominal_bounds`) — a prefix module annotating `Holder<Foo>` (satisfied
+    // through the hot module's impl) and `Holder<Bar>` (refused) — whose sites
+    // ride M143's module lane: skipped for a reused module, their refusals
+    // replayed from the audit's record under its late-impl guard.
+    Fixture {
+        name: "written_bound_audit",
+        platform: NODE,
+        files: &[
+            ("main.vl", WRITTEN_MAIN),
+            ("shapes.vl", BOUND_SHAPES),
+            ("shine.vl", BOUND_SHINE),
+            ("written.vl", WRITTEN_HELD),
+            ("views.vl", POST_PASS_VIEWS),
+        ],
+        edits: &[
+            Edit {
+                label: "a statement typed into the leaf beside the prefix module's written-bound refusal",
+                file: "views.vl",
+                seed: None,
+                replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+            },
+            Edit {
+                label: "the impl a prefix module's written bound is satisfied through, moved to the other type",
+                file: "shine.vl",
+                seed: None,
+                replacements: &[(
+                    "export impl Foo with Shine {",
+                    "export impl Bar with Shine {",
+                )],
+            },
+        ],
+        dependencies: &[],
+    },
+];
+
+const WRITTEN_HELD: &str = "import pkg::shapes::{ Bar, Foo, Shine };\n\nstruct Holder<T: Shine> {\n\tvalue: T,\n}\n\nexport fun held(foo: Holder<Foo>, bar: Holder<Bar>): i32 {\n\t1\n}\n";
+
+const WRITTEN_MAIN: &str = "import pkg::written::held;\nimport pkg::shine;\nimport pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
 
 // --- M110 S3: the effect classes (incr-50, Order 50; pass map §6, §7.2) ----------
 //
@@ -1130,6 +1265,7 @@ pub const EFFECT_FIXTURES: &[Fixture] = &[
                 replacements: &[("\ttime::sleep(1);\n\t1\n", "\t1\n")],
             },
         ],
+        dependencies: &[],
     },
     Fixture {
         name: "effects_browser",
@@ -1158,6 +1294,7 @@ pub const EFFECT_FIXTURES: &[Fixture] = &[
                 )],
             },
         ],
+        dependencies: &[],
     },
 ];
 
@@ -1209,6 +1346,7 @@ pub const WINDOW_FIXTURES: &[Fixture] = &[Fixture {
             replacements: &[("[derive(PartialEq)]\n", "")],
         },
     ],
+    dependencies: &[],
 }];
 
 // --- B569: a labelled tuple in a reused module (lang-a-49, Order 49) -------------
@@ -1250,4 +1388,126 @@ pub const LABELS_FIXTURE: Fixture = Fixture {
             )],
         },
     ],
+    dependencies: &[],
 };
+
+// --- M152: programs with DEPENDENCIES (the std-and-dependencies prefix) ------
+//
+// A package with a module of its own (`report.vl`, hot over the prefix) and a
+// `[library]` dependency with a surface that re-exports a module of its own
+// (`shapes::geometry`), so the dependency tier holds a surface walk, a module
+// walk and a re-export; and `examples/fullstack`'s two members over its shared
+// `common` library, as the example ships them.
+
+pub const DEPENDENCY_MAIN: &str = "import std::io::print;\nimport pkg::report::summary;\n\nfun main() {\n\tprint(summary());\n}\n";
+
+pub const DEPENDENCY_REPORT: &str = "import std::display::Display;\nimport shapes::{ Shape, area, describe };\n\nexport fun summary(): str {\n\tlet total = area(Shape::Square(2.0)) + area(Shape::Rect(1.0, 3.0));\n\tdescribe(Shape::Square(3.0)) + i\" / total {total}\"\n}\n";
+
+pub const DEPENDENCY_SHAPES_LIB: &str = "import std::display::Display;\n\nexport import pkg::geometry::{ Shape, area };\n\nfun describe(shape: Shape): str {\n\ti\"a shape of area {area(shape)}\"\n}\n";
+
+pub const DEPENDENCY_SHAPES_GEOMETRY: &str = "export enum Shape {\n\tSquare(f64),\n\tRect(f64, f64),\n}\n\nexport fun area(shape: Shape): f64 {\n\tmatch shape {\n\t\tShape::Square(let side) => side * side,\n\t\tShape::Rect(let width, let height) => width * height,\n\t}\n}\n\nexport fun perimeter(shape: Shape): f64 {\n\tmatch shape {\n\t\tShape::Square(let side) => 4.0 * side,\n\t\tShape::Rect(let width, let height) => 2.0 * (width + height),\n\t}\n}\n";
+
+pub const DEPENDENCY_SHAPES: &[Dependency] = &[Dependency {
+    name: "shapes",
+    files: &[
+        ("lib.vl", DEPENDENCY_SHAPES_LIB),
+        ("geometry.vl", DEPENDENCY_SHAPES_GEOMETRY),
+    ],
+}];
+
+pub const DEPENDENCY_EDITS: &[Edit] = &[
+    Edit {
+        label: "a literal typed into the package module that calls the dependency",
+        file: "report.vl",
+        seed: None,
+        replacements: &[("Square(2.0)", "Square(2.5)")],
+    },
+    Edit {
+        label: "the package module reaches a dependency module by its path",
+        file: "report.vl",
+        seed: None,
+        replacements: &[
+            (
+                "import shapes::{ Shape, area, describe };\n",
+                "import shapes::{ Shape, area, describe };\nimport shapes::geometry::perimeter;\n",
+            ),
+            (
+                "\tlet total = area(Shape::Square(2.0))",
+                "\tlet total = perimeter(Shape::Square(1.0)) + area(Shape::Square(2.0))",
+            ),
+        ],
+    },
+    Edit {
+        label: "a type error against a dependency's signature",
+        file: "report.vl",
+        seed: None,
+        replacements: &[("area(Shape::Rect(1.0, 3.0))", "area(\"rect\")")],
+    },
+    Edit {
+        label: "a statement typed into the entry beside the dependency's caller",
+        file: "main.vl",
+        seed: None,
+        replacements: &[(
+            "\tprint(summary());\n",
+            "\tprint(summary());\n\tprint(\"done\");\n",
+        )],
+    },
+];
+
+pub const DEPENDENCY_FIXTURE: Fixture = Fixture {
+    name: "dependency",
+    platform: NODE,
+    files: &[
+        ("main.vl", DEPENDENCY_MAIN),
+        ("report.vl", DEPENDENCY_REPORT),
+    ],
+    edits: DEPENDENCY_EDITS,
+    dependencies: DEPENDENCY_SHAPES,
+};
+
+pub const FULLSTACK_COMMON: &[Dependency] = &[Dependency {
+    name: "common",
+    files: &[(
+        "lib.vl",
+        include_str!("../../../../vilan/examples/fullstack/common/src/lib.vl"),
+    )],
+}];
+
+pub const FULLSTACK_SERVER_FIXTURE: Fixture = Fixture {
+    name: "fullstack_server",
+    platform: NODE,
+    files: &[(
+        "main.vl",
+        include_str!("../../../../vilan/examples/fullstack/server/src/main.vl"),
+    )],
+    edits: &[Edit {
+        label: "fullstack's server: a string typed into the entry beside `common::greeting`",
+        file: "main.vl",
+        seed: None,
+        replacements: &[("greeting(\"server\")", "greeting(\"node server\")")],
+    }],
+    dependencies: FULLSTACK_COMMON,
+};
+
+pub const FULLSTACK_CLIENT_FIXTURE: Fixture = Fixture {
+    name: "fullstack_client",
+    platform: Platform::Browser,
+    files: &[(
+        "main.vl",
+        include_str!("../../../../vilan/examples/fullstack/client/src/main.vl"),
+    )],
+    edits: &[Edit {
+        label: "fullstack's client: a string typed into the entry beside `common::greeting`",
+        file: "main.vl",
+        seed: None,
+        replacements: &[("greeting(\"browser\")", "greeting(\"the browser\")")],
+    }],
+    dependencies: FULLSTACK_COMMON,
+};
+
+/// M152's fixtures, in the order the gates iterate them.
+pub const DEPENDENCY_FIXTURES: &[&Fixture] = &[
+    &DEPENDENCY_FIXTURE,
+    &FULLSTACK_SERVER_FIXTURE,
+    &FULLSTACK_CLIENT_FIXTURE,
+];

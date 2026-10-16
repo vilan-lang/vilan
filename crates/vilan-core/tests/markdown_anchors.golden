@@ -27,6 +27,7 @@ appendix/cli.md h3 scope
 appendix/cli.md h2 vilan-upgrade
 appendix/cli.md h2 vilan-cache-prune
 appendix/cli.md h2 vilan-cache-clean
+appendix/cli.md h2 vilan-cache-warm
 appendix/editor.md h1 the-editor
 appendix/editor.md h2 getting-it
 appendix/editor.md h2 what-it-gives-you
@@ -59,6 +60,7 @@ guide/debugging.md h2 everything-in-scope-dbg_stack
 guide/debugging.md h2 where-panics-name-their-line
 guide/debugging.md h3 track_caller
 guide/debugging.md h2 in-a-debugger
+guide/debugging.md h3 in-vs-code
 guide/dev-loop.md h1 the-dev-loop
 guide/dev-loop.md h2 what-each-edit-does
 guide/dev-loop.md h2 when-a-round-fails

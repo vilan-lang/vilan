@@ -44,7 +44,9 @@ fun picks<T: (2..)>(values: (U in T: U), names: (U in T: str)): (U in T: str) {
 }
 
 fun main() {
-	let named = labels((Labelled { label = "a", value = 1 }, Labelled { label = "b", value = true }));
+	let named = labels(
+		(Labelled { label = "a", value = 1 }, Labelled { label = "b", value = true }),
+	);
 	print(named.0 + named.1);
 	let back = echo((7, "seven", false));
 	print(i"{back.0} {back.1} {back.2}");

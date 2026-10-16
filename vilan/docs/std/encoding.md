@@ -24,10 +24,10 @@ trait FromJson {                                           // decode
 
 A fixed array `[T; n]` is a JSON array, as a `List` is, and decoding it
 checks the count: `[1]` read as an `[i32; 2]` is the error "expected an
-array of 2 elements, found 1". An array type cannot head a path
-(`[i32; 2]::from_json(..)` is no expression), so a direct decode goes
-through `from_json_value_of<[i32; 2]>(value)`, the call the derive
-writes for an array field.
+array of 2 elements, found 1". The array type heads the decode's path
+as any type does — `[i32; 2]::from_json(text)`, and the derive writes
+`[i32; 2]::from_json_value(..)` for an array field — and
+`from_json_value_of<[i32; 2]>(value)` is the same call spelled generically.
 
 `Result<T, E>` is Json when both arms are, and it is spelled the way the
 codecs spell it: externally tagged by variant NAME, `Ok(7)` as
@@ -307,6 +307,36 @@ Wire's.
 definition. A conditional impl's own binder bounds are what recurse into
 the arguments, so `impl Pair<type A: Wire, type B: Wire> with Wire`
 demands both and `impl Handle<type T> with Wire` demands neither.
+
+A GENERIC `[derive(Wire)]` type gets that same shape from the derive: every
+parameter a field or payload reaches is bound under `Wire`, and a parameter
+no member mentions (`Handle<T>`'s `T`, which names an arena and never
+travels) is left bare. So `Page<T>` below derives `impl Page<type T: Wire>
+with Wire`: `Page<i32>` is Wire, `Page<|| i32>` is refused wherever a Wire
+type is asked for, and a generic function that sends a `Page<T>` declares
+`T: Wire` itself (the refusal names the bound to add).
+
+```vilan
+import std::io::print;
+import std::json::{ encode_json, decode_json };
+import std::result::Result::{ self, Ok, Err };
+import std::option::Option::{ self, Some, None };
+import std::wire::Wire;
+
+[derive(Wire)]
+struct Page<T> { items: List<T>, next: Option<T> }
+
+fun resend<T: Wire>(page: Page<T>): Result<Page<T>, str> {
+	decode_json(encode_json(page))
+}
+
+fun main() {
+	match resend(Page { items = [1, 2], next = Some(3) }) {
+		Ok(let page) => print(page.items.len()),
+		Err(let reason) => print(reason),
+	}
+}
+```
 
 `Result<T, E>` is Wire when both arms are, and narrates in `Option`'s
 vocabulary: an externally-tagged `{"Ok": …}` / `{"Err": …}` over JSON, a

@@ -1014,13 +1014,19 @@ fun rpc_frame_response(service: Service, request: Request): Response {
 				Session::anonymous()
 			};
 			let answering = protocol.in_session(session);
-			let (reply, status) = turn(FlushPolicy::AtEnd, || answering.respond_with_status(Frame::Binary(request.bytes())));
+			let (reply, status) = turn(
+				FlushPolicy::AtEnd,
+				|| answering.respond_with_status(Frame::Binary(request.bytes())),
+			);
 			envelope_response(reply, status)
 		},
 		// §9.7.7: as an ENVELOPE now, so a vilan client meeting it reads a typed
 		// `Remote(..)` rather than `Decode("unrecognized reply envelope")` about a
 		// plain-text sentence.
-		None => envelope_response(encode_reply(service.codec, RpcOutcome::Failure(RpcError::Remote(FACTORY_REFUSAL))), 501),
+		None => envelope_response(
+			encode_reply(service.codec, RpcOutcome::Failure(RpcError::Remote(FACTORY_REFUSAL))),
+			501,
+		),
 	}
 }
 
@@ -1357,7 +1363,10 @@ fun accept_socket(
 							// promised: replies carry their request id and arrive
 							// when their handler is done.
 							let _running = async {
-								let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Text(payload)));
+								let reply = turn(
+									FlushPolicy::AtEnd,
+									|| protocol.respond(Frame::Text(payload)),
+								);
 								match reply {
 									Frame::Text(let answer) => {
 										socket.write_bytes(text_frame(i"r:{id_text}:{answer}"));
@@ -1398,7 +1407,10 @@ fun accept_socket(
 						// Started, not awaited — the text lane's rule, and for the
 						// same reason (a chunk is not a queue).
 						let _running = async {
-							let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Binary(payload)));
+							let reply = turn(
+								FlushPolicy::AtEnd,
+								|| protocol.respond(Frame::Binary(payload)),
+							);
 							match reply {
 								Frame::Binary(let answer) => {
 									socket.write_bytes(binary_frame(tag_rpc_bytes(id, answer)));

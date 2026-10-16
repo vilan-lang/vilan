@@ -1,7 +1,8 @@
-// E257 S6: the `vilan` debug type's registration — the configuration provider
-// that resolves a `vilan` launch configuration to the JavaScript debugger's
-// (`debug.ts` holds the resolution itself, pinned under plain node), and the
-// "Debug" code lens on a program's `fun main`.
+// E257 S6/S7: the `vilan` debug type's registration — vilan-dap as its
+// adapter (`dap/adapter.ts`, inline in the extension host), the configuration
+// provider that completes a `vilan` launch configuration for it (`debug.ts`
+// holds the resolution itself, pinned under plain node), and the "Debug" code
+// lens on a program's `fun main`.
 import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
@@ -9,6 +10,9 @@ import * as path from 'path';
 import {
     CodeLens,
     CodeLensProvider,
+    DebugAdapterDescriptor,
+    DebugAdapterDescriptorFactory,
+    DebugAdapterInlineImplementation,
     DebugConfiguration,
     DebugConfigurationProvider,
     ExtensionContext,
@@ -22,11 +26,12 @@ import {
     window,
     workspace,
 } from 'vscode';
+import { VilanDebugAdapter } from './dap/adapter';
 import {
     VilanLaunchConfiguration,
     mainFunctionLines,
     mainLensConfiguration,
-    resolveLaunch,
+    resolveAdapterLaunch,
     vilanCandidates,
 } from './debug';
 
@@ -35,6 +40,7 @@ const executableSuffix = process.platform === 'win32' ? '.exe' : '';
 export function registerDebugging(context: ExtensionContext): void {
     context.subscriptions.push(
         debug.registerDebugConfigurationProvider('vilan', new VilanConfigurationProvider(context)),
+        debug.registerDebugAdapterDescriptorFactory('vilan', new VilanAdapterFactory()),
         languages.registerCodeLensProvider(
             { language: 'vilan', scheme: 'file' },
             new MainLensProvider(),
@@ -58,7 +64,7 @@ class VilanConfigurationProvider implements DebugConfigurationProvider {
             !configuration.type && !configuration.request
                 ? { type: 'vilan', request: 'launch', name: 'Debug vilan program' }
                 : (configuration as VilanLaunchConfiguration);
-        const resolved = resolveLaunch(launch, {
+        const resolved = resolveAdapterLaunch(launch, {
             vilan: this.vilanExecutable(),
             port: await freePort(),
             stdDirectories: stdDirectories(),
@@ -82,6 +88,14 @@ class VilanConfigurationProvider implements DebugConfigurationProvider {
             dirname: path.dirname,
         });
         return candidates.find((candidate) => fs.existsSync(candidate)) ?? `vilan${executableSuffix}`;
+    }
+}
+
+/// vilan-dap runs inside the extension host — no process of its own, nothing
+/// to install beside the extension.
+class VilanAdapterFactory implements DebugAdapterDescriptorFactory {
+    createDebugAdapterDescriptor(): DebugAdapterDescriptor {
+        return new DebugAdapterInlineImplementation(new VilanDebugAdapter());
     }
 }
 

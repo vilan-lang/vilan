@@ -19,6 +19,7 @@ mod support;
 
 mod array_lengths;
 mod ascription;
+mod async_inference;
 mod auto_annotations;
 mod backed_enums;
 mod borrows;
@@ -26,6 +27,7 @@ mod bounds;
 mod callable;
 mod collections;
 mod const_eval;
+mod contexts;
 mod contextual_keywords;
 mod debugging;
 mod dyn_objects;

@@ -43,9 +43,14 @@ pub fn transform_with_source_map<'src>(
     let mut transformer = Transformer::new(program, options);
     transformer.source_marks = true;
     transformer.formatter = transformer.formatter.with_marks();
+    // E257 S7: the sidecar rides with the map, under the same switches.
+    transformer.debug_recorder = Some(Box::default());
     let printed = transformer.transform_entry()?;
-    let (javascript, map) =
+    let (javascript, mut map) =
         crate::source_map::strip_marks(program, &printed.text, &printed.marks, printed.runtime);
+    if let Some(recorded) = printed.debug {
+        map.debug = Some(Box::new(crate::debug_info::finish(program, recorded, &map)));
+    }
     Ok((javascript, Some(map)))
 }
 
@@ -56,6 +61,9 @@ struct Printed {
     text: String,
     marks: Vec<SourceMark>,
     runtime: Option<std::ops::Range<usize>>,
+    /// What the walk recorded for the `.vdbg.json` sidecar (E257 S7), names
+    /// already renamed; `None` unless the map's entry asked for it.
+    debug: Option<crate::debug_info::RecordedDebug>,
 }
 
 /// A script's prelude — the host imports, then the runtime helpers' sources —
@@ -171,7 +179,7 @@ pub fn transform_functions<'src>(
         .required_functions
         .into_iter()
         .collect::<Vec<_>>();
-    t_functions.sort_by_key(|a| a.0.0);
+    t_functions.sort_by_key(|a| program.canonical_declaration_key(a.0));
     let t_functions = t_functions.into_iter().map(|x| x.1);
     let t_instances = transformer
         .monomorphized
@@ -2212,6 +2220,12 @@ fn helper_source(name: &str) -> &'static str {
         "__list_sort_by" => {
             "function __list_sort_by(list, compare) {\n\treturn list.slice().sort(compare);\n}"
         }
+        // `List.to_array<const N>(self): Option<[T; N]>` (A172) — `Some` of a
+        // copy when the length is `N`, `None` otherwise. A copy for the reason
+        // `sort_by`'s is one: `self` is by value and the array grows apart.
+        "__list_to_array" => {
+            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.slice() ] : [ 1 ];\n}"
+        }
         // `Option.take(&mut self): Option<T>` — snapshot the slot (a structural
         // copy, not a deep clone: the payload MOVES out), then rewrite it to `None`
         // in place so the caller's binding sees the change. `[0, v]` -> the slot
@@ -2928,6 +2942,17 @@ struct Transformer<'src> {
     // `const` landed in the statement list, so the emitter can close a
     // `try`/`finally` around everything after it. Empty between statements.
     pending_temporaries: Vec<PendingTemporary>,
+    /// F138: which `mut` bindings a closure captures — per function being
+    /// emitted (a local is captured only by a closure written inside the
+    /// function that declares it: the closures whose spans its span holds),
+    /// and over the whole program for a module-level binding, each computed
+    /// at the first call that could hand one on — see
+    /// `transformer/argument_order.rs`.
+    captured_mut_bindings: std::cell::OnceCell<HashSet<Id>>,
+    function_captures: std::cell::RefCell<HashMap<Id, Rc<HashSet<Id>>>>,
+    closure_captures: std::cell::RefCell<crate::captures::ClosureCaptures>,
+    closure_spans: std::cell::OnceCell<Vec<argument_order::ClosureSpan>>,
+    module_bindings: std::cell::OnceCell<HashSet<Id>>,
     // Route-chunk partition (`bundle-splitting.md` S2): function id -> chunk
     // index, plus how many chunks there are. Empty for every build that did not
     // ask to split, which is what keeps single-file emission byte-identical —
@@ -2956,6 +2981,10 @@ struct Transformer<'src> {
     // check's `diagnose`, the const world, the macro interpreter) builds the
     // tree it always did.
     source_marks: bool,
+    // E257 S7: record each emitted user function's bindings for the
+    // `.vdbg.json` sidecar. Set beside `source_marks` by
+    // [`transform_with_source_map`]; it reads the walk and never emits.
+    debug_recorder: Option<Box<debug_info::DebugRecorder>>,
 }
 
 /// One thing the shared const world declares: a concrete function, or a KEYED
@@ -3134,6 +3163,26 @@ thread_local! {
     static CONST_LOWERING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// M147 (3): how many requirement CLOSURES the const pass walked on this
+    /// thread since [`reset_const_reach_walks`] — one per requirement, however
+    /// many sites require it, once the memo serves the rest. The same argument
+    /// as [`CONST_LOWERING_COUNT`]'s: a memoized reach and a re-walked one are
+    /// the same set, so only the count tells them apart.
+    static CONST_REACH_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many requirement closures the const pass walked on this thread since
+/// the last [`reset_const_reach_walks`]. See [`CONST_REACH_WALKS`].
+pub fn const_reach_walks() -> usize {
+    CONST_REACH_WALKS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`const_reach_walks`].
+pub fn reset_const_reach_walks() {
+    CONST_REACH_WALKS.with(|count| count.set(0));
+}
+
 /// How many function bodies the const pass has lowered on this thread since the
 /// last [`reset_const_lowering_count`]. See [`CONST_LOWERING_COUNT`].
 pub fn const_lowering_count() -> usize {
@@ -3250,6 +3299,8 @@ struct Assembled<'src> {
     /// files the chunk map and the registrations into, after every module
     /// binding has initialized and before anything can navigate.
     main_body_start: usize,
+    /// E257 S7: the sidecar's records, renamed with the script.
+    debug: Option<crate::debug_info::RecordedDebug>,
 }
 
 /// How a resource-owning scope's tail value is used when it is restructured into
@@ -3359,6 +3410,11 @@ impl<'src> Transformer<'src> {
             unresolved_array_lengths: Vec::new(),
             unrendered_concatenations: Vec::new(),
             pending_temporaries: Vec::new(),
+            captured_mut_bindings: std::cell::OnceCell::new(),
+            function_captures: std::cell::RefCell::default(),
+            closure_captures: std::cell::RefCell::default(),
+            closure_spans: std::cell::OnceCell::new(),
+            module_bindings: std::cell::OnceCell::new(),
             chunk_members: HashMap::default(),
             chunk_count: 0,
             chunk_gate: None,
@@ -3366,6 +3422,7 @@ impl<'src> Transformer<'src> {
             recorder: None,
             diagnose_only: false,
             source_marks: false,
+            debug_recorder: None,
         }
     }
 
@@ -3374,14 +3431,19 @@ impl<'src> Transformer<'src> {
     fn transform_entry(self) -> Result<Printed, Error> {
         let formatter = self.formatter.clone();
         let line_break = formatter.line_break;
-        let program = self.transform_entry_ast()?;
-        let body = formatter.file(&program.nodes);
-        let (mut text, runtime) = with_prelude(&program.imports, &program.helpers, body);
+        let assembled = self.assemble()?;
+        debug_assert!(
+            assembled.chunks.is_empty(),
+            "a single-file build splits nothing"
+        );
+        let body = formatter.file(&assembled.nodes);
+        let (mut text, runtime) = with_prelude(&assembled.imports, &assembled.helpers, body);
         text.push_str(line_break);
         Ok(Printed {
             text,
             marks: formatter.take_marks(),
             runtime,
+            debug: assembled.debug,
         })
     }
 
@@ -3596,6 +3658,7 @@ impl<'src> Transformer<'src> {
             }
             t_main_fn_body
         };
+        self.record_main_frame(main_fn);
 
         self.restore_instance(saved_instance);
 
@@ -3935,7 +3998,8 @@ impl<'src> Transformer<'src> {
         }
 
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
-        t_functions.sort_by_key(|a| a.0.0);
+        let program = self.program;
+        t_functions.sort_by_key(|a| program.canonical_declaration_key(a.0));
 
         // The route-chunk partition (`bundle-splitting.md` §1): a function
         // reachable from exactly one route arm and nothing eager leaves the
@@ -4020,7 +4084,10 @@ impl<'src> Transformer<'src> {
         // which is why a caller that is going to drop the text says so rather
         // than paying for names nobody will read.
         if !self.diagnose_only {
-            rename_for_scopes(&self.ng, self.program, &mut nodes);
+            let rename = rename_for_scopes(&self.ng, self.program, &mut nodes);
+            if let Some(recorder) = self.debug_recorder.as_mut() {
+                recorder.recorded.rename(&rename);
+            }
         }
         // Lift the chunk runs out, last first so the earlier ranges stay valid.
         let mut chunks: Vec<Vec<js::Node<'src>>> = Vec::with_capacity(chunk_ranges.len());
@@ -4035,6 +4102,7 @@ impl<'src> Transformer<'src> {
             nodes,
             chunks,
             main_body_start,
+            debug: self.debug_recorder.map(|recorder| recorder.recorded),
         })
     }
 
@@ -4146,6 +4214,28 @@ impl<'src> Transformer<'src> {
     fn mark_tail(&self, tail: Id, block: &mut Vec<js::Node<'src>>) {
         if self.source_marks {
             block.push(js::Node::Mark(tail));
+        }
+    }
+
+    /// E257 S7: what a closure's `return` or a match leg's value maps to —
+    /// the tail its body block ends with (`|value| { let total = ..; total }`
+    /// returns at `total`'s line, where a breakpoint on it binds), or the body
+    /// itself when it is no block or its tail has no text of its own.
+    fn tail_anchor(&self, body: Id) -> Id {
+        if !self.source_marks {
+            return body;
+        }
+        match self.program.entity_map.get(&body) {
+            Some(Expr::Block((_, tail)))
+                if self
+                    .program
+                    .span_map
+                    .get(tail)
+                    .is_some_and(|span| span.start != span.end) =>
+            {
+                *tail
+            }
+            _ => body,
         }
     }
 
@@ -5490,6 +5580,12 @@ impl<'src> Transformer<'src> {
                 {
                     reads.insert(*root);
                 }
+                // B626: naming the cell is a REFERENCE of the binding, as the
+                // `Expr::Local` arm's read is — the module-binding tree-shake
+                // (F6) keeps only the bindings `referenced_globals` holds, so a
+                // module scalar read ONLY through a view (`read(&LIMIT)`) was
+                // shaken out and its pair named an undeclared `LIMIT`.
+                self.referenced_globals.insert(*root);
                 (js::Node::Local(self.ng.name_for(*root)), zero())
             }
             // A view of a view is the view: `&v` of a `v: &i32`, `&*v`.
@@ -5548,6 +5644,49 @@ impl<'src> Transformer<'src> {
     /// Whether this intrinsic call is a `Shared::write()` whose pointee resolves
     /// (under the active monomorphization) to a scalar — the case that lowers to
     /// a `(base, key)` pair rather than to the bare `cell.v` slot access.
+    /// A172: the `N` a `list.to_array()` call converts to under the active
+    /// instance — the external's own `const N` binder, bound by the written
+    /// argument (`to_array<2>()`) or by the analyzer's record for the call
+    /// (the expected type's length), then resolved through the current
+    /// substitution (a `const N` of the enclosing generic body).
+    fn list_to_array_length(&self, call_expr_id: Id) -> Option<usize> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return None;
+        };
+        let function_call = self.program.function_calls.get(call_id)?;
+        let Some(Expr::Local(callee_id)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let binder = *self
+            .program
+            .external_functions
+            .get(callee_id)?
+            .generic_parameter_constraint_ids
+            .first()?;
+        let bound = function_call
+            .generic_argument_ids
+            .first()
+            .copied()
+            .or_else(|| {
+                self.program
+                    .own_generic_call_bindings
+                    .get(call_id)
+                    .and_then(|values| values.first().copied())
+            })
+            .or_else(|| {
+                [call_expr_id, *call_id].iter().find_map(|key| {
+                    self.program
+                        .method_call_substitution
+                        .get(key)
+                        .and_then(|substitution| substitution.get(&binder).copied())
+                })
+            })?;
+        self.program
+            .type_id_to_type_map
+            .array_length(self.resolve_type_id(bound))
+    }
+
     fn emits_scalar_shared_write(&self, intrinsic: Intrinsic, call_expr_id: Id) -> bool {
         matches!(intrinsic, Intrinsic::SharedWrite)
             && self.shared_write_pointee_is_scalar(call_expr_id)
@@ -5702,6 +5841,26 @@ impl<'src> Transformer<'src> {
         &mut self,
         ids: &[Id],
         block: &mut Vec<js::Node<'src>>,
+        walk_one: F,
+    ) -> Vec<(Id, js::Node<'src>)>
+    where
+        F: FnMut(&mut Self, Id, &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>>,
+    {
+        self.walk_siblings_reading_late(ids, &[], block, walk_one)
+    }
+
+    /// [`Self::walk_siblings_in_order`] with some siblings read LATE (F138: a
+    /// call's argument rooted at a captured `mut` binding, named in `late` —
+    /// see `transformer/argument_order.rs`): a late sibling is never spilled
+    /// ahead of a later sibling's statements, and once every sibling is
+    /// walked, each other one whose value is not settled is bound to a
+    /// `const` in order, so the late ones are read after all of them. With
+    /// no late sibling this is the plain walk.
+    fn walk_siblings_reading_late<F>(
+        &mut self,
+        ids: &[Id],
+        late: &[Id],
+        block: &mut Vec<js::Node<'src>>,
         mut walk_one: F,
     ) -> Vec<(Id, js::Node<'src>)>
     where
@@ -5716,7 +5875,10 @@ impl<'src> Transformer<'src> {
             let node = walk_one(self, id, &mut statements);
             if !statements.is_empty() {
                 for (earlier_id, earlier, spilled) in walked.iter_mut() {
-                    if *spilled || self.sibling_value_is_settled(*earlier_id, earlier) {
+                    if *spilled
+                        || late.contains(earlier_id)
+                        || self.sibling_value_is_settled(*earlier_id, earlier)
+                    {
                         continue;
                     }
                     let temp = self.ng.next_name();
@@ -5739,6 +5901,20 @@ impl<'src> Transformer<'src> {
             }
             if let Some(node) = node {
                 walked.push((id, node, false));
+            }
+        }
+        if !late.is_empty() {
+            for (id, node, spilled) in walked.iter_mut() {
+                if *spilled || late.contains(id) || self.sibling_value_is_settled(*id, node) {
+                    continue;
+                }
+                let temp = self.ng.next_name();
+                let value = std::mem::replace(node, js::Node::Local(temp.clone()));
+                block.push(js::Node::ConstVariable(js::Variable {
+                    name: temp,
+                    value: Box::new(value),
+                }));
+                *spilled = true;
             }
         }
         walked.into_iter().map(|(id, node, _)| (id, node)).collect()
@@ -6296,11 +6472,15 @@ impl<'src> Transformer<'src> {
             Expr::Call(id) => {
                 let function_call = self.program.function_calls.get(id).unwrap().clone();
                 let value_positions = self.by_value_argument_positions(function_call.subject_id);
+                // F138: an argument rooted at a captured `mut` binding is read
+                // after the later arguments, as natively (spec §6.9).
+                let late = self.arguments_read_late(*id, &function_call);
                 // B452: in source order, an argument that needs statements
                 // spilling the ones before it.
                 let args = self
-                    .walk_siblings_in_order(
+                    .walk_siblings_reading_late(
                         &function_call.argument_ids,
+                        &late,
                         block,
                         |this, arg, block| {
                             // lazy.md §1: an argument standing in a `lazy` position
@@ -6803,7 +6983,7 @@ impl<'src> Transformer<'src> {
                 }
                 let value = self.walk_entity(closure.return_, &mut body);
                 if let Some(value) = value {
-                    self.mark_tail(closure.return_, &mut body);
+                    self.mark_tail(self.tail_anchor(closure.return_), &mut body);
                     // Same seam as a function body's tail (B152): a divergent
                     // tail is the statement, never a value to `return`.
                     if value.is_divergent() {
@@ -6813,6 +6993,7 @@ impl<'src> Transformer<'src> {
                     }
                 }
                 self.seal_pending_temporaries(mark, &mut body);
+                self.record_closure_frame(*closure_id);
                 js::Node::Closure(js::Closure {
                     parameters,
                     body,
@@ -7783,6 +7964,10 @@ impl<'src> Transformer<'src> {
                     return Some(js::Node::Local(temp));
                 }
                 for statement in &body.0 {
+                    // E257 S7: a block's statements are where a breakpoint in
+                    // a block-bodied closure (or a value block) binds — marked
+                    // as a statement list's are, so the map reaches them.
+                    let statement_mark = self.mark_statement(*statement, block);
                     if let Some(node) = self.walk_entity(*statement, block) {
                         // A statement that lowered to nothing (a void tail, a
                         // self-emitting loop/`if`) leaves no stray `undefined`.
@@ -7790,6 +7975,7 @@ impl<'src> Transformer<'src> {
                             block.push(node);
                         }
                     }
+                    Self::drop_bare_mark(statement_mark, block);
                 }
                 // B152: a block whose tail LEAVES (`{ ret 1 }`, `{ jump break }`)
                 // has no value — emit the statement here, where it is legal, and
@@ -8266,6 +8452,9 @@ impl<'src> Transformer<'src> {
                     let mut leg_body = Vec::new();
                     let value = self.walk_entity(leg.body, &mut leg_body);
                     let value = value.unwrap_or(js::Node::Null);
+                    // E257 S7: a leg's value is its tail, where a breakpoint
+                    // on an arm (`Some(let x) => x * 2,`) binds.
+                    self.mark_tail(self.tail_anchor(leg.body), &mut leg_body);
                     self.push_result_or_divergence(&result_name, value, &mut leg_body);
                     // A leg owing nothing splices its body in unchanged, which is
                     // what keeps every data match byte-identical.
@@ -10284,6 +10473,20 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
+            // A172: the length is the call's own `N` under this instance, a
+            // number by the time anything emits (a `const N` binder no
+            // substitution reached is an analyzer bug, not a program).
+            Intrinsic::ListToArray => {
+                self.used_helpers.insert("__list_to_array");
+                let length = call_expr_id
+                    .and_then(|id| self.list_to_array_length(id))
+                    .expect("internal: `to_array`'s `N` is a length under every instance");
+                let receiver = args.next().unwrap_or(js::Node::Void);
+                js::Node::Call(
+                    Box::new(js::Node::Local("__list_to_array".to_string())),
+                    vec![receiver, js::Node::Number(length.to_string(), None)],
+                )
+            }
             // `opt.take()` / `opt.replace(v)` (destruction.md §6): the receiver is
             // the `&mut self` slot (a JS array, mutated in place so the caller's
             // binding sees the change). Each snapshots the old contents, rewrites
@@ -11102,6 +11305,7 @@ impl<'src> Transformer<'src> {
         let body = self.wrap_own_param_drops(function, body);
         crate::impl_select::set_selection_owner(enclosing_owner);
         self.emitting_stack.pop();
+        self.record_function_frame(function, &name);
         js::Node::Function(js::Function {
             name,
             parameters,
@@ -11431,7 +11635,9 @@ impl<'src> Transformer<'src> {
         if self.monomorphized.len() == landed_before {
             let body = canonical_instance_body(&js_function, name, &self.ng.minted);
             if let Some(shared) = self.shared_bodies.get(&(subject, body.clone())) {
-                return Some(shared.clone());
+                let shared = shared.clone();
+                self.record_shared_frame(name, &shared.name);
+                return Some(shared);
             }
             self.shared_bodies.insert(
                 (subject, body),
@@ -14292,6 +14498,26 @@ pub struct ConstWorld<'src> {
     /// site that reached the function and therefore already carries its whole
     /// transitive requirement set.
     finalisers: HashMap<String, SiteWalk<'src>>,
+    /// M147 (3): each requirement's transitive reach, once every emission it
+    /// reaches is recorded ([`ConstWorld::closure_of`]). Sites share large
+    /// sub-closures (kolt's style chain), and re-walking `requires` per site
+    /// was 17.5 M instructions of a warm client pass.
+    reach_memo: std::cell::RefCell<HashMap<EmissionId, Rc<ReachClosure>>>,
+    /// M147 (3): the union of a SET of requirements' closures, by the set —
+    /// sites whose own walks required the same things share one union, and the
+    /// per-site work is then a copy of it plus the site's own few rows.
+    union_memo: std::cell::RefCell<HashMap<Vec<EmissionId>, Rc<ReachClosure>>>,
+}
+
+/// M147 (3): what one requirement reaches, transitively — the part of a
+/// [`SiteReach`] a site's own walk does not add.
+#[derive(Default)]
+struct ReachClosure {
+    functions: Vec<Id>,
+    slots: Vec<usize>,
+    globals: HashSet<Id>,
+    helpers: BTreeSet<&'static str>,
+    imports: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// One site's own lowering, cached: the statements its expression emitted (the
@@ -14361,6 +14587,8 @@ impl<'src> ConstWorld<'src> {
             seed,
             sites: HashMap::default(),
             finalisers: HashMap::default(),
+            reach_memo: std::cell::RefCell::default(),
+            union_memo: std::cell::RefCell::default(),
         }
     }
 
@@ -14638,53 +14866,29 @@ impl<'src> ConstWorld<'src> {
 
     /// Closes over `requires` from one walk's record: the set a per-site
     /// re-walk of the whole closure would have produced, read off the records
-    /// the single lowering left instead. The walk is a plain worklist, so a
-    /// recursive or mutually recursive requirement terminates on `visited`.
+    /// the single lowering left instead — the union of the requirements'
+    /// closures from the memos ([`ConstWorld::union_of`],
+    /// [`ConstWorld::closure_of`]), so a closure two sites share is walked once
+    /// and a requirement set two sites share is united once.
     fn reach_from(&self, seed: &EmissionRecord) -> SiteReach {
-        let mut functions: Vec<Id> = Vec::new();
-        let mut slots: Vec<usize> = Vec::new();
-        let mut globals = seed.globals.clone();
-        let mut helpers = seed.helpers.clone();
-        let mut imports = seed.imports.clone();
-        if let Some(recorder) = self.transformer.recorder.as_ref() {
-            let mut visited: HashSet<EmissionId> = HashSet::default();
-            let mut worklist: Vec<EmissionId> = seed.requires.clone();
-            while let Some(key) = worklist.pop() {
-                if !visited.insert(key) {
-                    continue;
-                }
-                match key {
-                    EmissionId::Function(function_id) => {
-                        if self
-                            .transformer
-                            .required_functions
-                            .contains_key(&function_id)
-                        {
-                            functions.push(function_id);
-                        }
-                    }
-                    EmissionId::Keyed(index) => {
-                        if let Some(Some(slot)) = recorder.keyed_slots.get(index) {
-                            slots.push(*slot);
-                        }
-                    }
-                }
-                let Some(record) = recorder.records.get(&key) else {
-                    continue;
-                };
-                globals.extend(record.globals.iter().copied());
-                helpers.extend(record.helpers.iter().copied());
-                for (module, symbols) in &record.imports {
-                    imports
-                        .entry(module.clone())
-                        .or_default()
-                        .extend(symbols.iter().cloned());
-                }
-                worklist.extend(record.requires.iter().copied());
-            }
+        let union = match self.transformer.recorder.as_ref() {
+            Some(recorder) => self.union_of(&seed.requires, recorder),
+            None => Rc::new(ReachClosure::default()),
+        };
+        // The shared union is the large half: copied whole (a table copy, not a
+        // re-hash of every row), the site's own few rows added to the copy.
+        let mut globals = union.globals.clone();
+        globals.extend(seed.globals.iter().copied());
+        let mut helpers = union.helpers.clone();
+        helpers.extend(seed.helpers.iter().copied());
+        let mut imports = union.imports.clone();
+        for (module, symbols) in &seed.imports {
+            imports
+                .entry(module.clone())
+                .or_default()
+                .extend(symbols.iter().cloned());
         }
-        functions.sort_by_key(|function_id| function_id.0);
-        slots.sort_unstable();
+        let (functions, slots) = (union.functions.clone(), union.slots.clone());
         SiteReach {
             functions,
             slots,
@@ -14699,9 +14903,109 @@ impl<'src> ConstWorld<'src> {
                 .collect(),
         }
     }
+
+    /// M147 (3): the union of `requires`' closures, its functions in
+    /// entity-id order and its slots in emission order — memoized by the set,
+    /// on [`ConstWorld::closure_of`]'s rule.
+    fn union_of(&self, requires: &[EmissionId], recorder: &EmissionRecorder) -> Rc<ReachClosure> {
+        let mut roots: Vec<EmissionId> = requires.to_vec();
+        roots.sort_unstable_by_key(|root| match root {
+            EmissionId::Function(function_id) => (0, function_id.0 as usize),
+            EmissionId::Keyed(index) => (1, *index),
+        });
+        roots.dedup();
+        if let Some(union) = self.union_memo.borrow().get(&roots) {
+            return union.clone();
+        }
+        let mut union = ReachClosure::default();
+        for root in &roots {
+            let closure = self.closure_of(*root, recorder);
+            union.functions.extend(closure.functions.iter().copied());
+            union.slots.extend(closure.slots.iter().copied());
+            union.globals.extend(closure.globals.iter().copied());
+            union.helpers.extend(closure.helpers.iter().copied());
+            for (module, symbols) in &closure.imports {
+                union
+                    .imports
+                    .entry(module.clone())
+                    .or_default()
+                    .extend(symbols.iter().cloned());
+            }
+        }
+        union.functions.sort_by_key(|function_id| function_id.0);
+        union.functions.dedup();
+        union.slots.sort_unstable();
+        union.slots.dedup();
+        let union = Rc::new(union);
+        if recorder.frames.is_empty() {
+            self.union_memo.borrow_mut().insert(roots, union.clone());
+        }
+        union
+    }
+
+    /// M147 (3): `root`'s transitive reach — the functions and slots it and
+    /// everything it requires emitted, and their globals, helpers and imports.
+    /// The walk is a plain worklist, so a recursive or mutually recursive
+    /// requirement terminates on `visited`. Memoized when no emission is in
+    /// flight (no recorder frame open — the state every site's reach is taken
+    /// in): an emission writes its record when it finishes, its requirements
+    /// were emitted inside it, and a record never changes after, so nothing the
+    /// rest of the pass emits can add to a closure taken then. A requirement
+    /// with no record (an external, a body emitted through another channel)
+    /// has none forever, as the per-site walk found.
+    fn closure_of(&self, root: EmissionId, recorder: &EmissionRecorder) -> Rc<ReachClosure> {
+        if let Some(closure) = self.reach_memo.borrow().get(&root) {
+            return closure.clone();
+        }
+        CONST_REACH_WALKS.with(|count| count.set(count.get() + 1));
+        let mut closure = ReachClosure::default();
+        let mut visited: HashSet<EmissionId> = HashSet::default();
+        let mut worklist: Vec<EmissionId> = vec![root];
+        while let Some(key) = worklist.pop() {
+            if !visited.insert(key) {
+                continue;
+            }
+            match key {
+                EmissionId::Function(function_id) => {
+                    if self
+                        .transformer
+                        .required_functions
+                        .contains_key(&function_id)
+                    {
+                        closure.functions.push(function_id);
+                    }
+                }
+                EmissionId::Keyed(index) => {
+                    if let Some(Some(slot)) = recorder.keyed_slots.get(index) {
+                        closure.slots.push(*slot);
+                    }
+                }
+            }
+            let Some(record) = recorder.records.get(&key) else {
+                continue;
+            };
+            closure.globals.extend(record.globals.iter().copied());
+            closure.helpers.extend(record.helpers.iter().copied());
+            for (module, symbols) in &record.imports {
+                closure
+                    .imports
+                    .entry(module.clone())
+                    .or_default()
+                    .extend(symbols.iter().cloned());
+            }
+            worklist.extend(record.requires.iter().copied());
+        }
+        let closure = Rc::new(closure);
+        if recorder.frames.is_empty() {
+            self.reach_memo.borrow_mut().insert(root, closure.clone());
+        }
+        closure
+    }
 }
 
+mod argument_order;
 mod dbg;
+mod debug_info;
 
 pub mod js {
     use crate::node::BinaryOp;
@@ -15026,6 +15330,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__list_get",
     "__list_pop",
     "__list_sort_by",
+    "__list_to_array",
     "__option_take",
     "__option_replace",
     "__map_get",
@@ -15784,9 +16089,13 @@ fn rename_if(branch: &mut js::IfBranch, rename: &HashMap<String, String>) {
 /// RESERVING whatever the walk did not reach. Every generated name is therefore
 /// either re-allocated against a scope's `used` set or reserved in every scope,
 /// and a binding the walk misses can only come out over-long, never colliding.
-fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::Node>) {
+fn rename_for_scopes(
+    ng: &NameGenerator,
+    program: &Program,
+    nodes: &mut Vec<js::Node>,
+) -> HashMap<String, String> {
     let release = match ng.seed.style {
-        NameStyle::Annotated => return,
+        NameStyle::Annotated => return HashMap::default(),
         NameStyle::Readable => false,
         NameStyle::Plain => true,
     };
@@ -15812,7 +16121,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         source_of.keys().cloned().collect()
     };
     if renameable.is_empty() {
-        return;
+        return HashMap::default();
     }
     // The reserved set (keywords, referenced globals, `__`-helpers, the program's
     // `[extern]` symbols) counts as used in every scope, so nothing collides.
@@ -15853,6 +16162,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         "a generated name was neither re-allocated nor reserved — it can collide"
     );
     rename_nodes(nodes, &rename);
+    rename
 }
 
 /// Every binding name the scope tree accounts for — the walk's reach, which is

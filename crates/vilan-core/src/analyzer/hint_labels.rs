@@ -36,7 +36,7 @@ use super::*;
 
 /// A `[hint(..)]` as the walk banked it: the declaration, the written type
 /// walked in the declaration's generic scope, where it was written.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct PendingHint {
     pub declaration: Id,
     pub type_id: TypeId,
@@ -46,7 +46,7 @@ pub(super) struct PendingHint {
 
 /// A resolved `[hint(..)]`: the trait and its arguments, in the declaration's
 /// own generic parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct HintAttribute {
     pub trait_id: Id,
     pub arguments: Vec<TypeId>,

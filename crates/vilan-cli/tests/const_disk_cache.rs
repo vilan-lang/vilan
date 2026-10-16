@@ -204,3 +204,51 @@ fn a_corrupt_table_is_a_miss_and_is_repaired() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// N177: a site's key is a function of the site's CONTENT, not of the
+/// world's shape. The same package checked over the std-prefix world
+/// (`VILAN_STD_PREFIX=on`: std's ids first, the package's after std's resolve)
+/// and over the canonical world writes one table, byte for byte — `square`
+/// is a package function, whose lowered name carried its id before.
+#[test]
+fn n177_the_table_is_the_same_over_the_std_prefix_and_the_canonical_world() {
+    let dir = package("n177");
+    let check = |prefix: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(&dir)
+            .arg("check")
+            .arg(".")
+            .env("VILAN_COUNTERS", "1")
+            .env("VILAN_STD_PREFIX", prefix)
+            .env("VILAN_WORLD_CACHE", "off")
+            .output()
+            .expect("run vilan");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains(&format!("prefix-world={}", u8::from(prefix == "on"))),
+            "the {prefix} leg must take its shape: {stderr}"
+        );
+        let bytes = std::fs::read(table(&dir)).expect("the table");
+        std::fs::remove_file(table(&dir)).expect("remove the table between legs");
+        bytes
+    };
+    let canonical = check("off");
+    let over_prefix = check("on");
+    assert_eq!(
+        const_lines(&canonical),
+        const_lines(&over_prefix),
+        "the const-site keys must not depend on the world's shape"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The table's rows past its header (the header names the build, which is
+/// one build here either way).
+fn const_lines(table: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(table)
+        .lines()
+        .skip(3)
+        .map(str::to_string)
+        .collect()
+}

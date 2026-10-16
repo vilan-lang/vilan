@@ -1,0 +1,13 @@
+// E257 S7's stepping gate (`src/test/session.test.ts`).
+import std::io::print;
+
+fun double(value: i32): i32 {
+	let twice = value * 2; // step: in
+	twice
+}
+
+fun main() {
+	let start = 20; // step: entry
+	let doubled = double(start); // step: call
+	print(doubled); // step: after
+}

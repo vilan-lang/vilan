@@ -203,8 +203,9 @@ default), `.set_header(name, value)`, `.body(str)`, `.build()`.
 A full-stack server adds two more links to that chain, and neither of them
 names a file. **`serve_build`** installs one route per artifact the client
 leg's build actually wrote — the bundle, the stylesheet if the leg emitted
-one, every route chunk — and **`with_service`** installs an rpc service's
-routes and its WebSocket handshake. Both answer *before* `on_request`,
+one, every route chunk, the source maps beside them — and
+**`with_service`** installs an rpc service's routes and its WebSocket
+handshake. Both answer *before* `on_request`,
 whatever order you wrote the chain in, so your own handler still gets
 every path they do not claim and deep links keep working (see
 [Routing](routing.md)):

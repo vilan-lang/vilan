@@ -8,5 +8,11 @@
 		{ "arm": "Route::Docs(..)", "tag": 1, "file": "app.Route_Docs.js" },
 		{ "arm": "Route::NotFound", "tag": 2, "file": "app.Route_NotFound.js" }
 	],
+	"maps": [
+		"app.js.map",
+		"app.Route_Home.js.map",
+		"app.Route_Docs.js.map",
+		"app.Route_NotFound.js.map"
+	],
 	"assets": []
 }

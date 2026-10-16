@@ -8194,6 +8194,12 @@ async fn main() {
     // takes std from the prefix the session's entries pin, instead of
     // draining it again. `VILAN_STD_PREFIX=off` turns it off.
     vilan_core::incremental::set_std_prefix_layering_default(true);
+    // std-prefix P3: the std-only prefix a cold start would build is loaded
+    // from `~/.vilan/cache/worlds` when a process already wrote it there, and
+    // written there when none has. `VILAN_WORLD_CACHE=off|<dir>` overrides.
+    vilan_core::incremental::set_world_cache_default(Some(
+        vilan_embedded::default_world_cache_root(),
+    ));
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     // E222: the one custom request, beside the standard surface.
@@ -11250,6 +11256,79 @@ mod dead_item_clock_tests {
     /// before). An edit to `shared.vl` stales the client's world, and the
     /// union that lands again rebuilt it over the pinned prefix — std was not
     /// drained a second time. The pins go with the package's last document.
+    /// std-prefix P3: a server starting COLD — no world in its base cache, no
+    /// prefix pinned — takes std from the persisted prefix file a previous
+    /// process wrote, instead of building it. The first open of this
+    /// session's package builds the std-only prefix and writes the file (the
+    /// world cache pointed at a scratch directory); the in-process caches are
+    /// then cleared, which is what a fresh process starts with, and the next
+    /// world build loads the file (the counters say so) and lands the same
+    /// paint.
+    #[tokio::test]
+    async fn a_cold_start_loads_the_std_prefix_from_its_file() {
+        vilan_core::incremental::set_std_prefix_layering(Some(true));
+        let cache = std::env::temp_dir().join(format!(
+            "vilan-lsp-world-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache);
+        vilan_core::incremental::set_world_cache(Some(Some(cache.clone())));
+        let (directory, shared) = workspace();
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        let (loads_before, writes_before, _) = vilan_core::analyzer::prefix_file_counts();
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union — both entries' legs analyzed",
+        );
+        let (_, writes_after_open, _) = vilan_core::analyzer::prefix_file_counts();
+        assert!(
+            writes_after_open > writes_before,
+            "the first layered build of this process built the std prefix and wrote its \
+             file: {writes_before} -> {writes_after_open} writes",
+        );
+
+        // A cold start, in this process: nothing remembered of worlds or files.
+        vilan_core::analyzer::base_cache_clear();
+        vilan_core::analyzer::prefix_files_forget();
+        server
+            .did_change(whole_file_change(
+                &shared,
+                2,
+                &format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n"),
+            ))
+            .await;
+        assert!(
+            wait_for_grays(server, &shared, false).await,
+            "the edit withdraws the paint",
+        );
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "and the union lands again",
+        );
+        let (loads_after, _, _) = vilan_core::analyzer::prefix_file_counts();
+        assert!(
+            loads_after > loads_before,
+            "the rebuild after the cold start took std from the prefix FILE: \
+             {loads_before} -> {loads_after} loads",
+        );
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: shared.clone(),
+                },
+            })
+            .await;
+        vilan_core::incremental::set_world_cache(None);
+        vilan_core::incremental::set_std_prefix_layering(None);
+        let _ = std::fs::remove_dir_all(&cache);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[tokio::test]
     async fn a_world_rebuilt_after_an_edit_takes_std_from_the_pinned_prefix() {
         vilan_core::incremental::set_std_prefix_layering(Some(true));

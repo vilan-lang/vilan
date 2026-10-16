@@ -860,3 +860,490 @@ fn the_marks_leave_a_js_node_as_wide_as_it_was() {
         80
     );
 }
+
+// --- E257 S7: the `.vdbg.json` sidecar (debugging.md §5.3, door D1). --------
+
+use vilan_core::debug_info::{BindingRead, DebugBinding, DebugFrame, DebugInfo, FrameKind, Layout};
+
+/// The sidecar a built program's map carries.
+fn sidecar(built: &Built) -> &DebugInfo {
+    built
+        .map
+        .debug
+        .as_deref()
+        .expect("a map carries its sidecar (E257 S7)")
+}
+
+fn frame<'info>(info: &'info DebugInfo, name: &str) -> &'info DebugFrame {
+    let found: Vec<&DebugFrame> = info
+        .frames
+        .iter()
+        .filter(|frame| frame.name == name)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "one frame named `{name}`: {:#?}",
+        info.frames
+    );
+    found[0]
+}
+
+fn binding<'frame>(frame: &'frame DebugFrame, name: &str) -> &'frame DebugBinding {
+    frame
+        .bindings
+        .iter()
+        .find(|binding| binding.name == name)
+        .unwrap_or_else(|| panic!("`{name}` in {frame:#?}"))
+}
+
+/// A binding's type, as the table spells it.
+fn type_text(info: &DebugInfo, binding: &DebugBinding) -> String {
+    let index = binding
+        .type_index
+        .unwrap_or_else(|| panic!("`{}` has a type: {binding:?}", binding.name));
+    info.types[index as usize].text.clone()
+}
+
+fn layout_of<'info>(info: &'info DebugInfo, text: &str) -> &'info Layout {
+    &info
+        .types
+        .iter()
+        .find(|type_| type_.text == text)
+        .unwrap_or_else(|| panic!("`{text}` in the table: {:#?}", info.types))
+        .layout
+}
+
+/// The JS function a sidecar frame names, declared in the script.
+fn declares(javascript: &str, name: &str) -> bool {
+    javascript.contains(&format!("function {name}("))
+}
+
+const VALUES: &str = r#"
+import std::hash_map::HashMap;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+enum Shape {
+    Circle(f64),
+    Rect(Point, Point),
+    Empty,
+}
+
+fun area(shape: Shape): f64 {
+    let scale = 2.0;
+    match shape {
+        Shape::Circle(let radius) => radius * radius * scale,
+        _ => 0.0,
+    }
+}
+
+fun scaled(factor: i32): |i32| i32 {
+    |value: i32| {
+        let total = value * factor;
+        total
+    }
+}
+
+fun main() {
+    let point = Point { x = 1, y = 2 };
+    let numbers = [1, 2, 3];
+    mut ages: HashMap<str, i32> = HashMap::new();
+    ages.insert("ada", 36);
+    let maybe: Option<i32> = Some(5);
+    let outcome: Result<i32, str> = Err("no");
+    let count: SignalCell<i32> = Signal::new(3);
+    let pair = (1, "two");
+    let triple = scaled(3);
+    print(area(Shape::Circle(1.5)));
+    print(triple(point.x));
+    print(numbers[0]);
+    print(ages.len());
+    print(maybe);
+    print(outcome);
+    print(count.get());
+    print(pair.0);
+}
+"#;
+
+/// Every user function is a frame, keyed as a JavaScript frame finds it —
+/// the emitted name, and the head's place in the map's coordinates — with its
+/// parameters and locals by vilan name, the name each got in the script, and
+/// a type whose layout is the printer's.
+#[test]
+fn s7_the_sidecar_lists_each_user_function_with_its_bindings_by_static_type() {
+    let (built, source) = build_program("sidecar_values", VALUES);
+    let info = sidecar(&built);
+
+    let area = frame(info, "area");
+    assert_eq!(area.kind, FrameKind::Function);
+    let js = area
+        .js
+        .as_deref()
+        .expect("a function frame names its function");
+    assert!(
+        declares(&built.mapped, js),
+        "`{js}` is declared:\n{}",
+        built.mapped
+    );
+    let (line, column) = source_position(&source, "area(shape: Shape)");
+    let entry = built
+        .map
+        .sources
+        .iter()
+        .position(|entry| entry.path.ends_with("main.vl"))
+        .expect("the user's file") as u32;
+    assert_eq!(
+        area.at,
+        Some((entry, line as u32, column as u32)),
+        "at the function's name"
+    );
+    let names: Vec<&str> = area
+        .bindings
+        .iter()
+        .map(|binding| binding.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["shape", "scale", "radius"],
+        "parameters, then locals in order"
+    );
+    assert!(binding(area, "shape").parameter && !binding(area, "scale").parameter);
+    for row in &area.bindings {
+        assert!(
+            built.mapped.contains(&format!("{} ", row.js))
+                || built.mapped.contains(&format!("{},", row.js))
+                || built.mapped.contains(&format!("{})", row.js)),
+            "`{}` is bound in the script as `{}`",
+            row.name,
+            row.js
+        );
+    }
+    assert_eq!(type_text(info, binding(area, "shape")), "Shape");
+    assert_eq!(type_text(info, binding(area, "scale")), "f64");
+
+    // The closure is a frame of its own, at its bars; its captures are its
+    // enclosing function's.
+    let closure = frame(info, "a closure in scaled");
+    assert_eq!(closure.kind, FrameKind::Closure);
+    assert_eq!(closure.js, None);
+    let (line, column) = source_position(&source, "|value: i32| {");
+    assert_eq!(closure.at, Some((entry, line as u32, column as u32)));
+    let names: Vec<&str> = closure
+        .bindings
+        .iter()
+        .map(|binding| binding.name.as_str())
+        .collect();
+    assert_eq!(names, ["value", "total"]);
+    let scaled = frame(info, "scaled");
+    let names: Vec<&str> = scaled
+        .bindings
+        .iter()
+        .map(|binding| binding.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["factor"],
+        "the closure's bindings are not its enclosing function's"
+    );
+
+    // `main` runs at the top level: no name, no head.
+    let main = frame(info, "main");
+    assert_eq!(
+        (main.kind, main.js.as_deref(), main.at),
+        (FrameKind::Main, None, None)
+    );
+    for (name, text) in [
+        ("point", "Point"),
+        ("numbers", "List<i32>"),
+        ("ages", "HashMap<str, i32>"),
+        ("maybe", "Option<i32>"),
+        ("outcome", "Result<i32, str>"),
+        ("count", "SignalCell<i32>"),
+        ("pair", "(i32, str)"),
+        ("triple", "|i32| i32"),
+    ] {
+        assert_eq!(type_text(info, binding(main, name)), text, "`{name}`");
+    }
+
+    // The layouts are the printer's.
+    let i32_index = info
+        .types
+        .iter()
+        .position(|type_| type_.text == "i32")
+        .expect("i32") as u32;
+    let str_index = info
+        .types
+        .iter()
+        .position(|type_| type_.text == "str")
+        .expect("str") as u32;
+    assert_eq!(
+        layout_of(info, "Point"),
+        &Layout::Struct {
+            name: "Point".to_string(),
+            fields: vec![("x".to_string(), i32_index), ("y".to_string(), i32_index)],
+        }
+    );
+    let Layout::Enum { variants } = layout_of(info, "Shape") else {
+        panic!("Shape is an enum layout");
+    };
+    let labels: Vec<&str> = variants.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["Shape::Circle", "Shape::Rect", "Shape::Empty"],
+        "qualified"
+    );
+    let Layout::Enum { variants } = layout_of(info, "Option<i32>") else {
+        panic!("Option is an enum layout");
+    };
+    assert_eq!(
+        variants,
+        &vec![
+            ("Some".to_string(), vec![i32_index]),
+            ("None".to_string(), vec![])
+        ]
+    );
+    assert_eq!(
+        layout_of(info, "List<i32>"),
+        &Layout::List {
+            element: i32_index,
+            fill: true
+        }
+    );
+    assert_eq!(
+        layout_of(info, "(i32, str)"),
+        &Layout::Tuple(vec![
+            (String::new(), i32_index, 1),
+            (String::new(), str_index, 1)
+        ])
+    );
+    assert!(matches!(
+        layout_of(info, "HashMap<str, i32>"),
+        Layout::Map { label, key, value, key_width: 1, value_width: 1, .. }
+            if label == "HashMap" && *key == str_index && *value == i32_index
+    ));
+    assert!(matches!(
+        layout_of(info, "SignalCell<i32>"),
+        Layout::Cell { label, value, .. } if label == "SignalCell" && *value == i32_index
+    ));
+    assert_eq!(
+        layout_of(info, "|i32| i32"),
+        &Layout::Text("<closure |i32| i32>".to_string())
+    );
+
+    // Only the user's file: std's functions are ignore-listed, never a frame.
+    assert!(
+        info.frames
+            .iter()
+            .all(|frame| frame.at.is_none_or(|(source, _, _)| source == entry)),
+        "{:#?}",
+        info.frames
+    );
+}
+
+/// Two instances whose bodies print the same share one JavaScript function
+/// (M16): its frame keeps a binding's type only where the instances agree, so
+/// a pane never prints a `str` as an `i32`.
+#[test]
+fn s7_a_shared_generic_body_keeps_only_the_types_its_instances_agree_on() {
+    let source = r#"
+import std::io::print;
+
+fun first<T>(items: List<T>): Option<T> {
+    let count = items.len();
+    if count == 0 { None } else { Some(items[0]) }
+}
+
+fun main() {
+    print(first([7, 8]));
+    print(first(["a"]));
+}
+"#;
+    let (built, _) = build_program("sidecar_shared", source);
+    let info = sidecar(&built);
+    let first = frame(info, "first");
+    assert_eq!(
+        built.mapped.matches("function first").count(),
+        1,
+        "the two instances share one body:\n{}",
+        built.mapped
+    );
+    assert_eq!(
+        binding(first, "items").type_index,
+        None,
+        "List<i32> and List<str> disagree"
+    );
+    assert_eq!(
+        type_text(info, binding(first, "count")),
+        "usize",
+        "both agree on `usize`"
+    );
+}
+
+/// Two instances whose bodies differ are two JavaScript functions, and each
+/// frame carries its own instance's types.
+#[test]
+fn s7_each_distinct_instance_is_a_frame_of_its_own() {
+    let source = r#"
+import std::io::print;
+
+trait Shape {
+    fun size(self): i32;
+}
+
+struct Square {
+    side: i32,
+}
+
+struct Line {
+    length: i32,
+}
+
+impl Square with Shape {
+    fun size(self): i32 {
+        self.side * self.side
+    }
+}
+
+impl Line with Shape {
+    fun size(self): i32 {
+        self.length
+    }
+}
+
+fun doubled<T: Shape>(shape: T): i32 {
+    let size = shape.size();
+    size * 2
+}
+
+fun main() {
+    print(doubled(Square { side = 3 }));
+    print(doubled(Line { length = 4 }));
+}
+"#;
+    let (built, _) = build_program("sidecar_instances", source);
+    let info = sidecar(&built);
+    let instances: Vec<&DebugFrame> = info
+        .frames
+        .iter()
+        .filter(|frame| frame.name == "doubled")
+        .collect();
+    assert_eq!(instances.len(), 2, "{:#?}", info.frames);
+    assert_ne!(instances[0].js, instances[1].js, "two emitted functions");
+    assert_eq!(instances[0].at, instances[1].at, "one source head");
+    let mut types: Vec<String> = instances
+        .iter()
+        .map(|instance| type_text(info, binding(instance, "shape")))
+        .collect();
+    types.sort();
+    assert_eq!(types, ["Line", "Square"]);
+    for instance in instances {
+        let js = instance.js.as_deref().expect("named");
+        assert!(declares(&built.mapped, js), "`{js}` is declared");
+    }
+}
+
+/// A row says how its binding holds the value, so the debugger reads what
+/// `dbg` prints and not the representation: a scalar view is a `(base, key)`
+/// pair, and a `lazy` parameter a thunk that reading would force.
+#[test]
+fn s7_a_view_and_a_lazy_parameter_say_how_they_are_read() {
+    let source = r#"
+import std::io::print;
+
+fun shout(lazy message: str) {
+    print(message);
+}
+
+fun main() {
+    mut rows = [Some(1), Some(2)];
+    match &rows[0] {
+        Some(let first) => {
+            print(*first);
+        },
+        None => {},
+    }
+    shout("hey");
+    rows.push(None);
+}
+"#;
+    let (built, _) = build_program("sidecar_reads", source);
+    let info = sidecar(&built);
+    let main = frame(info, "main");
+    let first = binding(main, "first");
+    assert_eq!((first.read, first.view), (BindingRead::ViewPair, true));
+    assert_eq!(type_text(info, first), "i32");
+    assert_eq!(binding(main, "rows").read, BindingRead::Value);
+    let shout = frame(info, "shout");
+    assert_eq!(binding(shout, "message").read, BindingRead::Lazy);
+}
+
+/// A statement inside a block-bodied closure maps to its own line, and the
+/// closure's `return` to its tail's — so a breakpoint inside the closure binds
+/// inside it rather than sliding past its end.
+#[test]
+fn s7_a_block_bodied_closures_statements_and_tail_map_to_their_lines() {
+    let (built, source) = build_program("sidecar_closure_lines", VALUES);
+    let segments = assert_valid(&built.mapped, &built.map);
+    let statement = segment_at(
+        &segments,
+        generated_position(&built.mapped, "const total = ", 0),
+    );
+    assert_eq!(
+        (statement.line, statement.column),
+        source_position(&source, "let total = value * factor;")
+    );
+    let tail = segment_at(
+        &segments,
+        generated_position(&built.mapped, "return total;", 0),
+    );
+    let (line, _) = source_position(&source, "        total\n");
+    assert_eq!(tail.line, line, "the closure returns at its tail's line");
+}
+
+/// The sidecar's JSON: what `vilan-dap` reads (`editors/vscode/src/dap/sidecar.ts`).
+#[test]
+fn s7_the_sidecar_json_is_the_format_the_adapter_reads() {
+    let source = r#"
+import std::io::print;
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fun main() {
+    let point = Point { x = 1, y = 2 };
+    print(point.x);
+}
+"#;
+    let (built, _) = build_program("sidecar_json", source);
+    let json = sidecar(&built).to_json("main.mjs");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("the sidecar is JSON");
+    assert_eq!(parsed["version"], 1);
+    assert_eq!(parsed["file"], "main.mjs");
+    let main = parsed["frames"]
+        .as_array()
+        .expect("frames")
+        .iter()
+        .find(|frame| frame["kind"] == "main")
+        .expect("main's frame");
+    assert_eq!(main["name"], "main");
+    assert_eq!(main["bindings"][0]["name"], "point");
+    assert_eq!(main["bindings"][0]["js"], "point");
+    let point = &parsed["types"][main["bindings"][0]["type"].as_u64().expect("typed") as usize];
+    assert_eq!(point["text"], "Point");
+    assert_eq!(point["shape"], "struct");
+    assert_eq!(point["name"], "Point");
+    let x = &point["fields"][0];
+    assert_eq!(x[0], "x");
+    assert_eq!(
+        parsed["types"][x[1].as_u64().expect("an index") as usize]["shape"],
+        "integer"
+    );
+}

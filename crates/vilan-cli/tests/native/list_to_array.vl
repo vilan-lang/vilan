@@ -1,0 +1,47 @@
+// A172: `List::to_array` - `Some` at the list's length, `None` otherwise, the
+// length from the expected type, the written argument, or a `const N` of the
+// enclosing body, and the array a copy - the same on both backends.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Point {
+	x: i32,
+}
+
+fun take<const N>(items: List<str>): Option<[str; N]> {
+	items.to_array()
+}
+
+fun main() {
+	let numbers: List<i32> = [1, 2, 3];
+	let three: Option<[i32; 3]> = numbers.to_array();
+	let two: Option<[i32; 2]> = numbers.to_array();
+	match three {
+		Some(let array) => print(array[0] + array[2]),
+		None => print("none"),
+	}
+	print(two.is_none());
+	print([4, 5].to_array<2>().unwrap()[1]);
+	let words = ["a", "b", "c"];
+	let exact: Option<[str; 3]> = take(words);
+	let longer: Option<[str; 4]> = take(words);
+	print(i"{exact.unwrap()[2]} {longer.is_none()}");
+	let nothing: List<Point> = [];
+	let empty: Option<[Point; 0]> = nothing.to_array();
+	print(empty.is_some());
+	mut points = [Point { x = 1 }, Point { x = 2 }];
+	mut array = points.to_array<2>().unwrap();
+	array[0].x = 9;
+	points[1].x = 8;
+	print(i"{points[0].x} {array[0].x} {points[1].x} {array[1].x}");
+	mut count = 0;
+	mut grown: List<i32> = [];
+	let bump = || {
+		grown.push(count);
+		count += 1;
+	};
+	bump();
+	bump();
+	let pair: Option<[i32; 2]> = grown.to_array();
+	print(pair.unwrap()[1]);
+}

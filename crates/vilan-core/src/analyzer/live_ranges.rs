@@ -35,7 +35,7 @@ use crate::id::Id;
 
 /// The ids a predicate does NOT cover, as sorted disjoint `[start, end)`
 /// ranges over `[0, high)`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct LiveRanges {
     ranges: Vec<(u32, u32)>,
     /// How many ids the ranges cover.

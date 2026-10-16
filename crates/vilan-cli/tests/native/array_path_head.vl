@@ -1,0 +1,47 @@
+// A171: a fixed-array type heads a `::` path - its impls' statics, the head
+// binding the impl's element and length, through a nested array, a generic
+// element and a `const N` - the same on both backends.
+import std::default::Default;
+import std::io::print;
+import std::json::{ FromJson, Json };
+import std::result::Result::{ self, Err, Ok };
+
+[derive(Default, Json)]
+struct Pixel {
+	rgb: [u8; 3],
+	alpha: u8,
+}
+
+fun zeros<const N>(): [i32; N] {
+	[i32; N]::default()
+}
+
+fun filled<T: Default, const N>(): [T; N] {
+	[T; N]::default()
+}
+
+fun main() {
+	let three = [i32; 3]::default();
+	print(i"{three.len()} {three[2]}");
+	let grid = [[u8; 2]; 3]::default();
+	print(grid[2][1]);
+	let four: [i32; 4] = zeros();
+	print(four.len());
+	let words: [str; 2] = filled();
+	print(i"[{words[1]}]");
+	match [str; 2]::from_json("[\"a\", \"b\"]") {
+		Ok(let pair) => print(pair[1]),
+		Err(let reason) => print(reason),
+	}
+	match [i32; 3]::from_json("[1, 2]") {
+		Ok(let triple) => print(triple[0]),
+		Err(let reason) => print(reason),
+	}
+	print([i32; 2]::to_list([7, 8]).len());
+	let pixel = Pixel::default();
+	print(pixel.to_json());
+	match Pixel::from_json("{\"rgb\":[1,2,3],\"alpha\":9}") {
+		Ok(let back) => print(back.rgb[2] + back.alpha),
+		Err(let reason) => print(reason),
+	}
+}

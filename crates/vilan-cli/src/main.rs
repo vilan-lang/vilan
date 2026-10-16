@@ -360,16 +360,27 @@ enum CacheCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Delete every `vilan check` macro-expansion table (`~/.vilan/check-cache`).
+    /// Delete every `vilan check` macro-expansion table (`~/.vilan/check-cache`)
+    /// and every persisted std prefix (`~/.vilan/cache/worlds`).
     ///
     /// Each package `vilan check` has warmed keeps one table there, keyed by
     /// its path; a check holds the root to a bound by itself (thirty days, 256
     /// tables, 256 MiB, oldest first), and this is the gesture for emptying it
-    /// outright. Every table is re-created by the next check of its package.
+    /// outright. Every table is re-created by the next check of its package,
+    /// and every prefix by the next analysis that looks for it.
     Clean {
         /// Print what would be deleted, with sizes, and delete nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Write the persisted std prefix for a program (`~/.vilan/cache/worlds`):
+    /// check it once with the prefix on, so the next process — a CI step, an
+    /// editor's first open — loads std (and the program's dependencies) instead
+    /// of analyzing them again.
+    Warm {
+        /// A `.vl` file, a project directory, or omitted for the nearest
+        /// `vilan.toml`, as `vilan check` takes it.
+        file: Option<PathBuf>,
     },
 }
 
@@ -410,6 +421,14 @@ fn spawn_scoped_compiler_thread<'scope, 'env, T: Send + 'scope>(
 
 fn main() -> ExitCode {
     vilan_core::counters::arm_from_env();
+    // std-prefix P3: a `vilan check`/`build` under `VILAN_STD_PREFIX=on|layered`
+    // loads the std-only prefix from `~/.vilan/cache/worlds` when a process
+    // already wrote it there, and writes it there when none has;
+    // `VILAN_STD_PREFIX=off` (the CLI's default) never touches it, and
+    // `VILAN_WORLD_CACHE=off|<dir>` overrides the root.
+    vilan_core::incremental::set_world_cache_default(Some(
+        vilan_embedded::default_world_cache_root(),
+    ));
     // Compilation recurses over deeply-nested ASTs and type graphs, which can
     // run past the default main-thread stack on otherwise-valid programs. Do the
     // work on a worker with a generous stack, as rustc and other compilers do;
@@ -612,6 +631,7 @@ fn run_cli() -> ExitCode {
         Command::Cache { command } => match command {
             CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
             CacheCommand::Clean { dry_run } => cache_clean(dry_run),
+            CacheCommand::Warm { file } => cache_warm(file),
         },
     }
 }
@@ -657,15 +677,124 @@ fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
             outcome = one;
         }
     }
+    // FOUR since std-prefix P4: the persisted std prefixes. A world another
+    // build of the analyzer wrote can never be read by this one (its header
+    // names its build — G28's stamp), so those go; this build's are kept.
+    let worlds = world_cache_root();
+    let removed = vilan_core::world_cache::prune(&worlds, max_age, dry_run);
+    report_world_cache(
+        &worlds,
+        &removed,
+        if dry_run { "would prune" } else { "pruned" },
+        all,
+    );
     outcome
 }
 
-/// `vilan cache clean` (N137): every check-cache table, whatever its age.
-/// They are caches in the strict sense — a check re-creates its package's
-/// table — so nothing in that root is protected.
+/// `vilan cache clean` (N137): every check-cache table, whatever its age —
+/// and, since std-prefix P4, every persisted std prefix. They are caches in
+/// the strict sense — a check re-creates its package's table, an analysis its
+/// prefix — so nothing in either root is protected.
 fn cache_clean(dry_run: bool) -> ExitCode {
     let root = vilan_embedded::default_check_cache_root();
-    prune_one_cache_root(&root, None, dry_run, true, None)
+    let outcome = prune_one_cache_root(&root, None, dry_run, true, None);
+    let worlds = world_cache_root();
+    let removed = vilan_core::world_cache::clean(&worlds, dry_run);
+    report_world_cache(
+        &worlds,
+        &removed,
+        if dry_run { "would clean" } else { "cleaned" },
+        true,
+    );
+    outcome
+}
+
+/// std-prefix P4: `vilan cache warm` — the program checked once with the std
+/// prefix forced on, so its prefix file (std's, and the dependency tier's for a
+/// program with dependencies) is written for the next process to load.
+fn cache_warm(file: Option<PathBuf>) -> ExitCode {
+    let root = world_cache_root();
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let (loads_before, writes_before, _) = vilan_core::analyzer::prefix_file_counts();
+    let outcome = check_once(file, None, false);
+    let (loads, writes, _) = vilan_core::analyzer::prefix_file_counts();
+    let written = writes - writes_before;
+    let present = loads - loads_before;
+    println!(
+        "{}: wrote {written} prefix file{}, {present} already present",
+        root.display(),
+        if written == 1 { "" } else { "s" },
+    );
+    outcome.into()
+}
+
+/// The world cache's root as this process resolves it: `VILAN_WORLD_CACHE`
+/// when set to a directory, else `~/.vilan/cache/worlds`.
+fn world_cache_root() -> PathBuf {
+    vilan_core::incremental::world_cache_dir()
+        .unwrap_or_else(vilan_embedded::default_world_cache_root)
+}
+
+/// One report for the world cache, in [`prune_one_cache_root`]'s shape: what
+/// went, each with its size, age and the build that wrote it.
+fn report_world_cache(
+    root: &Path,
+    removed: &[vilan_core::world_cache::WorldCacheEntry],
+    verb: &str,
+    all: bool,
+) {
+    let kept = vilan_core::world_cache::entries(root).len();
+    if removed.is_empty() {
+        println!(
+            "{}: nothing to prune ({kept} entr{} kept)",
+            root.display(),
+            if kept == 1 { "y" } else { "ies" }
+        );
+        return;
+    }
+    let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
+    println!(
+        "{}: {verb} {} entr{} ({})",
+        root.display(),
+        removed.len(),
+        if removed.len() == 1 { "y" } else { "ies" },
+        human_bytes(freed),
+    );
+    for entry in removed {
+        let build = match &entry.build {
+            Some(build) => format!("build {build}"),
+            None if entry.name == vilan_core::world_cache::STD_INDEX_DIRECTORY => {
+                "the std import index".to_string()
+            }
+            None => "unreadable header".to_string(),
+        };
+        println!(
+            "  {}  {:>9}  {}  {build}",
+            entry.name,
+            human_bytes(entry.bytes),
+            entry
+                .age
+                .map(|age| format!("{} days old", age.as_secs() / (24 * 60 * 60)))
+                .unwrap_or_else(|| "age unknown".to_string()),
+        );
+    }
+    if kept > 0 {
+        let rule = if all {
+            "this build's own worlds are never pruned"
+        } else {
+            "this build's own worlds are never pruned, and nothing used in the last seven days"
+        };
+        println!(
+            "{}",
+            paint::out(
+                paint::Style::DIM,
+                &format!(
+                    "{kept} entr{} kept: {rule}",
+                    if kept == 1 { "y" } else { "ies" }
+                )
+            )
+        );
+    }
 }
 
 /// One cache root pruned and reported. Split out when the check tables became a
@@ -1348,8 +1477,8 @@ fn install_watch_interrupt_hook() {
     // (or a second install) refused.
     let _ = ctrlc::set_handler(|| {
         let _ = fs::remove_file(watch_script_path());
-        // The round's source map (E257 S6) goes with its script.
-        let _ = fs::remove_file(source_map_path(&watch_script_path()));
+        // The round's source map (E257 S6) and sidecar (S7) go with its script.
+        remove_script_maps(&watch_script_path());
         std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
     });
 }
@@ -2008,6 +2137,13 @@ fn hmr_round(
                     let _ = fs::remove_file(&map_path);
                 }
             }
+            if let Err(error) = write_sidecar(&bundle_path, map.as_ref()) {
+                eprintln!(
+                    "{} cannot write {}: {error}",
+                    paint::error_prefix(),
+                    sidecar_path(&bundle_path).display()
+                );
+            }
         }
         if let Some(css) = &leg.css {
             let css_path = dist.join(format!("{}.css", leg.name));
@@ -2045,11 +2181,15 @@ fn hmr_round(
         )
         .unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
+        // The map this round wrote, or the one a SKIPPED leg's unchanged
+        // bundle still names — on disk either way, which is the fact.
+        let bundle_map = source_map_path(&bundle_path).exists();
         let _ = write_chunks(
             &bundle_path,
             &[],
             styles.as_deref(),
             &assets,
+            bundle_map,
             leg.is_browser,
         );
     }
@@ -2201,8 +2341,8 @@ fn watch_script_path() -> PathBuf {
 /// (`windows-support.md` §5). A missing file is success.
 fn remove_watch_script() {
     let script = watch_script_path();
-    // Its map (E257 S6) goes with it; most rounds have one.
-    let _ = fs::remove_file(source_map_path(&script));
+    // Its map (E257 S6) and sidecar (S7) go with it; most rounds have one.
+    remove_script_maps(&script);
     if let Err(error) = fs::remove_file(&script)
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -4843,6 +4983,7 @@ fn build_single(
         &chunks,
         styles.as_deref(),
         &assets,
+        compiled.source_map.is_some(),
         matches!(platform, Platform::Browser),
     )
     .is_err()
@@ -5454,6 +5595,7 @@ fn build_workspace_artifacts(
                 &chunks,
                 styles.as_deref(),
                 &assets,
+                compiled.source_map.is_some(),
                 matches!(platform, Platform::Browser),
             )?;
             let mapped = compiled.source_map.is_some();
@@ -6299,7 +6441,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         .arg(&script)
         .output();
     let _ = fs::remove_file(&script);
-    let _ = fs::remove_file(source_map_path(&script));
+    remove_script_maps(&script);
     match output {
         Ok(result) if result.status.success() => Ok(()),
         Ok(result) => {
@@ -6950,7 +7092,11 @@ fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
 ///   `document.currentScript` (§3.5);
 /// - `chunks` — the route chunks, `[]` for a leg that does not split;
 /// - `assets` — the files `const asset::bundle` carried into `dist/`, `[]` for
-///   a leg that bundled none (kolt.local 029).
+///   a leg that bundled none (kolt.local 029);
+/// - `maps` — the source maps written beside the bundle (`bundle_map`) and
+///   each chunk, `[]` for a build that wrote none (B630): what `serve_build`
+///   routes so a built page's DevTools reaches the `.vl` sources the bundle's
+///   last line names.
 ///
 /// That reverses `bundle-splitting.md` §9's "dropping `split` takes the manifest
 /// with it", and STRENGTHENS its invariant rather than weakening it: the
@@ -6984,6 +7130,9 @@ fn write_chunks(
     // order — the manifest's `assets` array, and so what `serve_build` serves
     // without a route of the app's own (kolt.local 029).
     assets: &[String],
+    // Whether the bundle's own `<entry>.map` is written beside it by this
+    // build — the caller's answer, since the bundle is written after this.
+    bundle_map: bool,
     is_browser: bool,
 ) -> Result<(), ExitCode> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
@@ -7060,8 +7209,30 @@ fn write_chunks(
             .join(",\n");
         format!("[\n{rows}\n\t]")
     };
+    // The bundle's map first, then each chunk's, in the chunks' order — the
+    // file names the scripts' last lines name (`write_script`).
+    let map_names: Vec<String> = bundle_map
+        .then(|| format!("{entry}.map"))
+        .into_iter()
+        .chain(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.map.is_some())
+                .map(|chunk| format!("{}.map", chunk.file)),
+        )
+        .collect();
+    let maps = if map_names.is_empty() {
+        "[]".to_string()
+    } else {
+        let rows = map_names
+            .iter()
+            .map(|name| format!("\t\t{}", json_string(name)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("[\n{rows}\n\t]")
+    };
     let manifest = format!(
-        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing},\n\t\"assets\": {bundled}\n}}\n",
+        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing},\n\t\"maps\": {maps},\n\t\"assets\": {bundled}\n}}\n",
         json_string(&leg),
         json_string(&entry),
         styles.map_or_else(|| "null".to_string(), json_string),
@@ -7895,6 +8066,44 @@ fn source_map_path(script: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The file a script's debug-info sidecar is written to (E257 S7):
+/// `<script>.vdbg.json` beside `<script>.map` — what `vilan-dap` reads to show
+/// the debugger's panes by static type.
+fn sidecar_path(script: &Path) -> PathBuf {
+    let mut name = script.as_os_str().to_os_string();
+    name.push(".vdbg.json");
+    PathBuf::from(name)
+}
+
+/// Writes the sidecar that rides with `map` beside `script` (E257 S7), or
+/// removes a stale one when this build has none — a `release` build, or a
+/// split leg, which maps its chunks but describes no frames.
+fn write_sidecar(
+    script: &Path,
+    map: Option<&vilan_core::source_map::SourceMap>,
+) -> std::io::Result<()> {
+    let path = sidecar_path(script);
+    match map.and_then(|map| map.debug.as_deref()) {
+        Some(debug) => {
+            let file = script
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            fs::write(&path, debug.to_json(&file))
+        }
+        None => {
+            let _ = fs::remove_file(&path);
+            Ok(())
+        }
+    }
+}
+
+/// Removes a script's map and sidecar — a temp script's, when its run ends.
+fn remove_script_maps(script: &Path) {
+    let _ = fs::remove_file(source_map_path(script));
+    let _ = fs::remove_file(sidecar_path(script));
+}
+
 /// `javascript` with the comment that names its map appended (E257 S5), or
 /// unchanged when there is no map.
 fn with_mapping_comment(script: &Path, javascript: String, map: bool) -> String {
@@ -7952,6 +8161,7 @@ fn write_script(
             let _ = fs::remove_file(&map_path);
         }
     }
+    write_sidecar(script, map)?;
     fs::write(
         script,
         with_mapping_comment(script, javascript, map.is_some()),
@@ -7969,7 +8179,7 @@ fn write_run_script_with_map(
     map: Option<&vilan_core::source_map::SourceMap>,
 ) -> std::io::Result<bool> {
     let map_path = source_map_path(script);
-    let _ = fs::remove_file(&map_path);
+    remove_script_maps(script);
     let Some(map) = map else {
         write_run_script(script, javascript)?;
         return Ok(false);
@@ -7979,6 +8189,7 @@ fn write_run_script_with_map(
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     fs::write(&map_path, map.to_json(&file, None))?;
+    write_sidecar(script, Some(map))?;
     write_run_script(
         script,
         &with_mapping_comment(script, javascript.to_string(), true),
@@ -8012,7 +8223,7 @@ fn run_node_script(
     let status = spawn_node(&script, &node_flags(mapped, inspect), args, None)
         .and_then(|mut child| child.wait());
     let _ = fs::remove_file(&script);
-    let _ = fs::remove_file(source_map_path(&script));
+    remove_script_maps(&script);
     exit_code_of(status)
 }
 

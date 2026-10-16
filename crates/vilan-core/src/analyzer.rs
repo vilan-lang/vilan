@@ -22,10 +22,14 @@ mod dbg_stack;
 mod held_tables;
 mod hint_labels;
 mod hover_labels;
+mod hover_records;
 pub mod id_windows;
 mod item_records;
+mod lazy_tables;
 mod live_ranges;
 mod liveness;
+mod move_tables;
+mod row_families;
 mod written_types;
 
 pub use dbg_stack::{
@@ -239,7 +243,7 @@ fn derived_origin_bounds(row: &(std::ops::Range<u32>, Span, SourceId)) -> (u32, 
 /// written. A row whose subject was unresolved when the index was built waits
 /// in `unsettled` and is offered to every subject, because it may have
 /// resolved since; `impl_subject_admits` decides it then.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ImplHeadRows {
     nominal: HashMap<ImplSubjectBucket, Vec<usize>>,
     open: Vec<usize>,
@@ -267,7 +271,8 @@ impl ImplHeadRows {
 }
 
 /// Which row of impl indices a [`MemberRowIndex`] splits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 enum ImplRowKey<'src> {
     /// `implementations_by_member[name]`: the impls that DECLARE the name.
     Member(&'src str),
@@ -275,7 +280,7 @@ enum ImplRowKey<'src> {
     Trait(Id),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct MemberRowIndex {
     indexed: usize,
     nominal: HashMap<ImplSubjectBucket, Vec<usize>>,
@@ -304,7 +309,7 @@ struct MemberRowIndex {
 /// lookup would have made — not a syntactic stand-in for it (M110 S1's
 /// spelling guard refused every hot set whose inherent members shared a name
 /// with ANY identifier outside it).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ImplReachLog {
     /// Whether the resolve now running records.
     recording: bool,
@@ -387,7 +392,7 @@ impl ImplReachLog {
 /// answer a trait or an inherited member anywhere, so everything is. A late
 /// file with none of these records nothing at all, which is every `vilan
 /// check` whose entry writes no impl on another file's type.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct ReachFilter {
     /// Record every question (a foreign trait impl, an item macro).
     everything: bool,
@@ -476,7 +481,7 @@ impl ReachFilter {
 /// [`ImplReachLog`]'s insert: `receiver` joins the set, and a package asker
 /// marks it so whoever asked first.
 /// How one receiver was asked about ([`ImplReachLog`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Asked {
     /// A PACKAGE source asked (as opposed to only std's).
     by_package: bool,
@@ -521,7 +526,7 @@ struct ImplReached {
 }
 
 /// [`Analyzer::impl_subject_bucket`]'s classes (M107).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum ImplSubjectBucket {
     Struct(Id),
     Enum(Id),
@@ -707,7 +712,7 @@ impl Drop for TypeCycleGuard {
 /// registration and enforced with the trait bounds: the bound value must be a
 /// tuple, its arity inside `lo..=hi`, and — when `element_bound` is set —
 /// every element must satisfy that trait.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct TupleBoundRequirement {
     lo: Option<u32>,
     hi: Option<u32>,
@@ -817,7 +822,8 @@ fn primed_binder_name(name: &str) -> &'static str {
     leaked
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum Expr<'src> {
     // An assignment to a local: target accessor and the (possibly desugared,
     // e.g. `x + v` for `x += v`) value expression.
@@ -977,7 +983,7 @@ enum TupleLeaf {
     SubTuple,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ExprIfBranch {
     If(Id, (Vec<Id>, Id), Option<Box<ExprIfBranch>>),
     Else((Vec<Id>, Id)),
@@ -1032,7 +1038,7 @@ pub struct Divergence<'a, 'src> {
 /// Computed once and carried on both the analyzer and the finished [`Program`]:
 /// each half is a scan of every entity, while the question is asked once per
 /// statement, and on the editor's side once per publish (E121).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DivergenceLeaves {
     pub panic_calls: HashSet<Id>,
     pub endless_loops: HashSet<Id>,
@@ -1132,7 +1138,7 @@ fn if_branch_bodies(branch: &ExprIfBranch, out: &mut Vec<(Vec<Id>, Id)>) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExprMatchLeg {
     pub pattern: ExprPattern,
     // An optional `if` guard, evaluated (with the pattern's captures in scope)
@@ -1146,7 +1152,7 @@ pub struct ExprMatchLeg {
 /// How two INHERENT impl subjects claim the same receivers — what
 /// [`Analyzer::subjects_collide`] answers and what the duplicate-member message
 /// says (B315).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SubjectCollision {
     /// One subject written twice: the same type, or two binders bound the same
     /// way. The duplicate the rule has refused since B57.
@@ -1165,7 +1171,7 @@ pub enum SubjectCollision {
 /// GENERAL path names a module SUBTREE, and a subtree is a question about file
 /// paths — `Program::canonical_sources` — so the row travels to where the paths
 /// are.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScopedReachCheck {
     /// The `(in PATH)` segments: `["pkg", "a"]`.
     pub scope: Vec<String>,
@@ -1198,7 +1204,7 @@ pub struct ScopedReachCheck {
 /// that tier 1 of method resolution takes the first inherent candidate WITHOUT
 /// ranking, so declaration order decides which body runs and swapping the two
 /// blocks changes the answer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BlanketResidue {
     /// The member name both blankets declare.
     pub member: String,
@@ -1219,7 +1225,7 @@ pub struct BlanketResidue {
 /// namespace is worth its cost (`visibility.md` §3.7). It becomes a problem
 /// only in a FILE that admits both, so that is where it is reported —
 /// [`refuse_imported_member_collisions`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MemberCollision {
     /// The member name both blocks declare.
     pub member: String,
@@ -1236,7 +1242,7 @@ pub struct MemberCollision {
 }
 
 // A fully resolved match pattern, ready for code generation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ExprPattern {
     // `_` — matches anything without binding it.
     Wildcard,
@@ -1410,7 +1416,8 @@ fn default_rows(rows: &[Vec<ExprPattern>]) -> Vec<Vec<ExprPattern>> {
 /// costs EIGHT steps (`capture-clones.md` §12.5).
 const COVERAGE_WALK_STEP_BUDGET: u32 = 200_000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Function<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -1495,7 +1502,8 @@ pub struct Function<'src> {
     pub trait_only: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ExternalFunction<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -1552,7 +1560,7 @@ pub struct ExternalFunction<'src> {
     pub track_caller: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionCall {
     pub id: Id,
     pub subject_id: Id,
@@ -1561,7 +1569,8 @@ pub struct FunctionCall {
     pub arguments_span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Parameter<'src> {
     pub id: Id,
     pub function_id: Id,
@@ -1729,7 +1738,8 @@ struct PendingViewCrossing {
 /// [`check_view_suspensions`] once `async_infer::infer` has run. Nothing here
 /// overlaps the explicit-`await` half, which `check_invalidation` still decides
 /// on its own: the token stays SUFFICIENT, it only stops being necessary.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ViewSuspensionChecks<'src> {
     /// E3's body rule at a call site: `(anchor, call, view, the view's root)`.
     pub crossings: Vec<(Id, Id, Id, Option<Id>)>,
@@ -1831,7 +1841,7 @@ pub fn retired_slot_value_name(method_name: &str) -> Option<&'static str> {
 /// closure suspends nothing, so this over-approximates — and over-approximating
 /// refuses a program that could have compiled, which is the recoverable
 /// mistake.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ThunkEffects {
     /// Every call the expression performs, by call id — read against
     /// `async_functions` and `context_dependent_functions` once the post-passes
@@ -1899,6 +1909,7 @@ struct ArmMoveState {
 /// Conservative by construction: a variant whose payload cannot be classified
 /// completely counts as carrying one, so the failure mode is an over-report,
 /// never a missed leak.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct IsRefinement {
     /// The place tested — only a bare `Expr::Local` refines anything.
     binding: Id,
@@ -2073,7 +2084,7 @@ impl ResourceMoveViolation {
 /// B461: where a bare trait NESTED in an annotation stands — the reading
 /// each position gives it (a mint for a parameter, an existential for a
 /// `let`). A field is not one: A124 R3 made a trait at a field the object.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 enum NestedAnnotationOwner {
     /// Inside a parameter's annotation: an implicit generic of the function
     /// (B186's reading, one per mention).
@@ -2214,7 +2225,8 @@ struct LiteralShape {
     lets: Vec<Id>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Variable<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -2234,7 +2246,8 @@ pub struct Variable<'src> {
 /// none survives into `generic_parameter_constraint_ids` — that list holds
 /// constraint ids, and a defaulted parameter's entry there is the DEFAULT's type
 /// id, indistinguishable from a bound one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct DeclaredGenericParameter<'src> {
     name: &'src str,
     has_default: bool,
@@ -2244,7 +2257,8 @@ struct DeclaredGenericParameter<'src> {
     is_bounded: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Struct<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -2283,7 +2297,8 @@ struct ContainerResource<'src> {
     declared_at: Option<(Id, Span)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Field<'src> {
     pub name: &'src str,
     /// The span of just the field's name in the source (for go-to-definition and
@@ -2300,7 +2315,8 @@ pub struct Field<'src> {
     pub internal: Option<&'src str>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Enum<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -2332,7 +2348,7 @@ pub struct Enum<'src> {
 /// Which scalar an enum's variants are backed by. Fixed by the first explicit
 /// backing value in declaration order; a later disagreement is a hard error
 /// (backed-enums.md §3.2 — an enum has ONE runtime representation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Backing {
     /// `= (-)? INTEGER` — the C-like discriminant that always existed.
     Int,
@@ -2353,7 +2369,7 @@ impl Backing {
 /// One variant's backing value, in the two shapes §3.2 admits. Every variant of
 /// an enum carries the same shape — the mixed case is rejected at the
 /// declaration, so nothing downstream has to handle a per-variant mixture.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum BackingValue {
     Int(i64),
     /// The RAW literal text, escapes unprocessed — the same representation
@@ -2361,7 +2377,8 @@ pub enum BackingValue {
     Str(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct EnumVariantDeclaration<'src> {
     pub name: &'src str,
     pub data_type_ids: Vec<TypeId>,
@@ -2741,7 +2758,8 @@ fn backing_placement_error(
 }
 
 // A match pattern as walked, with variant names not yet resolved.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 enum WalkPattern<'src> {
     // `_`, with where it is written (E241's hover).
     Wildcard(Span, SourceId),
@@ -2767,7 +2785,8 @@ enum WalkPattern<'src> {
 
 // A walked match leg: its patterns (an or-pattern when more than one), optional
 // guard, and body, each scoped to the leg's captures.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct WalkLeg<'src> {
     patterns: Vec<WalkPattern<'src>>,
     guard: Option<Id>,
@@ -2775,7 +2794,8 @@ struct WalkLeg<'src> {
 }
 
 // A match expression awaiting subject and pattern resolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct PreppedMatch<'src> {
     id: Id,
     subject_id: Id,
@@ -2787,7 +2807,8 @@ struct PreppedMatch<'src> {
 // A `let (a, b) = value` destructuring binding awaiting its value's type, so the
 // pattern's bindings can be typed from the value's (tuple) element types. The
 // bindings are already walked into `scope_id`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct DestructureConstraint<'src> {
     id: Id,
     value_id: Id,
@@ -2803,7 +2824,8 @@ struct DestructureConstraint<'src> {
 
 // An `is` pattern test awaiting subject and pattern resolution. Its captures are
 // already walked into `scope_id`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct PreppedIs<'src> {
     id: Id,
     subject_id: Id,
@@ -2813,7 +2835,7 @@ struct PreppedIs<'src> {
 
 /// E309: one `L <M>(args)` site — a generic call spaced from its name, which
 /// E291's whitespace rule reads as the comparison chain `(L < M) > (args)`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SpacedGenericCall {
     /// The inner `<` binary.
     inner: Id,
@@ -2827,7 +2849,8 @@ struct SpacedGenericCall {
     span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Implementation<'src> {
     pub subject: TypeId,
     /// The block's own entity id — what `export impl …` marks, and therefore
@@ -2913,7 +2936,8 @@ pub struct Implementation<'src> {
 /// it would be — about 160 blocks and the ~60 KB they hold — and the part that
 /// is not in the Ir figure is the allocation COUNT: one malloc per block per
 /// clone, per analysis of every open document, gone.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct ImplNamespace<'src> {
     /// The subject's written head name (`impl Length<..>` -> `Length`).
     subject_name: &'src str,
@@ -3056,7 +3080,8 @@ impl ForEachNextProviders {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Trait<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -3129,7 +3154,7 @@ enum SignatureSide<'a> {
 /// label, and it carries the arguments for the same reason: under a
 /// PARAMETERIZED clause a `= Self`-defaulted parameter and `Self` resolve to the
 /// one type, so only the written name says which of the two a position is.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct SupertraitSelf {
     declaring_trait_id: Id,
     sub_trait: TypeId,
@@ -3152,7 +3177,8 @@ struct SupertraitSelf {
 /// One `EXP as T` site (B571): the value, the written type's slot, and the
 /// type's span — read by `Constraint::Ascription` and by the binding-style
 /// annotation checks ([`Analyzer::annotated_value`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct AscriptionSite<'src> {
     value_id: Id,
     type_id: TypeId,
@@ -3174,7 +3200,7 @@ struct AscriptionSite<'src> {
 /// member begins (a line break between them is a chain split one stage per
 /// line), and the link's span. The chain's head is worked out when the hints
 /// are built (`stage_hints`), never on the walk every analysis pays for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct ChainStage {
     id: Id,
     subject_id: Id,
@@ -3186,7 +3212,7 @@ struct ChainStage {
 /// One per-stage inlay hint (E278, `type-ascription.md` §11): a stage of a
 /// chain split one stage per line, whose line it ends, with its type as the
 /// hint shows it and as the "Ascribe this stage" action writes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageHint {
     /// The stage expression (or the chain's head): the hint sits at its end.
     pub id: Id,
@@ -3205,7 +3231,7 @@ pub struct StageHint {
 }
 
 /// What an `auto` annotation is written on (B570).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum AutoOwner {
     /// A function's return.
     Return(Id),
@@ -3219,7 +3245,8 @@ enum AutoOwner {
 /// reported under, the whole annotation's span (what `--fix` rewrites), the
 /// written type's slot when one is written (`None`: the bare `auto`), and the
 /// scope its rewrite is spelled for.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct AutoAnnotation<'src> {
     owner: AutoOwner,
     name: &'src str,
@@ -3267,7 +3294,7 @@ struct AnnotatedValue<'src> {
     span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BindingTraitConstraint {
     /// The annotated binding.
     pub variable_id: Id,
@@ -3281,7 +3308,8 @@ pub struct BindingTraitConstraint {
 
 /// A pending `impl Subject with Trait` conformance check: the subject type
 /// must provide every member the named trait requires.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct TraitImplCheck<'src> {
     pub subject_type_id: TypeId,
     pub trait_name: &'src str,
@@ -3309,7 +3337,7 @@ pub struct TraitImplCheck<'src> {
 /// traits, each of which is its own pair. Separate from [`TraitImplCheck`]
 /// because that queue is drained inside `build()` and the rule is a post-build
 /// definition-site check, like the two duplicate rules it sits beside.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TraitImplSite {
     trait_id: Id,
     /// The trait's arguments as WRITTEN (`with Into<Bar>` -> `[Bar]`), in the
@@ -3338,7 +3366,8 @@ type WrittenNominalBoundSites = Vec<(Id, Vec<TypeId>, Span, SourceId, TypeId, bo
 /// The unqualified twin is `prepped_type_locals`, whose head is a NAME resolved
 /// in a lexical scope; here the head is a walked type that must turn out to be a
 /// module, and the member is looked up in what that module declares.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct PreppedTypePath<'src> {
     /// The type slot this path fills once it resolves.
     type_id: TypeId,
@@ -3374,7 +3403,7 @@ struct ObjectSafetyViolation {
 /// resolving in one pass, is also what gives the object-safety check a single
 /// site: the trait's members are knowable exactly once, and every `dyn` in the
 /// program asks the same question at the same point.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct PreppedDyn {
     /// The `dyn` slot itself — what the annotation's position reads.
     type_id: TypeId,
@@ -3395,7 +3424,7 @@ struct PreppedDyn {
 /// monomorphized and `async_infer` propagates asyncness through the contract, so
 /// a caller awaits regardless of the declaration; std's `SplitDuplex::send` is
 /// exactly this shape). Names are stored owned so the struct carries no lifetime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConformanceSignatureCheck {
     /// The impl's providing member, resolved to its function id.
     pub impl_function_id: Id,
@@ -3444,14 +3473,15 @@ struct MemberSignatureShape {
     generic_constraint_ids: Vec<TypeId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Module<'src> {
     pub id: Id,
     pub name: &'src str,
     pub body: (Vec<Id>, Id),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Closure {
     pub id: Id,
     pub parameters: Vec<Id>,
@@ -3480,7 +3510,8 @@ pub struct Closure {
 
 /// A constraint that a struct initializer's field value must
 /// match the corresponding struct field type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct StructInitializerConstraint<'src> {
     pub initializer_id: Id,
     pub struct_id: Id,
@@ -3511,7 +3542,7 @@ pub struct StructInitializerConstraint<'src> {
 
 /// A constraint that a variable's type must unify with its
 /// initial value's type (possibly multiple times for reassignments).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VariableConstraint {
     pub variable_id: Id,
     pub initial_type_id: TypeId,
@@ -3526,7 +3557,7 @@ pub struct VariableConstraint {
 /// A constraint that a call subject expression's type must resolve to
 /// a callable type (Function or ExternalFunction) and that each argument
 /// must unify with the corresponding parameter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CallSubjectConstraint {
     pub call_id: Id,
     pub subject_id: Id,
@@ -3537,7 +3568,8 @@ pub struct CallSubjectConstraint {
 
 /// A constraint that a field accessor's subject type must resolve to
 /// a struct and that a field of that struct is accessible by name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct FieldAccessorConstraint<'src> {
     pub id: Id,
     pub subject_id: Id,
@@ -3550,7 +3582,8 @@ pub struct FieldAccessorConstraint<'src> {
 /// order (and, in a later increment, dependency-driven). Variants are migrated
 /// over from the old worklists one kind at a time; `priority` reproduces the
 /// original inter-section order so each migration stays corpus-identical.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 enum Constraint<'src> {
     /// `subject[index]` — resolves to the subject `List`'s element type.
     Subscript {
@@ -3923,7 +3956,7 @@ impl CallSubjectConstraint {
 /// whose test is not known to have passed past some point — inside an operand of
 /// `||` (B171), under a negation (B195), or off the condition's boolean spine
 /// (B199).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct LocalDeclaration {
     /// Where the name starts resolving to this entity.
     pub visible_from: usize,
@@ -3968,7 +4001,7 @@ fn min_operand_end(outer: Option<usize>, inner: usize) -> usize {
 /// The reason a negation needs any of this: `if !(x is P)` runs its THEN branch
 /// exactly when `P` did NOT match, so the capture is unbound there; the branch
 /// that proves the match is the ELSE. B171's then-branch rule, mirrored.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct ConditionPolarity {
     /// Visibility end (`LocalDeclaration::visible_until`) for an even-parity
     /// capture — [`LocalDeclaration::FOREVER`] when it reaches the then-branch.
@@ -4088,7 +4121,8 @@ impl ConditionPolarity {
 /// the moment the guard was walked, the panic was not yet an ending. The
 /// question moves whole to the one place that can answer it for every leaf —
 /// the walk now only records what it would have asked.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct GuardContinuation<'src> {
     /// The scope the captures are published into: the one the guard is written
     /// in, which is where its continuation runs.
@@ -4121,7 +4155,8 @@ fn is_condition_spine(node: &Node<'_>) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Scope<'src> {
     pub id: Id,
     pub parent_id: Option<Id>,
@@ -4230,7 +4265,8 @@ type ExposeFieldCheck<'src> = (
     Exposure<'src>,
 );
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Analyzer<'src> {
     assignment_values: IndexMap<Id, Vec<Id>>,
     closures: IndexMap<Id, Closure>,
@@ -4242,6 +4278,7 @@ pub struct Analyzer<'src> {
     /// `[derive(Wire)]` types awaiting the all-fields check — collected as each is
     /// walked, validated once `wire_names` is complete: `(type name, [(member
     /// label, member type node, span)])`.
+    #[serde(skip)]
     wire_types_to_check: Vec<WireTypeCheck<'src>>,
     /// Names of the types known to be Hashable syntactically — every
     /// `[derive(Hashable)]` struct/enum, plus every bare-lowered enum, whose
@@ -4251,12 +4288,14 @@ pub struct Analyzer<'src> {
     /// Hashable, or `canonical_hash` (JSON.stringify) would silently mangle it
     /// into a broken key.
     hashable_names: HashSet<&'src str>,
+    #[serde(skip)]
     hashable_types_to_check: Vec<WireTypeCheck<'src>>,
     /// `[derive(PartialEq)]` types awaiting the resource-field reject
     /// (destruction.md §8) — same member shape as the Wire/Hashable pair, but
     /// the only rule enforced here is R12's sibling: a resource cannot be
     /// compared by value (equality copies). Ordinary data fields need no
     /// all-fields gate, so this list feeds only the resource check.
+    #[serde(skip)]
     partialeq_types_to_check: Vec<WireTypeCheck<'src>>,
     /// `[derive(Json)]` types awaiting the resource-field reject
     /// (backed-enums.md §10.8's residual, B120) — the `PartialEq` shape, not
@@ -4264,6 +4303,7 @@ pub struct Analyzer<'src> {
     /// field's own type by codegen, so Json has no all-fields type DOMAIN the
     /// way Wire does (`is_wire_type`) — an ordinary field imposes no
     /// requirement and this list feeds only the resource check.
+    #[serde(skip)]
     json_types_to_check: Vec<WireTypeCheck<'src>>,
     /// Per-instantiation resource classification memo (`type_is_resource`,
     /// destruction.md §3): keyed by the interned instantiation `TypeId`, so
@@ -4300,6 +4340,19 @@ pub struct Analyzer<'src> {
     /// B469: chunk 3's admitted field moves (place -> owned root), published
     /// for the whole-program drop plan beside `resource_value_places`.
     partial_move_roots: HashMap<Id, Id>,
+    /// M149: the live lane's contributions to the move scan's helper sets
+    /// (`move_tables.rs`), partitioned into the records at the tail; whether
+    /// this analysis derived them at all (a program with no resource binding
+    /// files no move rows); and the fold, read by R11 and the drop plan.
+    move_rows_live: move_tables::MoveRows,
+    move_rows_filed: bool,
+    move_sets: Option<move_tables::MoveSets>,
+    /// M150: the live lane's lazy-argument and HMR-site contributions
+    /// (`lazy_tables.rs`), and whether each pass derived them.
+    lazy_rows_live: lazy_tables::LazyRows,
+    lazy_rows_filed: bool,
+    hmr_rows_live: lazy_tables::HmrRows,
+    hmr_rows_filed: bool,
     /// B470: every resource erased into a `dyn` at a coercion site, as
     /// `(site, the value's type, the object type)`, for the post-build
     /// question of whether it may be.
@@ -4412,6 +4465,7 @@ pub struct Analyzer<'src> {
     view_suspension_checks: ViewSuspensionChecks<'src>,
     /// `[rpc]` methods awaiting the Wire-signature check (`check_rpc_signatures`),
     /// collected as each is walked, validated once `wire_names` is complete.
+    #[serde(skip)]
     rpc_signatures_to_check: Vec<RpcSignatureCheck<'src>>,
     /// Structs carrying `[client_service]` (`transport-rpc.md` §9.3, R1) — the
     /// reverse direction's handler structs. Their `[rpc]` methods are
@@ -4446,6 +4500,7 @@ pub struct Analyzer<'src> {
     current_impl_subject_name: Option<&'src str>,
     /// `[expose]`d fields awaiting the `Signal`-of-Wire check
     /// (`check_expose_fields`), collected at the struct walk.
+    #[serde(skip)]
     expose_fields_to_check: Vec<ExposeFieldCheck<'src>>,
     // The innermost enclosing callable's return frame: `ret` returns from the
     // nearest callable, so each body walk pushes one (proposal/ret-checking.md).
@@ -4673,8 +4728,10 @@ pub struct Analyzer<'src> {
     // fixpoint an answer may still move as types resolve). Keyed on the
     // resolved value type, the trait and its resolved arguments, as the
     // audit's own per-site memo is (ids are minted per occurrence).
+    #[serde(skip)]
     bound_proof_memo: Option<HashMap<(Type, Id, Vec<Type>), bool>>,
     // M123: `bound_providers`' rows per required trait, for the same window.
+    #[serde(skip)]
     bound_provider_memo: Option<HashMap<Id, std::sync::Arc<[(TypeId, Option<Vec<TypeId>>)]>>>,
     // M123: the shallowest open question (its index in
     // `bound_proofs_in_progress`) a CUT below the current question reached —
@@ -4688,6 +4745,11 @@ pub struct Analyzer<'src> {
     /// THIS analysis (call, the callee's constraint, the trait), taken into
     /// the module's record by `take_reuse_record`.
     bound_questions_derived: HashMap<u32, Vec<(Id, TypeId, Id)>>,
+    /// M150: the written applications' questions, filed the same way.
+    written_bound_questions_derived: HashMap<u32, Vec<(TypeId, Id)>>,
+    /// M150: the reused sources whose audit re-runs (`bound_recompute_ranges`'
+    /// sources) — the written applications' sites are keyed by source.
+    bound_recompute_sources: HashSet<SourceId>,
     /// M110 S2a: the id ranges of reused sources whose audit must RE-RUN this
     /// analysis — a late impl answers one of their recorded questions, or
     /// their record carries no audit. Sorted, disjoint.
@@ -4763,11 +4825,21 @@ pub struct Analyzer<'src> {
     // M110 S7b: the held table passes' lane — the complement of the modules'
     // and items' ranges whose record carried held rows (`held_tables.rs`).
     live_held: live_ranges::LiveRanges,
+    // M149/M150: the conditionally-filed row families' lanes — per family,
+    // the complement of the ranges whose record carried its rows
+    // (`row_families.rs`).
+    live_families: row_families::FamilyLanes,
+    // M148: the label rows' lane — the complement of the modules' and
+    // items' ranges whose record carried their S2b label rows. E317's
+    // variant labels walk it (`hover_labels.rs`).
+    live_labels: live_ranges::LiveRanges,
     // M110 S7b: the view bindings and the view origins, computed ONCE per
     // analysis for the five checks and the two tail passes that ask (each
     // was a fixpoint over every binding of the program per ask). Cleared
     // before the tree rewrites of the extraction tail, which move reads.
+    #[serde(skip)]
     view_bindings_memo: std::cell::OnceCell<HashSet<Id>>,
+    #[serde(skip)]
     view_origins_memo: std::cell::OnceCell<HashMap<Id, Vec<Id>>>,
     // M19 T1b: those sources, in ascending order — the phase line's second
     // count and the record pass's exclusion list.
@@ -4793,14 +4865,17 @@ pub struct Analyzer<'src> {
     // M107: the same search BEFORE the seal, over the ranges pushed so far —
     // see [`SourceRangeIndex`]. A cell because `source_of_id` is a read: the
     // index extends itself as the walk pushes ranges between asks.
+    #[serde(skip)]
     source_range_index: std::cell::RefCell<RangeIndex>,
     // M107: `derived_origins` the same way, for the same reason.
+    #[serde(skip)]
     derived_origin_index: std::cell::RefCell<RangeIndex>,
     // `std::tuple`'s `Tuple` members by id, with the impl count they were
     // read at (`tuple_member_name`): a cell for the same reason, rebuilt when
     // an impl registers after it was read.
     // (Each member maps to the impl index declaring it, `None` for the trait:
     // the name is read back from there, which keeps `'src` out of the cell.)
+    #[serde(skip)]
     tuple_member_index: std::cell::RefCell<Option<(usize, HashMap<Id, Option<usize>>)>>,
     // M19 T0 (`per-module-analysis-reuse.md` §3.3): the source each `TypeId`
     // was minted in, indexed by the id's own dense counter. `Id`s get this
@@ -5306,6 +5381,7 @@ pub struct Analyzer<'src> {
     // address (stable: all walked ASTs are leaked or outlive the analysis).
     // Item-position invocations walk to nothing (their output was appended to
     // the module); expression-position ones walk their spliced replacement.
+    #[serde(skip)]
     macro_item_invocations: HashSet<usize>,
     // Marker id → the rendered `macro fun name(..): Source` signature, for
     // editor hover at attribute/invocation/derive sites.
@@ -5320,9 +5396,11 @@ pub struct Analyzer<'src> {
     // the lookups that hold `&mut self`; the log is written only while
     // `recording`, and never read until the resolve that wrote it has ended.
     impl_reach: std::cell::RefCell<ImplReachLog>,
+    #[serde(skip)]
     macro_expression_expansions: HashMap<usize, &'static Spanned<Node<'static>>>,
     // Expression sites whose expansion failed — already diagnosed; they walk
     // to an error entity without a second (misleading) message.
+    #[serde(skip)]
     macro_failed_sites: HashSet<usize>,
     // Scopes that are a module's top level: the entry file's global scope, each
     // loaded file's namespace scope, and every `mod { .. }` body. `export` is
@@ -5714,6 +5792,7 @@ pub struct Analyzer<'src> {
     /// M133: [`Analyzer::impl_bounds_hold`]'s answers for a GROUND receiver,
     /// for the length of one world's fixpoint (`None` outside it) — see
     /// [`ImplBoundsMemo`].
+    #[serde(skip)]
     impl_bounds_memo: Option<ImplBoundsMemo>,
     // proposal/lazy.md §1 — the three tables the `lazy` lowering needs, filled
     // by `record_lazy_arguments` once every call has resolved and read by the
@@ -5914,6 +5993,10 @@ pub struct Analyzer<'src> {
     // E309: those refusals, held: the message and the entity the name
     // resolved to.
     deferred_not_a_value: HashMap<Id, (String, Id)>,
+    // B627: the generics the binding residual sweep (`finalize_build`)
+    // already reported as "never fully determined" — the bound check's
+    // undetermined-call refusal stands down for them (one refusal per root).
+    swept_residual_generics: HashSet<TypeId>,
     // B569 §4.1: a labelled literal matched BY NAME against a labelled type
     // whose order differs — `let p: (x: f64, y: f64) = (y = 7, x = 5);` —
     // keyed by the literal: the written entry each storage slot takes, and
@@ -5944,6 +6027,10 @@ pub struct Analyzer<'src> {
     tuple_index_paths: HashMap<Id, (TypeId, Vec<usize>)>,
     scope_id: u32,
     scopes: IndexMap<Id, Scope<'src>>,
+    #[serde(
+        serialize_with = "crate::prefix_file::serialize_span_refs",
+        deserialize_with = "crate::prefix_file::deserialize_span_refs"
+    )]
     span_map: HashMap<Id, &'src Span>,
     struct_initializer_to_def: HashMap<Id, Id>, // initializer_id -> struct definition id
     structs: IndexMap<Id, Struct<'src>>,
@@ -6340,6 +6427,21 @@ pub struct Analyzer<'src> {
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
+    /// M147 (2): how many `const` expressions the walk is inside, and every
+    /// entity it minted while inside one — the const pass's local-reference
+    /// index reads these instead of scanning the whole entity map for the
+    /// `Expr::Local`s whose span a `const` expression covers (an identifier
+    /// resolved to a local later keeps the entity the walk minted for it).
+    #[serde(skip)]
+    const_walk_depth: u32,
+    const_walk_entities: Vec<Id>,
+    /// M152: the entity ranges the dependencies' ROOT `lib.vl` walks minted
+    /// (generated expansions included), and where the entry file's walk began
+    /// — what [`Program::canonical_declaration_key`] reads to keep spec §7.1's
+    /// declaration order (dependency roots after the entry package's modules)
+    /// now that a dependency walks whole before the package.
+    dependency_root_ranges: Vec<(u32, u32)>,
+    entry_walk_start: Option<u32>,
     /// G24: the INITIALIZER expression of every `const let NAME = EXPR;`, a
     /// subset of `const_exprs`. The binding is an ordinary `let` whose value
     /// the build computes; what the marker adds over `let x = const e` is the
@@ -6497,7 +6599,8 @@ pub struct Analyzer<'src> {
 }
 
 /// One leaf of an `[deprecated("…")] export import` (B382).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct DeprecatedImportLeaf<'src> {
     source: SourceId,
     leaf_span: Span,
@@ -6514,7 +6617,8 @@ struct DeprecatedImportLeaf<'src> {
 }
 
 /// One resolved import leaf, for `check_plain_reaches` (B318 §5).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct ImportReach<'src> {
     /// What the leaf bound.
     target: Id,
@@ -7034,12 +7138,26 @@ fn type_head<'src>(node: &Node<'src>) -> Option<&'src str> {
 /// struct, or a function in an `impl` block whose subject is that type. A
 /// syntactic question, asked of a twin file that is not part of this analysis —
 /// no ids, no types, nothing loaded.
-fn declares_member_on(item: &Node, type_name: &str, member: &str) -> bool {
+/// Which kind of member a twin note asks the other twin about (E320): a
+/// field miss is answered by a FIELD of the other twin only — both twins
+/// declaring `View::autofocus` as a method is no reason to send a field read
+/// to the other platform — and a method miss by a method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TwinMember {
+    Field,
+    Method,
+}
+
+fn declares_member_on(item: &Node, type_name: &str, member: &str, kind: TwinMember) -> bool {
     match item {
-        Node::Struct(name, _, _, _, Some(fields), _) if name.0 == type_name => {
+        Node::Struct(name, _, _, _, Some(fields), _)
+            if name.0 == type_name && kind == TwinMember::Field =>
+        {
             fields.0.iter().any(|field| field.0.0.0 == member)
         }
-        Node::Impl(subject, _, body, _) if type_head(&subject.0) == Some(type_name) => {
+        Node::Impl(subject, _, body, _)
+            if type_head(&subject.0) == Some(type_name) && kind == TwinMember::Method =>
+        {
             body.0.iter().any(|inner| {
                 matches!(unwrap_item(inner), Node::Func(function) if function.name.0 == member)
             })
@@ -7380,7 +7498,8 @@ fn operator_trait_required_method(trait_name: &str) -> Option<(&'static str, &'s
 /// ([`Analyzer::import_alias_uses`]). The scope still binds the target
 /// directly, so nothing about typing, dispatch or code generation changes: this
 /// is an editor-facing identity, and it is deliberately the only thing it is.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ImportAlias<'src> {
     /// The alias as written — the name this file binds and its code uses.
     pub name: &'src str,
@@ -7631,7 +7750,7 @@ struct ImplBoundsMemo {
 /// Keyed by BLOCK rather than by member id, so a whole-block selector admits
 /// the defaults the block inherits as well as what it declares (B455): a
 /// default-only `impl Box with One {}` is a block `(impl Box)` names.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct LookupAdmission {
     /// The importing files whose own statements restrict anything at all.
     restricting: HashSet<SourceId>,
@@ -7689,7 +7808,7 @@ impl LookupAdmission {
 /// introduced. The pass runs on the finished [`Program`] because the question
 /// it asks — does this impl's subject unify with the selector's type — is
 /// `impl_select::subject_applies`, which reads one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportImplRestriction {
     /// The importing file.
     pub source: SourceId,
@@ -7707,7 +7826,7 @@ pub struct ImportImplRestriction {
 }
 
 /// One resolved `(impl TYPE)` selector (B318 S3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportImplSelector {
     /// The `(impl …)` element's span — the key Organize Imports asks about and
     /// the anchor of a refusal naming the selector.
@@ -7874,6 +7993,13 @@ impl<'src> Analyzer<'src> {
             resource_value_places: HashSet::default(),
             trait_self_markers: HashMap::default(),
             partial_move_roots: HashMap::default(),
+            move_rows_live: move_tables::MoveRows::default(),
+            move_rows_filed: false,
+            move_sets: None,
+            lazy_rows_live: lazy_tables::LazyRows::default(),
+            lazy_rows_filed: false,
+            hmr_rows_live: lazy_tables::HmrRows::default(),
+            hmr_rows_filed: false,
             resource_erasures: Vec::new(),
             variant_coercions: HashMap::default(),
             nested_annotation_owners: HashMap::default(),
@@ -7944,6 +8070,8 @@ impl<'src> Analyzer<'src> {
             bound_provider_memo: None,
             bound_proof_cut_floor: usize::MAX,
             bound_questions_derived: HashMap::default(),
+            written_bound_questions_derived: HashMap::default(),
+            bound_recompute_sources: HashSet::default(),
             bound_recompute_ranges: Vec::new(),
             prefix_impl_count: None,
             prefix_entity_end: None,
@@ -7960,6 +8088,8 @@ impl<'src> Analyzer<'src> {
             live_table: live_ranges::LiveRanges::default(),
             live_module: live_ranges::LiveRanges::default(),
             live_held: live_ranges::LiveRanges::default(),
+            live_families: row_families::FamilyLanes::default(),
+            live_labels: live_ranges::LiveRanges::default(),
             view_bindings_memo: std::cell::OnceCell::new(),
             view_origins_memo: std::cell::OnceCell::new(),
             reused_table_sources: Vec::new(),
@@ -8185,6 +8315,7 @@ impl<'src> Analyzer<'src> {
             spaced_generic_calls: HashMap::default(),
             spaced_generic_operands: HashSet::default(),
             deferred_not_a_value: HashMap::default(),
+            swept_residual_generics: HashSet::default(),
             tuple_literal_layouts: HashMap::default(),
             tuple_literal_label_problems: HashMap::default(),
             named_arguments: Vec::new(),
@@ -8264,6 +8395,10 @@ impl<'src> Analyzer<'src> {
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
+            const_walk_depth: 0,
+            const_walk_entities: Vec::new(),
+            dependency_root_ranges: Vec::new(),
+            entry_walk_start: None,
             const_let_initializers: HashSet::default(),
             const_functions: HashSet::default(),
             walk_depth: 0,
@@ -8299,15 +8434,20 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_entity_id(&mut self) -> Id {
-        if self.id_windows.on() {
+        let id = if self.id_windows.on() {
             let (id, _) = self
                 .id_windows
                 .mint(id_windows::Lane::Entity, &mut self.entity_id);
-            return Id(id);
+            Id(id)
+        } else {
+            let id = self.entity_id;
+            self.entity_id += 1;
+            Id(id)
+        };
+        if self.const_walk_depth > 0 {
+            self.const_walk_entities.push(id);
         }
-        let id = self.entity_id;
-        self.entity_id += 1;
-        Id(id)
+        id
     }
 
     /// M110 S5: walks a module-level node list one ITEM at a time, each under
@@ -9534,6 +9674,9 @@ impl<'src> Analyzer<'src> {
                             "'{type_label}' does not implement trait '{trait_label}', \
                              required by a generic bound of this call{}",
                             self.total_join_steer(call_id, *required_trait_id)
+                                .or_else(
+                                    || self.argument_bound_steer(&value_type, *required_trait_id)
+                                )
                                 .unwrap_or_default()
                         )
                     };
@@ -9611,6 +9754,7 @@ impl<'src> Analyzer<'src> {
             // the native build emitted one instance for every instantiation
             // (`A A` for a `Holder<B>`) — so it is this invariant's case.
             let mut unbindable = Vec::new();
+            let mut undetermined: Vec<(TypeId, Type)> = Vec::new();
             if self
                 .function_calls
                 .get(&call_id)
@@ -9626,11 +9770,87 @@ impl<'src> Analyzer<'src> {
                     let return_type = return_type_id.get_type(self);
                     self.collect_generics(&return_type, 0, &mut in_return);
                 }
-                unbindable = self
-                    .impl_binder_generics(member_id)
+                let binders = self.impl_binder_generics(member_id);
+                // B627: a bounded binder the RETURN mentions is bound where the
+                // result lands — and when nothing it lands in names it (`let
+                // held = Holder::build().unwrap();`), the call's settled type
+                // still carries the binder itself, and so does what it lands
+                // in (`undetermined_value_flows_on`; a result landing in a
+                // position its consumer typed — `Signal::new(HashMap::new())`
+                // under an annotated binding — is that position's to type).
+                // JS then reached the bound trait's body-less requirement (an
+                // internal error) and the native build refused the unbound
+                // parameter as a backend gap; the program is incomplete, so it
+                // is refused here. The cheap tests first — a bounded binder the return carries
+                // that the call recorded no binding for, outside the enclosing
+                // declaration and not already named by the residual sweep —
+                // and the settled type only for a call that has one.
+                let open: Vec<TypeId> = binders
+                    .iter()
+                    .copied()
+                    .filter(|generic| {
+                        in_return.contains(generic)
+                            && !self.swept_residual_generics.contains(generic)
+                            && !self
+                                .method_call_substitution
+                                .get(&call_id)
+                                .is_some_and(|substitution| substitution.contains_key(generic))
+                            && !self.generic_bound_traits(*generic).is_empty()
+                            && !self.generic_is_enclosing_binder(*generic, call_id)
+                    })
+                    .collect();
+                if !open.is_empty() {
+                    let settled = self.infer_type(call_id, &Type::Unknown, &HashMap::default());
+                    let mut carried = Vec::new();
+                    self.collect_generics(&settled, 0, &mut carried);
+                    for generic in open {
+                        if carried.contains(&generic)
+                            && self.undetermined_value_flows_on(call_id, generic)
+                        {
+                            undetermined.push((generic, settled.clone()));
+                        }
+                    }
+                }
+                unbindable = binders
                     .into_iter()
                     .filter(|generic| !in_return.contains(generic))
                     .collect();
+            }
+            for (generic, settled) in std::mem::take(&mut undetermined) {
+                let generic_label =
+                    self.pretty_print_type(&Type::Generic(generic), &HashMap::default());
+                let settled_label = self.pretty_print_type(&settled, &HashMap::default());
+                // The path door names the impl's subject with its arguments
+                // written (`Holder<…>::build()`), when the subject is nominal.
+                let path_door = self
+                    .implementation_by_declaration
+                    .get(&member_id)
+                    .and_then(|index| self.implementations.get(*index))
+                    .and_then(
+                        |implementation| match implementation.subject.get_type(self) {
+                            Type::Struct(struct_id, _) => {
+                                self.structs.get(&struct_id).map(|s| s.name)
+                            }
+                            Type::Enum(enum_id, _) => self.enums.get(&enum_id).map(|e| e.name),
+                            _ => None,
+                        },
+                    )
+                    .zip(self.callable_name(member_id))
+                    .map(|(subject, member)| {
+                        format!(", or on the path (`{subject}<…>::{member}(…)`)")
+                    })
+                    .unwrap_or_default();
+                errors.push((
+                    call_id,
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    format!(
+                        "this call's result `{settled_label}` is never fully determined: nothing \
+                         it is passed binds '{generic_label}' and nothing its result lands in \
+                         names it. Write the type on the binding the result lands in (`let \
+                         value: … = …`){path_door}"
+                    ),
+                    generic,
+                ));
             }
             // B424, door (a) (the owner's ruling, 2026-09-28): an UNBOUNDED
             // own generic the call left free is refused too when the call's
@@ -9640,8 +9860,17 @@ impl<'src> Analyzer<'src> {
             // type can be written. One whose only role is a parameter the
             // result does not carry decides nothing the program can observe,
             // and stays free.
-            let return_generics = self.member_return_generics(member_id);
-            let parameter_generics = self.member_parameter_generics(member_id);
+            // Read only for a member with own generics to refuse: every wired
+            // call reaches here, and most (`push`, `len`, a plain function)
+            // declare none.
+            let (return_generics, parameter_generics) = if own_generics.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    self.member_return_generics(member_id),
+                    self.member_parameter_generics(member_id),
+                )
+            };
             for constraint_id in own_generics.iter().copied() {
                 if !self.generic_bound_traits(constraint_id).is_empty()
                     || !return_generics.contains(&constraint_id)
@@ -10292,9 +10521,24 @@ impl<'src> Analyzer<'src> {
     /// one report per written spelling (B188) — and neither does a path head,
     /// which applies nothing.
     fn check_written_nominal_bounds(&mut self) {
+        // M150: M143's MODULE lane, the bound audit's — a site of a frozen
+        // (std) source has no refusal to find, and a REUSED module's sites
+        // were judged with its record: their refusals ride the audit's
+        // (`bound_diagnostics`, filed by `record_bound_window` below) and
+        // replay under the same guard, the module's questions here being
+        // `(written argument, required trait)` (`written_bound_questions`) —
+        // re-audited when a late impl answers one. A re-walked file's sites
+        // stay live, as the audit's do.
+        let diagnostics_before = self.diagnostics.len();
         for (owner_id, written_arguments, span, source_id, type_id, generics_exempt) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
+            if self.frozen_sources.contains(&source_id)
+                || (self.reused_sources.binary_search(&source_id).is_ok()
+                    && !self.bound_recompute_sources.contains(&source_id))
+            {
+                continue;
+            }
             // M134: the site's own slot is the anchor (the owner is declared
             // elsewhere); a written type that lives in no window stays unanchored.
             self.id_windows.set_check_anchor_type(type_id);
@@ -10363,6 +10607,12 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
                 for (required_trait_id, required_arguments) in &bound_traits {
+                    if source_id != SourceId(0) && source_id != DERIVED_SOURCE {
+                        self.written_bound_questions_derived
+                            .entry(source_id.0)
+                            .or_default()
+                            .push((*argument_type_id, *required_trait_id));
+                    }
                     let required_arguments: Vec<TypeId> = required_arguments
                         .iter()
                         .map(|argument| {
@@ -10427,6 +10677,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        self.record_bound_window(diagnostics_before);
     }
 
     /// The ways a grounded value violates a tuple bound (`T: (2..: Display)`)
@@ -10861,6 +11112,18 @@ impl<'src> Analyzer<'src> {
     /// Enforce the Wire boundary (`proposal/transport-rpc.md` §3): every field of a
     /// `[derive(Wire)]` type must itself be Wire, else a compile diagnostic. Runs
     /// after all modules are walked, so `wire_names` sees cross-module Wire types.
+    /// std-prefix P3: the six derive and boundary queues drained at the
+    /// std-only world's store point (see the store in `analyze_inner`) —
+    /// exactly the calls the checks phase makes, in its order.
+    fn drain_boundary_checks(&mut self) {
+        self.check_wire_boundary();
+        self.check_json_boundary();
+        self.check_hashable_boundary();
+        self.check_partialeq_boundary();
+        self.check_rpc_signatures();
+        self.check_expose_fields();
+    }
+
     fn check_wire_boundary(&mut self) {
         let checks = std::mem::take(&mut self.wire_types_to_check);
         for (type_name, declaration_id, members) in &checks {
@@ -10894,7 +11157,16 @@ impl<'src> Analyzer<'src> {
                     );
                     continue;
                 }
-                if !self.resolved_type_is_wire(*field_type_id) {
+                // B633: the member read under the derived impl's own binders,
+                // B622's shape — the derive binds every parameter a member
+                // reaches under `Wire` (`impl Page<type T: Wire> with Wire`),
+                // so a reached `T`, `List<T>` or `Inner<T>` is Wire there.
+                let under_binders = self.member_under_derive_binders(
+                    *declaration_id,
+                    *field_type_id,
+                    self.wire_trait_id,
+                );
+                if !self.resolved_type_is_wire(under_binders) {
                     let rendered = render_type_quoted(type_node);
                     self.push_anchored(
                         Error {
@@ -10996,8 +11268,11 @@ impl<'src> Analyzer<'src> {
                     }, *declaration_id);
                     continue;
                 }
-                let under_binders =
-                    self.hashable_member_under_binders(*declaration_id, *field_type_id);
+                let under_binders = self.member_under_derive_binders(
+                    *declaration_id,
+                    *field_type_id,
+                    self.hashable_trait_id,
+                );
                 if !self.resolved_type_is_hashable(under_binders) {
                     let rendered = render_type_quoted(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
@@ -14572,34 +14847,21 @@ impl<'src> Analyzer<'src> {
     /// reactive cell is rejected. Inert unless `std::web::dev` is loaded (the ids are
     /// `None`), so a program that never touches HMR pays nothing.
     fn check_hmr_transfer_bounds(&mut self) {
+        self.hmr_rows_live = lazy_tables::HmrRows::default();
+        self.hmr_rows_filed = false;
         if self.hmr_stash_fn_id.is_none() && self.hmr_take_fn_id.is_none() {
             return;
         }
-        // Collected read-only; the `&mut self` inference/classification runs
-        // after, as in `check_resource_any_coercion`. A `stash` site carries the
-        // value argument (whose type IS `T`); a `take` site carries the call
-        // (whose resolved type is `Option<T>`).
-        let mut stash_value_ids: Vec<Id> = Vec::new();
-        let mut take_call_ids: HashSet<Id> = HashSet::default();
-        for expr in self.expr_id_to_expr_map.values() {
-            let Expr::Call(call_id) = expr else {
-                continue;
-            };
-            let Some(function_call) = self.function_calls.get(call_id) else {
-                continue;
-            };
-            let callee_id = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
-                Some(Expr::Local(callee_id)) => *callee_id,
-                _ => continue,
-            };
-            if Some(callee_id) == self.hmr_stash_fn_id {
-                if let Some(value_id) = function_call.argument_ids.get(1).copied() {
-                    stash_value_ids.push(value_id);
-                }
-            } else if Some(callee_id) == self.hmr_take_fn_id {
-                take_call_ids.insert(*call_id);
-            }
-        }
+        // M150: the sites are rows (`lazy_tables.rs`) — the restored regions'
+        // and the live lane's — and every site's inference below runs on
+        // every analysis, so nothing minted here is ever served.
+        let live = self.live_hmr_rows();
+        let mut stash_value_ids: Vec<Id> = self.restored_tables.hmr.stash_values.clone();
+        stash_value_ids.extend(live.stash_values.iter().copied());
+        let mut take_bindings: Vec<Id> = self.restored_tables.hmr.take_bindings.clone();
+        take_bindings.extend(live.take_bindings.iter().copied());
+        self.hmr_rows_live = live;
+        self.hmr_rows_filed = true;
         // A `stash` value's type is self-determined (a literal, constructor, or
         // place), so re-inferring it against no expectation yields `T` directly —
         // the generic argument isn't recorded on the call when it was inferred,
@@ -14621,35 +14883,33 @@ impl<'src> Analyzer<'src> {
         // no stored result type, and an unconstrained `T` (a `take` whose element
         // never resolves concretely) stays generic and is left alone, so a good
         // `take` never false-rejects.
-        if !take_call_ids.is_empty() {
-            let mut take_sites: Vec<(Id, TypeId)> = Vec::new();
-            for variable in self.variables.values() {
-                let Some(initial) = variable.initial else {
-                    continue;
-                };
-                if !take_call_ids.contains(&initial) {
-                    continue;
+        let mut take_sites: Vec<(Id, TypeId)> = Vec::new();
+        for binding_id in take_bindings {
+            let Some(variable) = self.variables.get(&binding_id) else {
+                continue;
+            };
+            let Some(initial) = variable.initial else {
+                continue;
+            };
+            let element = match variable.type_id.get_type(self) {
+                Type::Enum(id, arguments)
+                    if Some(id) == self.option_enum_id && arguments.len() == 1 =>
+                {
+                    arguments[0]
                 }
-                let element = match variable.type_id.get_type(self) {
-                    Type::Enum(id, arguments)
-                        if Some(id) == self.option_enum_id && arguments.len() == 1 =>
-                    {
-                        arguments[0]
-                    }
-                    _ => continue,
-                };
-                if matches!(
-                    element.get_type(self),
-                    Type::Unresolved | Type::Unknown | Type::Generic(_)
-                ) {
-                    continue;
-                }
-                take_sites.push((initial, element));
+                _ => continue,
+            };
+            if matches!(
+                element.get_type(self),
+                Type::Unresolved | Type::Unknown | Type::Generic(_)
+            ) {
+                continue;
             }
-            for (call_id, element) in take_sites {
-                if !self.transferable_as_value(element) {
-                    self.report_hmr_transfer(call_id, element);
-                }
+            take_sites.push((initial, element));
+        }
+        for (call_id, element) in take_sites {
+            if !self.transferable_as_value(element) {
+                self.report_hmr_transfer(call_id, element);
             }
         }
     }
@@ -14736,93 +14996,6 @@ impl<'src> Analyzer<'src> {
     // moved binding is use-after-move.
     // ---------------------------------------------------------------------
 
-    /// The resource-typed binding entities (variables + parameters), by
-    /// per-instantiation classification. `&mut` because `type_is_resource`
-    /// memoizes; the scan then runs against the returned (owned) set as `&self`.
-    /// Every binding — variable or parameter — whose type is a resource.
-    ///
-    /// **M38, and what MEASURING it decided.** The item asked for a
-    /// per-nominal "can any instantiation of this be a resource" pre-filter
-    /// (M28's `resource_reaching_nominals` / `type_reaches_resource`) ahead of
-    /// the field recursion, on the reading that `type_is_resource` over every
-    /// variable and parameter was ~100 ms on kolt's browser entry. It was
-    /// built, it is answer-identical (M28 proves `type_is_resource(T)` implies
-    /// `type_reaches_resource(T)`), and it was measured: **+2,312,262
-    /// instructions on `vilan check src/client.vl` over the full kolt copy —
-    /// a LOSS, not a win.** It could not be otherwise on a program that
-    /// declares a resource: the filter substitutes one recursive walk over the
-    /// distinct `TypeId`s (`classify_resource`) for another over the same ones
-    /// (`type_mentions_nominal`), and `resource_classification` — the
-    /// analyzer's persistent memo — had already made the first cost once per
-    /// distinct type rather than once per binding. The filter is a wash by
-    /// construction, and pays for the nominals closure on top. It is not here.
-    ///
-    /// **What IS here is the gate the filter was carrying.** A world where
-    /// nothing is declared `resource` has no resource type at all —
-    /// containment bottoms out at a declared leaf — so no binding can be one
-    /// and both sweeps below can be skipped outright. `check_resource_moves`
-    /// tested that only AFTER them, by finding the result empty: two whole-map
-    /// walks and a `type_is_resource` call per binding, on every corpus
-    /// program that owns no resource, for an answer two `.any()` scans give.
-    fn collect_resource_bindings(&mut self) -> HashSet<Id> {
-        let mut bindings = HashSet::default();
-        if !self.declares_a_resource() {
-            return bindings;
-        }
-        let variables: Vec<(Id, TypeId)> =
-            self.variables.values().map(|v| (v.id, v.type_id)).collect();
-        for (id, type_id) in variables {
-            // M134: the planner's mints for a binding belong to its item.
-            self.id_windows.set_anchor(id);
-            if self.type_is_resource(type_id) {
-                bindings.insert(id);
-            }
-        }
-        let parameters: Vec<(Id, TypeId)> = self
-            .parameters
-            .values()
-            .map(|p| (p.id, p.type_id))
-            .collect();
-        for (id, type_id) in parameters {
-            self.id_windows.set_anchor(id);
-            if self.type_is_resource(type_id) {
-                bindings.insert(id);
-            }
-        }
-        bindings
-    }
-
-    /// Every place expression (`Local`, `Field`, `Index`, `TupleIndex`) whose
-    /// value type is a resource. Feeds R5 (a `Field`/element consume is a
-    /// partial move) and — stored on the analyzer — `compute_clone_sites`, which
-    /// must never mark a resource place a clone (R1: resources move, not copy).
-    fn collect_resource_value_places(&mut self) -> HashSet<Id> {
-        let mut places = HashSet::default();
-        let place_ids: Vec<Id> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter(|(_, expr)| {
-                matches!(
-                    expr,
-                    Expr::Local(_)
-                        | Expr::Field(_, _, _)
-                        | Expr::TupleIndex(_, _, _)
-                        | Expr::Index(_, _)
-                )
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in place_ids {
-            if let Some(place_type) = self.place_value_type(id) {
-                let type_id = place_type.get_type_id(self);
-                if self.type_is_resource(type_id) {
-                    places.insert(id);
-                }
-            }
-        }
-        places
-    }
-
     /// Every pattern capture bound by a LOANED subject, mapped to the subject
     /// expression that still owns the payload (B65). R6/§7.2's other half: a
     /// capture of a *consumed* subject owns its payload, but a capture of a
@@ -14837,31 +15010,35 @@ impl<'src> Analyzer<'src> {
     /// Consuming such a capture is the capture-position twin of
     /// `binding_is_loaned_parameter`, and is rejected in `scan_move_touch`.
     fn collect_loaned_pattern_captures(&self) -> HashMap<Id, Id> {
-        let mut loaned: HashMap<Id, Id> = HashMap::default();
+        let mut rows: Vec<(Id, Id)> = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            self.loaned_captures_of(expr, &mut rows);
+        }
+        rows.into_iter().collect()
+    }
+
+    /// One expression's loaned captures, `(capture, subject)` — the per-
+    /// region half of [`Self::collect_loaned_pattern_captures`] (M149).
+    fn loaned_captures_of(&self, expr: &Expr<'src>, into: &mut Vec<(Id, Id)>) {
         let mut record = |pattern: &ExprPattern, subject: Id| {
             let mut captures = Vec::new();
             Self::collect_pattern_captures(pattern, &mut captures);
-            for capture in captures {
-                loaned.insert(capture, subject);
-            }
+            into.extend(captures.into_iter().map(|capture| (capture, subject)));
         };
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                // An `is` test loans unconditionally — `is_some`'s body is
-                // exactly this shape and B60 left it free on a resource.
-                Expr::Is(subject, pattern) => record(pattern, *subject),
-                Expr::Match(subject, legs) if self.pattern_subject_is_loan(*subject) => {
-                    for leg in legs {
-                        record(&leg.pattern, *subject);
-                    }
+        match expr {
+            // An `is` test loans unconditionally — `is_some`'s body is
+            // exactly this shape and B60 left it free on a resource.
+            Expr::Is(subject, pattern) => record(pattern, *subject),
+            Expr::Match(subject, legs) if self.pattern_subject_is_loan(*subject) => {
+                for leg in legs {
+                    record(&leg.pattern, *subject);
                 }
-                Expr::Destructure(subject, pattern) if self.pattern_subject_is_loan(*subject) => {
-                    record(pattern, *subject)
-                }
-                _ => {}
             }
+            Expr::Destructure(subject, pattern) if self.pattern_subject_is_loan(*subject) => {
+                record(pattern, *subject)
+            }
+            _ => {}
         }
-        loaned
     }
 
     /// B67: what every `x is P` test in the program proves about `x`'s payload,
@@ -15028,54 +15205,75 @@ impl<'src> Analyzer<'src> {
     }
 
     fn check_resource_moves(&mut self) {
-        let resource_bindings = self.collect_resource_bindings();
+        // M149: the helper sets are folded from the restored regions' rows
+        // and the live lane's contributions (`move_tables.rs`). The bindings
+        // first: a program holding no resource binding derives nothing else
+        // and files no move rows.
+        self.move_rows_live = move_tables::MoveRows {
+            bindings: self.live_resource_bindings(),
+            ..move_tables::MoveRows::default()
+        };
+        self.move_rows_filed = false;
+        self.move_sets = None;
         // No resource binding => no resource place (a resource-typed field lives
         // only on a resource aggregate, which any owner binds as a resource). Skip
-        // the whole-program place scan on resource-free programs (std / corpus).
-        if resource_bindings.is_empty() {
+        // the place scan on resource-free programs (std / corpus).
+        if self.move_rows_live.bindings.is_empty() && self.restored_tables.moves.bindings.is_empty()
+        {
+            self.move_rows_live = move_tables::MoveRows::default();
             return;
         }
-        let resource_value_places = self.collect_resource_value_places();
+        let mut live = std::mem::take(&mut self.move_rows_live);
+        self.live_move_rows(&mut live);
+        let sets = self.fold_moves(&live);
+        self.move_rows_live = live;
+        self.move_rows_filed = true;
+        if !crate::macros::in_macro_world() {
+            let walked = self.move_rows_live.len() as u64;
+            crate::incremental::update_census(|census| census.move_rows_live += walked);
+        }
         // Published for `compute_clone_sites` (R1: a resource never clones).
-        self.resource_value_places = resource_value_places.clone();
+        self.resource_value_places = sets.places.clone();
         // §5 loan-only corollary: the module-level resources (a subset of the
         // module-level `let`s). Consuming one is rejected wherever a body reads it.
         let module_level_bindings: HashSet<Id> = self
             .module_level_binding_ids()
             .into_iter()
-            .filter(|id| resource_bindings.contains(id))
+            .filter(|id| sets.bindings.contains(id))
             .collect();
-        let loaned_captures = self.collect_loaned_pattern_captures();
-        // The concrete scan knows no generic resources, so the empty constraint
-        // set makes `type_is_resource_with` agree with `type_is_resource`.
-        let is_refinements =
-            self.collect_is_refinements(None, &HashSet::default(), &mut HashMap::default());
-        let value_crossings = self.compute_return_value_crossings();
         // B469: which field moves read as destructures. The concrete scan
         // knows no instantiation, so a generic inside an aggregate's type may
-        // hold a `Drop` and keeps the refusal.
+        // hold a `Drop` and keeps the refusal. Decided over EVERY candidate on
+        // every analysis (M149): the verdict reads the Drop-implementing
+        // nominal set and the root's module-level-ness, which another region
+        // can move.
         let partial_move_roots = self.collect_partial_move_roots(
-            &resource_value_places,
+            &sets.places,
             &module_level_bindings,
-            &loaned_captures,
+            &sets.loaned,
             &HashMap::default(),
         );
         self.partial_move_roots = partial_move_roots.clone();
 
         let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
+        // The concrete scan knows no generic resources, so the empty constraint
+        // set the refinements were classified under makes
+        // `type_is_resource_with` agree with `type_is_resource`.
         let scan = MoveScan {
-            resource_bindings: &resource_bindings,
-            resource_value_places: &resource_value_places,
+            resource_bindings: &sets.bindings,
+            resource_value_places: &sets.places,
             module_level_bindings: &module_level_bindings,
-            loaned_captures: &loaned_captures,
-            is_refinements: &is_refinements,
-            value_crossings: &value_crossings,
+            loaned_captures: &sets.loaned,
+            is_refinements: &sets.is_refinements,
+            value_crossings: &sets.crossings,
             partial_move_roots: &partial_move_roots,
             dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
         self.emit_resource_move_violations(violations);
+        // R11's whole-program sets and the drop plan read the fold too.
+        self.move_sets = Some(sets);
     }
 
     /// The places a by-value return hands back through a VIEW leaf (B109) — the
@@ -15088,7 +15286,7 @@ impl<'src> Analyzer<'src> {
     ///
     /// A view RETURN is excluded — rule 3's sanctioned projection, where the
     /// reference stays a reference and nothing crosses.
-    fn compute_return_value_crossings(&self) -> HashSet<Id> {
+    fn compute_return_value_crossings(&self, include: &dyn Fn(Id) -> bool) -> HashSet<Id> {
         let mut crossings = HashSet::default();
         // Every return position of every by-value function: the tail, and (B116)
         // each `ret`. `return_sites` carries both, for every bodied function —
@@ -15096,6 +15294,7 @@ impl<'src> Analyzer<'src> {
         let seams: Vec<(&Function, Id)> = self
             .return_sites
             .iter()
+            .filter(|(function_id, _)| include(*function_id))
             .filter_map(|(function_id, value_id)| {
                 Some((self.functions.get(function_id)?, *value_id))
             })
@@ -15357,6 +15556,8 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             asked += 1;
+            // M134: the gate's classification mints belong to the body's item.
+            self.id_windows.set_anchor(function.id);
             let mut signature: Vec<TypeId> = function
                 .parameters
                 .iter()
@@ -15378,6 +15579,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             asked += 1;
+            self.id_windows.set_anchor(closure.id);
             let signature: Vec<TypeId> = closure.return_type_id.into_iter().collect();
             let mut seeds: Vec<Id> = closure.parameter_destructures.clone();
             seeds.push(closure.return_);
@@ -15753,7 +15955,16 @@ impl<'src> Analyzer<'src> {
     /// and the overwrite drops. A resource-free program plans nothing, keeping its
     /// output byte-identical.
     fn plan_resource_drops(&mut self) {
-        let bindings = self.collect_resource_bindings();
+        // M149: the move scan's fold (`move_tables.rs`) — no fold means no
+        // resource binding anywhere, so nothing is owned and no name or
+        // component overwrite can hold a resource.
+        let (bindings, place_overwrites) = match self.move_sets.take() {
+            Some(sets) => {
+                let overwrites = self.decide_place_overwrites(&sets);
+                (sets.bindings, overwrites)
+            }
+            None => (HashSet::default(), HashMap::default()),
+        };
         // A loan owns nothing (B94). References are transparent, so `let v = &mut
         // holder` and a `&mut Holder` parameter both mint resource-TYPED bindings
         // whose value belongs to someone else — enrolling them made a view local's
@@ -15763,8 +15974,6 @@ impl<'src> Analyzer<'src> {
             .copied()
             .filter(|binding| !self.binding_or_param_is_view(*binding))
             .collect();
-        let place_overwrites =
-            self.collect_place_overwrites(&bindings, &self.resource_value_places);
         let explicitly_dropped = self.explicitly_dropped_bindings(&owned_bindings);
         let resources = ResourceOwnership {
             owned_bindings,
@@ -16840,6 +17049,7 @@ impl<'src> Analyzer<'src> {
             .map(|function| function.id)
             .collect();
         for function_id in function_ids {
+            self.id_windows.set_anchor(function_id);
             let (calls, _, _) = self.r11_body_calls_and_closures(function_id);
             let types = self.drop_sink_types_of_calls(&calls);
             if !types.is_empty() {
@@ -16853,6 +17063,7 @@ impl<'src> Analyzer<'src> {
             .map(|(id, closure)| (*id, closure.return_))
             .collect();
         for (closure_id, return_id) in closures {
+            self.id_windows.set_anchor(closure_id);
             let mut calls = Vec::new();
             let mut nested = Vec::new();
             let mut visited = HashSet::default();
@@ -16986,6 +17197,9 @@ impl<'src> Analyzer<'src> {
             if !seen.insert(type_id) {
                 continue;
             }
+            // M134: a classification's mints belong to the slot's item (M149
+            // moved a restored region's first classification here).
+            self.id_windows.set_check_anchor_type(type_id);
             if !self.type_is_resource(type_id) {
                 continue;
             }
@@ -19348,8 +19562,16 @@ impl<'src> Analyzer<'src> {
         while let Some(instance) = worklist.pop_front() {
             if sets.is_none() {
                 sets = Some(R11Sets {
-                    loaned_captures: self.collect_loaned_pattern_captures(),
-                    value_crossings: self.compute_return_value_crossings(),
+                    // M149: the move scan's fold when it ran — the same
+                    // whole-program sets, restored and live.
+                    loaned_captures: match &self.move_sets {
+                        Some(sets) => sets.loaned.clone(),
+                        None => self.collect_loaned_pattern_captures(),
+                    },
+                    value_crossings: match &self.move_sets {
+                        Some(sets) => sets.crossings.clone(),
+                        None => self.compute_return_value_crossings(&|_| true),
+                    },
                     binding_candidates: LexicalCandidates::build(
                         self,
                         self.variables
@@ -21844,57 +22066,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Whether a RESOLVED type is Wire — the ONE predicate behind all four
-    /// boundaries: the `[derive(Wire)]` all-fields check, the `[rpc]`
-    /// signature check, that check's handle-element arm, and the `[expose]`
-    /// element check.
-    ///
-    /// Until B289 this was a SYNTACTIC ALLOWLIST — six scalar spellings,
-    /// `List`/`Option`/`HashMap` of Wire, and the `[derive(Wire)]` names — so a
-    /// hand-written `impl Result<type T: Wire, type E: Wire> with Wire` was
-    /// invisible to every one of them: kolt carried forty lines of exactly
-    /// that impl and still could not return a `Result<i53, str>` from an
-    /// `[rpc]` method. What is Wire is what an `impl .. with Wire` APPLIES to,
-    /// so the impl table has the last word here; the name arms stay in front
-    /// of it as the fast path and as the rule for the primitives.
-    ///
-    /// The arms, in order:
-    ///
-    /// 1. **The scalars** ([`WIRE_SCALAR_NAMES`]). They are Wire by the
-    ///    language's own rule and `std::wire`'s impls for them are the leaves
-    ///    the derived code bottoms out in — answering them here keeps them
-    ///    decidable with `std::wire` unloaded.
-    /// 2. **A `[derive(Wire)]` NAME, whatever its arguments** — C7's
-    ///    phantom-parameter condition. A `[derive(Wire)]` type can only ever
-    ///    have PHANTOM parameters, because a field typed by a parameter
-    ///    (`value: T`, or `List<T>`) fails this very check at the type's own
-    ///    declaration. So the arguments cannot reach the payload, and
-    ///    `Handle<Database>` is as sendable as `Handle<i32>` (a name is not the
-    ///    thing it names). B194 made the derive generators generic-aware and
-    ///    this rule is what decides how: a derived impl binds only the
-    ///    parameters the generated body REACHES, and for `Wire` the reached
-    ///    case is unreachable (the declaration check refuses it first), so the
-    ///    phantom parameter takes a bare binder, `impl Handle<type T> with
-    ///    Wire`. Were the declaration rule ever relaxed to admit a
-    ///    parameter-typed field, the argument check would land with it AND
-    ///    `Wire`'s reached parameters would start binding, both on the same day.
-    /// 3. **`List`/`Option`/`HashMap` of Wire**, recursing into the arguments —
-    ///    the fast path for std's own conditional impls (`HashMap` joined the pair
-    ///    with A39, narrating as a list of `{key, value}` pairs; its key must
-    ///    also be `Hashable`, which is `HashMap`'s own declaration bound rather
-    ///    than this predicate's business).
-    /// 4. **The impl table**, via [`Self::satisfies_trait_bound`] — which is
-    ///    what makes arm 3 redundant rather than load-bearing, and what reads
-    ///    a user's own impl. Recursion into the arguments happens exactly
-    ///    where the IMPL's own binder bounds demand it: `impl Result<type T:
-    ///    Wire, type E: Wire>` checks both arguments, `impl Handle<type T>`
-    ///    checks neither — C7's phantom rule expressed by the impl instead of
-    ///    by a special case here.
-    ///
-    /// A type that is not a resolved nominal — a closure, a tuple, a generic
-    /// parameter, an unresolved annotation — is NOT Wire and never reaches the
-    /// impl table: a bare parameter would otherwise answer from its declared
-    /// bound, which is the one answer arm 2 exists to refuse.
     /// Record a type the `[rpc]` Wire-signature refusal has just reported as
     /// not Wire — and every non-Wire component nested inside it — so the
     /// generated client's `call<T: Wire>` failure at the same type stands down
@@ -21949,30 +22120,33 @@ impl<'src> Analyzer<'src> {
             .map(|(_, span, _)| (source, *span))
     }
 
-    /// B622: a `[derive(Hashable)]` member's type read under the derived
-    /// impl's OWN binders — the subject's parameters substituted by the
-    /// arguments of the impl the derive wrote over the declaration.
+    /// B622 (`Hashable`) and B633 (`Wire`): a derived member's type read
+    /// under the derived impl's OWN binders — the subject's parameters
+    /// substituted by the arguments of the impl the derive wrote over the
+    /// declaration for `trait_id`.
     ///
-    /// The derive binds every parameter a member reaches under `Hashable`
-    /// (B194: `impl Holder<type T: Hashable> with Hashable`), so under that
-    /// impl a reached `T` — and a `List<T>`, a `[T; N]`, an `Inner<T>` whose
-    /// impl asks `T: Hashable` — is `Hashable`. Read at the declaration's own
-    /// `T`, whose bound is whatever the struct wrote (most often nothing), the
-    /// boundary refused the very field the derive accounts for. A non-generic
-    /// declaration, or one with no `Hashable` impl over its binders, reads the
-    /// member as declared.
+    /// The derive binds every parameter a member reaches under the derived
+    /// trait (B194: `impl Holder<type T: Hashable> with Hashable`, `impl
+    /// Page<type T: Wire> with Wire`), so under that impl a reached `T` — and
+    /// a `List<T>`, a `[T; N]`, an `Inner<T>` whose impl asks `T: Hashable` —
+    /// carries the trait. Read at the declaration's own `T`, whose bound is
+    /// whatever the struct wrote (most often nothing), the boundary refused
+    /// the very field the derive accounts for. A non-generic declaration, or
+    /// one with no impl of the trait over its binders, reads the member as
+    /// declared.
     ///
-    /// Deliberately NOT the Wire boundary's: there a parameter-typed field is
-    /// refused on purpose (C7's guard, `borrows::
-    /// a_wire_type_with_a_parameter_typed_field_is_rejected`) so a Wire type's
-    /// parameters stay phantom and `resolved_type_is_wire` may answer a
-    /// derived name without its arguments.
-    fn hashable_member_under_binders(
+    /// For `Wire` this retires C7's declaration guard (a parameter-typed field
+    /// refused so a Wire type's parameters stayed phantom): a reached
+    /// parameter now binds `Wire` on the derived impl, and a phantom one keeps
+    /// its bare binder, so `Handle<Session>` stays sendable while `Page<|| i32>`
+    /// is the impl table's refusal ([`Self::resolved_type_is_wire`]'s arm 2).
+    fn member_under_derive_binders(
         &mut self,
         declaration_id: Id,
         member_type_id: TypeId,
+        trait_id: Option<Id>,
     ) -> TypeId {
-        let Some(trait_id) = self.hashable_trait_id else {
+        let Some(trait_id) = trait_id else {
             return member_type_id;
         };
         let parameters = match self.structs.get(&declaration_id) {
@@ -22013,11 +22187,67 @@ impl<'src> Analyzer<'src> {
         self.substitute_type_id(member_type_id, &context)
     }
 
+    /// Whether a RESOLVED type is Wire — the ONE predicate behind all four
+    /// boundaries: the `[derive(Wire)]` all-fields check, the `[rpc]`
+    /// signature check, that check's handle-element arm, and the `[expose]`
+    /// element check.
+    ///
+    /// Until B289 this was a SYNTACTIC ALLOWLIST — six scalar spellings,
+    /// `List`/`Option`/`HashMap` of Wire, and the `[derive(Wire)]` names — so a
+    /// hand-written `impl Result<type T: Wire, type E: Wire> with Wire` was
+    /// invisible to every one of them: kolt carried forty lines of exactly
+    /// that impl and still could not return a `Result<i53, str>` from an
+    /// `[rpc]` method. What is Wire is what an `impl .. with Wire` APPLIES to,
+    /// so the impl table has the last word here; the name arms stay in front
+    /// of it as the fast path and as the rule for the primitives.
+    ///
+    /// The arms, in order:
+    ///
+    /// 1. **The scalars** ([`WIRE_SCALAR_NAMES`]). They are Wire by the
+    ///    language's own rule and `std::wire`'s impls for them are the leaves
+    ///    the derived code bottoms out in — answering them here keeps them
+    ///    decidable with `std::wire` unloaded.
+    /// 2. **A NON-generic `[derive(Wire)]` name.** A generic derived type
+    ///    is judged through the impl table (arm 4) by its ARGUMENTS (B633):
+    ///    the derive binds every parameter a field reaches under `Wire`
+    ///    (`impl Page<type T: Wire> with Wire`) and a PHANTOM one bare
+    ///    (`impl Handle<type T> with Wire`, B194's reached-parameters rule),
+    ///    so `Handle<Database>` is as sendable as `Handle<i32>` (C7: a name is
+    ///    not the thing it names) while `Page<|| i32>` is refused. Until B633
+    ///    the declaration refused a parameter-typed field outright (C7's
+    ///    guard), every Wire parameter was phantom, and the name answered
+    ///    whatever its arguments; the guard and the name shortcut retired on
+    ///    the same day, as the guard's own comment required.
+    /// 3. **`List`/`Option`/`HashMap` of Wire**, recursing into the arguments —
+    ///    the fast path for std's own conditional impls (`HashMap` joined the pair
+    ///    with A39, narrating as a list of `{key, value}` pairs; its key must
+    ///    also be `Hashable`, which is `HashMap`'s own declaration bound rather
+    ///    than this predicate's business).
+    /// 4. **The impl table**, via [`Self::satisfies_trait_bound`] — which is
+    ///    what makes arm 3 redundant rather than load-bearing, and what reads
+    ///    a user's own impl. Recursion into the arguments happens exactly
+    ///    where the IMPL's own binder bounds demand it: `impl Result<type T:
+    ///    Wire, type E: Wire>` checks both arguments, `impl Handle<type T>`
+    ///    checks neither — C7's phantom rule expressed by the impl instead of
+    ///    by a special case here.
+    ///
+    /// A generic parameter is Wire exactly when its bound carries `Wire` —
+    /// the derived impl's binder a member reads under (B633). A type that is
+    /// not a resolved nominal otherwise — a closure, a tuple, an unresolved
+    /// annotation — is NOT Wire and never reaches the impl table.
     fn resolved_type_is_wire(&mut self, type_id: TypeId) -> bool {
         let type_ = type_id.get_type(self);
         let (name, arguments) = match &type_ {
             Type::Struct(id, arguments) => (self.structs.get(id).map(|s| s.name), arguments),
             Type::Enum(id, arguments) => (self.enums.get(id).map(|e| e.name), arguments),
+            // B633: a parameter is Wire when its bound says so — the bound a
+            // derived member reads under `member_under_derive_binders`. The
+            // declaration's own bare `T` carries none and stays refused.
+            Type::Generic(constraint) => {
+                return self
+                    .wire_trait_id
+                    .is_some_and(|wire| self.generic_bound_carries_trait(*constraint, wire));
+            }
             _ => return false,
         };
         let Some(name) = name else {
@@ -22026,7 +22256,11 @@ impl<'src> Analyzer<'src> {
         if WIRE_SCALAR_NAMES.contains(&name) {
             return true;
         }
-        if self.wire_names.contains(name) {
+        // B633: the name answers for a NON-generic derive only. A generic
+        // one's impl binds its reached parameters under `Wire` (and a phantom
+        // one bare), so `Page<|| i32>` is the impl table's question, below —
+        // read by name it would put a closure on the wire.
+        if self.wire_names.contains(name) && arguments.is_empty() {
             return true;
         }
         if matches!(name, "List" | "Option" | "HashMap")
@@ -22056,7 +22290,7 @@ impl<'src> Analyzer<'src> {
             // arm below reads `List` — at a literal length or a `const N`.
             Type::Array(element, _) => return self.resolved_type_is_hashable(*element),
             // B622: a parameter is `Hashable` when its bound says so — the
-            // bound a derived member reads under `hashable_member_under_binders`.
+            // bound a derived member reads under `member_under_derive_binders`.
             Type::Generic(constraint) => {
                 return self.hashable_trait_id.is_some_and(|hashable| {
                     self.generic_bound_carries_trait(*constraint, hashable)
@@ -23679,6 +23913,217 @@ impl<'src> Analyzer<'src> {
         selected
     }
 
+    /// B627: whether the value of `call_id`, whose settled type still carries
+    /// `generic`, ends where nothing decides it. The value is followed through
+    /// what it lands in — the binding it initializes, the call it is an
+    /// argument (or receiver) of — while each carrier's settled type still
+    /// carries the generic. A carrier the program TYPED decides it: a
+    /// position with an expectation that does not carry it (a struct
+    /// literal's field, an annotated binding, a parameter the callee fixes —
+    /// `Shared::new(HashMap::new())` as a `Shared<HashMap<str, Node>>` field),
+    /// or a landing whose own settled type no longer carries it. A binding
+    /// that still carries it, or a carrier only a field read or a statement
+    /// consumes, is undetermined.
+    fn undetermined_value_flows_on(&mut self, call_id: Id, generic: TypeId) -> bool {
+        let mut current = call_id;
+        // Each step moves to an enclosing expression, so the walk is bounded
+        // by the nesting depth; the cap only guards a malformed table.
+        for _ in 0..64 {
+            if let Some(expected_id) = self.expected_types.get(&current).copied() {
+                let expected = expected_id.get_type(self);
+                let mut carried = Vec::new();
+                self.collect_generics(&expected, 0, &mut carried);
+                if !matches!(expected, Type::Unknown | Type::Unresolved | Type::Any)
+                    && !carried.contains(&generic)
+                {
+                    return false;
+                }
+            }
+            let initialized: Vec<Id> = self
+                .variables
+                .iter()
+                .filter(|(_, variable)| variable.initial == Some(current))
+                .map(|(variable_id, _)| *variable_id)
+                .collect();
+            if !initialized.is_empty() {
+                return initialized
+                    .into_iter()
+                    .any(|variable_id| self.settled_type_carries(variable_id, generic));
+            }
+            let consumer = self
+                .function_calls
+                .iter()
+                .find(|(_, consumer)| consumer.argument_ids.contains(&current))
+                .map(|(consumer_id, _)| *consumer_id);
+            match consumer {
+                Some(consumer_id) if self.settled_type_carries(consumer_id, generic) => {
+                    current = consumer_id;
+                }
+                Some(_) => return false,
+                // A field read off the carrier, or a statement discarding it,
+                // consumes it untyped (`print(Holder::build().unwrap().value)`,
+                // `Holder::build();`): the instance is emitted undetermined.
+                // Any other position (a list element, a tuple, a typed return)
+                // is that position's to type.
+                None => {
+                    return self.expr_id_to_expr_map.values().any(|expr| match expr {
+                        Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..) => {
+                            *subject == current
+                        }
+                        Expr::Block((statements, _)) => statements.contains(&current),
+                        _ => false,
+                    });
+                }
+            }
+        }
+        false
+    }
+
+    /// B627: whether `id`'s settled type mentions `generic`.
+    fn settled_type_carries(&mut self, id: Id, generic: TypeId) -> bool {
+        let settled = self.infer_type(id, &Type::Unknown, &HashMap::default());
+        let mut carried = Vec::new();
+        self.collect_generics(&settled, 0, &mut carried);
+        carried.contains(&generic)
+    }
+
+    /// [`Self::infer_type_path`]'s external-callee arm: the external's OWN
+    /// generics its return alone carries, bound by reconciling the (receiver-
+    /// substituted) return with the call's expectation and recorded on the
+    /// call — the bodied arm's reconcile-and-record, narrowed to the generics
+    /// the external itself declares (B627).
+    fn record_external_return_generics(
+        &mut self,
+        call_id: Id,
+        function_id: Id,
+        return_type: &Type,
+        constraint: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        if matches!(constraint, Type::Unknown | Type::Unresolved | Type::Any) {
+            return;
+        }
+        let Some(own_generics) = self
+            .external_functions
+            .get(&function_id)
+            .map(|function| function.generic_parameter_constraint_ids.clone())
+        else {
+            return;
+        };
+        if own_generics.is_empty() {
+            return;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(return_type, 0, &mut carried);
+        if !own_generics.iter().any(|generic| carried.contains(generic)) {
+            return;
+        }
+        let previously_inferable =
+            std::mem::replace(&mut self.inferable_generics, own_generics.clone());
+        let reconciled = self.reconcile_type(return_type, constraint, substitution_context);
+        self.inferable_generics = previously_inferable;
+        let Some((_, bindings)) = reconciled else {
+            return;
+        };
+        for (generic, bound_to) in bindings {
+            let foreign = match *bound_to.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
+            if own_generics.contains(&generic)
+                && !foreign
+                && !self.generic_is_enclosing_binder(generic, call_id)
+            {
+                self.method_call_substitution
+                    .entry(call_id)
+                    .or_default()
+                    .entry(generic)
+                    .or_insert(bound_to);
+            }
+        }
+    }
+
+    /// B627 / std-53's A?1: a method call's EXPECTATION reaches its receiver.
+    /// `let held: Holder<i32> = Holder::build().unwrap();` expects `unwrap`'s
+    /// result to be a `Holder<i32>`, and `unwrap` on an `Option<Holder<T>>`
+    /// answers that `Holder<T>` — so the receiver call is `Option<Holder<i32>>`,
+    /// and the static's impl binder `T` is `i32`. Method resolution runs
+    /// receiver-first, so the receiver call settled before the expectation
+    /// reached the method: its generic stayed the impl's binder (JS reached
+    /// `Make`'s body-less `make`, an internal error, while the native build
+    /// read the binding's type and ran), and a free call's own generic
+    /// (`make().unwrap_or(3)`, `xs.to_array().unwrap()`) was refused "cannot
+    /// infer". The receiver is re-inferred DIRECTED at the type the
+    /// expectation implies — `resolve_try_assert`'s precedent for `call()!`,
+    /// whose call arm records the bindings for monomorphization.
+    ///
+    /// Only a receiver that is a CALL and still carries a generic nothing at
+    /// this site holds rigid is directed, and only through what the member's
+    /// return type (its impl's binders bound from the receiver) says about
+    /// those generics; `None` when the expectation decides nothing new.
+    fn receiver_directed_by_expectation(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> Option<Type> {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&subject_id),
+            Some(Expr::Call(_))
+        ) {
+            return None;
+        }
+        let expected = self.expected_types.get(&call_id)?.get_type(self);
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+            return None;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(subject_type, 0, &mut carried);
+        let open: Vec<TypeId> = carried
+            .into_iter()
+            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
+        let impl_subject = self.implementations.get(implementation_index)?.subject;
+        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        // The member's own generics are open in its answer too (a `map<U>`
+        // returning `Option<U>`), but they are the member's to bind, from
+        // its arguments; only the receiver's generics are taken from here.
+        let mut inferable = open.clone();
+        if let Some((_, own_generics)) = self.method_signature_ref(member_id) {
+            inferable.extend_from_slice(own_generics);
+        }
+        let previously_inferable = std::mem::replace(&mut self.inferable_generics, inferable);
+        let reconciled = self.reconcile_type(&answered, &expected, &HashMap::default());
+        self.inferable_generics = previously_inferable;
+        let (_, bindings) = reconciled?;
+        let mut directed_by: SubstitutionContext = HashMap::default();
+        for (generic, bound_to) in bindings {
+            // B351's rule, the value side: an expectation that is itself some
+            // other call's abstract generic is not evidence.
+            let foreign = match *bound_to.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
+            if open.contains(&generic) && !foreign {
+                directed_by.entry(generic).or_insert(bound_to);
+            }
+        }
+        if directed_by.is_empty() {
+            return None;
+        }
+        let directed = self.substitute_type(subject_type, &directed_by);
+        let redirected = self.infer_type(subject_id, &directed, &HashMap::default());
+        match redirected {
+            Type::Unresolved | Type::Unknown => None,
+            redirected => Some(redirected),
+        }
+    }
+
     /// A candidate member's declared return type, with the declaring impl's own
     /// binders bound from the receiver — so the blanket's `fun into(self): T`
     /// reads as `Foo` on a `Foo` and the user's `fun into(self): Bar` as `Bar`.
@@ -24894,6 +25339,10 @@ impl<'src> Analyzer<'src> {
         subject: Option<&SignatureSubject<'_>>,
         substitution: &SubstitutionContext,
     ) -> String {
+        // E316: an implicit parameter (`username: Signal<str>`) prints its bound.
+        if let Some(bound) = self.implicit_parameter_bound(type_id, substitution) {
+            return self.signature_type_label(bound, subject, substitution);
+        }
         if subject.is_some() {
             return self.declaration_type_label_for(type_id, subject);
         }
@@ -32075,19 +32524,30 @@ impl<'src> Analyzer<'src> {
     /// `*` target and a lifted chain already carry their own refusal.
     fn check_assignment_places(&mut self) {
         // M110 S7b: the live assignments only, walked.
-        let mut assignment_targets: Vec<Id> = self
+        let mut assignment_targets: Vec<(Id, Id)> = self
             .live_entries_where(&self.expr_id_to_expr_map, |expr| {
                 matches!(expr, Expr::Assignment(..))
             })
-            .filter_map(|(_, expr)| match expr {
-                Expr::Assignment(target_id, _) => Some(*target_id),
+            .filter_map(|(assignment_id, expr)| match expr {
+                Expr::Assignment(target_id, _) => Some((*target_id, *assignment_id)),
                 _ => None,
             })
             .collect();
         // Source order, so a program with several reports them in reading order.
-        assignment_targets.sort_unstable_by_key(|target_id| target_id.0);
-        for target_id in assignment_targets {
+        assignment_targets.sort_unstable_by_key(|(target_id, _)| target_id.0);
+        let shared_reads = self
+            .shared_members()
+            .map(|[_, reads, _, _]| reads)
+            .unwrap_or_default();
+        for (target_id, assignment_id) in assignment_targets {
             let Some((non_place_id, what)) = self.first_non_place(target_id) else {
+                // F141: a place inside a `Shared::read()` — the read's copy —
+                // is a place nobody keeps.
+                if !shared_reads.is_empty()
+                    && let Some(read_id) = self.spine_rooted_at_a_read(target_id, &shared_reads)
+                {
+                    self.refuse_write_through_read(target_id, assignment_id, read_id);
+                }
                 continue;
             };
             self.push_anchored(
@@ -32105,6 +32565,248 @@ impl<'src> Analyzer<'src> {
                 target_id,
             );
         }
+    }
+
+    /// native-53's B?2 (spec §6.4, rule 4: no invalidating mutation under a
+    /// live view): a call lends a place `&mut` — a `&mut self` receiver
+    /// (`log.items.push(..)`, `log.bump(..)`) or a `&mut` argument
+    /// (`add(&mut log.items, ..)`) — and a LATER argument of the same call
+    /// re-binds that place's root binding (`{ log = fresh(); 9 }`). The view is
+    /// taken where it stands, so the call writes the value the binding held
+    /// before the re-bind: JS wrote the old object, and the native emission was
+    /// refused by rustc (E0506, reported as a backend defect). Refused at the
+    /// re-bind, with the value settled first. A binding a closure captures is
+    /// F138's (both backends read it after the later arguments, so the call
+    /// writes the new binding), and a module-level binding is F?3's question;
+    /// neither is refused here.
+    fn check_lent_root_rebinds(&mut self) {
+        // M110 S7b: the live calls only — a call's id is its expression's.
+        // Only a call with two or more arguments can lend one and re-bind it
+        // in another, so the rest cost a length test.
+        let mut module_level: Option<HashSet<Id>> = None;
+        let mut capture_verdicts: HashMap<Id, bool> = HashMap::default();
+        let mut refusals: Vec<(Id, Id, Id, Id, Id)> = Vec::new();
+        for (call_expr_id, function_call) in self.live_entries(&self.function_calls) {
+            let arguments = &function_call.argument_ids;
+            if arguments.len() < 2 {
+                continue;
+            }
+            let Some(Expr::Local(callee_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let parameters: &[Id] = self
+                .method_signature_ref(*callee_id)
+                .map(|(parameters, _)| parameters)
+                .unwrap_or_default();
+            for (position, argument_id) in arguments.iter().enumerate() {
+                let lent_by_parameter = parameters
+                    .get(position)
+                    .and_then(|parameter| self.parameters.get(parameter))
+                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
+                let lent_by_argument = matches!(
+                    self.expr_id_to_expr_map.get(argument_id),
+                    Some(Expr::Reference(_, true))
+                );
+                if !lent_by_parameter && !lent_by_argument {
+                    continue;
+                }
+                let Some(root) = self.place_root_binding(*argument_id) else {
+                    continue;
+                };
+                for later in &arguments[position + 1..] {
+                    let Some(rebind) = self.rebind_of_within(*later, root) else {
+                        continue;
+                    };
+                    let module_level =
+                        module_level.get_or_insert_with(|| self.module_level_binding_ids());
+                    if module_level.contains(&root) {
+                        continue;
+                    }
+                    let captured = *capture_verdicts
+                        .entry(root)
+                        .or_insert_with(|| self.binding_is_closure_captured(root));
+                    if !captured {
+                        refusals.push((rebind, root, *argument_id, *call_expr_id, *later));
+                    }
+                }
+            }
+        }
+        // Source order, so a program with several reports them in reading order.
+        refusals.sort_unstable_by_key(|(rebind, ..)| rebind.0);
+        for (rebind, root, lent, call_expr_id, later) in refusals {
+            self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+        }
+    }
+
+    /// B?2: the binding a place's spine roots at — `log` for `log.items`,
+    /// `&mut log.items[0]`, `log` — when it is a local or a parameter.
+    fn place_root_binding(&self, place_id: Id) -> Option<Id> {
+        let mut current = place_id;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
+                Expr::TupleIndex(root, ..) | Expr::Reference(root, _) => current = *root,
+                Expr::Local(binding)
+                    if self.variables.contains_key(binding)
+                        || self.parameters.contains_key(binding) =>
+                {
+                    return Some(*binding);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// B?2: an assignment re-binding `binding` WHOLE inside `expr_id`'s
+    /// subtree, closures excluded (a closure's body runs when it is called,
+    /// not where it is written).
+    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<Id> {
+        let mut pending = vec![expr_id];
+        let mut children = Vec::new();
+        while let Some(current) = pending.pop() {
+            if let Some(Expr::Assignment(target, _)) = self.expr_id_to_expr_map.get(&current)
+                && matches!(self.expr_id_to_expr_map.get(target), Some(Expr::Local(named)) if *named == binding)
+            {
+                return Some(current);
+            }
+            children.clear();
+            self.drop_scan_children(current, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        None
+    }
+
+    /// B?2: whether any closure of the program names `binding` from outside
+    /// its own body (F138's captured binding).
+    fn binding_is_closure_captured(&self, binding: Id) -> bool {
+        let targets: HashSet<Id> = std::iter::once(binding).collect();
+        self.closures.values().any(|closure| {
+            let mut declared_inside: HashSet<Id> = closure
+                .parameters
+                .iter()
+                .chain(&closure.parameter_destructures)
+                .copied()
+                .collect();
+            let mut captured: Vec<Id> = Vec::new();
+            self.scan_capture_body(
+                closure.return_,
+                &targets,
+                &mut declared_inside,
+                &mut captured,
+                &mut HashSet::default(),
+                &mut ThunkEffects::default(),
+            );
+            captured.iter().any(|reference| {
+                matches!(self.expr_id_to_expr_map.get(reference), Some(Expr::Local(named)) if *named == binding)
+            }) && !declared_inside.contains(&binding)
+        })
+    }
+
+    fn refuse_lent_root_rebind(
+        &mut self,
+        rebind: Id,
+        root: Id,
+        lent: Id,
+        call_expr_id: Id,
+        later: Id,
+    ) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let name = self
+            .variables
+            .get(&root)
+            .map(|variable| variable.name)
+            .or_else(|| self.parameters.get(&root).map(|parameter| parameter.name))
+            .unwrap_or("the binding");
+        let lent_text = text_of(self, lent).unwrap_or(name);
+        let lent_text = lent_text.strip_prefix("&mut ").unwrap_or(lent_text);
+        // The call as written with the re-binding argument replaced by the
+        // settled value's name, and the value itself when it fits a line.
+        let later_text = text_of(self, later);
+        let settled = text_of(self, call_expr_id)
+            .zip(later_text)
+            .map(|(call_text, argument_text)| call_text.replacen(argument_text, "item", 1))
+            .filter(|rewritten| !rewritten.contains('\n'))
+            .unwrap_or_else(|| format!("{lent_text}.…(item)"));
+        let value = later_text
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("{ … }");
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&rebind).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{name}` is re-bound while `{lent_text}` is lent `&mut` to this call, which \
+                     would write the value `{name}` held before; settle the value first: `let \
+                     item = {value}; {settled}`"
+                ),
+            },
+            rebind,
+        );
+    }
+
+    /// F141: the `Shared::read()` call an assignment target's spine roots at —
+    /// `cell.read().count`, `cell.read().items[0]`, `cell.read().pair.0` —
+    /// walking fields, elements and tuple positions down to the expression
+    /// they are read off. `None` when the root is anything else.
+    fn spine_rooted_at_a_read(&self, target_id: Id, shared_reads: &HashSet<Id>) -> Option<Id> {
+        let mut current = target_id;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
+                Expr::TupleIndex(root, ..) => current = *root,
+                Expr::Call(_) if current != target_id => {
+                    let (callee_id, _) = self.call_callee_and_receiver(current)?;
+                    return shared_reads.contains(&callee_id).then_some(current);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// F141: spec §6.7 — `read()` answers a COPY of the cell's value, so an
+    /// assignment into it writes the copy, which nothing keeps: natively the
+    /// write was lost, while JS (whose read aliased the cell) wrote the cell.
+    /// Refused at the target, with the assignment rewritten through `write()`.
+    fn refuse_write_through_read(&mut self, target_id: Id, assignment_id: Id, read_id: Id) {
+        let text_of = |analyzer: &Self, id: Id| {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let read_text = text_of(self, read_id).unwrap_or("cell.read()");
+        let handle_text = read_text
+            .strip_suffix("read()")
+            .and_then(|head| head.strip_suffix('.'))
+            .unwrap_or("cell");
+        let write_text = format!("{handle_text}.write()");
+        let rewritten = text_of(self, assignment_id)
+            .and_then(|assignment| assignment.strip_prefix(read_text))
+            .filter(|rest| !rest.contains('\n'))
+            .map(|rest| format!("{write_text}{rest}"))
+            .unwrap_or_else(|| format!("{write_text}.… = …"));
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{read_text}` is a copy, so this assignment is lost; write through \
+                     `{write_text}`: `{rewritten}`"
+                ),
+            },
+            target_id,
+        );
     }
 
     /// The first sub-expression of an assignment target that is not a place,
@@ -32238,41 +32940,26 @@ impl<'src> Analyzer<'src> {
     /// tables are the lowering's input, not a diagnostic, and a module whose
     /// checks are replayed still has to emit.
     fn record_lazy_arguments(&mut self) {
+        self.lazy_rows_live = lazy_tables::LazyRows::default();
+        self.lazy_rows_filed = false;
         // Every program that writes no `lazy` parameter pays one set lookup.
         if self.lazy_cells.is_empty() {
             return;
         }
-        let calls: Vec<(Id, Vec<Id>)> = self
-            .function_calls
-            .values()
-            .map(|call| (call.subject_id, call.argument_ids.clone()))
-            .collect();
         // M81's first pass: every (lazy parameter, argument) pair this program
         // actually resolved, banked before anything is recorded, because the
         // elision below is a fact about the PARAMETER and the arguments decide
-        // it together.
-        let mut lazy_pairs: Vec<(Id, Id, &'src str)> = Vec::new();
-        for (subject_id, argument_ids) in calls {
-            let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
-                continue;
-            };
-            let Some(parameter_ids) = self
-                .functions
-                .get(callee_id)
-                .map(|function| function.parameters.clone())
-            else {
-                continue;
-            };
-            for (parameter_id, argument_id) in parameter_ids.iter().zip(argument_ids.iter()) {
-                let Some(parameter) = self.parameters.get(parameter_id) else {
-                    continue;
-                };
-                if !parameter.lazy {
-                    continue;
-                }
-                lazy_pairs.push((*parameter_id, *argument_id, parameter.name));
-            }
-        }
+        // it together. M150: the pairs are rows (`lazy_tables.rs`) — the
+        // restored regions' and the live lane's, in the calls' recorded order
+        // — and the decisions below are taken over every one of them.
+        let live = self.live_lazy_rows();
+        let (pairs, lazy_parameters) = self.fold_lazy(&live);
+        self.lazy_rows_live = live;
+        self.lazy_rows_filed = true;
+        let lazy_pairs: Vec<(Id, Id, &'src str)> = pairs
+            .iter()
+            .map(|(parameter_id, argument_id, name, _)| (*parameter_id, *argument_id, *name))
+            .collect();
         // M81 — **a lazy parameter every call site fills INERTLY is eager in
         // this program.** 111 of A103's 114 `__lazy` emissions carried a
         // literal, an enum constant or `[]`, and each one allocated a memo
@@ -32302,12 +32989,7 @@ impl<'src> Analyzer<'src> {
         // `inner` stays a plain pass-through instead of re-wrapping the value
         // in a cell the way a per-pair decision would. Each round only ever
         // removes, so it terminates in at most one round per parameter.
-        let mut eager_parameters: HashSet<Id> = self
-            .parameters
-            .values()
-            .filter(|parameter| parameter.lazy)
-            .map(|parameter| parameter.id)
-            .collect();
+        let mut eager_parameters: HashSet<Id> = lazy_parameters;
         // B362 (RULED) — **a trait's declaration and every impl of it are ONE
         // convention**, so they are eager together or lazy together.
         //
@@ -32372,20 +33054,12 @@ impl<'src> Analyzer<'src> {
             }
         }
         self.lazy_eager_parameters = eager_parameters;
-        // The effects half, in a second loop so the borrow of `self` the walk
-        // takes does not fight the insert above.
-        let thunks: Vec<Id> = self.lazy_argument_thunks.keys().copied().collect();
-        for argument_id in thunks {
-            let mut effects = ThunkEffects::default();
-            self.scan_capture_body(
-                argument_id,
-                &HashSet::default(),
-                &mut HashSet::default(),
-                &mut Vec::new(),
-                &mut HashSet::default(),
-                &mut effects,
-            );
-            self.lazy_thunk_effects.insert(argument_id, effects);
+        // The effects half: each thunk's, read off its pair (M150: a row the
+        // argument's region contributed), in the thunks' order.
+        for (_, argument_id, _, effects) in pairs {
+            if self.lazy_argument_thunks.contains_key(&argument_id) {
+                self.lazy_thunk_effects.insert(argument_id, effects);
+            }
         }
     }
 
@@ -33574,7 +34248,7 @@ impl<'src> Analyzer<'src> {
         &self,
         definition_id: Id,
         type_name: &str,
-        member_name: Option<&str>,
+        member: Option<(&str, TwinMember)>,
     ) -> Option<Note> {
         let source = self.source_of_id(definition_id)?;
         let layer = self.std_layer_sources.get(&source)?;
@@ -33593,9 +34267,9 @@ impl<'src> Analyzer<'src> {
         // answer that settles it is that the OTHER twin has one by that name.
         // Without this the note explains a colour and leaves the member looking
         // like a typo.
-        if let Some(member_name) = member_name
+        if let Some((member_name, kind)) = member
             && let Some((other_layer, module, patterns)) =
-                self.twin_declaring_member(source, type_name, member_name)
+                self.twin_declaring_member(source, type_name, member_name, kind)
         {
             // F27 R1: and the move that puts the file there, which is now a
             // line the author writes — the editor's quick fix inserts exactly
@@ -33633,6 +34307,7 @@ impl<'src> Analyzer<'src> {
         source: SourceId,
         type_name: &str,
         member_name: &str,
+        kind: TwinMember,
     ) -> Option<(String, String, Vec<String>)> {
         for (layer, module, path, patterns) in self.std_layer_twin_files.get(&source)? {
             let Ok(text) = crate::util::read_source(path) else {
@@ -33644,7 +34319,7 @@ impl<'src> Analyzer<'src> {
             if tree
                 .0
                 .iter()
-                .any(|item| declares_member_on(unwrap_item(item), type_name, member_name))
+                .any(|item| declares_member_on(unwrap_item(item), type_name, member_name, kind))
             {
                 return Some((layer.clone(), module.clone(), patterns.clone()));
             }
@@ -34603,6 +35278,10 @@ impl<'src> Analyzer<'src> {
         let mut shared: HashSet<Id> = HashSet::default();
         let mut materialized: HashSet<Id> = HashSet::default();
         for &(capture_id, subject_id) in candidates {
+            // M134: the classification's mints belong to the capture's item
+            // (M149 moved the restored regions' first classification here
+            // from the move scan's binding walk, which anchored it).
+            self.id_windows.set_anchor(capture_id);
             let Some((type_id, capture_is_mutable)) = self
                 .variables
                 .get(&capture_id)
@@ -35396,8 +36075,12 @@ impl<'src> Analyzer<'src> {
     /// counted where it is first asked). An external writes no vilan cell
     /// (`Shared::write` IS the write, counted by the span test), and a variant
     /// builds a value. A dispatched member answers for every body of its name.
-    /// A call through a closure VALUE (a subscriber) is unknown statically,
-    /// and answers whether ANY write mutates the cell in place.
+    /// A call through a closure LITERAL — applied where it is written, or
+    /// named by an immutable `let` whose initializer is one (B634) — answers
+    /// for the literal's body, as a function answers for its own. Any other
+    /// call through a closure VALUE (a subscriber, a parameter, a `mut`
+    /// binding, a field) is unknown statically, and answers whether ANY write
+    /// mutates the cell in place.
     fn call_reaches_an_in_place_write(
         &self,
         call_id: Id,
@@ -35444,6 +36127,9 @@ impl<'src> Analyzer<'src> {
                 self.function_reaches_an_in_place_write(member, cell, calls, summaries)
             });
         }
+        if let Some(body) = self.closure_literal_body(function_call.subject_id) {
+            return self.function_reaches_an_in_place_write(body, cell, calls, summaries);
+        }
         match self.expr_id_to_expr_map.get(&function_call.subject_id) {
             Some(Expr::Local(callee)) => {
                 if self.external_functions.contains_key(callee)
@@ -35468,8 +36154,38 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B634: the BODY of the closure literal a call's subject is — the literal
+    /// itself (`(|| ..)()`), or an immutable `let` whose initializer is one,
+    /// through immutable aliases of it (`let g = f;`). A `mut` binding may be
+    /// re-bound to any closure, and a parameter or a field holds one nothing
+    /// here can see, so neither answers.
+    fn closure_literal_body(&self, subject: Id) -> Option<Id> {
+        let mut current = subject;
+        // An alias chain is as long as the `let`s that wrote it; the bound is
+        // belt and braces against a cycle no program can spell.
+        for _ in 0..16 {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Closure(closure_id) => {
+                    return self.closures.get(closure_id).map(|closure| closure.return_);
+                }
+                Expr::Ascribe(inner) => current = *inner,
+                Expr::Local(binding) => {
+                    let variable = self.variables.get(binding)?;
+                    if variable.mutable {
+                        return None;
+                    }
+                    current = variable.initial?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// B457: a function's write summary for `cell` — an in-place write inside
-    /// its span, or a call inside it that reaches one. The calls come from
+    /// its span, or a call inside it that reaches one. B634: a closure
+    /// literal's BODY answers here too (`function_id` is then the body's
+    /// expression, whose span is the body's). The calls come from
     /// `calls`' span index (M96): filtering the whole expression map per
     /// function asked made the summary O(functions × expressions) — 48
     /// summaries, ~95M instructions each, on kolt's client.
@@ -36796,6 +37512,68 @@ impl<'src> Analyzer<'src> {
              of plain sources is followed with `.switch(|inner| inner)`"
                 .to_string(),
         )
+    }
+
+    /// B633's steer: a generic INSTANCE refused a trait only because one of
+    /// its arguments is a parameter missing a bound the impl's binder asks.
+    /// `fun send<T>(page: Page<T>)` encoding `page` under `[derive(Wire)]
+    /// struct Page<T> { items: List<T> }` meets `impl Page<type T: Wire>
+    /// with Wire` at an unbounded `T`: the instance has an impl, and the fix
+    /// is the bound on the caller's own `T` — the sentence a bare "does not
+    /// implement" left the author to work out. `None` unless some impl of the
+    /// trait over the declaration has every BOUNDED binder met by a
+    /// parameter argument and at least one of those parameters lacks the
+    /// bound.
+    fn argument_bound_steer(&self, value_type: &Type, required_trait_id: Id) -> Option<String> {
+        let (declaration_id, arguments) = match value_type {
+            Type::Struct(id, arguments) | Type::Enum(id, arguments) if !arguments.is_empty() => {
+                (*id, arguments)
+            }
+            _ => return None,
+        };
+        self.implementations.iter().find_map(|implementation| {
+            if !implementation.trait_ids.contains(&required_trait_id) {
+                return None;
+            }
+            let binders = match self.borrow_type_by_type_id(implementation.subject) {
+                Type::Struct(id, binders) | Type::Enum(id, binders)
+                    if *id == declaration_id && binders.len() == arguments.len() =>
+                {
+                    binders
+                }
+                _ => return None,
+            };
+            let mut missing = Vec::new();
+            for (binder, argument) in binders.iter().zip(arguments) {
+                let Type::Generic(binder_constraint) = self.borrow_type_by_type_id(*binder) else {
+                    // A concrete subject argument: not the derive's shape,
+                    // and not a bound a caller can add.
+                    return None;
+                };
+                let argument_type = self.borrow_type_by_type_id(*argument);
+                for bound in self.generic_bound_trait_ids(*binder_constraint) {
+                    match argument_type {
+                        Type::Generic(constraint)
+                            if !self.generic_bound_carries_trait(*constraint, bound) =>
+                        {
+                            let parameter =
+                                self.pretty_print_type(argument_type, &HashMap::default());
+                            let trait_name = self.traits.get(&bound)?.name;
+                            missing.push(format!(
+                                "generic parameter '{parameter}' is missing the bound \
+                                 ': {trait_name}' its impl asks of it"
+                            ));
+                        }
+                        Type::Generic(_) => {}
+                        // A concrete argument at a bounded binder: whether it
+                        // is the one at fault is the impl table's question,
+                        // and the steer names only a fix it is sure of.
+                        _ => return None,
+                    }
+                }
+            }
+            (!missing.is_empty()).then(|| format!("; {}", missing.join("; ")))
+        })
     }
 
     /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for
@@ -39317,12 +40095,17 @@ impl<'src> Analyzer<'src> {
             // beside the entity — so nothing downstream needs a second shape
             // for a declaration that happens to be compile-time.
             if matches!(&inner.0, Node::Let(..) | Node::LetDestructure(..)) {
-                return self.walk_const_let(inner, scope_id);
+                self.const_walk_depth += 1;
+                let id = self.walk_const_let(inner, scope_id);
+                self.const_walk_depth -= 1;
+                return id;
             }
             if matches!(&inner.0, Node::Func(_)) {
                 return self.walk_const_fun(inner, scope_id);
             }
+            self.const_walk_depth += 1;
             let inner_id = self.walk_expr_node(inner, scope_id);
+            self.const_walk_depth -= 1;
             self.const_exprs.push(inner_id);
             return inner_id;
         }
@@ -40998,7 +41781,17 @@ impl<'src> Analyzer<'src> {
                 Node::Accessor(_) | Node::AccessorWithGenerics(..) | Node::StaticAccessor(..)
             )
         };
-        if !names_a_path(&left.0) || !names_a_path(&middle.0) {
+        // E319: a METHOD named on a receiver (`h.make <str>("a")`) is the
+        // member form of the same shape; whether `make` is a generic method of
+        // the receiver's type is decided where the field read fails
+        // (`refuse_missing_struct_field` holds that refusal for the site).
+        let names_a_member = |node: &Node<'_>| match node {
+            Node::MemberAccessor(_, member) => {
+                matches!(crate::node::unmark_head_link(member).0.0, Node::Accessor(_))
+            }
+            _ => false,
+        };
+        if !(names_a_path(&left.0) || names_a_member(&left.0)) || !names_a_path(&middle.0) {
             return;
         }
         if self.current_source_id == DERIVED_SOURCE {
@@ -43654,6 +44447,26 @@ impl<'src> Analyzer<'src> {
     /// written type APPLICATION either, so `Option` as a head names the enum's
     /// namespace rather than an under-supplied `Option<T>` (B188).
     fn walk_path_head_type_node(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        // A171: a bracket heads a path only as a fixed-array TYPE, which the
+        // parser hands over as `Node::ArrayType` (`[i32; 3]::default()`). A
+        // list literal or a repeat of a value in that place names no type,
+        // and the fence's generic "cannot be used as a type" did not say
+        // which bracket does.
+        if matches!(node.0, Node::List(_) | Node::Repeat(..)) {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: "a bracket heads a `::` path only as a fixed-array type, `[T; n]` \
+                      (`[i32; 3]::default()`): a list or repeat literal is a value and names \
+                      no type to look a member up in; write the element type and the length, \
+                      or `List<T>::` for a list"
+                    .to_string(),
+            });
+            let type_id = Type::Unresolved.get_type_id(self);
+            self.path_head_type_ids.insert(type_id);
+            return type_id;
+        }
         let type_id = self.walk_trait_position_type_node(node, scope_id);
         self.path_head_type_ids.insert(type_id);
         type_id
@@ -47839,6 +48652,23 @@ impl<'src> Analyzer<'src> {
                             } else {
                                 return_type
                             };
+                            // B627 / std-53's A?1: an external member's OWN
+                            // generic fixed only by its return (`to_array<const
+                            // N>(self): Option<[T; N]>`) is recorded from the
+                            // call's expectation, as the declared path below
+                            // records a bodied one's — B424's check reads the
+                            // same substitution, and `xs.to_array().unwrap()`
+                            // reaches its receiver only through this
+                            // directed re-read. The impl's binders are not
+                            // the external's own and stay as the receiver and
+                            // the slot freshening below decide them.
+                            self.record_external_return_generics(
+                                id,
+                                function_id,
+                                &return_type,
+                                &constraint,
+                                substitution_context,
+                            );
                             // B280: the same guard the DECLARED return takes
                             // below (B263), plus the one thing the external
                             // path needs that the declared one does not.
@@ -50294,7 +51124,14 @@ impl<'src> Analyzer<'src> {
                     let resolved = resolved_id.get_type(self);
                     let (unified, mut bindings) =
                         self.reconcile_type(&resolved, b, substitution_context)?;
-                    bindings.push((*constraint_id, b.clone().get_type_id(self)));
+                    // B628: the other side IS this parameter (a `None` typed
+                    // `Option<T>` against the field's `Option<T>`): the
+                    // recursion above already recorded what the context binds
+                    // it to, and a trailing self-map would override that
+                    // binding wherever the bindings are folded in order.
+                    if *b != Type::Generic(*constraint_id) {
+                        bindings.push((*constraint_id, b.clone().get_type_id(self)));
+                    }
                     return Some((unified, bindings));
                 }
                 let bindings = vec![(*constraint_id, b.clone().get_type_id(self))];
@@ -50308,7 +51145,10 @@ impl<'src> Analyzer<'src> {
                     let resolved = resolved_id.get_type(self);
                     let (unified, mut bindings) =
                         self.reconcile_type(a, &resolved, substitution_context)?;
-                    bindings.push((*constraint_id, a.clone().get_type_id(self)));
+                    // B628: see the mirrored arm above.
+                    if *a != Type::Generic(*constraint_id) {
+                        bindings.push((*constraint_id, a.clone().get_type_id(self)));
+                    }
                     return Some((unified, bindings));
                 }
                 let bindings = vec![(*constraint_id, a.clone().get_type_id(self))];
@@ -52595,6 +53435,8 @@ impl<'src> Analyzer<'src> {
         let mut label_sources: HashSet<SourceId> = HashSet::default();
         let mut hint_sources: HashSet<SourceId> = HashSet::default();
         let mut held_sources: HashSet<SourceId> = HashSet::default();
+        let mut family_sources: [HashSet<SourceId>; row_families::FAMILIES] = Default::default();
+        let mut hover_sources: HashSet<SourceId> = HashSet::default();
         for source in &with_tables {
             if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
                 self.restored_tables.absorb(tables);
@@ -52607,8 +53449,33 @@ impl<'src> Analyzer<'src> {
                 if tables.held_recorded {
                     held_sources.insert(*source);
                 }
+                for family in row_families::RowFamily::ALL {
+                    if tables.families.contains(family) {
+                        family_sources[family.index()].insert(*source);
+                    }
+                }
+                if tables.hover_recorded {
+                    hover_sources.insert(*source);
+                }
             }
         }
+        self.restored_tables.hover_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| hover_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.restored_tables.hover_ranges.sort_unstable();
+        self.restored_tables.hover_sources = hover_sources;
+        for family in row_families::RowFamily::ALL {
+            *self.restored_tables.family_ranges.of_mut(family) = self
+                .source_ranges
+                .iter()
+                .filter(|range| family_sources[family.index()].contains(&range.source))
+                .map(|range| (range.start, range.end))
+                .collect();
+        }
+        self.restored_tables.family_ranges.sort();
         self.restored_tables.label_ranges = self
             .source_ranges
             .iter()
@@ -52653,12 +53520,18 @@ impl<'src> Analyzer<'src> {
             let label_ranges = std::mem::take(&mut self.restored_tables.label_ranges);
             let hint_ranges = std::mem::take(&mut self.restored_tables.hint_ranges);
             let held_ranges = std::mem::take(&mut self.restored_tables.held_ranges);
+            let family_ranges = std::mem::take(&mut self.restored_tables.family_ranges);
+            let hover_ranges = std::mem::take(&mut self.restored_tables.hover_ranges);
+            let hover_sources = std::mem::take(&mut self.restored_tables.hover_sources);
             self.restored_tables = RestoredTables {
                 drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
                 label_ranges,
                 hint_ranges,
                 held_ranges,
+                family_ranges,
+                hover_ranges,
+                hover_sources,
                 ..RestoredTables::default()
             };
         }
@@ -53091,6 +53964,12 @@ impl<'src> Analyzer<'src> {
             merge(&self.restored_tables.hint_ranges, self.item_hint_ranges());
         self.restored_tables.held_ranges =
             merge(&self.restored_tables.held_ranges, self.item_held_ranges());
+        self.restored_tables.family_ranges = self
+            .restored_tables
+            .family_ranges
+            .merged(self.item_family_ranges());
+        self.restored_tables.hover_ranges =
+            merge(&self.restored_tables.hover_ranges, self.item_hover_ranges());
         // M110 S7b: the complements, over the entity counter's high water —
         // every id this analysis holds lies below it. The Class A lane's
         // plant leaves the served ITEMS' windows live: a pass walking the
@@ -53120,6 +53999,23 @@ impl<'src> Analyzer<'src> {
         self.live_module = live_ranges::LiveRanges::complement(&module_reused, high);
         self.live_held =
             live_ranges::LiveRanges::complement(&self.restored_tables.held_ranges, high);
+        // M149/M150: the conditional families' lanes. The Class A plant
+        // leaves the served windows live here too — a family's sets are
+        // unions, so walking a served window beside its restored rows
+        // changes no answer (the stale-table plant is what proves the rows
+        // load-bearing).
+        let mut family_restored = self.restored_tables.family_ranges.clone();
+        if served_left_live {
+            for family in row_families::RowFamily::ALL {
+                let items: HashSet<(u32, u32)> = self.item_ranges().iter().copied().collect();
+                family_restored
+                    .of_mut(family)
+                    .retain(|range| !items.contains(range));
+            }
+        }
+        self.live_families = row_families::FamilyLanes::complement(&family_restored, high);
+        self.live_labels =
+            live_ranges::LiveRanges::complement(&self.restored_tables.label_ranges, high);
         if !crate::macros::in_macro_world() {
             let ranges = self.live_class_a.ranges().len() as u64;
             let entities = self.live_class_a.count();
@@ -53357,14 +54253,60 @@ impl<'src> Analyzer<'src> {
     /// resolve's questions; the audit's are asked after the store, which is
     /// why they need their own.
     fn late_impl_answers(&self, questions: &[(Id, TypeId, Id)]) -> bool {
-        if crate::incremental::planted(crate::incremental::Plant::BoundRecordUnguarded) {
+        if questions.is_empty() {
             return false;
         }
-        let Some(floor) = self.prefix_impl_count else {
+        let Some(late) = self.late_impls() else {
             return false;
         };
-        if floor >= self.implementations.len() || questions.is_empty() {
+        questions.iter().any(|(call_id, constraint_id, trait_id)| {
+            let Some(value_type_id) = self
+                .method_call_substitution
+                .get(call_id)
+                .and_then(|substitution| substitution.get(constraint_id))
+            else {
+                // A site the stored world no longer records: nothing to
+                // compare, so the module is re-audited.
+                return true;
+            };
+            self.late_impl_admits(&late, *value_type_id, *trait_id)
+        })
+    }
+
+    /// M150: [`Self::late_impl_answers`] for the written applications'
+    /// questions, whose value is the written argument itself.
+    fn late_impl_answers_written(&self, questions: &[(TypeId, Id)]) -> bool {
+        if questions.is_empty() {
             return false;
+        }
+        let Some(late) = self.late_impls() else {
+            return false;
+        };
+        questions
+            .iter()
+            .any(|(argument, trait_id)| self.late_impl_admits(&late, *argument, *trait_id))
+    }
+
+    /// Whether one of the `late` impls provides `trait_id` (or a trait whose
+    /// supertraits reach it) with a subject admitting `value`.
+    fn late_impl_admits(&self, late: &[(Type, Vec<Id>)], value: TypeId, trait_id: Id) -> bool {
+        let value_type = value.get_type(self);
+        late.iter().any(|(subject, traits)| {
+            traits.contains(&trait_id)
+                && self.impl_subject_admits(&value_type, subject, &HashMap::default())
+        })
+    }
+
+    /// The impls past the stored world's floor, each with the traits it
+    /// provides (supertraits included) — `None` when there are none, or under
+    /// the plant that leaves the guard off.
+    fn late_impls(&self) -> Option<Vec<(Type, Vec<Id>)>> {
+        if crate::incremental::planted(crate::incremental::Plant::BoundRecordUnguarded) {
+            return None;
+        }
+        let floor = self.prefix_impl_count?;
+        if floor >= self.implementations.len() {
+            return None;
         }
         let late: Vec<(Type, Vec<Id>)> = self.implementations[floor..]
             .iter()
@@ -53384,22 +54326,7 @@ impl<'src> Analyzer<'src> {
                 (implementation.subject.get_type(self), traits)
             })
             .collect();
-        questions.iter().any(|(call_id, constraint_id, trait_id)| {
-            let Some(value_type_id) = self
-                .method_call_substitution
-                .get(call_id)
-                .and_then(|substitution| substitution.get(constraint_id))
-            else {
-                // A site the stored world no longer records: nothing to
-                // compare, so the module is re-audited.
-                return true;
-            };
-            let value_type = value_type_id.get_type(self);
-            late.iter().any(|(subject, traits)| {
-                traits.contains(trait_id)
-                    && self.impl_subject_admits(&value_type, subject, &HashMap::default())
-            })
-        })
+        Some(late)
     }
 
     /// Whether a module's diagnostic points at the ENTRY — a `Note.source` or
@@ -53480,13 +54407,19 @@ impl<'src> Analyzer<'src> {
         // M110 S2a: the audit's questions, and whether its verdicts may be
         // replayed at all — not when a late impl answered one of them now
         // (the plant records the questions and drops the refusals).
-        let questions = std::mem::take(&mut self.bound_questions_derived);
+        let mut questions = std::mem::take(&mut self.bound_questions_derived);
+        let mut written = std::mem::take(&mut self.written_bound_questions_derived);
         let unrecorded_plant =
             crate::incremental::planted(crate::incremental::Plant::BoundAuditUnrecorded);
-        for (source, asked) in questions {
-            let answered = self.late_impl_answers(&asked);
+        let asking: HashSet<u32> = questions.keys().chain(written.keys()).copied().collect();
+        for source in asking {
+            let asked = questions.remove(&source).unwrap_or_default();
+            let asked_written = written.remove(&source).unwrap_or_default();
+            let answered =
+                self.late_impl_answers(&asked) || self.late_impl_answers_written(&asked_written);
             let module = derived.entry(source).or_default();
             module.bound_questions = asked;
+            module.written_bound_questions = asked_written;
             module.bound_recordable = !answered;
             if unrecorded_plant {
                 module.bound_diagnostics.clear();
@@ -53495,7 +54428,10 @@ impl<'src> Analyzer<'src> {
         // A module that asked nothing recorded no questions above: its
         // (empty) audit is replayable.
         for module in derived.values_mut() {
-            if module.bound_questions.is_empty() && module.bound_diagnostics.is_empty() {
+            if module.bound_questions.is_empty()
+                && module.written_bound_questions.is_empty()
+                && module.bound_diagnostics.is_empty()
+            {
                 module.bound_recordable = true;
             }
         }
@@ -53540,13 +54476,17 @@ impl<'src> Analyzer<'src> {
     fn replay_world_diagnostics(&mut self, records: &HashMap<u32, ModuleDiagnostics>) {
         let reused = self.reused_sources.clone();
         self.bound_recompute_ranges.clear();
+        self.bound_recompute_sources.clear();
         for source in reused {
             let Some(record) = records.get(&source.0) else {
                 continue;
             };
             // M110 S2a: the audit's refusals, replayed only while their
             // condition holds; otherwise the module's sites are re-audited.
-            if record.bound_recordable && !self.late_impl_answers(&record.bound_questions) {
+            if record.bound_recordable
+                && !self.late_impl_answers(&record.bound_questions)
+                && !self.late_impl_answers_written(&record.written_bound_questions)
+            {
                 let from = self.diagnostics.len();
                 self.diagnostics
                     .extend(record.bound_diagnostics.iter().cloned());
@@ -53559,6 +54499,7 @@ impl<'src> Analyzer<'src> {
                     .map(|range| (range.start, range.end))
                     .collect();
                 self.bound_recompute_ranges.extend(ranges);
+                self.bound_recompute_sources.insert(source);
             }
             let from = self.diagnostics.len();
             self.diagnostics.extend(record.diagnostics.iter().cloned());
@@ -57391,6 +58332,14 @@ impl<'src> Analyzer<'src> {
                     arguments_span,
                 ),
             MethodLookup::Found(member_id) => {
+                // B627 / std-53's A?1: the call's expectation reaches its
+                // RECEIVER before anything reads the receiver's type —
+                // `Holder::build().unwrap()` into a `Holder<i32>` binds the
+                // static's impl binder, `make().unwrap_or(3)` into an `i32`
+                // binds `make`'s own `T`.
+                let subject_type = self
+                    .receiver_directed_by_expectation(id, subject_id, member_id, &subject_type)
+                    .unwrap_or_else(|| subject_type.clone());
                 // Drive bidirectional inference of any closure arguments against the
                 // method's parameter types, and defer a full argument type-check.
                 let mut substitution = self
@@ -57644,7 +58593,11 @@ impl<'src> Analyzer<'src> {
                             .get(&struct_id)
                             .map(|struct_| struct_.name.to_string());
                         name.and_then(|name| {
-                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                            self.overlaid_std_type_note(
+                                struct_id,
+                                &name,
+                                Some((member_name, TwinMember::Method)),
+                            )
                         })
                     }
                     _ => None,
@@ -57853,7 +58806,11 @@ impl<'src> Analyzer<'src> {
                             .get(&struct_id)
                             .map(|struct_| struct_.name.to_string());
                         name.and_then(|name| {
-                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                            self.overlaid_std_type_note(
+                                struct_id,
+                                &name,
+                                Some((member_name, TwinMember::Method)),
+                            )
                         })
                     }
                     _ => None,
@@ -64016,15 +64973,24 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B424: the generic parameters `member_id`'s declared return type
-    /// mentions (empty for a member with no written return).
+    /// mentions (empty for a member with no written return). An `external`
+    /// member's too (A172): `List::to_array<const N>(self): Option<[T; N]>`
+    /// is an intrinsic, and an `N` nothing binds is the same refusal a
+    /// bodied `zeros<const N>()` gets — not an emitter's internal error.
     fn member_return_generics(&self, member_id: Id) -> Vec<TypeId> {
         let mut generics = Vec::new();
-        if let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&member_id)
-            && let Some(return_type_id) = self
+        let return_type_id = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => self
                 .functions
                 .get(function_id)
-                .and_then(|function| function.return_type_id)
-        {
+                .and_then(|function| function.return_type_id),
+            Some(Expr::ExternalFunction(function_id)) => self
+                .external_functions
+                .get(function_id)
+                .map(|function| function.return_type_id),
+            _ => None,
+        };
+        if let Some(return_type_id) = return_type_id {
             let return_type = return_type_id.get_type(self);
             self.collect_generics(&return_type, 0, &mut generics);
         }
@@ -65136,6 +66102,123 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
+    /// `subject.member` on a struct with no FIELD of that name. Three answers
+    /// before the plain refusal:
+    ///
+    /// - E319: the accessor is the name of a spaced generic method call —
+    ///   `h.make <str>("a")` read as a comparison — and the struct has a
+    ///   generic method of that name: the refusal is HELD for the site's
+    ///   decision (`steer_spaced_generic_calls`), which replaces it, the two
+    ///   comparisons and the type in value position with ONE steer.
+    /// - E320: the struct has a METHOD of that name, named without its
+    ///   parentheses (`p.norm`, an element head's bare `.autofocus`): the
+    ///   refusal says so and writes the call.
+    /// - E119: the struct came from an overlaid std layer — the note names the
+    ///   twin, and claims the other twin declares the member only when it
+    ///   declares it as a FIELD.
+    fn refuse_missing_struct_field(
+        &mut self,
+        id: Id,
+        struct_id: Id,
+        arguments: &[TypeId],
+        struct_name: &'src str,
+        member_name: &'src str,
+    ) {
+        let subject_type = Type::Struct(struct_id, arguments.to_vec());
+        let method = match self.resolve_impl_member(&subject_type, member_name) {
+            ImplMemberResolution::Found(member_id, _)
+            | ImplMemberResolution::FoundInheritedDefault(member_id, ..) => Some(member_id),
+            // A STATIC is no method candidate of a receiver; the struct's own
+            // impls declare it by name.
+            _ => self.implementations.iter().find_map(|implementation| {
+                match implementation.subject.borrow_type(self) {
+                    Type::Struct(subject_id, _) if *subject_id == struct_id => {
+                        implementation.declarations.get(member_name).copied()
+                    }
+                    _ => None,
+                }
+            }),
+        };
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let plain = format!(
+            "struct '{struct_name}' has no field '{member_name}'{}",
+            // B471: a style value's retired `.css` field.
+            self.css_rename_steer(&Type::Struct(struct_id, Vec::new()), member_name)
+                .unwrap_or_default()
+        );
+        if self.spaced_generic_operands.contains(&id)
+            && let Some(method_id) = method
+            && self
+                .method_signature_ref(method_id)
+                .is_some_and(|(_, own_generics)| !own_generics.is_empty())
+        {
+            self.deferred_not_a_value.insert(id, (plain, method_id));
+            return;
+        }
+        let Some(method_id) = method else {
+            let note = self.overlaid_std_type_note(
+                struct_id,
+                struct_name,
+                Some((member_name, TwinMember::Field)),
+            );
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note,
+                span,
+                msg: plain,
+            });
+            return;
+        };
+        let call = self.written_method_call(id, span, method_id, struct_name, member_name);
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "struct '{struct_name}' has no field '{member_name}': `{member_name}` is a method \
+                 of `{struct_name}`: call it, {call}"
+            ),
+        });
+    }
+
+    /// E320: the call a method named without its parentheses was meant to be,
+    /// as the reader wrote the access — `p.norm` → `` `p.norm()` ``, an element
+    /// head's `.autofocus` (whose accessor spans the element) →
+    /// `` `.autofocus()` ``, `(…)` when the method takes arguments, and the
+    /// path for a static (`` `Point::origin()` ``).
+    fn written_method_call(
+        &self,
+        id: Id,
+        span: Span,
+        method_id: Id,
+        struct_name: &str,
+        member_name: &str,
+    ) -> String {
+        let parameters = self
+            .method_signature_ref(method_id)
+            .map(|(parameters, _)| parameters.to_vec())
+            .unwrap_or_default();
+        let takes_self = parameters
+            .first()
+            .and_then(|parameter| self.parameters.get(parameter))
+            .is_some_and(|parameter| parameter.name == "self");
+        let explicit = parameters.len().saturating_sub(usize::from(takes_self));
+        let arguments = if explicit == 0 { "()" } else { "(…)" };
+        if !takes_self {
+            return format!("as a static: `{struct_name}::{member_name}{arguments}`");
+        }
+        let written = self
+            .source_of_id(id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| text.get(span.into_range()))
+            .filter(|written| written.ends_with(&format!(".{member_name}")))
+            .filter(|written| !written.contains('\n'));
+        match written {
+            Some(written) => format!("`{written}{arguments}`"),
+            None => format!("`.{member_name}{arguments}`"),
+        }
+    }
+
     /// `subject.field`: once the subject resolves to a struct, the accessor's type
     /// is the named field's. Defers while the subject is unresolved (or an
     /// unknown closure parameter awaiting bidirectional inference).
@@ -65338,29 +66421,13 @@ impl<'src> Analyzer<'src> {
                             self.expr_id_to_expr_map.insert(id, Expr::Error);
                             return Resolution::Failed;
                         }
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            // E119: when the struct came from an overlaid std
-                            // layer, the miss is usually about WHICH `View` this
-                            // is, not about the field.
-                            note: self.overlaid_std_type_note(
-                                struct_id,
-                                struct_name,
-                                Some(member_name),
-                            ),
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "struct '{}' has no field '{}'{}",
-                                struct_name,
-                                member_name,
-                                // B471: a style value's retired `.css` field.
-                                self.css_rename_steer(
-                                    &Type::Struct(struct_id, Vec::new()),
-                                    member_name
-                                )
-                                .unwrap_or_default()
-                            ),
-                        });
+                        self.refuse_missing_struct_field(
+                            id,
+                            struct_id,
+                            &arguments,
+                            struct_name,
+                            member_name,
+                        );
                         self.expr_id_to_expr_map.insert(id, Expr::Error);
                         Resolution::Failed
                     }
@@ -67507,6 +68574,33 @@ impl<'src> Analyzer<'src> {
                                 (Type::Trait(id, _), false) => Type::Trait(id, argument_type_ids),
                                 (other, _) => other,
                             };
+                            // E315: the member is a SEGMENT of the written path
+                            // (`Length` in `style::Length::px(4)`, `deep` in
+                            // `lib::deep::Overlay::fresh()`) and takes the
+                            // reference a path's head takes, so the language
+                            // server paints and hovers it. The segment is the
+                            // path's last: the span ends where the member's
+                            // name does.
+                            let definition_id = match &member_type {
+                                Type::Struct(id, _) | Type::Enum(id, _) | Type::Trait(id, _) => {
+                                    Some(*id)
+                                }
+                                Type::Module(id) => Some(*id),
+                                _ => None,
+                            };
+                            let path_end = span.into_range().end;
+                            if definition_id.is_some()
+                                && span.into_range().len() >= member_name.len()
+                            {
+                                let segment_span: Span =
+                                    (path_end - member_name.len()..path_end).into();
+                                self.type_references.push((
+                                    source_id,
+                                    segment_span,
+                                    definition_id,
+                                    type_id,
+                                ));
+                            }
                             self.write_type_slot(type_id, member_type);
                         }
                         None => {
@@ -67677,8 +68771,12 @@ impl<'src> Analyzer<'src> {
                 // Static access on a nominal type (`Id::new`), a trait
                 // (`Iterator::from_fn`), or an enum (`Option::Some`): look the
                 // member up among the variants (for enums) and the matching
-                // implementations.
-                Type::Struct(_, _) | Type::Trait(_, _) | Type::Enum(_, _) => {
+                // implementations. A171: a fixed array (`[i32; 3]::default()`)
+                // the same way — its members are its impls' (`impl [type T:
+                // Default; const N] with Default`), and the head binds the
+                // impl's element and length below as an application's
+                // arguments do.
+                Type::Struct(_, _) | Type::Trait(_, _) | Type::Enum(_, _) | Type::Array(_, _) => {
                     let variant_id = match &subject_type {
                         Type::Enum(enum_id, _) => {
                             let variants_scope_id =
@@ -67831,10 +68929,14 @@ impl<'src> Analyzer<'src> {
                                 }
                                 _ => subject_type,
                             };
+                            // A171: an array head is always written whole
+                            // (`[i32; 3]`), so its element and length bind
+                            // the impl's `[type T; const N]` as a generic
+                            // application's arguments bind its binders.
                             let has_concrete_args = matches!(
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()
-                            );
+                            ) || matches!(&subject_type, Type::Array(..));
                             // B595: a BLANKET's member named on a concrete head
                             // (`str::tag(1)` answered by `impl type T: Leaf with
                             // Tag`) binds the blanket's subject binder to the
@@ -68987,8 +70089,9 @@ impl<'src> Analyzer<'src> {
     /// a pre-entry world would freeze std constraints the entry still binds
     /// (the chained-`map` failure that pinned this split).
     /// E309: decides each spaced generic call the walk noted
-    /// (`note_spaced_generic_call`). When its name is a generic function or a
-    /// generic type, the comparison chain E291 reads it as is not what was
+    /// (`note_spaced_generic_call`). When its name is a generic function, a
+    /// generic type or a generic method of its receiver's type (E319,
+    /// `h.make <str>("a")`), the comparison chain E291 reads it as is not what was
     /// meant — a function or a type has no ordering, and the `bool` the first
     /// comparison makes has none either — so ONE steer at `L <M>` names the
     /// spacing and the tight call, and the three refusals it replaces (the
@@ -69048,7 +70151,8 @@ impl<'src> Analyzer<'src> {
 
     /// E309: whether the name `id` resolved to a function with generic
     /// parameters, or (held as "a type, not a value") a struct or enum with
-    /// them.
+    /// them, or (E319, a held field miss) names a generic method of the
+    /// receiver's type.
     fn names_something_generic(&self, id: Id) -> bool {
         let generic_function = |target: &Id| match self.expr_id_to_expr_map.get(target) {
             Some(Expr::Function(function_id)) => self
@@ -69065,6 +70169,8 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Local(target)) => generic_function(target),
             _ => match self.deferred_not_a_value.get(&id) {
                 Some((_, target)) => match self.expr_id_to_expr_map.get(target) {
+                    // E319: a held member miss carries the generic METHOD.
+                    Some(Expr::Function(_) | Expr::ExternalFunction(_)) => generic_function(target),
                     Some(Expr::Struct(struct_id)) => {
                         self.structs.get(struct_id).is_some_and(|struct_| {
                             !struct_.generic_parameter_constraint_ids.is_empty()
@@ -71774,6 +72880,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        self.swept_residual_generics.clear();
         let variable_ids: Vec<Id> = self.variables.keys().copied().collect();
         for variable_id in variable_ids {
             // The hazard is USES checking vacuously — a binding nothing reads
@@ -71814,6 +72921,8 @@ impl<'src> Analyzer<'src> {
                     .is_some_and(|declared_in| !declared_in.contains(&source))
             });
             if leaked {
+                self.swept_residual_generics
+                    .extend(residuals.iter().copied());
                 let name = self
                     .variables
                     .get(&variable_id)
@@ -72676,7 +73785,8 @@ fn clause_target_is_a_closure(node: &Node<'_>) -> bool {
 /// concrete callee, so it records how codegen should re-resolve it at each
 /// monomorphization. Unifies the static-accessor, generic-method, and
 /// trait-method dispatch records into one channel (`generic_dispatch`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum GenericDispatch<'src> {
     /// `T::member()`, `value.method()`, or `a op b` on a generic-bounded operand:
     /// resolve the constraint through the active substitution, then dispatch to
@@ -72763,6 +73873,11 @@ pub enum Intrinsic {
     // numeric enum lowering to -1/0/1, which is already `sort`'s contract, so
     // the vilan comparator passes through unwrapped.
     ListSortBy,
+    // `List.to_array<const N>(self): Option<[T; N]>` (A172, array-lengths.md
+    // §9) -> a runtime helper that answers `Some` of a COPY when the length is
+    // `N` and `None` otherwise; `N` is the call's own binding under the active
+    // instance, which each emitter reads off the call's result type.
+    ListToArray,
     // `Option.take(&mut self): Option<T>` -> a runtime helper that reads the slot,
     // writes `None` back in place, and returns the old contents (destruction.md §6).
     OptionTake,
@@ -72901,7 +74016,9 @@ pub enum Intrinsic {
 /// Identifies a source file within a compiled `Program` — an index into
 /// `Program.sources`. `SourceId(0)` is always the entry file; the rest are
 /// `std` package modules pulled in during analysis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SourceId(pub u32);
 
 /// Which library layer one source sits under ([`Program::source_layers`], M53).
@@ -72948,7 +74065,7 @@ const WEB_PRELUDE_MARK: &str = "web-prelude:";
 /// The innermost callable a `ret`/`!` returns from (proposal/ret-checking.md).
 /// At a `ret` the only question is declared-or-inferred; what becomes of the
 /// collected rets is the popper's business.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum ReturnFrame {
     /// A function with a declared return type — rets check against it. Carries
     /// the function's id so a `ret` site can be attributed to its function
@@ -73003,7 +74120,7 @@ struct ReturnInference {
 /// How one `?.` site lowers: the std pair inline — short-circuit the bad tag,
 /// run the continuation on the element, wrap (`map`) or pass through
 /// (`flatten`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LiftDispatch {
     Std {
         flatten: bool,
@@ -73031,7 +74148,7 @@ pub enum LiftDispatch {
     TraitRegion,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TryDispatch {
     /// `Option`/`Result`: bad is tag 1, and the bad VALUE (`None` / `Err(e)`)
     /// is byte-identical at any success type — the lowering returns it as-is.
@@ -73059,7 +74176,7 @@ struct BumpScan {
     callees: Vec<Id>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct SourceRange {
     pub start: u32,
     pub end: u32,
@@ -73101,7 +74218,7 @@ impl SourceLookup<'_> {
 /// type has a `Drop` impl), then destroy its resource members — so a value cannot
 /// resurrect itself, and containment-only types (no `Drop`) still free their
 /// fields.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DropGlue {
     /// The emittable function id of the impl's `drop`, if the type has a `Drop`
     /// impl. Called on the value before its members are destroyed.
@@ -73115,7 +74232,7 @@ pub struct DropGlue {
 /// `Option::unwrap`'s `Some(let x)` is typed `T`, `List::push`'s `own item` is
 /// typed `T`, and whether a `T` copies depends on what `T` is bound to at each
 /// instantiation. Shared by both passes (B53's captures and B54/A20's stores).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CopyDecision {
     /// A cloneable aggregate whose copy-ness no instantiation can change:
     /// `__clone` at every emission.
@@ -73172,7 +74289,7 @@ struct WrittenRoots {
 /// unplaceable handle hazards the unplaceable cells and nothing else, because a
 /// placeable slot that ever reaches an unplaceable position is unioned into it
 /// at that position.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 enum CellSlot {
     /// A binding (a local or a parameter) that holds a handle.
     Binding(Id),
@@ -73193,7 +74310,7 @@ enum CellSlot {
 /// previous read handed out, and is the aliasing hazard rule 2 must refuse.
 /// The two forms are `Expr::Assignment`'s two shapes at the same intrinsic,
 /// which is why they can be told apart syntactically at all.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct SharedCells {
     /// The union-find parent map over slots. A slot absent from it is its own
     /// representative.
@@ -73364,7 +74481,7 @@ pub type DropEdge = (Id, Option<Id>);
 type DropSites = Vec<(TypeId, Option<Id>)>;
 
 /// How a resource type's members are reached at runtime for destruction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum DropMembers {
     /// A positional aggregate (struct / tuple / fixed array) stored as an array:
     /// the resource slots `[index]` and their types, dropped in REVERSE
@@ -73658,6 +74775,14 @@ pub struct Program<'src> {
     pub asset_channel_fns: Vec<(Id, &'static str)>,
     /// `const`-marked expression ids in walk order (const-eval.md §1).
     pub const_exprs: Vec<Id>,
+    /// M147 (2): every entity the walk minted inside a `const` expression —
+    /// the const pass's local-reference index reads these (`const_eval.rs`'s
+    /// `LocalIndex`) instead of scanning the whole entity map.
+    pub const_walk_entities: Vec<Id>,
+    /// M152: the dependencies' root `lib.vl` walks' entity ranges and the
+    /// entry walk's first id ([`Program::canonical_declaration_key`]).
+    pub dependency_root_ranges: Vec<(u32, u32)>,
+    pub entry_walk_start: Option<u32>,
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
     /// the transformer serializes these in place of the expressions.
     pub const_results: HashMap<Id, crate::interpreter::ConstValue>,
@@ -74470,6 +75595,15 @@ pub struct Program<'src> {
     /// coloring, and a scan of every impl each time. Derived data, like the
     /// graph.
     trait_method_memo: std::sync::Mutex<HashMap<(Id, String), std::sync::Arc<Vec<Id>>>>,
+    /// The members a dispatch of `member` selects on a CONCRETE receiver type,
+    /// per (receiver, member) (M133): `async_infer`'s
+    /// `receiver_selected_members` — the receiver's own impls, else the trait
+    /// defaults they inherit, else the blanket impls whose subject applies —
+    /// asked per dispatch edge by platform coloring's per-instantiation walks
+    /// (13k edges on kolt's client, each a scan of every impl). `None` is "no
+    /// narrowing: take the whole candidate list". Derived data, like the graph.
+    receiver_dispatch_memo:
+        std::sync::Mutex<HashMap<(TypeId, String), std::sync::Arc<Option<Vec<Id>>>>>,
 }
 
 /// One module-level binding's HMR transfer descriptor (`hmr.md` §4).
@@ -74967,6 +76101,41 @@ impl<'src> Program<'src> {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<(Id, String), std::sync::Arc<Vec<Id>>>> {
         self.trait_method_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The canonical DECLARATION order's key (spec §7.1, `b33-emission-order.md`):
+    /// a declaration's entity id, after its walk's tier — std's modules and
+    /// root, the dependencies' modules and the entry package's modules (tier 0,
+    /// by id), then the dependencies' ROOT `lib.vl`s in manifest order (tier
+    /// 1), then the entry file (tier 2). Module-level initialization and
+    /// function emission sort by it. Before M152 the walk order WAS this order
+    /// and the raw id served; a dependency now walks whole — its root included
+    /// — before the package's first node mints (the layout a
+    /// std-and-dependencies prefix holds), so the roots' tier is named here
+    /// rather than read off the id.
+    pub(crate) fn canonical_declaration_key(&self, id: Id) -> u64 {
+        let tier: u64 = if self.entry_walk_start.is_some_and(|start| id.0 >= start) {
+            2
+        } else if self
+            .dependency_root_ranges
+            .iter()
+            .any(|(start, end)| id.0 >= *start && id.0 < *end)
+        {
+            1
+        } else {
+            0
+        };
+        (tier << 32) | u64::from(id.0)
+    }
+
+    /// `async_infer`'s per-(receiver, member) selection memo (M133), read
+    /// through a poisoned lock for [`Self::bound_selection_memo`]'s reason.
+    pub(crate) fn receiver_dispatch_memo(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(TypeId, String), std::sync::Arc<Option<Vec<Id>>>>> {
+        self.receiver_dispatch_memo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -78122,7 +79291,7 @@ impl EntryMode {
 /// and holds it in a page toggle instead, which is why "set `prelude = …` in
 /// vilan.toml" was advice a visitor could not take. Only the front end knows
 /// which world it is, so only the front end can say.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PreludeRepair {
     /// The entry package's `vilan.toml` — every front end with files behind it.
     #[default]
@@ -78135,7 +79304,7 @@ pub enum PreludeRepair {
 /// register into (its own `pkg`), and its resolved dependency edges (import name →
 /// the dependency's namespace module id). Used by `resolve_import_root` to resolve
 /// `pkg::` / `<dep>::` relative to the importing package.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LoadedPackage {
     namespace_id: Id,
     namespace_scope_id: Id,
@@ -78368,6 +79537,15 @@ pub(crate) struct BaseCacheKey {
     /// `hot` are empty — the world holds no package path, so two packages
     /// whose std closure is one set share it.
     std_prefix: bool,
+    /// M152: a std-and-dependencies prefix's DEPENDENCY TIER, rendered — the
+    /// `<dep>::` modules the package's own modules request (the prefix loads
+    /// them on the package's behalf, as S1's prefix loads a hot set's
+    /// requests), and a hash over every dependency file that tier loads, so an
+    /// edited dependency is a different key before any file is read (the
+    /// persisted file's half; a hit re-validates by content either way).
+    /// Empty for every key but a prefix built for a program with dependencies,
+    /// so every key minted before this field existed is unchanged.
+    dependency_tier: Vec<String>,
 }
 
 /// One retained base world and the claims that keep its borrows alive (M23).
@@ -78546,6 +79724,12 @@ static BASE_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
 #[derive(Default)]
 struct BaseCacheState {
     worlds: HashMap<BaseCacheKey, StoredWorld>,
+    /// std-prefix P3: the prefix keys whose FILE this process has looked for
+    /// (once per key: a load is not retried), and among them the ones whose
+    /// file was a miss — the world this process then builds under such a key
+    /// is written out (`prefix_file_write`).
+    prefix_files_tried: HashSet<BaseCacheKey>,
+    prefix_files_missed: HashSet<BaseCacheKey>,
     retained_bytes: usize,
     tick: u64,
     /// M44: keys whose world some thread is BUILDING right now, and which
@@ -79150,7 +80334,8 @@ fn workspace_fingerprint(
 /// clean module records two empty vectors, and the spans inside are byte
 /// offsets into that module's own unchanged text, so nothing has to be
 /// relocated on the way back in.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct ModuleDiagnostics {
     diagnostics: Vec<crate::error::Error>,
     warnings: Vec<crate::error::Error>,
@@ -79210,6 +80395,12 @@ struct ModuleDiagnostics {
     /// when no analysis has recorded the audit for this module yet.
     bound_diagnostics: Vec<crate::error::Error>,
     bound_questions: Vec<(Id, TypeId, Id)>,
+    /// M150: the WRITTEN applications' questions (`check_written_nominal_
+    /// bounds`, B251's twin of the audit) — `(argument type, required trait)`,
+    /// prefix slots identical on every hit. Their refusals ride
+    /// `bound_diagnostics` and replay under the same condition: no late impl
+    /// answers a question of either kind.
+    written_bound_questions: Vec<(TypeId, Id)>,
     bound_recordable: bool,
 }
 
@@ -79227,7 +80418,7 @@ struct ModuleDiagnostics {
 /// planner's `resource_temporaries` and `drop_owned_types_by_root`, whose
 /// values come from `infer_type(..).get_type_id(..)` inside the checks phase —
 /// are therefore NOT in this record and stay live.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct ModuleTables {
     last_uses: Vec<Id>,
     last_use_opaque: Vec<Id>,
@@ -79261,6 +80452,15 @@ struct ModuleTables {
     /// and stays live for those passes.
     held: held_tables::HeldRows,
     held_recorded: bool,
+    /// M149: the module's contributions to the move scan's helper sets
+    /// (`move_tables.rs`), filed only by an analysis that derived them —
+    /// [`Self::families`] says which conditional families a slice carries.
+    moves: move_tables::MoveRows,
+    /// M150: the module's lazy-argument candidates and HMR transfer sites
+    /// (`lazy_tables.rs`), filed only by an analysis that ran those passes.
+    lazy: lazy_tables::LazyRows,
+    hmr: lazy_tables::HmrRows,
+    families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
     return_clone_sites: Vec<(Id, CopyDecision)>,
@@ -79313,6 +80513,13 @@ struct ModuleTables {
     /// analysis with reading aids computes them); a record written by any
     /// other analysis carries none, and the stages are hinted live.
     hints_recorded: bool,
+    /// M148: the editor's per-file hover rows for this module's regions
+    /// (E206, E237, E240, E241 — `hover_records.rs`), and whether they were
+    /// FILED: only a seeded analysis under the reading aids renders them for
+    /// a module, and a region whose rows name another re-walked window's
+    /// entity files none.
+    hover: hover_records::RecordedHoverRows,
+    hover_recorded: bool,
 }
 
 impl ModuleTables {
@@ -79374,7 +80581,17 @@ impl ModuleTables {
                     }
             })
             .sum();
-        flat * id + chains + bumps + decisions + labels + hints + self.held.bytes()
+        flat * id
+            + chains
+            + bumps
+            + decisions
+            + labels
+            + hints
+            + self.held.bytes()
+            + self.moves.bytes()
+            + self.lazy.bytes()
+            + self.hmr.bytes()
+            + self.hover.bytes()
     }
 }
 
@@ -79386,7 +80603,7 @@ impl ModuleTables {
 /// never a wrong answer. The reverse mistake — a pass that SKIPS a reused
 /// module's entities without restoring its rows — is the one that loses a
 /// table, and the differential's emitted-JS leg is what catches it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct RestoredTables {
     last_uses: HashSet<Id>,
     last_use_opaque: HashSet<Id>,
@@ -79430,6 +80647,18 @@ struct RestoredTables {
     /// items whose record carried them (the regions the held passes skip).
     held: held_tables::HeldRows,
     held_ranges: Vec<(u32, u32)>,
+    /// M149: the restored move rows, and per conditional family the ranges
+    /// of the modules and items whose record carried it.
+    moves: move_tables::MoveRows,
+    lazy: lazy_tables::LazyRows,
+    hmr: lazy_tables::HmrRows,
+    family_ranges: row_families::FamilyRanges,
+    /// M148: the restored hover rows, the entity ranges of the modules and
+    /// items whose record carried them, and the restored MODULES as sources
+    /// (the span-keyed rows' predicate; a served item's is its text region).
+    hover: hover_records::RecordedHoverRows,
+    hover_ranges: Vec<(u32, u32)>,
+    hover_sources: HashSet<SourceId>,
 }
 
 impl Default for RestoredTables {
@@ -79461,6 +80690,13 @@ impl Default for RestoredTables {
             hint_ranges: Vec::new(),
             held: held_tables::HeldRows::default(),
             held_ranges: Vec::new(),
+            moves: move_tables::MoveRows::default(),
+            lazy: lazy_tables::LazyRows::default(),
+            hmr: lazy_tables::HmrRows::default(),
+            family_ranges: row_families::FamilyRanges::default(),
+            hover: hover_records::RecordedHoverRows::default(),
+            hover_ranges: Vec::new(),
+            hover_sources: HashSet::default(),
         }
     }
 }
@@ -79499,6 +80735,18 @@ impl RestoredTables {
         self.stage_hints.extend(tables.stage_hints.iter().cloned());
         if tables.held_recorded {
             self.held.extend(&tables.held);
+        }
+        if tables.families.contains(row_families::RowFamily::Moves) {
+            self.moves.extend(&tables.moves);
+        }
+        if tables.families.contains(row_families::RowFamily::Lazy) {
+            self.lazy.extend(&tables.lazy);
+        }
+        if tables.families.contains(row_families::RowFamily::Hmr) {
+            self.hmr.extend(&tables.hmr);
+        }
+        if tables.hover_recorded {
+            self.hover.extend(&tables.hover);
         }
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
@@ -79987,15 +81235,7 @@ fn base_cache_lookup_locked(
         let contents_match = !entry_is_a_loaded_module
             && (crate::incremental::planted(crate::incremental::Plant::PrefixUnvalidated)
                 && stored.world.hot.is_some()
-                || world
-                    .sources
-                    .iter()
-                    .zip(world.source_hashes.iter())
-                    .skip(1)
-                    .all(|(path, expected)| {
-                        crate::util::read_source(path)
-                            .is_ok_and(|text| crate::content_hash(&text) == *expected)
-                    }));
+                || stored_world_contents_match(world, entry_path));
         if contents_match {
             // M23: the clone borrows every module this world loaded,
             // including the analysis-owned overlay copies the storing
@@ -80016,7 +81256,14 @@ fn base_cache_lookup_locked(
                             .collect(),
                     ));
             if claimable {
+                let clone_started = crate::prefix_file::now();
                 let clone = world.clone();
+                if crate::phase_timing_enabled() && key.std_prefix {
+                    eprintln!(
+                        "[vilan phase] prefix-hit-clone us={}",
+                        crate::prefix_file::micros_since(clone_started)
+                    );
+                }
                 // M24: a hit refreshes the world's recency, so the LRU keeps
                 // what a session keeps coming back to.
                 let tick = state.next_tick();
@@ -80047,6 +81294,29 @@ fn base_cache_lookup_locked(
         }
     }
     BaseCacheLookup::Absent
+}
+
+/// The E12 rule: every source a stored world holds but its entry is byte-
+/// identical, on disk or in the overlay, to the text it was compiled from.
+/// (The entry's own slot is the file that changed; a world whose loaded
+/// modules include the entry is the caller's separate refusal.)
+fn stored_world_contents_match(world: &World<'_>, entry_path: &Path) -> bool {
+    let entry_canonical = crate::util::canonical_path(entry_path);
+    let entry_is_a_loaded_module = world
+        .sources
+        .iter()
+        .skip(1)
+        .any(|path| crate::util::canonical_path(path) == entry_canonical);
+    !entry_is_a_loaded_module
+        && world
+            .sources
+            .iter()
+            .zip(world.source_hashes.iter())
+            .skip(1)
+            .all(|(path, expected)| {
+                crate::util::read_source(path)
+                    .is_ok_and(|text| crate::content_hash(&text) == *expected)
+            })
 }
 
 /// What a base-cache lookup found, which M44 needs to tell apart: `Absent` is
@@ -80110,6 +81380,7 @@ fn base_cache_admit(
     key: &BaseCacheKey,
     entry_path: &Path,
     learn: bool,
+    std: &PackageSpec,
 ) -> (Option<World<'static>>, Option<BaseCacheBuild>) {
     let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
     let mut state = cache
@@ -80172,6 +81443,68 @@ fn base_cache_admit(
                 return (None, None);
             }
             BaseCacheLookup::Absent => {}
+        }
+        // std-prefix P3: a std-prefix key this process has no world for may
+        // have one on disk — the std-only world another process built and
+        // wrote. Looked for once per key; served through the same lookup as
+        // a stored world (its sources re-validated by content, the E12 rule);
+        // a miss of any kind marks the key, so the world this analysis builds
+        // under it is written out.
+        if key.std_prefix && !state.prefix_files_tried.contains(key) {
+            state.prefix_files_tried.insert(key.clone());
+            if let Some(directory) = crate::incremental::world_cache_dir() {
+                match prefix_file_load(&directory, key, std) {
+                    Ok((world, bytes, micros)) => {
+                        PREFIX_FILE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::incremental::update_census(|census| {
+                            census.prefix_file = Some("loaded");
+                            census.prefix_file_bytes = bytes;
+                            census.prefix_file_micros = micros;
+                        });
+                        // A one-shot process (the CLI's check: the in-memory
+                        // store is off, nothing will hit this world again) is
+                        // handed the loaded world itself — validated by content
+                        // as a stored one would be, neither retained nor cloned,
+                        // which is what keeps its peak RSS at the canonical
+                        // check's (measured on kolt: +48 % retained and cloned,
+                        // the two copies of each leg's std).
+                        if !BASE_CACHE_STORE.load(std::sync::atomic::Ordering::Relaxed)
+                            && stored_world_contents_match(&world, entry_path)
+                        {
+                            BASE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            return (Some(world), None);
+                        }
+                        let stored_bytes = base_cache_world_bytes(&world);
+                        let tick = state.next_tick();
+                        state.worlds.insert(
+                            key.clone(),
+                            StoredWorld {
+                                world,
+                                overlay_claims: Vec::new(),
+                                bytes: stored_bytes,
+                                last_hit: tick,
+                            },
+                        );
+                        state.retained_bytes += stored_bytes;
+                        crate::leak_tally::record(
+                            crate::leak_tally::LeakSite::BaseCacheWorld,
+                            stored_bytes,
+                        );
+                        state.evict_to_budget(Some(key));
+                        continue;
+                    }
+                    Err(miss) => {
+                        PREFIX_FILE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        state.prefix_files_missed.insert(key.clone());
+                        crate::incremental::update_census(|census| {
+                            census.prefix_file = Some(miss.label());
+                        });
+                        if crate::phase_timing_enabled() {
+                            eprintln!("[vilan phase] prefix-file-miss {}", miss.label());
+                        }
+                    }
+                }
+            }
         }
         match state.building.get(key) {
             None => {
@@ -80267,6 +81600,34 @@ unsafe fn release_stored_world(stored: StoredWorld) {
     }
 }
 
+/// A world as the base cache stores it — and, since std-prefix P3, as the
+/// prefix file holds it: a clone with the three entry slots emptied (the
+/// entry's path, hash and text) and the entry's own expansions dropped.
+fn scrubbed_world(world: &World<'_>) -> World<'static> {
+    let mut scrubbed = world.clone();
+    scrubbed.sources[0] = PathBuf::new();
+    scrubbed.source_hashes[0] = 0;
+    scrubbed.analyzer.source_texts[0] = (SourceId(0), "");
+    scrubbed.generated_by_source.remove(&SourceId(0));
+    // SAFETY: lifetime-only transmute. After the scrub, every reference the
+    // world holds outlives the store: module/dep texts and ASTs live in
+    // `parse_clean_cached`'s leaked cache (`analyze` loads every non-entry
+    // file through it, EXCEPT an opted-in analysis's overlay-served loads —
+    // which are analysis-owned, and which the store therefore CLAIMS, so they
+    // are freed only after the claim taken there is released: the M23 clause
+    // this argument rests on, replacing M9's outright refusal), the
+    // entry-derived strings that reach the world's maps — a seeded module
+    // name, whether it seeded `std`, a `pkg::` SIBLING (M21) or a DEPENDENCY
+    // — go through `interned_display_name`, dependency namespace display
+    // names go through it too, and the three entry slots (the only places
+    // entry-borrowed data ever lands before the entry walk) were just
+    // emptied. The store path is additionally gated on `base_cacheable` (no
+    // macro-DEFINING entry text), and the entry's own expansion is hoisted
+    // past the store (§6.13), so no other entry-derived state exists in the
+    // world.
+    unsafe { std::mem::transmute(scrubbed) }
+}
+
 /// Stores a scrubbed clone of `world` under its key.
 fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // M23, replacing §7.9.4a's store gate. An opted-in analysis that loaded
@@ -80288,12 +81649,8 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     } else {
         crate::owned_modules::claim_overlay_loads()
     };
-    let mut scrubbed = world.clone();
-    scrubbed.sources[0] = PathBuf::new();
-    scrubbed.source_hashes[0] = 0;
-    scrubbed.analyzer.source_texts[0] = (SourceId(0), "");
-    scrubbed.generated_by_source.remove(&SourceId(0));
-    // SAFETY: lifetime-only transmute. After the scrub, every reference the
+    let static_world = scrubbed_world(world);
+    // Backlog M11: this map is the compiler's largest per-process retention After the scrub, every reference the
     // world holds outlives this store: module/dep texts and ASTs live in
     // `parse_clean_cached`'s leaked cache (`analyze` loads every non-entry
     // file through it, EXCEPT an opted-in analysis's overlay-served loads —
@@ -80309,7 +81666,6 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // `base_cacheable` (no macro-DEFINING entry text), and the entry's own
     // expansion is hoisted past this store (§6.13), so no other entry-derived
     // state exists in the world.
-    let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
     // Backlog M11: this map is the compiler's largest per-process retention
     // and the tally could not see it. Record what the world is worth on the
     // way in, and give back whatever it displaced — per-key overwrite is the
@@ -80345,6 +81701,272 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // oversized world turns the budget into "one world" rather than turning
     // the cache off.
     state.evict_to_budget(Some(&key));
+}
+
+// --- std-prefix P3: the persisted prefix --------------------------------------
+
+/// Persisted prefix files this process LOADED, WROTE, and looked for and
+/// MISSED (the test surface; the census carries the per-analysis outcome).
+static PREFIX_FILE_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREFIX_FILE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREFIX_FILE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(loads, writes, misses)` of the persisted std prefix in this process.
+#[doc(hidden)]
+pub fn prefix_file_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PREFIX_FILE_LOADS.load(Relaxed),
+        PREFIX_FILE_WRITES.load(Relaxed),
+        PREFIX_FILE_MISSES.load(Relaxed),
+    )
+}
+
+/// Forgets which prefix files this process has looked for, so the next
+/// lookup reads the disk again — the companion of [`base_cache_clear`] for
+/// a pin that writes a file and wants to see it loaded in the same process.
+#[doc(hidden)]
+pub fn prefix_files_forget() {
+    if let Some(cache) = BASE_CACHE.get() {
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.prefix_files_tried.clear();
+        state.prefix_files_missed.clear();
+    }
+}
+
+/// The std package's roots as its spec names them — the base root, then
+/// each layer's, in the spec's order: the same order `BaseCacheKey::std_roots`
+/// holds them canonical, so the two map by position.
+fn std_spec_roots(std: &PackageSpec) -> Vec<PathBuf> {
+    std::iter::once(std.base_root.clone())
+        .chain(std.layers.iter().map(|layer| layer.root.clone()))
+        .collect()
+}
+
+/// The persisted prefix's key for a std-prefix base-cache key
+/// (`std-prefix.md` §6): the format, the analyzer's build, the platform, the
+/// std closure and a hash over its files under every std root, the macro
+/// limits, the entry prelude and the workspace rows.
+fn prefix_file_key(key: &BaseCacheKey) -> crate::prefix_file::Key {
+    crate::prefix_file::Key {
+        format: crate::prefix_file::FORMAT_VERSION,
+        build_id: crate::BUILD_ID.to_string(),
+        platform: format!("{:?}", key.platform),
+        closure: key.std_seeds.clone(),
+        std_content: {
+            let started = crate::prefix_file::now();
+            let content = std_closure_content(&key.std_roots, &key.std_seeds);
+            if crate::phase_timing_enabled() {
+                eprintln!(
+                    "[vilan phase] prefix-file-key us={}",
+                    crate::prefix_file::micros_since(started)
+                );
+            }
+            content
+        },
+        macro_limits: key.macro_limits,
+        entry_prelude: key.entry_prelude.clone(),
+        // M152: the dependency tier's rows (its requests and its content)
+        // ride the workspace rows, and the tier list names it — the format
+        // carried both from its first version.
+        workspace: key
+            .workspace
+            .iter()
+            .chain(&key.dependency_tier)
+            .cloned()
+            .collect(),
+        tiers: if key.dependency_tier.is_empty() {
+            vec![crate::prefix_file::STD_TIER.to_string()]
+        } else {
+            vec![
+                crate::prefix_file::STD_TIER.to_string(),
+                crate::prefix_file::DEPENDENCIES_TIER.to_string(),
+            ]
+        },
+    }
+}
+
+/// A hash over the std closure's files as they are on disk now — every root
+/// of the std package (a layer's twin included, whichever platform asked)
+/// and `lib.vl` — so an edited std is a different key before any file is
+/// read. The world's own sources are re-validated by content on the hit.
+fn std_closure_content(std_roots: &[PathBuf], closure: &[String]) -> u64 {
+    use std::fmt::Write as _;
+    let mut rendered = String::new();
+    for root in std_roots {
+        for name in closure {
+            let Some(resolution) = resolve_module_file(root, name) else {
+                continue;
+            };
+            if let Ok(text) = crate::util::read_source(&resolution.path) {
+                let _ = write!(
+                    rendered,
+                    "{}\0{:016x}\0",
+                    resolution.relative.display(),
+                    crate::content_hash(&text)
+                );
+            }
+        }
+        if let Ok(text) = crate::util::read_source(std_module_path(root, "lib.vl")) {
+            let _ = write!(rendered, "lib.vl\0{:016x}\0", crate::content_hash(&text));
+        }
+    }
+    crate::content_hash(&rendered)
+}
+
+impl World<'static> {
+    /// std-prefix P3's load fixup (`std-prefix.md` §2 row 14, §3): every
+    /// std path the world holds, mapped — its sources, the analyzer's copy of
+    /// them, the std module inventory, the layer twins and the macro
+    /// registry's definition files.
+    fn reroot_std_paths(&mut self, map: &impl Fn(&Path) -> Option<PathBuf>) {
+        let moved = |path: &mut PathBuf| {
+            if let Some(to) = map(path) {
+                *path = to;
+            }
+        };
+        self.sources.iter_mut().for_each(moved);
+        self.analyzer.source_paths.iter_mut().for_each(moved);
+        for (_, path) in &mut self.analyzer.std_module_files {
+            moved(path);
+        }
+        for twins in self.analyzer.std_layer_twin_files.values_mut() {
+            for (_, _, path, _) in twins {
+                moved(path);
+            }
+        }
+        self.macro_registry.reroot_files(map);
+    }
+}
+
+/// The persisted prefix for `key`, loaded: read and validated, decoded, its
+/// paths re-rooted from the writer's canonical std roots to this process's
+/// std, and its per-source path keys (M110 S6) recomputed over them. `Err`
+/// is the miss and its reason. Returns the world with the file's size and
+/// the load's wall time in microseconds.
+fn prefix_file_load(
+    directory: &Path,
+    key: &BaseCacheKey,
+    std: &PackageSpec,
+) -> Result<(World<'static>, u64, u64), crate::prefix_file::Miss> {
+    let file_key = prefix_file_key(key);
+    let loaded = crate::prefix_file::read(directory, &file_key)?;
+    let current = std_spec_roots(std);
+    if loaded.std_roots.len() != current.len() {
+        return Err(crate::prefix_file::Miss::ForeignKey);
+    }
+    let decode_started = crate::prefix_file::now();
+    let mut world: World<'static> = crate::prefix_file::codec::decode(loaded.body, loaded.table)
+        .map_err(|_| crate::prefix_file::Miss::Undecodable)?;
+    world.reroot_std_paths(&crate::prefix_file::reroot(&loaded.std_roots, &current));
+    for (index, source) in world.sources.iter().enumerate().skip(1) {
+        if let Some(source_key) = world.analyzer.id_windows.source_keys.get_mut(index) {
+            *source_key = crate::content_hash(&source.to_string_lossy());
+        }
+    }
+    let micros = loaded.read.as_micros() as u64 + crate::prefix_file::micros_since(decode_started);
+    if crate::phase_timing_enabled() {
+        eprintln!(
+            "[vilan phase] prefix-file-loaded bytes={} us={micros}",
+            loaded.bytes
+        );
+    }
+    Ok((world, loaded.bytes as u64, micros))
+}
+
+/// Writes the std-only world this analysis just built and stored, when this
+/// process looked for its file and missed (`BaseCacheState::prefix_files_missed`)
+/// and the world is one the file may hold: the world cache is on, no std
+/// source came from an editor overlay (§6.15's rule), and no module minted
+/// in a later drain round (B619: the closure the key names is over WRITTEN
+/// imports, and such a world grew past it). The paths are re-rooted to the
+/// key's canonical std roots on the way out, so the file reads the same from
+/// any checkout of the same std.
+fn prefix_file_write(
+    key: &BaseCacheKey,
+    world: &World<'_>,
+    std: &PackageSpec,
+    late_round_mints: u64,
+) {
+    let Some(directory) = crate::incremental::world_cache_dir() else {
+        return;
+    };
+    let wanted = {
+        let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.prefix_files_missed.remove(key)
+    };
+    if !wanted {
+        return;
+    }
+    let refused = if late_round_mints > 0 {
+        Some("late-round-mints")
+    } else if world
+        .sources
+        .iter()
+        .skip(1)
+        .any(|path| document_overlay_contains(path))
+    {
+        Some("overlay")
+    } else {
+        None
+    };
+    if let Some(reason) = refused {
+        if crate::phase_timing_enabled() {
+            eprintln!("[vilan phase] prefix-file-unwritable {reason}");
+        }
+        crate::incremental::update_census(|census| census.prefix_file = Some("unwritable"));
+        return;
+    }
+    let mut scrubbed = scrubbed_world(world);
+    scrubbed.reroot_std_paths(&crate::prefix_file::reroot(
+        &std_spec_roots(std),
+        &key.std_roots,
+    ));
+    let file_key = prefix_file_key(key);
+    let encoded = crate::prefix_file::codec::encode(&scrubbed);
+    let outcome = encoded
+        .map_err(|error| error.to_string())
+        .and_then(|(body, table)| {
+            crate::prefix_file::write(&directory, &file_key, &key.std_roots, &body, &table)
+        });
+    match outcome {
+        Ok(written) => {
+            PREFIX_FILE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // P4: the root held to its byte budget, the least recently used
+            // worlds first, never the one just written.
+            let evicted = crate::world_cache::bound(
+                &directory,
+                crate::world_cache::max_bytes(),
+                written.path.parent(),
+            );
+            if !evicted.is_empty() && crate::phase_timing_enabled() {
+                eprintln!("[vilan phase] prefix-file-evicted {}", evicted.len());
+            }
+            let micros = written.took.as_micros() as u64;
+            crate::incremental::update_census(|census| {
+                census.prefix_file = Some("written");
+                census.prefix_file_bytes = written.bytes as u64;
+                census.prefix_file_micros = micros;
+            });
+            if crate::phase_timing_enabled() {
+                eprintln!(
+                    "[vilan phase] prefix-file-written {} bytes={} us={micros}",
+                    written.path.display(),
+                    written.bytes
+                );
+            }
+        }
+        Err(error) => {
+            if crate::phase_timing_enabled() {
+                eprintln!("[vilan phase] prefix-file-write-failed {error}");
+            }
+        }
+    }
 }
 
 /// Expands the ENTRY over a constructed [`World`] — the derive/macro hoist
@@ -81015,6 +82637,7 @@ fn resolve_package_over_prefix(
     nodes: &Spanned<NodeList<'_>>,
     layered: Option<&Layered>,
 ) -> Result<(), ImplReached> {
+    let resolve_started = crate::prefix_file::now();
     let package_sources = world.prefix_len as u32..world.sources.len() as u32;
     let analyzer = &mut world.analyzer;
     let std_log = std::mem::take(analyzer.impl_reach.get_mut());
@@ -81042,6 +82665,12 @@ fn resolve_package_over_prefix(
         analyzer.prefix_impl_count = package_log.floor;
     }
     *analyzer.impl_reach.get_mut() = package_log;
+    if crate::phase_timing_enabled() {
+        eprintln!(
+            "[vilan phase] prefix-package-resolve us={}",
+            crate::prefix_file::micros_since(resolve_started)
+        );
+    }
     if let Some(mut reached) = verdict {
         // The impl guard's plant (M110 S1) lets a package impl through too.
         if crate::incremental::planted(crate::incremental::Plant::ImplGuardOff) {
@@ -81059,7 +82688,8 @@ fn resolve_package_over_prefix(
 /// `resolve_world`, plus the boundary state the entry tail consumes. The
 /// base cache stores a scrubbed clone of one of these; a hit patches the
 /// three entry slots and runs the tail.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct World<'src> {
     analyzer: Analyzer<'src>,
     sources: Vec<PathBuf>,
@@ -81092,6 +82722,10 @@ struct World<'src> {
     /// the same way it answers it for `std::` (M21), instead of rebuilding the
     /// world for every derive that reaches a sibling.
     pkg_module_names: HashSet<&'src str>,
+    // std-prefix P3: not in the file (census row 3) — std's generated trees are
+    // read by the walk alone, and a loaded prefix never walks std again; the
+    // rows the package and the entry add after the load are theirs.
+    #[serde(skip)]
     generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>>,
     // The std intrinsics the tail keys passes off (resolved from the loaded
     // world's scopes; `None` when the module never loaded).
@@ -81113,6 +82747,8 @@ struct World<'src> {
     // own CLONE and expands against it, post-snapshot, on hit and miss
     // alike.
     macro_registry: crate::macros::MacroRegistry,
+    // std-prefix P3: per-analysis (census row 15); the hit path restamps it.
+    #[serde(skip, default = "PhaseMarks::unstarted")]
     phase_marks: PhaseMarks,
     /// How many of `sources` the STORED world holds — the entry's slot and the
     /// modules loaded before the store. Every source at or past it was loaded
@@ -81179,7 +82815,8 @@ fn note_prefix_refusal(reason: &'static str) {
 /// What a hot-set world (M110 S1) needs, after the store, to finish the load
 /// the canonical drain would have done in one go: which modules to load, and
 /// the drain state they register into.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 struct HotWorld<'src> {
     /// The hot modules' `pkg::` names, sorted — the order the drain would
     /// load them in among themselves (all tier 2, by name).
@@ -81222,6 +82859,11 @@ struct PhaseMarks {
 }
 
 impl PhaseMarks {
+    /// A loaded world's marks before the hit path restamps them (std-prefix P3).
+    fn unstarted() -> PhaseMarks {
+        PhaseMarks::started_at(crate::PhaseClock::now())
+    }
+
     /// The marks for an analysis starting now that has resolved no base of
     /// its own — a base-cache hit, whose world came ready-made.
     fn started_at(started: crate::PhaseClock) -> PhaseMarks {
@@ -81391,7 +83033,9 @@ fn drop_reserved_dependency_edges(workspace: &Workspace) -> (Option<Workspace>, 
 /// (P2) — resolve under its layered roots into its own isolated namespace,
 /// reachable from a dependent as `<import-name>::name` and from within the
 /// dependency as `pkg::name`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 enum Origin {
     Std,
     Pkg,
@@ -81434,6 +83078,124 @@ const ALWAYS_LOADED_STD: [&str; 11] = [
 /// Sorted: two spellings of one std set name one prefix. Parsing goes through
 /// the parse cache, which mints nothing. A module GENERATED code alone reaches
 /// is outside it, as it is outside the drain's first round (B603's residue).
+/// std-prefix P3: std's IMPORT GRAPH for one std tree and platform — every
+/// module file under the platform's search roots, by resolved name, with the
+/// modules each one requests (its `pkg::` imports, the std module a
+/// `[service]` seeds, the modules its elements and `css` blocks seed), resolved
+/// — so [`std_closure`] is a table walk in a process that never parses std
+/// (`std-prefix.md` §4.3: "the std import graph ships in the prefix index").
+/// Keyed by a hash over the files' names and contents; built by parsing once
+/// and kept under the world cache as `std-index/<hash>.index`, read back by
+/// every later process. Without the world cache the closure parses, as it did,
+/// once per process.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct StdImportIndex {
+    requests: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+static STD_IMPORT_INDEXES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<u64, std::sync::Arc<StdImportIndex>>>,
+> = std::sync::OnceLock::new();
+
+/// The index for `std` on `platform`: this process's, the world cache's, or
+/// built now (and written when the world cache is on).
+fn std_import_index(std: &PackageSpec, platform: Platform) -> std::sync::Arc<StdImportIndex> {
+    let roots = std.search_roots(platform);
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for root in &roots {
+        files.extend(modules_under_root(root, &roots));
+    }
+    // The drain reads the BASE root's `lib.vl` alone (a layer's would re-export
+    // its own modules into every closure); a module under two roots resolves
+    // to the first root's, as `resolve_module_in_roots` answers it.
+    let lib = std_module_path(&std.base_root, "lib.vl");
+    if lib.is_file() {
+        files.push(("lib".to_string(), lib));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.dedup_by(|a, b| a.0 == b.0);
+    let tree_hash = {
+        use std::fmt::Write as _;
+        let mut rendered = String::new();
+        for (name, path) in &files {
+            let hash = crate::util::read_source(path)
+                .map(|text| crate::content_hash(&text))
+                .unwrap_or(0);
+            let _ = write!(rendered, "{name}\0{hash:016x}\0");
+        }
+        crate::content_hash(&rendered)
+    };
+    let indexes = STD_IMPORT_INDEXES.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
+    if let Some(index) = indexes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&tree_hash)
+    {
+        return index.clone();
+    }
+    let file = crate::incremental::world_cache_dir().map(|directory| {
+        directory
+            .join("std-index")
+            .join(format!("{tree_hash:016x}.index"))
+    });
+    let read: Option<StdImportIndex> = file.as_ref().and_then(|file| {
+        let bytes = std::fs::read(file).ok()?;
+        crate::prefix_file::codec::decode_inline::<StdImportIndex>(&bytes)
+            .ok()
+            .filter(|(_, used)| *used == bytes.len())
+            .map(|(index, _)| index)
+    });
+    let index = match read {
+        Some(index) => index,
+        None => {
+            let mut index = StdImportIndex::default();
+            for (name, path) in &files {
+                let Some(loaded) = load_package_module(path) else {
+                    continue;
+                };
+                let mut requests: Vec<String> = collect_module_paths(&loaded.ast.0, "pkg")
+                    .into_iter()
+                    .map(|(module, _)| module.to_string())
+                    .chain(
+                        service_seeds(&loaded.ast.0)
+                            .iter()
+                            .map(|seed| seed.to_string()),
+                    )
+                    .chain(
+                        collect_std_item_modules(&loaded.ast.0)
+                            .into_iter()
+                            .map(str::to_string),
+                    )
+                    .filter_map(|request| deepest_module_or_namespace(&roots, &request))
+                    .collect();
+                requests.sort();
+                requests.dedup();
+                index.requests.insert(name.clone(), requests);
+            }
+            if let Some(file) = &file
+                && let Ok(bytes) = crate::prefix_file::codec::encode_inline(&index)
+                && let Some(parent) = file.parent()
+                && std::fs::create_dir_all(parent).is_ok()
+            {
+                let temporary =
+                    parent.join(format!(".{tree_hash:016x}.{}.tmp", std::process::id()));
+                if std::fs::write(&temporary, &bytes).is_ok()
+                    && std::fs::rename(&temporary, file).is_err()
+                {
+                    let _ = std::fs::remove_file(&temporary);
+                }
+            }
+            index
+        }
+    };
+    let index = std::sync::Arc::new(index);
+    indexes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(tree_hash, index.clone());
+    index
+}
+
 fn std_closure<'a>(
     seeds: impl IntoIterator<Item = &'a str>,
     std: &PackageSpec,
@@ -81441,14 +83203,11 @@ fn std_closure<'a>(
     entry_prelude: &crate::manifest::PreludeSpec,
 ) -> Vec<&'static str> {
     let roots = std.search_roots(platform);
+    let index = std_import_index(std, platform);
     let mut pending: Vec<String> = seeds.into_iter().map(str::to_string).collect();
     pending.extend(ALWAYS_LOADED_STD.iter().map(|module| module.to_string()));
-    if let Some(lib) = load_package_module(&std_module_path(&std.base_root, "lib.vl")) {
-        pending.extend(
-            collect_module_paths(&lib.ast.0, "pkg")
-                .into_iter()
-                .map(|(module, _)| module.to_string()),
-        );
+    if let Some(lib) = index.requests.get("lib") {
+        pending.extend(lib.iter().cloned());
     }
     for prelude in [&std.prelude, entry_prelude] {
         if let Some(module) = prelude
@@ -81471,26 +83230,10 @@ fn std_closure<'a>(
             name.match_indices("::")
                 .map(|(cut, _)| name[..cut].to_string()),
         );
-        let Some(resolution) = resolve_module_in_roots(&roots, &name) else {
-            // A pure namespace: registered by the drain, but no body to follow.
-            continue;
-        };
-        if let Some(loaded) = load_package_module(&resolution.path) {
-            pending.extend(
-                collect_module_paths(&loaded.ast.0, "pkg")
-                    .into_iter()
-                    .map(|(module, _)| module.to_string()),
-            );
-            pending.extend(
-                service_seeds(&loaded.ast.0)
-                    .iter()
-                    .map(|seed| seed.to_string()),
-            );
-            pending.extend(
-                collect_std_item_modules(&loaded.ast.0)
-                    .into_iter()
-                    .map(str::to_string),
-            );
+        // A pure namespace has no row (no body under any root): registered
+        // by the drain, nothing of its own to follow.
+        if let Some(requests) = index.requests.get(&name) {
+            pending.extend(requests.iter().cloned());
             closure.push(interned_display_name(name));
         }
     }
@@ -81533,6 +83276,192 @@ enum DiscoveredModule {
     Body {
         resolution: ModuleResolution,
         parsed: Option<LoadedModule>,
+    },
+}
+
+/// B625: one file the drain's FIRST round registers (a macro definition is
+/// reachable without expansion, so the registry is the first round's) or
+/// expands before that round mints.
+struct PremintFile<'src> {
+    key: crate::macros::ModuleKey,
+    package: crate::macros::FilePackage,
+    ast: &'src NodeList<'src>,
+    text: &'src str,
+    path: PathBuf,
+    /// The `SourceId` the round's minting gives the file — taken in
+    /// `load_order_key` order exactly as the minting takes them, so the ids
+    /// this expansion attributes to are the minted ones.
+    source: SourceId,
+    origin: Origin,
+    /// The round's module this file is (`None` for the entry and a
+    /// dependency's surface).
+    module: Option<(Origin, &'src str)>,
+}
+
+/// B625: what [`premint_expansion`] produced, held until the round mints and
+/// committed then — or dropped, when what it generated asked for a module the
+/// round had not discovered (the round re-discovers and expands again).
+struct Premint<'src> {
+    registry: crate::macros::MacroRegistry,
+    /// Each file's diagnostics (registration's, then expansion's), grouped as
+    /// the epilogue attributes them: one group per file, in order.
+    diagnostics: Vec<(SourceId, Vec<Error>)>,
+    generated: Vec<(SourceId, Vec<crate::macros::GeneratedItems>)>,
+    item_sites: Vec<usize>,
+    failed_sites: Vec<usize>,
+    expressions: Vec<(usize, &'static Spanned<Node<'static>>)>,
+    expanded: Vec<SourceId>,
+    site_counter: u32,
+    /// The module requests the generated code makes — the drain's next
+    /// discovery pass follows them before anything mints.
+    requests: Vec<(Origin, &'src str)>,
+}
+
+/// B625: the macro epilogue's first round, run BEFORE the round mints — the
+/// registry built from `register` (the entry, the round's modules, the
+/// dependency surfaces), then `expand` expanded in the epilogue's order with
+/// the same site counter — so a module only GENERATED code reaches is
+/// discovered in the round that generates it and mints in its canonical place
+/// beside every other module of the round, where it minted a round later
+/// (B619): a derive whose generated impl imports `std::path::basename` minted
+/// `std::path` after `std::time`, and a redundant written import of it moved
+/// `basename` ahead of `now` in the emitted bundle. Nothing here touches the
+/// analyzer: diagnostics are collected per file, attributed when committed.
+fn premint_expansion<'src>(
+    register: &[&PremintFile<'src>],
+    expand: &[&PremintFile<'src>],
+    std: &PackageSpec,
+    workspace: &Workspace,
+    site_counter: u32,
+) -> Premint<'src> {
+    let mut diagnostics: Vec<(SourceId, Vec<Error>)> = Vec::new();
+    let mut registry = crate::macros::MacroRegistry::default();
+    // Inside a macro WORLD, register nothing (see IN_MACRO_WORLD): expansion
+    // still runs with the empty registry, so std's own derives generate
+    // through the Rust fallback. E212: a SPLIT toolchain is refused once,
+    // before the first registration, attributed to the entry.
+    if !crate::macros::in_macro_world() {
+        if crate::macros::split_toolchain_refusal(std).is_some() {
+            let mut refusal = Vec::new();
+            crate::macros::push_split_toolchain_refusal(std, &mut refusal);
+            diagnostics.push((SourceId(0), refusal));
+        } else {
+            for file in register {
+                let mut found = Vec::new();
+                crate::macros::register_file(
+                    &mut registry,
+                    file.key.clone(),
+                    file.ast,
+                    file.text,
+                    &file.path,
+                    file.source,
+                    std,
+                    &mut found,
+                );
+                diagnostics.push((file.source, found));
+            }
+        }
+    }
+    let mut site_counter = site_counter;
+    let mut generated = Vec::new();
+    let mut item_sites = Vec::new();
+    let mut failed_sites = Vec::new();
+    let mut expressions = Vec::new();
+    let mut expanded = Vec::new();
+    let mut requests: Vec<(Origin, &'src str)> = Vec::new();
+    for file in expand {
+        let scope =
+            crate::macros::scope_for(&registry, workspace, &file.package, &file.key, file.ast);
+        let mut found = Vec::new();
+        let output = crate::macros::expand_source(
+            &scope,
+            std,
+            workspace.macro_limits,
+            file.ast,
+            file.text,
+            &mut found,
+            &mut site_counter,
+            workspace.macro_expansion_cache.as_deref(),
+            0,
+        );
+        diagnostics.push((file.source, found));
+        // Lazy world-compile failures carry the DEFINING file's spans.
+        for (defining_source, error) in output.world_errors {
+            diagnostics.push((defining_source, vec![error]));
+        }
+        for list in output.items.iter().map(|items| items.nodes) {
+            requests.extend(
+                collect_module_paths(list, "std")
+                    .into_iter()
+                    .map(|(module, _)| (Origin::Std, module)),
+            );
+            requests.extend(
+                collect_module_paths(list, "pkg")
+                    .into_iter()
+                    .map(|(module, _)| (file.origin, module)),
+            );
+            for (dependency, index) in &workspace.entry_dependencies {
+                requests.extend(
+                    collect_module_paths(list, dependency)
+                        .into_iter()
+                        .map(|(module, _)| (Origin::Dep(*index), module)),
+                );
+            }
+        }
+        generated.push((file.source, output.items));
+        item_sites.extend(output.item_sites);
+        failed_sites.extend(output.failed_sites);
+        expressions.extend(output.expressions);
+        expanded.push(file.source);
+    }
+    Premint {
+        registry,
+        diagnostics,
+        generated,
+        item_sites,
+        failed_sites,
+        expressions,
+        expanded,
+        site_counter,
+        requests,
+    }
+}
+
+/// M144: a NON-STD module whose NODE — its entity, its item scope, its binding
+/// in its package's namespace — mints after std has walked, so that every std
+/// id is a function of the std module set alone (`std-prefix.md` §3, §4.1).
+///
+/// B603 put std's module nodes first and std's WALK first, but every module of
+/// the program still registered its node before any walk, so a std item's
+/// entity id moved with the package's module count: `basename` was `Id(8149)`
+/// in a single-file program and `Id(8151)` beside two sibling modules, and the
+/// native backend — whose names carry ids — emitted two programs for one std.
+/// The drain now registers a non-std module's SOURCE at discovery (its
+/// `SourceId`, its text, its package, its parse diagnostics: nothing that
+/// mints an entity or a scope) and holds the node back here; std's modules
+/// mint and walk as before, then these mint in the order the hot load mints a
+/// package over a stored prefix (`load_hot_modules`: the pure namespaces,
+/// then the modules), then walk. The canonical world and the std-prefix world
+/// therefore lay out one program's ids identically.
+enum DeferredMint<'src> {
+    /// A pure namespace (`DiscoveredModule::Namespace`).
+    Namespace {
+        origin: Origin,
+        name: &'src str,
+        children: Vec<String>,
+    },
+    /// The `pkg::<entry>` alias (`DiscoveredModule::EntryAlias`): an entity
+    /// whose body is the entry's own global scope.
+    EntryAlias { name: &'src str },
+    /// A module with a body, registered as a source already: `loaded_index`
+    /// is its row in the drain's `loaded` list, whose scope id this mint
+    /// fills in.
+    Body {
+        origin: Origin,
+        name: &'src str,
+        module_source_id: SourceId,
+        directory_holds_a_lib_body: bool,
+        loaded_index: usize,
     },
 }
 
@@ -81622,6 +83551,129 @@ fn module_children_scope(analyzer: &mut Analyzer<'_>, module_id: Id, global_scop
     let scope_id = analyzer.push_scope(scope);
     analyzer.module_children_scopes.insert(module_id, scope_id);
     scope_id
+}
+
+/// The NODE of a module with a body — the drain's body arm, and since M144 the
+/// deferred non-std mint ([`DeferredMint::Body`]): its item scope, its entity
+/// (or the namespace node a child created first, adopted — A65), its location
+/// row, its binding in its package's namespace — the origin's root scope for a
+/// top-level module, the parent module's children scope for a nested one — and
+/// the per-origin indexes the primitive captures (`module_scopes`, std only:
+/// a user module named `io` must not shadow the real one) and the
+/// entry-expansion hoist (`pkg_module_names`, M21) read. Returns the module's
+/// scope id. What it does NOT do is register the SOURCE: that is discovery's,
+/// and it mints nothing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drain's per-module state, threaded through one mint"
+)]
+fn mint_module_node<'src>(
+    analyzer: &mut Analyzer<'src>,
+    module_nodes: &mut HashMap<(Origin, &'src str), Id>,
+    to_load: &mut Vec<(Origin, &'src str)>,
+    module_scopes: &mut HashMap<&'src str, Id>,
+    pkg_module_names: &mut HashSet<&'src str>,
+    origin: Origin,
+    name: &'src str,
+    origin_scope_id: Id,
+    global_scope_id: Id,
+    module_source_id: SourceId,
+    directory_holds_a_lib_body: bool,
+) -> Id {
+    let module_scope = analyzer.create_scope(Some(global_scope_id));
+    let module_scope_id = analyzer.push_scope(module_scope);
+    // A65: a module already has an entity when a CHILD of it loaded first
+    // (`lib/util.vl` before `lib/lib.vl`) — adopt that node, so the children
+    // already registered under it stay reachable and `pkg::lib` and
+    // `pkg::lib::util` name one `lib`. Otherwise this is the flat path the
+    // loader has always taken, id for id.
+    let adopted = module_nodes.get(&(origin, name)).copied();
+    let module_id = adopted.unwrap_or_else(|| analyzer.new_entity_id());
+    analyzer.modules.insert(
+        module_id,
+        Module {
+            id: module_id,
+            name: module_leaf_name(name),
+            body: (Vec::new(), module_scope_id),
+        },
+    );
+    // A body: whatever the directory probe concluded before it loaded is no
+    // longer true.
+    analyzer.namespace_only_modules.remove(&module_id);
+    if directory_holds_a_lib_body {
+        analyzer.modules_bodied_by_a_lib_file.insert(module_id);
+    }
+    // Give the module entity a location (its file, at the top) so a path
+    // segment naming it can go-to-definition. A one-id range maps it to its
+    // source; the span is the file start.
+    //
+    // B335: an ADOPTED node already HAS a one-id range — the namespace
+    // placeholder `ensure_module_node` attributed to the entry, because a
+    // namespace has no file of its own. Pushing a second range for the same
+    // id left `source_of` (which takes the FIRST range that contains an id)
+    // answering the ENTRY for every module that owns both `x.vl` and `x/`,
+    // so `program.source_of(segment)` named the importing file — and
+    // `import_module_is_used` (E168/E169) asks exactly that, so Organize
+    // Imports was reading the wrong file. It also made `source_ranges`
+    // non-disjoint, which silently demoted `source_lookup` to the linear scan
+    // M27 exists to avoid. Corrected IN PLACE: the module has a file now, and
+    // the placeholder is the row that should say so.
+    analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+    match analyzer
+        .source_ranges
+        .iter_mut()
+        .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
+    {
+        Some(placeholder) => placeholder.source = module_source_id,
+        None => analyzer.source_ranges.push(SourceRange {
+            start: module_id.0,
+            end: module_id.0 + 1,
+            source: module_source_id,
+        }),
+    }
+    analyzer
+        .expr_id_to_expr_map
+        .insert(module_id, Expr::Module(module_id));
+    // Register the module under its package's namespace: entry modules in
+    // `pkg`, `std` modules in `std`, a dependency's in its own — so no
+    // package's modules collide with or shadow another's (E.10: a local
+    // `ui.vl` and `std::web::ui` coexist, each reachable through its root).
+    //
+    // A65: "its package's namespace" is the origin's root scope for a
+    // top-level module and its PARENT module's submodule scope for a nested
+    // one — `lib/util.vl` is a member of `lib`, not of `pkg`.
+    let namespace_scope_id = match name.rfind("::") {
+        None => origin_scope_id,
+        Some(cut) => {
+            let parent_id = ensure_module_node(
+                analyzer,
+                module_nodes,
+                to_load,
+                origin,
+                &name[..cut],
+                origin_scope_id,
+                global_scope_id,
+            );
+            module_children_scope(analyzer, parent_id, global_scope_id)
+        }
+    };
+    module_nodes.insert((origin, name), module_id);
+    analyzer
+        .mut_scope_for_scope_id(namespace_scope_id)
+        .name_to_id_map
+        .insert(module_leaf_name(name), module_id);
+    if origin == Origin::Std {
+        module_scopes.insert(name, module_scope_id);
+    }
+    if origin == Origin::Pkg {
+        pkg_module_names.insert(name);
+        // A65: and the directory it sits under, which is the segment a
+        // generated `pkg::lib::util` reference is checked by.
+        if let Some(cut) = name.find("::") {
+            pkg_module_names.insert(&name[..cut]);
+        }
+    }
+    module_scope_id
 }
 
 /// M110 S0/S1 (`incremental-analysis.md` §4.1, ruled Q2): the HOT SET of an
@@ -81849,6 +83901,153 @@ fn hot_set_of(
     }
 }
 
+/// M152: what a std-and-dependencies prefix's dependency tier is — see
+/// [`dependency_tier`].
+struct DependencyTier {
+    /// The key's rows ([`BaseCacheKey::dependency_tier`]).
+    rows: Vec<String>,
+    /// The `std::` modules the tier's files ask for.
+    std_requests: Vec<&'static str>,
+}
+
+/// M152: the dependency modules a prefix for this package loads, followed the
+/// way the drain's dependency arm follows them — each package's own prelude,
+/// each surface package's `lib.vl`, the entry's and the package modules'
+/// `<dep>::` requests, and from
+/// every module so loaded its own `pkg::` siblings, its ancestors and its
+/// `<subdep>::` references — with the `std::` modules those files request
+/// (written, the `css`/element/`async` seeds, a `[service]`'s), and a content
+/// hash over every file read. Parsing goes through the content-addressed parse
+/// cache the drain reads from, so the load that follows parses nothing twice.
+fn dependency_tier(
+    requests: &[(Origin, &'static str)],
+    base_cache_key: &BaseCacheKey,
+    workspace: &Workspace,
+    platform: Platform,
+) -> DependencyTier {
+    use std::fmt::Write as _;
+    let mut pending: Vec<(usize, String)> = requests
+        .iter()
+        .filter_map(|(origin, module)| match origin {
+            Origin::Dep(index) => Some((*index, module.to_string())),
+            _ => None,
+        })
+        .collect();
+    let mut rows: Vec<String> = pending
+        .iter()
+        .map(|(index, module)| format!("request {index}::{module}"))
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut std_requests: Vec<&'static str> = Vec::new();
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    // `surface` is a `lib.vl`: the drain seeds a surface's written `std::`
+    // imports and its `[service]` macro, not the `css`/element/`async` seeds
+    // a loaded module's discovery adds — and the closure must be the drain's
+    // set exactly, or the prefix is never stored (`prefix_unstorable`).
+    let follow = |index: usize,
+                  ast: &NodeList,
+                  surface: bool,
+                  pending: &mut Vec<(usize, String)>,
+                  std_requests: &mut Vec<&'static str>| {
+        std_requests.extend(
+            collect_module_paths(ast, "std")
+                .into_iter()
+                .map(|(module, _)| interned_display_name(module.to_string())),
+        );
+        if !surface {
+            std_requests.extend(collect_std_item_modules(ast));
+        }
+        std_requests.extend(service_seeds(ast).iter().copied());
+        // A surface's `pkg::` re-exports load from the BASE layer only (the
+        // drain refuses a platform layer's there, L1).
+        let base_root = [workspace.packages[index].base_root.as_path()];
+        pending.extend(
+            collect_module_paths(ast, "pkg")
+                .into_iter()
+                .filter(|(module, _)| {
+                    !surface || longest_module_prefix(&base_root, module).is_some()
+                })
+                .map(|(module, _)| (index, module.to_string())),
+        );
+        for (name, dependency_index) in &workspace.packages[index].dependencies {
+            pending.extend(
+                collect_module_paths(ast, name)
+                    .into_iter()
+                    .map(|(module, _)| (*dependency_index, module.to_string())),
+            );
+        }
+    };
+    for (index, spec) in workspace.packages.iter().enumerate() {
+        // A dependency's own prelude (prelude.md §7) is seeded for every
+        // package, a surface or not: `std::` into std, `pkg::` into itself.
+        if let Some(path) = spec.prelude.module_path()
+            && let Some((root, module)) = path.split_once("::")
+        {
+            match root {
+                "std" => std_requests.push(interned_display_name(module.to_string())),
+                "pkg" => pending.push((index, module.to_string())),
+                _ => {}
+            }
+        }
+        if !spec.surface {
+            continue;
+        }
+        let lib_path = std_module_path(&spec.base_root, "lib.vl");
+        let Some(lib) = load_package_module(&lib_path) else {
+            continue;
+        };
+        files.push((lib_path, crate::content_hash(lib.text)));
+        follow(index, &lib.ast.0, true, &mut pending, &mut std_requests);
+    }
+    // The entry's own `<dep>::` references are the workspace rows' seeds
+    // (`workspace_fingerprint`), already in the key; the tier follows them.
+    for row in &base_cache_key.workspace {
+        if let Some((index, module)) = row
+            .strip_prefix("seed ")
+            .and_then(|seed| seed.split_once("::"))
+            && let Ok(index) = index.parse::<usize>()
+        {
+            pending.push((index, module.to_string()));
+        }
+    }
+    let mut visited: HashSet<(usize, String)> = HashSet::default();
+    while let Some((index, request)) = pending.pop() {
+        let Some(spec) = workspace.packages.get(index) else {
+            continue;
+        };
+        let roots = spec.search_roots(platform);
+        let Some(name) = deepest_module_or_namespace(&roots, &request) else {
+            continue;
+        };
+        if !visited.insert((index, name.clone())) {
+            continue;
+        }
+        pending.extend(
+            name.match_indices("::")
+                .map(|(cut, _)| (index, name[..cut].to_string())),
+        );
+        let Some(resolution) = resolve_module_in_roots(&roots, &name) else {
+            continue;
+        };
+        let Some(module) = load_package_module(&resolution.path) else {
+            continue;
+        };
+        files.push((resolution.path.clone(), crate::content_hash(module.text)));
+        follow(index, &module.ast.0, false, &mut pending, &mut std_requests);
+    }
+    files.sort_unstable();
+    files.dedup();
+    let mut rendered = String::new();
+    for (path, hash) in &files {
+        let _ = write!(rendered, "{}\0{hash:016x}\0", path.display());
+    }
+    rows.push(format!("content {:016x}", crate::content_hash(&rendered)));
+    std_requests.sort_unstable();
+    std_requests.dedup();
+    DependencyTier { rows, std_requests }
+}
+
 /// std-prefix P1/P2: the prefix's key — the std CLOSURE of the entry's seeds
 /// and every module of `set` (§4.3), recording every question std's resolve
 /// asks — and the key a refusal of it is remembered under (per PACKAGE: the
@@ -81860,17 +84059,38 @@ fn std_prefix_keys(
     platform: Platform,
     workspace: &Workspace,
 ) -> (BaseCacheKey, BaseCacheKey) {
+    let closure_started = crate::prefix_file::now();
+    // M152: the dependency tier, when the program has one — what it loads,
+    // and the std modules ITS files ask for, which the prefix's std set holds
+    // beside the package's own (the drain's dependency arm seeds them).
+    let tier = (!workspace.packages.is_empty() || !workspace.entry_dependencies.is_empty())
+        .then(|| dependency_tier(&set.requests, base_cache_key, workspace, platform));
     let closure = std_closure(
-        base_cache_key.std_seeds.iter().map(String::as_str).chain(
-            set.requests
-                .iter()
-                .filter(|(origin, _)| *origin == Origin::Std)
-                .map(|(_, module)| *module),
-        ),
+        base_cache_key
+            .std_seeds
+            .iter()
+            .map(String::as_str)
+            .chain(
+                set.requests
+                    .iter()
+                    .filter(|(origin, _)| *origin == Origin::Std)
+                    .map(|(_, module)| *module),
+            )
+            .chain(
+                tier.iter()
+                    .flat_map(|tier| tier.std_requests.iter().copied()),
+            ),
         std,
         platform,
         &workspace.entry_prelude,
     );
+    if crate::phase_timing_enabled() {
+        eprintln!(
+            "[vilan phase] prefix-closure modules={} us={}",
+            closure.len(),
+            crate::prefix_file::micros_since(closure_started)
+        );
+    }
     let prefix_key = BaseCacheKey {
         std_seeds: closure.iter().map(|module| module.to_string()).collect(),
         entry_pkg: None,
@@ -81883,6 +84103,7 @@ fn std_prefix_keys(
             members: Default::default(),
         }),
         std_prefix: true,
+        dependency_tier: tier.map(|tier| tier.rows).unwrap_or_default(),
         ..base_cache_key.clone()
     };
     let package_refusal_key = BaseCacheKey {
@@ -82006,8 +84227,11 @@ fn finish_layered_world(
 /// own and the package resolves over its settled answers. `Err` names why this
 /// package cannot take that shape:
 ///
-/// - `dependencies`: a dependency's modules would load into the prefix (the
-///   prefix is std's alone; a dependency tier is a later slice's question);
+/// A program with DEPENDENCIES takes the prefix too (M152, door (b)): the
+/// dependency modules the package asks for load into the prefix world as its
+/// second TIER, keyed beside std's closure ([`std_prefix_keys`]), and only the
+/// package is hot.
+///
 /// - `package-prelude`: every package module's ambient scope reads a package
 ///   module, which S1 refuses for the same reason;
 /// - `reaches-the-entry`: something names `pkg::<entry>`, whose alias the
@@ -82019,9 +84243,6 @@ fn std_prefix_set(
     pkg_root: &Path,
     workspace: &Workspace,
 ) -> Result<HotSet, &'static str> {
-    if !workspace.packages.is_empty() || !workspace.entry_dependencies.is_empty() {
-        return Err("dependencies");
-    }
     let reach = package_reach(entry_pkg_seeds, entry_path, pkg_root, workspace);
     if reach.prelude_module.is_some() {
         return Err("package-prelude");
@@ -82372,6 +84593,7 @@ fn analyze_inner<'src>(
         hot: None,
         reach: None,
         std_prefix: false,
+        dependency_tier: Vec::new(),
     };
     let base_cacheable = shape.cache
         && !entry_is_inside_std
@@ -82505,11 +84727,18 @@ fn analyze_inner<'src>(
         let built = hot_world.is_some();
         crate::incremental::update_census(|census| census.hot_world = built);
     }
+    let admit_started = crate::prefix_file::now();
     let (cached_world, build_claim) = if reuse_allowed {
-        base_cache_admit(&base_cache_key, entry_path, true)
+        base_cache_admit(&base_cache_key, entry_path, true, std)
     } else {
         (None, None)
     };
+    if crate::phase_timing_enabled() && base_cache_key.std_prefix {
+        eprintln!(
+            "[vilan phase] prefix-admit us={}",
+            crate::prefix_file::micros_since(admit_started)
+        );
+    }
     if reuse_allowed && !crate::macros::in_macro_world() {
         crate::incremental::update_census(|census| match cached_world {
             Some(_) => {
@@ -82577,7 +84806,7 @@ fn analyze_inner<'src>(
                         _claim: build_claim,
                     });
                     let (prefix_world, prefix_claim) = if reuse_allowed {
-                        base_cache_admit(&base_cache_key, entry_path, false)
+                        base_cache_admit(&base_cache_key, entry_path, false, std)
                     } else {
                         (None, None)
                     };
@@ -82912,7 +85141,10 @@ fn analyze_inner<'src>(
     // items (or `None`), walked into the module's scope after its body — the general
     // form of the entry's derive expansion, so a derived type imported from another
     // module has its `to_json`/`from_json`/... like one defined in the entry.
-    let mut loaded: Vec<(&str, &Spanned<NodeList>, &str, Id, SourceId, Origin)> = Vec::new();
+    // M144: the scope id is `None` for a non-std module until its node mints
+    // after std's walk ([`DeferredMint`]); every reader of it runs after that.
+    let mut loaded: Vec<(&str, &Spanned<NodeList>, &str, Option<Id>, SourceId, Origin)> =
+        Vec::new();
     // The entry program's package root (`pkg_root`, passed in): the directory its
     // `import pkg::..` siblings live in. When it is one of `std`'s own layer roots
     // we're compiling std itself (or a std file opened in an editor), so every
@@ -83303,6 +85535,11 @@ fn analyze_inner<'src>(
     // the output. `counters::late_round_mints` counts them (a std-prefix P3 key
     // check, closed over WRITTEN imports, refuses a world that grew this way).
     let mut drain_round: u32 = 0;
+    // std-prefix P3: a world that grew in a later round (B619) is never written.
+    let late_round_mints_before = crate::counters::late_round_mints();
+    // M144: the non-std module NODES, held back until std has walked (see
+    // [`DeferredMint`]); their sources register at discovery like every other.
+    let mut deferred_mints: Vec<DeferredMint<'src>> = Vec::new();
     loop {
         // Canonical drain (WO-1b, completed by B603 — `std-prefix.md` §4.1): the
         // load order, and therefore every module node, `SourceId`, scope and walk
@@ -83332,181 +85569,311 @@ fn analyze_inner<'src>(
         // expansion.)
         while !to_load.is_empty() {
             let mut discovered: Vec<(Origin, &str, DiscoveredModule)> = Vec::new();
-            while let Some((origin, request)) = to_load.pop() {
-                // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
-                // the loader loads MODULES. Map every one to the longest prefix that
-                // names a module here — or, failing that, the module DIRECTORY it
-                // addresses — so the canonical order below is taken over module
-                // paths rather than over import paths.
-                let resolved = *resolved_requests
-                    .entry((origin, request))
-                    .or_insert_with(|| {
-                        let roots: Vec<&Path> = match origin {
-                            Origin::Std => std.search_roots(platform),
-                            Origin::Pkg => vec![pkg_root],
-                            Origin::Dep(index) => workspace.packages[index].search_roots(platform),
-                        };
-                        // B337: the LONGER of the two answers, not the first
-                        // that answers. `a::c` where `a.vl` is a module and
-                        // `a/c/` is a pure namespace resolved to `a` — the
-                        // module prefix truncated by a segment, and the
-                        // namespace fallback never ran because the module one
-                        // had answered. So `a::c` was never registered as `a`'s
-                        // child, and A67's collision rule (which reads the
-                        // children scope) could not see a declaration shadowing
-                        // it: `a.vl` declaring `c` beside `a/c/x.vl` bound the
-                        // declaration in silence, the one silent winner A67
-                        // exists to close. The shorter answer is a PREFIX of the
-                        // longer one and loads anyway — `ensure_module_node`
-                        // walks the path and ensures every parent — so taking
-                        // the longer one only ever adds the namespace node
-                        // itself, which contributes no items.
-                        //
-                        // The second call is made only where the first
-                        // truncated: a request the module walk answers whole is
-                        // the deepest answer there is, and that is every
-                        // `pkg::<module>` in a package with no module directory.
-                        deepest_module_or_namespace(&roots, request).map(|path| {
-                            match path == request {
-                                // The whole request IS the module: keep the caller's
-                                // own slice rather than interning a copy of it.
-                                true => request,
-                                false => interned_display_name(path),
-                            }
-                        })
-                    });
-                // A resolved path resolves to itself (it is the longest prefix
-                // naming a module or namespace), so it is resolved once.
-                let Some(name) = resolved else {
-                    continue;
-                };
-                // M110 S1: a hot module waits for `load_hot_modules`, after the store.
-                if origin == Origin::Pkg && (defer_package || hot_deferred.contains(name)) {
-                    continue;
-                }
-                if !loaded_keys.insert((origin, name)) {
-                    continue;
-                }
-                // The roots to search for this module. `std`/`pkg` are single-root; a
-                // dependency library is layered — its overlay for the build target, then its
-                // base, then other overlays (so a cross-target module still loads for typing).
-                let search_roots: Vec<&Path> = match origin {
-                    Origin::Std => std.search_roots(platform),
-                    Origin::Pkg => vec![pkg_root],
-                    Origin::Dep(index) => workspace.packages[index].search_roots(platform),
-                };
-                // A65: a nested module depends on each of its ANCESTORS (the
-                // minting below ensures the parent's node, and the parent's own
-                // file adopts it), so they are discovered with it — which is what
-                // lets them mint in their canonical place, before their children,
-                // rather than wherever the first child happened to ask for them.
-                for (cut, _) in name.match_indices("::") {
-                    to_load.push((origin, &name[..cut]));
-                }
-                // A platform-gated std module (e.g. `std::http` in a browser build) is *not*
-                // skipped here: it loads so its signatures bind and the rest of the file
-                // types cleanly. The cross-target diagnostic is reported once, at the user's
-                // `import`, where the load is seeded (P3/L1).
-                let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
-                    // A65: no body under any root — but the path may still name a
-                    // module DIRECTORY, a **pure namespace** whose children are
-                    // importable through it. Registered below (so `pkg::lib::util`
-                    // can walk through `lib`) with what the directory holds, so an
-                    // `import pkg::lib` that lands on it is refused with the
-                    // children named.
-                    let children = submodules_in_roots(&search_roots, name);
-                    if !children.is_empty() {
-                        discovered.push((origin, name, DiscoveredModule::Namespace(children)));
+            // B625: the first round's macro epilogue runs BEFORE the round
+            // mints ([`premint_expansion`]), and what its generated code asks
+            // for is discovered in the same round — so a module only generated
+            // code reaches mints in its canonical place, not a round later. A
+            // request that finds a module the round had not discovered drops
+            // the expansion (its `SourceId`s were the old set's) and the round
+            // discovers and expands again; the registry stays the WRITTEN
+            // closure's (macro definitions are reachable without expansion).
+            let mut premint: Option<Premint<'src>> = None;
+            let mut registered: Option<HashSet<(Origin, &str)>> = None;
+            loop {
+                let discovered_before = discovered.len();
+                while let Some((origin, request)) = to_load.pop() {
+                    // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
+                    // the loader loads MODULES. Map every one to the longest prefix that
+                    // names a module here — or, failing that, the module DIRECTORY it
+                    // addresses — so the canonical order below is taken over module
+                    // paths rather than over import paths.
+                    let resolved =
+                        *resolved_requests
+                            .entry((origin, request))
+                            .or_insert_with(|| {
+                                let roots: Vec<&Path> = match origin {
+                                    Origin::Std => std.search_roots(platform),
+                                    Origin::Pkg => vec![pkg_root],
+                                    Origin::Dep(index) => {
+                                        workspace.packages[index].search_roots(platform)
+                                    }
+                                };
+                                // B337: the LONGER of the two answers, not the first
+                                // that answers. `a::c` where `a.vl` is a module and
+                                // `a/c/` is a pure namespace resolved to `a` — the
+                                // module prefix truncated by a segment, and the
+                                // namespace fallback never ran because the module one
+                                // had answered. So `a::c` was never registered as `a`'s
+                                // child, and A67's collision rule (which reads the
+                                // children scope) could not see a declaration shadowing
+                                // it: `a.vl` declaring `c` beside `a/c/x.vl` bound the
+                                // declaration in silence, the one silent winner A67
+                                // exists to close. The shorter answer is a PREFIX of the
+                                // longer one and loads anyway — `ensure_module_node`
+                                // walks the path and ensures every parent — so taking
+                                // the longer one only ever adds the namespace node
+                                // itself, which contributes no items.
+                                //
+                                // The second call is made only where the first
+                                // truncated: a request the module walk answers whole is
+                                // the deepest answer there is, and that is every
+                                // `pkg::<module>` in a package with no module directory.
+                                deepest_module_or_namespace(&roots, request).map(|path| {
+                                    match path == request {
+                                        // The whole request IS the module: keep the caller's
+                                        // own slice rather than interning a copy of it.
+                                        true => request,
+                                        false => interned_display_name(path),
+                                    }
+                                })
+                            });
+                    // A resolved path resolves to itself (it is the longest prefix
+                    // naming a module or namespace), so it is resolved once.
+                    let Some(name) = resolved else {
+                        continue;
+                    };
+                    // M110 S1: a hot module waits for `load_hot_modules`, after the store.
+                    if origin == Origin::Pkg && (defer_package || hot_deferred.contains(name)) {
+                        continue;
                     }
-                    // Not a module file here (a non-module name, or a missing import
-                    // the resolver below will report) — skip, as the previous loader
-                    // did.
-                    continue;
-                };
-                // This module file IS the entry buffer. Two unrelated situations
-                // reach that equality and only the ORIGIN tells them apart (B226):
-                // a library file opened directly in an editor (`Std`/`Dep`), and a
-                // `pkg::<entry>` reference that walks back into the program's own
-                // entry.
-                let is_entry_file = crate::util::canonical_path(&resolution.path)
-                    == crate::util::canonical_path(entry_path);
-                if is_entry_file && origin == Origin::Pkg {
-                    // The `pkg::` re-entry (B226): aliased below, never loaded, and
-                    // its requests are the entry's own, seeded before the drain.
-                    discovered.push((origin, name, DiscoveredModule::EntryAlias));
-                    continue;
-                }
-                // A std or dependency file opened directly (the editor case below)
-                // is analyzed from the entry's buffer; every other module parses
-                // from disk.
-                let parsed = match is_entry_file {
-                    true => None,
-                    false => match load_package_module(&resolution.path) {
-                        Some(parsed) => Some(parsed),
-                        None => continue,
-                    },
-                };
-                let ast: &Spanned<NodeList> = parsed.map_or(nodes, |parsed| parsed.ast);
-                // A module's `pkg::` siblings inherit its package; a user/dependency
-                // module's `std::` imports are std, and its `<dep>::` references seed that
-                // dependency. (Std modules reference each other via `pkg::` only, so
-                // collecting their `std::` imports would be a no-op — skip it to keep the
-                // std load byte-for-byte unchanged.)
-                to_load.extend(
-                    collect_module_paths(&ast.0, "pkg")
-                        .into_iter()
-                        .map(|(sibling, _)| (origin, sibling)),
-                );
-                // A `[service]` item means the std `service` macro (hosted in
-                // `std::rpc`, too heavy to always-load) must be in the prelude.
-                for seed in service_seeds(&ast.0) {
-                    to_load.push((Origin::Std, seed));
-                }
-                // B270, the entry's twin: a loaded module's own `css` blocks and
-                // elements seed their std modules, whatever package it belongs to.
-                to_load.extend(
-                    collect_std_item_modules(&ast.0)
-                        .into_iter()
-                        .map(|module| (Origin::Std, module)),
-                );
-                // Seed the module's `std::` and `<dep>::` references. Only the *building*
-                // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
-                // (`Dep`) are its internals, loaded for typing without a gate (the
-                // dependency's compatibility was checked at the user's import). Std modules
-                // reference each other only via `pkg::`, so they seed nothing here.
-                match origin {
-                    Origin::Std => {}
-                    Origin::Pkg => {
-                        let std_refs = collect_module_paths(&ast.0, "std");
-                        to_load.extend(
-                            std_refs
-                                .into_iter()
-                                .map(|(module, _)| (Origin::Std, module)),
-                        );
-                        for (name, index) in &workspace.entry_dependencies {
-                            let refs = collect_module_paths(&ast.0, name);
-                            to_load.extend(
-                                refs.into_iter()
-                                    .map(|(module, _)| (Origin::Dep(*index), module)),
-                            );
+                    if !loaded_keys.insert((origin, name)) {
+                        continue;
+                    }
+                    // The roots to search for this module. `std`/`pkg` are single-root; a
+                    // dependency library is layered — its overlay for the build target, then its
+                    // base, then other overlays (so a cross-target module still loads for typing).
+                    let search_roots: Vec<&Path> = match origin {
+                        Origin::Std => std.search_roots(platform),
+                        Origin::Pkg => vec![pkg_root],
+                        Origin::Dep(index) => workspace.packages[index].search_roots(platform),
+                    };
+                    // A65: a nested module depends on each of its ANCESTORS (the
+                    // minting below ensures the parent's node, and the parent's own
+                    // file adopts it), so they are discovered with it — which is what
+                    // lets them mint in their canonical place, before their children,
+                    // rather than wherever the first child happened to ask for them.
+                    for (cut, _) in name.match_indices("::") {
+                        to_load.push((origin, &name[..cut]));
+                    }
+                    // A platform-gated std module (e.g. `std::http` in a browser build) is *not*
+                    // skipped here: it loads so its signatures bind and the rest of the file
+                    // types cleanly. The cross-target diagnostic is reported once, at the user's
+                    // `import`, where the load is seeded (P3/L1).
+                    let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
+                        // A65: no body under any root — but the path may still name a
+                        // module DIRECTORY, a **pure namespace** whose children are
+                        // importable through it. Registered below (so `pkg::lib::util`
+                        // can walk through `lib`) with what the directory holds, so an
+                        // `import pkg::lib` that lands on it is refused with the
+                        // children named.
+                        let children = submodules_in_roots(&search_roots, name);
+                        if !children.is_empty() {
+                            discovered.push((origin, name, DiscoveredModule::Namespace(children)));
                         }
+                        // Not a module file here (a non-module name, or a missing import
+                        // the resolver below will report) — skip, as the previous loader
+                        // did.
+                        continue;
+                    };
+                    // This module file IS the entry buffer. Two unrelated situations
+                    // reach that equality and only the ORIGIN tells them apart (B226):
+                    // a library file opened directly in an editor (`Std`/`Dep`), and a
+                    // `pkg::<entry>` reference that walks back into the program's own
+                    // entry.
+                    let is_entry_file = crate::util::canonical_path(&resolution.path)
+                        == crate::util::canonical_path(entry_path);
+                    if is_entry_file && origin == Origin::Pkg {
+                        // The `pkg::` re-entry (B226): aliased below, never loaded, and
+                        // its requests are the entry's own, seeded before the drain.
+                        discovered.push((origin, name, DiscoveredModule::EntryAlias));
+                        continue;
                     }
-                    Origin::Dep(index) => {
-                        to_load.extend(
-                            collect_module_paths(&ast.0, "std")
-                                .into_iter()
-                                .map(|(module, _)| (Origin::Std, module)),
-                        );
-                        for (name, dependency_index) in &workspace.packages[index].dependencies {
+                    // A std or dependency file opened directly (the editor case below)
+                    // is analyzed from the entry's buffer; every other module parses
+                    // from disk.
+                    let parsed = match is_entry_file {
+                        true => None,
+                        false => match load_package_module(&resolution.path) {
+                            Some(parsed) => Some(parsed),
+                            None => continue,
+                        },
+                    };
+                    let ast: &Spanned<NodeList> = parsed.map_or(nodes, |parsed| parsed.ast);
+                    // A module's `pkg::` siblings inherit its package; a user/dependency
+                    // module's `std::` imports are std, and its `<dep>::` references seed that
+                    // dependency. (Std modules reference each other via `pkg::` only, so
+                    // collecting their `std::` imports would be a no-op — skip it to keep the
+                    // std load byte-for-byte unchanged.)
+                    to_load.extend(
+                        collect_module_paths(&ast.0, "pkg")
+                            .into_iter()
+                            .map(|(sibling, _)| (origin, sibling)),
+                    );
+                    // A `[service]` item means the std `service` macro (hosted in
+                    // `std::rpc`, too heavy to always-load) must be in the prelude.
+                    for seed in service_seeds(&ast.0) {
+                        to_load.push((Origin::Std, seed));
+                    }
+                    // B270, the entry's twin: a loaded module's own `css` blocks and
+                    // elements seed their std modules, whatever package it belongs to.
+                    to_load.extend(
+                        collect_std_item_modules(&ast.0)
+                            .into_iter()
+                            .map(|module| (Origin::Std, module)),
+                    );
+                    // Seed the module's `std::` and `<dep>::` references. Only the *building*
+                    // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
+                    // (`Dep`) are its internals, loaded for typing without a gate (the
+                    // dependency's compatibility was checked at the user's import). Std modules
+                    // reference each other only via `pkg::`, so they seed nothing here.
+                    match origin {
+                        Origin::Std => {}
+                        Origin::Pkg => {
+                            let std_refs = collect_module_paths(&ast.0, "std");
                             to_load.extend(
-                                collect_module_paths(&ast.0, name)
+                                std_refs
                                     .into_iter()
-                                    .map(|(module, _)| (Origin::Dep(*dependency_index), module)),
+                                    .map(|(module, _)| (Origin::Std, module)),
                             );
+                            for (name, index) in &workspace.entry_dependencies {
+                                let refs = collect_module_paths(&ast.0, name);
+                                to_load.extend(
+                                    refs.into_iter()
+                                        .map(|(module, _)| (Origin::Dep(*index), module)),
+                                );
+                            }
+                        }
+                        Origin::Dep(index) => {
+                            to_load.extend(
+                                collect_module_paths(&ast.0, "std")
+                                    .into_iter()
+                                    .map(|(module, _)| (Origin::Std, module)),
+                            );
+                            for (name, dependency_index) in &workspace.packages[index].dependencies
+                            {
+                                to_load.extend(
+                                    collect_module_paths(&ast.0, name).into_iter().map(
+                                        |(module, _)| (Origin::Dep(*dependency_index), module),
+                                    ),
+                                );
+                            }
                         }
                     }
+                    discovered.push((origin, name, DiscoveredModule::Body { resolution, parsed }));
                 }
-                discovered.push((origin, name, DiscoveredModule::Body { resolution, parsed }));
+                if macro_registry.is_some()
+                    || discovered.is_empty()
+                    || (premint.is_some() && discovered.len() == discovered_before)
+                {
+                    break;
+                }
+                discovered
+                    .sort_unstable_by_key(|(origin, name, _)| load_order_key((*origin, name)));
+                let registered = registered.get_or_insert_with(|| {
+                    discovered
+                        .iter()
+                        .map(|(origin, name, _)| (*origin, *name))
+                        .collect()
+                });
+                let module_key = |origin: Origin, name: &str| match origin {
+                    Origin::Std => crate::macros::ModuleKey::Std(name.to_string()),
+                    Origin::Pkg => crate::macros::ModuleKey::Pkg(name.to_string()),
+                    Origin::Dep(index) => crate::macros::ModuleKey::Dep(index, name.to_string()),
+                };
+                let module_package = |origin: Origin| match origin {
+                    Origin::Std => crate::macros::FilePackage::Std,
+                    Origin::Pkg => crate::macros::FilePackage::Entry,
+                    Origin::Dep(index) => crate::macros::FilePackage::Dep(index),
+                };
+                // The round's modules with the ids its minting will give them:
+                // `load_order_key` order, a body loaded from disk the next
+                // `SourceId`, the entry opened as a module `SourceId(0)`.
+                let mut next_source = sources.len() as u32;
+                let mut entry_is_module_here = false;
+                let mut modules: Vec<PremintFile<'src>> = Vec::new();
+                for (origin, name, module) in &discovered {
+                    let DiscoveredModule::Body { resolution, parsed } = module else {
+                        continue;
+                    };
+                    let (ast, text, source): (&'src NodeList<'src>, &'src str, SourceId) =
+                        match parsed {
+                            Some(loaded) => {
+                                let source = SourceId(next_source);
+                                next_source += 1;
+                                (&loaded.ast.0, loaded.text, source)
+                            }
+                            None => {
+                                entry_is_module_here = true;
+                                (&nodes.0, entry_source, SourceId(0))
+                            }
+                        };
+                    modules.push(PremintFile {
+                        key: module_key(*origin, name),
+                        package: module_package(*origin),
+                        ast,
+                        text,
+                        path: match parsed {
+                            Some(_) => resolution.path.clone(),
+                            None => sources[0].clone(),
+                        },
+                        source,
+                        origin: *origin,
+                        module: Some((*origin, *name)),
+                    });
+                }
+                let entry_file = PremintFile {
+                    key: crate::macros::ModuleKey::Entry,
+                    package: match entry_pkg_origin {
+                        Origin::Std => crate::macros::FilePackage::Std,
+                        _ => crate::macros::FilePackage::Entry,
+                    },
+                    ast: &nodes.0,
+                    text: entry_source,
+                    path: entry_path.to_path_buf(),
+                    source: SourceId(0),
+                    origin: entry_pkg_origin,
+                    module: None,
+                };
+                let library_files: Vec<PremintFile<'src>> = dependency_lib_walks
+                    .iter()
+                    .map(
+                        |(lib_source_id, _, lib_ast, package_index, lib_text)| PremintFile {
+                            key: crate::macros::ModuleKey::DepLib(*package_index),
+                            package: crate::macros::FilePackage::Dep(*package_index),
+                            ast: &lib_ast.0,
+                            text: lib_text,
+                            path: sources[lib_source_id.0 as usize].clone(),
+                            source: *lib_source_id,
+                            origin: Origin::Dep(*package_index),
+                            module: None,
+                        },
+                    )
+                    .collect();
+                let mut register: Vec<&PremintFile<'src>> = vec![&entry_file];
+                register.extend(modules.iter().filter(|file| {
+                    file.module
+                        .is_some_and(|module| registered.contains(&module))
+                }));
+                register.extend(library_files.iter());
+                let mut expand: Vec<&PremintFile<'src>> = Vec::new();
+                if !entry_is_module_here && !expanded_sources.contains(&SourceId(0)) {
+                    expand.push(&entry_file);
+                }
+                expand.extend(modules.iter().filter(|file| {
+                    file.source == SourceId(0) || !expanded_sources.contains(&file.source)
+                }));
+                expand.extend(
+                    library_files
+                        .iter()
+                        .filter(|file| !expanded_sources.contains(&file.source)),
+                );
+                let computed =
+                    premint_expansion(&register, &expand, std, workspace, macro_site_counter);
+                to_load.extend(computed.requests.iter().copied());
+                premint = Some(computed);
+                if to_load.is_empty() {
+                    break;
+                }
             }
             discovered.sort_unstable_by_key(|(origin, name, _)| load_order_key((*origin, name)));
             for (origin, name, module) in discovered {
@@ -83521,6 +85888,15 @@ fn analyze_inner<'src>(
                     Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
                 };
                 let (resolution, parsed) = match module {
+                    // M144: a non-std namespace's node mints after std's walk.
+                    DiscoveredModule::Namespace(children) if origin != Origin::Std => {
+                        deferred_mints.push(DeferredMint::Namespace {
+                            origin,
+                            name,
+                            children,
+                        });
+                        continue;
+                    }
                     DiscoveredModule::Namespace(children) => {
                         let module_id = ensure_module_node(
                             &mut analyzer,
@@ -83548,28 +85924,10 @@ fn analyze_inner<'src>(
                         // instead: `pkg::<entry>::Name` then resolves to the entry's own
                         // declaration, which is exactly what the import asked for, and
                         // nothing is loaded, walked, or typed twice.
-                        let module_id = analyzer.new_entity_id();
-                        analyzer.modules.insert(
-                            module_id,
-                            Module {
-                                id: module_id,
-                                name,
-                                body: (Vec::new(), global_scope_id),
-                            },
-                        );
-                        analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                        analyzer.source_ranges.push(SourceRange {
-                            start: module_id.0,
-                            end: module_id.0 + 1,
-                            source: SourceId(0),
-                        });
-                        analyzer
-                            .expr_id_to_expr_map
-                            .insert(module_id, Expr::Module(module_id));
-                        analyzer
-                            .mut_scope_for_scope_id(pkg_scope_id)
-                            .name_to_id_map
-                            .insert(name, module_id);
+                        //
+                        // M144: the alias is a package node, so its entity mints
+                        // after std's walk with the rest of them.
+                        deferred_mints.push(DeferredMint::EntryAlias { name });
                         // The name is resolvable in `pkg` now, so the entry-expansion
                         // hoist must not rebuild the world for a generated reference
                         // to it (M21's "a module this world never loaded" rule).
@@ -83848,112 +86206,12 @@ fn analyze_inner<'src>(
                     }
                 };
                 analyzer.source_texts.push((module_source_id, module_text));
-                let module_scope = analyzer.create_scope(Some(global_scope_id));
-                let module_scope_id = analyzer.push_scope(module_scope);
-                // A65: a module already has an entity when a CHILD of it loaded
-                // first (`lib/util.vl` before `lib/lib.vl`) — adopt that node, so
-                // the children already registered under it stay reachable and
-                // `pkg::lib` and `pkg::lib::util` name one `lib`. Otherwise this is
-                // the flat path the loader has always taken, id for id.
-                let adopted = module_nodes.get(&(origin, name)).copied();
-                let module_id = adopted.unwrap_or_else(|| analyzer.new_entity_id());
-                analyzer.modules.insert(
-                    module_id,
-                    Module {
-                        id: module_id,
-                        name: module_leaf_name(name),
-                        body: (Vec::new(), module_scope_id),
-                    },
-                );
-                // A body: whatever the directory probe concluded before it loaded is
-                // no longer true.
-                analyzer.namespace_only_modules.remove(&module_id);
-                if directory_holds_a_lib_body {
-                    analyzer.modules_bodied_by_a_lib_file.insert(module_id);
-                }
-                // Give the module entity a location (its file, at the top) so a path
-                // segment naming it can go-to-definition. A one-id range maps it to its
-                // source; the span is the file start.
-                //
-                // B335: an ADOPTED node already HAS a one-id range — the namespace
-                // placeholder `ensure_module_node` attributed to the entry, because
-                // a namespace has no file of its own. Pushing a second range for
-                // the same id left `source_of` (which takes the FIRST range that
-                // contains an id) answering the ENTRY for every module that owns
-                // both `x.vl` and `x/`, so `program.source_of(segment)` named the
-                // importing file — and `import_module_is_used` (E168/E169) asks
-                // exactly that, so Organize Imports was reading the wrong file. It
-                // also made `source_ranges` non-disjoint, which silently demoted
-                // `source_lookup` to the linear scan M27 exists to avoid. Corrected
-                // IN PLACE: the module has a file now, and the placeholder is the
-                // row that should say so.
-                analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                match analyzer
-                    .source_ranges
-                    .iter_mut()
-                    .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
-                {
-                    Some(placeholder) => placeholder.source = module_source_id,
-                    None => analyzer.source_ranges.push(SourceRange {
-                        start: module_id.0,
-                        end: module_id.0 + 1,
-                        source: module_source_id,
-                    }),
-                }
-                analyzer
-                    .expr_id_to_expr_map
-                    .insert(module_id, Expr::Module(module_id));
-                // Register the module under its package's namespace: entry modules in
-                // `pkg`, `std` modules in `std`, a dependency's in its own — so no
-                // package's modules collide with or shadow another's (E.10: a local
-                // `ui.vl` and `std::web::ui` coexist, each reachable through its root).
-                //
-                // A65: "its package's namespace" is the origin's root scope for a
-                // top-level module and its PARENT module's submodule scope for a
-                // nested one — `lib/util.vl` is a member of `lib`, not of `pkg`.
-                let namespace_scope_id = match name.rfind("::") {
-                    None => origin_scope_id,
-                    Some(cut) => {
-                        let parent_id = ensure_module_node(
-                            &mut analyzer,
-                            &mut module_nodes,
-                            &mut to_load,
-                            origin,
-                            &name[..cut],
-                            origin_scope_id,
-                            global_scope_id,
-                        );
-                        module_children_scope(&mut analyzer, parent_id, global_scope_id)
-                    }
-                };
-                module_nodes.insert((origin, name), module_id);
-                analyzer
-                    .mut_scope_for_scope_id(namespace_scope_id)
-                    .name_to_id_map
-                    .insert(module_leaf_name(name), module_id);
-                // `module_scopes` indexes std modules by name for the primitive and
-                // `panic` captures below; other packages' modules must not enter it (a
-                // user or dependency module named `string`/`io`/`json`/... would shadow
-                // the real one and break those captures).
-                if origin == Origin::Std {
-                    module_scopes.insert(name, module_scope_id);
-                }
-                // M21: the entry package's own modules, for the entry-expansion
-                // hoist's "is it already here?" question. A dependency's modules
-                // are not `pkg::` from the entry, so they are not in this set.
-                if origin == Origin::Pkg {
-                    pkg_module_names.insert(name);
-                    // A65: and the directory it sits under, which is the segment a
-                    // generated `pkg::lib::util` reference is checked by.
-                    if let Some(cut) = name.find("::") {
-                        pkg_module_names.insert(&name[..cut]);
-                    }
-                }
-                // Record which package this module's source belongs to, so its imports
-                // resolve `pkg::`/`<dep>::` relative to that package. Std sources always
-                // map (their `pkg::` siblings are std's); entry sources only when the
-                // program has dependencies (otherwise the legacy global resolution
-                // applies, and the global `pkg` namespace is theirs alone).
+                // Which package this module's source belongs to, so its imports
+                // resolve `pkg::`/`<dep>::` relative to that package. Std sources
+                // always map (their `pkg::` siblings are std's); entry sources only
+                // when the program has dependencies (otherwise the legacy global
+                // resolution applies, and the global `pkg` namespace is theirs
+                // alone). A fact about the SOURCE, so it is recorded at discovery.
                 match origin {
                     Origin::Std => {
                         analyzer
@@ -83970,6 +86228,34 @@ fn analyze_inner<'src>(
                     }
                     Origin::Pkg => {}
                 }
+                // M144: a std module's node mints here, in the drain's canonical
+                // order; a non-std node waits for std's walk ([`DeferredMint`]),
+                // and the scope id its row in `loaded` carries is filled in then.
+                let module_scope_id = match origin {
+                    Origin::Std => Some(mint_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut to_load,
+                        &mut module_scopes,
+                        &mut pkg_module_names,
+                        origin,
+                        name,
+                        origin_scope_id,
+                        global_scope_id,
+                        module_source_id,
+                        directory_holds_a_lib_body,
+                    )),
+                    Origin::Pkg | Origin::Dep(_) => {
+                        deferred_mints.push(DeferredMint::Body {
+                            origin,
+                            name,
+                            module_source_id,
+                            directory_holds_a_lib_body,
+                            loaded_index: loaded.len(),
+                        });
+                        None
+                    }
+                };
                 loaded.push((
                     name,
                     ast,
@@ -83978,6 +86264,27 @@ fn analyze_inner<'src>(
                     module_source_id,
                     origin,
                 ));
+            }
+            // B625: the round's expansion, committed now that its ids exist —
+            // exactly what the epilogue below would have written for these
+            // files, which it now finds expanded.
+            if let Some(premint) = premint {
+                macro_registry = Some(premint.registry);
+                for (source, errors) in premint.diagnostics {
+                    let before = analyzer.diagnostics.len();
+                    analyzer.diagnostics.extend(errors);
+                    analyzer.attribute_new_diagnostics(before, source);
+                }
+                for (source, items) in premint.generated {
+                    generated_by_source.entry(source).or_default().extend(items);
+                }
+                analyzer.macro_item_invocations.extend(premint.item_sites);
+                analyzer.macro_failed_sites.extend(premint.failed_sites);
+                analyzer
+                    .macro_expression_expansions
+                    .extend(premint.expressions);
+                expanded_sources.extend(premint.expanded);
+                macro_site_counter = premint.site_counter;
             }
         }
 
@@ -84314,15 +86621,249 @@ fn analyze_inner<'src>(
         }
     }
 
-    // Every loaded module's importable names, read syntactically before any
+    // One module's walk: its items into its scope, then the macro-generated
+    // items (derives included — expansion is unified) into the DECLARING scope
+    // right after its body, so they see its types: the module's own scope, or
+    // the inline `mod` the deriving item was written inside (B201).
+    let walk_module = |analyzer: &mut Analyzer<'src>,
+                       ast: &'src Spanned<NodeList<'src>>,
+                       text: &'src str,
+                       module_scope_id: Id,
+                       source_id: SourceId,
+                       origin: Origin| {
+        analyzer.set_current_source(source_id);
+        analyzer.module_scope_ids.insert(module_scope_id);
+        // F27 R3: twins are userland's (std's are layer twins, a file each).
+        if !matches!(origin, Origin::Std) {
+            analyzer.select_platform_twins(&ast.0, text);
+        }
+        let start = analyzer.entity_id;
+        analyzer.walk_module_items(&ast.0, module_scope_id);
+        analyzer.source_ranges.push(SourceRange {
+            start,
+            end: analyzer.entity_id,
+            source: source_id,
+        });
+        for generated in generated_by_source.get(&source_id).into_iter().flatten() {
+            let scope_id = analyzer.declaring_module_scope(module_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                source_id,
+            );
+        }
+    };
+    // M144: std walks FIRST — its modules, then its `lib.vl` — while no non-std
+    // node exists yet, so std's walk ids follow std's own nodes and nothing
+    // else. The non-std nodes mint after it (below), in the order the hot load
+    // mints a package over a stored prefix (`load_hot_modules`: the pure
+    // namespaces, then the modules), and walk last; the canonical layout and
+    // the std-prefix layout are therefore one layout, and a std item's id is
+    // a function of the std module set alone (`std-prefix.md` §3).
+    for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
+        if *origin != Origin::Std {
+            continue;
+        }
+        let module_scope_id =
+            module_scope_id.expect("M144: a std module's node is minted by the drain");
+        walk_module(
+            &mut analyzer,
+            ast,
+            text,
+            module_scope_id,
+            *source_id,
+            *origin,
+        );
+    }
+    if let Some(lib_ast) = lib_ast {
+        analyzer.set_current_source(lib_source_id);
+        analyzer.module_scope_ids.insert(std_scope_id);
+        let start = analyzer.entity_id;
+        analyzer.walk_module_items(&lib_ast.0, std_scope_id);
+        analyzer.source_ranges.push(SourceRange {
+            start,
+            end: analyzer.entity_id,
+            source: lib_source_id,
+        });
+    }
+    // M144: the deferred non-std nodes. The pure namespaces first, then the
+    // modules and the entry's alias, each set in discovery order — exactly as
+    // `load_hot_modules` mints a package over a stored prefix. A parent a
+    // nested path needs was discovered with its child (the discovery pushes
+    // every ancestor), so the requests `ensure_module_node` writes here name
+    // nodes that exist and are dropped, as the hot load drops its own.
+    //
+    // M152: and a DEPENDENCY is whole — its nodes minted, its modules and its
+    // `lib.vl` walked — before the first package node mints. A dependency
+    // never names its consumer, so nothing in it waits on a package node; and
+    // this is the layout a std-and-dependencies prefix holds (the dependency
+    // tier walks in the prefix, the package after it as the hot set), so a
+    // dependency's ids — and the emitted order of its declarations against
+    // the package's — are one answer in both shapes.
+    let (dependency_mints, package_mints): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) =
+        deferred_mints.into_iter().partition(|mint| {
+            matches!(
+                mint,
+                DeferredMint::Namespace {
+                    origin: Origin::Dep(_),
+                    ..
+                } | DeferredMint::Body {
+                    origin: Origin::Dep(_),
+                    ..
+                }
+            )
+        });
+    let mut deferred_requests: Vec<(Origin, &str)> = Vec::new();
+    for (phase, phase_mints) in [dependency_mints, package_mints].into_iter().enumerate() {
+        let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = phase_mints
+            .into_iter()
+            .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
+        for mint in namespaces.into_iter().chain(bodies) {
+            let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
+                Origin::Std => std_scope_id,
+                Origin::Pkg => pkg_scope_id,
+                Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
+            };
+            match mint {
+                DeferredMint::Namespace {
+                    origin,
+                    name,
+                    children,
+                } => {
+                    let origin_scope_id = origin_scope_of(&analyzer, origin);
+                    let module_id = ensure_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut deferred_requests,
+                        origin,
+                        name,
+                        origin_scope_id,
+                        global_scope_id,
+                    );
+                    analyzer.namespace_only_modules.insert(module_id, children);
+                    if origin == Origin::Pkg {
+                        pkg_module_names.insert(name);
+                    }
+                }
+                DeferredMint::EntryAlias { name } => {
+                    let module_id = analyzer.new_entity_id();
+                    analyzer.modules.insert(
+                        module_id,
+                        Module {
+                            id: module_id,
+                            name,
+                            body: (Vec::new(), global_scope_id),
+                        },
+                    );
+                    analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+                    analyzer.source_ranges.push(SourceRange {
+                        start: module_id.0,
+                        end: module_id.0 + 1,
+                        source: SourceId(0),
+                    });
+                    analyzer
+                        .expr_id_to_expr_map
+                        .insert(module_id, Expr::Module(module_id));
+                    analyzer
+                        .mut_scope_for_scope_id(pkg_scope_id)
+                        .name_to_id_map
+                        .insert(name, module_id);
+                }
+                DeferredMint::Body {
+                    origin,
+                    name,
+                    module_source_id,
+                    directory_holds_a_lib_body,
+                    loaded_index,
+                } => {
+                    let origin_scope_id = origin_scope_of(&analyzer, origin);
+                    let module_scope_id = mint_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut deferred_requests,
+                        &mut module_scopes,
+                        &mut pkg_module_names,
+                        origin,
+                        name,
+                        origin_scope_id,
+                        global_scope_id,
+                        module_source_id,
+                        directory_holds_a_lib_body,
+                    );
+                    loaded[loaded_index].3 = Some(module_scope_id);
+                }
+            }
+        }
+        if phase == 0 {
+            // M152: the dependencies' modules, then each dependency's `lib.vl`
+            // into its own namespace (its public surface), mirroring the `std` lib
+            // walk above.
+            for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
+                if !matches!(origin, Origin::Dep(_)) {
+                    continue;
+                }
+                let module_scope_id =
+                    module_scope_id.expect("M144: a dependency's node is minted above");
+                walk_module(
+                    &mut analyzer,
+                    ast,
+                    text,
+                    module_scope_id,
+                    *source_id,
+                    *origin,
+                );
+            }
+            for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in
+                &dependency_lib_walks
+            {
+                let root_start = analyzer.entity_id;
+                analyzer.set_current_source(*source_id);
+                analyzer.module_scope_ids.insert(*namespace_scope_id);
+                let start = analyzer.entity_id;
+                analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
+                analyzer.source_ranges.push(SourceRange {
+                    start,
+                    end: analyzer.entity_id,
+                    source: *source_id,
+                });
+                // Macro-generated items (derives included) walk into the lib's
+                // namespace — or into the inline `mod` that declared the deriving
+                // item (B201).
+                for generated in generated_by_source.get(source_id).into_iter().flatten() {
+                    let scope_id = analyzer
+                        .declaring_module_scope(*namespace_scope_id, &generated.module_path);
+                    analyzer.walk_generated_expansion(
+                        generated.nodes,
+                        scope_id,
+                        generated.origin,
+                        *source_id,
+                    );
+                }
+                analyzer
+                    .dependency_root_ranges
+                    .push((root_start, analyzer.entity_id));
+            }
+        }
+    }
+    debug_assert!(
+        deferred_requests
+            .iter()
+            .all(|(origin, name)| module_nodes.contains_key(&(*origin, name))),
+        "M144: a deferred mint asked for a module the discovery never reached"
+    );
+    // Every loaded module's importable names, read syntactically before its
     // walk. A prelude module publishes exactly these (prelude.md §8), and
     // reading them here is what lets `seed_preludes` answer "what does
-    // `std::web::prelude` make ambient" without re-parsing anything.
+    // `std::web::prelude` make ambient" without re-parsing anything. (After
+    // std's walk since M144, which reads none of them: `seed_preludes` runs
+    // in the resolve, once everything has walked.)
     for (_name, ast, _text, module_scope_id, _source_id, _origin) in &loaded {
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
         let mut importables = Vec::new();
         collect_importables(&ast.0, &mut importables);
         analyzer.prelude_exports.insert(
-            *module_scope_id,
+            module_scope_id,
             importables
                 .into_iter()
                 .map(|importable| importable.name)
@@ -84353,6 +86894,7 @@ fn analyze_inner<'src>(
     // Queue each module's ambient set, from the prelude ITS OWN package
     // declares (prelude.md §7 — never the consumer's, never inherited).
     for (_name, _ast, _text, module_scope_id, source_id, origin) in &loaded {
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
         let prelude = match origin {
             Origin::Std => &std.prelude,
             Origin::Pkg => &workspace.entry_prelude,
@@ -84361,74 +86903,24 @@ fn analyze_inner<'src>(
         if let Some(path) = prelude.module_path() {
             analyzer
                 .prelude_seeds
-                .push((*module_scope_id, path.to_string(), *source_id));
+                .push((module_scope_id, path.to_string(), *source_id));
         }
     }
+    // M144: the package's modules walk after their nodes (a dependency's
+    // walked with its own, M152).
     for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
-        analyzer.set_current_source(*source_id);
-        analyzer.module_scope_ids.insert(*module_scope_id);
-        // F27 R3: twins are userland's (std's are layer twins, a file each).
-        if !matches!(origin, Origin::Std) {
-            analyzer.select_platform_twins(&ast.0, text);
+        if *origin != Origin::Pkg {
+            continue;
         }
-        let start = analyzer.entity_id;
-        analyzer.walk_module_items(&ast.0, *module_scope_id);
-        analyzer.source_ranges.push(SourceRange {
-            start,
-            end: analyzer.entity_id,
-            source: *source_id,
-        });
-        // Macro-generated items (derives included — expansion is unified) walk
-        // into the DECLARING scope right after its body, so they see its types:
-        // the module's own scope, or the inline `mod` the deriving item was
-        // written inside (B201).
-        for generated in generated_by_source.get(source_id).into_iter().flatten() {
-            let scope_id =
-                analyzer.declaring_module_scope(*module_scope_id, &generated.module_path);
-            analyzer.walk_generated_expansion(
-                generated.nodes,
-                scope_id,
-                generated.origin,
-                *source_id,
-            );
-        }
-    }
-    if let Some(lib_ast) = lib_ast {
-        analyzer.set_current_source(lib_source_id);
-        analyzer.module_scope_ids.insert(std_scope_id);
-        let start = analyzer.entity_id;
-        analyzer.walk_module_items(&lib_ast.0, std_scope_id);
-        analyzer.source_ranges.push(SourceRange {
-            start,
-            end: analyzer.entity_id,
-            source: lib_source_id,
-        });
-    }
-    // Walk each dependency's `lib.vl` into its own namespace (its public surface),
-    // mirroring the `std` lib walk above.
-    for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in &dependency_lib_walks
-    {
-        analyzer.set_current_source(*source_id);
-        analyzer.module_scope_ids.insert(*namespace_scope_id);
-        let start = analyzer.entity_id;
-        analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
-        analyzer.source_ranges.push(SourceRange {
-            start,
-            end: analyzer.entity_id,
-            source: *source_id,
-        });
-        // Macro-generated items (derives included) walk into the lib's namespace
-        // — or into the inline `mod` that declared the deriving item (B201).
-        for generated in generated_by_source.get(source_id).into_iter().flatten() {
-            let scope_id =
-                analyzer.declaring_module_scope(*namespace_scope_id, &generated.module_path);
-            analyzer.walk_generated_expansion(
-                generated.nodes,
-                scope_id,
-                generated.origin,
-                *source_id,
-            );
-        }
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        walk_module(
+            &mut analyzer,
+            ast,
+            text,
+            module_scope_id,
+            *source_id,
+            *origin,
+        );
     }
     // Remember `panic` so its calls can be typed as never and lowered to a throw.
     if let Some(io_scope_id) = module_scopes.get("io") {
@@ -84881,7 +87373,11 @@ fn analyze_inner<'src>(
         let prefix_modules: Vec<(&str, &NodeList<'_>, Id)> = loaded
             .iter()
             .filter(|(.., origin)| *origin == Origin::Pkg)
-            .map(|(name, ast, _, scope_id, ..)| (*name, &ast.0, *scope_id))
+            .map(|(name, ast, _, scope_id, ..)| {
+                let scope_id =
+                    scope_id.expect("M144: every module node is minted before the store");
+                (*name, &ast.0, scope_id)
+            })
             .collect();
         if hot_set_imports_a_use_inferred_binding(
             &analyzer,
@@ -84973,12 +87469,35 @@ fn analyze_inner<'src>(
             || BASE_CACHE_STORE.load(std::sync::atomic::Ordering::Relaxed))
         && !entry_is_module
         && (!entry_is_open_module || base_cache_key.entry_open_module.is_some());
+    // std-prefix P3: a std-only world this analysis BUILT is written to the
+    // world cache when this process looked for its file and missed — whether
+    // or not the in-memory store is on (the CLI switches that off for a
+    // one-shot check, and the CLI is the file's first consumer).
+    let prefix_file_wanted = base_cache_key.std_prefix
+        && reuse_allowed
+        && !prefix_unstorable
+        && !entry_is_module
+        && !crate::macros::in_macro_world();
+    if base_cache_key.std_prefix && ((world_storable && !prefix_unstorable) || prefix_file_wanted) {
+        // std-prefix P3: the std-only world's derive and boundary queues
+        // (`std-prefix.md` §2 row 6) are DRAINED before the store rather
+        // than after it. They hold `&'src Node` rows the file cannot carry,
+        // their only output is diagnostics, std resolved alone (§4.2) so
+        // nothing a package adds changes their verdicts, and std is
+        // diagnostic-clean — so draining them here reports exactly what
+        // the tail reported, once per prefix instead of once per hit.
+        world.analyzer.drain_boundary_checks();
+    }
     if world_storable && !prefix_unstorable {
         base_cache_store(base_cache_key.clone(), &world);
         crate::counters::checkpoint("world-stored");
         if !crate::macros::in_macro_world() {
             crate::incremental::update_census(|census| census.base_stores += 1);
         }
+    }
+    if prefix_file_wanted {
+        let late_round_mints = crate::counters::late_round_mints() - late_round_mints_before;
+        prefix_file_write(&base_cache_key, &world, std, late_round_mints);
     }
     // After the store, so the world the cache holds is the pre-entry one it
     // has always been.
@@ -85302,6 +87821,7 @@ fn analyze_over_world<'src>(
             analyzer.select_platform_twins(&nodes.0, entry_text);
         }
         let entry_walk_start = analyzer.entity_id;
+        analyzer.entry_walk_start = Some(entry_walk_start);
         analyzer.walk_module_items(&nodes.0, global_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start: entry_walk_start,
@@ -85670,6 +88190,7 @@ fn analyze_over_world<'src>(
     }
     class_a_checks! {
         analyzer.check_assignment_places();
+        analyzer.check_lent_root_rebinds();
         analyzer.check_readonly_mutation();
         analyzer.check_mutable_arguments();
         analyzer.check_lazy_arguments();
@@ -86000,6 +88521,7 @@ fn analyze_over_world<'src>(
                     ("remove", Intrinsic::ListRemove),
                     ("insert", Intrinsic::ListInsert),
                     ("sort_by", Intrinsic::ListSortBy),
+                    ("to_array", Intrinsic::ListToArray),
                 ] {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)
@@ -86462,8 +88984,13 @@ fn analyze_over_world<'src>(
     // E313: the files whose hover rows this analysis renders.
     let hover_rows = hover_labels::HoverRows::new(workspace, &sources);
     let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
+    // M148: the hover rows this analysis RENDERS, for the records — only an
+    // analysis whose records carry them (a seeded one under the reading
+    // aids) keeps the copies.
+    let records_hover = !workspace.hot_seeds.is_empty() && workspace.reading_aids;
+    let mut rendered_call_labels: Vec<(Id, String)> = Vec::new();
     for (call_id, substitution) in &analyzer.method_call_substitution {
-        if substitution.is_empty() {
+        if substitution.is_empty() || analyzer.hover_row_restored(*call_id) {
             continue;
         }
         if !analyzer
@@ -86489,8 +89016,15 @@ fn analyze_over_world<'src>(
         if declaration_labels.get(&function_id) == Some(&computed) {
             continue;
         }
+        if records_hover {
+            rendered_call_labels.push((*call_id, computed.clone()));
+            rendered_call_labels.push((subject_id, computed.clone()));
+        }
         call_signature_labels.insert(*call_id, computed.clone());
         call_signature_labels.insert(subject_id, computed);
+    }
+    if !label_rows_planted {
+        call_signature_labels.extend(analyzer.restored_call_labels(&hover_rows));
     }
     for (function_id, external) in &analyzer.external_functions {
         if analyzer.label_row_restored(*function_id) {
@@ -86554,10 +89088,57 @@ fn analyze_over_world<'src>(
                 .map(|(id, label)| (*id, label.clone())),
         );
     }
+    // E317: a generic enum's variant in value position reads the instantiation
+    // its position wanted (editor-only; empty without the reading aids).
+    for (id, label) in analyzer.variant_use_labels(&hover_rows, &expr_types) {
+        expr_types.insert(id, label);
+    }
     // E238: the block each member is declared in, and each block's header.
     crate::phase_pass_mark("the label tables");
     let (member_owners, member_headers) = analyzer.member_headers();
     crate::phase_pass_mark("analyzer.member_headers()");
+    // E237: the definition under an entry binding's, member's or field's type.
+    // E313: for every file a view can serve, under the editor's reading aids.
+    // M148: a region whose record carried its hover rows is not rendered —
+    // its rows are restored below (the label plant drops them, keeping the
+    // skip).
+    let (mut type_definitions, rendered_definitions) =
+        analyzer.type_definitions(&expr_type_ids, &hover_rows);
+    // E241: a variant pattern's label, rendered once its types have settled.
+    let mut pattern_labels = analyzer.pattern_labels(&hover_rows);
+    // E240: type parameters and traits named in type position.
+    let (mut reference_hovers, recordable_references) = analyzer.reference_hovers(&hover_rows);
+    let rendered_hover = if records_hover {
+        hover_records::RenderedHoverRows {
+            call_labels: rendered_call_labels,
+            definitions: rendered_definitions,
+            blocks: type_definitions.blocks().to_vec(),
+            patterns: pattern_labels.clone(),
+            references: reference_hovers
+                .iter()
+                .zip(&recordable_references)
+                .filter(|(_, recordable)| **recordable)
+                .map(|(row, _)| row.clone())
+                .collect(),
+        }
+    } else {
+        hover_records::RenderedHoverRows::default()
+    };
+    if !label_rows_planted {
+        analyzer.restore_type_definitions(&mut type_definitions, &expr_type_ids, &hover_rows);
+        let (patterns, references) = analyzer.restored_span_rows(&hover_rows);
+        if !crate::macros::in_macro_world() {
+            let restored = &analyzer.restored_tables.hover;
+            let count = (restored.call_labels.len()
+                + restored.definitions.len()
+                + patterns.len()
+                + references.len()) as u64;
+            crate::incremental::update_census(|census| census.hover_rows_restored += count);
+        }
+        pattern_labels.extend(patterns);
+        reference_hovers.extend(references);
+    }
+    crate::phase_pass_mark("the hover rows");
 
     if let Some(key) = &checks_key
         && !entry_is_module
@@ -86706,6 +89287,48 @@ fn analyze_over_world<'src>(
         if items_enabled {
             held_live.partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M149: the live lane's move rows, per source and per item.
+        analyzer
+            .move_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .move_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
+        // M148: the hover rows, per source and per item — the span rows by
+        // their place in the file.
+        let slice_at = |source: SourceId, _: Span| -> Option<u32> {
+            (source.0 != 0 && !skip(source)).then_some(source.0)
+        };
+        rendered_hover.partition_into(&|id| file_of(&analyzer, id), &slice_at, &mut tables);
+        if items_enabled {
+            let item_at = |source: SourceId, span: Span| -> Option<u32> {
+                analyzer
+                    .item_window_filed_at(source, span.start)
+                    .map(|window| window as u32)
+            };
+            rendered_hover.partition_into(&|id| item_of(&analyzer, id), &item_at, &mut item_tables);
+        }
+        // M150: the lazy and HMR rows likewise.
+        analyzer
+            .lazy_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        analyzer
+            .hmr_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .lazy_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+            analyzer
+                .hmr_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
+        let families = row_families::FamilySet::default()
+            .with(row_families::RowFamily::Moves, analyzer.move_rows_filed)
+            .with(row_families::RowFamily::Lazy, analyzer.lazy_rows_filed)
+            .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed);
         // M110 S7b: the resource slots per SOURCE (an item's window is
         // classified live), by the slot's own source stamp.
         {
@@ -86735,6 +89358,8 @@ fn analyze_over_world<'src>(
             // module's held rows name nothing outside the stored world.
             slice.hints_recorded = workspace.reading_aids;
             slice.held_recorded = true;
+            slice.families = families;
+            slice.hover_recorded = records_hover;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
         // M110 S7: the item records of the re-walked files, with their
@@ -86743,8 +89368,14 @@ fn analyze_over_world<'src>(
         // a truncated item on every later hit).
         if items_enabled && !crate::cancel::cancelled() {
             let digest = analyzer.drop_nominals_world_digest;
-            let (items, purge) =
-                analyzer.take_item_records(item_tables, digest, seeded, workspace.reading_aids);
+            let (items, purge) = analyzer.take_item_records(
+                item_tables,
+                digest,
+                seeded,
+                workspace.reading_aids,
+                families,
+                records_hover,
+            );
             item_records::checked_cache_store_items(
                 key,
                 &source_hashes[..prefix_len],
@@ -86754,14 +89385,7 @@ fn analyze_over_world<'src>(
         }
     }
 
-    // E237: the definition under an entry binding's, member's or field's type.
-    // E313: for every file a view can serve, under the editor's reading aids.
-    let type_definitions = analyzer.type_definitions(&expr_type_ids, &hover_rows);
     crate::phase_pass_mark("the class D partition and the records");
-    // E241: a variant pattern's label, rendered once its types have settled.
-    let pattern_labels = analyzer.pattern_labels(&hover_rows);
-    // E240: type parameters and traits named in type position.
-    let reference_hovers = analyzer.reference_hovers(&hover_rows);
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();
@@ -87243,6 +89867,9 @@ fn analyze_over_world<'src>(
         drop_fn_id: analyzer.drop_fn_id,
         asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),
+        const_walk_entities: analyzer.const_walk_entities.clone(),
+        dependency_root_ranges: analyzer.dependency_root_ranges.clone(),
+        entry_walk_start: analyzer.entry_walk_start,
         const_results: HashMap::default(),
         const_let_initializers: analyzer.const_let_initializers.clone(),
         const_functions: analyzer.const_functions.clone(),
@@ -87422,6 +90049,7 @@ fn analyze_over_world<'src>(
         selection_memos: crate::impl_select::SelectionMemos::default(),
         trait_subject_memo: std::sync::Mutex::default(),
         trait_method_memo: std::sync::Mutex::default(),
+        receiver_dispatch_memo: std::sync::Mutex::default(),
     }))
 }
 

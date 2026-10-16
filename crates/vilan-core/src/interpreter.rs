@@ -2069,6 +2069,21 @@ impl<'a> Interpreter<'a> {
                     None => Ok(option_none()),
                 }
             }
+            // `List.to_array<const N>()` (A172) — `Some` of a shallow copy at
+            // the length, `None` otherwise: the JS helper's
+            // `list.length === length ? [ 0, list.slice() ] : [ 1 ]`.
+            "__list_to_array" => {
+                let list = expect_array(&take(0))?;
+                let length = expect_number(&take(1))?;
+                let list = list.borrow();
+                if list.len() as f64 == length {
+                    Ok(option_some(Value::Array(Rc::new(RefCell::new(
+                        list.clone(),
+                    )))))
+                } else {
+                    Ok(option_none())
+                }
+            }
             // `List.sort_by(cmp)` — the JS side is `list.slice().sort(compare)`,
             // whose stability ECMA-262 guarantees. `Vec::sort_by` cannot host the
             // comparator (it is `&mut self` and fallible), so this is an explicit

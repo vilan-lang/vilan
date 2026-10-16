@@ -13,7 +13,9 @@ use std::ops::Range;
 ///
 /// `Debug` renders as `start..end` — identical to chumsky's `SimpleSpan` — which
 /// the span-inclusive AST differential and every span-bearing snapshot rely on.
-#[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Span {
     /// The start byte offset.
     pub start: usize,

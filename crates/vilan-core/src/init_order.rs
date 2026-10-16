@@ -85,7 +85,9 @@ use crate::span::Span;
 pub fn initialization_order(program: &Program, graph: &CallGraph) -> Vec<Id> {
     let dependencies = load_time_dependencies(program, graph);
     let bindings: Vec<Id> = dependencies.keys().copied().collect();
-    canonical_topological_order(&bindings, &dependencies)
+    canonical_topological_order(&bindings, &dependencies, |binding| {
+        canonical_key(program, binding)
+    })
 }
 
 /// The load-time relation: for each module-level binding, the bindings its
@@ -95,7 +97,7 @@ pub fn initialization_order(program: &Program, graph: &CallGraph) -> Vec<Id> {
 /// diagnostic) is deterministic too.
 pub fn load_time_dependencies(program: &Program, graph: &CallGraph) -> IndexMap<Id, Vec<Id>> {
     let mut bindings = program.module_level_bindings();
-    bindings.sort_by_key(canonical_key);
+    bindings.sort_by_key(|binding| canonical_key(program, binding));
     let mut walk = LoadTimeWalk::new(program, graph);
     bindings
         .iter()
@@ -168,7 +170,7 @@ pub fn check_module_level_cells(program: &mut Program) {
     {
         let graph = program.call_graph();
         let mut bindings = program.module_level_bindings();
-        bindings.sort_by_key(canonical_key);
+        bindings.sort_by_key(|binding| canonical_key(program, binding));
         for binding in bindings {
             if program.lazy_cells.contains(&binding) {
                 continue;
@@ -272,9 +274,9 @@ fn cycle_diagnostics(program: &Program, graph: &CallGraph) -> Vec<(Error, Source
     let members: HashSet<Id> = bindings.iter().copied().collect();
     let mut components = strongly_connected_components(&bindings, &dependencies, &members);
     for component in &mut components {
-        component.sort_by_key(canonical_key);
+        component.sort_by_key(|binding| canonical_key(program, binding));
     }
-    components.sort_by_key(|component| canonical_key(&component[0]));
+    components.sort_by_key(|component| canonical_key(program, &component[0]));
 
     let mut walk = LoadTimeWalk::new(program, graph);
     components
@@ -546,8 +548,8 @@ struct ReadWitness {
 /// and would have to re-export the loader's block-local `Origin`; the id is
 /// also already what function emission sorts by (`transform_entry_ast`'s
 /// `t_functions.sort_by`).
-fn canonical_key(binding: &Id) -> u32 {
-    binding.0
+fn canonical_key(program: &Program, binding: &Id) -> u64 {
+    program.canonical_declaration_key(*binding)
 }
 
 /// The initialization order for one relation: a topological order of the
@@ -572,14 +574,18 @@ fn canonical_key(binding: &Id) -> u32 {
 ///
 /// Split out from [`load_time_dependencies`] so the ordering law is testable
 /// against a synthetic relation, with no program to build.
-fn canonical_topological_order(bindings: &[Id], dependencies: &IndexMap<Id, Vec<Id>>) -> Vec<Id> {
+fn canonical_topological_order(
+    bindings: &[Id],
+    dependencies: &IndexMap<Id, Vec<Id>>,
+    canonical_key: impl Fn(&Id) -> u64,
+) -> Vec<Id> {
     let members: HashSet<Id> = bindings.iter().copied().collect();
     let mut canonical: Vec<Id> = bindings.to_vec();
-    canonical.sort_by_key(canonical_key);
+    canonical.sort_by_key(&canonical_key);
 
     let mut components = strongly_connected_components(&canonical, dependencies, &members);
     for component in &mut components {
-        component.sort_by_key(canonical_key);
+        component.sort_by_key(&canonical_key);
     }
     let mut component_of: HashMap<Id, usize> = HashMap::default();
     for (index, component) in components.iter().enumerate() {
@@ -616,7 +622,7 @@ fn canonical_topological_order(bindings: &[Id], dependencies: &IndexMap<Id, Vec<
         }
     }
 
-    let mut ready: BTreeSet<(u32, usize)> = (0..components.len())
+    let mut ready: BTreeSet<(u64, usize)> = (0..components.len())
         .filter(|index| unmet[*index] == 0)
         .map(|index| (component_key(index), index))
         .collect();
@@ -797,13 +803,13 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
         if self.program.lazy_cells.contains(&binding) {
             return Vec::new();
         }
-        let mut reads: BTreeSet<u32> = BTreeSet::new();
+        let mut reads: BTreeSet<(u64, u32)> = BTreeSet::new();
         let mut seen: HashSet<Id> = HashSet::default();
         seen.insert(binding);
         let mut pending = vec![binding];
         while let Some(unit) = pending.pop() {
             for (_reference, global) in self.graph.global_references_of(unit) {
-                reads.insert(canonical_key(global));
+                reads.insert((canonical_key(self.program, global), global.0));
             }
             for (next, _via) in self.entered_by(unit) {
                 if seen.insert(next) {
@@ -811,7 +817,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
                 }
             }
         }
-        reads.into_iter().map(Id).collect()
+        reads.into_iter().map(|(_, global)| Id(global)).collect()
     }
 
     /// A witness for the relation's edge `binding → target`: the reference
@@ -923,7 +929,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
         }
         // By canonical key, then by provenance — so a unit entered both ways
         // keeps its `Direct` tag when the duplicate is dropped.
-        entered.sort_by_key(|(body, via)| (canonical_key(body), *via));
+        entered.sort_by_key(|(body, via)| (canonical_key(self.program, body), *via));
         entered.dedup_by_key(|(body, _via)| *body);
         self.entered.insert(unit, entered.clone());
         entered
@@ -1175,7 +1181,7 @@ mod tests {
     fn order(edges: &[(u32, &[u32])]) -> Vec<u32> {
         let dependencies = relation(edges);
         let bindings: Vec<Id> = dependencies.keys().copied().collect();
-        canonical_topological_order(&bindings, &dependencies)
+        canonical_topological_order(&bindings, &dependencies, |id| u64::from(id.0))
             .into_iter()
             .map(|id| id.0)
             .collect()
@@ -1292,7 +1298,7 @@ mod tests {
             dependencies.insert(Id(step), next);
         }
         let bindings: Vec<Id> = dependencies.keys().copied().collect();
-        let order = canonical_topological_order(&bindings, &dependencies);
+        let order = canonical_topological_order(&bindings, &dependencies, |id| u64::from(id.0));
         assert_eq!(order.len(), depth as usize);
         assert_eq!(
             order[0],

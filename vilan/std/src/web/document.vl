@@ -406,7 +406,13 @@ export impl Document {
 				if self.head != "" || self.body != "" {
 					match check_shell(composed, self.build, default_mount) {
 						Ok(let _checked) => {},
-						Err(let faults) => panic(fault_report(i"{self.source} composed with this document's `head`/`body` markup", self.build, faults)),
+						Err(let faults) => panic(
+							fault_report(
+								i"{self.source} composed with this document's `head`/`body` markup",
+								self.build,
+								faults,
+							),
+						),
 					}
 				}
 				composed
@@ -421,7 +427,13 @@ export impl Document {
 				if self.head != "" || self.body != "" {
 					match check_shell(markup, self.build, self.mount) {
 						Ok(let _checked) => {},
-						Err(let faults) => panic(fault_report("this generated document's `head`/`body` markup", self.build, faults)),
+						Err(let faults) => panic(
+							fault_report(
+								"this generated document's `head`/`body` markup",
+								self.build,
+								faults,
+							),
+						),
 					}
 				}
 				markup

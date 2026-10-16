@@ -47,15 +47,49 @@ pub struct TypeDefinitions {
 impl TypeDefinitions {
     /// The block rendered for `type_id`, if its type has one (a struct with
     /// fields, an enum with variants, a trait-typed or `dyn` value).
+    /// The rendered blocks, by index.
+    pub(super) fn blocks(&self) -> &[String] {
+        &self.blocks
+    }
+
     pub fn of(&self, type_id: TypeId) -> Option<&str> {
         let index = *self.by_type.get(&type_id)?;
         self.blocks.get(index as usize).map(String::as_str)
+    }
+
+    /// M148: a restored region's block for `type_id`, unless a rendered
+    /// position already answered it — deduplicated by text, as rendering
+    /// deduplicates by label (`by_text` starts from the rendered blocks).
+    pub(super) fn insert_restored(
+        &mut self,
+        type_id: TypeId,
+        text: &str,
+        by_text: &mut HashMap<String, u32>,
+    ) {
+        if self.by_type.contains_key(&type_id) {
+            return;
+        }
+        if by_text.is_empty() {
+            for (index, block) in self.blocks.iter().enumerate() {
+                by_text.entry(block.clone()).or_insert(index as u32);
+            }
+        }
+        let index = match by_text.get(text) {
+            Some(index) => *index,
+            None => {
+                self.blocks.push(text.to_string());
+                let index = (self.blocks.len() - 1) as u32;
+                by_text.insert(text.to_string(), index);
+                index
+            }
+        };
+        self.by_type.insert(type_id, index);
     }
 }
 
 /// One PATTERN position the entry matches (E241), as `resolve_pattern` saw
 /// it: where its name is, what it is, and the matched value's type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct PatternSite {
     /// The file the pattern is written in (E313: a module served as a view
     /// of its entry's world reads its OWN rows, never the entry's).
@@ -66,7 +100,7 @@ pub(super) struct PatternSite {
     matched: Option<TypeId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum PatternSiteKind {
     /// A variant: the enum, the variant, its payload under the arguments.
     Variant {
@@ -81,7 +115,7 @@ enum PatternSiteKind {
 /// A pattern position's hover (E241): where its name is, what it renders
 /// as — `Option<i32>::Some(i32)`, `_: Option<i32>` — and, for a variant, the
 /// enum and variant it names, so the editor can read the variant's `///`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PatternLabel {
     /// The file `name_span` is an offset into (E313). A row is read only by
     /// the document that IS this source — the entry, or a module served as a
@@ -99,7 +133,7 @@ pub struct PatternLabel {
 /// answered with a bare name: a TYPE PARAMETER (`type I: Read<U>`, and the
 /// declaration that introduces it) and a TRAIT named in a bound, a `with`
 /// clause or a supertrait list (its required members, as E237's block).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceHover {
     /// The file `span` is an offset into (E313), as [`PatternLabel::source`].
     pub source: SourceId,
@@ -515,7 +549,11 @@ impl<'src> Analyzer<'src> {
         // every file of the world now banks its rows.
         let mut at: HashMap<(SourceId, Span), usize> = HashMap::default();
         for site in &self.pattern_sites {
-            if !self.renders_hover_rows(site.source, rows) {
+            // M148: a region whose record carried its hover rows is not
+            // rendered again (`hover_records.rs`).
+            if !self.renders_hover_rows(site.source, rows)
+                || self.hover_row_restored_at(site.source, site.name_span.start)
+            {
                 continue;
             }
             let earlier = at.get(&(site.source, site.name_span)).copied();
@@ -607,11 +645,191 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// E317: the type label of a GENERIC enum's variant named in value
+    /// position, where the reference's own id was tabled none. A bare variant
+    /// reference (`None`, `Option::None`) is typed by the context that wants
+    /// it and records nothing on its own id, so a returned `None` hovered as
+    /// `Option::None` - and `Some` in `Some(1)` likewise, since a call's
+    /// result is tabled only where something asked for it. The reading is the
+    /// type the POSITION settled, as E241 reads a pattern's matched type:
+    ///
+    /// - what the position EXPECTED (`expected_types`: the return slot of a
+    ///   body's tail or a `ret`, a `let` annotation), where it names this very
+    ///   enum at arguments;
+    /// - the type of the BINDING the value initializes (`let some = Some(1)`);
+    /// - the declared parameter of a plain call's argument (`take(None)`), where
+    ///   that type has no open parameter in it.
+    ///
+    /// For a payload variant the label belongs to the CALLEE (`Some` of
+    /// `Some(1)`), read through the call. A label with a hole in it
+    /// (`Unknown`) says nothing and is not tabled. Editor-only: empty without
+    /// the reading aids.
+    pub(super) fn variant_use_labels(
+        &self,
+        rows: &HoverRows,
+        expr_types: &HashMap<Id, String>,
+    ) -> Vec<(Id, String)> {
+        if !rows.every_view {
+            return Vec::new();
+        }
+        // The variant a reference names, where it is a variant of a generic
+        // enum, and which enum that is.
+        let variant_enum = |id: Id| -> Option<Id> {
+            let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&id) else {
+                return None;
+            };
+            let Some(Expr::EnumVariant(enum_id, _)) = self.expr_id_to_expr_map.get(target) else {
+                return None;
+            };
+            self.enums
+                .get(enum_id)
+                .is_some_and(|enum_| !enum_.generic_parameter_constraint_ids.is_empty())
+                .then_some(*enum_id)
+        };
+        let in_scope = |id: Id| -> bool {
+            !self.label_row_restored(id)
+                && self
+                    .source_of_id(id)
+                    .is_some_and(|source| self.renders_hover_rows(source, rows))
+        };
+        let wanted = |id: Id| -> bool { !expr_types.contains_key(&id) && in_scope(id) };
+        let empty = SubstitutionContext::default();
+        // The label of `type_id` where it is an instantiation of `enum_id`.
+        let label_of = |type_id: TypeId, enum_id: Id, ground: bool| -> Option<String> {
+            let Type::Enum(found, arguments) = type_id.borrow_type(self) else {
+                return None;
+            };
+            if *found != enum_id || arguments.is_empty() {
+                return None;
+            }
+            if ground && !self.type_is_ground(type_id) {
+                return None;
+            }
+            let label = self.pretty_print_type(type_id.borrow_type(self), &empty);
+            (!label.contains("Unknown") && !label.contains('?')).then_some(label)
+        };
+        // What a bare variant reference or a variant constructor CALL stands
+        // for: the id the label is keyed by (the reference) and the id the
+        // position's facts are keyed by (the reference, or its call).
+        let mut by_binding: HashMap<Id, TypeId> = HashMap::default();
+        // M148: the label lane only — a region whose record carried its
+        // label rows restores these with them (`expr_types`).
+        let live = &self.live_labels;
+        for (_, variable) in super::live_ranges::LiveEntries::over(&self.variables, live) {
+            if let Some(initial) = variable.initial
+                && in_scope(initial)
+            {
+                by_binding.insert(initial, variable.type_id);
+            }
+        }
+        let mut by_parameter: HashMap<Id, TypeId> = HashMap::default();
+        // The variant constructor calls: (callee, its enum, the call).
+        let mut variant_calls: Vec<(Id, Id, Id)> = Vec::new();
+        // The cheap, cache-hot test first: most of the world is std's.
+        for (call_id, call) in super::live_ranges::LiveEntries::over(&self.function_calls, live) {
+            if !in_scope(call.id) {
+                continue;
+            }
+            if let Some(enum_id) = variant_enum(call.subject_id) {
+                variant_calls.push((call.subject_id, enum_id, *call_id));
+                continue;
+            }
+            if call.argument_ids.is_empty() {
+                continue;
+            }
+            let Some(function) = self
+                .signature_site_callee(call.subject_id)
+                .and_then(|function_id| self.functions.get(&function_id))
+            else {
+                continue;
+            };
+            if function.parameters.len() != call.argument_ids.len() {
+                continue;
+            }
+            for (argument_id, parameter_id) in call.argument_ids.iter().zip(&function.parameters) {
+                if let Some(parameter) = self.parameters.get(parameter_id) {
+                    by_parameter.insert(*argument_id, parameter.type_id);
+                }
+            }
+        }
+        let mut labels: HashMap<Id, String> = HashMap::default();
+        let mut consider = |reference: Id, enum_id: Id, position: Id| {
+            if labels.contains_key(&reference) || !wanted(reference) {
+                return;
+            }
+            let label = self
+                .expected_types
+                .get(&position)
+                .and_then(|expected| label_of(*expected, enum_id, false))
+                .or_else(|| {
+                    by_binding
+                        .get(&position)
+                        .and_then(|bound| label_of(*bound, enum_id, false))
+                })
+                .or_else(|| {
+                    by_parameter
+                        .get(&position)
+                        .and_then(|declared| label_of(*declared, enum_id, true))
+                });
+            if let Some(label) = label {
+                labels.insert(reference, label);
+            }
+        };
+        // A variant constructor call: the label belongs to the callee.
+        for (callee, enum_id, call_id) in variant_calls {
+            consider(callee, enum_id, call_id);
+        }
+        // A bare variant reference.
+        for (id, _) in super::live_ranges::LiveEntries::over(&self.expected_types, live) {
+            if in_scope(*id)
+                && let Some(enum_id) = variant_enum(*id)
+            {
+                consider(*id, enum_id, *id);
+            }
+        }
+        for id in by_binding.keys().chain(by_parameter.keys()) {
+            if let Some(enum_id) = variant_enum(*id) {
+                consider(*id, enum_id, *id);
+            }
+        }
+        labels.into_iter().collect()
+    }
+
+    /// E316: the BOUND an implicit generic parameter stands for, where a
+    /// signature label should print it instead of the binder. An implicit
+    /// generic (`username: Signal<str>`, B186) has no name the reader wrote -
+    /// its bare rendering is the trait's name without its arguments (B261) -
+    /// so the label prints the bound as written. An explicit parameter
+    /// (`<S: Signal<str>>`) keeps its `S`, and a parameter the call site's
+    /// substitution already binds keeps the substitution's reading.
+    pub(super) fn implicit_parameter_bound(
+        &self,
+        type_id: TypeId,
+        substitution: &SubstitutionContext,
+    ) -> Option<TypeId> {
+        let Type::Generic(constraint_id) = type_id.borrow_type(self) else {
+            return None;
+        };
+        (self.implicit_generic_scopes.contains_key(constraint_id)
+            && !substitution.contains_key(constraint_id)
+            && matches!(constraint_id.borrow_type(self), Type::Trait(..)))
+        .then_some(*constraint_id)
+    }
+
     /// E240: the entry's type-position names that are a type parameter or a
     /// trait, rendered — every other row keeps its plain label.
-    pub(super) fn reference_hovers(&self, rows: &HoverRows) -> Vec<ReferenceHover> {
+    ///
+    /// M148: the TYPE-PARAMETER rows are a function of their region (the
+    /// parameter and the declaration introducing it), so a region whose
+    /// record carried them is not rendered again and the rendered ones are
+    /// answered recordable (the second vector, by index). The TRAIT rows are
+    /// not: E310's `implemented_by` lists every impl the row's FILE reaches,
+    /// which an impl in any other region moves — they render live on every
+    /// analysis.
+    pub(super) fn reference_hovers(&self, rows: &HoverRows) -> (Vec<ReferenceHover>, Vec<bool>) {
         let owners = self.generic_owners(rows);
         let mut hovers: Vec<ReferenceHover> = Vec::new();
+        let mut recordable: Vec<bool> = Vec::new();
         let mut seen: HashSet<(SourceId, Span)> = HashSet::default();
         // E310: the files each user file reaches (B515/B598's rule), asked
         // once, and only when a trait row needs it.
@@ -620,6 +838,7 @@ impl<'src> Analyzer<'src> {
             if !self.renders_hover_rows(*source, rows) || seen.contains(&(*source, *span)) {
                 continue;
             }
+            let restored = self.hover_row_restored_at(*source, span.start);
             match type_id.borrow_type(self) {
                 Type::Generic(constraint_id) => {
                     if self.implicit_generic_scopes.contains_key(constraint_id) {
@@ -645,7 +864,12 @@ impl<'src> Analyzer<'src> {
                                     rows.every_view,
                                 ),
                             });
+                            recordable.push(false);
                         }
+                        continue;
+                    }
+                    // M148: restored with its region's record.
+                    if restored {
                         continue;
                     }
                     let hover = ReferenceHover {
@@ -667,9 +891,11 @@ impl<'src> Analyzer<'src> {
                             span: **binder_span,
                             ..hover.clone()
                         });
+                        recordable.push(true);
                     }
                     seen.insert((*source, *span));
                     hovers.push(hover);
+                    recordable.push(true);
                 }
                 Type::Trait(trait_id, arguments) if *definition == Some(*trait_id) => {
                     let Some(block) = self.type_definition_block(*type_id) else {
@@ -689,11 +915,12 @@ impl<'src> Analyzer<'src> {
                             rows.every_view,
                         ),
                     });
+                    recordable.push(false);
                 }
                 _ => {}
             }
         }
-        hovers
+        (hovers, recordable)
     }
 
     /// E310: the subjects of `trait_id`'s impls that `source` reaches — an
@@ -876,36 +1103,50 @@ impl<'src> Analyzer<'src> {
     /// E237: the definition blocks for the entry's typed positions — every
     /// binding and parameter it declares, every member it reads, every field
     /// of a struct it declares — deduplicated by rendered type.
+    ///
+    /// M148: a position whose region restored its hover rows is not
+    /// rendered (its block comes back through
+    /// [`Analyzer::restore_type_definitions`]); the rendered positions are
+    /// answered as `(position, field index, block)` rows for the records.
     pub(super) fn type_definitions(
         &self,
         expr_type_ids: &HashMap<Id, TypeId>,
         rows: &HoverRows,
-    ) -> TypeDefinitions {
+    ) -> (TypeDefinitions, Vec<(Id, u32, u32)>) {
         let entry = |id: Id| {
-            self.source_of_id(id)
-                .is_some_and(|source| self.renders_hover_rows(source, rows))
+            !self.hover_row_restored(id)
+                && self
+                    .source_of_id(id)
+                    .is_some_and(|source| self.renders_hover_rows(source, rows))
         };
-        let mut positions: Vec<TypeId> = Vec::new();
+        let none = super::hover_records::FIELD_NONE;
+        let mut positions: Vec<(Id, u32, TypeId)> = Vec::new();
         for (id, variable) in &self.variables {
             if entry(*id) {
-                positions.push(variable.type_id);
+                positions.push((*id, none, variable.type_id));
             }
         }
         for (id, parameter) in &self.parameters {
             if entry(*id) {
-                positions.push(parameter.type_id);
+                positions.push((*id, none, parameter.type_id));
             }
         }
         for id in self.member_name_spans.keys() {
             if entry(*id)
                 && let Some(type_id) = expr_type_ids.get(id)
             {
-                positions.push(*type_id);
+                positions.push((*id, none, *type_id));
             }
         }
         for (id, struct_) in &self.structs {
             if entry(*id) {
-                positions.extend(struct_.fields.iter().map(|field| field.type_id));
+                positions.extend(
+                    struct_
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(index, field)| (*id, index as u32, field.type_id)),
+                );
             }
         }
         let empty = SubstitutionContext::default();
@@ -916,7 +1157,8 @@ impl<'src> Analyzer<'src> {
         // `Signal<Option<Channel>>` print alike and must not share a block
         // (E313 made the table every file's, where the two met in kolt).
         let mut by_label: HashMap<(String, Option<TypeId>), Option<u32>> = HashMap::default();
-        for type_id in positions {
+        for (_, _, type_id) in &positions {
+            let type_id = *type_id;
             if definitions.by_type.contains_key(&type_id) {
                 continue;
             }
@@ -938,7 +1180,13 @@ impl<'src> Analyzer<'src> {
                 definitions.by_type.insert(type_id, index);
             }
         }
-        definitions
+        let recorded = positions
+            .into_iter()
+            .filter_map(|(id, field, type_id)| {
+                Some((id, field, *definitions.by_type.get(&type_id)?))
+            })
+            .collect();
+        (definitions, recorded)
     }
 
     /// One type's definition block (E237), or `None` where there is nothing

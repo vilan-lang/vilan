@@ -183,7 +183,10 @@ macro fun Debug(item: Item): Source {
 		for variant in target.variants {
 			let arity = variant.payload.len();
 			if arity == 0 {
-				arms = arms.arm(i"{target.name}::{variant.name}", quote(i"{target.name}::{variant.name}"));
+				arms = arms.arm(
+					i"{target.name}::{variant.name}",
+					quote(i"{target.name}::{variant.name}"),
+				);
 			} else {
 				mut binds: List<str> = [];
 				mut parts: List<str> = [];

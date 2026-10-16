@@ -113,14 +113,29 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         crate::incremental::update_census(|census| census.seeded_passes += 1);
     }
     let seeds = async_set.clone();
-    let adaptation = loop {
+    // M138: the worklist re-runs whole while a round grows the async set, but
+    // the DECISIONS pass (each instance's emission data and its diagnostics,
+    // which reads the set and moves nothing) runs once, over the last round's
+    // stable flags: on kolt it was most of each round, and every round but the
+    // last threw its answer away.
+    let adaptive = adaptive_params_of(program);
+    ADAPTATION_INFERS.with(|count| count.set(count.get() + 1));
+    let worklist = loop {
         base_fixpoint(program, graph, &held_values, &mut async_set);
         let before = async_set.len();
-        let adaptation = compute_adaptation(program, graph, &held_values, &mut async_set);
+        let worklist = adaptation_worklist(program, graph, &held_values, &adaptive, &mut async_set);
         if async_set.len() == before {
-            break adaptation;
+            break worklist;
         }
     };
+    let adaptation = adaptation_decisions(
+        program,
+        graph,
+        &held_values,
+        &adaptive,
+        &async_set,
+        worklist,
+    );
     for (error, source) in adaptation.diagnostics {
         program.push_diagnostic(error, source);
     }
@@ -1116,20 +1131,17 @@ fn subject_head(program: &Program, subject: TypeId) -> Option<Id> {
 /// Like [`dispatch_candidates`], but with a resolved concrete RECEIVER type
 /// when a per-instantiation walk has one (platform coloring's refinement):
 /// only the members that type actually selects — its own impl's declared
-/// member, else the trait defaults its impls inherit. Nominal matching
+/// member, else the trait defaults its impls inherit, else (M133) the members
+/// of the BLANKET impls whose subject applies to it. Nominal matching
 /// (conditional impls over the same head both match) keeps it a sound
 /// over-approximation. A `None` receiver is the plain over-approximation.
 pub(crate) fn dispatch_candidates_for(
     program: &Program,
     call_id: Id,
-    receiver: Option<&Type>,
+    receiver: Option<TypeId>,
 ) -> Vec<Id> {
     let Some(receiver) = receiver else {
         return dispatch_candidates(program, call_id);
-    };
-    let receiver_head = match receiver {
-        Type::Struct(id, _) | Type::Enum(id, _) => *id,
-        _ => return dispatch_candidates(program, call_id),
     };
     let Some(dispatch) = dispatch_at(program, call_id) else {
         return Vec::new();
@@ -1137,14 +1149,40 @@ pub(crate) fn dispatch_candidates_for(
     let member = match dispatch {
         GenericDispatch::OnConstraint(_, member) | GenericDispatch::OnType(_, member) => member,
     };
+    let key = (receiver, member.to_string());
+    let cached = program.receiver_dispatch_memo().get(&key).cloned();
+    let selected = match cached {
+        Some(selected) => selected,
+        None => {
+            let computed =
+                std::sync::Arc::new(receiver_selected_members(program, receiver, member));
+            program
+                .receiver_dispatch_memo()
+                .insert(key, computed.clone());
+            computed
+        }
+    };
+    match selected.as_ref() {
+        Some(members) => members.clone(),
+        // Nothing the receiver selects is known (an unexpected receiver shape,
+        // or a generic left in it): stay sound.
+        None => dispatch_candidates(program, call_id),
+    }
+}
+
+/// [`dispatch_candidates_for`]'s memoized half: what a dispatch of `member`
+/// on the concrete `receiver` can select, or `None` when that cannot be told
+/// from the receiver (the caller takes every candidate).
+fn receiver_selected_members(program: &Program, receiver: TypeId, member: &str) -> Option<Vec<Id>> {
+    let receiver_head = match program.type_id_to_type_map.get(&receiver) {
+        Some(Type::Struct(id, _) | Type::Enum(id, _)) => *id,
+        _ => return None,
+    };
     let matching: Vec<&crate::analyzer::Implementation> = program
         .implementations
         .iter()
         .filter(|implementation| {
-            matches!(
-                program.type_id_to_type_map.get(&implementation.subject),
-                Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) if *id == receiver_head
-            )
+            subject_head(program, implementation.subject) == Some(receiver_head)
         })
         .collect();
     // The receiver's own impls: a declared member wins outright.
@@ -1153,10 +1191,60 @@ pub(crate) fn dispatch_candidates_for(
         .filter_map(|implementation| implementation.declarations.get(member).copied())
         .collect();
     if !declared.is_empty() {
-        return declared;
+        return Some(declared);
     }
     // Else the trait defaults those impls inherit.
-    let defaults: Vec<Id> = matching
+    let defaults = inherited_defaults(program, &matching, member);
+    if !defaults.is_empty() {
+        return Some(defaults);
+    }
+    // M133: no impl of the receiver's own head names the member, so what it
+    // reaches comes through a BLANKET impl — `impl type S: Flow<str> with
+    // Slot` for a `SignalCell<str>` receiver. Only the blankets whose subject
+    // APPLIES (the shape matches and every binder's bounds hold) can be
+    // selected at monomorphization, which is the same proof impl selection
+    // makes there; before this, a receiver that implements `Slot` through a
+    // blanket walked every `Slot` impl in std. The proof needs the receiver
+    // whole: a type still carrying a generic cannot be proved against a bound,
+    // and is left to the whole list.
+    if !type_is_ground(program, receiver, 0) {
+        return None;
+    }
+    let blankets: Vec<&crate::analyzer::Implementation> = program
+        .implementations
+        .iter()
+        .filter(|implementation| {
+            subject_head(program, implementation.subject).is_none()
+                && (implementation.declarations.contains_key(member)
+                    || implementation.trait_ids.iter().any(|trait_id| {
+                        program
+                            .traits
+                            .get(trait_id)
+                            .is_some_and(|trait_| trait_.declarations.contains_key(member))
+                    }))
+                && crate::impl_select::subject_applies(program, implementation.subject, receiver)
+        })
+        .collect();
+    let mut selected: Vec<Id> = Vec::new();
+    for implementation in &blankets {
+        match implementation.declarations.get(member) {
+            Some(declared) => selected.push(*declared),
+            None => selected.extend(inherited_defaults(program, &[implementation], member)),
+        }
+    }
+    selected.dedup();
+    // A ground receiver that applies to no blanket either is a shape this
+    // narrowing does not know: stay sound.
+    (!selected.is_empty()).then_some(selected)
+}
+
+/// The trait defaults for `member` that `implementations` inherit.
+fn inherited_defaults(
+    program: &Program,
+    implementations: &[&crate::analyzer::Implementation],
+    member: &str,
+) -> Vec<Id> {
+    implementations
         .iter()
         .flat_map(|implementation| implementation.trait_ids.iter())
         .filter_map(|trait_id| {
@@ -1165,12 +1253,31 @@ pub(crate) fn dispatch_candidates_for(
                 .get(trait_id)
                 .and_then(|trait_| trait_.declarations.get(member).copied())
         })
-        .collect();
-    if !defaults.is_empty() {
-        return defaults;
+        .collect()
+}
+
+/// Whether `type_id` names a type with no generic left in it — the only kind
+/// a blanket impl's bounds can be proved against outside an instantiation.
+fn type_is_ground(program: &Program, type_id: TypeId, depth: u32) -> bool {
+    if depth > 16 {
+        return false;
     }
-    // Nothing nominal matched (an unexpected receiver shape): stay sound.
-    dispatch_candidates(program, call_id)
+    let all = |ids: &[TypeId]| ids.iter().all(|id| type_is_ground(program, *id, depth + 1));
+    match program.type_id_to_type_map.get(&type_id) {
+        Some(
+            Type::Struct(_, arguments)
+            | Type::Enum(_, arguments)
+            | Type::Trait(_, arguments)
+            | Type::Dyn(_, arguments),
+        ) => all(arguments),
+        Some(Type::Tuple(elements, _)) => all(elements),
+        Some(Type::Array(element, length)) => all(&[*element, *length]),
+        Some(Type::Closure(parameters, return_type, _, _)) => {
+            all(parameters) && type_is_ground(program, *return_type, depth + 1)
+        }
+        Some(Type::Length(_) | Type::Function(_) | Type::Module(_) | Type::Never) => true,
+        _ => false,
+    }
 }
 
 /// The `GenericDispatch` recorded for a call site — keyed by the call id (an
@@ -1342,27 +1449,67 @@ fn record_origin(origins: &mut HashMap<InstanceKey, Id>, key: &InstanceKey, call
     }
 }
 
-fn compute_adaptation(
+/// The component of a root function: itself plus its transitively nested
+/// closures — they share the instance's bits context.
+fn component_of(graph: &CallGraph, root: Id) -> Vec<Id> {
+    let mut members = vec![root];
+    let mut cursor = 0;
+    while cursor < members.len() {
+        if let Some(children) = graph.closure_children_of(members[cursor]) {
+            members.extend(children.iter().copied());
+        }
+        cursor += 1;
+    }
+    members
+}
+
+thread_local! {
+    /// M138's instrument: the passes (one per analysis, a macro world's
+    /// included), the worklist ROUNDS and the DECISIONS passes this thread ran
+    /// since the last [`reset_adaptation_counts`]. The answer is the
+    /// same either way, so only the counts can see that the decisions run once.
+    static ADAPTATION_INFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ADAPTATION_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ADAPTATION_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(passes, worklist rounds, decisions passes)` on this thread since the
+/// last [`reset_adaptation_counts`].
+pub fn adaptation_counts() -> (usize, usize, usize) {
+    (
+        ADAPTATION_INFERS.with(std::cell::Cell::get),
+        ADAPTATION_ROUNDS.with(std::cell::Cell::get),
+        ADAPTATION_DECISIONS.with(std::cell::Cell::get),
+    )
+}
+
+/// Zeroes this thread's [`adaptation_counts`].
+pub fn reset_adaptation_counts() {
+    ADAPTATION_INFERS.with(|count| count.set(0));
+    ADAPTATION_ROUNDS.with(|count| count.set(0));
+    ADAPTATION_DECISIONS.with(|count| count.set(0));
+}
+
+/// One round of the instance worklist's answer: every instance key the round
+/// discovered with its async flag, and the call each was first instantiated by.
+struct Worklist {
+    instance_async: HashMap<InstanceKey, bool>,
+    origins: HashMap<InstanceKey, Id>,
+}
+
+/// One round of the instance worklist (async-polymorphism.md A.1): every
+/// function as its base instance, every instance a call discovers, until each
+/// flag is stable over `async_set` — which a base instance's flips extend.
+/// The caller re-runs a round from scratch while a round grows the set.
+fn adaptation_worklist(
     program: &Program,
     graph: &CallGraph,
     held_values: &HashMap<Id, Vec<Id>>,
+    adaptive: &HashMap<Id, HashSet<Id>>,
     async_set: &mut HashSet<Id>,
-) -> Adaptation {
-    let adaptive = adaptive_params_of(program);
-
-    // The component of a root function: itself plus its transitively nested
-    // closures — they share the instance's bits context.
-    let component = |root: Id| -> Vec<Id> {
-        let mut members = vec![root];
-        let mut cursor = 0;
-        while cursor < members.len() {
-            if let Some(children) = graph.closure_children_of(members[cursor]) {
-                members.extend(children.iter().copied());
-            }
-            cursor += 1;
-        }
-        members
-    };
+) -> Worklist {
+    ADAPTATION_ROUNDS.with(|count| count.set(count.get() + 1));
+    let component = |root: Id| component_of(graph, root);
 
     let mut instance_async: HashMap<InstanceKey, bool> = HashMap::default();
     let mut origins: HashMap<InstanceKey, Id> = HashMap::default();
@@ -1384,7 +1531,7 @@ fn compute_adaptation(
                     program,
                     held_values,
                     async_set,
-                    &adaptive,
+                    adaptive,
                     &HashMap::default(),
                     &[],
                     callee,
@@ -1425,7 +1572,7 @@ fn compute_adaptation(
                                 program,
                                 held_values,
                                 async_set,
-                                &adaptive,
+                                adaptive,
                                 &flags,
                                 bits,
                                 callee,
@@ -1512,8 +1659,29 @@ fn compute_adaptation(
         }
     }
 
-    // --- Final pass: with every flag stable, collect each instance's
-    // emission decisions and the context-dependent diagnostics.
+    Worklist {
+        instance_async,
+        origins,
+    }
+}
+
+/// The worklist's decisions, over its LAST round (every flag stable, the async
+/// set final): each instance's emission data and the context-dependent
+/// diagnostics. Reads the set; moves nothing.
+fn adaptation_decisions(
+    program: &Program,
+    graph: &CallGraph,
+    held_values: &HashMap<Id, Vec<Id>>,
+    adaptive: &HashMap<Id, HashSet<Id>>,
+    async_set: &HashSet<Id>,
+    worklist: Worklist,
+) -> Adaptation {
+    let Worklist {
+        instance_async,
+        origins,
+    } = worklist;
+    ADAPTATION_DECISIONS.with(|count| count.set(count.get() + 1));
+    let component = |root: Id| component_of(graph, root);
     let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::default();
     let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
     let mut reported: HashSet<(Id, Id)> = HashSet::default();
@@ -1550,7 +1718,17 @@ fn compute_adaptation(
             .iter()
             .map(|member| (*member, async_set.contains(member)))
             .collect();
+        // A BASE instance's flags are the async set's already: the last round
+        // re-evaluated it against every final callee verdict (a flip re-queues
+        // its dependents) and wrote each member it flipped into the set — and
+        // that round wrote nothing new, or it would not have been the last. So
+        // the loop below would find no member to flip, and only an adapted
+        // instance (whose bits make its members async where the set does not)
+        // runs it.
         loop {
+            if bits.is_empty() {
+                break;
+            }
             let mut changed = false;
             for member in &members {
                 if flags[member] {
@@ -1566,7 +1744,7 @@ fn compute_adaptation(
                                     program,
                                     held_values,
                                     async_set,
-                                    &adaptive,
+                                    adaptive,
                                     &flags,
                                     bits,
                                     callee,
@@ -1623,7 +1801,7 @@ fn compute_adaptation(
                             program,
                             held_values,
                             async_set,
-                            &adaptive,
+                            adaptive,
                             &flags,
                             bits,
                             callee,

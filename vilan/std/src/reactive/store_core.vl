@@ -799,7 +799,12 @@ export impl Option<type P: Storable> with Storable {
 			},
 			Some(let held) => match other {
 				None => store_switch(node, 1, 1, woken),
-				Some(let written) => held.store_diff(&written, store_kid(node, 1), need || store_has_me(node), woken),
+				Some(let written) => held.store_diff(
+					&written,
+					store_kid(node, 1),
+					need || store_has_me(node),
+					woken,
+				),
 			},
 		};
 		store_wake_me(node, changed, woken);

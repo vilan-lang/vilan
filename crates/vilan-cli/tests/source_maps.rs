@@ -148,6 +148,117 @@ fn a_release_build_writes_none_unless_asked_and_removes_a_stale_one() {
     assert_eq!(map["sources"], serde_json::json!(["main.vl"]));
 }
 
+/// E257 S7: the `.vdbg.json` sidecar rides with the map — beside it, under the
+/// same switches, removed with it — and names what the script declares, so a
+/// debugger's frame finds its bindings by their JavaScript names.
+#[test]
+fn s7_the_sidecar_is_written_beside_the_map_and_goes_with_it() {
+    let directory = project("sidecar");
+    write(&directory, "src/main.vl", PROGRAM);
+    write(&directory, "vilan.toml", "[package]\nname = \"maps\"\n");
+    let output = vilan()
+        .arg("build")
+        .current_dir(&directory)
+        .output()
+        .expect("run vilan");
+    succeeded(&output, "vilan build");
+    let sidecar = map_json(&directory.join("src/main.mjs.vdbg.json"));
+    assert_eq!(sidecar["version"], 1);
+    assert_eq!(sidecar["file"], "main.mjs");
+    let script = std::fs::read_to_string(directory.join("src/main.mjs")).expect("main.mjs");
+    let frames = sidecar["frames"].as_array().expect("frames");
+    let area = frames
+        .iter()
+        .find(|frame| frame["name"] == "area")
+        .expect("`area` is a frame");
+    let names: Vec<&str> = area["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|binding| binding["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(names, ["width", "height", "product"]);
+    assert!(script.contains(&format!(
+        "function {}(",
+        area["js"].as_str().expect("named")
+    )));
+
+    // A release build writes no map, and so no sidecar: the stale one goes.
+    write(
+        &directory,
+        "vilan.toml",
+        "[package]\nname = \"maps\"\n\n[build]\npreset = \"release\"\n",
+    );
+    let output = vilan()
+        .arg("build")
+        .current_dir(&directory)
+        .output()
+        .expect("run vilan");
+    succeeded(&output, "vilan build (release)");
+    assert!(!directory.join("src/main.mjs.map").exists());
+    assert!(
+        !directory.join("src/main.mjs.vdbg.json").exists(),
+        "a build without a map removes the stale sidecar"
+    );
+
+    // `--source-maps` under release: the rows name the minified script's own
+    // bindings (`area` itself is folded away there: `first` is a constant).
+    let output = vilan()
+        .args(["build", "--source-maps"])
+        .current_dir(&directory)
+        .output()
+        .expect("run vilan");
+    succeeded(&output, "vilan build --source-maps (release)");
+    let script = std::fs::read_to_string(directory.join("src/main.mjs")).expect("main.mjs");
+    let sidecar = map_json(&directory.join("src/main.mjs.vdbg.json"));
+    let main = sidecar["frames"]
+        .as_array()
+        .expect("frames")
+        .iter()
+        .find(|frame| frame["kind"] == "main")
+        .expect("`main` is a frame");
+    let first = main["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .find(|binding| binding["name"] == "first")
+        .expect("`first` has a row");
+    let js = first["js"].as_str().expect("a JS name");
+    assert_ne!(js, "first", "release renames it");
+    assert!(
+        script.contains(&format!("const {js}=")),
+        "`{js}` in:\n{script}"
+    );
+}
+
+/// `vilan run` writes its temp script's sidecar beside its map, and removes
+/// both when the program ends. The run's temp directory is pointed at a
+/// scratch one of this test's (`TMPDIR`, and `TMP`/`TEMP` on Windows), so what
+/// it leaves is this run's alone.
+#[test]
+fn s7_run_leaves_no_script_map_or_sidecar_behind() {
+    let directory = project("run_sidecar");
+    write(&directory, "main.vl", PROGRAM);
+    let temp = directory.join("temp");
+    std::fs::create_dir_all(&temp).expect("the run's temp directory");
+    let output = vilan()
+        .args(["run", "main.vl"])
+        .current_dir(&directory)
+        .env("TMPDIR", &temp)
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
+        .output()
+        .expect("run vilan");
+    succeeded(&output, "vilan run");
+    let left: Vec<String> = std::fs::read_dir(&temp)
+        .expect("the run's temp directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("vilan-run-"))
+        .collect();
+    assert!(left.is_empty(), "the run left {left:?} behind");
+}
+
 #[test]
 fn the_manifest_turns_the_debug_presets_map_off() {
     let directory = project("off");

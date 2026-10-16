@@ -68,7 +68,16 @@ fun main() {
 		reply_store(request, global)
 	});
 	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
-	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
+	let g: RemoteStoreSome<Global> = mint_store(
+		client,
+		|| call_reading(
+			local,
+			codec,
+			"global",
+			[],
+			|reply: Deserializer| read_store_reply<Global>(reply, false),
+		),
+	);
 	let page = Owner::new();
 	run_with_owner(page, || {
 		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));

@@ -81,7 +81,9 @@ fun main() {
 		.port(0)
 		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
 		.on_request(|request| Response::builder().code(404).body("nope").build())
-		.on_start(|server| print(i"vilan-test-port={server.port()} contract={chat.contract_hash()}"))
+		.on_start(
+			|server| print(i"vilan-test-port={server.port()} contract={chat.contract_hash()}"),
+		)
 		.build()
 		.start();
 }

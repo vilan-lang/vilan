@@ -1248,9 +1248,10 @@ fn a_wire_type_may_carry_a_handle_field() {
 fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
     // A name is not the thing it names: `Handle<T>` is sendable whatever `T` is
     // — the point of the naming layer (the entity stays on the server). The
-    // generic argument is deliberately unconstrained, which is sound only
-    // because a derived type's parameters are necessarily phantom
-    // (`a_wire_type_with_a_parameter_typed_field_is_rejected` is the other half).
+    // generic argument is deliberately unconstrained: `Handle`'s parameter is
+    // phantom (no field mentions it), so its derived impl binds it bare. Since
+    // B633 a REACHED parameter binds `Wire` instead
+    // (`b633_a_wire_type_with_a_parameter_typed_field_binds_its_parameter`).
     //
     // B194 is why this still holds now that derived impls carry bounds: the
     // trait binds only the parameters the generated body REACHES, and a phantom
@@ -1273,20 +1274,70 @@ fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
 }
 
 #[test]
-fn a_wire_type_with_a_parameter_typed_field_is_rejected() {
-    // The guard behind C7's unconstrained generic arguments: a `[derive(Wire)]`
-    // type whose field is typed by a PARAMETER is rejected at its own
-    // declaration, so no derived type can put a generic argument on the wire.
-    // B194 made the generators generic-aware, and this guard is what keeps
-    // `Wire`'s parameters phantom-only, so a `Wire` impl never binds one. If
-    // this rule is ever relaxed, `is_wire_type` must start checking the
-    // arguments on the same day.
-    assert_fails_with(
+fn b633_a_wire_type_with_a_parameter_typed_field_binds_its_parameter() {
+    // C7's guard, retired by B633: a `[derive(Wire)]` type whose field is
+    // typed by a PARAMETER was rejected at its own declaration, so every Wire
+    // parameter was phantom and `resolved_type_is_wire` answered a derived
+    // name whatever its arguments. The derive binds every REACHED parameter
+    // under `Wire` (`impl Pair<type T: Wire> with Wire`), the boundary reads
+    // each field under those binders, and a generic derived type is judged by
+    // its ARGUMENTS through the impl table — the guard and the name answer
+    // retired on the same day, as this pin's old comment required.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
+        import std::wire::Wire;
+        import std::json::{ encode_json, decode_json };
+        import std::result::Result::{ self, Ok, Err };
         [derive(Wire)]
         struct Pair<T> { value: T, count: i32 }
+        fun main() {
+            let carried: Result<Pair<str>, str> =
+                decode_json(encode_json(Pair { value = "v", count = 2 }));
+            match carried {
+                Ok(let pair) => print(i"{pair.value} {pair.count}"),
+                Err(let reason) => print(reason),
+            }
+        }
+        main();
         "#,
-        "which is not Wire",
+        "v 2\n",
+    );
+}
+
+#[test]
+fn b633_an_unbounded_parameter_sending_a_generic_wire_type_is_refused_naming_the_bound() {
+    // The negative twin: the parameter a derived impl binds under `Wire` is
+    // the CALLER's to bound. A generic function sending `Pair<T>` at an
+    // unbounded `T` is refused, and the refusal names the bound to add — the
+    // impl exists, only `T: Wire` is missing.
+    assert_fails_with(
+        r#"
+        import std::wire::Wire;
+        import std::json::encode_json;
+        [derive(Wire)]
+        struct Pair<T> { value: T, count: i32 }
+        fun send<T>(pair: Pair<T>): str {
+            encode_json(pair)
+        }
+        fun main() {}
+        "#,
+        "'Pair<T>' does not implement trait 'Wire', required by a generic bound of this \
+         call; generic parameter 'T' is missing the bound ': Wire' its impl asks of it",
+    );
+    // A concrete argument the binder refuses names the instance, not a bound.
+    assert_fails_with(
+        r#"
+        import std::wire::Wire;
+        import std::json::encode_json;
+        struct Opaque { tag: i32 }
+        [derive(Wire)]
+        struct Pair<T> { value: T, count: i32 }
+        fun main() {
+            let _text = encode_json(Pair { value = Opaque { tag = 1 }, count = 1 });
+        }
+        "#,
+        "'Pair<Opaque>' does not implement trait 'Wire', required by a generic bound of this call",
     );
 }
 
@@ -10913,6 +10964,103 @@ fn f135_a_read_beside_arguments_that_write_no_cell_of_its_own_is_not_copied() {
     );
 }
 
+/// B634's program: `cell` IS written in place somewhere (`grow`), so before
+/// B634 any call through a closure value beside a read of it — `touch()`,
+/// whose literal writes nothing — counted as "may write any written cell" and
+/// copied the read. `main` is filled in per pin.
+fn b634_program(main: &str) -> String {
+    format!(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun grow(cell: Shared<List<i32>>): i32 {{\n",
+            "\tcell.write().push(9);\n",
+            "\t9\n",
+            "}}\n",
+            "fun has(items: List<i32>, value: i32): bool {{\n",
+            "\titems.contains(value)\n",
+            "}}\n",
+            "fun probe(cell: Shared<List<i32>>, f: || i32): bool {{\n",
+            "\thas(cell.read(), f())\n",
+            "}}\n",
+            "fun main() {{\n",
+            "{main}",
+            "\tprint(grow(Shared::new([1])));\n",
+            "}}\n",
+        ),
+        main = main
+    )
+}
+
+#[test]
+fn b634_a_read_beside_a_closure_literal_that_writes_nothing_is_not_copied() {
+    // A let-bound literal, an alias of it, and a literal applied where it is
+    // written: each body writes no cell, so the read beside its call is the
+    // cell's own storage, uncopied (B457's summary of the literal's body).
+    let emitted = compile(&b634_program(concat!(
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tlet touch = || 9;\n",
+        "\tlet again = touch;\n",
+        "\tprint(has(cell.read(), touch()));\n",
+        "\tprint(has(cell.read(), again()));\n",
+        "\tprint(has(cell.read(), (|| 9)()));\n",
+        "\tcell.write().push(3);\n",
+    )))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a read beside a closure literal that writes no cell must not be copied:\n{emitted}"
+    );
+}
+
+#[test]
+fn b634_a_read_beside_a_closure_literal_that_writes_its_cell_is_a_copy() {
+    // The literal's body writes the cell in place — directly, and through a
+    // function it calls — so the read is copied where it stands (F135), and
+    // the callee answers from the items before the write on both backends.
+    assert_compiles_and_runs(
+        &b634_program(concat!(
+            "\tlet cell = Shared::new([1, 2]);\n",
+            "\tlet push = || {\n",
+            "\t\tcell.write().push(9);\n",
+            "\t\t9\n",
+            "\t};\n",
+            "\tprint(has(cell.read(), push()));\n",
+            "\tlet other = Shared::new([1, 2]);\n",
+            "\tlet through = || grow(other);\n",
+            "\tprint(has(other.read(), through()));\n",
+            "\tlet third = Shared::new([1, 2]);\n",
+            "\tprint(has(third.read(), (|| grow(third))()));\n",
+        )),
+        "false\nfalse\nfalse\n9\n",
+    );
+}
+
+#[test]
+fn b634_a_read_beside_a_closure_value_of_unknown_origin_is_still_a_copy() {
+    // A closure PARAMETER and a `mut` binding (which may be re-bound to any
+    // closure) are unknown statically: the call answers whether any write
+    // mutates the cell in place, and `cell` is written in place, so the read
+    // is copied — `probe` copies `cell.read()` beside `f()` whatever `f` is.
+    let emitted = compile(&b634_program(concat!(
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tmut later = || 9;\n",
+        "\tprint(has(cell.read(), later()));\n",
+        "\tlater = || grow(cell);\n",
+        "\tprint(probe(cell, later));\n",
+    )))
+    .expect("compiles");
+    for copied in [
+        "has(__clone(cell.v), later())",
+        "has(__clone(cell2.v), f())",
+    ] {
+        assert!(
+            emitted.contains(copied),
+            "a read beside a closure value of unknown origin is copied (`{copied}`):\n{emitted}"
+        );
+    }
+}
+
 #[test]
 fn a_mut_self_call_on_a_reads_field_does_not_write_the_cell() {
     // B274 copied a bare `cell.read()` standing as a `&mut self` receiver;
@@ -14079,5 +14227,253 @@ fn b578_a_view_of_a_call_result_in_a_generic_body_pairs_per_instance() {
         }
         "#,
         "[5]\n[s]\n[7]\n[t]\n",
+    );
+}
+
+// --- F141: an assignment through `Shared::read()` ---------------------------
+//
+// Spec §6.7: `read()` answers a COPY of the cell's value, so `cell.read().count
+// = 3` writes a copy nothing keeps. It checked clean and the backends split:
+// natively the write was lost (0, 1), while JS — whose read aliased the cell —
+// wrote the cell (3, 7). Refused at the target, rewritten through `write()`.
+
+const F141_BAG: &str = r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        struct Bag {
+            count: i32,
+            items: List<i32>,
+            pair: (i32, i32),
+        }
+
+        fun fresh(): Shared<Bag> {
+            Shared::new(Bag { count = 0, items = [1], pair = (2, 3) })
+        }
+"#;
+
+#[test]
+fn f141_an_assignment_through_a_read_is_refused() {
+    for (statement, read, rewritten) in [
+        (
+            "cell.read().count = 3;",
+            "cell.read()",
+            "cell.write().count = 3",
+        ),
+        (
+            "cell.read().items[0] = 7;",
+            "cell.read()",
+            "cell.write().items[0] = 7",
+        ),
+        (
+            "cell.read().count += 1;",
+            "cell.read()",
+            "cell.write().count += 1",
+        ),
+        (
+            "cell.read().pair.0 = 9;",
+            "cell.read()",
+            "cell.write().pair.0 = 9",
+        ),
+        (
+            "holder.cell.read().count = 4;",
+            "holder.cell.read()",
+            "holder.cell.write().count = 4",
+        ),
+    ] {
+        let source = format!(
+            "{F141_BAG}
+        struct Holder {{
+            cell: Shared<Bag>,
+        }}
+
+        fun main() {{
+            let cell = fresh();
+            let holder = Holder {{ cell = fresh() }};
+            {statement}
+            print(cell.read().count + holder.cell.read().count);
+        }}
+        "
+        );
+        let write = read.replace("read()", "write()");
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`{read}` is a copy, so this assignment is lost; write through `{write}`: \
+                 `{rewritten}`"
+            ),
+        );
+    }
+}
+
+/// F141's boundary: the `write()` spelling, a `mut` copy of a read written
+/// whole, and reads themselves are untouched.
+#[test]
+fn f141_writing_through_write_or_into_a_copy_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{F141_BAG}{}",
+            r#"
+        fun main() {
+            let cell = fresh();
+            cell.write().count = 3;
+            cell.write().items[0] = 7;
+            cell.write().pair.0 = 9;
+            mut copy = cell.read();
+            copy.count = 40;
+            print(cell.read().count);
+            print(cell.read().items[0]);
+            print(cell.read().pair.0);
+            print(copy.count);
+        }
+        main();
+        "#
+        ),
+        "3\n7\n9\n40\n",
+    );
+}
+
+// --- B626: a module scalar read only through a view -------------------------
+//
+// The transformer's module-binding tree-shake (F6) keeps the bindings emitted
+// code referenced, and naming a boxed scalar's CELL for a view (`read(&LIMIT)`)
+// recorded no reference — so a `let`/`const let` scalar read nowhere by value
+// was shaken out and the bundle threw `ReferenceError: LIMIT is not defined`
+// (natively it printed 41). The item's premise — the analyzer's reference count
+// — was wrong: that count was 1.
+
+#[test]
+fn b626_a_module_scalar_read_only_through_a_view_is_declared() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        const let LIMIT = 40;
+        let LOOSE = 50;
+        mut COUNTER = 7;
+        let LATER = 60;
+
+        fun read(value: &i32): i32 {
+            *value + 1
+        }
+
+        fun bump(value: &mut i32) {
+            value += 1;
+        }
+
+        fun main() {
+            print(read(&LIMIT));
+            print(read(&LOOSE));
+            bump(&mut COUNTER);
+            print(read(&COUNTER));
+            let later = || read(&LATER);
+            print(later());
+        }
+        main();
+        "#,
+        "41\n51\n9\n61\n",
+    );
+}
+
+// --- native-53's B?2: a lent place's root re-bound by a later argument --------
+//
+// Spec §6.4 (rule 4): `log.items.push({ log = fresh(); 9 })` re-binds the root
+// of the place the call lends `&mut` while the view is live. It checked clean;
+// JS wrote the object `log` held when the receiver was evaluated (the new `log`
+// stayed empty) and rustc refused the native emission (E0506, reported as a
+// backend defect). Refused at the re-bind. A binding a closure captures is
+// F138's — both backends read it after the later arguments.
+
+const LENT_ROOT_LOG: &str = r#"
+        import std::io::print;
+
+        struct Log {
+            items: List<i32>,
+            count: i32,
+        }
+
+        impl Log {
+            fun bump(&mut self, by: i32) {
+                self.count += by;
+            }
+        }
+
+        fun fresh(): Log {
+            Log { items = [], count = 0 }
+        }
+
+        fun add(target: &mut List<i32>, item: i32) {
+            target.push(item);
+        }
+"#;
+
+#[test]
+fn a_lent_places_root_rebound_by_a_later_argument_is_refused() {
+    for (statement, lent, settled) in [
+        (
+            "log.items.push({ log = fresh(); 9 });",
+            "log.items",
+            "let item = { log = fresh(); 9 }; log.items.push(item)",
+        ),
+        (
+            "log.bump({ log = fresh(); 9 });",
+            "log",
+            "let item = { log = fresh(); 9 }; log.bump(item)",
+        ),
+        (
+            "add(&mut log.items, { log = fresh(); 9 });",
+            "log.items",
+            "let item = { log = fresh(); 9 }; add(&mut log.items, item)",
+        ),
+    ] {
+        let source = format!(
+            "{LENT_ROOT_LOG}
+        fun main() {{
+            mut log = fresh();
+            {statement}
+            print(log.items.len());
+        }}
+        "
+        );
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`log` is re-bound while `{lent}` is lent `&mut` to this call, which would \
+                 write the value `log` held before; settle the value first: `{settled}`"
+            ),
+        );
+    }
+}
+
+/// B?2's boundary: the settled form, a write that does not re-bind the root,
+/// and a CAPTURED binding (F138: read after the later arguments, so the call
+/// writes the new binding) all compile.
+#[test]
+fn a_settled_value_or_a_captured_root_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{LENT_ROOT_LOG}{}",
+            r#"
+        fun main() {
+            mut log = fresh();
+            let item = {
+                log = fresh();
+                9
+            };
+            log.items.push(item);
+            print(log.items.len());
+            mut captured = fresh();
+            let peek = || captured.items.len();
+            captured.items.push({
+                captured = fresh();
+                9
+            });
+            print(captured.items.len());
+            print(peek());
+        }
+        main();
+        "#
+        ),
+        "1\n1\n1\n",
     );
 }

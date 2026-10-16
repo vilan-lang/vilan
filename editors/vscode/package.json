@@ -2,7 +2,7 @@
   "name": "vilan",
   "displayName": "Vilan",
   "description": "Language support for Vilan: live diagnostics, completion with signatures, hover, inlay hints, semantic highlighting, go to definition, find references, rename, formatting, and Organize Imports.",
-  "version": "0.50.0",
+  "version": "0.51.0",
   "publisher": "vilan-lang",
   "license": "MIT OR Apache-2.0",
   "icon": "icon.png",
@@ -118,6 +118,19 @@
                 ],
                 "description": "Where the program's input and output go. The terminal keeps stdin (`scan()`).",
                 "default": "integratedTerminal"
+              },
+              "adapter": {
+                "type": "string",
+                "enum": [
+                  "vilan",
+                  "js-debug"
+                ],
+                "enumDescriptions": [
+                  "vilan-dap: the Variables and Watch panes print values as `dbg` does (`Point { x = 1, y = 2 }`), by their static types.",
+                  "VS Code's JavaScript debugger: values as JavaScript holds them (`[1, 2]`)."
+                ],
+                "description": "Which debugger runs the session. Default: `vilan`.",
+                "default": "vilan"
               }
             }
           }
@@ -133,7 +146,7 @@
         "configurationSnippets": [
           {
             "label": "Vilan: Launch",
-            "description": "Debug a vilan program: `vilan run --inspect-brk` with its source map, breakpoints in .vl files.",
+            "description": "Debug a vilan program: breakpoints in .vl files, values printed as `dbg` prints them.",
             "body": {
               "type": "vilan",
               "request": "launch",

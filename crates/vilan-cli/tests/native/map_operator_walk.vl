@@ -42,7 +42,19 @@ fun main() {
 		let followed_sum = cell
 			.sum_by(|v| flag_for(flags, v).derive(|on| if on { v } else { 0 }))
 			.memo();
-		(values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count, followed_sum)
+		(
+			values,
+			entries,
+			tens,
+			signed,
+			odd,
+			followed,
+			counted,
+			summed,
+			odd_values,
+			followed_count,
+			followed_sum
+		)
 	});
 	let (values, entries, tens, signed, odd, followed, counted, summed, odd_values, followed_count, followed_sum) = outs;
 	mut failures = 0;

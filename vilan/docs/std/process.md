@@ -747,6 +747,7 @@ struct LegBuild {
 	bundle: str,            // `client.js`
 	styles: Option<str>,    // `client.css`, or None if the leg compiled no styles
 	chunks: List<str>,      // route chunks, empty unless the leg splits
+	maps: List<str>,        // source maps beside the bundle and chunks, if written
 	classic_script: bool,   // true exactly when it splits
 	assets: List<str>,      // resources the const asset channel carried in
 }
@@ -775,6 +776,13 @@ instead — the url spelled at the call, minus its leading `/` — and is served
 and read exactly the same way, which is why a fingerprinted or path-pinned
 name needs nothing here. A build written before bundling existed carries no
 `assets` field and reads as a build with none, which is what it was.
+
+`maps` are the source maps the build wrote beside the bundle and each chunk
+(`client.js.map`), so a served page's DevTools finds the `.vl` sources: a
+built bundle names its map on its last line, and `serve_build` answers it
+at `/client.js.map` instead of leaving the request to the app's catch-all.
+The `debug` preset writes them; a `release` build writes one only when
+`[build] source-maps = true` asks, and lists exactly what it wrote.
 
 ## std::web::document
 

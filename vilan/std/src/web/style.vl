@@ -366,10 +366,14 @@ fun check_custom_property_name(name: str) {
 
 fun check_oklch(lightness: f64, chroma: f64, hue: f64) {
 	if lightness < 0.0 || lightness > 1.0 {
-		panic(i"oklch lightness {lightness} is outside 0.0-1.0 (the CSS number form — 1.0 is white)");
+		panic(
+			i"oklch lightness {lightness} is outside 0.0-1.0 (the CSS number form — 1.0 is white)",
+		);
 	}
 	if chroma < 0.0 || chroma > 0.5 {
-		panic(i"oklch chroma {chroma} is outside 0.0-0.5 (0 is achromatic; sRGB tops out near 0.37)");
+		panic(
+			i"oklch chroma {chroma} is outside 0.0-0.5 (0 is achromatic; sRGB tops out near 0.37)",
+		);
 	}
 	if hue < 0.0 || hue > 360.0 {
 		panic(i"oklch hue {hue} is outside 0.0-360.0 (degrees; angles wrap, so write the canonical turn)");
@@ -2154,7 +2158,12 @@ export impl Style {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
 					let composed = compose_condition(set, slot.media, slot.condition);
-					out = out.rule(condition_set_media(composed), condition_set_text(composed), slot.property, declaration);
+					out = out.rule(
+						condition_set_media(composed),
+						condition_set_text(composed),
+						slot.property,
+						declaration,
+					);
 				}
 				None => {}
 			}
@@ -2614,7 +2623,10 @@ export fun preflight() {
 	preflight_rule("body", declarations().raw("margin", "0").raw("line-height", "inherit"));
 
 	// The UA's margins, gone — the block elements that carry one by default.
-	preflight_rule("blockquote,dl,dd,h1,h2,h3,h4,h5,h6,hr,figure,p,pre", declarations().raw("margin", "0"));
+	preflight_rule(
+		"blockquote,dl,dd,h1,h2,h3,h4,h5,h6,hr,figure,p,pre",
+		declarations().raw("margin", "0"),
+	);
 	preflight_rule("fieldset", declarations().raw("margin", "0").raw("padding", "0"));
 	preflight_rule("legend", declarations().raw("padding", "0"));
 	preflight_rule("dialog", declarations().raw("padding", "0"));

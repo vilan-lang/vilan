@@ -268,25 +268,434 @@ impl std::fmt::Write for HashWriter<'_> {
     }
 }
 
-fn hash_node(node: &js::Node<'_>, hasher: &mut DefaultHasher) {
-    let _ = write!(HashWriter(hasher), "{node:?}");
-    // A separator no rendering ends with, so two node lists that concatenate
-    // to one text still hash apart.
-    hasher.write_u8(0xff);
+/// The key's hasher (N177): every lowered node by variant and CONTENT, and no
+/// entity id in it. The `Debug` rendering was the key before, and it carried
+/// the emitter's marks (`Mark`, `At`), the functions' and closures' `origin`s
+/// and — inside every DECLARED name — the id the emitter appends to keep
+/// names unique (`flush_stylesheet13056`): ids a world numbers by its shape,
+/// so kolt's 109 site keys read 79 different over a std-prefix world than
+/// over a canonical one for byte-identical output.
+///
+/// Three kinds of name, three spellings. A name bound INSIDE the program
+/// being hashed (a parameter, a `let`/`const`, a `for..of` binding, a label,
+/// a function's own name) hashes as the ordinal of its first occurrence in
+/// that program — a canonical renaming. A name that reaches a WORLD
+/// declaration hashes as that declaration's DIGEST: its own content under the
+/// same rules, memoized by address for the pass (`world_digests`: every site
+/// reaches into one lowering, so each declaration is digested once however
+/// many sites reach it); a declaration reached again while its own digest
+/// is being computed (recursion) hashes as a marker, and a digest that met
+/// one is not memoized, since it depends on where the walk started. A FREE
+/// name — a JS global, a helper, an import's binding — hashes by its text,
+/// since its identity is the name. The interpreter reads none of the ids but
+/// one: a CLOSURE's `origin`, which a `const let` snapshot keeps as
+/// `ConstValue::Callable { body }` — so that id stays in the key exactly
+/// when `snapshots` admits such a result, and a run never names another
+/// site's closure.
+struct Keyer<'k, 'a> {
+    snapshots: bool,
+    world: &'k [&'a js::Node<'a>],
+    /// A world declaration's name → its index in `world`.
+    by_name: std::collections::HashMap<&'a str, usize>,
+    digests: &'k mut HashMap<usize, u64>,
+    in_progress: Vec<usize>,
+    /// Markers emitted so far: a digest computed across one is not memoized.
+    markers: u64,
+}
+
+/// The names one program (a declaration's body, or the site's prelude and
+/// body) binds, and the ordinals it has handed out.
+#[derive(Default)]
+struct Scope {
+    locals: std::collections::HashSet<String>,
+    ordinals: std::collections::HashMap<String, u32>,
+}
+
+impl Scope {
+    fn of(nodes: &[&js::Node<'_>]) -> Scope {
+        let mut scope = Scope::default();
+        for node in nodes {
+            scope.declare(node);
+        }
+        scope
+    }
+
+    fn declare_all(&mut self, nodes: &[js::Node<'_>]) {
+        for node in nodes {
+            self.declare(node);
+        }
+    }
+
+    /// The declaring pass: every name `node` binds, at any depth.
+    fn declare(&mut self, node: &js::Node<'_>) {
+        use js::Node;
+        match node {
+            Node::Function(function) => {
+                self.locals.insert(function.name.clone());
+                for parameter in &function.parameters {
+                    self.locals.insert(parameter.name.clone());
+                }
+                self.declare_all(&function.body);
+            }
+            Node::Closure(closure) => {
+                for parameter in &closure.parameters {
+                    self.locals.insert(parameter.name.clone());
+                }
+                self.declare_all(&closure.body);
+            }
+            Node::ConstVariable(variable) | Node::LetVariable(variable) => {
+                self.locals.insert(variable.name.clone());
+                self.declare(&variable.value);
+            }
+            Node::ForOf(binding, iterable, body) => {
+                self.locals.insert(binding.clone());
+                self.declare(iterable);
+                self.declare_all(body);
+            }
+            Node::Labeled(label, body) => {
+                self.locals.insert(label.clone());
+                self.declare_all(body);
+            }
+            Node::Array(items) | Node::Sequence(items) => self.declare_all(items),
+            Node::Spread(inner)
+            | Node::Await(inner)
+            | Node::Unary(_, inner)
+            | Node::Return(inner)
+            | Node::Throw(inner)
+            | Node::At(_, inner) => self.declare(inner),
+            Node::Assignment(left, right)
+            | Node::Binary(_, left, right)
+            | Node::PropertyIndex(left, right) => {
+                self.declare(left);
+                self.declare(right);
+            }
+            Node::Call(callee, arguments) => {
+                self.declare(callee);
+                self.declare_all(arguments);
+            }
+            Node::If(branch) => self.declare_branch(branch),
+            Node::While(condition, body) => {
+                self.declare(condition);
+                self.declare_all(body);
+            }
+            Node::Vtable(rows) => {
+                for (_, value) in rows {
+                    self.declare(value);
+                }
+            }
+            Node::Property(subject, _) => self.declare(subject),
+            Node::Try(tried, handler) => {
+                self.declare_all(tried);
+                self.declare_all(handler);
+            }
+            Node::Bool(_)
+            | Node::Break
+            | Node::BreakLabel(_)
+            | Node::Continue
+            | Node::Local(_)
+            | Node::Null
+            | Node::Number(..)
+            | Node::String(_)
+            | Node::Void
+            | Node::Mark(_) => {}
+        }
+    }
+
+    fn declare_branch(&mut self, branch: &js::IfBranch<'_>) {
+        match branch {
+            js::IfBranch::If(condition, body, next) => {
+                self.declare(condition);
+                self.declare_all(body);
+                if let Some(next) = next {
+                    self.declare_branch(next);
+                }
+            }
+            js::IfBranch::Else(body) => self.declare_all(body),
+        }
+    }
+}
+
+impl<'a> Keyer<'_, 'a> {
+    /// A world declaration's digest, memoized by address for the pass.
+    fn digest(&mut self, index: usize) -> u64 {
+        let declaration = self.world[index];
+        let address = std::ptr::from_ref::<js::Node<'_>>(declaration) as usize;
+        if let Some(digest) = self.digests.get(&address) {
+            return *digest;
+        }
+        if let Some(depth) = self.in_progress.iter().position(|open| *open == index) {
+            // Recursion: the declaration is its own ancestor in this walk. A
+            // marker by the distance up the stack — id-free, and the same
+            // whichever name the walk started from.
+            self.markers += 1;
+            let mut hasher = DefaultHasher::new();
+            hasher.write_u8(0xfe);
+            hasher.write_usize(self.in_progress.len() - depth);
+            return hasher.finish();
+        }
+        let markers_before = self.markers;
+        self.in_progress.push(index);
+        let mut hasher = DefaultHasher::new();
+        let mut scope = Scope::of(&[declaration]);
+        // The declaration's own top-level name is the handle other code reaches
+        // it by, carried by their reference, not by its content.
+        match declaration {
+            js::Node::Function(function) => {
+                hasher.write_u8(14);
+                self.parameters(&mut scope, &function.parameters, &mut hasher);
+                self.list(&mut scope, &function.body, &mut hasher);
+                hasher.write_u8(u8::from(function.is_async));
+            }
+            js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                hasher.write_u8(12);
+                self.content(&mut scope, &variable.value, &mut hasher);
+            }
+            other => self.content(&mut scope, other, &mut hasher),
+        }
+        self.in_progress.pop();
+        let digest = hasher.finish();
+        if self.markers == markers_before {
+            self.digests.insert(address, digest);
+        }
+        digest
+    }
+
+    /// A name: its ordinal when `scope` binds it, the digest of the world
+    /// declaration it reaches, else its text.
+    fn name(&mut self, scope: &mut Scope, name: &str, hasher: &mut DefaultHasher) {
+        if scope.locals.contains(name) {
+            let next = scope.ordinals.len() as u32;
+            let ordinal = *scope.ordinals.entry(name.to_string()).or_insert(next);
+            hasher.write_u8(1);
+            hasher.write_u32(ordinal);
+        } else if let Some(index) = self.by_name.get(name).copied() {
+            let digest = self.digest(index);
+            hasher.write_u8(3);
+            hasher.write_u64(digest);
+        } else {
+            hasher.write_u8(2);
+            hasher.write_usize(name.len());
+            hasher.write(name.as_bytes());
+        }
+    }
+
+    /// A node, closed by a separator no content ends with, so two lists that
+    /// concatenate to one text hash apart.
+    fn node(&mut self, scope: &mut Scope, node: &js::Node<'_>, hasher: &mut DefaultHasher) {
+        self.content(scope, node, hasher);
+        hasher.write_u8(0xff);
+    }
+
+    fn list(&mut self, scope: &mut Scope, nodes: &[js::Node<'_>], hasher: &mut DefaultHasher) {
+        hasher.write_usize(nodes.len());
+        for node in nodes {
+            self.content(scope, node, hasher);
+        }
+    }
+
+    fn parameters(
+        &mut self,
+        scope: &mut Scope,
+        parameters: &[js::Parameter],
+        hasher: &mut DefaultHasher,
+    ) {
+        hasher.write_usize(parameters.len());
+        for parameter in parameters {
+            self.name(scope, &parameter.name, hasher);
+        }
+    }
+
+    fn content(&mut self, scope: &mut Scope, node: &js::Node<'_>, hasher: &mut DefaultHasher) {
+        use js::Node;
+        let text = |hasher: &mut DefaultHasher, text: &str| {
+            hasher.write_usize(text.len());
+            hasher.write(text.as_bytes());
+        };
+        match node {
+            Node::Array(items) => {
+                hasher.write_u8(1);
+                self.list(scope, items, hasher);
+            }
+            Node::Spread(inner) => {
+                hasher.write_u8(2);
+                self.content(scope, inner, hasher);
+            }
+            Node::Assignment(place, value) => {
+                hasher.write_u8(3);
+                self.content(scope, place, hasher);
+                self.content(scope, value, hasher);
+            }
+            Node::Await(inner) => {
+                hasher.write_u8(4);
+                self.content(scope, inner, hasher);
+            }
+            Node::Binary(op, left, right) => {
+                hasher.write_u8(5);
+                let _ = write!(HashWriter(hasher), "{op:?}");
+                self.content(scope, left, hasher);
+                self.content(scope, right, hasher);
+            }
+            Node::Unary(op, inner) => {
+                hasher.write_u8(6);
+                hasher.write_u32(u32::from(*op));
+                self.content(scope, inner, hasher);
+            }
+            Node::Bool(value) => {
+                hasher.write_u8(7);
+                hasher.write_u8(u8::from(*value));
+            }
+            Node::Break => hasher.write_u8(8),
+            Node::BreakLabel(label) => {
+                hasher.write_u8(9);
+                self.name(scope, label, hasher);
+            }
+            Node::Call(callee, arguments) => {
+                hasher.write_u8(10);
+                self.content(scope, callee, hasher);
+                self.list(scope, arguments, hasher);
+            }
+            Node::Closure(closure) => {
+                hasher.write_u8(11);
+                self.parameters(scope, &closure.parameters, hasher);
+                self.list(scope, &closure.body, hasher);
+                hasher.write_u8(u8::from(closure.is_async));
+                if self.snapshots {
+                    hasher.write_u32(closure.origin.map_or(u32::MAX, |id| id.0));
+                }
+            }
+            Node::ConstVariable(variable) => {
+                hasher.write_u8(12);
+                self.name(scope, &variable.name, hasher);
+                self.content(scope, &variable.value, hasher);
+            }
+            Node::Continue => hasher.write_u8(13),
+            Node::Function(function) => {
+                hasher.write_u8(14);
+                self.name(scope, &function.name, hasher);
+                self.parameters(scope, &function.parameters, hasher);
+                self.list(scope, &function.body, hasher);
+                hasher.write_u8(u8::from(function.is_async));
+            }
+            Node::If(branch) => {
+                hasher.write_u8(15);
+                self.branch(scope, branch, hasher);
+            }
+            Node::While(condition, body) => {
+                hasher.write_u8(16);
+                self.content(scope, condition, hasher);
+                self.list(scope, body, hasher);
+            }
+            Node::ForOf(binding, iterable, body) => {
+                hasher.write_u8(17);
+                self.name(scope, binding, hasher);
+                self.content(scope, iterable, hasher);
+                self.list(scope, body, hasher);
+            }
+            Node::Labeled(label, body) => {
+                hasher.write_u8(18);
+                self.name(scope, label, hasher);
+                self.list(scope, body, hasher);
+            }
+            Node::LetVariable(variable) => {
+                hasher.write_u8(19);
+                self.name(scope, &variable.name, hasher);
+                self.content(scope, &variable.value, hasher);
+            }
+            Node::Local(name) => {
+                hasher.write_u8(20);
+                self.name(scope, name, hasher);
+            }
+            Node::Null => hasher.write_u8(21),
+            Node::Vtable(rows) => {
+                hasher.write_u8(22);
+                hasher.write_usize(rows.len());
+                for (name, value) in rows {
+                    text(hasher, name);
+                    self.content(scope, value, hasher);
+                }
+            }
+            Node::Number(digits, suffix) => {
+                hasher.write_u8(23);
+                text(hasher, digits);
+                text(hasher, suffix.as_deref().unwrap_or(""));
+                hasher.write_u8(u8::from(suffix.is_some()));
+            }
+            Node::Property(subject, name) => {
+                hasher.write_u8(24);
+                self.content(scope, subject, hasher);
+                text(hasher, name);
+            }
+            Node::PropertyIndex(subject, index) => {
+                hasher.write_u8(25);
+                self.content(scope, subject, hasher);
+                self.content(scope, index, hasher);
+            }
+            Node::Return(value) => {
+                hasher.write_u8(26);
+                self.content(scope, value, hasher);
+            }
+            Node::Sequence(nodes) => {
+                hasher.write_u8(27);
+                self.list(scope, nodes, hasher);
+            }
+            Node::String(value) => {
+                hasher.write_u8(28);
+                text(hasher, value);
+            }
+            Node::Throw(value) => {
+                hasher.write_u8(29);
+                self.content(scope, value, hasher);
+            }
+            Node::Try(body, handler) => {
+                hasher.write_u8(30);
+                self.list(scope, body, hasher);
+                self.list(scope, handler, hasher);
+            }
+            Node::Void => hasher.write_u8(31),
+            // The emitter's marks: the id is the program's shape, not the
+            // site's content.
+            Node::Mark(_) => hasher.write_u8(32),
+            Node::At(_, inner) => {
+                hasher.write_u8(33);
+                self.content(scope, inner, hasher);
+            }
+        }
+    }
+
+    fn branch(&mut self, scope: &mut Scope, branch: &js::IfBranch<'_>, hasher: &mut DefaultHasher) {
+        match branch {
+            js::IfBranch::If(condition, body, next) => {
+                hasher.write_u8(1);
+                self.content(scope, condition, hasher);
+                self.list(scope, body, hasher);
+                match next {
+                    Some(next) => {
+                        hasher.write_u8(1);
+                        self.branch(scope, next, hasher);
+                    }
+                    None => hasher.write_u8(0),
+                }
+            }
+            js::IfBranch::Else(body) => {
+                hasher.write_u8(2);
+                self.list(scope, body, hasher);
+            }
+        }
+    }
 }
 
 /// The key a site is remembered by: everything [`interpreter::eval_const`]
 /// reads besides the project — the lowered program (world declarations,
-/// imports, helpers, prelude, body), whether a closure result is admitted,
-/// the budgets, and this compiler's version (the interpreter's semantics are
-/// the binary's). `world_hashes` memoizes the world declarations' hashes by
-/// address for one pass, where the declarations are shared by every site and
-/// never move.
+/// imports, helpers, prelude, body) by CONTENT (N177; see [`Keyer`]),
+/// whether a closure result is admitted, the budgets, and this compiler's
+/// version (the interpreter's semantics are the binary's). `world_digests`
+/// memoizes the world declarations' digests by address for one pass, where
+/// the declarations are shared by every site and never move.
 pub(crate) fn site_key(
     site: &ConstSite<'_>,
     snapshots: bool,
     limits: Limits,
-    world_hashes: &mut HashMap<usize, u64>,
+    world_digests: &mut HashMap<usize, u64>,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     // Valid only for a CLEAN program (`analyzer-pass-map.md`, recommendation
@@ -300,27 +709,45 @@ pub(crate) fn site_key(
     snapshots.hash(&mut hasher);
     limits.fuel.hash(&mut hasher);
     limits.call_depth.hash(&mut hasher);
-    if !crate::incremental::planted(crate::incremental::Plant::ConstKeyWithoutWorld) {
-        site.world.len().hash(&mut hasher);
-        for declaration in &site.world {
-            let address = std::ptr::from_ref::<js::Node<'_>>(declaration) as usize;
-            let hash = *world_hashes.entry(address).or_insert_with(|| {
-                let mut declaration_hasher = DefaultHasher::new();
-                hash_node(declaration, &mut declaration_hasher);
-                declaration_hasher.finish()
-            });
-            hash.hash(&mut hasher);
-        }
+    let with_world = !crate::incremental::planted(crate::incremental::Plant::ConstKeyWithoutWorld);
+    let world: &[&js::Node<'_>] = if with_world { &site.world } else { &[] };
+    let by_name = world
+        .iter()
+        .enumerate()
+        .filter_map(|(index, declaration)| match declaration {
+            js::Node::Function(function) => Some((function.name.as_str(), index)),
+            js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                Some((variable.name.as_str(), index))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut keyer = Keyer {
+        snapshots,
+        world,
+        by_name,
+        digests: world_digests,
+        in_progress: Vec::new(),
+        markers: 0,
+    };
+    world.len().hash(&mut hasher);
+    for index in 0..world.len() {
+        let digest = keyer.digest(index);
+        hasher.write_u64(digest);
     }
     site.imports.hash(&mut hasher);
     site.helpers.hash(&mut hasher);
+    // The prelude and the body are one program: a name the prelude binds is
+    // the body's by the same ordinal.
+    let site_nodes: Vec<&js::Node<'_>> = site.prelude.iter().chain(site.body.iter()).collect();
+    let mut scope = Scope::of(&site_nodes);
     site.prelude.len().hash(&mut hasher);
     for node in &site.prelude {
-        hash_node(node, &mut hasher);
+        keyer.node(&mut scope, node, &mut hasher);
     }
     site.body.len().hash(&mut hasher);
     for node in site.body {
-        hash_node(node, &mut hasher);
+        keyer.node(&mut scope, node, &mut hasher);
     }
     hasher.finish()
 }
@@ -349,13 +776,13 @@ pub(crate) fn evaluate(
     limits: Limits,
     snapshots: bool,
     reader: &dyn AssetReader,
-    world_hashes: &mut HashMap<usize, u64>,
+    world_digests: &mut HashMap<usize, u64>,
 ) -> Result<SiteRun, Failure> {
     if crate::incremental::clean_requested() {
         return interpreter::eval_const(site, limits, snapshots, Some(reader)).map(run_of);
     }
     disk_load_once();
-    let key = site_key(site, snapshots, limits, world_hashes);
+    let key = site_key(site, snapshots, limits, world_digests);
     let mut forwarded: Vec<ChannelCall> = Vec::new();
     if let Some(cached) = lookup(key) {
         let unvalidated =

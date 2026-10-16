@@ -2976,7 +2976,9 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U
 		let outer_pull = outer.pull;
 		// The FIRST selection is made here, at start — the instance's state begins
 		// with it, and a consumer's first pull reads it.
-		let followed: Shared<Instance<U>> = Shared::new(run_tracked(runs, tracker, || select(outer_pull())).start());
+		let followed: Shared<Instance<U>> = Shared::new(
+			run_tracked(runs, tracker, || select(outer_pull())).start(),
+		);
 		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
 		Instance<U> {
 			pull = || (followed.read().pull)(),

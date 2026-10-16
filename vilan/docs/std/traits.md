@@ -57,8 +57,8 @@ trait Default {
 Zero for numbers, `""` for `str`, `false` for `bool`, `None` for
 `Option<T>`, the empty container for `List<T>`, `HashMap<K, V>` and
 `HashSet<T>`, and the element's default at every position for a fixed
-array `[T; n]`. `default_of<T>()` is `T::default()` spelled for a type
-that cannot head a path: `default_of<[i32; 4]>()`. `[derive(Default)]` composes fields' defaults — so a struct
+array `[T; n]` (`[i32; 4]::default()`). `default_of<T>()` is `T::default()`
+spelled as a generic call, `default_of<[i32; 4]>()`. `[derive(Default)]` composes fields' defaults — so a struct
 holding a container derives one. Used as a bound by helpers like
 `unwrap_or_default` and `List.sum`.
 

@@ -8281,6 +8281,92 @@ fn a_bound_selection_tests_only_the_impls_that_can_answer_it() {
     );
 }
 
+/// M147: a bound selection asks the per-importer ADMISSION only of the impls
+/// that can answer it. The admission walk ran first, over every impl of the
+/// program (std's hundreds), for every selection — 175,122 `admits_impl` calls,
+/// 18 M instructions of kolt's client check; it now runs after the member
+/// filter, as M103's subject test does, and the answer is unchanged.
+#[test]
+fn m147_a_bound_selection_asks_admission_only_of_the_impls_that_can_answer_it() {
+    use vilan_core::dispatch_refine;
+    use vilan_core::type_::Type;
+
+    let source = r#"
+        trait Show5 { fun show5(self): str; }
+        struct Badge { size: i32 }
+        impl Badge with Show5 { fun show5(self): str { "badge" } }
+
+        fun tell<V: Show5>(value: V) { print(value.show5()); }
+
+        fun main() {
+            tell(Badge { size = 1 });
+        }
+        main();
+        "#;
+    let (selected, expected, tests, restricts, implementations) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let badge = program
+                .structs
+                .values()
+                .find(|struct_| struct_.name == "Badge")
+                .expect("the program declares `Badge`")
+                .id;
+            let subject = program
+                .type_id_to_type_map
+                .iter()
+                .find(|(_, type_)| matches!(type_, Type::Struct(id, arguments) if *id == badge && arguments.is_empty()))
+                .map(|(type_id, _)| type_id)
+                .expect("`Badge` has a type slot");
+            let implementation = program
+                .implementations
+                .iter()
+                .find(|implementation| implementation.declarations.contains_key("show5"))
+                .expect("one impl declares `show5`");
+            let file = implementation.source;
+            let expected = vec![implementation.declarations["show5"]];
+            dispatch_refine::reset_bound_selection_admission_tests();
+            let selected =
+                dispatch_refine::impl_members_for_bound(&program, Some(file), subject, "show5", &[]);
+            (
+                selected,
+                expected,
+                dispatch_refine::bound_selection_admission_tests(),
+                program.impl_admission.restricts(file),
+                program.implementations.len(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+
+    assert_eq!(selected, expected, "the selection is `Badge`'s own member");
+    assert!(
+        restricts && implementations > 50,
+        "the file must be one the admission restricts, with std loaded, for the count to \
+         mean anything (restricts: {restricts}, {implementations} impls)"
+    );
+    assert_eq!(
+        tests, 1,
+        "{tests} of the program's {implementations} impls were admission-tested for a member \
+         exactly one of them can provide (M147)"
+    );
+}
+
 /// M103: an inherited default's dispatch candidates are computed once per
 /// member, not once per call site.
 ///

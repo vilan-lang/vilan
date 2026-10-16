@@ -12,10 +12,12 @@ vilan/examples/**/*.mjs
 vilan/examples/**/*.css
 vilan/examples/**/*.chunks.json
 vilan/examples/**/*.map
+vilan/examples/**/*.vdbg.json
 
 # The benchmark bundle (`vilan run vilan/benchmarks` writes it beside the source).
 vilan/benchmarks/src/main.mjs
 vilan/benchmarks/src/main.mjs.map
+vilan/benchmarks/src/main.mjs.vdbg.json
 
 # Every package's BUILD directory, wherever one sits beside checked-in sources.
 # `dist/` holds emitted artifacts, the build hooks' stamp file, and — under
@@ -43,8 +45,10 @@ vilan/docs/book/
 /vilan/test/robots.txt
 # A debug build's source map beside each program it writes (E257 S5): the
 # golden is the script, whose last line names the map; the map itself carries
-# an absolute std path and is never a golden.
+# an absolute std path and is never a golden. Nor is the debugger's sidecar
+# beside it (E257 S7).
 /vilan/test/**/*.mjs.map
+/vilan/test/**/*.mjs.vdbg.json
 
 # The union-suite log every integration writes beside the tree (three
 # tracked-by-accident incidents in one day; the hygiene gate caught two).

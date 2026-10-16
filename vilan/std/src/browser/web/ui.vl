@@ -1638,7 +1638,13 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 		let plan = if whole {
 			reconcile(row_keys.read(), row_items.read(), list, key, same)
 		} else {
-			reconcile(held_span(row_keys, at, count), held_span(row_items, at, count), list, key, same)
+			reconcile(
+				held_span(row_keys, at, count),
+				held_span(row_items, at, count),
+				list,
+				key,
+				same,
+			)
 		};
 		// A98: the rows that already stand in their new relative order, and the
 		// marker every other row is threaded in before.
@@ -1939,7 +1945,13 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 		let plan = if whole {
 			reconcile(row_keys.read(), row_items.read(), list, key, same)
 		} else {
-			reconcile(held_span(row_keys, at, count), held_span(row_items, at, count), list, key, same)
+			reconcile(
+				held_span(row_keys, at, count),
+				held_span(row_items, at, count),
+				list,
+				key,
+				same,
+			)
 		};
 		// A98, exactly as `place_each` reads it: the rows already in their new
 		// relative order stay put, and every other row is threaded in before the

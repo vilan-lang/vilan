@@ -194,6 +194,70 @@ pub fn set_std_prefix_layering(on: Option<bool>) {
     STD_PREFIX_LAYERING_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
+// --- std-prefix P3: the world cache on disk ---------------------------------
+
+/// Where the persisted std prefix lives, or `None` when no process may touch
+/// it: the test override, else `VILAN_WORLD_CACHE` (`off`, or a directory),
+/// else the default a front end set ([`set_world_cache_default`]: the CLI
+/// and the language server name `~/.vilan/cache/worlds`; a test process has
+/// none — the workspace's `.cargo/config.toml` says `off`, and P5 points the
+/// suite at `target/`). Off under `VILAN_HASH_SHUFFLE` and in a clean
+/// analysis, as the in-process prefix is (Q11).
+pub fn world_cache_dir() -> Option<PathBuf> {
+    let setting = WORLD_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let wanted = match &setting.test_override {
+        Some(forced) => forced.clone(),
+        None => {
+            static FROM_ENV: OnceLock<Option<Option<PathBuf>>> = OnceLock::new();
+            FROM_ENV
+                .get_or_init(|| match std::env::var("VILAN_WORLD_CACHE") {
+                    Ok(value) if value.is_empty() || value == "off" || value == "0" => Some(None),
+                    Ok(value) => Some(Some(PathBuf::from(value))),
+                    Err(_) => None,
+                })
+                .clone()
+                .unwrap_or_else(|| setting.default.clone())
+        }
+    };
+    drop(setting);
+    wanted.filter(|_| !clean_requested() && !crate::fx::shuffling())
+}
+
+#[derive(Default)]
+struct WorldCacheSetting {
+    /// `Some(None)` is off, `Some(Some(dir))` a directory; `None` reads the
+    /// environment and the default.
+    test_override: Option<Option<PathBuf>>,
+    default: Option<PathBuf>,
+}
+
+static WORLD_CACHE: Mutex<WorldCacheSetting> = Mutex::new(WorldCacheSetting {
+    test_override: None,
+    default: None,
+});
+
+/// The process default of [`world_cache_dir`] — a front end that owns a
+/// toolchain home sets it at start.
+pub fn set_world_cache_default(directory: Option<PathBuf>) {
+    WORLD_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .default = directory;
+}
+
+/// Overrides [`world_cache_dir`] for this process: `Some(None)` is off,
+/// `Some(Some(dir))` a directory, `None` restores the environment and the
+/// default — the test surface.
+#[doc(hidden)]
+pub fn set_world_cache(directory: Option<Option<PathBuf>>) {
+    WORLD_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .test_override = directory;
+}
+
 // --- Q3: the clean analysis -------------------------------------------------
 
 /// What a clean analysis on this thread keeps of the incremental machinery.
@@ -448,6 +512,13 @@ pub struct Census {
     /// whole-program pass walks in place of the table.
     pub live_ranges: u64,
     pub live_entities: u64,
+    /// M149: the move rows this analysis derived by walking its live lane (`analyzer/move_tables.rs`) — the restored regions' rows
+    /// are not walked, so a served keystroke reads a fraction of a filing
+    /// one's.
+    pub move_rows_live: u64,
+    /// M148: the hover rows this analysis RESTORED from its records (E206,
+    /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
+    pub hover_rows_restored: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -461,6 +532,17 @@ pub struct Census {
     pub prefix_hits: u64,
     pub prefix_refusals: u64,
     pub prefix_refusal: Option<&'static str>,
+    /// std-prefix P3: what the persisted prefix did for this analysis —
+    /// `loaded` (the std-only world came from its file), `written` (this
+    /// analysis built it and wrote the file), or the reason the file was a
+    /// miss (`absent`, `corrupt`, `truncated`, `foreign-version`,
+    /// `foreign-key`, `unreadable`, `undecodable`); `None` when no prefix
+    /// key was looked up or the world cache is off.
+    pub prefix_file: Option<&'static str>,
+    /// The file's size and the load's or the write's wall time, for the row
+    /// the report asks for (not a clock the gate reads).
+    pub prefix_file_bytes: u64,
+    pub prefix_file_micros: u64,
 }
 
 thread_local! {
@@ -496,11 +578,16 @@ thread_local! {
             item_records_filed: 0,
             live_ranges: 0,
             live_entities: 0,
+            move_rows_live: 0,
+            hover_rows_restored: 0,
             prefix_world: false,
             prefix_layered: false,
             prefix_hits: 0,
             prefix_refusals: 0,
             prefix_refusal: None,
+            prefix_file: None,
+            prefix_file_bytes: 0,
+            prefix_file_micros: 0,
         })
     };
 }
@@ -862,8 +949,8 @@ pub fn report(program: &Program) {
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
-             live-entities={} prefix-world={} prefix-layered={} prefix-hits={} \
-             prefix-refusals={}",
+             live-entities={} move-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
+             prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -890,10 +977,15 @@ pub fn report(program: &Program) {
             census.item_records_filed,
             census.live_ranges,
             census.live_entities,
+            census.move_rows_live,
+            census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
             census.prefix_hits,
             census.prefix_refusals,
+            census.prefix_file.unwrap_or("-"),
+            census.prefix_file_bytes,
+            census.prefix_file_micros,
         );
     }
 }
@@ -1015,6 +1107,76 @@ pub fn render_observation(program: &Program, diagnostics: &[crate::Error]) -> St
             path_of(*source),
             span.into_range(),
             target.and_then(place).unwrap_or_else(|| "?".to_string())
+        ));
+    }
+    // M148: the four per-file hover tables (E206, E237, E240, E241) — every
+    // row at its place. E237's blocks are keyed by a TYPE id, which differs
+    // between worlds, so they are rendered at the package positions a hover
+    // reads them from (a binding, a parameter, a member read, a field);
+    // std's positions share interned types with the package's differently
+    // in two worlds and are left out.
+    for (id, label) in &program.call_signature_labels {
+        if let Some(at) = place(*id) {
+            rows.push(format!("call-label {at} {label}"));
+        }
+    }
+    let package_position = |id: Id| -> Option<String> {
+        let source = lookup.of(id)?;
+        (!program.std_sources.contains(&source)).then_some(())?;
+        place(id)
+    };
+    let definition = |type_id: crate::type_::TypeId| -> String {
+        program
+            .type_definitions
+            .of(type_id)
+            .unwrap_or("-")
+            .replace('\n', "\\n")
+    };
+    for (id, variable) in &program.variables {
+        if let Some(at) = package_position(*id) {
+            rows.push(format!("definition {at} {}", definition(variable.type_id)));
+        }
+    }
+    for (id, parameter) in &program.parameters {
+        if let Some(at) = package_position(*id) {
+            rows.push(format!("definition {at} {}", definition(parameter.type_id)));
+        }
+    }
+    for id in program.member_name_spans.keys() {
+        if let (Some(at), Some(type_id)) = (package_position(*id), program.expr_type_ids.get(id)) {
+            rows.push(format!("definition {at} {}", definition(*type_id)));
+        }
+    }
+    for (id, struct_) in &program.structs {
+        if let Some(at) = package_position(*id) {
+            for (index, field) in struct_.fields.iter().enumerate() {
+                rows.push(format!(
+                    "definition {at} field {index} {}",
+                    definition(field.type_id)
+                ));
+            }
+        }
+    }
+    for row in &program.pattern_labels {
+        rows.push(format!(
+            "pattern {} {:?} {} {} {}",
+            path_of(row.source),
+            row.name_span.into_range(),
+            row.label,
+            row.variant
+                .and_then(|(enum_id, index)| place(enum_id).map(|at| format!("{at}#{index}")))
+                .unwrap_or_else(|| "-".to_string()),
+            row.matched
+        ));
+    }
+    for row in &program.reference_hovers {
+        rows.push(format!(
+            "reference-hover {} {:?} {} | {} | {}",
+            path_of(row.source),
+            row.span.into_range(),
+            row.code.replace('\n', "\\n"),
+            row.declared_by.as_deref().unwrap_or("-"),
+            row.implemented_by.join(", ")
         ));
     }
     rows.sort_unstable();

@@ -306,6 +306,12 @@ fn normalize(rendering: &str, root: &Path, permuted: Option<&Permuted>) -> Strin
     // every path the rows carry is read with `\` as `/` before it is
     // compared (the raw root is replaced in prose too, for a host that spells
     // it either way).
+    // M152: a fixture's dependency packages sit beside the package, under
+    // `<root>_deps/` — the same for both legs once the root is set aside.
+    let rendering = rendering
+        .replace(&format!("{}_deps/", root.display()), "<dependencies>/")
+        .replace(&format!("{}_deps\\", root.display()), "<dependencies>/");
+    let rendering = rendering.as_str();
     let backslashed_root = format!("{}\\", root.display());
     let raw_root = format!("{}/", root.display());
     let root = format!("{}/", slashed(&root.display().to_string()));
@@ -410,11 +416,22 @@ fn observe_leg(
     files: &[(String, String)],
     leg: Leg,
 ) -> (String, PathBuf) {
+    observe_leg_with(name, platform, files, &[], leg)
+}
+
+/// [`observe_leg`] for a package with `dependencies` beside it (M152).
+fn observe_leg_with(
+    name: &str,
+    platform: Platform,
+    files: &[(String, String)],
+    dependencies: &[Dependency],
+    leg: Leg,
+) -> (String, PathBuf) {
     let borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(file, text)| (file.as_str(), text.as_str()))
         .collect();
-    let package = Package::write(name, platform, &borrowed);
+    let package = Package::write_with(name, platform, &borrowed, dependencies);
     let observation = observe(&package, Vec::new(), leg);
     if observation.census.prefix_world {
         PREFIX_WORLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -456,18 +473,47 @@ fn compare(
     permutation: Permutation,
     permuted_leg: Leg,
 ) -> Option<String> {
+    compare_with(
+        label,
+        platform,
+        files,
+        &[],
+        opaque,
+        permutation,
+        permuted_leg,
+    )
+}
+
+/// [`compare`] for a package with `dependencies` beside it (M152); the
+/// permutation moves the package's own modules, never a dependency's.
+fn compare_with(
+    label: &str,
+    platform: Platform,
+    files: &[(String, String)],
+    dependencies: &[Dependency],
+    opaque: &[&str],
+    permutation: Permutation,
+    permuted_leg: Leg,
+) -> Option<String> {
     let name = label
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .take(40)
         .collect::<String>();
-    let (canonical, root) = observe_clean(&format!("perm_{name}"), platform, files);
+    let (canonical, root) = observe_leg_with(
+        &format!("perm_{name}"),
+        platform,
+        files,
+        dependencies,
+        Leg::Clean,
+    );
     let canonical = normalize(&canonical, &root, None);
     let permuted = permute(files, opaque, permutation)?;
-    let (rendering, root) = observe_leg(
+    let (rendering, root) = observe_leg_with(
         &format!("perm_{name}_{permutation:?}"),
         platform,
         &permuted.files,
+        dependencies,
         permuted_leg,
     );
     let rendering = normalize(&rendering, &root, Some(&permuted));
@@ -494,10 +540,11 @@ fn compare_fixture_on(fixture: &Fixture, skip: &[&str], permuted_leg: Leg) -> Ve
             continue;
         }
         for permutation in PERMUTATIONS {
-            divergences.extend(compare(
+            divergences.extend(compare_with(
                 &label,
                 fixture.platform,
                 &files,
+                fixture.dependencies,
                 &[],
                 permutation,
                 permuted_leg,
@@ -755,4 +802,37 @@ fn the_normalizer_reads_a_windows_hosts_rows() {
         canonical_leaf_at + 4
     );
     assert_eq!(normalized, expected);
+}
+
+/// **M152's leg**: the programs with DEPENDENCIES — the two-package fixture
+/// and `examples/fullstack`'s members — in every state, under every
+/// permutation of the package's own modules, analyzed cleanly and then
+/// incrementally over the forced std-and-dependencies prefix (each permuted
+/// package its own; the dependency tier is shared), against the canonical
+/// clean analysis.
+#[test]
+fn m152_programs_with_dependencies_answer_the_same_under_every_permutation() {
+    let mut divergences = Vec::new();
+    for fixture in DEPENDENCY_FIXTURES {
+        divergences.extend(compare_fixture(fixture, &[]));
+    }
+    let before = PREFIX_WORLDS.load(std::sync::atomic::Ordering::Relaxed);
+    vilan_core::incremental::set_std_prefix(Some(true));
+    for fixture in DEPENDENCY_FIXTURES {
+        divergences.extend(compare_fixture_on(fixture, &[], Leg::Incremental));
+    }
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_std_prefix(None);
+    assert!(
+        divergences.is_empty(),
+        "{} state(s) of the dependency programs depend on the load order:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let prefix_worlds = PREFIX_WORLDS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert!(
+        prefix_worlds >= 4,
+        "the permuted dependency programs must be built over the prefix ({prefix_worlds} \
+         were); the comparison is otherwise vacuous about M152"
+    );
 }

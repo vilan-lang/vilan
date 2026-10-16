@@ -39,7 +39,7 @@ use super::{Analyzer, Expr, MoveState, Resolution, SourceId};
 
 /// E281: a resource binding's move state at a `dbg_stack()` call, as the
 /// resource move scan holds it there, with the span of a move that spent it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DbgStackMove {
     /// Moved on every path reaching the call.
     Moved(Span),
@@ -50,7 +50,7 @@ pub enum DbgStackMove {
 
 /// E282: a capture view a `dbg_stack()` call must not read — past its last
 /// use, with a rule-4 event on its root since.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DbgStackInvalidation {
     pub view: Id,
     /// The event's anchor: the mutating call, or the assignment's target.
@@ -60,7 +60,7 @@ pub struct DbgStackInvalidation {
 }
 
 /// One `dbg_stack()` call's expansion.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DbgStackSite {
     /// What the header line names: `main`, `a closure in main`, or nothing at
     /// module level.
@@ -69,7 +69,7 @@ pub struct DbgStackSite {
 }
 
 /// One listed binding.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DbgStackBinding {
     pub name: String,
     /// `L:C` of the declaration that hides this one, for a shadowed binding.
@@ -89,7 +89,7 @@ pub struct DbgStackBinding {
 }
 
 /// How a listed binding's value prints.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DbgStackValue {
     /// Through the printer, from this minted read — an argument of the call.
     Read(Id),

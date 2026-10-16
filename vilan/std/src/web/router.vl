@@ -212,9 +212,12 @@ export fun parse_query(query: str): HashMap<str, str> {
 			let equals = pair.split("=");
 			if equals.len() > 1 {
 				let mark = equals[0].len();
-				values.insert(percent_decode(pair.substring(0, mark).replace("+", " ")), percent_decode(pair
-					.substring(mark + 1, pair.len())
-					.replace("+", " ")));
+				values.insert(
+					percent_decode(pair.substring(0, mark).replace("+", " ")),
+					percent_decode(pair
+						.substring(mark + 1, pair.len())
+						.replace("+", " ")),
+				);
 			} else {
 				values.insert(percent_decode(pair.replace("+", " ")), "");
 			}

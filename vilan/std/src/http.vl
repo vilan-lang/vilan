@@ -740,7 +740,10 @@ export impl ServerBuilder {
 		let fallback = self.request_handler;
 		Server {
 			port = self.port,
-			request_handler = fold_service_requests(self.services, |request| respond_from_build(assets, cache, fallback, request)),
+			request_handler = fold_service_requests(
+				self.services,
+				|request| respond_from_build(assets, cache, fallback, request),
+			),
 			on_start = self.on_start,
 			on_stop = self.on_stop,
 			upgrade_handler = fold_service_upgrades(self.services, self.upgrade_handler),

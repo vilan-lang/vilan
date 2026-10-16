@@ -440,13 +440,24 @@ impl<'src> Analyzer<'src> {
 
 impl Analyzer<'_> {
     /// E303: whether `stage` is a link of an ELEMENT's lowering rather than
-    /// one the reader wrote — its chain's head is an element (the `<tag`
-    /// the desugar's `view(..)` call spans), and it is not a link written
-    /// with a `.` after the finished element (whose subject, the element,
-    /// ends at its `>`). A link inside the opening tag has a subject ending
-    /// at the previous item, never at a `>`; a child's link is written with
-    /// no `.`.
+    /// one the reader wrote - its chain's head is an element (the `<tag` the
+    /// desugar's `view(..)` call spans), and the link is one the desugar made
+    /// of the element's own parts.
+    ///
+    /// E322: the desugar says which. A link the reader wrote INSIDE the opening
+    /// tag (`<div .class("x") />`) is marked at the walk (B620's
+    /// `element_head_links`, keyed by the link's entity - the stage's own id);
+    /// an event, an attribute or a child is built on a ZERO-WIDTH name anchor
+    /// (`elements.rs`: the markup owns the written name, so the generated
+    /// method reference spans nothing). A chain written after the finished
+    /// element has neither: its link is a real name the reader typed. This
+    /// replaced a scan of the text for a `>` before the subject and a `.`
+    /// before the link, which took the head link after an item ending in a `>`
+    /// (`title(x as Option<str>)`, an element-valued item) for a chain written
+    /// after the element.
     fn element_link(&self, text: &str, stage: &ChainStage, head_id: Id) -> bool {
+        // Only a chain whose head is an element: a `css { .. }` block lowers to
+        // anchored links too (`css.rs`), and those hint as they always have.
         let element = self
             .span_map
             .get(&head_id)
@@ -455,13 +466,11 @@ impl Analyzer<'_> {
         if !element {
             return false;
         }
-        let after_the_element = text
-            .get(..stage.subject_end)
-            .is_some_and(|before| before.trim_end().ends_with('>'))
-            && text
-                .get(..stage.member_start)
-                .is_some_and(|before| before.trim_end().ends_with('.'));
-        !after_the_element
+        self.element_head_links.contains_key(&stage.id)
+            || self
+                .member_name_spans
+                .get(&stage.id)
+                .is_some_and(|name| name.start == name.end)
     }
 }
 

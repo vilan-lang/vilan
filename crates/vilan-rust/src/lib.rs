@@ -68,6 +68,7 @@ use vilan_core::analyzer::{
     AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
     ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
+use vilan_core::captures::{mutates_its_receiver, reads_its_receiver_in_place};
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
@@ -872,47 +873,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// value its signature says and re-bound into its cell on entry — see
     /// [`Emitter::boxed_parameter_prologue`].
     fn compute_boxed_bindings(&mut self) {
-        let closures: Vec<Id> = self.program.closures.keys().copied().collect();
-        for closure_id in closures {
-            let Some(closure) = self.program.closures.get(&closure_id) else {
-                continue;
-            };
-            // The closure's OWN parameters are declared inside it: `|mut v|
-            // { v = v - 1; v }` writes its parameter and captures nothing, and
-            // since parameters joined the analysis (F47) an unseeded walk read
-            // `v` as a capture of itself and boxed it.
-            let mut declared_inside = self.closure_parameter_bindings(closure);
-            let mut referenced = HashSet::new();
-            let mut visited = HashSet::new();
-            self.scan_closure(
-                closure.return_,
-                &mut declared_inside,
-                &mut referenced,
-                &mut visited,
-            );
-            for binding in referenced {
-                if declared_inside.contains(&binding) {
-                    continue;
-                }
-                let mutable_local = self
-                    .program
-                    .variables
-                    .get(&binding)
-                    .is_some_and(|variable| variable.mutable);
-                let mutable_parameter =
-                    self.program
-                        .parameters
-                        .get(&binding)
-                        .is_some_and(|parameter| {
-                            parameter.mutable
-                                && !parameter.lazy
-                                && self.receiving_form(parameter) == Receiving::ByValue
-                        });
-                if mutable_local || mutable_parameter {
-                    self.boxed.insert(binding);
-                }
-            }
-        }
+        self.boxed
+            .extend(vilan_core::captures::captured_mut_bindings(self.program));
     }
 
     /// F124, the aliasing-loans model (`F99-aliasing-loans.md`): a root
@@ -1602,17 +1564,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn closure_parameter_bindings(&self, closure: &vilan_core::analyzer::Closure) -> HashSet<Id> {
-        let mut bindings: HashSet<Id> = closure.parameters.iter().copied().collect();
-        for destructure in &closure.parameter_destructures {
-            if let Some(Expr::Destructure(_, pattern)) = self.program.entity_map.get(destructure) {
-                collect_pattern_bindings_into(pattern, &mut bindings);
-            }
-        }
-        bindings
+        vilan_core::captures::closure_parameter_bindings(self.program, closure)
     }
 
     /// Walks a closure body, collecting the bindings it DECLARES and the
-    /// bindings it READS. The difference is what it captured.
+    /// bindings it READS. The difference is what it captured
+    /// ([`vilan_core::captures::scan_closure`], the walk both backends share).
     fn scan_closure(
         &self,
         expr_id: Id,
@@ -1620,62 +1577,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         referenced: &mut HashSet<Id>,
         visited: &mut HashSet<Id>,
     ) {
-        if !visited.insert(expr_id) {
-            return;
-        }
-        match self.program.entity_map.get(&expr_id) {
-            Some(Expr::Variable(binding)) => {
-                declared.insert(*binding);
-                if let Some(initial) = self
-                    .program
-                    .variables
-                    .get(binding)
-                    .and_then(|variable| variable.initial)
-                {
-                    self.scan_closure(initial, declared, referenced, visited);
-                }
-            }
-            Some(Expr::Local(binding)) => {
-                referenced.insert(*binding);
-            }
-            Some(other) => {
-                // A `let` is not the only way a body introduces a name (F20, and
-                // F18's destructuring `let`). A match leg's pattern, an `is`
-                // test's capture, a destructure's pattern, a `for` binder and a
-                // nested closure's parameters all declare INSIDE, and a walk
-                // that missed them called them captures: the capture prelude
-                // then emitted `let live = live.clone();` for a binding that
-                // only exists inside the leg it is bound in, and
-                // `future_closure_argument` — which emits one clone per capture
-                // — did the same for the three `match` captures and the two
-                // destructured names in `std::http`'s response loop.
-                match other {
-                    Expr::Match(_, legs) => {
-                        for leg in legs {
-                            collect_pattern_bindings_into(&leg.pattern, declared);
-                        }
-                    }
-                    Expr::Is(_, pattern) | Expr::Destructure(_, pattern) => {
-                        collect_pattern_bindings_into(pattern, declared);
-                    }
-                    Expr::ForEach(_, item, _) => declared.extend(item.iter().copied()),
-                    Expr::Closure(closure_id) => {
-                        // A NESTED closure's destructured parameters too
-                        // (`|(k, _)| k == key` inside `get_post_var`): they are
-                        // not in `parameters`, and read as captures of the
-                        // OUTER closure they were cloned before they existed.
-                        if let Some(closure) = self.program.closures.get(closure_id) {
-                            declared.extend(self.closure_parameter_bindings(closure));
-                        }
-                    }
-                    _ => {}
-                }
-                for child in self.children_of(expr_id) {
-                    self.scan_closure(child, declared, referenced, visited);
-                }
-            }
-            None => {}
-        }
+        vilan_core::captures::scan_closure(self.program, expr_id, declared, referenced, visited);
     }
 
     // ------------------------------------------------------- F31 liveness ---
@@ -1768,6 +1670,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 state.declared_at.insert(binding, depth);
             }
+            // M151: a read of a context-threaded HIDDEN parameter is never a
+            // last-use candidate. What it carries is a handle (J6: every read
+            // of one is retained, `reads_a_handle_binding`), so a move would
+            // save nothing — and `context::apply` shares ONE reference entity
+            // among every threaded call of a node (M137), so a candidate keyed
+            // by that entity would name every one of those reads the binding's
+            // last use at once. Neither the read nor a field spine over it is
+            // recorded: no later read can be "after" a read that is not here.
+            Some(Expr::Local(binding) | Expr::Parameter(binding))
+                if self
+                    .program
+                    .context_hidden_parameters
+                    .contains_key(&binding) => {}
             Some(Expr::Local(binding) | Expr::Parameter(binding)) => {
                 let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
                 let candidate = if depth <= declared {
@@ -1783,7 +1698,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // and the root read registered as the whole-binding walk would
             // have (the spine has no other children to visit).
             Some(Expr::Field(..) | Expr::TupleIndex(..))
-                if let Some((binding, path)) = self.liveness_spine(expr_id) =>
+                if let Some((binding, path)) = self.liveness_spine(expr_id)
+                    && !self
+                        .program
+                        .context_hidden_parameters
+                        .contains_key(&binding) =>
             {
                 let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
                 let movable = depth <= declared;
@@ -2034,81 +1953,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// recurse. Written once rather than per walk: an arm this misses is a
     /// capture the box would not see, so there is exactly one list to keep.
     fn children_of(&self, expr_id: Id) -> Vec<Id> {
-        let Some(expr) = self.program.entity_map.get(&expr_id) else {
-            return Vec::new();
-        };
-        let mut children = Vec::new();
-        match expr {
-            Expr::Assignment(a, b) | Expr::Binary(_, a, b) | Expr::Index(a, b) => {
-                children.push(*a);
-                children.push(*b);
-            }
-            Expr::Async(a)
-            | Expr::Await(a)
-            | Expr::Ascribe(a)
-            | Expr::Unary(_, a)
-            | Expr::Reference(a, _)
-            | Expr::Dereference(a)
-            | Expr::TryAssert(a)
-            | Expr::Field(a, _, _)
-            | Expr::TupleIndex(a, _, _)
-            | Expr::ArrayLen(a, _)
-            | Expr::Repeat(a, _) => children.push(*a),
-            Expr::FunctionReturn(value) => children.extend(value.iter().copied()),
-            Expr::Block((statements, tail)) => {
-                children.extend(statements.iter().copied());
-                children.push(*tail);
-            }
-            Expr::List(ids) | Expr::Tuple(ids) => children.extend(ids.iter().copied()),
-            Expr::StructInitializer(_, fields) => children.extend(fields.values().copied()),
-            Expr::For(condition, (statements, tail)) => {
-                children.extend(condition.iter().copied());
-                children.extend(statements.iter().copied());
-                children.push(*tail);
-            }
-            Expr::ForEach(iterable, _, (statements, tail)) => {
-                children.push(*iterable);
-                children.extend(statements.iter().copied());
-                children.push(*tail);
-            }
-            Expr::If(branch) => collect_if_children(branch, &mut children),
-            Expr::Match(subject, legs) => {
-                children.push(*subject);
-                for leg in legs {
-                    children.extend(leg.guard.iter().copied());
-                    children.push(leg.body);
-                }
-            }
-            Expr::Is(subject, _) | Expr::Destructure(subject, _) => children.push(*subject),
-            Expr::Lift(subject, _, continuation) => {
-                children.push(*subject);
-                children.push(*continuation);
-            }
-            Expr::LiftRegion(steps, body) => {
-                children.extend(steps.iter().map(|(step, _, _)| *step));
-                children.push(*body);
-            }
-            Expr::TupleComprehension(bindings, body) => {
-                for (binder, source) in bindings {
-                    children.push(*binder);
-                    children.push(*source);
-                }
-                children.push(*body);
-            }
-            Expr::Call(call_id) => {
-                if let Some(function_call) = self.program.function_calls.get(call_id) {
-                    children.push(function_call.subject_id);
-                    children.extend(function_call.argument_ids.iter().copied());
-                }
-            }
-            Expr::Closure(closure_id) => {
-                if let Some(closure) = self.program.closures.get(closure_id) {
-                    children.push(closure.return_);
-                }
-            }
-            _ => {}
-        }
-        children
+        vilan_core::captures::expression_children(self.program, expr_id)
     }
 
     fn span_of(&self, id: Id) -> Span {
@@ -12524,9 +12369,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // A value call — `(h.f)()`. The subject is a counted closure.
             let subject = self.expression(function_call.subject_id, depth)?;
             let callee_type = self.type_of(function_call.subject_id);
-            let arguments =
-                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
-            return Ok(format!("({subject})({})", arguments.join(", ")));
+            // A subject that runs code is evaluated before its arguments, and
+            // nothing moves ahead of it: the arguments keep their places.
+            let mut prelude = String::new();
+            let arguments = self.closure_call_arguments(
+                callee_type,
+                &function_call.argument_ids,
+                depth,
+                self.runs_no_code(function_call.subject_id)
+                    .then_some(&mut prelude),
+            )?;
+            return Ok(Self::with_argument_prelude(
+                prelude,
+                format!("({subject})({})", arguments.join(", ")),
+            ));
         };
         let target = *target;
 
@@ -12802,10 +12658,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             || self.program.variables.contains_key(&target)
         {
             let callee_type = self.type_of(function_call.subject_id);
-            let arguments =
-                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
+            let mut prelude = String::new();
+            let arguments = self.closure_call_arguments(
+                callee_type,
+                &function_call.argument_ids,
+                depth,
+                Some(&mut prelude),
+            )?;
             let callee = self.read_module_binding_or_local(target, span)?;
-            return Ok(format!("({callee})({})", arguments.join(", ")));
+            return Ok(Self::with_argument_prelude(
+                prelude,
+                format!("({callee})({})", arguments.join(", ")),
+            ));
         }
 
         // An ordinary call, monomorphized against whatever binds it.
@@ -14077,6 +13941,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         callee_type: Option<TypeId>,
         argument_ids: &[Id],
         depth: usize,
+        mut prelude: Option<&mut String>,
     ) -> Result<Vec<String>, Error> {
         let callee = callee_type
             .map(|type_id| self.concrete(type_id))
@@ -14105,13 +13970,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(type_) => self.program.closure_parameter_views(&type_),
             None => Vec::new(),
         };
+        // F?1 (Order 53, F129's order through a closure VALUE): a copy out of a
+        // captured binding's cell that a later argument may write is taken
+        // after the other arguments, as a named callee's is — the JS argument
+        // is the binding's object itself, so `check(items, push())` (`push`
+        // pushing into `items`) printed the pushed list on JS and the copy
+        // taken before the push natively. The arguments that run code are
+        // settled in order ahead of it.
+        let conventions: Vec<Receiving> = (0..argument_ids.len())
+            .map(|index| match views.get(index).copied().flatten() {
+                Some(true) => Receiving::RefMut,
+                Some(false) => Receiving::Ref,
+                None => Receiving::ByValue,
+            })
+            .collect();
+        let no_views = vec![false; argument_ids.len()];
+        let defers_a_copy: Vec<bool> = (0..argument_ids.len())
+            .map(|index| {
+                prelude.is_some()
+                    && self.defers_its_cell_copy(&conventions, argument_ids, &no_views, index)
+            })
+            .collect();
+        let defers_copies = defers_a_copy.contains(&true);
+        let mut deferred_copies = String::new();
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             let already_a_reference = matches!(
                 self.program.entity_map.get(argument),
                 Some(Expr::Reference(_, _))
             );
-            rendered.push(match views.get(index).copied().flatten() {
+            let text = match views.get(index).copied().flatten() {
                 Some(_) if already_a_reference => self.expression(*argument, depth)?,
                 Some(true) => {
                     let place = self.mutable_place(*argument, depth)?;
@@ -14123,7 +14011,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Some(false) => format!("&{}", self.expression(*argument, depth)?),
                 None => self.consumed_value_of(*argument, depth)?,
-            });
+            };
+            if defers_a_copy[index] {
+                let name = format!("__copied{index}");
+                let _ = write!(deferred_copies, "let {name} = {text}; ");
+                rendered.push(name);
+            } else if let Some(prelude) = prelude.as_deref_mut()
+                && defers_copies
+                && conventions[index] != Receiving::RefMut
+                && !self.runs_no_code(*argument)
+            {
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {text}; ");
+                rendered.push(name);
+            } else {
+                rendered.push(text);
+            }
+        }
+        if let Some(prelude) = prelude {
+            prelude.push_str(&deferred_copies);
         }
         Ok(rendered)
     }
@@ -15333,6 +15239,74 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// the call answers ([`vilan_rt::tuple_get`]: a key is a VALUE, so the
     /// position is read at run time). The receiver is read through a
     /// reference, evaluated once.
+    /// A172: `list.to_array()` — `<[_; N]>::try_from(..).ok()` over a copy of
+    /// the list (Rust's `TryFrom<Vec<T>> for [T; N]`, no `Copy` asked of the
+    /// element), with `N` the call's own `const N` under this instance: the
+    /// written argument (`to_array<2>()`) or the analyzer's record for the
+    /// call (the expected type's length), resolved through the active
+    /// substitution. The element is left to rustc, which reads it off the
+    /// list.
+    fn list_to_array(
+        &mut self,
+        argument_ids: &[Id],
+        call: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some(&receiver) = argument_ids.first() else {
+            return Err(unsupported("a `to_array` with no receiver", span));
+        };
+        let call_id = call.and_then(|call| match self.program.entity_map.get(&call) {
+            Some(&Expr::Call(call_id)) => Some(call_id),
+            _ => None,
+        });
+        let binder = call_id
+            .and_then(|call_id| self.program.function_calls.get(&call_id))
+            .and_then(|function_call| {
+                match self.program.entity_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(callee_id)) => self.program.external_functions.get(callee_id),
+                    _ => None,
+                }
+            })
+            .and_then(|external| external.generic_parameter_constraint_ids.first().copied());
+        let bound = call_id.and_then(|call_id| {
+            let function_call = self.program.function_calls.get(&call_id)?;
+            function_call
+                .generic_argument_ids
+                .first()
+                .copied()
+                .or_else(|| {
+                    self.program
+                        .own_generic_call_bindings
+                        .get(&call_id)
+                        .and_then(|values| values.first().copied())
+                })
+                .or_else(|| {
+                    let binder = binder?;
+                    [call?, call_id].iter().find_map(|key| {
+                        self.program
+                            .method_call_substitution
+                            .get(key)
+                            .and_then(|substitution| substitution.get(&binder).copied())
+                    })
+                })
+        });
+        let Some(length) = bound.and_then(|bound| {
+            let resolved = self.deeply_resolved(bound);
+            self.program.type_id_to_type_map.array_length(resolved)
+        }) else {
+            return Err(unsupported(
+                "a `to_array` whose length is not fixed here",
+                span,
+            ));
+        };
+        let receiver_text =
+            self.expecting_nothing(|emitter| emitter.expression(receiver, depth))?;
+        Ok(format!(
+            "<[_; {length}]>::try_from(({receiver_text}).to_vec()).ok()"
+        ))
+    }
+
     fn tuple_intrinsic(
         &mut self,
         intrinsic: Intrinsic,
@@ -15555,6 +15529,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 | Intrinsic::TupleGet
         ) {
             return self.tuple_intrinsic(intrinsic, argument_ids, call, depth, span);
+        }
+        if matches!(intrinsic, Intrinsic::ListToArray) {
+            return self.list_to_array(argument_ids, call, depth, span);
         }
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest
@@ -15889,6 +15866,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `sort_by` answers a COPY (`own self`), and its comparator arrives
             // as an `Rc<dyn Fn>` — which implements no `Fn` trait itself, so it
             // is bound and CALLED inside a closure the runtime can take.
+            // Rendered whole by `list_to_array`, which reads the call's `N`.
+            Intrinsic::ListToArray => {
+                return Err(unsupported("a `to_array` away from its call", span));
+            }
             Intrinsic::ListSortBy => {
                 let receiver = next();
                 let compare = next();
@@ -16002,51 +15983,6 @@ enum NativeDispatch {
 /// read, THEN the cell is written. F62's place-in-a-cell rule, at the `set`.
 fn settled_cell_write(cell: &str, value: &str) -> String {
     format!("{{ let __assigned = {value}; {cell}.set(__assigned); }}")
-}
-
-fn mutates_its_receiver(intrinsic: Intrinsic) -> bool {
-    matches!(
-        intrinsic,
-        Intrinsic::ListPop
-            | Intrinsic::ListRemove
-            | Intrinsic::ListInsert
-            | Intrinsic::ListSortBy
-            | Intrinsic::MapInsert
-            | Intrinsic::MapRemove
-            | Intrinsic::SetInsert
-            | Intrinsic::SetRemove
-    )
-}
-
-/// The intrinsics that only READ their receiver, through a `&` (every arm
-/// renders it `&{receiver}` or as a `&self` method's) and answer an owned
-/// value, and take no closure: a receiver in a boxed binding is read through
-/// a view of its cell for the call rather than copied out whole (F49/F103).
-fn reads_its_receiver_in_place(intrinsic: Intrinsic) -> bool {
-    matches!(
-        intrinsic,
-        Intrinsic::StrLen
-            | Intrinsic::StrTrim
-            | Intrinsic::StrToLowercase
-            | Intrinsic::StrToUppercase
-            | Intrinsic::StrContains
-            | Intrinsic::StrStartsWith
-            | Intrinsic::StrEndsWith
-            | Intrinsic::StrReplace
-            | Intrinsic::StrRepeat
-            | Intrinsic::StrSplit
-            | Intrinsic::StrSubstring
-            | Intrinsic::ParseI32
-            | Intrinsic::ParseF64
-            | Intrinsic::ListLen
-            | Intrinsic::ListGet
-            | Intrinsic::SetContains
-            | Intrinsic::SetLen
-            | Intrinsic::MapGet
-            | Intrinsic::MapContainsKey
-            | Intrinsic::MapLen
-            | Intrinsic::CanonicalHash
-    )
 }
 
 /// How a parameter is received natively.
@@ -16337,50 +16273,13 @@ fn describe(resolved: &Type) -> String {
 
 /// Every binding a pattern introduces, in source order.
 fn collect_pattern_bindings(pattern: &ExprPattern, out: &mut Vec<Id>) {
-    match pattern {
-        ExprPattern::Binding(id) => out.push(*id),
-        ExprPattern::Variant(_, _, payload) => {
-            for sub in payload {
-                collect_pattern_bindings(sub, out);
-            }
-        }
-        ExprPattern::Tuple(elements) => {
-            for (element, _) in elements {
-                collect_pattern_bindings(element, out);
-            }
-        }
-        ExprPattern::Array(elements) => {
-            for element in elements {
-                collect_pattern_bindings(element, out);
-            }
-        }
-        ExprPattern::Wildcard | ExprPattern::Literal(_) => {}
-    }
+    vilan_core::captures::pattern_bindings(pattern, out);
 }
 
 /// [`collect_pattern_bindings`] into a set — what the closure scan's
 /// declared-inside side wants.
 fn collect_pattern_bindings_into(pattern: &ExprPattern, out: &mut HashSet<Id>) {
-    let mut bindings = Vec::new();
-    collect_pattern_bindings(pattern, &mut bindings);
-    out.extend(bindings);
-}
-
-fn collect_if_children(branch: &ExprIfBranch, children: &mut Vec<Id>) {
-    match branch {
-        ExprIfBranch::If(condition, (statements, tail), next) => {
-            children.push(*condition);
-            children.extend(statements.iter().copied());
-            children.push(*tail);
-            if let Some(next) = next {
-                collect_if_children(next, children);
-            }
-        }
-        ExprIfBranch::Else((statements, tail)) => {
-            children.extend(statements.iter().copied());
-            children.push(*tail);
-        }
-    }
+    vilan_core::captures::pattern_bindings_into(pattern, out);
 }
 
 fn form_name(expr: &Expr<'_>) -> &'static str {

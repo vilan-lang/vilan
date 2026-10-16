@@ -1,21 +1,25 @@
-// E257 S6 (debugging.md §5.2): the `vilan` debug type and the "Debug" code
-// lens on `fun main`.
+// E257 S6/S7 (debugging.md §5.2, §5.3): the `vilan` debug type and the
+// "Debug" code lens on `fun main`.
 //
-// A `vilan` launch configuration is not a debug adapter of its own. It
-// RESOLVES to VS Code's JavaScript debugger (`type: node`), which already
-// speaks node's inspector and reads source maps — and `vilan run` writes the
-// map beside the script it hands node (E257 S5). Two shapes:
+// A `vilan` launch configuration runs under `vilan-dap` (`dap/adapter.ts`,
+// S7), the extension's own adapter: `vilan run --inspect-brk` over the
+// program, node's inspector driven directly, and the Variables and Watch panes
+// printed by static type from the sidecar `vilan run` writes beside the map —
+// `Point { x = 1, y = 2 }` where the JavaScript debugger showed `[1, 2]`. Two
+// shapes:
 //
-// - a plain run: `vilan run --inspect-brk=127.0.0.1:<port> <program>`, the
-//   JavaScript debugger attaching at that port (`attachSimplePort`) before
-//   the first line runs, so every breakpoint is bound when the program starts;
-// - `watch: true`: `vilan run --watch <program>`, the JavaScript debugger
-//   attaching to every node process `vilan` starts (its child-process attach),
-//   so the server a watch round restarts is debugged again each round.
+// - a plain run: one inspector, attached before the first line runs, so
+//   every breakpoint is bound when the program starts;
+// - `watch: true`: `vilan run --watch`, each round's server held at its first
+//   line until the adapter has attached to it again.
+//
+// `"adapter": "js-debug"` keeps S6's resolution — the configuration becomes
+// VS Code's JavaScript debugger's (`type: node`), values JavaScript-shaped —
+// for a session vilan-dap cannot serve.
 //
 // Either way the breakpoints are set in `.vl` files and the stops are shown in
-// them; std's frames are skipped (the map lists std in `ignoreList`, and
-// `skipFiles` names the std cache as well), as are the runtime helpers'.
+// them; std's frames are skipped (the map lists std in `ignoreList`), as are
+// the runtime helpers'.
 //
 // No `vscode` import: configurations in, configurations out, so `npm test`
 // pins the resolution under plain node (`src/test/debug.test.ts`).
@@ -41,6 +45,9 @@ export interface VilanLaunchConfiguration {
     vilanPath?: string;
     env?: Record<string, string>;
     console?: string;
+    /// `vilan` (the default): vilan-dap, values by static type. `js-debug`:
+    /// VS Code's JavaScript debugger, values as JavaScript (S6).
+    adapter?: string;
     [key: string]: unknown;
 }
 
@@ -69,8 +76,61 @@ export type Resolved =
 /// own default.
 export const INSPECT_HOST = '127.0.0.1';
 
-/// Resolves a `vilan` launch configuration (an empty one — F5 with no
-/// `launch.json` — debugs the active `.vl` file).
+/// Resolves a `vilan` launch configuration for vilan-dap (an empty one — F5
+/// with no `launch.json` — debugs the active `.vl` file): the configuration
+/// stays a `vilan` one, completed with what the adapter needs to start the
+/// program. `"adapter": "js-debug"` resolves as S6 did ([`resolveLaunch`]).
+export function resolveAdapterLaunch(
+    configuration: VilanLaunchConfiguration,
+    context: LaunchContext,
+): Resolved {
+    if (configuration.adapter === 'js-debug') {
+        return resolveLaunch(configuration, context);
+    }
+    if (configuration.adapter !== undefined && configuration.adapter !== 'vilan') {
+        return {
+            ok: false,
+            message: `Unknown \`adapter\` "${configuration.adapter}": use "vilan" (the default) or "js-debug".`,
+        };
+    }
+    if (configuration.request !== 'launch') {
+        return {
+            ok: false,
+            message:
+                'A `vilan` debug configuration launches its program (`"request": "launch"`); ' +
+                'to attach to a running `vilan run --inspect`, use a `node` attach configuration.',
+        };
+    }
+    const program = configuration.program || context.activeFile || context.workspaceFolder;
+    if (!program) {
+        return {
+            ok: false,
+            message:
+                'Nothing to debug: open a `.vl` file, or set `program` in the launch configuration.',
+        };
+    }
+    const resolved: Record<string, unknown> = {
+        type: 'vilan',
+        request: 'launch',
+        name: configuration.name ?? 'Debug vilan program',
+        vilan: configuration.vilanPath || context.vilan,
+        program,
+        args: configuration.args ?? [],
+        cwd: configuration.cwd ?? context.workspaceFolder,
+        env: configuration.env,
+        entry: configuration.entry,
+        watch: configuration.watch === true,
+        stopOnEntry: configuration.stopOnEntry === true,
+        // The program's stdin is the terminal's (`scan()`), as under `vilan run`.
+        console: configuration.console ?? 'integratedTerminal',
+        port: context.port,
+        adapter: 'vilan',
+    };
+    return { ok: true, configuration: resolved };
+}
+
+/// Resolves a `vilan` launch configuration to the JavaScript debugger's
+/// (S6) — what `"adapter": "js-debug"` asks for.
 export function resolveLaunch(
     configuration: VilanLaunchConfiguration,
     context: LaunchContext,

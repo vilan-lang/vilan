@@ -2290,6 +2290,90 @@ const CONTEXT_PROBE: &str = concat!(
     "}\n",
 );
 
+/// M151 + M137: one node threading its context into many calls passes ONE
+/// shared read entity (M137), and the native backend's last-use walk exempts a
+/// hidden parameter's reads (M151) — so no threaded read is ever a move, and
+/// every one hands on a copy of the handle. A list context makes a move
+/// observable to rustc (a second read of a moved `Vec` is E0382), and the calls
+/// sit in sequence, in both arms of an `if`, in a loop and last.
+#[test]
+fn m151_a_context_threaded_into_many_calls_copies_every_read_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_m151_shared_context_read.vl"),
+        SHARED_CONTEXT_READ,
+    )
+    .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_m151_shared_context_read.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    assert!(
+        emitted.status.success(),
+        "the shared-context probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    let relay = source
+        .split("\nfn ")
+        .find(|function| function.starts_with("relay_"))
+        .unwrap_or_else(|| panic!("no `fn relay_..` in the emitted source:\n{source}"));
+    let hidden = relay
+        .split("mut context_")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or_else(|| panic!("no hidden parameter in `relay`:\n{relay}"));
+    let copied = format!("(context_{hidden}).clone()");
+    assert_eq!(
+        relay.matches(&copied).count(),
+        5,
+        "each of the five threaded reads copies the handle:\n{relay}"
+    );
+    assert_eq!(
+        compare(&staged, "native_probe_m151_shared_context_read.vl"),
+        Verdict::Identical,
+        "the program must agree on both backends"
+    );
+}
+
+const SHARED_CONTEXT_READ: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::display::Display;\n",
+    "\n",
+    "let current: Context<List<str>> = Context::new();\n",
+    "\n",
+    "fun needy(tag: str) {\n",
+    "\tlet held = current.get();\n",
+    "\tprint(tag + \" \" + held.len().to_string());\n",
+    "}\n",
+    "\n",
+    "fun relay(times: i32) {\n",
+    "\tneedy(\"first\");\n",
+    "\tif times > 1 {\n",
+    "\t\tneedy(\"then\");\n",
+    "\t} else {\n",
+    "\t\tneedy(\"else\");\n",
+    "\t}\n",
+    "\tfor tag in [\"loop\", \"again\"] {\n",
+    "\t\tneedy(tag);\n",
+    "\t}\n",
+    "\tneedy(\"last\");\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run([\"a\", \"b\"], || {\n",
+    "\t\trelay(2);\n",
+    "\t});\n",
+    "}\n",
+);
+
 /// A destructuring `let` means the same thing on both backends (F18).
 ///
 /// `std::http`'s response loop is what wanted it — `for header in
@@ -12906,6 +12990,59 @@ fn b622_derives_over_generic_fields_answer_on_both_backends() {
     );
 }
 
+/// A171: a fixed-array type as a `::` path head — `[i32; 3]::default()`,
+/// `[str; 2]::from_json(..)`, a nested array, a generic element, a `const N`,
+/// and the `Default`/`Json` derives spelling an array field through it —
+/// answers the same on both backends.
+#[test]
+fn a171_an_array_path_head_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_array_path_head.vl";
+    std::fs::write(staged.join(file), include_str!("native/array_path_head.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an array path head must answer the same natively"
+    );
+}
+
+/// A172: `List::to_array` — a length check and a slice on JS,
+/// `<[_; N]>::try_from` natively — answers the same at the expected type's
+/// length, a written one, a `const N` instance's and length 0.
+#[test]
+fn a172_list_to_array_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_list_to_array.vl";
+    std::fs::write(staged.join(file), include_str!("native/list_to_array.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "`to_array` must answer the same natively"
+    );
+}
+
+/// B633: `[derive(Wire)]` over a generic struct's and enum's generic fields —
+/// refused at the declaration before (C7's guard), read under the derived
+/// impl's `T: Wire` binders now, a phantom parameter still bare — round-trips
+/// the same on both backends.
+#[test]
+fn b633_wire_derives_over_generic_fields_answer_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_derive_wire_over_generic_fields.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/derive_wire_over_generic_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a Wire derive over generic fields must round-trip the same natively"
+    );
+}
+
 /// array-lengths.md S4: a named length — a top-level `const let`, a `let`
 /// chained through it, a local `let` — in a type and in a repeat literal,
 /// resolved to its number before the fixpoint, the same on both backends.
@@ -13312,25 +13449,83 @@ fn f135_a_read_argument_is_copied_before_a_later_argument_writes_its_cell_on_bot
     );
 }
 
-/// F135's binding half (spec §6.9, outside R-a's `read()`): a later argument
-/// that RE-BINDS a captured `mut` binding whose `&self` view the call takes
-/// (`words.measured(swap())`, `swap` assigning `words` whole). The native
-/// view is taken after the other arguments, as §6.9's native note orders it,
-/// and sees the new binding (3); the JS receiver is the object the binding
-/// held when it was evaluated (1). The in-place write (`more()` pushing) is
-/// the same on both (F129's pin).
+/// F138 (F135's binding half; R-a door (1): JS follows spec §6.9): a later
+/// argument that RE-BINDS a captured `mut` binding whose `&self` view the call
+/// takes (`words.measured(swap())`, `swap` assigning `words` whole). The view
+/// is taken after the other arguments on both backends, so the callee sees
+/// the new binding (3); the JS receiver had been the object the binding held
+/// when it was evaluated (1). The in-place write (`more()` pushing) was
+/// already the same on both (F129's pin).
 #[test]
-#[ignore = "F138 (F135's binding half, filed by native-52; retarget to its id): a later argument that re-binds a captured binding under a `&self` call is seen natively and not on JS"]
-fn f135_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same_on_both_backends()
+fn f138_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same_on_both_backends()
 {
     let staged = stage();
-    let file = "native_probe_f135_captured_binding_argument_replaced.vl";
+    let file = "native_probe_f138_captured_binding_argument_replaced.vl";
     std::fs::write(
         staged.join(file),
         include_str!("native/captured_binding_argument_replaced.vl"),
     )
     .expect("write the probe program");
-    assert_eq!(compare(&staged, file), Verdict::Identical);
+    assert_eq!(
+        both_stdouts(&staged, file),
+        ("3\n".to_string(), "3\n".to_string())
+    );
+}
+
+/// F138 across the positions spec §6.9 orders: a by-value place JS hands on
+/// by reference (`has(log.items, rep())`, the by-value twin; `size(words,
+/// swap())`, and a later BLOCK that rebinds), a `&` view, a `&self` receiver
+/// through a generic callee and through a `dyn` object, an intrinsic's
+/// receiver (`contains`, `get`, a `str`'s `contains`), and a `&mut`
+/// receiver (`push`, a user `&mut self`) beside a later argument that
+/// rebinds the binding: each is read after the later arguments on both
+/// backends, and the earlier arguments still run first (`first`, `second`).
+/// The controls read where they stand on both: a scalar by value (`9`) and
+/// an `&Option` beside a closure that writes it (`None` — a copy taken in
+/// order), while the same `&Option` beside a block that writes it is a view
+/// taken last (`Some(2)`).
+#[test]
+fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_arguments_on_both_backends()
+ {
+    let staged = stage();
+    let file = "native_probe_f138_captured_binding_argument_rebound.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_argument_rebound.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "an argument rooted at a captured binding waits for the later arguments on both backends"
+    );
+}
+
+/// native-53's find (F129's order through a closure VALUE): `check(items,
+/// push())`, `check` a closure binding and `push` pushing into the captured
+/// `items`, printed `true` on JS (the argument is the binding's object) and
+/// `false` natively (the copy was taken in argument order) — and a `&`
+/// parameter (`measure(&words, more())`, `count_of(&total, add())`) the same.
+/// The copy now waits for the later arguments through a closure binding, a
+/// field holding one and a function item's binding, so an in-place write and
+/// a re-binding are both seen on both backends; a subject that runs code and
+/// a literal applied where it is written keep their order on both.
+#[test]
+fn a_closure_value_call_reads_a_captured_binding_after_the_later_arguments_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_captured_binding_closure_value_call.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/captured_binding_closure_value_call.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\ntrue\ntrue\ntrue\nfalse\nfalse\n2\n3\n3\n5\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "a closure value's argument rooted at a captured binding waits on both backends"
+    );
 }
 
 /// A `&` of a captured `mut` binding's SCALAR place (`count_of(&log.count,
@@ -13763,4 +13958,62 @@ fn f124_two_loans_in_one_call_and_a_projected_interleaved_view_are_refused_by_na
             other => panic!("{file}: must be refused by name, was {other:?}"),
         }
     }
+}
+
+/// B628: a generic struct literal with a `None` field beside the field that
+/// fixes `T` — refused at its use as `Page<T>` before — answers the same on
+/// both backends through `Debug`, `Json` and a swapped field order.
+#[test]
+fn b628_a_literal_none_field_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_literal_none_field.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/literal_none_field.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a literal's `None` field must type the same natively"
+    );
+}
+
+/// B627 / std-53's A?1: an expected type reaching a receiver call through a
+/// method — a static's impl binder (an internal error on JS before), a derived
+/// decode, a free call's own generic, an external member's own length —
+/// answers the same on both backends.
+#[test]
+fn b627_an_expected_type_through_a_receiver_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_expected_type_through_a_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/expected_type_through_a_receiver.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an expectation through a receiver must bind the same natively"
+    );
+}
+
+/// B626: a module scalar read only through a view — a `const let`, a `let`, a
+/// `mut` written through `&mut`, a read inside a closure — answers the same on
+/// both backends (JS shook the binding out and threw `ReferenceError`).
+#[test]
+fn b626_a_module_scalar_read_only_through_a_view_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_module_scalar_view.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/module_scalar_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a module scalar read through a view must be declared on JS"
+    );
 }

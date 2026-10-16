@@ -1,0 +1,56 @@
+// B627 / std-53's A?1: the expectation on a method's result reaches its
+// receiver call - a static's impl binder (`Holder::build().unwrap()`), a
+// derived decode (`Bag::from_json(..).unwrap()`), a free call's own generic
+// (`make().unwrap_or(3)`) and an external member's own length
+// (`xs.to_array().unwrap()`) - and the program answers the same on both
+// backends (JS reported an internal error for the first).
+import std::io::print;
+import std::json::{ FromJson, Json };
+import std::option::Option::{ self, None, Some };
+import std::result::Result::{ self, Err, Ok };
+
+trait Make {
+	fun make(): Self;
+}
+
+impl i32 with Make {
+	fun make(): i32 {
+		7
+	}
+}
+
+struct Holder<T> {
+	value: T,
+}
+
+impl Holder<type T: Make> {
+	fun build(): Option<Holder<T>> {
+		Some(Holder { value = T::make() })
+	}
+}
+
+[derive(Json)]
+struct Bag<T> {
+	items: List<T>,
+}
+
+fun make<T>(): Option<T> {
+	None
+}
+
+fun built(): Holder<i32> {
+	Holder::build().unwrap()
+}
+
+fun main() {
+	let held: Holder<i32> = Holder::build().unwrap();
+	print(held.value);
+	print(built().value + 1);
+	let bag: Bag<i32> = Bag::from_json("{\"items\":[1,2]}").unwrap();
+	print(bag.items.len());
+	let x: i32 = make().unwrap_or(3);
+	print(x);
+	let xs = [1, 2];
+	let array: [i32; 2] = xs.to_array().unwrap();
+	print(array[1]);
+}

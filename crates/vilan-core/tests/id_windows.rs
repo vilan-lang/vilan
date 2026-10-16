@@ -413,6 +413,50 @@ fn a_second_seeded_analysis_serves_the_items_records() {
     package.remove();
 }
 
+/// M148: a served keystroke's PREFIX module answers its hover rows (E206's
+/// call label, E237's definition, E241's patterns, E240's type parameter)
+/// from its record rather than rendering them again — the first analysis
+/// restores none, the second some — and the served rendering, the four tables
+/// included, is the clean one.
+#[test]
+fn a_served_keystroke_restores_the_prefix_modules_hover_rows() {
+    let package = Package::write(
+        "hover_rows",
+        vilan_core::Platform::default(),
+        &[
+            (
+                "main.vl",
+                "import pkg::shapes::{ pair, pick };\nimport pkg::views::render;\n\nfun main() {\n\tprint(pair().first);\n\tprint(pick(None));\n\tprint(render());\n}\n",
+            ),
+            (
+                "shapes.vl",
+                "export struct Pair<T> {\n\tfirst: T,\n\tsecond: T,\n}\n\nfun same<U>(value: U): U {\n\tvalue\n}\n\nexport fun pair(): Pair<i32> {\n\tlet made = Pair { first = same(1), second = 2 };\n\tmade\n}\n\nexport fun pick(value: Option<i32>): i32 {\n\tmatch value {\n\t\tSome(let inner) => inner,\n\t\tNone => 0,\n\t}\n}\n",
+            ),
+            ("views.vl", "export fun render(): i32 {\n\t1\n}\n"),
+        ],
+    );
+    vilan_core::analyzer::base_cache_clear();
+    let (first, _) = seeded(&package, "views.vl");
+    let (second, rendering) = seeded(&package, "views.vl");
+    assert_eq!(first.hover_rows_restored, 0, "{first:#?}");
+    assert!(
+        second.base_hits > 0 && second.records_replayed > 0,
+        "the second analysis reuses the prefix module: {second:#?}"
+    );
+    assert!(
+        second.hover_rows_restored > 0,
+        "the served analysis restores the prefix module's hover rows: {second:#?}"
+    );
+    for row in ["definition ", "pattern ", "call-label ", "reference-hover "] {
+        assert!(
+            rendering.contains(row),
+            "the fixture renders a {row:?} row (or the pin says nothing about it):\n{rendering}"
+        );
+    }
+    assert_eq!(rendering, clean(&package));
+    package.remove();
+}
+
 /// S7: an edit inside one item re-checks that item and the items that read
 /// from it (the entry's `main` calls the edited `render`, and its import of
 /// `render` binds to it), and serves the rest (the imports of the prefix's

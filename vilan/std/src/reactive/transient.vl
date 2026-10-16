@@ -110,7 +110,10 @@ export impl TransientState<type T, type E> {
 			TransientState::Pending => TransientState::Pending,
 			TransientState::Ready(let value) => TransientState::Ready(transform(value)),
 			TransientState::Refreshing(let value) => TransientState::Refreshing(transform(value)),
-			TransientState::Failed(let error, let stale) => TransientState::Failed(error, stale.map(transform)),
+			TransientState::Failed(let error, let stale) => TransientState::Failed(
+				error,
+				stale.map(transform),
+			),
 			TransientState::Absent => TransientState::Absent,
 		}
 	}
@@ -157,11 +160,20 @@ export impl TransientState<type T, type E> {
 	fun zip<U>(own self, own other: TransientState<U, E>): TransientState<(T, U), E> {
 		let stale = self.latest().zip(other.latest());
 		match (self, other) {
-			(TransientState::Failed(let error, let _mine), _) => TransientState::Failed(error, stale),
-			(_, TransientState::Failed(let error, let _theirs)) => TransientState::Failed(error, stale),
+			(TransientState::Failed(let error, let _mine), _) => TransientState::Failed(
+				error,
+				stale,
+			),
+			(_, TransientState::Failed(let error, let _theirs)) => TransientState::Failed(
+				error,
+				stale,
+			),
 			(TransientState::Absent, _) => TransientState::Absent,
 			(_, TransientState::Absent) => TransientState::Absent,
-			(TransientState::Ready(let mine), TransientState::Ready(let theirs)) => TransientState::Ready((mine, theirs)),
+			(TransientState::Ready(let mine), TransientState::Ready(let theirs)) => TransientState::Ready((
+				mine,
+				theirs
+			)),
 			_ => match stale {
 				Some(let both) => TransientState::Refreshing(both),
 				None => TransientState::Pending,

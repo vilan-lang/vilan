@@ -61,8 +61,8 @@ measured_at = "v0.47.0's seal"
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_371_583_124
-measured_at = "v0.48.0's seal"
+ceiling = 1_330_572_454
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:fullstack"
@@ -75,57 +75,57 @@ measured_at = "v0.50.0's seal"
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_532_276_405
-measured_at = "v0.48.0's seal"
+ceiling = 1_449_723_044
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_626_337_835
-measured_at = "v0.50.0's seal"
+ceiling = 1_559_323_849
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_448_815_594
-measured_at = "v0.48.0's seal"
+ceiling = 3_117_145_554
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_378_211_823
-measured_at = "v0.48.0's seal"
+ceiling = 1_338_608_120
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_766_105_821
-measured_at = "v0.48.0's seal"
+ceiling = 1_571_179_502
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_210_143_329
-measured_at = "v0.50.0's seal"
+ceiling = 3_866_819_166
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 4_315_348_241
-measured_at = "v0.50.0's seal"
+ceiling = 3_992_720_534
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 7_759_098_337
-measured_at = "v0.48.0's seal"
+ceiling = 7_413_799_197
+measured_at = "v0.51.0's seal"
 
 [[row]]
 subject = "example:math"
@@ -232,22 +232,22 @@ max_ratio = 2.3
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 1
-blocking = false
+green_seals = 2
+blocking = true
 mandate = true
 
 [[e121]]
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 4
+green_seals = 5
 blocking = true
 
 [[e121]]
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 3
+green_seals = 4
 blocking = true
 series = "Order 52 (N174): the keystroke edit is unchanged; the Find References probe moved from `fun messages(self)` (gone from model.vl) to `fun global()`, the mirrored store reader, so that probe starts a new series."
 
@@ -255,7 +255,7 @@ series = "Order 52 (N174): the keystroke edit is unchanged; the Find References 
 scenario = "model.vl keystroke, importers open"
 metric = "cpu_ms"
 target_ms = 500
-green_seals = 0
+green_seals = 1
 blocking = false
 
 [[e121]]
