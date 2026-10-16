@@ -19,6 +19,7 @@ mod support;
 
 mod array_lengths;
 mod ascription;
+mod async_inference;
 mod auto_annotations;
 mod backed_enums;
 mod borrows;

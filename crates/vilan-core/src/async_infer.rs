@@ -113,14 +113,29 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         crate::incremental::update_census(|census| census.seeded_passes += 1);
     }
     let seeds = async_set.clone();
-    let adaptation = loop {
+    // M138: the worklist re-runs whole while a round grows the async set, but
+    // the DECISIONS pass (each instance's emission data and its diagnostics,
+    // which reads the set and moves nothing) runs once, over the last round's
+    // stable flags: on kolt it was most of each round, and every round but the
+    // last threw its answer away.
+    let adaptive = adaptive_params_of(program);
+    ADAPTATION_INFERS.with(|count| count.set(count.get() + 1));
+    let worklist = loop {
         base_fixpoint(program, graph, &held_values, &mut async_set);
         let before = async_set.len();
-        let adaptation = compute_adaptation(program, graph, &held_values, &mut async_set);
+        let worklist = adaptation_worklist(program, graph, &held_values, &adaptive, &mut async_set);
         if async_set.len() == before {
-            break adaptation;
+            break worklist;
         }
     };
+    let adaptation = adaptation_decisions(
+        program,
+        graph,
+        &held_values,
+        &adaptive,
+        &async_set,
+        worklist,
+    );
     for (error, source) in adaptation.diagnostics {
         program.push_diagnostic(error, source);
     }
@@ -1342,27 +1357,67 @@ fn record_origin(origins: &mut HashMap<InstanceKey, Id>, key: &InstanceKey, call
     }
 }
 
-fn compute_adaptation(
+/// The component of a root function: itself plus its transitively nested
+/// closures — they share the instance's bits context.
+fn component_of(graph: &CallGraph, root: Id) -> Vec<Id> {
+    let mut members = vec![root];
+    let mut cursor = 0;
+    while cursor < members.len() {
+        if let Some(children) = graph.closure_children_of(members[cursor]) {
+            members.extend(children.iter().copied());
+        }
+        cursor += 1;
+    }
+    members
+}
+
+thread_local! {
+    /// M138's instrument: the passes (one per analysis, a macro world's
+    /// included), the worklist ROUNDS and the DECISIONS passes this thread ran
+    /// since the last [`reset_adaptation_counts`]. The answer is the
+    /// same either way, so only the counts can see that the decisions run once.
+    static ADAPTATION_INFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ADAPTATION_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ADAPTATION_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(passes, worklist rounds, decisions passes)` on this thread since the
+/// last [`reset_adaptation_counts`].
+pub fn adaptation_counts() -> (usize, usize, usize) {
+    (
+        ADAPTATION_INFERS.with(std::cell::Cell::get),
+        ADAPTATION_ROUNDS.with(std::cell::Cell::get),
+        ADAPTATION_DECISIONS.with(std::cell::Cell::get),
+    )
+}
+
+/// Zeroes this thread's [`adaptation_counts`].
+pub fn reset_adaptation_counts() {
+    ADAPTATION_INFERS.with(|count| count.set(0));
+    ADAPTATION_ROUNDS.with(|count| count.set(0));
+    ADAPTATION_DECISIONS.with(|count| count.set(0));
+}
+
+/// One round of the instance worklist's answer: every instance key the round
+/// discovered with its async flag, and the call each was first instantiated by.
+struct Worklist {
+    instance_async: HashMap<InstanceKey, bool>,
+    origins: HashMap<InstanceKey, Id>,
+}
+
+/// One round of the instance worklist (async-polymorphism.md A.1): every
+/// function as its base instance, every instance a call discovers, until each
+/// flag is stable over `async_set` — which a base instance's flips extend.
+/// The caller re-runs a round from scratch while a round grows the set.
+fn adaptation_worklist(
     program: &Program,
     graph: &CallGraph,
     held_values: &HashMap<Id, Vec<Id>>,
+    adaptive: &HashMap<Id, HashSet<Id>>,
     async_set: &mut HashSet<Id>,
-) -> Adaptation {
-    let adaptive = adaptive_params_of(program);
-
-    // The component of a root function: itself plus its transitively nested
-    // closures — they share the instance's bits context.
-    let component = |root: Id| -> Vec<Id> {
-        let mut members = vec![root];
-        let mut cursor = 0;
-        while cursor < members.len() {
-            if let Some(children) = graph.closure_children_of(members[cursor]) {
-                members.extend(children.iter().copied());
-            }
-            cursor += 1;
-        }
-        members
-    };
+) -> Worklist {
+    ADAPTATION_ROUNDS.with(|count| count.set(count.get() + 1));
+    let component = |root: Id| component_of(graph, root);
 
     let mut instance_async: HashMap<InstanceKey, bool> = HashMap::default();
     let mut origins: HashMap<InstanceKey, Id> = HashMap::default();
@@ -1384,7 +1439,7 @@ fn compute_adaptation(
                     program,
                     held_values,
                     async_set,
-                    &adaptive,
+                    adaptive,
                     &HashMap::default(),
                     &[],
                     callee,
@@ -1425,7 +1480,7 @@ fn compute_adaptation(
                                 program,
                                 held_values,
                                 async_set,
-                                &adaptive,
+                                adaptive,
                                 &flags,
                                 bits,
                                 callee,
@@ -1512,8 +1567,29 @@ fn compute_adaptation(
         }
     }
 
-    // --- Final pass: with every flag stable, collect each instance's
-    // emission decisions and the context-dependent diagnostics.
+    Worklist {
+        instance_async,
+        origins,
+    }
+}
+
+/// The worklist's decisions, over its LAST round (every flag stable, the async
+/// set final): each instance's emission data and the context-dependent
+/// diagnostics. Reads the set; moves nothing.
+fn adaptation_decisions(
+    program: &Program,
+    graph: &CallGraph,
+    held_values: &HashMap<Id, Vec<Id>>,
+    adaptive: &HashMap<Id, HashSet<Id>>,
+    async_set: &HashSet<Id>,
+    worklist: Worklist,
+) -> Adaptation {
+    let Worklist {
+        instance_async,
+        origins,
+    } = worklist;
+    ADAPTATION_DECISIONS.with(|count| count.set(count.get() + 1));
+    let component = |root: Id| component_of(graph, root);
     let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::default();
     let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
     let mut reported: HashSet<(Id, Id)> = HashSet::default();
@@ -1550,7 +1626,17 @@ fn compute_adaptation(
             .iter()
             .map(|member| (*member, async_set.contains(member)))
             .collect();
+        // A BASE instance's flags are the async set's already: the last round
+        // re-evaluated it against every final callee verdict (a flip re-queues
+        // its dependents) and wrote each member it flipped into the set — and
+        // that round wrote nothing new, or it would not have been the last. So
+        // the loop below would find no member to flip, and only an adapted
+        // instance (whose bits make its members async where the set does not)
+        // runs it.
         loop {
+            if bits.is_empty() {
+                break;
+            }
             let mut changed = false;
             for member in &members {
                 if flags[member] {
@@ -1566,7 +1652,7 @@ fn compute_adaptation(
                                     program,
                                     held_values,
                                     async_set,
-                                    &adaptive,
+                                    adaptive,
                                     &flags,
                                     bits,
                                     callee,
@@ -1623,7 +1709,7 @@ fn compute_adaptation(
                             program,
                             held_values,
                             async_set,
-                            &adaptive,
+                            adaptive,
                             &flags,
                             bits,
                             callee,
