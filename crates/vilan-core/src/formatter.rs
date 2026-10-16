@@ -4396,6 +4396,13 @@ impl<'src> Printer<'src> {
     /// same-line comment of whatever ends at `after` (`import x; // note`), so a
     /// caller reordering the items it belongs to can re-emit it in the new
     /// place. Returns `None` (consuming nothing) otherwise.
+    ///
+    /// E325: a comment with a brace between `after` and itself trails the
+    /// CONSTRUCT that brace belongs to, not the node ending at `after` - in
+    /// `if c { 1 } else { 2 } // note` the `1` is a block's tail whose `}` and
+    /// the `else` branch both come before the comment, so it stays pending for
+    /// the construct's own end (after the closing `}`) instead of moving onto
+    /// the first arm.
     fn take_trailing_comment(&mut self, after: usize) -> Option<&'src str> {
         if let Some((span, text)) = self.comments.get(self.cursor).copied() {
             let start = span.into_range().start;
@@ -4403,7 +4410,7 @@ impl<'src> Printer<'src> {
                 && self
                     .source
                     .get(after..start)
-                    .is_some_and(|gap| !gap.contains('\n'))
+                    .is_some_and(|gap| !gap.contains(['\n', '{', '}']))
             {
                 self.cursor += 1;
                 return Some(text);
@@ -19120,5 +19127,163 @@ mod call_statement_terminator {
         assert_construct(&at_the_budget, &at_the_budget);
         let (past, split) = hole(102);
         assert_construct(&past, &split);
+    }
+}
+
+#[cfg(test)]
+mod trailing_comment_anchor {
+    //! E325: a trailing comment written after a one-line `if c { 1 } else { 2 }`
+    //! annotated the whole construct, but the formatter, breaking the `if` over
+    //! lines, handed it to the first arm's tail (`1 // note`): the tail's
+    //! trailing-comment flush took any same-line comment, whatever code stood
+    //! between the tail and the comment. A comment with a brace between itself
+    //! and the node stays pending for the construct's own end - after the
+    //! closing `}`. Every case runs through `assert_construct`.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_comment_after_a_one_line_if_statement_lands_after_the_closing_brace() {
+        assert_construct(
+            r####"fun demo(c: bool) {
+	if c { foo() } else { bar() } // the tail
+}
+"####,
+            r####"fun demo(c: bool) {
+	if c {
+		foo()
+	} else {
+		bar()
+	} // the tail
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_comment_after_a_block_tail_if_lands_after_the_closing_brace() {
+        assert_construct(
+            r####"fun pick(c: bool): i32 {
+	if c { 1 } else { 2 } // the tail
+}
+"####,
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1
+	} else {
+		2
+	} // the tail
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_comment_after_an_else_if_chain_lands_after_the_closing_brace() {
+        assert_construct(
+            r####"fun demo(c: bool, d: bool) {
+	if c { foo() } else if d { bar() } else { baz() } // chain
+}
+"####,
+            r####"fun demo(c: bool, d: bool) {
+	if c {
+		foo()
+	} else if d {
+		bar()
+	} else {
+		baz()
+	} // chain
+}
+"####,
+        );
+    }
+
+    /// A comment that already sits on the then-branch stays there, and a second
+    /// one after the construct stays after it.
+    #[test]
+    fn a_comment_already_on_the_then_branch_stays() {
+        assert_construct(
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1 // then
+	} else {
+		2
+	} // after
+}
+"####,
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1 // then
+	} else {
+		2
+	} // after
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_comment_in_the_else_branch_stays_on_its_tail() {
+        assert_construct(
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1
+	} else {
+		2 // else
+	}
+}
+"####,
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1
+	} else {
+		2 // else
+	}
+}
+"####,
+        );
+    }
+
+    /// An `if` that fits inline on a `let` keeps the comment after the `;`.
+    #[test]
+    fn an_inline_if_keeps_its_comment_after_the_semicolon() {
+        assert_construct(
+            r####"fun demo(c: bool) {
+	let v = if c { 1 } else { 2 }; // the tail
+}
+"####,
+            r####"fun demo(c: bool) {
+	let v = if c { 1 } else { 2 }; // the tail
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_match_arm_comment_is_unchanged() {
+        assert_construct(
+            r####"fun demo(c: bool) {
+	let y = match c {
+		true => 1, // arm
+		false => 2
+	};
+}
+"####,
+            r####"fun demo(c: bool) {
+	let y = match c {
+		true => 1, // arm
+		false => 2
+	};
+}
+"####,
+        );
+    }
+
+    /// The same anchor on a function body written on one line.
+    #[test]
+    fn a_comment_after_a_one_line_function_lands_after_its_closing_brace() {
+        assert_construct(
+            "fun one(): i32 { 7 } // one-line fn\n",
+            "fun one(): i32 {\n\t7\n} // one-line fn\n",
+        );
     }
 }
