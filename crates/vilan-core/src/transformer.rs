@@ -5559,6 +5559,12 @@ impl<'src> Transformer<'src> {
                 {
                     reads.insert(*root);
                 }
+                // B626: naming the cell is a REFERENCE of the binding, as the
+                // `Expr::Local` arm's read is — the module-binding tree-shake
+                // (F6) keeps only the bindings `referenced_globals` holds, so a
+                // module scalar read ONLY through a view (`read(&LIMIT)`) was
+                // shaken out and its pair named an undeclared `LIMIT`.
+                self.referenced_globals.insert(*root);
                 (js::Node::Local(self.ng.name_for(*root)), zero())
             }
             // A view of a view is the view: `&v` of a `v: &i32`, `&*v`.

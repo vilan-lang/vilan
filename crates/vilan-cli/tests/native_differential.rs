@@ -13875,3 +13875,61 @@ fn f124_two_loans_in_one_call_and_a_projected_interleaved_view_are_refused_by_na
         }
     }
 }
+
+/// B628: a generic struct literal with a `None` field beside the field that
+/// fixes `T` — refused at its use as `Page<T>` before — answers the same on
+/// both backends through `Debug`, `Json` and a swapped field order.
+#[test]
+fn b628_a_literal_none_field_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_literal_none_field.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/literal_none_field.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a literal's `None` field must type the same natively"
+    );
+}
+
+/// B627 / std-53's A?1: an expected type reaching a receiver call through a
+/// method — a static's impl binder (an internal error on JS before), a derived
+/// decode, a free call's own generic, an external member's own length —
+/// answers the same on both backends.
+#[test]
+fn b627_an_expected_type_through_a_receiver_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_expected_type_through_a_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/expected_type_through_a_receiver.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an expectation through a receiver must bind the same natively"
+    );
+}
+
+/// B626: a module scalar read only through a view — a `const let`, a `let`, a
+/// `mut` written through `&mut`, a read inside a closure — answers the same on
+/// both backends (JS shook the binding out and threw `ReferenceError`).
+#[test]
+fn b626_a_module_scalar_read_only_through_a_view_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_module_scalar_view.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/module_scalar_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a module scalar read through a view must be declared on JS"
+    );
+}

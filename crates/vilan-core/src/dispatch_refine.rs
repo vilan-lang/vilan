@@ -132,6 +132,24 @@ thread_local! {
     /// is the count that shows it, since the answer is the same either way.
     static BOUND_SELECTION_SUBJECT_TESTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// How many per-importer ADMISSION tests (`ImplAdmission::admits_impl`)
+    /// [`impl_members_for_bound`]'s selections have run on this thread since
+    /// [`reset_bound_selection_admission_tests`] (M147). Asked after the
+    /// member filter, so only of the impls that can contribute to the answer.
+    static BOUND_SELECTION_ADMISSION_TESTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The number of admission tests [`impl_members_for_bound`]'s selections have
+/// run on this thread since the last [`reset_bound_selection_admission_tests`].
+/// See [`BOUND_SELECTION_ADMISSION_TESTS`].
+pub fn bound_selection_admission_tests() -> usize {
+    BOUND_SELECTION_ADMISSION_TESTS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`bound_selection_admission_tests`].
+pub fn reset_bound_selection_admission_tests() {
+    BOUND_SELECTION_ADMISSION_TESTS.with(|count| count.set(0));
 }
 
 /// The number of impl subject tests [`impl_members_for_bound`]'s selections
@@ -458,12 +476,6 @@ fn impl_members_for_bound_uncached(
     let mut matching: Vec<&crate::analyzer::Implementation> = program
         .implementations
         .iter()
-        // B318 S4: the per-importer namespace, applied BEFORE the subject test
-        // — the cheap filter first, and the one that says whether this file may
-        // see the block at all.
-        .filter(|implementation| {
-            scope.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
-        })
         // M103: the impls this selection can READ, before the subject test
         // that costs a recursive bound proof per blanket impl. A matching impl
         // contributes to the answer in exactly two ways: a member it declares
@@ -484,6 +496,19 @@ fn impl_members_for_bound_uncached(
                             .get(trait_id)
                             .is_some_and(|trait_| trait_.declarations.contains_key(member))
                 })
+        })
+        // B318 S4: the per-importer namespace, applied BEFORE the subject test,
+        // which costs a bound proof — the one that says whether this file may
+        // see the block at all. M147: after the member filter above, not
+        // before it: both are pure predicates of the block, the member filter
+        // is a map lookup that passes a handful of blocks per selection, and
+        // the admission walk cost ~100 instructions for each of std's hundreds
+        // (175,122 calls, 18 M instructions, on kolt's client check).
+        .filter(|implementation| {
+            scope.is_none_or(|file| {
+                BOUND_SELECTION_ADMISSION_TESTS.with(|count| count.set(count.get() + 1));
+                program.impl_admission.admits_impl(file, implementation)
+            })
         })
         .filter(|implementation| {
             BOUND_SELECTION_SUBJECT_TESTS.with(|count| count.set(count.get() + 1));
@@ -665,6 +690,73 @@ fn resolve_through(
     }
 }
 
+/// The program-wide facts [`refined_edges`] reads at every site: which
+/// functions are taken as values, and every function's incoming calls — from
+/// graph nodes and from top-level code. A function of the program and the
+/// graph it is asked with, never of the sites.
+struct RefineIndex {
+    /// The functions whose entries cannot be enumerated because they are
+    /// taken as a value (called indirectly).
+    value_taken: HashSet<Id>,
+    /// Incoming direct calls per function: (calling node, call).
+    incoming_calls: HashMap<Id, Vec<(Id, Id)>>,
+    /// Incoming calls per function from code no graph node owns.
+    top_level_incoming: HashMap<Id, Vec<Id>>,
+}
+
+impl RefineIndex {
+    fn build(program: &Program, graph: &CallGraph) -> Self {
+        let call_subject_entities: HashSet<Id> = program
+            .function_calls
+            .values()
+            .map(|call| call.subject_id)
+            .collect();
+        let value_taken: HashSet<Id> = program
+            .entity_map
+            .iter()
+            .filter_map(|(entity_id, expr)| match expr {
+                Expr::Local(target)
+                    if program.functions.contains_key(target)
+                        && !call_subject_entities.contains(entity_id) =>
+                {
+                    Some(*target)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut owned_call_ids: HashSet<Id> = HashSet::default();
+        let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
+        for node in graph.nodes() {
+            for call in graph.calls_of(node.id()) {
+                owned_call_ids.insert(call.call_id);
+                if let CallTarget::Function(target) = call.target {
+                    incoming_calls
+                        .entry(target)
+                        .or_default()
+                        .push((node.id(), call.call_id));
+                }
+            }
+        }
+        let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::default();
+        for (call_id, call) in &program.function_calls {
+            if owned_call_ids.contains(call_id) {
+                continue;
+            }
+            if let Some(Expr::Local(target)) = program.entity_map.get(&call.subject_id) {
+                top_level_incoming
+                    .entry(*target)
+                    .or_default()
+                    .push(*call_id);
+            }
+        }
+        Self {
+            value_taken,
+            incoming_calls,
+            top_level_incoming,
+        }
+    }
+}
+
 /// Refines `sites` into concrete edges. See the module documentation for the
 /// per-site rules; the guarantees are (a) every edge's `callee` is one of the
 /// site's candidates, and (b) fallbacks always widen to the whole candidate
@@ -696,26 +788,11 @@ fn refined_edges_timed(
     if sites.is_empty() {
         return Vec::new();
     }
-    // The functions whose entries cannot be enumerated: taken as a value
-    // (called indirectly), or themselves reachable through dispatch.
-    let call_subject_entities: HashSet<Id> = program
-        .function_calls
-        .values()
-        .map(|call| call.subject_id)
-        .collect();
-    let value_taken: HashSet<Id> = program
-        .entity_map
-        .iter()
-        .filter_map(|(entity_id, expr)| match expr {
-            Expr::Local(target)
-                if program.functions.contains_key(target)
-                    && !call_subject_entities.contains(entity_id) =>
-            {
-                Some(*target)
-            }
-            _ => None,
-        })
-        .collect();
+    let RefineIndex {
+        value_taken,
+        incoming_calls,
+        top_level_incoming,
+    } = RefineIndex::build(program, graph);
     let dispatch_reachable: HashSet<Id> = sites
         .iter()
         .flat_map(|site| site.candidates.iter().copied())
@@ -732,37 +809,6 @@ fn refined_edges_timed(
             current = graph.closure_parent_of(current)?;
         }
     };
-
-    // Incoming direct calls per function, and top-level incoming calls.
-    let owned_call_ids: HashSet<Id> = graph
-        .nodes()
-        .iter()
-        .flat_map(|node| graph.calls_of(node.id()))
-        .map(|call| call.call_id)
-        .collect();
-    let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
-    for node in graph.nodes() {
-        for call in graph.calls_of(node.id()) {
-            if let CallTarget::Function(target) = call.target {
-                incoming_calls
-                    .entry(target)
-                    .or_default()
-                    .push((node.id(), call.call_id));
-            }
-        }
-    }
-    let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::default();
-    for (call_id, call) in &program.function_calls {
-        if owned_call_ids.contains(call_id) {
-            continue;
-        }
-        if let Some(Expr::Local(target)) = program.entity_map.get(&call.subject_id) {
-            top_level_incoming
-                .entry(*target)
-                .or_default()
-                .push(*call_id);
-        }
-    }
 
     let mut edges: Vec<RefinedEdge> = Vec::new();
     for site in sites {

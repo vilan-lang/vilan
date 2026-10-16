@@ -901,6 +901,187 @@ fn e309_a_spaced_comparison_of_values_or_a_plain_function_keeps_its_refusals() {
     );
 }
 
+// --- E319: E309's member form — a spaced generic METHOD call -----------------
+//
+// `h.make <str>("a")` read `h.make` as a FIELD, which failed ("struct 'Holder'
+// has no field 'make'") before anything knew `make` is a generic method of
+// `Holder`, and the comparison's other two refusals followed. The field miss is
+// held for the site like the type in value position, and the site steers when
+// the receiver's type has a generic method of that name.
+
+const E319_HEAD: &str = r#"
+struct Holder {
+    tag: i32,
+}
+impl Holder {
+    fun make<U>(self, u: U): U {
+        u
+    }
+    fun plain(self, u: i32): i32 {
+        u
+    }
+}
+"#;
+
+#[test]
+fn e319_a_spaced_generic_method_call_gets_one_steer_naming_the_spacing() {
+    for (statement, written, tight) in [
+        (
+            "let _m = h.make <str>(\"a\");",
+            "h.make <str>",
+            "h.make<str>(\"a\")",
+        ),
+        (
+            "let _m = h.make < i32 > (1);",
+            "h.make < i32 >",
+            "h.make<i32>(1)",
+        ),
+    ] {
+        let source = format!(
+            "{E319_HEAD}fun main() {{\n    let h = Holder {{ tag = 1 }};\n    {statement}\n}}\n"
+        );
+        let diagnostics = failure_diagnostics(&source);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "one steer for {statement:?}: {diagnostics:#?}"
+        );
+        let (message, range) = &diagnostics[0];
+        assert_eq!(
+            &source[range.clone()],
+            written,
+            "spans the member through the `>`"
+        );
+        assert_eq!(
+            message,
+            &format!(
+                "`{written}`: a generic list touches its name — `{tight}`; spaced, the `<` \
+                 after a name is a comparison"
+            )
+        );
+    }
+}
+
+/// E319's boundary: a NON-generic method keeps the field refusal (with E320's
+/// steer) and the comparison's, and a real field compared twice keeps the
+/// comparison's.
+#[test]
+fn e319_a_spaced_non_generic_method_or_a_field_keeps_its_refusals() {
+    let plain = format!(
+        "{E319_HEAD}fun main() {{\n    let h = Holder {{ tag = 1 }};\n    \
+         let _p = h.plain <i32>(1);\n}}\n"
+    );
+    let messages: Vec<String> = failure_diagnostics(&plain)
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("`plain` is a method of `Holder`"))
+            && messages
+                .iter()
+                .all(|message| !message.contains("a generic list touches its name")),
+        "{messages:#?}"
+    );
+    let field = format!(
+        "{E319_HEAD}fun main() {{\n    let h = Holder {{ tag = 1 }};\n    let b = 2;\n    \
+         let _z = h.tag < b > (3);\n}}\n"
+    );
+    assert_fails_with(&field, "`bool` has no ordering");
+    assert_fails_without(&field, "a generic list touches its name");
+}
+
+// --- E320: a method named without its parentheses ---------------------------
+
+const E320_POINT: &str = r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+impl Point {
+    fun norm(self): i32 {
+        self.x + self.y
+    }
+    fun scaled(self, by: i32): i32 {
+        self.x * by
+    }
+    fun origin(): Point {
+        Point { x = 0, y = 0 }
+    }
+}
+"#;
+
+/// `p.norm` was "struct 'Point' has no field 'norm'"; the refusal now says
+/// `norm` is a method and writes the call as the reader wrote the access —
+/// `(…)` when the method takes arguments, the path for a static.
+#[test]
+fn e320_a_method_named_without_parentheses_is_called_in_the_refusal() {
+    for (expression, call) in [
+        ("p.norm", "`p.norm()`"),
+        ("p.scaled", "`p.scaled(…)`"),
+        ("p.origin", "as a static: `Point::origin()`"),
+    ] {
+        let source = format!(
+            "{E320_POINT}fun main() {{\n    let p = Point {{ x = 1, y = 2 }};\n    \
+             let _n = {expression};\n}}\n"
+        );
+        let member = expression.trim_start_matches("p.");
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "struct 'Point' has no field '{member}': `{member}` is a method of `Point`: \
+                 call it, {call}"
+            ),
+        );
+    }
+    // A name that is neither keeps the plain refusal.
+    assert_fails_with(
+        &format!(
+            "{E320_POINT}fun main() {{\n    let p = Point {{ x = 1, y = 2 }};\n    \
+             let _n = p.length;\n}}\n"
+        ),
+        "struct 'Point' has no field 'length'",
+    );
+    assert_fails_without(
+        &format!(
+            "{E320_POINT}fun main() {{\n    let p = Point {{ x = 1, y = 2 }};\n    \
+             let _n = p.length;\n}}\n"
+        ),
+        "is a method of",
+    );
+}
+
+/// E320 in an element head: `<input .autofocus />` names `.autofocus()` — and
+/// E119's twin note, which claimed the browser twin declares `autofocus`
+/// (both twins declare the METHOD), is not attached: the miss is no field of
+/// either twin.
+#[test]
+fn e320_an_element_heads_bare_link_names_the_call() {
+    let source = r#"
+        import std::web::ui::View;
+        fun page(): View {
+            <input .autofocus />
+        }
+        fun main() {}
+        "#;
+    assert_fails_once_with(
+        source,
+        "struct 'View' has no field 'autofocus': `autofocus` is a method of `View`: call it, \
+         `.autofocus()`",
+    );
+    let notes: Vec<String> = failure_diagnostics_with_notes(source)
+        .into_iter()
+        .filter_map(|(_, _, note)| note.map(|(message, _, _)| message))
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .all(|note| !note.contains("declares `autofocus`")),
+        "{notes:#?}"
+    );
+}
+
 /// E291's boundary: a TIGHT list reads as always — a generic call, a member
 /// call's, a path head's, a struct literal's — and comparisons stay
 /// comparisons.

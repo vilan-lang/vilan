@@ -14229,3 +14229,251 @@ fn b578_a_view_of_a_call_result_in_a_generic_body_pairs_per_instance() {
         "[5]\n[s]\n[7]\n[t]\n",
     );
 }
+
+// --- F141: an assignment through `Shared::read()` ---------------------------
+//
+// Spec §6.7: `read()` answers a COPY of the cell's value, so `cell.read().count
+// = 3` writes a copy nothing keeps. It checked clean and the backends split:
+// natively the write was lost (0, 1), while JS — whose read aliased the cell —
+// wrote the cell (3, 7). Refused at the target, rewritten through `write()`.
+
+const F141_BAG: &str = r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        struct Bag {
+            count: i32,
+            items: List<i32>,
+            pair: (i32, i32),
+        }
+
+        fun fresh(): Shared<Bag> {
+            Shared::new(Bag { count = 0, items = [1], pair = (2, 3) })
+        }
+"#;
+
+#[test]
+fn f141_an_assignment_through_a_read_is_refused() {
+    for (statement, read, rewritten) in [
+        (
+            "cell.read().count = 3;",
+            "cell.read()",
+            "cell.write().count = 3",
+        ),
+        (
+            "cell.read().items[0] = 7;",
+            "cell.read()",
+            "cell.write().items[0] = 7",
+        ),
+        (
+            "cell.read().count += 1;",
+            "cell.read()",
+            "cell.write().count += 1",
+        ),
+        (
+            "cell.read().pair.0 = 9;",
+            "cell.read()",
+            "cell.write().pair.0 = 9",
+        ),
+        (
+            "holder.cell.read().count = 4;",
+            "holder.cell.read()",
+            "holder.cell.write().count = 4",
+        ),
+    ] {
+        let source = format!(
+            "{F141_BAG}
+        struct Holder {{
+            cell: Shared<Bag>,
+        }}
+
+        fun main() {{
+            let cell = fresh();
+            let holder = Holder {{ cell = fresh() }};
+            {statement}
+            print(cell.read().count + holder.cell.read().count);
+        }}
+        "
+        );
+        let write = read.replace("read()", "write()");
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`{read}` is a copy, so this assignment is lost; write through `{write}`: \
+                 `{rewritten}`"
+            ),
+        );
+    }
+}
+
+/// F141's boundary: the `write()` spelling, a `mut` copy of a read written
+/// whole, and reads themselves are untouched.
+#[test]
+fn f141_writing_through_write_or_into_a_copy_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{F141_BAG}{}",
+            r#"
+        fun main() {
+            let cell = fresh();
+            cell.write().count = 3;
+            cell.write().items[0] = 7;
+            cell.write().pair.0 = 9;
+            mut copy = cell.read();
+            copy.count = 40;
+            print(cell.read().count);
+            print(cell.read().items[0]);
+            print(cell.read().pair.0);
+            print(copy.count);
+        }
+        main();
+        "#
+        ),
+        "3\n7\n9\n40\n",
+    );
+}
+
+// --- B626: a module scalar read only through a view -------------------------
+//
+// The transformer's module-binding tree-shake (F6) keeps the bindings emitted
+// code referenced, and naming a boxed scalar's CELL for a view (`read(&LIMIT)`)
+// recorded no reference — so a `let`/`const let` scalar read nowhere by value
+// was shaken out and the bundle threw `ReferenceError: LIMIT is not defined`
+// (natively it printed 41). The item's premise — the analyzer's reference count
+// — was wrong: that count was 1.
+
+#[test]
+fn b626_a_module_scalar_read_only_through_a_view_is_declared() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        const let LIMIT = 40;
+        let LOOSE = 50;
+        mut COUNTER = 7;
+        let LATER = 60;
+
+        fun read(value: &i32): i32 {
+            *value + 1
+        }
+
+        fun bump(value: &mut i32) {
+            value += 1;
+        }
+
+        fun main() {
+            print(read(&LIMIT));
+            print(read(&LOOSE));
+            bump(&mut COUNTER);
+            print(read(&COUNTER));
+            let later = || read(&LATER);
+            print(later());
+        }
+        main();
+        "#,
+        "41\n51\n9\n61\n",
+    );
+}
+
+// --- native-53's B?2: a lent place's root re-bound by a later argument --------
+//
+// Spec §6.4 (rule 4): `log.items.push({ log = fresh(); 9 })` re-binds the root
+// of the place the call lends `&mut` while the view is live. It checked clean;
+// JS wrote the object `log` held when the receiver was evaluated (the new `log`
+// stayed empty) and rustc refused the native emission (E0506, reported as a
+// backend defect). Refused at the re-bind. A binding a closure captures is
+// F138's — both backends read it after the later arguments.
+
+const LENT_ROOT_LOG: &str = r#"
+        import std::io::print;
+
+        struct Log {
+            items: List<i32>,
+            count: i32,
+        }
+
+        impl Log {
+            fun bump(&mut self, by: i32) {
+                self.count += by;
+            }
+        }
+
+        fun fresh(): Log {
+            Log { items = [], count = 0 }
+        }
+
+        fun add(target: &mut List<i32>, item: i32) {
+            target.push(item);
+        }
+"#;
+
+#[test]
+fn a_lent_places_root_rebound_by_a_later_argument_is_refused() {
+    for (statement, lent, settled) in [
+        (
+            "log.items.push({ log = fresh(); 9 });",
+            "log.items",
+            "let item = { log = fresh(); 9 }; log.items.push(item)",
+        ),
+        (
+            "log.bump({ log = fresh(); 9 });",
+            "log",
+            "let item = { log = fresh(); 9 }; log.bump(item)",
+        ),
+        (
+            "add(&mut log.items, { log = fresh(); 9 });",
+            "log.items",
+            "let item = { log = fresh(); 9 }; add(&mut log.items, item)",
+        ),
+    ] {
+        let source = format!(
+            "{LENT_ROOT_LOG}
+        fun main() {{
+            mut log = fresh();
+            {statement}
+            print(log.items.len());
+        }}
+        "
+        );
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`log` is re-bound while `{lent}` is lent `&mut` to this call, which would \
+                 write the value `log` held before; settle the value first: `{settled}`"
+            ),
+        );
+    }
+}
+
+/// B?2's boundary: the settled form, a write that does not re-bind the root,
+/// and a CAPTURED binding (F138: read after the later arguments, so the call
+/// writes the new binding) all compile.
+#[test]
+fn a_settled_value_or_a_captured_root_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{LENT_ROOT_LOG}{}",
+            r#"
+        fun main() {
+            mut log = fresh();
+            let item = {
+                log = fresh();
+                9
+            };
+            log.items.push(item);
+            print(log.items.len());
+            mut captured = fresh();
+            let peek = || captured.items.len();
+            captured.items.push({
+                captured = fresh();
+                9
+            });
+            print(captured.items.len());
+            print(peek());
+        }
+        main();
+        "#
+        ),
+        "1\n1\n1\n",
+    );
+}

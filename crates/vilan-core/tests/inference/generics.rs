@@ -6368,6 +6368,345 @@ fn b633_a_generic_field_no_wire_binder_makes_wire_is_still_refused() {
     );
 }
 
+// --- B628: a literal's fields unify across every field -------------------
+//
+// `reconcile_type`'s bound-generic arm reconciled a parameter the context had
+// already bound and then appended `T := <the other side>` — a self-map when the
+// other side was the same parameter (a `None` typed `Option<T>` meeting the
+// field's `Option<T>`). The literal folds its bindings in order, so the
+// trailing self-map overwrote `items`' `T := str` and the binding typed as
+// the declaration's own `Page<T>` (swap the two fields and it compiled).
+
+const B628_PAGE: &str = r#"
+        import std::io::print;
+        import std::debug::Debug;
+        import std::option::Option::{ self, Some, None };
+
+        [derive(Debug)]
+        struct Page<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        fun shown<T: Debug>(value: T): str {
+            value.debug()
+        }
+"#;
+
+#[test]
+fn b628_a_literal_none_field_takes_the_parameter_another_field_fixed() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B628_PAGE}{}",
+            r#"
+        fun main() {
+            let words = Page { items = ["a"], first = None };
+            print(shown(words));
+            let swapped = Page { first = None, items = ["b"] };
+            print(shown(swapped));
+            let nested = Page { items = [Some(1)], first = None };
+            print(shown(nested));
+            print(shown(Page { items = [2.5], first = None }));
+        }
+        main();
+        "#
+        ),
+        "Page { items = [\"a\"], first = None }\nPage { items = [\"b\"], first = None }\nPage { items = [Some(1)], first = None }\nPage { items = [2.5], first = None }\n",
+    );
+}
+
+/// B628's mismatch side: the fix drops only the SELF-map. A `None` beside a
+/// field that fixes `T` still checks every other field against that `T`.
+#[test]
+fn b628_a_literal_field_against_the_parameter_another_field_fixed_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B628_PAGE}{}",
+            r#"
+        fun main() {
+            let words = Page { items = ["a"], first = Some(3) };
+            print(shown(words));
+        }
+        "#
+        ),
+        "Expected",
+    );
+    // The literal's type is `Page<str>`, so it never reaches a `Page<i32>`.
+    assert_fails_with(
+        &format!(
+            "{B628_PAGE}{}",
+            r#"
+        fun main() {
+            let words = Page { items = ["a"], first = None };
+            let numbers: Page<i32> = words;
+            print(shown(numbers));
+        }
+        "#
+        ),
+        "Page<str>",
+    );
+}
+
+/// B628, the derives B622/B633 met it through: `[derive(Json)]`'s `to_json`,
+/// `[derive(Wire)]`'s `encode` and `[derive(Hashable)]`'s `hash` over a literal
+/// whose `None` field sits beside the field that fixes `T` — each was refused
+/// "generic parameter 'T' is missing the bound" against `Page<T>`.
+#[test]
+fn b628_the_derives_accept_a_literal_with_a_none_field() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        import std::wire::{ Wire, encode, decode };
+        import std::json::json_codec;
+        import std::hash::{ Hash, Hashable };
+        import std::result::Result::{ self, Ok, Err };
+        import std::option::Option::{ self, Some, None };
+
+        [derive(Json)]
+        struct Page<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        [derive(Wire)]
+        struct Sent<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        [derive(Hashable)]
+        struct Keyed<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        fun main() {
+            let words = Page { items = ["a"], first = None };
+            print(words.to_json());
+            let sent = Sent { items = [4, 5], first = None };
+            let back: Result<Sent<i32>, str> = decode(json_codec(), encode(json_codec(), sent));
+            print(back.unwrap().items.len());
+            let keyed = Keyed { items = [true], first = None };
+            print(keyed.hash() == Keyed { items = [true], first = None }.hash());
+        }
+        main();
+        "#,
+        "{\"items\":[\"a\"],\"first\":null}\n2\ntrue\n",
+    );
+}
+
+// --- B627 / std-53's A?1: a method's expectation reaches its receiver ------
+//
+// Method resolution runs receiver-first, so a receiver CALL settled before the
+// expectation on the method's result reached it: a static's impl binder only
+// that expectation fixes stayed the binder (JS reached the bound trait's
+// body-less requirement — an internal error — while the native build read the
+// binding's type and ran), and a free call's own generic was refused "cannot
+// infer". The receiver is now re-inferred directed at the type the expectation
+// implies through the member's return.
+
+const B627_HOLDER: &str = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Make {
+            fun make(): Self;
+        }
+
+        impl i32 with Make {
+            fun make(): i32 {
+                7
+            }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T: Make> {
+            fun build(): Option<Holder<T>> {
+                Some(Holder { value = T::make() })
+            }
+        }
+"#;
+
+#[test]
+fn b627_an_expected_type_binds_a_static_receivers_impl_binder_through_a_method() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun built(): Holder<i32> {
+            Holder::build().unwrap()
+        }
+
+        fun main() {
+            let held: Holder<i32> = Holder::build().unwrap();
+            print(held.value);
+            print(built().value + 1);
+            let kept: Holder<i32> = Holder::build().unwrap_or(Holder { value = 0 });
+            print(kept.value + 2);
+        }
+        main();
+        "#
+        ),
+        "7\n8\n9\n",
+    );
+}
+
+/// B627's derive shapes (B623 met them writing its pins): a derived `FromJson`
+/// over a generic struct, decoded through `unwrap()` into an annotated
+/// binding — the type's parameter and a `const N` length both come from it.
+#[test]
+fn b627_a_derived_decode_through_unwrap_takes_the_bindings_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        import std::result::Result::{ self, Ok, Err };
+
+        [derive(Json)]
+        struct Bag<T> {
+            items: List<T>,
+        }
+
+        [derive(Json)]
+        struct Ring<T, const N> {
+            slots: [T; N],
+        }
+
+        fun main() {
+            let bag: Bag<i32> = Bag::from_json("{\"items\":[1,2]}").unwrap();
+            print(bag.items.len());
+            let ring: Ring<str, 2> = Ring::from_json("{\"slots\":[\"p\",\"q\"]}").unwrap();
+            print(ring.slots[1]);
+        }
+        main();
+        "#,
+        "2\nq\n",
+    );
+}
+
+/// std-53's A?1, the same seam: a free call's own generic and an external
+/// member's own length fixed by the expectation on a method of their result.
+#[test]
+fn b627_an_expected_type_binds_a_receiver_calls_own_generic_through_a_method() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun make<T>(): Option<T> {
+            None
+        }
+
+        fun tail(): i32 {
+            make().unwrap_or(4)
+        }
+
+        fun main() {
+            let x: i32 = make().unwrap_or(3);
+            print(x);
+            print(tail());
+            let xs = [1, 2];
+            let array: [i32; 2] = xs.to_array().unwrap();
+            print(array[1]);
+            let short: [i32; 3] = xs.to_array().unwrap_or([0, 0, 9]);
+            print(short[2]);
+        }
+        main();
+        "#,
+        "3\n4\n2\n9\n",
+    );
+}
+
+/// B627's other door: with nothing to fix the binder, the call is refused —
+/// never an internal error on JS and a backend refusal natively.
+#[test]
+fn b627_a_static_receiver_nothing_determines_is_refused() {
+    for body in [
+        "let held = Holder::build().unwrap(); print(held.value);",
+        "let held = Holder::build(); print(held.is_some());",
+        "print(Holder::build().unwrap().value);",
+    ] {
+        assert_fails_once_with(
+            &format!("{B627_HOLDER}\n        fun main() {{ {body} }}\n"),
+            "this call's result `Option<Holder<T>>` is never fully determined: nothing it is \
+             passed binds 'T' and nothing its result lands in names it. Write the type on the \
+             binding the result lands in (`let value: … = …`), or on the path \
+             (`Holder<…>::build(…)`)",
+        );
+    }
+    // The path door compiles, as the binding door does above.
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun main() {
+            print(Holder<i32>::build().unwrap().value);
+        }
+        main();
+        "#
+        ),
+        "7\n",
+    );
+    // B403's case with the binder in the RETURN: a static whose result a later
+    // method call was to settle (`bag.add(3)`) left the binder open, and JS
+    // reached `Debug`'s body-less `debug`.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::debug::Debug;
+        struct Bag<T> {
+            items: List<T>,
+        }
+        impl Bag<type T: Debug> {
+            fun new(): Bag<T> {
+                Bag { items = [] }
+            }
+            fun add(&mut self, item: T) {
+                self.items.push(item);
+            }
+            fun shown(self): str {
+                self.items.debug()
+            }
+        }
+        fun main() {
+            mut bag = Bag::new();
+            bag.add(3);
+            print(bag.shown());
+        }
+        "#,
+        "this call's result `Bag<T>` is never fully determined",
+    );
+    // A result landing where its consumer typed it is that position's: the
+    // corpus's `Signal::new(HashMap::new())` under an annotated binding.
+    assert_compiles(
+        r#"
+        import std::hash_map::HashMap;
+        import std::reactive::{ Signal, SignalCell };
+        fun main() {
+            let scores: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());
+        }
+        "#,
+    );
+    // A binder the expectation fixes to a type outside the bound is the bound
+    // check's refusal, as through an annotated intermediate.
+    assert_fails_with(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun main() {
+            let held: Holder<str> = Holder::build().unwrap();
+            print(held.value);
+        }
+        "#
+        ),
+        "'str' does not implement trait 'Make'",
+    );
+}
+
 #[test]
 fn b188_a_path_head_is_not_an_under_supplied_application() {
     // `Option::None` and `List::new()` name a NAMESPACE to look a member up

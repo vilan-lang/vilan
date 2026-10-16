@@ -759,3 +759,7 @@ row	flagship	key
 736	-	`{written}`: a generic list touches its name — `{tight}`; spaced, the `<` after a name is a comparison
 737	-	a bracket heads a `::` path only as a fixed-array type, `[T; n]` (`[i32; 3]::default()`): a list or repeat literal is a value and names no type to look a member up in; write the element type and the length, or `List<T>::` for a list
 738	-	generic parameter '{parameter}' is missing the bound ': {trait_name}' its impl asks of it
+739	-	`{name}` is re-bound while `{lent_text}` is lent `&mut` to this call, which would write the value `{name}` held before; settle the value first: `let item = {value}; {settled}`
+740	-	`{read_text}` is a copy, so this assignment is lost; write through `{write_text}`: `{rewritten}`
+741	-	struct '{struct_name}' has no field '{member_name}': `{member_name}` is a method of `{struct_name}`: call it, {call}
+742	-	this call's result `{settled_label}` is never fully determined: nothing it is passed binds '{generic_label}' and nothing its result lands in names it. Write the type on the binding the result lands in (`let value: … = …`){path_door}

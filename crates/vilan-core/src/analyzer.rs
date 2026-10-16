@@ -5945,6 +5945,10 @@ pub struct Analyzer<'src> {
     // E309: those refusals, held: the message and the entity the name
     // resolved to.
     deferred_not_a_value: HashMap<Id, (String, Id)>,
+    // B627: the generics the binding residual sweep (`finalize_build`)
+    // already reported as "never fully determined" — the bound check's
+    // undetermined-call refusal stands down for them (one refusal per root).
+    swept_residual_generics: HashSet<TypeId>,
     // B569 §4.1: a labelled literal matched BY NAME against a labelled type
     // whose order differs — `let p: (x: f64, y: f64) = (y = 7, x = 5);` —
     // keyed by the literal: the written entry each storage slot takes, and
@@ -7065,12 +7069,26 @@ fn type_head<'src>(node: &Node<'src>) -> Option<&'src str> {
 /// struct, or a function in an `impl` block whose subject is that type. A
 /// syntactic question, asked of a twin file that is not part of this analysis —
 /// no ids, no types, nothing loaded.
-fn declares_member_on(item: &Node, type_name: &str, member: &str) -> bool {
+/// Which kind of member a twin note asks the other twin about (E320): a
+/// field miss is answered by a FIELD of the other twin only — both twins
+/// declaring `View::autofocus` as a method is no reason to send a field read
+/// to the other platform — and a method miss by a method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TwinMember {
+    Field,
+    Method,
+}
+
+fn declares_member_on(item: &Node, type_name: &str, member: &str, kind: TwinMember) -> bool {
     match item {
-        Node::Struct(name, _, _, _, Some(fields), _) if name.0 == type_name => {
+        Node::Struct(name, _, _, _, Some(fields), _)
+            if name.0 == type_name && kind == TwinMember::Field =>
+        {
             fields.0.iter().any(|field| field.0.0.0 == member)
         }
-        Node::Impl(subject, _, body, _) if type_head(&subject.0) == Some(type_name) => {
+        Node::Impl(subject, _, body, _)
+            if type_head(&subject.0) == Some(type_name) && kind == TwinMember::Method =>
+        {
             body.0.iter().any(|inner| {
                 matches!(unwrap_item(inner), Node::Func(function) if function.name.0 == member)
             })
@@ -8227,6 +8245,7 @@ impl<'src> Analyzer<'src> {
             spaced_generic_calls: HashMap::default(),
             spaced_generic_operands: HashSet::default(),
             deferred_not_a_value: HashMap::default(),
+            swept_residual_generics: HashSet::default(),
             tuple_literal_layouts: HashMap::default(),
             tuple_literal_label_problems: HashMap::default(),
             named_arguments: Vec::new(),
@@ -9656,6 +9675,7 @@ impl<'src> Analyzer<'src> {
             // the native build emitted one instance for every instantiation
             // (`A A` for a `Holder<B>`) — so it is this invariant's case.
             let mut unbindable = Vec::new();
+            let mut undetermined: Vec<(TypeId, Type)> = Vec::new();
             if self
                 .function_calls
                 .get(&call_id)
@@ -9671,11 +9691,87 @@ impl<'src> Analyzer<'src> {
                     let return_type = return_type_id.get_type(self);
                     self.collect_generics(&return_type, 0, &mut in_return);
                 }
-                unbindable = self
-                    .impl_binder_generics(member_id)
+                let binders = self.impl_binder_generics(member_id);
+                // B627: a bounded binder the RETURN mentions is bound where the
+                // result lands — and when nothing it lands in names it (`let
+                // held = Holder::build().unwrap();`), the call's settled type
+                // still carries the binder itself, and so does what it lands
+                // in (`undetermined_value_flows_on`; a result landing in a
+                // position its consumer typed — `Signal::new(HashMap::new())`
+                // under an annotated binding — is that position's to type).
+                // JS then reached the bound trait's body-less requirement (an
+                // internal error) and the native build refused the unbound
+                // parameter as a backend gap; the program is incomplete, so it
+                // is refused here. The cheap tests first — a bounded binder the return carries
+                // that the call recorded no binding for, outside the enclosing
+                // declaration and not already named by the residual sweep —
+                // and the settled type only for a call that has one.
+                let open: Vec<TypeId> = binders
+                    .iter()
+                    .copied()
+                    .filter(|generic| {
+                        in_return.contains(generic)
+                            && !self.swept_residual_generics.contains(generic)
+                            && !self
+                                .method_call_substitution
+                                .get(&call_id)
+                                .is_some_and(|substitution| substitution.contains_key(generic))
+                            && !self.generic_bound_traits(*generic).is_empty()
+                            && !self.generic_is_enclosing_binder(*generic, call_id)
+                    })
+                    .collect();
+                if !open.is_empty() {
+                    let settled = self.infer_type(call_id, &Type::Unknown, &HashMap::default());
+                    let mut carried = Vec::new();
+                    self.collect_generics(&settled, 0, &mut carried);
+                    for generic in open {
+                        if carried.contains(&generic)
+                            && self.undetermined_value_flows_on(call_id, generic)
+                        {
+                            undetermined.push((generic, settled.clone()));
+                        }
+                    }
+                }
+                unbindable = binders
                     .into_iter()
                     .filter(|generic| !in_return.contains(generic))
                     .collect();
+            }
+            for (generic, settled) in std::mem::take(&mut undetermined) {
+                let generic_label =
+                    self.pretty_print_type(&Type::Generic(generic), &HashMap::default());
+                let settled_label = self.pretty_print_type(&settled, &HashMap::default());
+                // The path door names the impl's subject with its arguments
+                // written (`Holder<…>::build()`), when the subject is nominal.
+                let path_door = self
+                    .implementation_by_declaration
+                    .get(&member_id)
+                    .and_then(|index| self.implementations.get(*index))
+                    .and_then(
+                        |implementation| match implementation.subject.get_type(self) {
+                            Type::Struct(struct_id, _) => {
+                                self.structs.get(&struct_id).map(|s| s.name)
+                            }
+                            Type::Enum(enum_id, _) => self.enums.get(&enum_id).map(|e| e.name),
+                            _ => None,
+                        },
+                    )
+                    .zip(self.callable_name(member_id))
+                    .map(|(subject, member)| {
+                        format!(", or on the path (`{subject}<…>::{member}(…)`)")
+                    })
+                    .unwrap_or_default();
+                errors.push((
+                    call_id,
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    format!(
+                        "this call's result `{settled_label}` is never fully determined: nothing \
+                         it is passed binds '{generic_label}' and nothing its result lands in \
+                         names it. Write the type on the binding the result lands in (`let \
+                         value: … = …`){path_door}"
+                    ),
+                    generic,
+                ));
             }
             // B424, door (a) (the owner's ruling, 2026-09-28): an UNBOUNDED
             // own generic the call left free is refused too when the call's
@@ -23726,6 +23822,217 @@ impl<'src> Analyzer<'src> {
         selected
     }
 
+    /// B627: whether the value of `call_id`, whose settled type still carries
+    /// `generic`, ends where nothing decides it. The value is followed through
+    /// what it lands in — the binding it initializes, the call it is an
+    /// argument (or receiver) of — while each carrier's settled type still
+    /// carries the generic. A carrier the program TYPED decides it: a
+    /// position with an expectation that does not carry it (a struct
+    /// literal's field, an annotated binding, a parameter the callee fixes —
+    /// `Shared::new(HashMap::new())` as a `Shared<HashMap<str, Node>>` field),
+    /// or a landing whose own settled type no longer carries it. A binding
+    /// that still carries it, or a carrier only a field read or a statement
+    /// consumes, is undetermined.
+    fn undetermined_value_flows_on(&mut self, call_id: Id, generic: TypeId) -> bool {
+        let mut current = call_id;
+        // Each step moves to an enclosing expression, so the walk is bounded
+        // by the nesting depth; the cap only guards a malformed table.
+        for _ in 0..64 {
+            if let Some(expected_id) = self.expected_types.get(&current).copied() {
+                let expected = expected_id.get_type(self);
+                let mut carried = Vec::new();
+                self.collect_generics(&expected, 0, &mut carried);
+                if !matches!(expected, Type::Unknown | Type::Unresolved | Type::Any)
+                    && !carried.contains(&generic)
+                {
+                    return false;
+                }
+            }
+            let initialized: Vec<Id> = self
+                .variables
+                .iter()
+                .filter(|(_, variable)| variable.initial == Some(current))
+                .map(|(variable_id, _)| *variable_id)
+                .collect();
+            if !initialized.is_empty() {
+                return initialized
+                    .into_iter()
+                    .any(|variable_id| self.settled_type_carries(variable_id, generic));
+            }
+            let consumer = self
+                .function_calls
+                .iter()
+                .find(|(_, consumer)| consumer.argument_ids.contains(&current))
+                .map(|(consumer_id, _)| *consumer_id);
+            match consumer {
+                Some(consumer_id) if self.settled_type_carries(consumer_id, generic) => {
+                    current = consumer_id;
+                }
+                Some(_) => return false,
+                // A field read off the carrier, or a statement discarding it,
+                // consumes it untyped (`print(Holder::build().unwrap().value)`,
+                // `Holder::build();`): the instance is emitted undetermined.
+                // Any other position (a list element, a tuple, a typed return)
+                // is that position's to type.
+                None => {
+                    return self.expr_id_to_expr_map.values().any(|expr| match expr {
+                        Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..) => {
+                            *subject == current
+                        }
+                        Expr::Block((statements, _)) => statements.contains(&current),
+                        _ => false,
+                    });
+                }
+            }
+        }
+        false
+    }
+
+    /// B627: whether `id`'s settled type mentions `generic`.
+    fn settled_type_carries(&mut self, id: Id, generic: TypeId) -> bool {
+        let settled = self.infer_type(id, &Type::Unknown, &HashMap::default());
+        let mut carried = Vec::new();
+        self.collect_generics(&settled, 0, &mut carried);
+        carried.contains(&generic)
+    }
+
+    /// [`Self::infer_type_path`]'s external-callee arm: the external's OWN
+    /// generics its return alone carries, bound by reconciling the (receiver-
+    /// substituted) return with the call's expectation and recorded on the
+    /// call — the bodied arm's reconcile-and-record, narrowed to the generics
+    /// the external itself declares (B627).
+    fn record_external_return_generics(
+        &mut self,
+        call_id: Id,
+        function_id: Id,
+        return_type: &Type,
+        constraint: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        if matches!(constraint, Type::Unknown | Type::Unresolved | Type::Any) {
+            return;
+        }
+        let Some(own_generics) = self
+            .external_functions
+            .get(&function_id)
+            .map(|function| function.generic_parameter_constraint_ids.clone())
+        else {
+            return;
+        };
+        if own_generics.is_empty() {
+            return;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(return_type, 0, &mut carried);
+        if !own_generics.iter().any(|generic| carried.contains(generic)) {
+            return;
+        }
+        let previously_inferable =
+            std::mem::replace(&mut self.inferable_generics, own_generics.clone());
+        let reconciled = self.reconcile_type(return_type, constraint, substitution_context);
+        self.inferable_generics = previously_inferable;
+        let Some((_, bindings)) = reconciled else {
+            return;
+        };
+        for (generic, bound_to) in bindings {
+            let foreign = match *bound_to.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
+            if own_generics.contains(&generic)
+                && !foreign
+                && !self.generic_is_enclosing_binder(generic, call_id)
+            {
+                self.method_call_substitution
+                    .entry(call_id)
+                    .or_default()
+                    .entry(generic)
+                    .or_insert(bound_to);
+            }
+        }
+    }
+
+    /// B627 / std-53's A?1: a method call's EXPECTATION reaches its receiver.
+    /// `let held: Holder<i32> = Holder::build().unwrap();` expects `unwrap`'s
+    /// result to be a `Holder<i32>`, and `unwrap` on an `Option<Holder<T>>`
+    /// answers that `Holder<T>` — so the receiver call is `Option<Holder<i32>>`,
+    /// and the static's impl binder `T` is `i32`. Method resolution runs
+    /// receiver-first, so the receiver call settled before the expectation
+    /// reached the method: its generic stayed the impl's binder (JS reached
+    /// `Make`'s body-less `make`, an internal error, while the native build
+    /// read the binding's type and ran), and a free call's own generic
+    /// (`make().unwrap_or(3)`, `xs.to_array().unwrap()`) was refused "cannot
+    /// infer". The receiver is re-inferred DIRECTED at the type the
+    /// expectation implies — `resolve_try_assert`'s precedent for `call()!`,
+    /// whose call arm records the bindings for monomorphization.
+    ///
+    /// Only a receiver that is a CALL and still carries a generic nothing at
+    /// this site holds rigid is directed, and only through what the member's
+    /// return type (its impl's binders bound from the receiver) says about
+    /// those generics; `None` when the expectation decides nothing new.
+    fn receiver_directed_by_expectation(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> Option<Type> {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&subject_id),
+            Some(Expr::Call(_))
+        ) {
+            return None;
+        }
+        let expected = self.expected_types.get(&call_id)?.get_type(self);
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+            return None;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(subject_type, 0, &mut carried);
+        let open: Vec<TypeId> = carried
+            .into_iter()
+            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
+        let impl_subject = self.implementations.get(implementation_index)?.subject;
+        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        // The member's own generics are open in its answer too (a `map<U>`
+        // returning `Option<U>`), but they are the member's to bind, from
+        // its arguments; only the receiver's generics are taken from here.
+        let mut inferable = open.clone();
+        if let Some((_, own_generics)) = self.method_signature_ref(member_id) {
+            inferable.extend_from_slice(own_generics);
+        }
+        let previously_inferable = std::mem::replace(&mut self.inferable_generics, inferable);
+        let reconciled = self.reconcile_type(&answered, &expected, &HashMap::default());
+        self.inferable_generics = previously_inferable;
+        let (_, bindings) = reconciled?;
+        let mut directed_by: SubstitutionContext = HashMap::default();
+        for (generic, bound_to) in bindings {
+            // B351's rule, the value side: an expectation that is itself some
+            // other call's abstract generic is not evidence.
+            let foreign = match *bound_to.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
+            if open.contains(&generic) && !foreign {
+                directed_by.entry(generic).or_insert(bound_to);
+            }
+        }
+        if directed_by.is_empty() {
+            return None;
+        }
+        let directed = self.substitute_type(subject_type, &directed_by);
+        let redirected = self.infer_type(subject_id, &directed, &HashMap::default());
+        match redirected {
+            Type::Unresolved | Type::Unknown => None,
+            redirected => Some(redirected),
+        }
+    }
+
     /// A candidate member's declared return type, with the declaring impl's own
     /// binders bound from the receiver — so the blanket's `fun into(self): T`
     /// reads as `Foo` on a `Foo` and the user's `fun into(self): Bar` as `Bar`.
@@ -32126,19 +32433,30 @@ impl<'src> Analyzer<'src> {
     /// `*` target and a lifted chain already carry their own refusal.
     fn check_assignment_places(&mut self) {
         // M110 S7b: the live assignments only, walked.
-        let mut assignment_targets: Vec<Id> = self
+        let mut assignment_targets: Vec<(Id, Id)> = self
             .live_entries_where(&self.expr_id_to_expr_map, |expr| {
                 matches!(expr, Expr::Assignment(..))
             })
-            .filter_map(|(_, expr)| match expr {
-                Expr::Assignment(target_id, _) => Some(*target_id),
+            .filter_map(|(assignment_id, expr)| match expr {
+                Expr::Assignment(target_id, _) => Some((*target_id, *assignment_id)),
                 _ => None,
             })
             .collect();
         // Source order, so a program with several reports them in reading order.
-        assignment_targets.sort_unstable_by_key(|target_id| target_id.0);
-        for target_id in assignment_targets {
+        assignment_targets.sort_unstable_by_key(|(target_id, _)| target_id.0);
+        let shared_reads = self
+            .shared_members()
+            .map(|[_, reads, _, _]| reads)
+            .unwrap_or_default();
+        for (target_id, assignment_id) in assignment_targets {
             let Some((non_place_id, what)) = self.first_non_place(target_id) else {
+                // F141: a place inside a `Shared::read()` — the read's copy —
+                // is a place nobody keeps.
+                if !shared_reads.is_empty()
+                    && let Some(read_id) = self.spine_rooted_at_a_read(target_id, &shared_reads)
+                {
+                    self.refuse_write_through_read(target_id, assignment_id, read_id);
+                }
                 continue;
             };
             self.push_anchored(
@@ -32156,6 +32474,248 @@ impl<'src> Analyzer<'src> {
                 target_id,
             );
         }
+    }
+
+    /// native-53's B?2 (spec §6.4, rule 4: no invalidating mutation under a
+    /// live view): a call lends a place `&mut` — a `&mut self` receiver
+    /// (`log.items.push(..)`, `log.bump(..)`) or a `&mut` argument
+    /// (`add(&mut log.items, ..)`) — and a LATER argument of the same call
+    /// re-binds that place's root binding (`{ log = fresh(); 9 }`). The view is
+    /// taken where it stands, so the call writes the value the binding held
+    /// before the re-bind: JS wrote the old object, and the native emission was
+    /// refused by rustc (E0506, reported as a backend defect). Refused at the
+    /// re-bind, with the value settled first. A binding a closure captures is
+    /// F138's (both backends read it after the later arguments, so the call
+    /// writes the new binding), and a module-level binding is F?3's question;
+    /// neither is refused here.
+    fn check_lent_root_rebinds(&mut self) {
+        // M110 S7b: the live calls only — a call's id is its expression's.
+        // Only a call with two or more arguments can lend one and re-bind it
+        // in another, so the rest cost a length test.
+        let mut module_level: Option<HashSet<Id>> = None;
+        let mut capture_verdicts: HashMap<Id, bool> = HashMap::default();
+        let mut refusals: Vec<(Id, Id, Id, Id, Id)> = Vec::new();
+        for (call_expr_id, function_call) in self.live_entries(&self.function_calls) {
+            let arguments = &function_call.argument_ids;
+            if arguments.len() < 2 {
+                continue;
+            }
+            let Some(Expr::Local(callee_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let parameters: &[Id] = self
+                .method_signature_ref(*callee_id)
+                .map(|(parameters, _)| parameters)
+                .unwrap_or_default();
+            for (position, argument_id) in arguments.iter().enumerate() {
+                let lent_by_parameter = parameters
+                    .get(position)
+                    .and_then(|parameter| self.parameters.get(parameter))
+                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
+                let lent_by_argument = matches!(
+                    self.expr_id_to_expr_map.get(argument_id),
+                    Some(Expr::Reference(_, true))
+                );
+                if !lent_by_parameter && !lent_by_argument {
+                    continue;
+                }
+                let Some(root) = self.place_root_binding(*argument_id) else {
+                    continue;
+                };
+                for later in &arguments[position + 1..] {
+                    let Some(rebind) = self.rebind_of_within(*later, root) else {
+                        continue;
+                    };
+                    let module_level =
+                        module_level.get_or_insert_with(|| self.module_level_binding_ids());
+                    if module_level.contains(&root) {
+                        continue;
+                    }
+                    let captured = *capture_verdicts
+                        .entry(root)
+                        .or_insert_with(|| self.binding_is_closure_captured(root));
+                    if !captured {
+                        refusals.push((rebind, root, *argument_id, *call_expr_id, *later));
+                    }
+                }
+            }
+        }
+        // Source order, so a program with several reports them in reading order.
+        refusals.sort_unstable_by_key(|(rebind, ..)| rebind.0);
+        for (rebind, root, lent, call_expr_id, later) in refusals {
+            self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+        }
+    }
+
+    /// B?2: the binding a place's spine roots at — `log` for `log.items`,
+    /// `&mut log.items[0]`, `log` — when it is a local or a parameter.
+    fn place_root_binding(&self, place_id: Id) -> Option<Id> {
+        let mut current = place_id;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
+                Expr::TupleIndex(root, ..) | Expr::Reference(root, _) => current = *root,
+                Expr::Local(binding)
+                    if self.variables.contains_key(binding)
+                        || self.parameters.contains_key(binding) =>
+                {
+                    return Some(*binding);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// B?2: an assignment re-binding `binding` WHOLE inside `expr_id`'s
+    /// subtree, closures excluded (a closure's body runs when it is called,
+    /// not where it is written).
+    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<Id> {
+        let mut pending = vec![expr_id];
+        let mut children = Vec::new();
+        while let Some(current) = pending.pop() {
+            if let Some(Expr::Assignment(target, _)) = self.expr_id_to_expr_map.get(&current)
+                && matches!(self.expr_id_to_expr_map.get(target), Some(Expr::Local(named)) if *named == binding)
+            {
+                return Some(current);
+            }
+            children.clear();
+            self.drop_scan_children(current, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        None
+    }
+
+    /// B?2: whether any closure of the program names `binding` from outside
+    /// its own body (F138's captured binding).
+    fn binding_is_closure_captured(&self, binding: Id) -> bool {
+        let targets: HashSet<Id> = std::iter::once(binding).collect();
+        self.closures.values().any(|closure| {
+            let mut declared_inside: HashSet<Id> = closure
+                .parameters
+                .iter()
+                .chain(&closure.parameter_destructures)
+                .copied()
+                .collect();
+            let mut captured: Vec<Id> = Vec::new();
+            self.scan_capture_body(
+                closure.return_,
+                &targets,
+                &mut declared_inside,
+                &mut captured,
+                &mut HashSet::default(),
+                &mut ThunkEffects::default(),
+            );
+            captured.iter().any(|reference| {
+                matches!(self.expr_id_to_expr_map.get(reference), Some(Expr::Local(named)) if *named == binding)
+            }) && !declared_inside.contains(&binding)
+        })
+    }
+
+    fn refuse_lent_root_rebind(
+        &mut self,
+        rebind: Id,
+        root: Id,
+        lent: Id,
+        call_expr_id: Id,
+        later: Id,
+    ) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let name = self
+            .variables
+            .get(&root)
+            .map(|variable| variable.name)
+            .or_else(|| self.parameters.get(&root).map(|parameter| parameter.name))
+            .unwrap_or("the binding");
+        let lent_text = text_of(self, lent).unwrap_or(name);
+        let lent_text = lent_text.strip_prefix("&mut ").unwrap_or(lent_text);
+        // The call as written with the re-binding argument replaced by the
+        // settled value's name, and the value itself when it fits a line.
+        let later_text = text_of(self, later);
+        let settled = text_of(self, call_expr_id)
+            .zip(later_text)
+            .map(|(call_text, argument_text)| call_text.replacen(argument_text, "item", 1))
+            .filter(|rewritten| !rewritten.contains('\n'))
+            .unwrap_or_else(|| format!("{lent_text}.…(item)"));
+        let value = later_text
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("{ … }");
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&rebind).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{name}` is re-bound while `{lent_text}` is lent `&mut` to this call, which \
+                     would write the value `{name}` held before; settle the value first: `let \
+                     item = {value}; {settled}`"
+                ),
+            },
+            rebind,
+        );
+    }
+
+    /// F141: the `Shared::read()` call an assignment target's spine roots at —
+    /// `cell.read().count`, `cell.read().items[0]`, `cell.read().pair.0` —
+    /// walking fields, elements and tuple positions down to the expression
+    /// they are read off. `None` when the root is anything else.
+    fn spine_rooted_at_a_read(&self, target_id: Id, shared_reads: &HashSet<Id>) -> Option<Id> {
+        let mut current = target_id;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
+                Expr::TupleIndex(root, ..) => current = *root,
+                Expr::Call(_) if current != target_id => {
+                    let (callee_id, _) = self.call_callee_and_receiver(current)?;
+                    return shared_reads.contains(&callee_id).then_some(current);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// F141: spec §6.7 — `read()` answers a COPY of the cell's value, so an
+    /// assignment into it writes the copy, which nothing keeps: natively the
+    /// write was lost, while JS (whose read aliased the cell) wrote the cell.
+    /// Refused at the target, with the assignment rewritten through `write()`.
+    fn refuse_write_through_read(&mut self, target_id: Id, assignment_id: Id, read_id: Id) {
+        let text_of = |analyzer: &Self, id: Id| {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let read_text = text_of(self, read_id).unwrap_or("cell.read()");
+        let handle_text = read_text
+            .strip_suffix("read()")
+            .and_then(|head| head.strip_suffix('.'))
+            .unwrap_or("cell");
+        let write_text = format!("{handle_text}.write()");
+        let rewritten = text_of(self, assignment_id)
+            .and_then(|assignment| assignment.strip_prefix(read_text))
+            .filter(|rest| !rest.contains('\n'))
+            .map(|rest| format!("{write_text}{rest}"))
+            .unwrap_or_else(|| format!("{write_text}.… = …"));
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{read_text}` is a copy, so this assignment is lost; write through \
+                     `{write_text}`: `{rewritten}`"
+                ),
+            },
+            target_id,
+        );
     }
 
     /// The first sub-expression of an assignment target that is not a place,
@@ -33597,7 +34157,7 @@ impl<'src> Analyzer<'src> {
         &self,
         definition_id: Id,
         type_name: &str,
-        member_name: Option<&str>,
+        member: Option<(&str, TwinMember)>,
     ) -> Option<Note> {
         let source = self.source_of_id(definition_id)?;
         let layer = self.std_layer_sources.get(&source)?;
@@ -33616,9 +34176,9 @@ impl<'src> Analyzer<'src> {
         // answer that settles it is that the OTHER twin has one by that name.
         // Without this the note explains a colour and leaves the member looking
         // like a typo.
-        if let Some(member_name) = member_name
+        if let Some((member_name, kind)) = member
             && let Some((other_layer, module, patterns)) =
-                self.twin_declaring_member(source, type_name, member_name)
+                self.twin_declaring_member(source, type_name, member_name, kind)
         {
             // F27 R1: and the move that puts the file there, which is now a
             // line the author writes — the editor's quick fix inserts exactly
@@ -33656,6 +34216,7 @@ impl<'src> Analyzer<'src> {
         source: SourceId,
         type_name: &str,
         member_name: &str,
+        kind: TwinMember,
     ) -> Option<(String, String, Vec<String>)> {
         for (layer, module, path, patterns) in self.std_layer_twin_files.get(&source)? {
             let Ok(text) = crate::util::read_source(path) else {
@@ -33667,7 +34228,7 @@ impl<'src> Analyzer<'src> {
             if tree
                 .0
                 .iter()
-                .any(|item| declares_member_on(unwrap_item(item), type_name, member_name))
+                .any(|item| declares_member_on(unwrap_item(item), type_name, member_name, kind))
             {
                 return Some((layer.clone(), module.clone(), patterns.clone()));
             }
@@ -41124,7 +41685,17 @@ impl<'src> Analyzer<'src> {
                 Node::Accessor(_) | Node::AccessorWithGenerics(..) | Node::StaticAccessor(..)
             )
         };
-        if !names_a_path(&left.0) || !names_a_path(&middle.0) {
+        // E319: a METHOD named on a receiver (`h.make <str>("a")`) is the
+        // member form of the same shape; whether `make` is a generic method of
+        // the receiver's type is decided where the field read fails
+        // (`refuse_missing_struct_field` holds that refusal for the site).
+        let names_a_member = |node: &Node<'_>| match node {
+            Node::MemberAccessor(_, member) => {
+                matches!(crate::node::unmark_head_link(member).0.0, Node::Accessor(_))
+            }
+            _ => false,
+        };
+        if !(names_a_path(&left.0) || names_a_member(&left.0)) || !names_a_path(&middle.0) {
             return;
         }
         if self.current_source_id == DERIVED_SOURCE {
@@ -47985,6 +48556,23 @@ impl<'src> Analyzer<'src> {
                             } else {
                                 return_type
                             };
+                            // B627 / std-53's A?1: an external member's OWN
+                            // generic fixed only by its return (`to_array<const
+                            // N>(self): Option<[T; N]>`) is recorded from the
+                            // call's expectation, as the declared path below
+                            // records a bodied one's — B424's check reads the
+                            // same substitution, and `xs.to_array().unwrap()`
+                            // reaches its receiver only through this
+                            // directed re-read. The impl's binders are not
+                            // the external's own and stay as the receiver and
+                            // the slot freshening below decide them.
+                            self.record_external_return_generics(
+                                id,
+                                function_id,
+                                &return_type,
+                                &constraint,
+                                substitution_context,
+                            );
                             // B280: the same guard the DECLARED return takes
                             // below (B263), plus the one thing the external
                             // path needs that the declared one does not.
@@ -50440,7 +51028,14 @@ impl<'src> Analyzer<'src> {
                     let resolved = resolved_id.get_type(self);
                     let (unified, mut bindings) =
                         self.reconcile_type(&resolved, b, substitution_context)?;
-                    bindings.push((*constraint_id, b.clone().get_type_id(self)));
+                    // B628: the other side IS this parameter (a `None` typed
+                    // `Option<T>` against the field's `Option<T>`): the
+                    // recursion above already recorded what the context binds
+                    // it to, and a trailing self-map would override that
+                    // binding wherever the bindings are folded in order.
+                    if *b != Type::Generic(*constraint_id) {
+                        bindings.push((*constraint_id, b.clone().get_type_id(self)));
+                    }
                     return Some((unified, bindings));
                 }
                 let bindings = vec![(*constraint_id, b.clone().get_type_id(self))];
@@ -50454,7 +51049,10 @@ impl<'src> Analyzer<'src> {
                     let resolved = resolved_id.get_type(self);
                     let (unified, mut bindings) =
                         self.reconcile_type(a, &resolved, substitution_context)?;
-                    bindings.push((*constraint_id, a.clone().get_type_id(self)));
+                    // B628: see the mirrored arm above.
+                    if *a != Type::Generic(*constraint_id) {
+                        bindings.push((*constraint_id, a.clone().get_type_id(self)));
+                    }
                     return Some((unified, bindings));
                 }
                 let bindings = vec![(*constraint_id, a.clone().get_type_id(self))];
@@ -57638,6 +58236,14 @@ impl<'src> Analyzer<'src> {
                     arguments_span,
                 ),
             MethodLookup::Found(member_id) => {
+                // B627 / std-53's A?1: the call's expectation reaches its
+                // RECEIVER before anything reads the receiver's type —
+                // `Holder::build().unwrap()` into a `Holder<i32>` binds the
+                // static's impl binder, `make().unwrap_or(3)` into an `i32`
+                // binds `make`'s own `T`.
+                let subject_type = self
+                    .receiver_directed_by_expectation(id, subject_id, member_id, &subject_type)
+                    .unwrap_or_else(|| subject_type.clone());
                 // Drive bidirectional inference of any closure arguments against the
                 // method's parameter types, and defer a full argument type-check.
                 let mut substitution = self
@@ -57891,7 +58497,11 @@ impl<'src> Analyzer<'src> {
                             .get(&struct_id)
                             .map(|struct_| struct_.name.to_string());
                         name.and_then(|name| {
-                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                            self.overlaid_std_type_note(
+                                struct_id,
+                                &name,
+                                Some((member_name, TwinMember::Method)),
+                            )
                         })
                     }
                     _ => None,
@@ -58100,7 +58710,11 @@ impl<'src> Analyzer<'src> {
                             .get(&struct_id)
                             .map(|struct_| struct_.name.to_string());
                         name.and_then(|name| {
-                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                            self.overlaid_std_type_note(
+                                struct_id,
+                                &name,
+                                Some((member_name, TwinMember::Method)),
+                            )
                         })
                     }
                     _ => None,
@@ -65392,6 +66006,123 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
+    /// `subject.member` on a struct with no FIELD of that name. Three answers
+    /// before the plain refusal:
+    ///
+    /// - E319: the accessor is the name of a spaced generic method call —
+    ///   `h.make <str>("a")` read as a comparison — and the struct has a
+    ///   generic method of that name: the refusal is HELD for the site's
+    ///   decision (`steer_spaced_generic_calls`), which replaces it, the two
+    ///   comparisons and the type in value position with ONE steer.
+    /// - E320: the struct has a METHOD of that name, named without its
+    ///   parentheses (`p.norm`, an element head's bare `.autofocus`): the
+    ///   refusal says so and writes the call.
+    /// - E119: the struct came from an overlaid std layer — the note names the
+    ///   twin, and claims the other twin declares the member only when it
+    ///   declares it as a FIELD.
+    fn refuse_missing_struct_field(
+        &mut self,
+        id: Id,
+        struct_id: Id,
+        arguments: &[TypeId],
+        struct_name: &'src str,
+        member_name: &'src str,
+    ) {
+        let subject_type = Type::Struct(struct_id, arguments.to_vec());
+        let method = match self.resolve_impl_member(&subject_type, member_name) {
+            ImplMemberResolution::Found(member_id, _)
+            | ImplMemberResolution::FoundInheritedDefault(member_id, ..) => Some(member_id),
+            // A STATIC is no method candidate of a receiver; the struct's own
+            // impls declare it by name.
+            _ => self.implementations.iter().find_map(|implementation| {
+                match implementation.subject.borrow_type(self) {
+                    Type::Struct(subject_id, _) if *subject_id == struct_id => {
+                        implementation.declarations.get(member_name).copied()
+                    }
+                    _ => None,
+                }
+            }),
+        };
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let plain = format!(
+            "struct '{struct_name}' has no field '{member_name}'{}",
+            // B471: a style value's retired `.css` field.
+            self.css_rename_steer(&Type::Struct(struct_id, Vec::new()), member_name)
+                .unwrap_or_default()
+        );
+        if self.spaced_generic_operands.contains(&id)
+            && let Some(method_id) = method
+            && self
+                .method_signature_ref(method_id)
+                .is_some_and(|(_, own_generics)| !own_generics.is_empty())
+        {
+            self.deferred_not_a_value.insert(id, (plain, method_id));
+            return;
+        }
+        let Some(method_id) = method else {
+            let note = self.overlaid_std_type_note(
+                struct_id,
+                struct_name,
+                Some((member_name, TwinMember::Field)),
+            );
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note,
+                span,
+                msg: plain,
+            });
+            return;
+        };
+        let call = self.written_method_call(id, span, method_id, struct_name, member_name);
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "struct '{struct_name}' has no field '{member_name}': `{member_name}` is a method \
+                 of `{struct_name}`: call it, {call}"
+            ),
+        });
+    }
+
+    /// E320: the call a method named without its parentheses was meant to be,
+    /// as the reader wrote the access — `p.norm` → `` `p.norm()` ``, an element
+    /// head's `.autofocus` (whose accessor spans the element) →
+    /// `` `.autofocus()` ``, `(…)` when the method takes arguments, and the
+    /// path for a static (`` `Point::origin()` ``).
+    fn written_method_call(
+        &self,
+        id: Id,
+        span: Span,
+        method_id: Id,
+        struct_name: &str,
+        member_name: &str,
+    ) -> String {
+        let parameters = self
+            .method_signature_ref(method_id)
+            .map(|(parameters, _)| parameters.to_vec())
+            .unwrap_or_default();
+        let takes_self = parameters
+            .first()
+            .and_then(|parameter| self.parameters.get(parameter))
+            .is_some_and(|parameter| parameter.name == "self");
+        let explicit = parameters.len().saturating_sub(usize::from(takes_self));
+        let arguments = if explicit == 0 { "()" } else { "(…)" };
+        if !takes_self {
+            return format!("as a static: `{struct_name}::{member_name}{arguments}`");
+        }
+        let written = self
+            .source_of_id(id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| text.get(span.into_range()))
+            .filter(|written| written.ends_with(&format!(".{member_name}")))
+            .filter(|written| !written.contains('\n'));
+        match written {
+            Some(written) => format!("`{written}{arguments}`"),
+            None => format!("`.{member_name}{arguments}`"),
+        }
+    }
+
     /// `subject.field`: once the subject resolves to a struct, the accessor's type
     /// is the named field's. Defers while the subject is unresolved (or an
     /// unknown closure parameter awaiting bidirectional inference).
@@ -65594,29 +66325,13 @@ impl<'src> Analyzer<'src> {
                             self.expr_id_to_expr_map.insert(id, Expr::Error);
                             return Resolution::Failed;
                         }
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            // E119: when the struct came from an overlaid std
-                            // layer, the miss is usually about WHICH `View` this
-                            // is, not about the field.
-                            note: self.overlaid_std_type_note(
-                                struct_id,
-                                struct_name,
-                                Some(member_name),
-                            ),
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "struct '{}' has no field '{}'{}",
-                                struct_name,
-                                member_name,
-                                // B471: a style value's retired `.css` field.
-                                self.css_rename_steer(
-                                    &Type::Struct(struct_id, Vec::new()),
-                                    member_name
-                                )
-                                .unwrap_or_default()
-                            ),
-                        });
+                        self.refuse_missing_struct_field(
+                            id,
+                            struct_id,
+                            &arguments,
+                            struct_name,
+                            member_name,
+                        );
                         self.expr_id_to_expr_map.insert(id, Expr::Error);
                         Resolution::Failed
                     }
@@ -69278,8 +69993,9 @@ impl<'src> Analyzer<'src> {
     /// a pre-entry world would freeze std constraints the entry still binds
     /// (the chained-`map` failure that pinned this split).
     /// E309: decides each spaced generic call the walk noted
-    /// (`note_spaced_generic_call`). When its name is a generic function or a
-    /// generic type, the comparison chain E291 reads it as is not what was
+    /// (`note_spaced_generic_call`). When its name is a generic function, a
+    /// generic type or a generic method of its receiver's type (E319,
+    /// `h.make <str>("a")`), the comparison chain E291 reads it as is not what was
     /// meant — a function or a type has no ordering, and the `bool` the first
     /// comparison makes has none either — so ONE steer at `L <M>` names the
     /// spacing and the tight call, and the three refusals it replaces (the
@@ -69339,7 +70055,8 @@ impl<'src> Analyzer<'src> {
 
     /// E309: whether the name `id` resolved to a function with generic
     /// parameters, or (held as "a type, not a value") a struct or enum with
-    /// them.
+    /// them, or (E319, a held field miss) names a generic method of the
+    /// receiver's type.
     fn names_something_generic(&self, id: Id) -> bool {
         let generic_function = |target: &Id| match self.expr_id_to_expr_map.get(target) {
             Some(Expr::Function(function_id)) => self
@@ -69356,6 +70073,8 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Local(target)) => generic_function(target),
             _ => match self.deferred_not_a_value.get(&id) {
                 Some((_, target)) => match self.expr_id_to_expr_map.get(target) {
+                    // E319: a held member miss carries the generic METHOD.
+                    Some(Expr::Function(_) | Expr::ExternalFunction(_)) => generic_function(target),
                     Some(Expr::Struct(struct_id)) => {
                         self.structs.get(struct_id).is_some_and(|struct_| {
                             !struct_.generic_parameter_constraint_ids.is_empty()
@@ -72065,6 +72784,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        self.swept_residual_generics.clear();
         let variable_ids: Vec<Id> = self.variables.keys().copied().collect();
         for variable_id in variable_ids {
             // The hazard is USES checking vacuously — a binding nothing reads
@@ -72105,6 +72825,8 @@ impl<'src> Analyzer<'src> {
                     .is_some_and(|declared_in| !declared_in.contains(&source))
             });
             if leaked {
+                self.swept_residual_generics
+                    .extend(residuals.iter().copied());
                 let name = self
                     .variables
                     .get(&variable_id)
@@ -86029,6 +86751,7 @@ fn analyze_over_world<'src>(
     }
     class_a_checks! {
         analyzer.check_assignment_places();
+        analyzer.check_lent_root_rebinds();
         analyzer.check_readonly_mutation();
         analyzer.check_mutable_arguments();
         analyzer.check_lazy_arguments();

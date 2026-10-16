@@ -1,0 +1,27 @@
+// B628: a generic struct literal whose `None` field sits beside the field that
+// fixes `T` types as `Page<str>`, not the declaration's `Page<T>` - the same on
+// both backends, through `Debug`, `Json` and a swapped field order.
+import std::debug::Debug;
+import std::io::print;
+import std::json::{ FromJson, Json };
+import std::option::Option::{ self, None, Some };
+
+[derive(Debug, Json)]
+struct Page<T> {
+	items: List<T>,
+	first: Option<T>,
+}
+
+fun shown<T: Debug>(value: T): str {
+	value.debug()
+}
+
+fun main() {
+	let words = Page { items = ["a"], first = None };
+	print(shown(words));
+	print(words.to_json());
+	let swapped = Page { first = None, items = [3, 4] };
+	print(shown(swapped));
+	let nested = Page { items = [Some(1)], first = None };
+	print(nested.to_json());
+}
