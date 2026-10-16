@@ -618,7 +618,7 @@ impl<'src> Transformer<'src> {
 
     /// Whether an element of `type_id` prints as one short token, so its list
     /// or set fills its broken lines (E277).
-    fn prints_as_a_scalar(&self, type_id: TypeId) -> bool {
+    pub(super) fn prints_as_a_scalar(&self, type_id: TypeId) -> bool {
         let resolve = |type_id| self.ground_printer_type(type_id);
         shape_of(self.program, type_id, &resolve).is_scalar()
     }
@@ -628,7 +628,7 @@ impl<'src> Transformer<'src> {
     /// `Any`), not through a `Generic` node, so the substitution is asked
     /// for the id directly first — the native emitter's `concrete` does the
     /// same, for the same reason.
-    fn ground_printer_type(&self, type_id: TypeId) -> TypeId {
+    pub(super) fn ground_printer_type(&self, type_id: TypeId) -> TypeId {
         let Some(_guard) = crate::util::RecursionGuard::enter() else {
             return type_id;
         };

@@ -43,9 +43,14 @@ pub fn transform_with_source_map<'src>(
     let mut transformer = Transformer::new(program, options);
     transformer.source_marks = true;
     transformer.formatter = transformer.formatter.with_marks();
+    // E257 S7: the sidecar rides with the map, under the same switches.
+    transformer.debug_recorder = Some(Box::default());
     let printed = transformer.transform_entry()?;
-    let (javascript, map) =
+    let (javascript, mut map) =
         crate::source_map::strip_marks(program, &printed.text, &printed.marks, printed.runtime);
+    if let Some(recorded) = printed.debug {
+        map.debug = Some(Box::new(crate::debug_info::finish(program, recorded, &map)));
+    }
     Ok((javascript, Some(map)))
 }
 
@@ -56,6 +61,9 @@ struct Printed {
     text: String,
     marks: Vec<SourceMark>,
     runtime: Option<std::ops::Range<usize>>,
+    /// What the walk recorded for the `.vdbg.json` sidecar (E257 S7), names
+    /// already renamed; `None` unless the map's entry asked for it.
+    debug: Option<crate::debug_info::RecordedDebug>,
 }
 
 /// A script's prelude — the host imports, then the runtime helpers' sources —
@@ -2973,6 +2981,10 @@ struct Transformer<'src> {
     // check's `diagnose`, the const world, the macro interpreter) builds the
     // tree it always did.
     source_marks: bool,
+    // E257 S7: record each emitted user function's bindings for the
+    // `.vdbg.json` sidecar. Set beside `source_marks` by
+    // [`transform_with_source_map`]; it reads the walk and never emits.
+    debug_recorder: Option<Box<debug_info::DebugRecorder>>,
 }
 
 /// One thing the shared const world declares: a concrete function, or a KEYED
@@ -3267,6 +3279,8 @@ struct Assembled<'src> {
     /// files the chunk map and the registrations into, after every module
     /// binding has initialized and before anything can navigate.
     main_body_start: usize,
+    /// E257 S7: the sidecar's records, renamed with the script.
+    debug: Option<crate::debug_info::RecordedDebug>,
 }
 
 /// How a resource-owning scope's tail value is used when it is restructured into
@@ -3388,6 +3402,7 @@ impl<'src> Transformer<'src> {
             recorder: None,
             diagnose_only: false,
             source_marks: false,
+            debug_recorder: None,
         }
     }
 
@@ -3396,14 +3411,19 @@ impl<'src> Transformer<'src> {
     fn transform_entry(self) -> Result<Printed, Error> {
         let formatter = self.formatter.clone();
         let line_break = formatter.line_break;
-        let program = self.transform_entry_ast()?;
-        let body = formatter.file(&program.nodes);
-        let (mut text, runtime) = with_prelude(&program.imports, &program.helpers, body);
+        let assembled = self.assemble()?;
+        debug_assert!(
+            assembled.chunks.is_empty(),
+            "a single-file build splits nothing"
+        );
+        let body = formatter.file(&assembled.nodes);
+        let (mut text, runtime) = with_prelude(&assembled.imports, &assembled.helpers, body);
         text.push_str(line_break);
         Ok(Printed {
             text,
             marks: formatter.take_marks(),
             runtime,
+            debug: assembled.debug,
         })
     }
 
@@ -3618,6 +3638,7 @@ impl<'src> Transformer<'src> {
             }
             t_main_fn_body
         };
+        self.record_main_frame(main_fn);
 
         self.restore_instance(saved_instance);
 
@@ -4042,7 +4063,10 @@ impl<'src> Transformer<'src> {
         // which is why a caller that is going to drop the text says so rather
         // than paying for names nobody will read.
         if !self.diagnose_only {
-            rename_for_scopes(&self.ng, self.program, &mut nodes);
+            let rename = rename_for_scopes(&self.ng, self.program, &mut nodes);
+            if let Some(recorder) = self.debug_recorder.as_mut() {
+                recorder.recorded.rename(&rename);
+            }
         }
         // Lift the chunk runs out, last first so the earlier ranges stay valid.
         let mut chunks: Vec<Vec<js::Node<'src>>> = Vec::with_capacity(chunk_ranges.len());
@@ -4057,6 +4081,7 @@ impl<'src> Transformer<'src> {
             nodes,
             chunks,
             main_body_start,
+            debug: self.debug_recorder.map(|recorder| recorder.recorded),
         })
     }
 
@@ -4168,6 +4193,28 @@ impl<'src> Transformer<'src> {
     fn mark_tail(&self, tail: Id, block: &mut Vec<js::Node<'src>>) {
         if self.source_marks {
             block.push(js::Node::Mark(tail));
+        }
+    }
+
+    /// E257 S7: what a closure's `return` or a match leg's value maps to —
+    /// the tail its body block ends with (`|value| { let total = ..; total }`
+    /// returns at `total`'s line, where a breakpoint on it binds), or the body
+    /// itself when it is no block or its tail has no text of its own.
+    fn tail_anchor(&self, body: Id) -> Id {
+        if !self.source_marks {
+            return body;
+        }
+        match self.program.entity_map.get(&body) {
+            Some(Expr::Block((_, tail)))
+                if self
+                    .program
+                    .span_map
+                    .get(tail)
+                    .is_some_and(|span| span.start != span.end) =>
+            {
+                *tail
+            }
+            _ => body,
         }
     }
 
@@ -6909,7 +6956,7 @@ impl<'src> Transformer<'src> {
                 }
                 let value = self.walk_entity(closure.return_, &mut body);
                 if let Some(value) = value {
-                    self.mark_tail(closure.return_, &mut body);
+                    self.mark_tail(self.tail_anchor(closure.return_), &mut body);
                     // Same seam as a function body's tail (B152): a divergent
                     // tail is the statement, never a value to `return`.
                     if value.is_divergent() {
@@ -6919,6 +6966,7 @@ impl<'src> Transformer<'src> {
                     }
                 }
                 self.seal_pending_temporaries(mark, &mut body);
+                self.record_closure_frame(*closure_id);
                 js::Node::Closure(js::Closure {
                     parameters,
                     body,
@@ -7889,6 +7937,10 @@ impl<'src> Transformer<'src> {
                     return Some(js::Node::Local(temp));
                 }
                 for statement in &body.0 {
+                    // E257 S7: a block's statements are where a breakpoint in
+                    // a block-bodied closure (or a value block) binds — marked
+                    // as a statement list's are, so the map reaches them.
+                    let statement_mark = self.mark_statement(*statement, block);
                     if let Some(node) = self.walk_entity(*statement, block) {
                         // A statement that lowered to nothing (a void tail, a
                         // self-emitting loop/`if`) leaves no stray `undefined`.
@@ -7896,6 +7948,7 @@ impl<'src> Transformer<'src> {
                             block.push(node);
                         }
                     }
+                    Self::drop_bare_mark(statement_mark, block);
                 }
                 // B152: a block whose tail LEAVES (`{ ret 1 }`, `{ jump break }`)
                 // has no value — emit the statement here, where it is legal, and
@@ -8372,6 +8425,9 @@ impl<'src> Transformer<'src> {
                     let mut leg_body = Vec::new();
                     let value = self.walk_entity(leg.body, &mut leg_body);
                     let value = value.unwrap_or(js::Node::Null);
+                    // E257 S7: a leg's value is its tail, where a breakpoint
+                    // on an arm (`Some(let x) => x * 2,`) binds.
+                    self.mark_tail(self.tail_anchor(leg.body), &mut leg_body);
                     self.push_result_or_divergence(&result_name, value, &mut leg_body);
                     // A leg owing nothing splices its body in unchanged, which is
                     // what keeps every data match byte-identical.
@@ -11222,6 +11278,7 @@ impl<'src> Transformer<'src> {
         let body = self.wrap_own_param_drops(function, body);
         crate::impl_select::set_selection_owner(enclosing_owner);
         self.emitting_stack.pop();
+        self.record_function_frame(function, &name);
         js::Node::Function(js::Function {
             name,
             parameters,
@@ -11551,7 +11608,9 @@ impl<'src> Transformer<'src> {
         if self.monomorphized.len() == landed_before {
             let body = canonical_instance_body(&js_function, name, &self.ng.minted);
             if let Some(shared) = self.shared_bodies.get(&(subject, body.clone())) {
-                return Some(shared.clone());
+                let shared = shared.clone();
+                self.record_shared_frame(name, &shared.name);
+                return Some(shared);
             }
             self.shared_bodies.insert(
                 (subject, body),
@@ -14823,6 +14882,7 @@ impl<'src> ConstWorld<'src> {
 
 mod argument_order;
 mod dbg;
+mod debug_info;
 
 pub mod js {
     use crate::node::BinaryOp;
@@ -15906,9 +15966,13 @@ fn rename_if(branch: &mut js::IfBranch, rename: &HashMap<String, String>) {
 /// RESERVING whatever the walk did not reach. Every generated name is therefore
 /// either re-allocated against a scope's `used` set or reserved in every scope,
 /// and a binding the walk misses can only come out over-long, never colliding.
-fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::Node>) {
+fn rename_for_scopes(
+    ng: &NameGenerator,
+    program: &Program,
+    nodes: &mut Vec<js::Node>,
+) -> HashMap<String, String> {
     let release = match ng.seed.style {
-        NameStyle::Annotated => return,
+        NameStyle::Annotated => return HashMap::default(),
         NameStyle::Readable => false,
         NameStyle::Plain => true,
     };
@@ -15934,7 +15998,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         source_of.keys().cloned().collect()
     };
     if renameable.is_empty() {
-        return;
+        return HashMap::default();
     }
     // The reserved set (keywords, referenced globals, `__`-helpers, the program's
     // `[extern]` symbols) counts as used in every scope, so nothing collides.
@@ -15975,6 +16039,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         "a generated name was neither re-allocated nor reserved — it can collide"
     );
     rename_nodes(nodes, &rename);
+    rename
 }
 
 /// Every binding name the scope tree accounts for — the walk's reach, which is

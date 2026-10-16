@@ -1348,8 +1348,8 @@ fn install_watch_interrupt_hook() {
     // (or a second install) refused.
     let _ = ctrlc::set_handler(|| {
         let _ = fs::remove_file(watch_script_path());
-        // The round's source map (E257 S6) goes with its script.
-        let _ = fs::remove_file(source_map_path(&watch_script_path()));
+        // The round's source map (E257 S6) and sidecar (S7) go with its script.
+        remove_script_maps(&watch_script_path());
         std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
     });
 }
@@ -2008,6 +2008,13 @@ fn hmr_round(
                     let _ = fs::remove_file(&map_path);
                 }
             }
+            if let Err(error) = write_sidecar(&bundle_path, map.as_ref()) {
+                eprintln!(
+                    "{} cannot write {}: {error}",
+                    paint::error_prefix(),
+                    sidecar_path(&bundle_path).display()
+                );
+            }
         }
         if let Some(css) = &leg.css {
             let css_path = dist.join(format!("{}.css", leg.name));
@@ -2205,8 +2212,8 @@ fn watch_script_path() -> PathBuf {
 /// (`windows-support.md` §5). A missing file is success.
 fn remove_watch_script() {
     let script = watch_script_path();
-    // Its map (E257 S6) goes with it; most rounds have one.
-    let _ = fs::remove_file(source_map_path(&script));
+    // Its map (E257 S6) and sidecar (S7) go with it; most rounds have one.
+    remove_script_maps(&script);
     if let Err(error) = fs::remove_file(&script)
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -6305,7 +6312,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         .arg(&script)
         .output();
     let _ = fs::remove_file(&script);
-    let _ = fs::remove_file(source_map_path(&script));
+    remove_script_maps(&script);
     match output {
         Ok(result) if result.status.success() => Ok(()),
         Ok(result) => {
@@ -7930,6 +7937,44 @@ fn source_map_path(script: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The file a script's debug-info sidecar is written to (E257 S7):
+/// `<script>.vdbg.json` beside `<script>.map` — what `vilan-dap` reads to show
+/// the debugger's panes by static type.
+fn sidecar_path(script: &Path) -> PathBuf {
+    let mut name = script.as_os_str().to_os_string();
+    name.push(".vdbg.json");
+    PathBuf::from(name)
+}
+
+/// Writes the sidecar that rides with `map` beside `script` (E257 S7), or
+/// removes a stale one when this build has none — a `release` build, or a
+/// split leg, which maps its chunks but describes no frames.
+fn write_sidecar(
+    script: &Path,
+    map: Option<&vilan_core::source_map::SourceMap>,
+) -> std::io::Result<()> {
+    let path = sidecar_path(script);
+    match map.and_then(|map| map.debug.as_deref()) {
+        Some(debug) => {
+            let file = script
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            fs::write(&path, debug.to_json(&file))
+        }
+        None => {
+            let _ = fs::remove_file(&path);
+            Ok(())
+        }
+    }
+}
+
+/// Removes a script's map and sidecar — a temp script's, when its run ends.
+fn remove_script_maps(script: &Path) {
+    let _ = fs::remove_file(source_map_path(script));
+    let _ = fs::remove_file(sidecar_path(script));
+}
+
 /// `javascript` with the comment that names its map appended (E257 S5), or
 /// unchanged when there is no map.
 fn with_mapping_comment(script: &Path, javascript: String, map: bool) -> String {
@@ -7987,6 +8032,7 @@ fn write_script(
             let _ = fs::remove_file(&map_path);
         }
     }
+    write_sidecar(script, map)?;
     fs::write(
         script,
         with_mapping_comment(script, javascript, map.is_some()),
@@ -8004,7 +8050,7 @@ fn write_run_script_with_map(
     map: Option<&vilan_core::source_map::SourceMap>,
 ) -> std::io::Result<bool> {
     let map_path = source_map_path(script);
-    let _ = fs::remove_file(&map_path);
+    remove_script_maps(script);
     let Some(map) = map else {
         write_run_script(script, javascript)?;
         return Ok(false);
@@ -8014,6 +8060,7 @@ fn write_run_script_with_map(
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     fs::write(&map_path, map.to_json(&file, None))?;
+    write_sidecar(script, Some(map))?;
     write_run_script(
         script,
         &with_mapping_comment(script, javascript.to_string(), true),
@@ -8047,7 +8094,7 @@ fn run_node_script(
     let status = spawn_node(&script, &node_flags(mapped, inspect), args, None)
         .and_then(|mut child| child.wait());
     let _ = fs::remove_file(&script);
-    let _ = fs::remove_file(source_map_path(&script));
+    remove_script_maps(&script);
     exit_code_of(status)
 }
 

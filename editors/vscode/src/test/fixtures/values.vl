@@ -1,0 +1,95 @@
+// E257 S7's gate (`src/test/session.test.ts`): one value of each of the
+// printer's shapes, and a frame of each kind. A `// break:` comment names a
+// line the session stops on.
+import std::hash_map::HashMap;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+struct Segment {
+	from: Point,
+	to: Point,
+}
+
+struct Labelled {
+	start: Point,
+	finish: Point,
+	label: str,
+	weight: f64,
+}
+
+enum Shape {
+	Circle(f64),
+	Rect(Point, Point),
+	Empty,
+}
+
+fun area(shape: Shape): f64 {
+	let scale = 2.0;
+	match shape {
+		Shape::Circle(let radius) => radius * radius * scale, // break: area
+		_ => 0.0,
+	}
+}
+
+fun scaled(factor: i32): |i32| i32 {
+	|value: i32| {
+		let total = value * factor;
+		total // break: closure
+	}
+}
+
+fun first<T>(items: List<T>): Option<T> {
+	let count = items.len();
+	let found = count > 0; // break: shared
+	if found {
+		Some(items[0])
+	} else {
+		None
+	}
+}
+
+fun main() {
+	let point = Point { x = 1, y = 2 };
+	let segment = Segment { from = point, to = Point { x = 3, y = 4 } };
+	let shape = Shape::Rect(Point { x = 0, y = 0 }, Point { x = 5, y = 6 });
+	let empty = Shape::Empty;
+	let numbers = [1, 2, 3];
+	mut ages: HashMap<str, i32> = HashMap::new();
+	ages.insert("ada", 36);
+	ages.insert("alan", 41);
+	let maybe: Option<i32> = Some(5);
+	let missing: Option<i32> = None;
+	let outcome: Result<i32, str> = Err("no");
+	let count: SignalCell<i32> = Signal::new(3);
+	let add = |a: i32, b: i32| a + b;
+	let pair = (1, "two");
+	let long = Labelled {
+		start = point,
+		finish = Point { x = 10, y = 20 },
+		label = "a label long enough to break",
+		weight = 2.5,
+	};
+	mut rows = [Some(1), Some(2)];
+	match &rows[0] {
+		Some(let view) => {
+			dbg(view); // break: view
+			print(*view);
+		},
+		None => {},
+	}
+	dbg(point, segment, shape, empty, numbers, ages, maybe, missing, outcome, count, add, pair); // break: main
+	dbg(long);
+	print(long);
+	print(area(Shape::Circle(1.5)));
+	let triple = scaled(3);
+	print(triple(2));
+	print(first([7, 8]));
+	print(first(["a"]));
+	print(add(1, 2));
+	rows.push(None);
+}
