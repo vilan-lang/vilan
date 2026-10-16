@@ -15637,7 +15637,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest
         // are values.
-        let mutating = mutates_its_receiver(intrinsic);
+        // F?1 (native-54's find): `Option::take` and `Option::replace` write
+        // their receiver too. Rendered through the reading arm, a receiver
+        // that lives in a cell — a module-level binding's `thread_local!`, a
+        // captured binding, a `Shared` view's field — was a COPY out of it, so
+        // `module_maybe.take()` answered the value and left the binding
+        // holding it (JS: `None` after the take).
+        let mutating = mutates_its_receiver(intrinsic)
+            || matches!(intrinsic, Intrinsic::OptionTake | Intrinsic::OptionReplace);
         // F30: a mutating receiver that lives in a CELL holds a borrow of it
         // for the whole call, and Rust evaluates the receiver BEFORE the
         // arguments — so `counts.push(counts.len())` met its own live borrow

@@ -1,0 +1,54 @@
+// native-54's F?1: `Option::take` and `Option::replace` over a receiver that
+// lives in a cell natively - a module-level binding, a field of one, a
+// captured binding, a `Shared` view's field - wrote a COPY taken out of the
+// cell, so the binding kept its value (JS: `None` after the take). A plain
+// local, a field of one and a `&mut self` field are the controls.
+import std::io::print;
+import std::shared::Shared;
+
+struct Slot {
+	maybe: Option<i32>,
+}
+
+impl Slot {
+	fun drain(&mut self): Option<i32> {
+		self.maybe.take()
+	}
+	fun swap_in(&mut self, value: i32): Option<i32> {
+		self.maybe.replace(value)
+	}
+}
+
+fun drain_lent(slot: &mut Slot): Option<i32> {
+	slot.maybe.take()
+}
+
+mut module_maybe: Option<i32> = Some(1);
+mut module_slot = Slot { maybe = Some(1) };
+
+fun main() {
+	mut plain = Some(1);
+	print(plain.take());
+	print(plain);
+	mut slot = Slot { maybe = Some(1) };
+	print(slot.maybe.take());
+	print(slot.maybe);
+	slot.maybe = Some(2);
+	print(slot.drain());
+	print(slot.maybe);
+	print(slot.swap_in(4));
+	print(slot.maybe);
+	print(drain_lent(&mut slot));
+	print(slot.maybe);
+	print(module_maybe.take());
+	print(module_maybe);
+	print(module_slot.maybe.replace(6));
+	print(module_slot.maybe);
+	mut captured = Some(1);
+	let peek = || captured;
+	print(captured.take());
+	print(peek());
+	let cell = Shared::new(Slot { maybe = Some(1) });
+	print(cell.write().maybe.take());
+	print(cell.read().maybe);
+}

@@ -13555,6 +13555,31 @@ fn an_awaiting_inherent_next_drives_a_for_loop_on_both_backends() {
     );
 }
 
+/// native-54's F?1: `Option::take` / `Option::replace` over a receiver that
+/// lives in a CELL natively — a module-level binding (`module_maybe.take()`),
+/// a field of one, a captured binding, a `Shared` view's field
+/// (`cell.write().maybe.take()`) — rendered the receiver through the reading
+/// arm, a copy out of the cell, so the take answered the value and left the
+/// binding holding it (`Some(1)` where JS prints `None`). The receiver is a
+/// place now, as a `List`'s `pop` receiver is; a plain local, its field and a
+/// `&mut self` field are the controls (they were places already).
+#[test]
+fn an_option_take_through_a_cell_writes_the_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_option_take_through_a_cell.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/option_take_through_a_cell.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "Some(1)\nNone\nSome(1)\nNone\nSome(2)\nNone\nNone\nSome(4)\nSome(4)\nNone\n\
+                    Some(1)\nNone\nSome(1)\nSome(6)\nSome(1)\nNone\nSome(1)\nNone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// The stdout of `file` on the JS and on the native backend.
 fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
     let run = |arguments: &[&str]| {
