@@ -2290,6 +2290,90 @@ const CONTEXT_PROBE: &str = concat!(
     "}\n",
 );
 
+/// M151 + M137: one node threading its context into many calls passes ONE
+/// shared read entity (M137), and the native backend's last-use walk exempts a
+/// hidden parameter's reads (M151) — so no threaded read is ever a move, and
+/// every one hands on a copy of the handle. A list context makes a move
+/// observable to rustc (a second read of a moved `Vec` is E0382), and the calls
+/// sit in sequence, in both arms of an `if`, in a loop and last.
+#[test]
+fn m151_a_context_threaded_into_many_calls_copies_every_read_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_m151_shared_context_read.vl"),
+        SHARED_CONTEXT_READ,
+    )
+    .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_m151_shared_context_read.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    assert!(
+        emitted.status.success(),
+        "the shared-context probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    let relay = source
+        .split("\nfn ")
+        .find(|function| function.starts_with("relay_"))
+        .unwrap_or_else(|| panic!("no `fn relay_..` in the emitted source:\n{source}"));
+    let hidden = relay
+        .split("mut context_")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or_else(|| panic!("no hidden parameter in `relay`:\n{relay}"));
+    let copied = format!("(context_{hidden}).clone()");
+    assert_eq!(
+        relay.matches(&copied).count(),
+        5,
+        "each of the five threaded reads copies the handle:\n{relay}"
+    );
+    assert_eq!(
+        compare(&staged, "native_probe_m151_shared_context_read.vl"),
+        Verdict::Identical,
+        "the program must agree on both backends"
+    );
+}
+
+const SHARED_CONTEXT_READ: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::display::Display;\n",
+    "\n",
+    "let current: Context<List<str>> = Context::new();\n",
+    "\n",
+    "fun needy(tag: str) {\n",
+    "\tlet held = current.get();\n",
+    "\tprint(tag + \" \" + held.len().to_string());\n",
+    "}\n",
+    "\n",
+    "fun relay(times: i32) {\n",
+    "\tneedy(\"first\");\n",
+    "\tif times > 1 {\n",
+    "\t\tneedy(\"then\");\n",
+    "\t} else {\n",
+    "\t\tneedy(\"else\");\n",
+    "\t}\n",
+    "\tfor tag in [\"loop\", \"again\"] {\n",
+    "\t\tneedy(tag);\n",
+    "\t}\n",
+    "\tneedy(\"last\");\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run([\"a\", \"b\"], || {\n",
+    "\t\trelay(2);\n",
+    "\t});\n",
+    "}\n",
+);
+
 /// A destructuring `let` means the same thing on both backends (F18).
 ///
 /// `std::http`'s response loop is what wanted it — `for header in

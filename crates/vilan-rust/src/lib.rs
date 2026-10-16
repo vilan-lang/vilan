@@ -1670,6 +1670,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 state.declared_at.insert(binding, depth);
             }
+            // M151: a read of a context-threaded HIDDEN parameter is never a
+            // last-use candidate. What it carries is a handle (J6: every read
+            // of one is retained, `reads_a_handle_binding`), so a move would
+            // save nothing — and `context::apply` shares ONE reference entity
+            // among every threaded call of a node (M137), so a candidate keyed
+            // by that entity would name every one of those reads the binding's
+            // last use at once. Neither the read nor a field spine over it is
+            // recorded: no later read can be "after" a read that is not here.
+            Some(Expr::Local(binding) | Expr::Parameter(binding))
+                if self
+                    .program
+                    .context_hidden_parameters
+                    .contains_key(&binding) => {}
             Some(Expr::Local(binding) | Expr::Parameter(binding)) => {
                 let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
                 let candidate = if depth <= declared {
@@ -1685,7 +1698,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // and the root read registered as the whole-binding walk would
             // have (the spine has no other children to visit).
             Some(Expr::Field(..) | Expr::TupleIndex(..))
-                if let Some((binding, path)) = self.liveness_spine(expr_id) =>
+                if let Some((binding, path)) = self.liveness_spine(expr_id)
+                    && !self
+                        .program
+                        .context_hidden_parameters
+                        .contains_key(&binding) =>
             {
                 let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
                 let movable = depth <= declared;
