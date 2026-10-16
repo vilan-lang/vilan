@@ -6707,6 +6707,91 @@ fn b627_a_static_receiver_nothing_determines_is_refused() {
     );
 }
 
+/// B637: an argument at a NON-generic parameter is a typed position as surely
+/// as an annotated binding — the outer call (a function, a method, a closure)
+/// seeds the argument call's expectation from the concrete parameter type,
+/// through a view too, and the method call waits for it, so B627's receiver
+/// path fixes `make`'s own `T` (and a static's impl binder) there.
+#[test]
+fn b637_an_argument_at_a_concrete_parameter_directs_a_receiver_calls_generic() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun make<T>(): Option<T> {
+            None
+        }
+
+        fun take(value: i32): i32 {
+            value + 1
+        }
+
+        fun held_value(held: Holder<i32>): i32 {
+            held.value
+        }
+
+        fun peek(value: &i32): i32 {
+            *value + 100
+        }
+
+        struct Counter {
+            total: i32,
+        }
+
+        impl Counter {
+            fun fresh(): Counter {
+                Counter { total = 10 }
+            }
+
+            fun add(&mut self, amount: i32): Counter {
+                self.total = self.total + amount;
+                Counter { total = self.total }
+            }
+        }
+
+        fun main() {
+            print(take(make().unwrap_or(5)));
+            print(take(take(make().unwrap_or(7))));
+            print(held_value(Holder::build().unwrap()));
+            mut counter = Counter::fresh();
+            print(counter.add(make().unwrap_or(2)).total);
+            print(Counter::fresh().add(make().unwrap_or(4)).total);
+            let double = |value: i32| value * 2;
+            print(double(make().unwrap_or(3)));
+            print(peek(&make().unwrap_or(2)));
+        }
+        main();
+        "#
+        ),
+        "6\n9\n7\n12\n14\n6\n102\n",
+    );
+}
+
+/// B637's boundary: a GENERIC parameter decides nothing, so the argument's
+/// own generic is still refused "cannot infer", as before.
+#[test]
+fn b637_an_argument_at_a_generic_parameter_still_cannot_infer() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun make<T>(): Option<T> {
+            None
+        }
+
+        fun keep<U>(value: U): U {
+            value
+        }
+
+        fun main() {
+            keep(make().unwrap_or(5));
+        }
+        "#,
+        "cannot infer 'T' for this call",
+    );
+}
+
 #[test]
 fn b188_a_path_head_is_not_an_under_supplied_application() {
     // `Option::None` and `List::new()` name a NAMESPACE to look a member up

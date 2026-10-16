@@ -14312,6 +14312,25 @@ fn b627_an_expected_type_through_a_receiver_answers_on_both_backends() {
     );
 }
 
+/// B637: an argument at a non-generic parameter — a function's, a method's, a
+/// closure's, through a view — directs its receiver call's generic, the same
+/// on both backends.
+#[test]
+fn b637_an_argument_expectation_through_a_receiver_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_argument_expectation_through_a_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/argument_expectation_through_a_receiver.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an argument's expectation through a receiver must bind the same natively"
+    );
+}
+
 /// B626: a module scalar read only through a view — a `const let`, a `let`, a
 /// `mut` written through `&mut`, a read inside a closure — answers the same on
 /// both backends (JS shook the binding out and threw `ReferenceError`).

@@ -24031,28 +24031,16 @@ impl<'src> Analyzer<'src> {
         member_id: Id,
         subject_type: &Type,
     ) -> Option<Type> {
-        if !matches!(
-            self.expr_id_to_expr_map.get(&subject_id),
-            Some(Expr::Call(_))
-        ) {
-            return None;
-        }
         let expected = self.expected_types.get(&call_id)?.get_type(self);
         if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
             return None;
         }
-        let mut carried = Vec::new();
-        self.collect_generics(subject_type, 0, &mut carried);
-        let open: Vec<TypeId> = carried
-            .into_iter()
-            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
-            .collect();
-        if open.is_empty() {
-            return None;
-        }
-        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
-        let impl_subject = self.implementations.get(implementation_index)?.subject;
-        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        let (open, answered) = self.receiver_generics_the_answer_carries(
+            call_id,
+            subject_id,
+            member_id,
+            subject_type,
+        )?;
         // The member's own generics are open in its answer too (a `map<U>`
         // returning `Option<U>`), but they are the member's to bind, from
         // its arguments; only the receiver's generics are taken from here.
@@ -24085,6 +24073,72 @@ impl<'src> Analyzer<'src> {
             Type::Unresolved | Type::Unknown => None,
             redirected => Some(redirected),
         }
+    }
+
+    /// B627 / B637: the generics of a receiver CALL that nothing at this site
+    /// holds rigid and that `member_id`'s answer (its impl's binders bound
+    /// from the receiver) still carries — the generics an expectation on the
+    /// method call could decide — with that answer. `None` for a receiver
+    /// that is not a call, or one whose open generics the answer drops
+    /// (`HashMap::new().len()`).
+    fn receiver_generics_the_answer_carries(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> Option<(Vec<TypeId>, Type)> {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&subject_id),
+            Some(Expr::Call(_))
+        ) {
+            return None;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(subject_type, 0, &mut carried);
+        let open: Vec<TypeId> = carried
+            .into_iter()
+            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
+        let impl_subject = self.implementations.get(implementation_index)?.subject;
+        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        let mut answered_generics = Vec::new();
+        self.collect_generics(&answered, 0, &mut answered_generics);
+        if !open
+            .iter()
+            .any(|generic| answered_generics.contains(generic))
+        {
+            return None;
+        }
+        Some((open, answered))
+    }
+
+    /// B637: whether a method call should WAIT for its expectation before it
+    /// resolves — B501's rule for an argument call, at the receiver. A call
+    /// standing at another call's parameter (`take(make().unwrap_or(5))`) is
+    /// told that parameter's type only when the outer call is attempted
+    /// (`seed_call_argument_expectations`), which is after the argument —
+    /// the worklist runs the inner call first, so resolving at once settled
+    /// the receiver with `make`'s own `T` open and B627's direction came too
+    /// late. A receiver whose open generics the member's answer carries
+    /// waits while the fixpoint moves; one nothing ever directs resolves at
+    /// the stall, exactly as before.
+    fn method_call_awaits_its_expectation(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> bool {
+        !self.fixpoint_stalled
+            && !self.expected_types.contains_key(&call_id)
+            && self
+                .receiver_generics_the_answer_carries(call_id, subject_id, member_id, subject_type)
+                .is_some()
     }
 
     /// A candidate member's declared return type, with the declaring impl's own
@@ -55398,13 +55452,9 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
     ) {
         for (parameter_id, argument_id) in parameters.iter().zip(argument_ids) {
-            if !matches!(
-                self.expr_id_to_expr_map.get(argument_id),
-                Some(Expr::Call(_))
-            ) || self.expected_types.contains_key(argument_id)
-            {
+            let Some(position) = self.unseeded_argument_call(*argument_id) else {
                 continue;
-            }
+            };
             let Some(parameter_type_id) = self
                 .parameters
                 .get(parameter_id)
@@ -55412,12 +55462,48 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            let parameter_type = parameter_type_id.get_type(self);
-            let decided = self.substitute_type(&parameter_type, substitution_context);
-            let decided_id = decided.get_type_id(self);
-            if self.type_is_ground(decided_id) {
-                self.expected_types.insert(*argument_id, decided_id);
+            // A parameter already ground is its own decision; only an open
+            // one is read through the substitution (and minted).
+            let decided_id = match self.type_is_ground(parameter_type_id) {
+                true => parameter_type_id,
+                false => {
+                    let parameter_type = parameter_type_id.get_type(self);
+                    self.substitute_type(&parameter_type, substitution_context)
+                        .get_type_id(self)
+                }
+            };
+            self.seed_ground_expectation(position, decided_id);
+        }
+    }
+
+    /// The call an argument expectation is told to — `argument_id` itself
+    /// when it is a call nothing nearer has told — or `None`.
+    ///
+    /// B637: a METHOD call still waiting for its expectation
+    /// (`method_call_awaits_its_expectation`) is no `Expr::Call` until it is
+    /// wired, so a member access the walk wrote and nothing has resolved yet
+    /// counts too — `take(make().unwrap_or(5))` under `fun take(value: i32)`
+    /// (a pending FIELD read is told the same; a parameter directs a field
+    /// read as surely as a call). A VIEW of a call at the parameter
+    /// (`peek(&make().unwrap_or(2))`) tells the call: the view's mode is the
+    /// parameter's, its referent the parameter's type.
+    fn unseeded_argument_call(&self, argument_id: Id) -> Option<Id> {
+        let mut position = argument_id;
+        let a_call = loop {
+            match self.expr_id_to_expr_map.get(&position) {
+                Some(Expr::Call(_)) => break true,
+                Some(Expr::Reference(operand, _)) => position = *operand,
+                Some(_) => break false,
+                None => break self.member_name_spans.contains_key(&position),
             }
+        };
+        (a_call && !self.expected_types.contains_key(&position)).then_some(position)
+    }
+
+    /// Records `decided_id` as `position`'s expectation when it is ground.
+    fn seed_ground_expectation(&mut self, position: Id, decided_id: TypeId) {
+        if self.type_is_ground(decided_id) {
+            self.expected_types.insert(position, decided_id);
         }
     }
 
@@ -56451,6 +56537,14 @@ impl<'src> Analyzer<'src> {
                 return Resolution::Failed;
             }
             let substitution_context = HashMap::default();
+            // B637: a closure's declared parameter types direct its argument
+            // calls as a function's do (`f(make().unwrap_or(3))` under
+            // `let f = |x: i32| ..`).
+            for (parameter_type_id, argument_id) in parameter_type_ids.iter().zip(argument_ids) {
+                if let Some(position) = self.unseeded_argument_call(*argument_id) {
+                    self.seed_ground_expectation(position, *parameter_type_id);
+                }
+            }
             for (index, parameter_type_id) in parameter_type_ids.clone().iter().enumerate() {
                 let parameter_type = parameter_type_id.get_type(self);
                 let argument_id = *argument_ids.get(index).unwrap();
@@ -58347,6 +58441,11 @@ impl<'src> Analyzer<'src> {
                     arguments_span,
                 ),
             MethodLookup::Found(member_id) => {
+                if self.method_call_awaits_its_expectation(id, subject_id, member_id, &subject_type)
+                {
+                    self.unwired_method_calls.insert(id, member_id);
+                    return Resolution::Deferred;
+                }
                 // B627 / std-53's A?1: the call's expectation reaches its
                 // RECEIVER before anything reads the receiver's type —
                 // `Holder::build().unwrap()` into a `Holder<i32>` binds the
