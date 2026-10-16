@@ -384,6 +384,24 @@ fn observe_in_package_on(
     entry_source: String,
     platform: Platform,
 ) -> ReuseObservation {
+    observe_in_package_under(
+        pkg_root,
+        entry_path,
+        entry_source,
+        platform,
+        Workspace::default(),
+    )
+}
+
+/// [`observe_in_package_on`] under `workspace` (M155's rows ride a SEEDED
+/// analysis's record only).
+fn observe_in_package_under(
+    pkg_root: &Path,
+    entry_path: &Path,
+    entry_source: String,
+    platform: Platform,
+    workspace: Workspace,
+) -> ReuseObservation {
     // N66: the harness's guard, on this binary's own twin of the helper too —
     // the trap is the ARGUMENT, so it has to be refused wherever the argument
     // is taken.
@@ -400,7 +418,7 @@ fn observe_in_package_on(
                 &pkg_root,
                 &entry_path,
                 Some(platform),
-                &Workspace::default(),
+                &workspace,
             );
             let diagnostics = format!("{errors:?}");
             // The FILE each diagnostic and warning publishes to rides in the
@@ -1292,6 +1310,50 @@ fn a_stale_restored_move_row_moves_the_diagnostics() {
     );
 }
 
+/// **M155's R11 candidate rows.** A reused module's generic that moves its
+/// `own` parameter twice is not move-clean at a resource, and R11 reads the
+/// candidates lexical to it — the parameter, its places — from the module's
+/// rows (`analyzer/r11_candidates.rs`), filed by a SEEDED analysis (the
+/// language server's; the seed here is the entry itself). With the rows
+/// thrown away the callee has no candidate, the instantiation scans clean,
+/// and the entry's R11 refusal goes.
+#[test]
+fn m155_a_stale_restored_r11_candidate_row_moves_the_diagnostics() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (honest, cold, planted) = honest_cold_planted_under(
+        "stale_r11_candidates",
+        "[resource]\nexport struct Db {\n\thandle: i32,\n}\n\nexport fun use_twice<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}\n\nexport fun sink(own d: Db) {\n\tprint(\"{d.handle}\");\n}\n",
+        &|revision| {
+            format!(
+                "import pkg::module::{{ Db, sink, use_twice }};\n\nfun main() {{\n\tlet revision = {revision};\n\tprint(\"{{revision}}\");\n\tlet db = Db {{ handle = 1 }};\n\tlet out = use_twice(db);\n\tsink(out);\n}}\n"
+            )
+        },
+        Platform::default(),
+        &|entry_path| Workspace {
+            hot_seeds: vec![entry_path.to_path_buf()],
+            ..Workspace::default()
+        },
+    );
+    assert!(
+        honest
+            .0
+            .contains("is not move-clean when instantiated with a resource"),
+        "the fixture's entry must be refused by R11: {}",
+        honest.0
+    );
+    assert_eq!(
+        honest.0, cold.0,
+        "the restored R11 rows must answer what a cold analysis answers"
+    );
+    assert_ne!(
+        honest.0, planted.0,
+        "a reused module whose R11 rows came back EMPTY left the entry's \
+         refusal standing — the restored rows are not read"
+    );
+}
+
 /// One module package observed warm (a first analysis files the module's
 /// record, the second is served it) under `entry(revision)`, honestly, with
 /// nothing remembered (cold), and under the stale-table plant (the module's
@@ -1303,10 +1365,31 @@ fn honest_cold_planted(
     entry: &dyn Fn(u32) -> String,
     platform: Platform,
 ) -> (ReuseObservation, ReuseObservation, ReuseObservation) {
+    honest_cold_planted_under(name, module, entry, platform, &|_| Workspace::default())
+}
+
+/// [`honest_cold_planted`] with each analysis run under `workspace_for(the
+/// entry's path)`.
+fn honest_cold_planted_under(
+    name: &str,
+    module: &str,
+    entry: &dyn Fn(u32) -> String,
+    platform: Platform,
+    workspace_for: &dyn Fn(&Path) -> Workspace,
+) -> (ReuseObservation, ReuseObservation, ReuseObservation) {
     let (directory, entry_path) = write_module_package(name, module);
+    let observe = |directory: &Path, entry_path: &Path, revision: u32| -> ReuseObservation {
+        observe_in_package_under(
+            directory,
+            entry_path,
+            entry(revision),
+            platform,
+            workspace_for(entry_path),
+        )
+    };
     let warm = |directory: &Path, entry_path: &Path| -> ReuseObservation {
-        let _ = observe_in_package_on(directory, entry_path, entry(1), platform);
-        observe_in_package_on(directory, entry_path, entry(2), platform)
+        let _ = observe(directory, entry_path, 1);
+        observe(directory, entry_path, 2)
     };
     vilan_core::analyzer::set_world_reuse(true);
     vilan_core::analyzer::set_world_table_reuse(true);
@@ -1314,7 +1397,7 @@ fn honest_cold_planted(
     vilan_core::analyzer::base_cache_clear();
     let honest = warm(&directory, &entry_path);
     vilan_core::analyzer::base_cache_clear();
-    let cold = observe_in_package_on(&directory, &entry_path, entry(2), platform);
+    let cold = observe(&directory, &entry_path, 2);
     vilan_core::analyzer::set_stale_table_plant(true);
     vilan_core::analyzer::base_cache_clear();
     let planted = warm(&directory, &entry_path);

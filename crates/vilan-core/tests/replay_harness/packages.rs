@@ -1394,6 +1394,62 @@ pub const LONE_FIXTURES: &[Fixture] = &[Fixture {
     dependencies: &[],
 }];
 
+// --- M155: R11's instantiations over restored and served candidate rows -------
+//
+// A leaf whose first function instantiates two of the leaf's OWN generics at
+// a resource — one not move-clean (R11 refuses the instantiation), one clean
+// — so a keystroke typed into that function re-walks the file and SERVES the
+// generics' items: their R11 candidate rows (`analyzer/r11_candidates.rs`)
+// come back re-based with their text, and the instantiation's slice must
+// still find them. The other edits make the clean generic dirty and the dirty
+// one clean.
+
+pub const R11_MAIN: &str = "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
+
+pub const R11_DB: &str = "[resource]\nexport struct Db {\n\thandle: i32,\n}\n\nexport fun sink(own d: Db) {\n\tprint(\"{d.handle}\");\n}\n";
+
+pub const R11_VIEWS: &str = "import pkg::db::{ Db, sink };\n\nexport fun render(): i32 {\n\tlet db = Db { handle = 1 };\n\tlet out = use_twice(db);\n\tsink(out);\n\tsink(pass_once(Db { handle = 2 }));\n\t1\n}\n\nfun use_twice<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}\n\nfun pass_once<T>(own x: T): T {\n\tx\n}\n";
+
+pub const R11_FIXTURES: &[Fixture] = &[Fixture {
+    name: "r11_rows",
+    platform: NODE,
+    files: &[
+        ("main.vl", R11_MAIN),
+        ("db.vl", R11_DB),
+        ("views.vl", R11_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a statement typed above the leaf's instantiated generics: their served rows re-based (M155)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\t1\n}\n\nfun use_twice",
+                "\tlet extra = \"a statement longer than the generic it pushes down, so a served row left at its old offset falls outside the callee\";\n\textra.len() as i32\n}\n\nfun use_twice",
+            )],
+        },
+        Edit {
+            label: "the clean generic made dirty: R11 must refuse its instantiation (M155)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "fun pass_once<T>(own x: T): T {\n\tx\n}",
+                "fun pass_once<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}",
+            )],
+        },
+        Edit {
+            label: "the dirty generic made clean: its refusal must go (M155)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\tlet keep = x;\n\tx\n}\n\nfun pass_once",
+                "\tx\n}\n\nfun pass_once",
+            )],
+        },
+    ],
+    dependencies: &[],
+}];
+
 // --- M110 S6: the id-window classes (incr-50, Order 50; spike-49's two predicted reds) ---
 //
 // Two shapes the spike named as classes to ADD. (1) A std item's resolve

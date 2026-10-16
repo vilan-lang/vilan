@@ -199,7 +199,11 @@ fn replay_the_classes() -> Replayed {
     // M110 S2a: the bound audit's verdicts at PREFIX sites are recorded and
     // replayed; the plants that serve a stale record (the audit skipped
     // without recording, the impl guard off) must turn this package red.
-    for fixture in BOUND_FIXTURES.iter().chain(WINDOW_FIXTURES) {
+    for fixture in BOUND_FIXTURES
+        .iter()
+        .chain(WINDOW_FIXTURES)
+        .chain(R11_FIXTURES)
+    {
         let mut package = fixture.write();
         for edit in fixture.edits {
             censuses.extend(replay(&mut package, edit, &mut divergences));
@@ -1081,6 +1085,7 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
     vilan_core::analyzer::base_cache_clear();
     for fixture in LONE_FIXTURES
         .iter()
+        .chain(R11_FIXTURES)
         .chain(EFFECT_FIXTURES)
         .chain(POST_PASS_FIXTURES)
         .chain(BOUND_FIXTURES)
@@ -1200,6 +1205,65 @@ fn m159_the_lone_leg_sees_a_fixpoint_seeded_from_the_settled_set() {
             .any(|divergence| divergence.contains("the initializer's refusal must go")),
         "the settled-seed plant must turn the lone sleep removal red; it found: \
          {divergences:#?}"
+    );
+}
+
+/// **M155**: R11's candidate rows are filed by the leaf's first (seeded)
+/// analysis and restored on its keystrokes — the served keystroke walks a
+/// fraction of the rows the filing one did — and the instantiation that
+/// slices a SERVED item's re-based rows still refuses (the fixture's R11
+/// refusal stands on every step; the classes leg compares every step with
+/// the clean analysis).
+#[test]
+fn m155_r11_candidate_rows_are_restored_on_a_served_keystroke() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let fixture = &R11_FIXTURES[0];
+    let mut package = fixture.write();
+    let seed = vec![package.path("views.vl")];
+    let first = observe(&package, seed.clone(), Leg::Incremental);
+    let warm = observe(&package, seed.clone(), Leg::Incremental);
+    let edited = fixture.edits[0].apply(package.text("views.vl"));
+    package.set("views.vl", edited);
+    let served = observe(&package, seed.clone(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        clean
+            .rendering
+            .contains("is not move-clean when instantiated with a resource"),
+        "the fixture's R11 refusal: {}",
+        clean.rendering
+    );
+    assert_eq!(
+        served.rendering, clean.rendering,
+        "the served keystroke answers clean"
+    );
+    eprintln!(
+        "M155: r11 rows live: first {} warm {} served {} (items served {})",
+        first.census.r11_rows_live,
+        warm.census.r11_rows_live,
+        served.census.r11_rows_live,
+        served.census.item_records_served
+    );
+    assert!(
+        first.census.r11_rows_live > 0
+            && warm.census.r11_rows_live * 4 < first.census.r11_rows_live
+            && served.census.r11_rows_live * 4 < first.census.r11_rows_live,
+        "the warm and served keystrokes restore R11's rows rather than walking them \
+         (first {}, warm {}, served {})",
+        first.census.r11_rows_live,
+        warm.census.r11_rows_live,
+        served.census.r11_rows_live
+    );
+    assert!(
+        served.census.item_records_served > 0,
+        "the leaf's generics were served items: {:#?}",
+        served.census
     );
 }
 

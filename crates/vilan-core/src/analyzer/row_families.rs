@@ -26,19 +26,26 @@ pub(super) enum RowFamily {
     Lazy,
     /// The HMR transfer sites (M150, `lazy_tables.rs`).
     Hmr,
+    /// R11's lexical candidates (M155, `r11_candidates.rs`).
+    R11,
 }
 
-pub(super) const FAMILIES: usize = 3;
+pub(super) const FAMILIES: usize = 4;
 
 impl RowFamily {
-    pub(super) const ALL: [RowFamily; FAMILIES] =
-        [RowFamily::Moves, RowFamily::Lazy, RowFamily::Hmr];
+    pub(super) const ALL: [RowFamily; FAMILIES] = [
+        RowFamily::Moves,
+        RowFamily::Lazy,
+        RowFamily::Hmr,
+        RowFamily::R11,
+    ];
 
     pub(super) fn index(self) -> usize {
         match self {
             RowFamily::Moves => 0,
             RowFamily::Lazy => 1,
             RowFamily::Hmr => 2,
+            RowFamily::R11 => 3,
         }
     }
 }

@@ -29,6 +29,7 @@ mod lazy_tables;
 mod live_ranges;
 mod liveness;
 mod move_tables;
+mod r11_candidates;
 mod row_families;
 mod written_types;
 
@@ -2123,9 +2124,9 @@ struct R11Instance {
 
 /// Candidate ids indexed by their source span, so a question about one
 /// region reads the candidates lexically inside it rather than every one in
-/// the program: R11's bindings, place expressions and `is` tests, sliced per
-/// instantiated callee (M94), and B457's calls, sliced per function and per
-/// loop (M96).
+/// the program: B457's calls, sliced per function and per loop (M96). (R11's
+/// bindings, places and `is` tests, M94's first use of it, are a row family
+/// since M155: `analyzer/r11_candidates.rs`.)
 ///
 /// A slice comes back in the order the candidates were handed in, which is
 /// what lets a reader that used to filter a whole map keep that map's
@@ -2135,35 +2136,25 @@ struct LexicalCandidates {
     /// Per source, `(start, end, position, id)` sorted by `start`, where
     /// `position` is the id's place in the order it was handed in.
     by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>>,
-    unplaced: Vec<Id>,
-    all: Vec<Id>,
 }
 
 impl LexicalCandidates {
     fn build(analyzer: &Analyzer<'_>, ids: impl Iterator<Item = Id>) -> Self {
         let mut by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>> = HashMap::default();
-        let mut unplaced = Vec::new();
-        let mut all = Vec::new();
         for (position, id) in ids.enumerate() {
-            all.push(id);
-            match (analyzer.source_of_id(id), analyzer.span_map.get(&id)) {
-                (Some(source), Some(span)) => {
-                    by_source
-                        .entry(source)
-                        .or_default()
-                        .push((span.start, span.end, position, id));
-                }
-                _ => unplaced.push(id),
+            if let (Some(source), Some(span)) =
+                (analyzer.source_of_id(id), analyzer.span_map.get(&id))
+            {
+                by_source
+                    .entry(source)
+                    .or_default()
+                    .push((span.start, span.end, position, id));
             }
         }
         for entries in by_source.values_mut() {
             entries.sort_unstable_by_key(|(start, _, position, _)| (*start, *position));
         }
-        LexicalCandidates {
-            by_source,
-            unplaced,
-            all,
-        }
+        LexicalCandidates { by_source }
     }
 
     /// The PLACED candidates whose span lies inside `start..end` of `source`,
@@ -2181,23 +2172,6 @@ impl LexicalCandidates {
             .collect();
         inside.sort_unstable_by_key(|(position, _)| *position);
         inside.into_iter().map(|(_, id)| id).collect()
-    }
-
-    /// R11's slice (M94): the candidates inside `callee`'s declaration span,
-    /// plus every candidate the index could not place — and every candidate
-    /// at all when the callee itself cannot be placed. Both widen the slice
-    /// back toward the whole-program set R11's readers were always correct
-    /// over, so a missing span costs time, never an answer.
-    fn within(&self, analyzer: &Analyzer<'_>, callee: Id) -> Vec<Id> {
-        let (Some(source), Some(span)) = (
-            analyzer.source_of_id(callee),
-            analyzer.span_map.get(&callee),
-        ) else {
-            return self.all.clone();
-        };
-        let mut within = self.unplaced.clone();
-        within.extend(self.inside(source, span.start, span.end));
-        within
     }
 }
 
@@ -4346,6 +4320,10 @@ pub struct Analyzer<'src> {
     /// files no move rows); and the fold, read by R11 and the drop plan.
     move_rows_live: move_tables::MoveRows,
     move_rows_filed: bool,
+    /// M155: the live lane's R11 candidate rows, and whether this analysis
+    /// derived them (it met an instantiation).
+    r11_rows_live: r11_candidates::CandidateRows,
+    r11_rows_filed: bool,
     move_sets: Option<move_tables::MoveSets>,
     /// M150: the live lane's lazy-argument and HMR-site contributions
     /// (`lazy_tables.rs`), and whether each pass derived them.
@@ -7995,6 +7973,8 @@ impl<'src> Analyzer<'src> {
             partial_move_roots: HashMap::default(),
             move_rows_live: move_tables::MoveRows::default(),
             move_rows_filed: false,
+            r11_rows_live: r11_candidates::CandidateRows::default(),
+            r11_rows_filed: false,
             move_sets: None,
             lazy_rows_live: lazy_tables::LazyRows::default(),
             lazy_rows_filed: false,
@@ -19549,18 +19529,27 @@ impl<'src> Analyzer<'src> {
         // callee's own body and the closures lexical to it, so an instance
         // slices out the candidates inside the callee's declaration instead
         // of re-classifying the whole program — which, with `Flow`/`Pipe` as
-        // `[resource]` traits, made R11 O(instances × program).
+        // `[resource]` traits, made R11 O(instances × program). M155: the
+        // indexes are folded from per-region rows (`r11_candidates.rs`) —
+        // restored for a reused module or served item, walked for the live
+        // lane — rather than swept from the whole program.
         struct R11Sets {
             loaned_captures: HashMap<Id, Id>,
             value_crossings: HashSet<Id>,
-            binding_candidates: LexicalCandidates,
-            place_candidates: LexicalCandidates,
-            test_candidates: LexicalCandidates,
+            candidates: r11_candidates::R11Candidates,
         }
         let mut sets: Option<R11Sets> = None;
 
         while let Some(instance) = worklist.pop_front() {
             if sets.is_none() {
+                let live = self.live_r11_candidate_rows();
+                let candidates = self.fold_r11_candidates(&live);
+                if !crate::macros::in_macro_world() {
+                    let walked = live.len() as u64;
+                    crate::incremental::update_census(|census| census.r11_rows_live += walked);
+                }
+                self.r11_rows_live = live;
+                self.r11_rows_filed = true;
                 sets = Some(R11Sets {
                     // M149: the move scan's fold when it ran — the same
                     // whole-program sets, restored and live.
@@ -19572,44 +19561,14 @@ impl<'src> Analyzer<'src> {
                         Some(sets) => sets.crossings.clone(),
                         None => self.compute_return_value_crossings(&|_| true),
                     },
-                    binding_candidates: LexicalCandidates::build(
-                        self,
-                        self.variables
-                            .values()
-                            .map(|variable| variable.id)
-                            .chain(self.parameters.values().map(|parameter| parameter.id)),
-                    ),
-                    place_candidates: LexicalCandidates::build(
-                        self,
-                        self.expr_id_to_expr_map
-                            .iter()
-                            .filter(|(_, expr)| {
-                                matches!(
-                                    expr,
-                                    Expr::Local(_)
-                                        | Expr::Field(_, _, _)
-                                        | Expr::TupleIndex(_, _, _)
-                                        | Expr::Index(_, _)
-                                )
-                            })
-                            .map(|(id, _)| *id),
-                    ),
-                    test_candidates: LexicalCandidates::build(
-                        self,
-                        self.expr_id_to_expr_map
-                            .iter()
-                            .filter(|(_, expr)| matches!(expr, Expr::Is(..)))
-                            .map(|(id, _)| *id),
-                    ),
+                    candidates,
                 });
                 crate::phase_pass_mark("R11: the whole-program sets");
             }
             let R11Sets {
                 loaned_captures,
                 value_crossings,
-                binding_candidates,
-                place_candidates,
-                test_candidates,
+                candidates,
             } = sets.as_ref().expect("built above");
             let resources: HashSet<TypeId> = instance.resources.iter().copied().collect();
             // Delta classification: only the places whose resource-ness is CAUSED
@@ -19620,12 +19579,12 @@ impl<'src> Analyzer<'src> {
             // double-report at the instantiation site.
             let mut memo: HashMap<TypeId, bool> = HashMap::default();
             let resource_bindings = self.collect_instantiation_bindings(
-                &binding_candidates.within(self, instance.callee),
+                &r11_candidates::R11Candidates::within(&candidates.bindings, self, instance.callee),
                 &resources,
                 &mut memo,
             );
             let resource_value_places = self.collect_instantiation_value_places(
-                &place_candidates.within(self, instance.callee),
+                &r11_candidates::R11Candidates::within(&candidates.places, self, instance.callee),
                 &resources,
                 &mut memo,
             );
@@ -19633,7 +19592,11 @@ impl<'src> Analyzer<'src> {
             // instantiation, but a variant carrying `T` is a resource only at
             // this one, so the refinement is recomputed under the delta set.
             let is_refinements = self.collect_is_refinements(
-                Some(&test_candidates.within(self, instance.callee)),
+                Some(&r11_candidates::R11Candidates::within(
+                    &candidates.tests,
+                    self,
+                    instance.callee,
+                )),
                 &resources,
                 &mut memo,
             );
@@ -80551,6 +80514,9 @@ struct ModuleTables {
     /// (`lazy_tables.rs`), filed only by an analysis that ran those passes.
     lazy: lazy_tables::LazyRows,
     hmr: lazy_tables::HmrRows,
+    /// M155: the module's R11 lexical candidates (`r11_candidates.rs`),
+    /// filed only by a seeded analysis that built R11's indexes.
+    r11: r11_candidates::CandidateRows,
     families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
@@ -80682,6 +80648,7 @@ impl ModuleTables {
             + self.moves.bytes()
             + self.lazy.bytes()
             + self.hmr.bytes()
+            + self.r11.bytes()
             + self.hover.bytes()
     }
 }
@@ -80743,6 +80710,8 @@ struct RestoredTables {
     moves: move_tables::MoveRows,
     lazy: lazy_tables::LazyRows,
     hmr: lazy_tables::HmrRows,
+    /// M155: the restored R11 candidate rows.
+    r11: r11_candidates::CandidateRows,
     family_ranges: row_families::FamilyRanges,
     /// M148: the restored hover rows, the entity ranges of the modules and
     /// items whose record carried them, and the restored MODULES as sources
@@ -80784,6 +80753,7 @@ impl Default for RestoredTables {
             moves: move_tables::MoveRows::default(),
             lazy: lazy_tables::LazyRows::default(),
             hmr: lazy_tables::HmrRows::default(),
+            r11: r11_candidates::CandidateRows::default(),
             family_ranges: row_families::FamilyRanges::default(),
             hover: hover_records::RecordedHoverRows::default(),
             hover_ranges: Vec::new(),
@@ -80835,6 +80805,9 @@ impl RestoredTables {
         }
         if tables.families.contains(row_families::RowFamily::Hmr) {
             self.hmr.extend(&tables.hmr);
+        }
+        if tables.families.contains(row_families::RowFamily::R11) {
+            self.r11.extend(&tables.r11);
         }
         if tables.hover_recorded {
             self.hover.extend(&tables.hover);
@@ -89384,6 +89357,19 @@ fn analyze_over_world<'src>(
                 .move_rows_live
                 .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M155: R11's candidate rows, per source and per item — a seeded
+        // analysis's record only (a cold check never reads one back).
+        let r11_filed = analyzer.r11_rows_filed && seeded;
+        if r11_filed {
+            analyzer
+                .r11_rows_live
+                .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+            if items_enabled {
+                analyzer
+                    .r11_rows_live
+                    .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+            }
+        }
         // M148: the hover rows, per source and per item — the span rows by
         // their place in the file.
         let slice_at = |source: SourceId, _: Span| -> Option<u32> {
@@ -89416,7 +89402,8 @@ fn analyze_over_world<'src>(
         let families = row_families::FamilySet::default()
             .with(row_families::RowFamily::Moves, analyzer.move_rows_filed)
             .with(row_families::RowFamily::Lazy, analyzer.lazy_rows_filed)
-            .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed);
+            .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed)
+            .with(row_families::RowFamily::R11, r11_filed);
         // M110 S7b: the resource slots per SOURCE (an item's window is
         // classified live), by the slot's own source stamp.
         {

@@ -516,6 +516,10 @@ pub struct Census {
     /// are not walked, so a served keystroke reads a fraction of a filing
     /// one's.
     pub move_rows_live: u64,
+    /// M155: R11's candidate rows this analysis derived by walking the
+    /// family's live lane (`analyzer/r11_candidates.rs`) when it met an
+    /// instantiation — a served keystroke reads a fraction of a filing one's.
+    pub r11_rows_live: u64,
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
@@ -619,6 +623,7 @@ thread_local! {
             live_ranges: 0,
             live_entities: 0,
             move_rows_live: 0,
+            r11_rows_live: 0,
             hover_rows_restored: 0,
             prefix_world: false,
             prefix_layered: false,
@@ -990,7 +995,7 @@ pub fn report(program: &Program) {
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
-             live-entities={} move-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
+             live-entities={} move-rows-live={} r11-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
              post-seam={}",
             census.base_hits,
@@ -1020,6 +1025,7 @@ pub fn report(program: &Program) {
             census.live_ranges,
             census.live_entities,
             census.move_rows_live,
+            census.r11_rows_live,
             census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
