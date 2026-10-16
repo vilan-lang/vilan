@@ -829,8 +829,9 @@ fn e257_s7_the_debug_adapters_scripted_sessions_pass() {
     );
     assert!(run.status.success(), "the debug sessions failed:\n{report}");
     // Run, not skipped: a session that cannot find the binary skips itself.
-    // The watch shape is pinned on unix, as `watch_lifecycle` is.
-    let ran = if cfg!(unix) { 4 } else { 3 };
+    // The watch shapes (the lone script's, and E331's two-leg server) are
+    // pinned on unix, as `watch_lifecycle` is.
+    let ran = if cfg!(unix) { 5 } else { 3 };
     assert!(
         report.contains(&format!("# pass {ran}")) || report.contains(&format!("ℹ pass {ran}")),
         "{ran} sessions ran:\n{report}"

@@ -22,7 +22,9 @@
 //! map's own coordinates (a `sources` index, a 0-based line, a 0-based UTF-16
 //! column). `main`'s body is inlined at the script's top level (B214), so its
 //! record is marked `main` and matches the module's own frame. Its locals are
-//! the module scope's `const`s.
+//! the module scope's `const`s. An async `main` runs in an arrow the top level
+//! calls; that arrow's head is marked at `main`, and the record carries the
+//! place, so the frame is found as a closure's is (E331).
 //!
 //! **What a binding's value reads as.** Most bindings hold their value. A
 //! local a view was taken of is BOXED (`[value]`, read through `[0]`); a scalar
@@ -94,7 +96,8 @@ pub struct DebugFrame {
     /// none of its own, and for `main`.
     pub js: Option<String>,
     /// Where the head maps to, in the map's coordinates: (`sources` index,
-    /// 0-based line, 0-based UTF-16 column). `None` for `main`.
+    /// 0-based line, 0-based UTF-16 column). `None` for a synchronous `main`; an
+    /// async one runs in an arrow whose head is marked at `main` (E331).
     pub at: Option<(u32, u32, u32)>,
     pub bindings: Vec<DebugBinding>,
 }
