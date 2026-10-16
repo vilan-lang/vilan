@@ -6368,6 +6368,134 @@ fn b633_a_generic_field_no_wire_binder_makes_wire_is_still_refused() {
     );
 }
 
+// --- B628: a literal's fields unify across every field -------------------
+//
+// `reconcile_type`'s bound-generic arm reconciled a parameter the context had
+// already bound and then appended `T := <the other side>` — a self-map when the
+// other side was the same parameter (a `None` typed `Option<T>` meeting the
+// field's `Option<T>`). The literal folds its bindings in order, so the
+// trailing self-map overwrote `items`' `T := str` and the binding typed as
+// the declaration's own `Page<T>` (swap the two fields and it compiled).
+
+const B628_PAGE: &str = r#"
+        import std::io::print;
+        import std::debug::Debug;
+        import std::option::Option::{ self, Some, None };
+
+        [derive(Debug)]
+        struct Page<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        fun shown<T: Debug>(value: T): str {
+            value.debug()
+        }
+"#;
+
+#[test]
+fn b628_a_literal_none_field_takes_the_parameter_another_field_fixed() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B628_PAGE}{}",
+            r#"
+        fun main() {
+            let words = Page { items = ["a"], first = None };
+            print(shown(words));
+            let swapped = Page { first = None, items = ["b"] };
+            print(shown(swapped));
+            let nested = Page { items = [Some(1)], first = None };
+            print(shown(nested));
+            print(shown(Page { items = [2.5], first = None }));
+        }
+        main();
+        "#
+        ),
+        "Page { items = [\"a\"], first = None }\nPage { items = [\"b\"], first = None }\nPage { items = [Some(1)], first = None }\nPage { items = [2.5], first = None }\n",
+    );
+}
+
+/// B628's mismatch side: the fix drops only the SELF-map. A `None` beside a
+/// field that fixes `T` still checks every other field against that `T`.
+#[test]
+fn b628_a_literal_field_against_the_parameter_another_field_fixed_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B628_PAGE}{}",
+            r#"
+        fun main() {
+            let words = Page { items = ["a"], first = Some(3) };
+            print(shown(words));
+        }
+        "#
+        ),
+        "Expected",
+    );
+    // The literal's type is `Page<str>`, so it never reaches a `Page<i32>`.
+    assert_fails_with(
+        &format!(
+            "{B628_PAGE}{}",
+            r#"
+        fun main() {
+            let words = Page { items = ["a"], first = None };
+            let numbers: Page<i32> = words;
+            print(shown(numbers));
+        }
+        "#
+        ),
+        "Page<str>",
+    );
+}
+
+/// B628, the derives B622/B633 met it through: `[derive(Json)]`'s `to_json`,
+/// `[derive(Wire)]`'s `encode` and `[derive(Hashable)]`'s `hash` over a literal
+/// whose `None` field sits beside the field that fixes `T` — each was refused
+/// "generic parameter 'T' is missing the bound" against `Page<T>`.
+#[test]
+fn b628_the_derives_accept_a_literal_with_a_none_field() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        import std::wire::{ Wire, encode, decode };
+        import std::json::json_codec;
+        import std::hash::{ Hash, Hashable };
+        import std::result::Result::{ self, Ok, Err };
+        import std::option::Option::{ self, Some, None };
+
+        [derive(Json)]
+        struct Page<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        [derive(Wire)]
+        struct Sent<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        [derive(Hashable)]
+        struct Keyed<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        fun main() {
+            let words = Page { items = ["a"], first = None };
+            print(words.to_json());
+            let sent = Sent { items = [4, 5], first = None };
+            let back: Result<Sent<i32>, str> = decode(json_codec(), encode(json_codec(), sent));
+            print(back.unwrap().items.len());
+            let keyed = Keyed { items = [true], first = None };
+            print(keyed.hash() == Keyed { items = [true], first = None }.hash());
+        }
+        main();
+        "#,
+        "{\"items\":[\"a\"],\"first\":null}\n2\ntrue\n",
+    );
+}
+
 #[test]
 fn b188_a_path_head_is_not_an_under_supplied_application() {
     // `Option::None` and `List::new()` name a NAMESPACE to look a member up

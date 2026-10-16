@@ -13875,3 +13875,22 @@ fn f124_two_loans_in_one_call_and_a_projected_interleaved_view_are_refused_by_na
         }
     }
 }
+
+/// B628: a generic struct literal with a `None` field beside the field that
+/// fixes `T` — refused at its use as `Page<T>` before — answers the same on
+/// both backends through `Debug`, `Json` and a swapped field order.
+#[test]
+fn b628_a_literal_none_field_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_literal_none_field.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/literal_none_field.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a literal's `None` field must type the same natively"
+    );
+}

@@ -50440,7 +50440,14 @@ impl<'src> Analyzer<'src> {
                     let resolved = resolved_id.get_type(self);
                     let (unified, mut bindings) =
                         self.reconcile_type(&resolved, b, substitution_context)?;
-                    bindings.push((*constraint_id, b.clone().get_type_id(self)));
+                    // B628: the other side IS this parameter (a `None` typed
+                    // `Option<T>` against the field's `Option<T>`): the
+                    // recursion above already recorded what the context binds
+                    // it to, and a trailing self-map would override that
+                    // binding wherever the bindings are folded in order.
+                    if *b != Type::Generic(*constraint_id) {
+                        bindings.push((*constraint_id, b.clone().get_type_id(self)));
+                    }
                     return Some((unified, bindings));
                 }
                 let bindings = vec![(*constraint_id, b.clone().get_type_id(self))];
@@ -50454,7 +50461,10 @@ impl<'src> Analyzer<'src> {
                     let resolved = resolved_id.get_type(self);
                     let (unified, mut bindings) =
                         self.reconcile_type(a, &resolved, substitution_context)?;
-                    bindings.push((*constraint_id, a.clone().get_type_id(self)));
+                    // B628: see the mirrored arm above.
+                    if *a != Type::Generic(*constraint_id) {
+                        bindings.push((*constraint_id, a.clone().get_type_id(self)));
+                    }
                     return Some((unified, bindings));
                 }
                 let bindings = vec![(*constraint_id, a.clone().get_type_id(self))];
