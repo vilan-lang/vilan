@@ -10447,6 +10447,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
                  vilan_rt::executor::queue_microtask(move || callback()) }}",
                 self.value_argument(argument_ids, 0, depth)?
             ),
+            // E257 S8: the reactive trace's seams (`std::reactive::trace`). A
+            // line is stderr's, as `dbg`'s is; a native program has no host
+            // task to tag a queued wake with (`console.createTask` is the JS
+            // backend's), so the token names nothing and the wake runs as a
+            // plain call — the lines stay byte-identical with node's.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__trace_line",
+            } => format!(
+                "{{ let line = {}; eprintln!(\"{{}}\", line) }}",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            ExternBinding::Function {
+                module: None,
+                symbol: "__trace_task",
+            } => format!(
+                "{{ let _ = ({}, {}); }}",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ExternBinding::Function {
+                module: None,
+                symbol: "__trace_run",
+            } => format!(
+                "{{ let _ = {}; let body = {}; body() }}",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
             ExternBinding::Function {
                 module: None,
                 symbol: "Promise.all",

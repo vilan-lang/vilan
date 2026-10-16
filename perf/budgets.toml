@@ -223,6 +223,132 @@ ceiling = 8_056_352_548
 measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
 tolerance = 0.005
 
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00746 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:browser"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00746 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00502 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00502 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00978 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:router"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00978 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00893 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00893 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00659 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00659 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00926 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:canvas"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00926 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00858 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:rpc"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00858 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00825 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00825 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00525 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.01
+reason = "E257 S8's reactive-trace seam in std::reactive (the hook table, the flag reads, SignalCell's inherent tracking new/set/update; the trace itself is its own module, analyzed only where imported): x1.00525 callgrind instructions of `vilan check` on the lane's box against next @b7c7afe0; the inline first build cost todo +1.48 % and reactive-ui +1.98 %, which is what moved the trace out. Re-taken at the Order 54 seal."
+item = "E257"
+
 [[growth]]
 small = 160
 large = 320

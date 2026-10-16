@@ -285,3 +285,17 @@ or for a single build with `vilan build --source-maps`; `--inspect` writes one
 whatever the preset says. `source-maps = false` turns the `debug` preset's off.
 A map changes no byte of the program it describes: the script is the same with
 it and without it, but for the comment that names it.
+
+## Who woke this effect: the reactive trace
+
+`trace(true)` (`std::reactive::trace::trace`) writes a line to stderr for every subscriber a
+write wakes, naming the write and the cell:
+
+```text
+[reactive] effect #4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
+```
+
+In the VS Code debugger the lines are in the Debug Console too, and a stop in
+an effect a turn ran later — at the end of a `batch`, or on a microtask — has
+the write that woke it below a label naming the cause in the Call Stack. The
+[`trace` reference](../std/reactive.md#trace--who-woke-what) has the details.

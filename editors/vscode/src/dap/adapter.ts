@@ -59,6 +59,16 @@ const WAITING_FOR_DISCONNECT = /^Waiting for the debugger to disconnect\.\.\.\r?
 const INSPECTOR_BANNER =
     /^(?:Debugger listening on ws:\/\/\S+|For help, see: https:\/\/nodejs\.org\/en\/docs\/inspector|Debugger attached\.|Waiting for the debugger to disconnect\.\.\.)\r?\n/gm;
 const THREAD_ID = 1;
+/// The reactive trace's lines (`std::reactive::trace`, E257 S8), as the program
+/// writes them to stderr.
+const TRACE_LINE = /^\[reactive\] .*(?:\r?\n|$)/gm;
+
+/// What an `internalConsole` launch shows of a chunk of the program's stderr:
+/// node's lines about the inspector this adapter is, and the reactive trace's
+/// lines (which reach the console from the inspector instead), taken out.
+export function shownStderr(text: string): string {
+    return text.replace(INSPECTOR_BANNER, '').replace(TRACE_LINE, '');
+}
 
 /// The command `vilan-dap` starts: `vilan run --inspect-brk` over the program,
 /// `--watch` with every round held at its first line until the adapter has
@@ -307,7 +317,10 @@ export class VilanDebugAdapter {
                     // signal no inspector protocol detail can lose.
                     this.programEnded();
                 }
-                const shown = text.replace(INSPECTOR_BANNER, '');
+                // The reactive trace's lines reach the console from the
+                // inspector (`Runtime.consoleAPICalled`), as in a terminal
+                // launch: once, and as the console's.
+                const shown = shownStderr(text);
                 if (shown) {
                     this.output('stderr', shown);
                 }
@@ -458,6 +471,9 @@ export class VilanDebugAdapter {
             case 'Debugger.paused':
                 void this.onPaused(params);
                 break;
+            case 'Runtime.consoleAPICalled':
+                this.consoleCalled(params);
+                break;
             case 'NodeRuntime.waitingForDisconnect':
                 // The program ran to its end: node holds the process open
                 // ("Waiting for the debugger to disconnect") until the
@@ -483,6 +499,43 @@ export class VilanDebugAdapter {
             default:
                 break;
         }
+    }
+
+    /// E257 S8: a line of the reactive trace, written by `console.error` (or
+    /// `console.log` in a browser), is an output event in the debug console —
+    /// whatever the launch did with stderr — with the write it names as its
+    /// place where a script's map holds that file. The program's other
+    /// console calls are its own output, which the launch already shows.
+    private consoleCalled(params: any): void {
+        const first = params.args?.[0];
+        if (first?.type !== 'string' || typeof first.value !== 'string' || !first.value.startsWith('[reactive] ')) {
+            return;
+        }
+        const line: string = first.value;
+        const body: Record<string, unknown> = { category: 'console', output: line + '\n' };
+        // The write's place when it has one, else the cell's.
+        const place = /, set at (.+):(\d+):(\d+)$/.exec(line) ?? /\(made at (.+?):(\d+):(\d+)\)/.exec(line);
+        const file = place ? this.sourceFile(place[1]) : undefined;
+        if (place && file) {
+            body.source = { name: path.basename(file), path: file };
+            body.line = Number(place[2]);
+            body.column = Number(place[3]);
+        }
+        this.event('output', body);
+    }
+
+    /// The file a location's text names (`src/main.vl`, relative to its package
+    /// root): the source of a script's map whose path ends with it.
+    private sourceFile(relative: string): string | undefined {
+        const tail = relative.split('/').join(path.sep);
+        for (const script of this.scripts.values()) {
+            for (const source of script.map?.sources ?? []) {
+                if (source.path && !source.ignored && (source.path === tail || source.path.endsWith(path.sep + tail))) {
+                    return source.path;
+                }
+            }
+        }
+        return undefined;
     }
 
     private scriptParsed(params: any): void {

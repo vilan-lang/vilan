@@ -29,6 +29,10 @@ function __panic(message, location) {
 	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
 	return error;
 }
+let __shared_identity_next = 1;
+function __shared_identity(cell) {
+	return cell.__id ??= __shared_identity_next++;
+}
 function __shared_new(value) {
 	return { v: value };
 }
@@ -93,22 +97,28 @@ function is_quiescent(self) {
 function enqueue(turn2, subscribers) {
 	for (const subscriber of subscribers) {
 		const key = hash(subscriber[0]);
-		let $j = null;
+		let $k = null;
 		if (subscriber[3]) {
 			if (!(turn2[3].v.has(key))) {
 				turn2[3].v.set(key, true);
+				if (tracing.v) {
+					trace_hooks.v[3](turn2, subscriber[0]);
+				}
 				turn2[1].v.push(__clone(subscriber));
 			}
-			$j = undefined;
+			$k = undefined;
 		} else if (!(turn2[2].v.has(key))) {
 			turn2[2].v.set(key, true);
+			if (tracing.v) {
+				trace_hooks.v[3](turn2, subscriber[0]);
+			}
 			let index = turn2[0].v.length;
-			while (index > 0 && __at(turn2[0].v, index - 1, "std/src/reactive.vl:414:21")[0] > subscriber[0]) {
+			while (index > 0 && __at(turn2[0].v, index - 1, "std/src/reactive.vl:421:21")[0] > subscriber[0]) {
 				index = index - 1;
 			}
-			__insert_at(turn2[0].v, index, __clone(subscriber), "std/src/reactive.vl:417:25");
+			__insert_at(turn2[0].v, index, __clone(subscriber), "std/src/reactive.vl:424:25");
 		}
-		$j;
+		$k;
 	}
 	if (turn2[5].v && !(turn2[6].v) && !(turn2[4].v)) {
 		turn2[6].v = true;
@@ -131,7 +141,9 @@ function drain(turn2) {
 					turn2[1].v = [  ];
 					turn2[3].v = new Map();
 					for (const subscriber of derivations) {
-						if (subscriber[2].v) {
+						if (tracing.v) {
+							trace_hooks.v[4](turn2, subscriber);
+						} else if (subscriber[2].v) {
 							subscriber[1]();
 						}
 						budget = budget - 1;
@@ -141,7 +153,9 @@ function drain(turn2) {
 				turn2[0].v = [  ];
 				turn2[2].v = new Map();
 				for (const subscriber2 of wave) {
-					if (subscriber2[2].v) {
+					if (tracing.v) {
+						trace_hooks.v[4](turn2, subscriber2);
+					} else if (subscriber2[2].v) {
 						subscriber2[1]();
 					}
 					budget = budget - 1;
@@ -155,29 +169,42 @@ function drain(turn2) {
 		});
 	}
 }
-function flush($o) {
-	const $p = $o;
-	let $q = null;
-	if ($p[0] === 0) {
-		const turn2 = $p[1];
-		$q = drain(turn2);
+function flush($q) {
+	const $r = $q;
+	let $s = null;
+	if ($r[0] === 0) {
+		const turn2 = $r[1];
+		$s = drain(turn2);
 	} else {
-		$q = undefined;
+		$s = undefined;
 	}
-	return $q;
+	return $s;
 }
 function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
 }
+function queue_wakes(turn2, subscribers, traced, cause) {
+	if (traced) {
+		waking.v = [ 0, cause ];
+		enqueue(turn2, subscribers);
+		waking.v = [ 1 ];
+	} else {
+		enqueue(turn2, subscribers);
+	}
+}
 async function tick() {
 
 }
-function new3(value) {
+function new3(value, caller) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	const cell = [ __shared_new(value), __shared_new(subscribers) ];
+	if (tracing.v) {
+		trace_hooks.v[0](__shared_identity(cell[0]), caller);
+	}
+	return cell;
 }
 function new4(value) {
-	return new3(value);
+	return new3(value, "std/src/reactive.vl:2448:15");
 }
 function attach(signal, subscriber) {
 	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
@@ -219,39 +246,57 @@ function is_empty(self) {
 	return self.length === 0;
 }
 function last(self) {
-	let $k = null;
+	let $l = null;
 	if (is_empty(self)) {
-		$k = [ 1 ];
+		$l = [ 1 ];
 	} else {
-		$k = __list_get(self, self.length - 1);
+		$l = __list_get(self, self.length - 1);
 	}
-	return $k;
+	return $l;
 }
 function notify(self, $g) {
-	const $h = $g;
-	let $i = null;
-	if ($h[0] === 0) {
-		const turn2 = $h[1];
-		$i = enqueue(turn2, __clone(self[1].v));
+	const traced = tracing.v;
+	let $h = null;
+	if (traced) {
+		$h = trace_hooks.v[2](__shared_identity(self[0]));
 	} else {
-		const $l = last(draining_turns.v);
-		let $m = null;
-		if ($l[0] === 0) {
-			const draining = $l[1];
-			$m = enqueue(draining, __clone(self[1].v));
+		$h = "";
+	}
+	const cause = $h;
+	const $i = $g;
+	let $j = null;
+	if ($i[0] === 0) {
+		const turn2 = $i[1];
+		$j = queue_wakes(turn2, __clone(self[1].v), traced, cause);
+	} else {
+		const $m = last(draining_turns.v);
+		let $n = null;
+		if ($m[0] === 0) {
+			const draining = $m[1];
+			$n = queue_wakes(draining, __clone(self[1].v), traced, cause);
 		} else {
 			for (const subscriber of __clone(self[1].v)) {
+				let $o = null;
 				if (subscriber[2].v) {
-					subscriber[1]();
+					if (traced) {
+						trace_hooks.v[5](subscriber, cause);
+					} else {
+						subscriber[1]();
+					}
+					$o = undefined;
 				}
+				$o;
 			}
-			$m = undefined;
+			$n = undefined;
 		}
-		$i = $m;
+		$j = $n;
 	}
-	return $i;
+	return $j;
 }
-function set(self, value, $f) {
+function set(self, value, $f, caller) {
+	if (tracing.v) {
+		trace_hooks.v[1](caller);
+	}
 	self[0].v = __clone(value);
 	notify(self, $f);
 }
@@ -262,24 +307,43 @@ function turn(policy, body) {
 	fresh[5].v = true;
 	return result;
 }
-function batch(body, $u) {
-	const $v = $u;
-	let $w = null;
-	if ($v[0] === 0) {
-		const current = $v[1];
-		$w = body(current);
+function batch(body, $w) {
+	const $x = $w;
+	let $y = null;
+	if ($x[0] === 0) {
+		const current = $x[1];
+		$y = body(current);
 	} else {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[5].v = true;
-		$w = result;
+		$y = result;
 	}
-	return $w;
+	return $y;
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
+const tracing = __shared_new(false);
+const trace_hooks = __shared_new([ (_identity, _site) => {
+	return;
+}, (_site) => {
+	return;
+}, (_identity) => {
+	return "";
+}, (_turn, _id) => {
+	return;
+}, (_turn, _subscriber) => {
+	return;
+}, (_subscriber, _cause) => {
+	return;
+}, (_subscriber, _draining) => {
+	return false;
+}, (_turn, _id) => {
+	return;
+} ]);
+const waking = __shared_new([ 1 ]);
 const a = new4(0);
 const b = new4(0);
 sub(__clone(a), (value, $a) => {
@@ -291,43 +355,43 @@ sub(__clone(b), (value, $d) => {
 const turn_a = new2();
 const turn_b = new2();
 (($e) => {
-	set(a, 1, [ 0, $e ]);
+	set(a, 1, [ 0, $e ], "reactive-turns.vl:22:5");
 	return;
 })(turn_a);
-(($n) => {
-	set(b, 1, [ 0, $n ]);
-	flush([ 0, $n ]);
+(($p) => {
+	set(b, 1, [ 0, $p ], "reactive-turns.vl:25:5");
+	flush([ 0, $p ]);
 	return;
 })(turn_b);
 console.log("mid");
-(($r) => {
-	return flush([ 0, $r ]);
+(($t) => {
+	return flush([ 0, $t ]);
 })(turn_a);
-turn([ 0 ], ($s) => {
-	set(a, 2, [ 0, $s ]);
-	set(b, 2, [ 0, $s ]);
+turn([ 0 ], ($u) => {
+	set(a, 2, [ 0, $u ], "reactive-turns.vl:33:5");
+	set(b, 2, [ 0, $u ], "reactive-turns.vl:34:5");
 	console.log("inside");
 	return;
 });
-batch(($t) => {
-	set(a, 3, [ 0, $t ]);
+batch(($v) => {
+	set(a, 3, [ 0, $v ], "reactive-turns.vl:40:5");
 	console.log("batched");
 	return;
 }, [ 1 ]);
-turn([ 0 ], ($x) => {
-	batch(($y) => {
-		set(a, 4, [ 0, $y ]);
+turn([ 0 ], ($z) => {
+	batch(($A) => {
+		set(a, 4, [ 0, $A ], "reactive-turns.vl:47:6");
 		return;
-	}, [ 0, $x ]);
+	}, [ 0, $z ]);
 	console.log("joined");
 	return;
 });
 const turn_c = new2();
-(($z) => {
+(($B) => {
 	__task(async () => {
 		await (await (tick()));
-		set(a, 5, [ 0, $z ]);
-		flush([ 0, $z ]);
+		set(a, 5, [ 0, $B ], "reactive-turns.vl:58:6");
+		flush([ 0, $B ]);
 		return;
 	}, "main");
 	return;

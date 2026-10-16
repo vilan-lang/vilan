@@ -1,5 +1,6 @@
 import pkg::compare::PartialEq;
 import pkg::context::Context;
+import pkg::debug::{ Location, caller };
 import pkg::hash::Hashable;
 import pkg::io::panic;
 import pkg::js::native_map::NativeMap;
@@ -399,10 +400,16 @@ fun enqueue(turn: Turn, subscribers: List<Subscriber>) {
 		if subscriber.derived {
 			if !turn.queued_derived.read().contains_key(key) {
 				turn.queued_derived.write().insert(key, true);
+				if tracing.read() {
+					(trace_hooks.read().queued)(turn, subscriber.id);
+				}
 				turn.pending_derived.write().push(subscriber);
 			}
 		} else if !turn.queued.read().contains_key(key) {
 			turn.queued.write().insert(key, true);
+			if tracing.read() {
+				(trace_hooks.read().queued)(turn, subscriber.id);
+			}
 			// The scan reads through `write()` and not through `read()`, and that
 			// is the difference between O(1) and O(n) PER ENQUEUE: `read()` yields
 			// a VALUE, so binding the queue to a local copies the whole list
@@ -473,7 +480,9 @@ export fun drain(turn: Turn) {
 					turn.pending_derived.write() = [];
 					turn.queued_derived.write() = NativeMap::new();
 					for subscriber in derivations {
-						if subscriber.live.read() {
+						if tracing.read() {
+							(trace_hooks.read().run_queued)(turn, subscriber);
+						} else if subscriber.live.read() {
 							(subscriber.notify)();
 						}
 						budget -= 1;
@@ -504,7 +513,9 @@ export fun drain(turn: Turn) {
 					// every nested form's teardown — cannot be asked to reach
 					// into the list phase 2 is walking (reactive-turns.md §7.4,
 					// finding one, resolved by door 1 landing first).
-					if subscriber.live.read() {
+					if tracing.read() {
+						(trace_hooks.read().run_queued)(turn, subscriber);
+					} else if subscriber.live.read() {
 						(subscriber.notify)();
 					}
 					budget -= 1;
@@ -632,7 +643,77 @@ fun reissued(subscriber: Subscriber): Subscriber {
 /// declare: every `dyn Source` would stop building natively.
 [internal("a node author's relay wake (A124 R2)")]
 export fun wake(subscriber: Subscriber) {
+	if tracing.read() && (trace_hooks.read().relay)(subscriber, draining_turns.read().last()) {
+		ret;
+	}
 	defer_subscriber(None, subscriber);
+}
+
+// === The reactive trace's seam (debugging.md §6.2, E257 S8) ===
+//
+// `std::reactive::trace::trace(true)` writes a line per WAKE — each subscriber a
+// write reached, as it runs — naming what woke it. The trace lives in its own module
+// (`reactive/trace.vl`): the scheduler here reaches it only through these HOOKS,
+// which `trace(true)` installs, so a program that never imports the trace neither
+// analyzes nor emits it, and pays a flag read per notify, per queued wake and per
+// drained subscriber.
+
+/// Whether the reactive trace is on.
+[internal("the reactive trace's switch (E257 S8)")]
+export let tracing: Shared<bool> = Shared::new(false);
+
+/// What the scheduler calls while the trace is on, installed by `trace(true)`.
+/// Until then, nothing.
+[internal("the reactive trace's hooks (E257 S8)")]
+export struct TraceHooks {
+	/// `SignalCell::new` made the cell with this identity, here.
+	made: |i32, Location| void,
+	/// `set`/`update` is about to notify, from here.
+	written: |Location| void,
+	/// A notify's cause: the cell with this identity, and the write.
+	cause: |i32| str,
+	/// `enqueue` queued this subscriber id in this turn.
+	queued: |Turn, i32| void,
+	/// `drain` runs this queued subscriber.
+	run_queued: |Turn, Subscriber| void,
+	/// A notify runs this subscriber now, with this cause.
+	run: |Subscriber, str| void,
+	/// `wake` from a relay, with the draining turn if any: whether the trace took
+	/// the wake.
+	relay: |Subscriber, Option<Turn>| bool,
+	/// A scrub took this subscriber id out of this turn's queue.
+	forget: |Turn, i32| void,
+}
+
+[internal("the reactive trace's hooks (E257 S8)")]
+export let trace_hooks: Shared<TraceHooks> = Shared::new(TraceHooks {
+	made = |_identity: i32, _site: Location| {},
+	written = |_site: Location| {},
+	cause = |_identity: i32| "",
+	queued = |_turn: Turn, _id: i32| {},
+	run_queued = |_turn: Turn, _subscriber: Subscriber| {},
+	run = |_subscriber: Subscriber, _cause: str| {},
+	relay = |_subscriber: Subscriber, _draining: Option<Turn>| false,
+	forget = |_turn: Turn, _id: i32| {},
+});
+
+/// The cause the wakes being QUEUED now were made by — set for the length of the
+/// one `enqueue` a traced notify or relay makes, `None` otherwise (a deferred
+/// action is nobody's wake).
+[internal("the reactive trace's queued cause (E257 S8)")]
+export let waking: Shared<Option<str>> = Shared::new(None);
+
+/// `enqueue`, with `cause` left for the trace to note on each wake it queues when
+/// `traced`.
+[internal("the reactive trace's enqueue (E257 S8)")]
+export fun queue_wakes(turn: Turn, subscribers: List<Subscriber>, traced: bool, cause: str) {
+	if traced {
+		waking.write() = Some(cause);
+		enqueue(turn, subscribers);
+		waking.write() = None;
+	} else {
+		enqueue(turn, subscribers);
+	}
 }
 
 /// Establish a FRESH turn for `body`'s dynamic extent, and settle it when the
@@ -936,6 +1017,9 @@ fun release_under(handle: Subscription, ambient: Option<Turn>) {
 			}
 			turn.pending_derived.write() = kept_derived;
 			turn.queued_derived.write().remove(handle.id.hash());
+			if tracing.read() {
+				(trace_hooks.read().forget)(turn, handle.id);
+			}
 		},
 		None => {},
 	}
@@ -2509,17 +2593,9 @@ fun attach<T>(signal: SignalCell<T>, subscriber: Subscriber): Subscription {
 /// The canonical write side. `set_with` is the trait's default, unchanged — the
 /// body std used to carry here is the body the trait carries now.
 export impl SignalCell<type T> with Signal<T> {
-	/// Declared, not inherited: `Type::func` reads the type's OWN members, so the
-	/// trait's default body is reachable at `Signal::new` and this one is reachable
-	/// at `SignalCell::new`. They are the same cell either way.
-	///
-	/// The cell STORES `value`, so it takes it `own` (R-c): a caller's last use
-	/// moves it in, any other use hands over a copy — never the caller's own value.
-	fun new(own value: T): SignalCell<T> {
-		mut subscribers: List<Subscriber> = [];
-		SignalCell { value = Shared::new(value), subscribers = Shared::new(subscribers) }
-	}
-
+	/// Reached through the trait — a `S: Signal<T>` bound, a `dyn Signal` — where
+	/// no call site names a location (a `[track_caller]` trait member is refused):
+	/// the inherent `set` below is what a concrete cell's `cell.set(v)` calls.
 	fun set(self, value: T) {
 		self.value.write() = value;
 		self.notify();
@@ -2533,12 +2609,22 @@ export impl SignalCell<type T> with Signal<T> {
 	/// ambient turn, join the currently DRAINING one if a settle is in progress (a
 	/// derived recomputing mid-drain — see `draining_turns`), else notify inline
 	/// (eager, depth-first).
+	///
+	/// Under the reactive trace (`trace`) each wake names this cell as its cause —
+	/// and the write that called this, when it was an inherent `set`/`update`.
 	fun notify(self) {
+		let traced = tracing.read();
+		let cause = if traced { (trace_hooks.read().cause)(self.value.identity()) } else { "" };
 		match turn_scope.get_safe() {
-			Some(let turn) => enqueue(turn, self.subscribers.read()),
+			Some(let turn) => queue_wakes(turn, self.subscribers.read(), traced, cause),
 			None => {
 				match draining_turns.read().last() {
-					Some(let draining) => enqueue(draining, self.subscribers.read()),
+					Some(let draining) => queue_wakes(
+						draining,
+						self.subscribers.read(),
+						traced,
+						cause,
+					),
 					None => {
 						// The loop walks a SNAPSHOT of the list, so an observer
 						// that cascades depth-first and disposes a later one leaves
@@ -2546,7 +2632,11 @@ export impl SignalCell<type T> with Signal<T> {
 						// 1, `Subscriber.live`).
 						for subscriber in self.subscribers.read() {
 							if subscriber.live.read() {
-								(subscriber.notify)();
+								if traced {
+									(trace_hooks.read().run)(subscriber, cause);
+								} else {
+									(subscriber.notify)();
+								}
 							}
 						}
 					},
@@ -2557,6 +2647,43 @@ export impl SignalCell<type T> with Signal<T> {
 }
 
 export impl SignalCell<type T> {
+	/// The type's OWN `new`, so `SignalCell::new` reaches it while `Signal::new`
+	/// reaches the trait's default body (which calls this one). They are the same
+	/// cell either way.
+	///
+	/// The cell STORES `value`, so it takes it `own` (R-c): a caller's last use
+	/// moves it in, any other use hands over a copy — never the caller's own value.
+	///
+	/// `[track_caller]`, and inherent rather than the `Signal` impl's (a tracking
+	/// trait member is refused): under the reactive trace (`trace`) the cell
+	/// remembers where it was made, and its wakes name the place.
+	[track_caller]
+	fun new(own value: T): SignalCell<T> {
+		mut subscribers: List<Subscriber> = [];
+		let cell = SignalCell {
+			value = Shared::new(value),
+			subscribers = Shared::new(subscribers),
+		};
+		if tracing.read() {
+			(trace_hooks.read().made)(cell.value.identity(), caller());
+		}
+		cell
+	}
+
+	/// Write `value` and notify — `Signal::set`, for a concrete cell. An inherent
+	/// method is found before the trait's, so `cell.set(v)` lands here, and under
+	/// the reactive trace (`trace`) every wake it causes names this call's place.
+	/// Through the trait (a bound, a `dyn Signal`) the write is the same and names
+	/// no place.
+	[track_caller]
+	fun set(self, value: T) {
+		if tracing.read() {
+			(trace_hooks.read().written)(caller());
+		}
+		self.value.write() = value;
+		self.notify();
+	}
+
 	/// Mutate the stored value IN PLACE, then notify once (backlog A18,
 	/// `proposal/signal-update.md`). `mutate` receives a writable view of the
 	/// storage, so a collection grows without the copy-transform-return dance
@@ -2583,7 +2710,14 @@ export impl SignalCell<type T> {
 	/// `batch`/`turn` the notification defers and coalesces like any other write.
 	/// `mutate` is `sync`: the view may not be live across an `await` (spec §6.6),
 	/// so an async closure is refused rather than adapted.
+	///
+	/// `[track_caller]`: under the reactive trace (`trace`) every wake it causes
+	/// names this call's place, as `set`'s do.
+	[track_caller]
 	fun update(self, mutate: sync |&mut T| void) {
+		if tracing.read() {
+			(trace_hooks.read().written)(caller());
+		}
 		mutate(self.value.write());
 		self.notify();
 	}

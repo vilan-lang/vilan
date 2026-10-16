@@ -488,6 +488,61 @@ test('a stop in an awaited call shows its callers below an await label', { skip 
     }
 });
 
+// E257 S8: the reactive trace under the debugger, in a terminal launch (so
+// stderr is the terminal's, and the trace's line reaches the debug console
+// from the inspector). The effect's queued wake runs when the `batch` ends, on
+// a stack without the write; its task (`console.createTask`) puts the write
+// back under the effect's frame, below a label naming the cause.
+test('a traced wake shows the waking write below its cause, and its line in the console', { skip }, async () => {
+    const program = copyFixture('trace.vl');
+    const breaks = markers(program, 'break');
+    const writes = markers(program, 'write');
+    const client = new DapClient();
+    try {
+        let { stopped } = await launch(client, program, [breaks.get('effect') ?? 0], { console: 'integratedTerminal' });
+        // `sub` runs the effect once, at once: a synchronous stop, no task.
+        const first = await stop(client, stopped);
+        assert.deepEqual([first.reason, first.frame.line], ['breakpoint', breaks.get('effect')]);
+        assert.equal(variable(first, 'value').value, '1');
+        const firstFrames: any[] = (await client.request('stackTrace', { threadId: 1 })).stackFrames;
+        assert.ok(
+            !firstFrames.some((frame) => frame.presentationHint === 'label' && frame.name.startsWith('cell #')),
+            `the first run is nobody's wake: ${JSON.stringify(firstFrames)}`,
+        );
+
+        ({ stopped } = await resume(client));
+        const woken = await stop(client, stopped);
+        assert.deepEqual([woken.reason, woken.frame.line], ['breakpoint', breaks.get('effect')]);
+        assert.equal(variable(woken, 'value').value, '2');
+        const frames: any[] = (await client.request('stackTrace', { threadId: 1 })).stackFrames;
+        const label = frames.findIndex((frame) => frame.presentationHint === 'label' && frame.name.startsWith('cell #'));
+        assert.ok(label > 0, `a label naming the cause: ${JSON.stringify(frames)}`);
+        const fixture = path.basename(program);
+        assert.match(frames[label].name, new RegExp(`^cell #\\d+ \\(made at ${fixture}:\\d+:\\d+\\), set at ${fixture}:${writes.get('bump')}:\\d+$`));
+        // Below it, the write: std's frames subtle, then `bump` at its `set`.
+        const below = frames.slice(label + 1).filter((frame) => frame.presentationHint === 'normal');
+        assert.deepEqual([below[0]?.name, below[0]?.line], ['bump', writes.get('bump')], JSON.stringify(frames));
+
+        const terminated = client.next('terminated');
+        await client.request('continue', { threadId: 1 });
+        await terminated;
+        // The trace's line, in the debug console as the console's output, at
+        // the write it names.
+        const lines = client.events.filter(
+            (event) => event.event === 'output' && event.body.category === 'console' && event.body.output.startsWith('[reactive] '),
+        );
+        assert.equal(lines.length, 1, JSON.stringify(lines.map((event) => event.body)));
+        assert.match(lines[0].body.output, /^\[reactive\] effect #\d+ woken by cell #\d+ \(made at trace\.vl:\d+:\d+\), set at trace\.vl:\d+:\d+\n$/);
+        assert.equal(lines[0].body.line, writes.get('bump'));
+        assert.equal(path.basename(lines[0].body.source?.path ?? ''), fixture);
+        // And on stderr, which in a terminal launch is the terminal's.
+        await until(() => client.terminal.output.includes('[reactive] effect #'), "the trace's line in the terminal");
+    } finally {
+        await client.close();
+        removeQuietly(path.dirname(program));
+    }
+});
+
 test('a terminal launch stops on entry and steps line by line', { skip }, async () => {
     const program = copyFixture('steps.vl');
     const lines = markers(program, 'step');

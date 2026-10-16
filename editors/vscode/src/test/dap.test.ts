@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { describe, runCommand } from '../dap/adapter';
+import { describe, runCommand, shownStderr } from '../dap/adapter';
 import { Doc, WALKER, children, dbgLine, flat, layout, walker } from '../dap/printer';
 import { Sidecar, parsePath } from '../dap/sidecar';
 import { SourceMap, decodeMappings, decodeVlq } from '../dap/sourceMap';
@@ -418,3 +418,11 @@ function vlq(value: number): string {
     } while (rest > 0);
     return out;
 }
+
+test('an internalConsole launch drops the trace\'s stderr lines, which reach the console from the inspector', () => {
+    const text =
+        'Debugger attached.\n[reactive] effect #0 woken by cell #1, set at main.vl:4:7\ncount is 2\n[reactive] derivation #2 woken by cell #1\n';
+    assert.equal(shownStderr(text), 'count is 2\n');
+    // A line that merely mentions the trace is the program's own.
+    assert.equal(shownStderr('see [reactive] lines\n'), 'see [reactive] lines\n');
+});

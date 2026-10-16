@@ -1302,6 +1302,9 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__chunk_load",
         "__chunk_preload",
         "__is_null",
+        "__trace_line",
+        "__trace_task",
+        "__trace_run",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -1695,6 +1698,43 @@ fn helper_source(name: &str) -> &'static str {
              \t} finally {\n\
              \t\tafter();\n\
              \t}\n\
+             }"
+        }
+        // The reactive trace's three seams (`std::reactive::trace`, E257 S8).
+        // A line goes where `dbg` writes: stderr under a process (and so to
+        // a debugger through the inspector's console events), the console in
+        // the browser. A queued wake's task is made on the waking write's
+        // stack (`console.createTask`), held by token on `globalThis` (the
+        // helpers are declarations; state of their own would need a
+        // declaration order), and the wake runs inside it — the host's async
+        // stack tagging, which a debugger shows as the waking write under
+        // the woken frame. A host without tasks runs the body plainly.
+        "__trace_line" => {
+            "function __trace_line(line) {\n\
+             \tif (typeof process === \"object\") {\n\
+             \t\tconsole.error(line);\n\
+             \t} else {\n\
+             \t\tconsole.log(line);\n\
+             \t}\n\
+             }"
+        }
+        "__trace_task" => {
+            "function __trace_task(token, name) {\n\
+             \tif (typeof console.createTask === \"function\") {\n\
+             \t\t(globalThis.__vilan_trace_tasks ??= new Map()).set(token, console.createTask(name));\n\
+             \t}\n\
+             }"
+        }
+        "__trace_run" => {
+            "function __trace_run(token, body) {\n\
+             \tconst tasks = globalThis.__vilan_trace_tasks;\n\
+             \tconst task = tasks === undefined ? undefined : tasks.get(token);\n\
+             \tif (task === undefined) {\n\
+             \t\tbody();\n\
+             \t\treturn;\n\
+             \t}\n\
+             \ttasks.delete(token);\n\
+             \ttask.run(body);\n\
              }"
         }
         // `__guarded` is the one a loop that must FINISH wants — `Owner`'s
