@@ -52355,11 +52355,29 @@ impl<'src> Analyzer<'src> {
     /// asked once, after the walk, rather than at each resolution site, because
     /// imports and uses drain in an order neither one controls.
     ///
-    /// A program with no `as` in it does no work here at all.
+    /// A program with no `as` in it does no work here at all, and one with
+    /// aliases reads the text only where an alias COULD be spelled (M154): an
+    /// identifier spells an alias only in the file that declares it, at a use
+    /// of the alias's target ([`Analyzer::alias_binding`]'s two conditions),
+    /// so every other reference of the world is passed over on its target
+    /// alone — kolt's 22 aliases against ~180,000 expressions and ~30,000
+    /// type references, std's and the generated icon module's included, each
+    /// of which used to be spelled out of its file and matched against every
+    /// alias.
     fn collect_import_alias_spans(&mut self) {
         if self.import_aliases.is_empty() {
             return;
         }
+        // Each alias TARGET with the files that alias it.
+        let mut aliased: HashMap<Id, Vec<SourceId>> = HashMap::default();
+        for alias in self.import_aliases.values() {
+            aliased.entry(alias.target).or_default().push(alias.source);
+        }
+        let aliased_in = |target: Id, source: SourceId| {
+            aliased
+                .get(&target)
+                .is_some_and(|sources| sources.contains(&source))
+        };
         let mut found: Vec<((SourceId, Span), Id)> = Vec::new();
         let note = |analyzer: &Self,
                     found: &mut Vec<((SourceId, Span), Id)>,
@@ -52380,7 +52398,9 @@ impl<'src> Analyzer<'src> {
         // Type positions, import/`use` path segments, match-pattern segments,
         // macro names — everything the analyzer records AS a reference.
         for (source, span, definition, _) in &self.type_references {
-            if let Some(target) = definition {
+            if let Some(target) = definition
+                && aliased_in(*target, *source)
+            {
                 note(self, &mut found, *source, *span, *target);
             }
         }
@@ -52390,12 +52410,16 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            if use_id == target {
+            if use_id == target || !aliased.contains_key(target) {
                 continue;
             }
-            let (Some(source), Some(span)) =
-                (self.source_of_id(*use_id), self.span_map.get(use_id))
-            else {
+            let Some(source) = self.source_of_id(*use_id) else {
+                continue;
+            };
+            if !aliased_in(*target, source) {
+                continue;
+            }
+            let Some(span) = self.span_map.get(use_id) else {
                 continue;
             };
             note(self, &mut found, source, **span, *target);
@@ -75223,7 +75247,11 @@ pub struct Program<'src> {
     pub struct_literal_expectations: HashMap<Id, TypeId>,
     // Named type references in type position: `(file, name span, definition id,
     // label)`. Type names aren't entities, so this drives go-to-definition and
-    // hover on them (e.g. `Option`, `i32`, a trait bound).
+    // hover on them (e.g. `Option`, `i32`, a trait bound). The LABEL is
+    // hover's alone and rendered only where a document can ask for it (M154):
+    // under the reading aids, in a file that banks hover rows; empty
+    // elsewhere — std's references, a derive's template, every reference of
+    // a `vilan check`.
     pub type_references: Vec<(SourceId, Span, Option<Id>, String)>,
     /// Every `as` alias, by its own entity id (E145) — a declaration the
     /// importing file makes, whose target lives elsewhere.
@@ -89449,11 +89477,24 @@ fn analyze_over_world<'src>(
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();
-    // Render each type reference's hover label now that all types are resolved.
+    crate::phase_pass_mark("E145's import-alias spans");
+    // Render each type reference's hover label now that all types are
+    // resolved — where a document can ASK for it (M154): the labels are
+    // hover's alone (find-references and go-to-definition read the
+    // `(file, span, definition)` triple), so they are rendered under the
+    // reading aids only, and only for a file that banks hover rows (never
+    // std's, never a derive's template: no document's focus is either). The
+    // rest carry an empty label — on kolt's served keystroke two thirds of
+    // the world's ~30,000 references are std's.
     let type_references = analyzer
         .type_references
         .iter()
         .map(|(source, span, definition, type_id)| {
+            if !workspace.reading_aids
+                || (*source != SourceId(0) && !analyzer.banks_hover_rows(*source))
+            {
+                return (*source, *span, *definition, String::new());
+            }
             // A macro marker's hover label is its rendered signature.
             if let Some(signature) =
                 definition.and_then(|definition| analyzer.macro_signatures.get(&definition))
@@ -89465,6 +89506,7 @@ fn analyze_over_world<'src>(
             (*source, *span, *definition, label)
         })
         .collect::<Vec<_>>();
+    crate::phase_pass_mark("the type-reference labels");
 
     // Resolve the diagnostic attribution marks before `diagnostics` moves into
     // the Program: a diagnostic's source is the last mark at or before its index
