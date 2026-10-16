@@ -5,8 +5,11 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-indexmap = "2.14.0"
-serde = { version = "1", features = ["derive"] }
+# std-prefix P3: the persisted std prefix (`prefix_file.rs`) derives serde across
+# the world's types — `indexmap`'s maps ride in it and `Arc` rows need `rc`. Two
+# FEATURES of crates already here, not new dependencies (std-prefix.md §5, Q12).
+indexmap = { version = "2.14.0", features = ["serde"] }
+serde = { version = "1", features = ["derive", "rc"] }
 sha2 = "0.10"
 toml = "0.8"
 

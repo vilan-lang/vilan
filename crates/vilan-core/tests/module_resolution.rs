@@ -10027,3 +10027,117 @@ fn b585_a_trait_member_on_the_types_path_is_anchored_in_its_module() {
         "'hello' is not an inherent member of 'Thing'",
     );
 }
+
+// --- M144: std's ids are a function of the std module set alone --------------
+
+/// Analyzes a package and hands back its program (the entry's text is leaked,
+/// as every analysis's is) with the package's directory, which the caller
+/// removes.
+fn analyze_package_program(
+    files: &[(&str, &str)],
+    entry: &str,
+) -> (vilan_core::analyzer::Program<'static>, PathBuf) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_m144_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the fixture must analyze cleanly: {errors:?}"
+    );
+    (program.expect("a program"), dir)
+}
+
+/// Every std function of `program`, as `(name, id)` rows sorted by name — the
+/// std half of the entity lane, which M144 makes a function of the std set.
+fn std_function_ids(program: &vilan_core::analyzer::Program<'_>) -> Vec<(String, u32)> {
+    let mut rows: Vec<(String, u32)> = program
+        .functions
+        .iter()
+        .filter(|(id, _)| {
+            program
+                .source_of(**id)
+                .is_some_and(|source| program.std_sources.contains(&source))
+        })
+        .map(|(id, function)| (function.name.to_string(), id.0))
+        .collect();
+    rows.sort();
+    rows
+}
+
+const M144_ENTRY_SINGLE: &str =
+    "import std::path::basename;\n\nfun main() {\n\tprint(basename(\"/x/y.txt\"));\n}\n";
+const M144_ENTRY_PACKAGE: &str = "import std::path::basename;\nimport pkg::b::two;\nimport pkg::c::three;\n\nfun main() {\n\tprint(basename(\"/x/y.txt\"));\n\tprint(two() + three());\n}\n";
+
+/// M144 (std-prefix P3's first step): a std item's entity id is the same in a
+/// single-file program and beside two sibling modules of the same std set.
+/// Before it, every module node of the program registered before any walk, so
+/// std's walk ids moved with the package's module count (`basename` was
+/// `Id(8149)` alone and `Id(8151)` beside two siblings — incr-51c's repro), and
+/// the native backend, whose names carry ids, emitted two programs for one
+/// std. Now the package's nodes mint after std has walked.
+#[test]
+fn m144_a_std_items_id_does_not_move_with_the_packages_module_count() {
+    let (single, single_dir) =
+        analyze_package_program(&[("main.vl", M144_ENTRY_SINGLE)], "main.vl");
+    let (package, package_dir) = analyze_package_program(
+        &[
+            ("main.vl", M144_ENTRY_PACKAGE),
+            ("b.vl", "export fun two(): i32 {\n\t2\n}\n"),
+            ("c.vl", "export fun three(): i32 {\n\t3\n}\n"),
+        ],
+        "main.vl",
+    );
+    let single_std = std_function_ids(&single);
+    let package_std = std_function_ids(&package);
+    let basename = |rows: &[(String, u32)]| {
+        rows.iter()
+            .find(|(name, _)| name == "basename")
+            .map(|(_, id)| *id)
+            .expect("std::path::basename is loaded")
+    };
+    assert_eq!(
+        basename(&single_std),
+        basename(&package_std),
+        "`basename` must have one id whatever the package around std"
+    );
+    assert_eq!(
+        single_std, package_std,
+        "every std function's id must be a function of the std set alone"
+    );
+    // The package's own nodes come AFTER every std entity: the two sibling
+    // modules' entities sit past std's last function.
+    let std_last = package_std
+        .iter()
+        .map(|(_, id)| *id)
+        .max()
+        .expect("std functions");
+    let (two, _) = package
+        .functions
+        .iter()
+        .find(|(_, function)| function.name == "two")
+        .expect("pkg::b::two");
+    assert!(
+        two.0 > std_last,
+        "a package item ({}) must be minted after std's last entity ({std_last})",
+        two.0
+    );
+    let _ = std::fs::remove_dir_all(single_dir);
+    let _ = std::fs::remove_dir_all(package_dir);
+}

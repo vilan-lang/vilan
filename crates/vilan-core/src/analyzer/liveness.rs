@@ -99,7 +99,7 @@ use super::{Analyzer, Expr, ExprIfBranch, ExprPattern, ModuleTables, SourceId};
 /// The transformer turns this into the point at which the drop `finally`
 /// closes. Every variant is a STATEMENT boundary, because that is what a
 /// `try`/`finally` can be cut at.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DropExtent {
     /// The binding is never read: it drops immediately after its own
     /// declaration. This is the shape that fixes the serve-forever `main` —
@@ -120,7 +120,7 @@ pub enum DropExtent {
 ///
 /// Empty by default — an analyzer that has not run the pass elides nothing and
 /// drops nothing early, which is the safe direction on both counts.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct LastUse {
     /// Every read that is the last use of its binding on every path out of it.
     last_uses: HashSet<Id>,

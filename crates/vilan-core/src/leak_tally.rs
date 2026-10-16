@@ -149,10 +149,13 @@ pub enum LeakSite {
     /// (`MacroWorldText`/`MacroWorldProgram`/`MacroWorldAst`) and clearing the
     /// map does not give one byte of it back.
     MacroFailureText,
+    /// std-prefix P3: a loaded prefix file's buffer (the world's strings borrow
+    /// from it) and its span rows, leaked once per load.
+    PrefixFile,
 }
 
 /// The number of [`LeakSite`] variants — keep in step with the enum.
-const SITE_COUNT: usize = 21;
+const SITE_COUNT: usize = 22;
 
 /// Every site in declaration order — keep in step with the enum; [`report`]
 /// iterates it.
@@ -178,6 +181,7 @@ const ALL_SITES: [LeakSite; SITE_COUNT] = [
     LeakSite::WasmEntryText,
     LeakSite::BaseCacheWorld,
     LeakSite::MacroFailureText,
+    LeakSite::PrefixFile,
 ];
 
 thread_local! {

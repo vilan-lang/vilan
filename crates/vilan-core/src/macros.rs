@@ -153,7 +153,7 @@ pub(crate) struct World {
 /// (`import pkg::x::my_macro`), and — for macros defined in `std` modules —
 /// everywhere (the macro PRELUDE: the built-in derives are ambient vocabulary,
 /// like the primitive types).
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ModuleKey {
     /// The entry file.
     Entry,
@@ -167,7 +167,7 @@ pub(crate) enum ModuleKey {
     DepLib(usize),
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MacroRegistry {
     by_module: HashMap<ModuleKey, HashMap<String, MacroDef>>,
     /// `macro { .. }` blocks per file, keyed by the block NODE's address —
@@ -177,6 +177,19 @@ pub(crate) struct MacroRegistry {
 }
 
 impl MacroRegistry {
+    /// std-prefix P3: every definition's file, mapped (the loader re-roots a
+    /// persisted registry's std paths to this process's std); a path the map
+    /// declines is kept.
+    pub(crate) fn reroot_files(&mut self, map: impl Fn(&Path) -> Option<PathBuf>) {
+        for definition in self.by_module.values_mut().flat_map(HashMap::values_mut) {
+            {
+                if let Some(moved) = map(&definition.file) {
+                    definition.file = moved;
+                }
+            }
+        }
+    }
+
     fn module(&self, key: &ModuleKey) -> Option<&HashMap<String, MacroDef>> {
         self.by_module.get(key)
     }
@@ -383,7 +396,7 @@ fn return_none_edges() -> &'static Vec<(String, usize)> {
 /// What a macro's signature says it consumes — which dispatch forms fit.
 /// Attributes need `(Item)` / `(Item, Arguments)`; invocations need
 /// `(Arguments)` / `()`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum MacroShape {
     Item,
     ItemArguments,
@@ -391,7 +404,7 @@ pub(crate) enum MacroShape {
     Unit,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MacroDef {
     /// The macro's declared name (the world's entry lookup key).
     name: String,
@@ -419,6 +432,9 @@ pub(crate) struct MacroDef {
     /// The defining file's source in THIS analysis — world-compile errors
     /// attribute here (their spans point into the defining file).
     source: SourceId,
+    // std-prefix P3: not in the file (census row 4) — compiled again on demand,
+    // which an M33 expansion-table hit never asks for.
+    #[serde(skip)]
     world: std::cell::RefCell<Option<Arc<World>>>,
 }
 

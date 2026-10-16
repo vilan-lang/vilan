@@ -89,7 +89,7 @@ impl TypeDefinitions {
 
 /// One PATTERN position the entry matches (E241), as `resolve_pattern` saw
 /// it: where its name is, what it is, and the matched value's type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct PatternSite {
     /// The file the pattern is written in (E313: a module served as a view
     /// of its entry's world reads its OWN rows, never the entry's).
@@ -100,7 +100,7 @@ pub(super) struct PatternSite {
     matched: Option<TypeId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum PatternSiteKind {
     /// A variant: the enum, the variant, its payload under the arguments.
     Variant {
@@ -115,7 +115,7 @@ enum PatternSiteKind {
 /// A pattern position's hover (E241): where its name is, what it renders
 /// as — `Option<i32>::Some(i32)`, `_: Option<i32>` — and, for a variant, the
 /// enum and variant it names, so the editor can read the variant's `///`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PatternLabel {
     /// The file `name_span` is an offset into (E313). A row is read only by
     /// the document that IS this source — the entry, or a module served as a
@@ -133,7 +133,7 @@ pub struct PatternLabel {
 /// answered with a bare name: a TYPE PARAMETER (`type I: Read<U>`, and the
 /// declaration that introduces it) and a TRAIT named in a bound, a `with`
 /// clause or a supertrait list (its required members, as E237's block).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceHover {
     /// The file `span` is an offset into (E313), as [`PatternLabel::source`].
     pub source: SourceId,

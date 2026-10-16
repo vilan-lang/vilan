@@ -17,3 +17,10 @@ RUST_MIN_STACK = "8388608"
 # A `cargo run` of the CLI from this workspace lands there too; an installed
 # `vilan` never reads this file.
 VILAN_CHECK_CACHE = { value = "target/test-check-cache", relative = true }
+# std-prefix P3: no test process — and no `vilan` a test spawns — reads or
+# writes the persisted std prefix under `~/.vilan/cache/worlds` (the CLI and the
+# language server set that default for themselves). The pins that exercise the
+# file point `VILAN_WORLD_CACHE` at a scratch directory of their own; P5 (N157)
+# points the whole suite at `target/` once the file's key and bound have held a
+# release. The shell still wins (no `force`).
+VILAN_WORLD_CACHE = "off"

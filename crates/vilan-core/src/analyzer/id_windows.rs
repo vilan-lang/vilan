@@ -47,7 +47,7 @@ use crate::analyzer::SourceId;
 use crate::id::Id;
 use crate::type_::TypeId;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     #[default]
     Off,
@@ -168,7 +168,7 @@ pub const FIRST_TYPE_RATIO: u32 = 4;
 /// `type_id_sources`): one row per run of slots stamped with one source,
 /// looked up by the slot's id. A window's room is one run (its item's
 /// source), so the padding costs no row per slack slot.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TypeSourceRuns {
     runs: Vec<(u32, SourceId)>,
     high: u32,
@@ -271,7 +271,7 @@ pub enum Lane {
 }
 
 /// Where the analysis is, for the census of unanchored mints.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Phase {
     /// The module, lib, generated and entry walks (and the drain around them).
     #[default]
@@ -297,7 +297,7 @@ impl Phase {
 
 /// One lane of one window: `[start, end)`; `cursor` is the next free id for a
 /// relocated mint (the walk's mints occupy `[start, cursor)` at close).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Range {
     pub start: u32,
     pub end: u32,
@@ -318,7 +318,7 @@ impl Range {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ItemWindow {
     /// The top-level node's id (the item), known once its walk returns.
     pub item: Option<Id>,
@@ -356,7 +356,7 @@ impl ItemWindow {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaneCensus {
     /// Minted while an item's window was being laid out: the walk's own.
     pub walk_in_window: u64,
@@ -396,7 +396,7 @@ impl LaneCensus {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Census {
     pub entities: LaneCensus,
     pub types: LaneCensus,
@@ -570,7 +570,7 @@ pub struct SavedAnchor {
     missed: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct IdWindows {
     pub mode: Mode,
     pub windows: Vec<ItemWindow>,

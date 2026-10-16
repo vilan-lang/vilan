@@ -31,7 +31,7 @@ use super::hover_labels::{PatternLabel, ReferenceHover, TypeDefinitions};
 use super::{Analyzer, SourceId};
 
 /// One region's hover rows.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct RecordedHoverRows {
     /// E206: `(call or written subject, the signature label)`.
     pub call_labels: Vec<(Id, String)>,
