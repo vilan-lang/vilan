@@ -3691,7 +3691,11 @@ impl<'src> Transformer<'src> {
                     parameters: Vec::new(),
                     body: t_main_fn_body,
                     is_async: true,
-                    origin: None,
+                    // E331: with a map, the wrapper's head is a mark at `main`
+                    // itself, so a debugger finds `main`'s frame (and the
+                    // sidecar's record of it) in the arrow an async `main`
+                    // runs in. Without one it stays an origin-less arrow.
+                    origin: self.source_marks.then_some(main_fn.id),
                 })),
                 Vec::new(),
             );

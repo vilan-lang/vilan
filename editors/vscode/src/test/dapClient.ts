@@ -28,7 +28,7 @@ export class DapClient {
         }
         if (message.type === 'request' && message.command === 'runInTerminal') {
             // The editor's half: run the command in a "terminal" — here a
-            // process whose output the test reads — and answer its pid.
+            // process whose output the test reads.
             const args: string[] = message.arguments.args;
             const child = spawn(args[0], args.slice(1), {
                 cwd: message.arguments.cwd,
@@ -45,7 +45,9 @@ export class DapClient {
                 request_seq: message.seq,
                 command: 'runInTerminal',
                 success: true,
-                body: { processId: child.pid },
+                // As VS Code answers for its integrated terminal: the
+                // terminal's shell, never the process it runs (E331).
+                body: { shellProcessId: process.pid },
             });
             return;
         }

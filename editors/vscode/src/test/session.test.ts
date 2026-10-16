@@ -106,14 +106,15 @@ async function launch(
         breakpoints: breakpoints.map((line) => ({ line })),
     });
     await client.request('setExceptionBreakpoints', { filters: ['uncaught'] });
-    const stopped = client.next('stopped');
+    // The first stop waits on a whole build (two legs, under the suite's load).
+    const stopped = client.next('stopped', () => true, 120000);
     await client.request('configurationDone');
     return { stopped };
 }
 
 /// Continues; answers the promise of the next stop.
-async function resume(client: DapClient): Promise<{ stopped: Promise<any> }> {
-    const stopped = client.next('stopped');
+async function resume(client: DapClient, timeout?: number): Promise<{ stopped: Promise<any> }> {
+    const stopped = client.next('stopped', () => true, timeout);
     await client.request('continue', { threadId: 1 });
     return { stopped };
 }
@@ -364,6 +365,73 @@ test('the watch shape: each round re-attaches, and its panes print as dbg does',
         await client.close();
         removeQuietly(path.dirname(program));
     }
+});
+
+/// A fresh copy of a fixture DIRECTORY (a package), in a directory of its own.
+function copyPackage(name: string): string {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'vilan-dap-'));
+    fs.cpSync(path.join(FIXTURES, name), path.join(directory, name), { recursive: true });
+    return path.join(directory, name);
+}
+
+function alive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// E331: kolt's shape — a package of two legs whose server keeps running —
+// under `--watch` in a terminal, the way VS Code launches it (its
+// `runInTerminal` answers with the shell, not `vilan run`'s pid). The round
+// boundary ended the session: the pid read before node bootstrapped was
+// `null`, and the liveness check between rounds read it as `vilan run` gone.
+test('a two-leg server under --watch in a terminal re-attaches across a round', { skip: skipWatch }, async () => {
+    const root = copyPackage('watch-workspace');
+    const server = path.join(root, 'src', 'server.vl');
+    const lines = markers(server, 'break');
+    const client = new DapClient();
+    let serverPid: number | undefined;
+    try {
+        let { stopped } = await launch(client, server, [lines.get('serve') ?? 0], {
+            watch: true,
+            console: 'integratedTerminal',
+            cwd: root,
+        });
+        for (let round = 1; round <= 2; round++) {
+            const atServe = await stop(client, stopped);
+            assert.deepEqual([atServe.reason, atServe.frame.line], ['breakpoint', lines.get('serve')]);
+            // An async `main` runs in an arrow; its frame is still `main`'s,
+            // with its bindings by type.
+            assert.equal(atServe.frame.name, 'main');
+            const origin = variable(atServe, 'origin');
+            assert.deepEqual([origin.value, origin.type], ['Point { x = 1, y = 2 }', 'Point']);
+            const pid = Number(
+                (await client.request('evaluate', { expression: 'process.pid', frameId: atServe.frame.id, context: 'repl' }))
+                    .result,
+            );
+            assert.ok(pid > 0 && pid !== serverPid, `round ${round} runs a node of its own (${pid})`);
+            serverPid = pid;
+            ({ stopped } = await resume(client, 120000));
+            if (round === 1) {
+                // The server is running; a change stops it and starts round 2.
+                fs.appendFileSync(server, '\n// touched by the watch session\n');
+            }
+        }
+        assert.equal(
+            client.events.filter((event) => event.event === 'terminated').length,
+            0,
+            'the session never ended between rounds',
+        );
+    } finally {
+        await client.close();
+        removeQuietly(path.dirname(root));
+    }
+    // Ending the session stops the round's server, not only `vilan run`.
+    assert.ok(serverPid !== undefined);
+    await until(() => !alive(serverPid as number), "the last round's server to stop", 10000);
 });
 
 test('a terminal launch stops on entry and steps line by line', { skip }, async () => {

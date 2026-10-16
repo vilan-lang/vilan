@@ -1,0 +1,17 @@
+// E331's gate: a server that keeps running until the next watch round stops
+// it. A `// break:` comment names a line the session stops on.
+import std::io::print;
+import std::time::sleep;
+
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+async fun main() {
+	let origin = Point { x = 1, y = 2 };
+	print(origin.x); // break: serve
+	for {
+		sleep(1000);
+	}
+}

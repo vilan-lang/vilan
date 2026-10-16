@@ -1347,3 +1347,49 @@ fun main() {
         "integer"
     );
 }
+
+/// E331: an async `main` runs in an arrow the script's top level calls, not
+/// at the top level itself — so its frame is not the module's. The arrow's
+/// head is marked at `main`, and `main`'s record carries that place, so a
+/// debugger finds the frame (and prints its bindings by type) as it finds a
+/// closure's. The script is the same bytes.
+#[test]
+fn e331_an_async_mains_frame_is_found_at_its_arrow() {
+    let source = r#"
+import std::io::print;
+import std::time::sleep;
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+async fun main() {
+    let origin = Point { x = 1, y = 2 };
+    sleep(1);
+    print(origin.x);
+}
+"#;
+    let (built, source) = build_program("e331_async_main", source);
+    let info = sidecar(&built);
+    let main = frame(info, "main");
+    assert_eq!(main.kind, FrameKind::Main);
+    let entry = built
+        .map
+        .sources
+        .iter()
+        .position(|entry| entry.path.ends_with("main.vl"))
+        .expect("the user's file") as u32;
+    let (line, column) = source_position(&source, "async fun main()");
+    assert_eq!(main.at, Some((entry, line as u32, column as u32)));
+    assert_eq!(type_text(info, binding(main, "origin")), "Point");
+    // The arrow's head carries the segment that place is read from.
+    let segments = assert_valid(&built.mapped, &built.map);
+    let arrow = generated_position(&built.mapped, "async () => {", 0);
+    let head = segments
+        .iter()
+        .rev()
+        .find(|segment| segment.generated_line == arrow.0 && segment.generated_column <= arrow.1)
+        .unwrap_or_else(|| panic!("a segment at the arrow's head:\n{}", built.mapped));
+    assert_eq!((head.line, head.column), (line, column));
+}

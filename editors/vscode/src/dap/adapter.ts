@@ -325,7 +325,10 @@ export class VilanDebugAdapter {
             if (!response.success) {
                 throw new Error(response.message ?? 'the editor could not start `vilan run`');
             }
-            this.vilanPid = response.body?.processId;
+            // VS Code answers with the terminal's shell, not the process it
+            // runs (`shellProcessId`); `vilan run` is then learned from its
+            // node at the first round.
+            this.vilanPid = validPid(response.body?.processId);
         }
         void this.attachRounds();
     }
@@ -344,7 +347,10 @@ export class VilanDebugAdapter {
                 }
                 if (this.vilanPid !== undefined && !alive(this.vilanPid)) {
                     // `vilan run` is gone — a compile error before any
-                    // inspector opened, or the end of a watch session.
+                    // inspector opened, or the end of a watch session. Only a
+                    // pid the session KNOWS can be declared gone (`validPid`);
+                    // an unknown one is not "dead" (E331: a `null` read as a
+                    // dead process ended a watch session between rounds).
                     this.finish();
                     return;
                 }
@@ -393,15 +399,18 @@ export class VilanDebugAdapter {
         await cdp.send('Debugger.enable');
         await cdp.send('Debugger.setAsyncCallStackDepth', { maxDepth: 32 }).catch(() => undefined);
         await cdp.send('Debugger.setPauseOnExceptions', { state: this.exceptions });
-        const pids = await cdp.send('Runtime.evaluate', {
-            expression: '[process.pid, process.ppid]',
-            returnByValue: true,
-        });
-        const [nodePid, parentPid] = (pids.result?.value as number[] | undefined) ?? [];
-        this.nodePid = nodePid;
-        this.vilanPid ??= parentPid;
         await cdp.send('Runtime.runIfWaitingForDebugger');
         await initial;
+        // Who to stop when the session ends: this round's node, and `vilan
+        // run` (its parent) when the launch could not say. Asked at the first
+        // line, not before it: until node has bootstrapped, `process.pid` and
+        // `process.ppid` read `null` (E331).
+        const pids = await cdp
+            .send('Runtime.evaluate', { expression: '[process.pid, process.ppid]', returnByValue: true })
+            .catch(() => undefined);
+        const [nodePid, parentPid] = (pids?.result?.value as unknown[] | undefined) ?? [];
+        this.nodePid = validPid(nodePid);
+        this.vilanPid ??= validPid(parentPid);
         // Every breakpoint binds before the program's first line runs.
         await this.bindAll();
         if (this.round === 1 && !this.configured) {
@@ -1229,6 +1238,13 @@ function signal(pid: number | undefined, name: NodeJS.Signals): void {
     } catch {
         // Gone in between.
     }
+}
+
+/// `value` when it is a process id, else `undefined` — never a `null` or a
+/// `NaN` that `process.kill` would refuse, and so never one a liveness check
+/// could read as a process that ended (E331).
+export function validPid(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 function alive(pid: number): boolean {
