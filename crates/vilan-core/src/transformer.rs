@@ -14856,7 +14856,24 @@ impl<'src> ConstWorld<'src> {
         if closed.requires.is_empty() {
             reach.own_globals = closed.globals.into_iter().collect();
         } else {
-            reach = self.reach_from(&closed);
+            // B?2 (incr-54a's find): the prelude's requirements JOIN the site's
+            // own. The frame opened empty, so `closed` alone is the prelude's
+            // reach — a G24 snapshot written into it (`const let add = |n|
+            // helper(n)`) requires `helper` — and taken alone it dropped every
+            // function the site's expression reached: `const twice(add(1))`
+            // failed with "unknown host call `twice`".
+            let mut seed = self
+                .sites
+                .get(&expr_id)
+                .map(|site| site.record.clone())
+                .unwrap_or_default();
+            seed.requires.extend(closed.requires);
+            seed.globals.extend(closed.globals);
+            seed.helpers.extend(closed.helpers);
+            for (module, symbols) in closed.imports {
+                seed.imports.entry(module).or_default().extend(symbols);
+            }
+            reach = self.reach_from(&seed);
         }
         (reach, prelude, unresolved)
     }

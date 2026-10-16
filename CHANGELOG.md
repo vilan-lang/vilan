@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**A `const` expression that calls a function and reads a `const let` closure evaluates - `const twice(add(1))`, `add` a `const let` closure over `helper`, failed with "const evaluation failed: unknown host call `twice`".** The closure's snapshot is written into the site's prelude, and when the prelude's walk required code (`helper`) the site's reach was REBUILT from the prelude's requirements alone, dropping every function the site's own expression reached. The prelude's requirements now join the site's (`ConstWorld::prepare`). Found by incr-54a reading `prepare` for M161; v0.51.0 fails the same program. Pin: `a_const_site_calling_a_function_beside_a_const_let_closure_keeps_its_own_reach`. Tracker B?2 (incr-54a).
+
 <!-- family: performance -->
 **M161 (Order 54): a `const` site's reach holds the shared union of its requirements behind its `Rc` beside its own few globals, instead of copying the union's module-level bindings per site - and the prelude fixpoint reads the union in place.** After M147 most const sites (kolt's style chain) reach the same union, and `ConstWorld::reach_from` copied its globals into every site's set, which `prepare` copied again into the prelude fixpoint's `referenced_globals`. `SiteReach` now holds the union (`Rc<ReachClosure>`: its functions, slots and globals) and the site's own globals; the fixpoint's first round reads the union's bindings straight from it, its later rounds what the prelude's walks added - the same batches in the same order, so the preludes, the unresolved lists and the emitted values are unchanged. Measured with callgrind on kolt's client check (inclusive): `ConstWorld::prepare` 45.2 -> 38.7 M, `reach_from` 18.8 -> 16.2 M. Gated by the const pins, the corpus goldens and the native differential (byte-identical). Tracker M161.
 
