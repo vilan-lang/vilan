@@ -7069,12 +7069,26 @@ fn type_head<'src>(node: &Node<'src>) -> Option<&'src str> {
 /// struct, or a function in an `impl` block whose subject is that type. A
 /// syntactic question, asked of a twin file that is not part of this analysis —
 /// no ids, no types, nothing loaded.
-fn declares_member_on(item: &Node, type_name: &str, member: &str) -> bool {
+/// Which kind of member a twin note asks the other twin about (E320): a
+/// field miss is answered by a FIELD of the other twin only — both twins
+/// declaring `View::autofocus` as a method is no reason to send a field read
+/// to the other platform — and a method miss by a method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TwinMember {
+    Field,
+    Method,
+}
+
+fn declares_member_on(item: &Node, type_name: &str, member: &str, kind: TwinMember) -> bool {
     match item {
-        Node::Struct(name, _, _, _, Some(fields), _) if name.0 == type_name => {
+        Node::Struct(name, _, _, _, Some(fields), _)
+            if name.0 == type_name && kind == TwinMember::Field =>
+        {
             fields.0.iter().any(|field| field.0.0.0 == member)
         }
-        Node::Impl(subject, _, body, _) if type_head(&subject.0) == Some(type_name) => {
+        Node::Impl(subject, _, body, _)
+            if type_head(&subject.0) == Some(type_name) && kind == TwinMember::Method =>
+        {
             body.0.iter().any(|inner| {
                 matches!(unwrap_item(inner), Node::Func(function) if function.name.0 == member)
             })
@@ -33890,7 +33904,7 @@ impl<'src> Analyzer<'src> {
         &self,
         definition_id: Id,
         type_name: &str,
-        member_name: Option<&str>,
+        member: Option<(&str, TwinMember)>,
     ) -> Option<Note> {
         let source = self.source_of_id(definition_id)?;
         let layer = self.std_layer_sources.get(&source)?;
@@ -33909,9 +33923,9 @@ impl<'src> Analyzer<'src> {
         // answer that settles it is that the OTHER twin has one by that name.
         // Without this the note explains a colour and leaves the member looking
         // like a typo.
-        if let Some(member_name) = member_name
+        if let Some((member_name, kind)) = member
             && let Some((other_layer, module, patterns)) =
-                self.twin_declaring_member(source, type_name, member_name)
+                self.twin_declaring_member(source, type_name, member_name, kind)
         {
             // F27 R1: and the move that puts the file there, which is now a
             // line the author writes — the editor's quick fix inserts exactly
@@ -33949,6 +33963,7 @@ impl<'src> Analyzer<'src> {
         source: SourceId,
         type_name: &str,
         member_name: &str,
+        kind: TwinMember,
     ) -> Option<(String, String, Vec<String>)> {
         for (layer, module, path, patterns) in self.std_layer_twin_files.get(&source)? {
             let Ok(text) = crate::util::read_source(path) else {
@@ -33960,7 +33975,7 @@ impl<'src> Analyzer<'src> {
             if tree
                 .0
                 .iter()
-                .any(|item| declares_member_on(unwrap_item(item), type_name, member_name))
+                .any(|item| declares_member_on(unwrap_item(item), type_name, member_name, kind))
             {
                 return Some((layer.clone(), module.clone(), patterns.clone()));
             }
@@ -41417,7 +41432,17 @@ impl<'src> Analyzer<'src> {
                 Node::Accessor(_) | Node::AccessorWithGenerics(..) | Node::StaticAccessor(..)
             )
         };
-        if !names_a_path(&left.0) || !names_a_path(&middle.0) {
+        // E319: a METHOD named on a receiver (`h.make <str>("a")`) is the
+        // member form of the same shape; whether `make` is a generic method of
+        // the receiver's type is decided where the field read fails
+        // (`refuse_missing_struct_field` holds that refusal for the site).
+        let names_a_member = |node: &Node<'_>| match node {
+            Node::MemberAccessor(_, member) => {
+                matches!(crate::node::unmark_head_link(member).0.0, Node::Accessor(_))
+            }
+            _ => false,
+        };
+        if !(names_a_path(&left.0) || names_a_member(&left.0)) || !names_a_path(&middle.0) {
             return;
         }
         if self.current_source_id == DERIVED_SOURCE {
@@ -58219,7 +58244,11 @@ impl<'src> Analyzer<'src> {
                             .get(&struct_id)
                             .map(|struct_| struct_.name.to_string());
                         name.and_then(|name| {
-                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                            self.overlaid_std_type_note(
+                                struct_id,
+                                &name,
+                                Some((member_name, TwinMember::Method)),
+                            )
                         })
                     }
                     _ => None,
@@ -58428,7 +58457,11 @@ impl<'src> Analyzer<'src> {
                             .get(&struct_id)
                             .map(|struct_| struct_.name.to_string());
                         name.and_then(|name| {
-                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                            self.overlaid_std_type_note(
+                                struct_id,
+                                &name,
+                                Some((member_name, TwinMember::Method)),
+                            )
                         })
                     }
                     _ => None,
@@ -65720,6 +65753,123 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
+    /// `subject.member` on a struct with no FIELD of that name. Three answers
+    /// before the plain refusal:
+    ///
+    /// - E319: the accessor is the name of a spaced generic method call —
+    ///   `h.make <str>("a")` read as a comparison — and the struct has a
+    ///   generic method of that name: the refusal is HELD for the site's
+    ///   decision (`steer_spaced_generic_calls`), which replaces it, the two
+    ///   comparisons and the type in value position with ONE steer.
+    /// - E320: the struct has a METHOD of that name, named without its
+    ///   parentheses (`p.norm`, an element head's bare `.autofocus`): the
+    ///   refusal says so and writes the call.
+    /// - E119: the struct came from an overlaid std layer — the note names the
+    ///   twin, and claims the other twin declares the member only when it
+    ///   declares it as a FIELD.
+    fn refuse_missing_struct_field(
+        &mut self,
+        id: Id,
+        struct_id: Id,
+        arguments: &[TypeId],
+        struct_name: &'src str,
+        member_name: &'src str,
+    ) {
+        let subject_type = Type::Struct(struct_id, arguments.to_vec());
+        let method = match self.resolve_impl_member(&subject_type, member_name) {
+            ImplMemberResolution::Found(member_id, _)
+            | ImplMemberResolution::FoundInheritedDefault(member_id, ..) => Some(member_id),
+            // A STATIC is no method candidate of a receiver; the struct's own
+            // impls declare it by name.
+            _ => self.implementations.iter().find_map(|implementation| {
+                match implementation.subject.borrow_type(self) {
+                    Type::Struct(subject_id, _) if *subject_id == struct_id => {
+                        implementation.declarations.get(member_name).copied()
+                    }
+                    _ => None,
+                }
+            }),
+        };
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let plain = format!(
+            "struct '{struct_name}' has no field '{member_name}'{}",
+            // B471: a style value's retired `.css` field.
+            self.css_rename_steer(&Type::Struct(struct_id, Vec::new()), member_name)
+                .unwrap_or_default()
+        );
+        if self.spaced_generic_operands.contains(&id)
+            && let Some(method_id) = method
+            && self
+                .method_signature_ref(method_id)
+                .is_some_and(|(_, own_generics)| !own_generics.is_empty())
+        {
+            self.deferred_not_a_value.insert(id, (plain, method_id));
+            return;
+        }
+        let Some(method_id) = method else {
+            let note = self.overlaid_std_type_note(
+                struct_id,
+                struct_name,
+                Some((member_name, TwinMember::Field)),
+            );
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note,
+                span,
+                msg: plain,
+            });
+            return;
+        };
+        let call = self.written_method_call(id, span, method_id, struct_name, member_name);
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "struct '{struct_name}' has no field '{member_name}': `{member_name}` is a method \
+                 of `{struct_name}`: call it, {call}"
+            ),
+        });
+    }
+
+    /// E320: the call a method named without its parentheses was meant to be,
+    /// as the reader wrote the access — `p.norm` → `` `p.norm()` ``, an element
+    /// head's `.autofocus` (whose accessor spans the element) →
+    /// `` `.autofocus()` ``, `(…)` when the method takes arguments, and the
+    /// path for a static (`` `Point::origin()` ``).
+    fn written_method_call(
+        &self,
+        id: Id,
+        span: Span,
+        method_id: Id,
+        struct_name: &str,
+        member_name: &str,
+    ) -> String {
+        let parameters = self
+            .method_signature_ref(method_id)
+            .map(|(parameters, _)| parameters.to_vec())
+            .unwrap_or_default();
+        let takes_self = parameters
+            .first()
+            .and_then(|parameter| self.parameters.get(parameter))
+            .is_some_and(|parameter| parameter.name == "self");
+        let explicit = parameters.len().saturating_sub(usize::from(takes_self));
+        let arguments = if explicit == 0 { "()" } else { "(…)" };
+        if !takes_self {
+            return format!("as a static: `{struct_name}::{member_name}{arguments}`");
+        }
+        let written = self
+            .source_of_id(id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| text.get(span.into_range()))
+            .filter(|written| written.ends_with(&format!(".{member_name}")))
+            .filter(|written| !written.contains('\n'));
+        match written {
+            Some(written) => format!("`{written}{arguments}`"),
+            None => format!("`.{member_name}{arguments}`"),
+        }
+    }
+
     /// `subject.field`: once the subject resolves to a struct, the accessor's type
     /// is the named field's. Defers while the subject is unresolved (or an
     /// unknown closure parameter awaiting bidirectional inference).
@@ -65922,29 +66072,13 @@ impl<'src> Analyzer<'src> {
                             self.expr_id_to_expr_map.insert(id, Expr::Error);
                             return Resolution::Failed;
                         }
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            // E119: when the struct came from an overlaid std
-                            // layer, the miss is usually about WHICH `View` this
-                            // is, not about the field.
-                            note: self.overlaid_std_type_note(
-                                struct_id,
-                                struct_name,
-                                Some(member_name),
-                            ),
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "struct '{}' has no field '{}'{}",
-                                struct_name,
-                                member_name,
-                                // B471: a style value's retired `.css` field.
-                                self.css_rename_steer(
-                                    &Type::Struct(struct_id, Vec::new()),
-                                    member_name
-                                )
-                                .unwrap_or_default()
-                            ),
-                        });
+                        self.refuse_missing_struct_field(
+                            id,
+                            struct_id,
+                            &arguments,
+                            struct_name,
+                            member_name,
+                        );
                         self.expr_id_to_expr_map.insert(id, Expr::Error);
                         Resolution::Failed
                     }
@@ -69606,8 +69740,9 @@ impl<'src> Analyzer<'src> {
     /// a pre-entry world would freeze std constraints the entry still binds
     /// (the chained-`map` failure that pinned this split).
     /// E309: decides each spaced generic call the walk noted
-    /// (`note_spaced_generic_call`). When its name is a generic function or a
-    /// generic type, the comparison chain E291 reads it as is not what was
+    /// (`note_spaced_generic_call`). When its name is a generic function, a
+    /// generic type or a generic method of its receiver's type (E319,
+    /// `h.make <str>("a")`), the comparison chain E291 reads it as is not what was
     /// meant — a function or a type has no ordering, and the `bool` the first
     /// comparison makes has none either — so ONE steer at `L <M>` names the
     /// spacing and the tight call, and the three refusals it replaces (the
@@ -69667,7 +69802,8 @@ impl<'src> Analyzer<'src> {
 
     /// E309: whether the name `id` resolved to a function with generic
     /// parameters, or (held as "a type, not a value") a struct or enum with
-    /// them.
+    /// them, or (E319, a held field miss) names a generic method of the
+    /// receiver's type.
     fn names_something_generic(&self, id: Id) -> bool {
         let generic_function = |target: &Id| match self.expr_id_to_expr_map.get(target) {
             Some(Expr::Function(function_id)) => self
@@ -69684,6 +69820,8 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Local(target)) => generic_function(target),
             _ => match self.deferred_not_a_value.get(&id) {
                 Some((_, target)) => match self.expr_id_to_expr_map.get(target) {
+                    // E319: a held member miss carries the generic METHOD.
+                    Some(Expr::Function(_) | Expr::ExternalFunction(_)) => generic_function(target),
                     Some(Expr::Struct(struct_id)) => {
                         self.structs.get(struct_id).is_some_and(|struct_| {
                             !struct_.generic_parameter_constraint_ids.is_empty()
