@@ -179,7 +179,7 @@ pub fn transform_functions<'src>(
         .required_functions
         .into_iter()
         .collect::<Vec<_>>();
-    t_functions.sort_by_key(|a| a.0.0);
+    t_functions.sort_by_key(|a| program.canonical_declaration_key(a.0));
     let t_functions = t_functions.into_iter().map(|x| x.1);
     let t_instances = transformer
         .monomorphized
@@ -3163,6 +3163,26 @@ thread_local! {
     static CONST_LOWERING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// M147 (3): how many requirement CLOSURES the const pass walked on this
+    /// thread since [`reset_const_reach_walks`] — one per requirement, however
+    /// many sites require it, once the memo serves the rest. The same argument
+    /// as [`CONST_LOWERING_COUNT`]'s: a memoized reach and a re-walked one are
+    /// the same set, so only the count tells them apart.
+    static CONST_REACH_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many requirement closures the const pass walked on this thread since
+/// the last [`reset_const_reach_walks`]. See [`CONST_REACH_WALKS`].
+pub fn const_reach_walks() -> usize {
+    CONST_REACH_WALKS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`const_reach_walks`].
+pub fn reset_const_reach_walks() {
+    CONST_REACH_WALKS.with(|count| count.set(0));
+}
+
 /// How many function bodies the const pass has lowered on this thread since the
 /// last [`reset_const_lowering_count`]. See [`CONST_LOWERING_COUNT`].
 pub fn const_lowering_count() -> usize {
@@ -3978,7 +3998,8 @@ impl<'src> Transformer<'src> {
         }
 
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
-        t_functions.sort_by_key(|a| a.0.0);
+        let program = self.program;
+        t_functions.sort_by_key(|a| program.canonical_declaration_key(a.0));
 
         // The route-chunk partition (`bundle-splitting.md` §1): a function
         // reachable from exactly one route arm and nothing eager leaves the
@@ -14477,6 +14498,26 @@ pub struct ConstWorld<'src> {
     /// site that reached the function and therefore already carries its whole
     /// transitive requirement set.
     finalisers: HashMap<String, SiteWalk<'src>>,
+    /// M147 (3): each requirement's transitive reach, once every emission it
+    /// reaches is recorded ([`ConstWorld::closure_of`]). Sites share large
+    /// sub-closures (kolt's style chain), and re-walking `requires` per site
+    /// was 17.5 M instructions of a warm client pass.
+    reach_memo: std::cell::RefCell<HashMap<EmissionId, Rc<ReachClosure>>>,
+    /// M147 (3): the union of a SET of requirements' closures, by the set —
+    /// sites whose own walks required the same things share one union, and the
+    /// per-site work is then a copy of it plus the site's own few rows.
+    union_memo: std::cell::RefCell<HashMap<Vec<EmissionId>, Rc<ReachClosure>>>,
+}
+
+/// M147 (3): what one requirement reaches, transitively — the part of a
+/// [`SiteReach`] a site's own walk does not add.
+#[derive(Default)]
+struct ReachClosure {
+    functions: Vec<Id>,
+    slots: Vec<usize>,
+    globals: HashSet<Id>,
+    helpers: BTreeSet<&'static str>,
+    imports: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// One site's own lowering, cached: the statements its expression emitted (the
@@ -14546,6 +14587,8 @@ impl<'src> ConstWorld<'src> {
             seed,
             sites: HashMap::default(),
             finalisers: HashMap::default(),
+            reach_memo: std::cell::RefCell::default(),
+            union_memo: std::cell::RefCell::default(),
         }
     }
 
@@ -14823,53 +14866,29 @@ impl<'src> ConstWorld<'src> {
 
     /// Closes over `requires` from one walk's record: the set a per-site
     /// re-walk of the whole closure would have produced, read off the records
-    /// the single lowering left instead. The walk is a plain worklist, so a
-    /// recursive or mutually recursive requirement terminates on `visited`.
+    /// the single lowering left instead — the union of the requirements'
+    /// closures from the memos ([`ConstWorld::union_of`],
+    /// [`ConstWorld::closure_of`]), so a closure two sites share is walked once
+    /// and a requirement set two sites share is united once.
     fn reach_from(&self, seed: &EmissionRecord) -> SiteReach {
-        let mut functions: Vec<Id> = Vec::new();
-        let mut slots: Vec<usize> = Vec::new();
-        let mut globals = seed.globals.clone();
-        let mut helpers = seed.helpers.clone();
-        let mut imports = seed.imports.clone();
-        if let Some(recorder) = self.transformer.recorder.as_ref() {
-            let mut visited: HashSet<EmissionId> = HashSet::default();
-            let mut worklist: Vec<EmissionId> = seed.requires.clone();
-            while let Some(key) = worklist.pop() {
-                if !visited.insert(key) {
-                    continue;
-                }
-                match key {
-                    EmissionId::Function(function_id) => {
-                        if self
-                            .transformer
-                            .required_functions
-                            .contains_key(&function_id)
-                        {
-                            functions.push(function_id);
-                        }
-                    }
-                    EmissionId::Keyed(index) => {
-                        if let Some(Some(slot)) = recorder.keyed_slots.get(index) {
-                            slots.push(*slot);
-                        }
-                    }
-                }
-                let Some(record) = recorder.records.get(&key) else {
-                    continue;
-                };
-                globals.extend(record.globals.iter().copied());
-                helpers.extend(record.helpers.iter().copied());
-                for (module, symbols) in &record.imports {
-                    imports
-                        .entry(module.clone())
-                        .or_default()
-                        .extend(symbols.iter().cloned());
-                }
-                worklist.extend(record.requires.iter().copied());
-            }
+        let union = match self.transformer.recorder.as_ref() {
+            Some(recorder) => self.union_of(&seed.requires, recorder),
+            None => Rc::new(ReachClosure::default()),
+        };
+        // The shared union is the large half: copied whole (a table copy, not a
+        // re-hash of every row), the site's own few rows added to the copy.
+        let mut globals = union.globals.clone();
+        globals.extend(seed.globals.iter().copied());
+        let mut helpers = union.helpers.clone();
+        helpers.extend(seed.helpers.iter().copied());
+        let mut imports = union.imports.clone();
+        for (module, symbols) in &seed.imports {
+            imports
+                .entry(module.clone())
+                .or_default()
+                .extend(symbols.iter().cloned());
         }
-        functions.sort_by_key(|function_id| function_id.0);
-        slots.sort_unstable();
+        let (functions, slots) = (union.functions.clone(), union.slots.clone());
         SiteReach {
             functions,
             slots,
@@ -14883,6 +14902,104 @@ impl<'src> ConstWorld<'src> {
                 })
                 .collect(),
         }
+    }
+
+    /// M147 (3): the union of `requires`' closures, its functions in
+    /// entity-id order and its slots in emission order — memoized by the set,
+    /// on [`ConstWorld::closure_of`]'s rule.
+    fn union_of(&self, requires: &[EmissionId], recorder: &EmissionRecorder) -> Rc<ReachClosure> {
+        let mut roots: Vec<EmissionId> = requires.to_vec();
+        roots.sort_unstable_by_key(|root| match root {
+            EmissionId::Function(function_id) => (0, function_id.0 as usize),
+            EmissionId::Keyed(index) => (1, *index),
+        });
+        roots.dedup();
+        if let Some(union) = self.union_memo.borrow().get(&roots) {
+            return union.clone();
+        }
+        let mut union = ReachClosure::default();
+        for root in &roots {
+            let closure = self.closure_of(*root, recorder);
+            union.functions.extend(closure.functions.iter().copied());
+            union.slots.extend(closure.slots.iter().copied());
+            union.globals.extend(closure.globals.iter().copied());
+            union.helpers.extend(closure.helpers.iter().copied());
+            for (module, symbols) in &closure.imports {
+                union
+                    .imports
+                    .entry(module.clone())
+                    .or_default()
+                    .extend(symbols.iter().cloned());
+            }
+        }
+        union.functions.sort_by_key(|function_id| function_id.0);
+        union.functions.dedup();
+        union.slots.sort_unstable();
+        union.slots.dedup();
+        let union = Rc::new(union);
+        if recorder.frames.is_empty() {
+            self.union_memo.borrow_mut().insert(roots, union.clone());
+        }
+        union
+    }
+
+    /// M147 (3): `root`'s transitive reach — the functions and slots it and
+    /// everything it requires emitted, and their globals, helpers and imports.
+    /// The walk is a plain worklist, so a recursive or mutually recursive
+    /// requirement terminates on `visited`. Memoized when no emission is in
+    /// flight (no recorder frame open — the state every site's reach is taken
+    /// in): an emission writes its record when it finishes, its requirements
+    /// were emitted inside it, and a record never changes after, so nothing the
+    /// rest of the pass emits can add to a closure taken then. A requirement
+    /// with no record (an external, a body emitted through another channel)
+    /// has none forever, as the per-site walk found.
+    fn closure_of(&self, root: EmissionId, recorder: &EmissionRecorder) -> Rc<ReachClosure> {
+        if let Some(closure) = self.reach_memo.borrow().get(&root) {
+            return closure.clone();
+        }
+        CONST_REACH_WALKS.with(|count| count.set(count.get() + 1));
+        let mut closure = ReachClosure::default();
+        let mut visited: HashSet<EmissionId> = HashSet::default();
+        let mut worklist: Vec<EmissionId> = vec![root];
+        while let Some(key) = worklist.pop() {
+            if !visited.insert(key) {
+                continue;
+            }
+            match key {
+                EmissionId::Function(function_id) => {
+                    if self
+                        .transformer
+                        .required_functions
+                        .contains_key(&function_id)
+                    {
+                        closure.functions.push(function_id);
+                    }
+                }
+                EmissionId::Keyed(index) => {
+                    if let Some(Some(slot)) = recorder.keyed_slots.get(index) {
+                        closure.slots.push(*slot);
+                    }
+                }
+            }
+            let Some(record) = recorder.records.get(&key) else {
+                continue;
+            };
+            closure.globals.extend(record.globals.iter().copied());
+            closure.helpers.extend(record.helpers.iter().copied());
+            for (module, symbols) in &record.imports {
+                closure
+                    .imports
+                    .entry(module.clone())
+                    .or_default()
+                    .extend(symbols.iter().cloned());
+            }
+            worklist.extend(record.requires.iter().copied());
+        }
+        let closure = Rc::new(closure);
+        if recorder.frames.is_empty() {
+            self.reach_memo.borrow_mut().insert(root, closure.clone());
+        }
+        closure
     }
 }
 

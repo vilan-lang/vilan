@@ -362,6 +362,29 @@ struct Arrival {
     teardown: bool,
 }
 
+/// Where the walk arrived at a frame, UNRESOLVED: the site expression and
+/// whether the edge is a synthetic teardown. Resolved into an [`Arrival`] only
+/// when a violation is reported (M133) — the walk takes ~276k edges on kolt's
+/// client and reports a handful at most, so resolving every edge's span, file
+/// and user-code bit up front was a seventh of the walk.
+#[derive(Clone, Copy)]
+struct ArrivalSite {
+    site: Id,
+    teardown: bool,
+}
+
+impl ArrivalSite {
+    fn resolve(self, program: &Program) -> Option<Arrival> {
+        let span = program.span_map.get(&self.site).map(|span| **span)?;
+        Some(Arrival {
+            span,
+            source: program.diagnostic_source_of(self.site),
+            user_code: is_user_code(program, self.site),
+            teardown: self.teardown,
+        })
+    }
+}
+
 /// The contextual DFS shared by admission (`platform` set: check + prune +
 /// chain diagnostics) and binding reachability (`platform` empty: collect).
 struct Traversal<'a, 'src> {
@@ -376,7 +399,7 @@ struct Traversal<'a, 'src> {
     /// site's span, the file that span indexes into, and whether it is user
     /// code. The file rides along with the span so a violation renders where it
     /// is anchored (backlog E16).
-    trail: Vec<(Id, Option<Arrival>)>,
+    trail: Vec<(Id, Option<ArrivalSite>)>,
     diagnostics: Vec<Violation>,
     module_bindings: HashSet<Id>,
     reached_bindings: HashSet<Id>,
@@ -395,6 +418,9 @@ struct Traversal<'a, 'src> {
     /// function whose deletion breaks the build (`dead-code-paint.md` §1.6).
     follow_const_initializers: bool,
     origin: Origin,
+    /// Each impl-declared member's impl SUBJECT, built on the first dispatch
+    /// that needs it (M133's [`Traversal::bind_candidate_impl`]).
+    impl_subjects: Option<HashMap<Id, TypeId>>,
 }
 
 impl<'a, 'src> Traversal<'a, 'src> {
@@ -412,6 +438,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
             collect_nodes: false,
             follow_const_initializers: false,
             origin: Origin::Entry,
+            impl_subjects: None,
         }
     }
 
@@ -458,7 +485,12 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
     }
 
-    fn walk(&mut self, node: Id, substitution: &SubstitutionContext, arrived_by: Option<Arrival>) {
+    fn walk(
+        &mut self,
+        node: Id,
+        substitution: &SubstitutionContext,
+        arrived_by: Option<ArrivalSite>,
+    ) {
         let mut key: Vec<(u32, u32)> = substitution
             .iter()
             .map(|(constraint, bound)| (constraint.0, self.resolve_type_id(*bound, substitution).0))
@@ -496,10 +528,17 @@ impl<'a, 'src> Traversal<'a, 'src> {
                 // reached from admissible code — and do not descend:
                 // everything beneath it lives in the same layer, and one
                 // chain tells the story.
+                let trail: Vec<(Id, Option<Arrival>)> = self
+                    .trail
+                    .iter()
+                    .map(|(frame, arrived)| {
+                        (*frame, arrived.and_then(|site| site.resolve(self.program)))
+                    })
+                    .collect();
                 let error = violation(
                     self.program,
                     platform,
-                    &self.trail,
+                    &trail,
                     node,
                     requirement,
                     &self.origin,
@@ -543,10 +582,14 @@ impl<'a, 'src> Traversal<'a, 'src> {
                     let candidates = crate::async_infer::dispatch_candidates_for(
                         self.program,
                         call.call_id,
-                        receiver.as_ref(),
+                        receiver,
                     );
                     for candidate in candidates {
-                        let next = self.callee_substitution(call.call_id, candidate, substitution);
+                        let mut next =
+                            self.callee_substitution(call.call_id, candidate, substitution);
+                        if let Some(receiver) = receiver {
+                            self.bind_candidate_impl(candidate, receiver, substitution, &mut next);
+                        }
                         self.walk(candidate, &next, arrived);
                     }
                 }
@@ -613,7 +656,10 @@ impl<'a, 'src> Traversal<'a, 'src> {
         // into the library's own source (E98).
         if let Some(drop_methods) = self.program.drop_call_edges.get(&node) {
             for (drop_method, site) in drop_methods.clone() {
-                let arrived = site.and_then(|site| self.arrival_by(site, true));
+                let arrived = site.map(|site| ArrivalSite {
+                    site,
+                    teardown: true,
+                });
                 self.walk(drop_method, &SubstitutionContext::default(), arrived);
             }
         }
@@ -621,17 +667,10 @@ impl<'a, 'src> Traversal<'a, 'src> {
         self.trail.pop();
     }
 
-    fn arrival(&self, site: Id) -> Option<Arrival> {
-        self.arrival_by(site, false)
-    }
-
-    fn arrival_by(&self, site: Id, teardown: bool) -> Option<Arrival> {
-        let span = self.program.span_map.get(&site).map(|span| **span)?;
-        Some(Arrival {
-            span,
-            source: self.program.diagnostic_source_of(site),
-            user_code: is_user_code(self.program, site),
-            teardown,
+    fn arrival(&self, site: Id) -> Option<ArrivalSite> {
+        Some(ArrivalSite {
+            site,
+            teardown: false,
         })
     }
 
@@ -674,6 +713,43 @@ impl<'a, 'src> Traversal<'a, 'src> {
         incoming.clone()
     }
 
+    /// M133: a dispatch candidate that an IMPL declares, reached on a concrete
+    /// receiver, runs with the impl's own binders bound from that receiver —
+    /// what monomorphization binds when it selects the impl, and what the
+    /// call's recorded substitution (the trait method's generics) never
+    /// carries. Without them a blanket or generic impl's body walked with its
+    /// binders as holes: `impl Each<.., type C: Slot> with Slot`'s
+    /// `self.content.place(..)` could not resolve `C`, so it walked every
+    /// `Slot` impl in std, and each of those walked every `Slot` impl again
+    /// for its own unbound child. A binding the call's substitution already
+    /// carries is kept.
+    fn bind_candidate_impl(
+        &mut self,
+        candidate: Id,
+        receiver: TypeId,
+        incoming: &SubstitutionContext,
+        next: &mut SubstitutionContext,
+    ) {
+        let subjects = self.impl_subjects.get_or_insert_with(|| {
+            let mut subjects: HashMap<Id, TypeId> = HashMap::default();
+            for implementation in &self.program.implementations {
+                for member in implementation.declarations.values() {
+                    subjects.insert(*member, implementation.subject);
+                }
+            }
+            subjects
+        });
+        let Some(subject) = subjects.get(&candidate).copied() else {
+            return;
+        };
+        let mut bindings: SubstitutionContext = HashMap::default();
+        crate::impl_select::bind_subject_and_bounds(self.program, subject, receiver, &mut bindings);
+        for (constraint, bound) in bindings {
+            let resolved = self.resolve_type_id(bound, incoming);
+            next.entry(constraint).or_insert(resolved);
+        }
+    }
+
     /// Follows `Generic` links through the active bindings (bounded, so a
     /// self-referential binding can't loop).
     fn resolve_type_id(&self, type_id: TypeId, substitution: &SubstitutionContext) -> TypeId {
@@ -692,7 +768,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
 
     /// The concrete receiver a dispatch resolves to under the bindings, if
     /// the record + the substitution pin one down.
-    fn dispatch_receiver(&self, call_id: Id, substitution: &SubstitutionContext) -> Option<Type> {
+    fn dispatch_receiver(&self, call_id: Id, substitution: &SubstitutionContext) -> Option<TypeId> {
         let resolved = match crate::async_infer::dispatch_at(self.program, call_id)? {
             GenericDispatch::OnConstraint(constraint_id, _) => {
                 self.resolve_type_id(*substitution.get(&constraint_id)?, substitution)
@@ -700,7 +776,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
             GenericDispatch::OnType(receiver, _) => self.resolve_type_id(receiver?, substitution),
         };
         match self.program.type_id_to_type_map.get(&resolved) {
-            Some(concrete @ (Type::Struct(_, _) | Type::Enum(_, _))) => Some(concrete.clone()),
+            Some(Type::Struct(_, _) | Type::Enum(_, _)) => Some(resolved),
             _ => None,
         }
     }

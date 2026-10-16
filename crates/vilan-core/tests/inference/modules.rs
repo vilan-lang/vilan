@@ -5319,6 +5319,71 @@ fn const_lowerings_of_one_analysis(source: &str) -> usize {
         .expect("worker panicked")
 }
 
+/// How many requirement closures one analysis of `source` walked — M147's
+/// instrument, isolated as [`const_lowerings_of_one_analysis`]'s is.
+fn const_reach_walks_of_one_analysis(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::transformer::reset_const_reach_walks();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let _ = program.expect("analysis should produce a program");
+            vilan_core::transformer::const_reach_walks()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// M147 (3): a site's reach — the closure of what its lowering required — is
+/// read off one walk per REQUIREMENT, not re-walked per site. Six sites calling
+/// one helper chain (`doubled` → `twice` → `once`) walk that chain's closure
+/// as often as one site does; before the memo every site walked it again (on
+/// kolt's client, 17.5 M instructions of a warm const pass).
+#[test]
+fn m147_a_requirements_reach_is_walked_once_however_many_sites_require_it() {
+    let sites = |count: usize| {
+        let bindings: String = (0..count)
+            .map(|index| format!("let SITE{index}: i32 = const doubled({index});\n"))
+            .collect();
+        let sum: Vec<String> = (0..count).map(|index| format!("SITE{index}")).collect();
+        format!(
+            r#"
+            import std::io::print;
+            import std::display::Display;
+            fun once(value: i32): i32 {{ value + 0 }}
+            fun twice(value: i32): i32 {{ once(value) + once(value) }}
+            fun doubled(value: i32): i32 {{ twice(value) }}
+            {bindings}
+            fun main() {{ print(({}).to_string()); }}
+            "#,
+            sum.join(" + ")
+        )
+    };
+    let one = const_reach_walks_of_one_analysis(&sites(1));
+    let six = const_reach_walks_of_one_analysis(&sites(6));
+    assert!(one >= 1, "the one site's reach is walked ({one} walks)");
+    assert_eq!(
+        six, one,
+        "six sites requiring one helper chain walked its reach {six} times where one site \
+         walked it {one}: the closure is the requirement's, so later sites read the memo"
+    );
+}
+
 #[test]
 fn the_const_pass_lowers_its_world_once_however_many_sites_reach_it() {
     // M4-A (`const-eval.md` §10.6). Every `const` site used to lower the whole

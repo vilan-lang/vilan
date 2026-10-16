@@ -999,15 +999,40 @@ costs a recompile of that package's macro worlds and nothing else; the
 same seven-day guard applies, because a check running right now is holding
 its own table open.
 
+A fourth root is `~/.vilan/cache/worlds/` (or the directory
+`VILAN_WORLD_CACHE` names): the persisted std prefix — std analyzed once,
+and a program's dependencies with it, written by the language server and by
+`vilan check` under `VILAN_STD_PREFIX=on`, and loaded by every later
+process. Each file's header names the build of the analyzer that wrote it,
+so `prune` takes a file another build wrote (past the seven-day guard, or
+all of them with `--all`) and never one this build wrote. The root also
+holds itself to 256 MiB as it is written (`VILAN_WORLD_CACHE_BYTES` sets
+another budget), the least recently used file first.
+
 ## `vilan cache clean`
 
 Deletes every macro expansion table `vilan check` keeps in
-`~/.vilan/check-cache/`, whatever its age. Each one is re-created by the
-next check of its package, so nothing is lost but the warm start.
+`~/.vilan/check-cache/` and every persisted std prefix in
+`~/.vilan/cache/worlds/`, whatever their age. Each one is re-created by the
+next check of its package — or the next analysis that looks for its prefix —
+so nothing is lost but the warm start.
 
 ```sh
-vilan cache clean            # every check table
+vilan cache clean            # every check table and every persisted prefix
 vilan cache clean --dry-run  # print what would go, with sizes; delete nothing
+```
+
+## `vilan cache warm`
+
+Writes the persisted std prefix for a program — checks it once with the
+prefix on — so the next process (a CI step, an editor opening the project)
+loads std, and the program's dependencies, instead of analyzing them again.
+It takes what `vilan check` takes: a file, a project directory, or nothing for
+the nearest `vilan.toml`.
+
+```sh
+vilan cache warm             # the project here
+vilan cache warm src/main.vl # one program
 ```
 
 A check also holds that root to a bound by itself, at most once a day:

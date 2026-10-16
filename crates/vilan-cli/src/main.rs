@@ -360,16 +360,27 @@ enum CacheCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Delete every `vilan check` macro-expansion table (`~/.vilan/check-cache`).
+    /// Delete every `vilan check` macro-expansion table (`~/.vilan/check-cache`)
+    /// and every persisted std prefix (`~/.vilan/cache/worlds`).
     ///
     /// Each package `vilan check` has warmed keeps one table there, keyed by
     /// its path; a check holds the root to a bound by itself (thirty days, 256
     /// tables, 256 MiB, oldest first), and this is the gesture for emptying it
-    /// outright. Every table is re-created by the next check of its package.
+    /// outright. Every table is re-created by the next check of its package,
+    /// and every prefix by the next analysis that looks for it.
     Clean {
         /// Print what would be deleted, with sizes, and delete nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Write the persisted std prefix for a program (`~/.vilan/cache/worlds`):
+    /// check it once with the prefix on, so the next process — a CI step, an
+    /// editor's first open — loads std (and the program's dependencies) instead
+    /// of analyzing them again.
+    Warm {
+        /// A `.vl` file, a project directory, or omitted for the nearest
+        /// `vilan.toml`, as `vilan check` takes it.
+        file: Option<PathBuf>,
     },
 }
 
@@ -620,6 +631,7 @@ fn run_cli() -> ExitCode {
         Command::Cache { command } => match command {
             CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
             CacheCommand::Clean { dry_run } => cache_clean(dry_run),
+            CacheCommand::Warm { file } => cache_warm(file),
         },
     }
 }
@@ -665,15 +677,124 @@ fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
             outcome = one;
         }
     }
+    // FOUR since std-prefix P4: the persisted std prefixes. A world another
+    // build of the analyzer wrote can never be read by this one (its header
+    // names its build — G28's stamp), so those go; this build's are kept.
+    let worlds = world_cache_root();
+    let removed = vilan_core::world_cache::prune(&worlds, max_age, dry_run);
+    report_world_cache(
+        &worlds,
+        &removed,
+        if dry_run { "would prune" } else { "pruned" },
+        all,
+    );
     outcome
 }
 
-/// `vilan cache clean` (N137): every check-cache table, whatever its age.
-/// They are caches in the strict sense — a check re-creates its package's
-/// table — so nothing in that root is protected.
+/// `vilan cache clean` (N137): every check-cache table, whatever its age —
+/// and, since std-prefix P4, every persisted std prefix. They are caches in
+/// the strict sense — a check re-creates its package's table, an analysis its
+/// prefix — so nothing in either root is protected.
 fn cache_clean(dry_run: bool) -> ExitCode {
     let root = vilan_embedded::default_check_cache_root();
-    prune_one_cache_root(&root, None, dry_run, true, None)
+    let outcome = prune_one_cache_root(&root, None, dry_run, true, None);
+    let worlds = world_cache_root();
+    let removed = vilan_core::world_cache::clean(&worlds, dry_run);
+    report_world_cache(
+        &worlds,
+        &removed,
+        if dry_run { "would clean" } else { "cleaned" },
+        true,
+    );
+    outcome
+}
+
+/// std-prefix P4: `vilan cache warm` — the program checked once with the std
+/// prefix forced on, so its prefix file (std's, and the dependency tier's for a
+/// program with dependencies) is written for the next process to load.
+fn cache_warm(file: Option<PathBuf>) -> ExitCode {
+    let root = world_cache_root();
+    vilan_core::incremental::set_std_prefix(Some(true));
+    let (loads_before, writes_before, _) = vilan_core::analyzer::prefix_file_counts();
+    let outcome = check_once(file, None, false);
+    let (loads, writes, _) = vilan_core::analyzer::prefix_file_counts();
+    let written = writes - writes_before;
+    let present = loads - loads_before;
+    println!(
+        "{}: wrote {written} prefix file{}, {present} already present",
+        root.display(),
+        if written == 1 { "" } else { "s" },
+    );
+    outcome.into()
+}
+
+/// The world cache's root as this process resolves it: `VILAN_WORLD_CACHE`
+/// when set to a directory, else `~/.vilan/cache/worlds`.
+fn world_cache_root() -> PathBuf {
+    vilan_core::incremental::world_cache_dir()
+        .unwrap_or_else(vilan_embedded::default_world_cache_root)
+}
+
+/// One report for the world cache, in [`prune_one_cache_root`]'s shape: what
+/// went, each with its size, age and the build that wrote it.
+fn report_world_cache(
+    root: &Path,
+    removed: &[vilan_core::world_cache::WorldCacheEntry],
+    verb: &str,
+    all: bool,
+) {
+    let kept = vilan_core::world_cache::entries(root).len();
+    if removed.is_empty() {
+        println!(
+            "{}: nothing to prune ({kept} entr{} kept)",
+            root.display(),
+            if kept == 1 { "y" } else { "ies" }
+        );
+        return;
+    }
+    let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
+    println!(
+        "{}: {verb} {} entr{} ({})",
+        root.display(),
+        removed.len(),
+        if removed.len() == 1 { "y" } else { "ies" },
+        human_bytes(freed),
+    );
+    for entry in removed {
+        let build = match &entry.build {
+            Some(build) => format!("build {build}"),
+            None if entry.name == vilan_core::world_cache::STD_INDEX_DIRECTORY => {
+                "the std import index".to_string()
+            }
+            None => "unreadable header".to_string(),
+        };
+        println!(
+            "  {}  {:>9}  {}  {build}",
+            entry.name,
+            human_bytes(entry.bytes),
+            entry
+                .age
+                .map(|age| format!("{} days old", age.as_secs() / (24 * 60 * 60)))
+                .unwrap_or_else(|| "age unknown".to_string()),
+        );
+    }
+    if kept > 0 {
+        let rule = if all {
+            "this build's own worlds are never pruned"
+        } else {
+            "this build's own worlds are never pruned, and nothing used in the last seven days"
+        };
+        println!(
+            "{}",
+            paint::out(
+                paint::Style::DIM,
+                &format!(
+                    "{kept} entr{} kept: {rule}",
+                    if kept == 1 { "y" } else { "ies" }
+                )
+            )
+        );
+    }
 }
 
 /// One cache root pruned and reported. Split out when the check tables became a

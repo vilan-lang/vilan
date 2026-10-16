@@ -1575,7 +1575,65 @@ impl LocalIndex {
     /// holds a few hundred rows instead of every local of the world - kolt's
     /// client pushed and sorted ~100 thousand of them to answer 166 queries. The
     /// inference sweep asks about arbitrary initializers, so it passes `None`.
+    ///
+    /// M147 (2): narrowed, the index does not scan the entity map at all — it
+    /// reads the entities the analyzer's walk minted inside a `const`
+    /// expression (`Program::const_walk_entities`), every reference written in
+    /// one among them (an identifier resolved to a local later keeps the
+    /// entity the walk minted). A debug build checks the two answers agree.
     fn build(program: &Program, within: Option<&SpanRegions>) -> Self {
+        let lookup = program.source_lookup();
+        let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::default();
+        let mut index = |id: Id, expr: &Expr| {
+            if let Expr::Local(binding) = expr
+                && let Some(source) = lookup.of(id)
+                && let Some(span) = program.span_map.get(&id)
+                && within.is_none_or(|regions| regions.covers(source, span.start, span.end))
+            {
+                by_source
+                    .entry(source.0)
+                    .or_default()
+                    .push((span.start, span.end, id, *binding));
+            }
+        };
+        match within {
+            Some(_) => {
+                for id in &program.const_walk_entities {
+                    if let Some(expr) = program.entity_map.get(id) {
+                        index(*id, expr);
+                    }
+                }
+            }
+            None => {
+                for (id, expr) in &program.entity_map {
+                    index(*id, expr);
+                }
+            }
+        }
+        for references in by_source.values_mut() {
+            // Sorted by position, which is also the order diagnostics want.
+            references.sort_unstable_by_key(|(start, end, id, _)| (*start, *end, id.0));
+            // A nested `const` mints inside its parent's walk too.
+            references.dedup();
+        }
+        let built = Self { by_source };
+        #[cfg(debug_assertions)]
+        if within.is_some() {
+            let scanned = Self::scan(program, within);
+            debug_assert!(
+                built.by_source == scanned.by_source,
+                "M147: the const expressions' recorded entities must index the references the \
+                 whole-map scan finds"
+            );
+        }
+        built
+    }
+
+    /// The index by a scan of the whole entity map — what [`LocalIndex::build`]
+    /// reads off the walk's record for a narrowed index, kept for a debug
+    /// build's check that the two agree.
+    #[cfg(debug_assertions)]
+    fn scan(program: &Program, within: Option<&SpanRegions>) -> Self {
         let lookup = program.source_lookup();
         let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::default();
         for (id, expr) in &program.entity_map {
@@ -1591,7 +1649,6 @@ impl LocalIndex {
             }
         }
         for references in by_source.values_mut() {
-            // Sorted by position, which is also the order diagnostics want.
             references.sort_unstable_by_key(|(start, end, id, _)| (*start, *end, id.0));
         }
         Self { by_source }

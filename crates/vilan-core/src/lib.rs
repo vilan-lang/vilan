@@ -66,6 +66,7 @@ pub mod track_caller;
 pub mod transformer;
 pub mod type_;
 pub mod util;
+pub mod world_cache;
 
 // The common pipeline + core types, re-exported for convenience.
 pub use analyzer::{EntryMode, Layer, PackageSpec, PreludeRepair, Program, Workspace, analyze};

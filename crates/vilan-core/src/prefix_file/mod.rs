@@ -20,9 +20,12 @@
 //! both. A key field that moves is a different file: the directory is named by
 //! the key's hash.
 //!
-//! **The tiers.** A file carries a tier list from this first version (`std`
-//! today). M152's dependency tier (incr-53c) joins the list without a format
-//! change: a tier is one more body under the same header.
+//! **The tiers.** A file carries a tier list from this first version. A
+//! program with dependencies (M152) takes a prefix of std AND the dependency
+//! modules its package requests — one world, its key naming both tiers
+//! (`["std", "dependencies"]`) and carrying the dependency tier's rows (its
+//! requests, a hash over its files) beside the workspace's — and joined the
+//! format without a change to it.
 
 pub mod codec;
 
@@ -40,8 +43,17 @@ pub(crate) const FORMAT_VERSION: u32 = 1;
 
 const MAGIC: &[u8] = b"vilan-std-prefix\0";
 
-/// The file name inside the key's directory, per tier.
+/// The tiers a file can carry, in order: std's, then the dependency tier a
+/// program with dependencies adds (M152).
+pub(crate) const STD_TIER: &str = "std";
+pub(crate) const DEPENDENCIES_TIER: &str = "dependencies";
+
+/// The file name inside the key's directory, by the key's LAST tier: a
+/// std-only world is `std.world`, a std-and-dependencies one
+/// `dependencies.world` (its key — and so its directory — differs anyway; the
+/// name says what the file holds to a reader of the cache).
 pub(crate) const STD_TIER_FILE: &str = "std.world";
+pub(crate) const DEPENDENCIES_TIER_FILE: &str = "dependencies.world";
 
 /// What a prefix world is a function of (`std-prefix.md` §6), in clear.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -65,10 +77,12 @@ pub(crate) struct Key {
     /// The entry package's prelude (`BaseCacheKey::entry_prelude`): it seeds
     /// the closure and the package modules' ambient scope.
     pub entry_prelude: Option<String>,
-    /// The workspace, rendered (`BaseCacheKey::workspace`) — empty for the
-    /// std prefix today, which refuses dependencies.
+    /// The workspace, rendered (`BaseCacheKey::workspace`), and — for a
+    /// world with a dependency tier (M152) — the tier's rows (its requests and
+    /// a hash over its files) after them.
     pub workspace: Vec<String>,
-    /// The tiers this file carries, in order: `std` today.
+    /// The tiers this file carries, in order: `std`, then `dependencies` for
+    /// a program that has them (M152).
     pub tiers: Vec<String>,
 }
 
@@ -163,7 +177,11 @@ pub(crate) fn micros_since(started: Option<std::time::Instant>) -> u64 {
 
 /// Where this key's std tier lives under `directory`.
 pub(crate) fn tier_path(directory: &Path, key: &Key) -> PathBuf {
-    directory.join(key.directory_name()).join(STD_TIER_FILE)
+    let file = match key.tiers.last().map(String::as_str) {
+        Some(DEPENDENCIES_TIER) => DEPENDENCIES_TIER_FILE,
+        _ => STD_TIER_FILE,
+    };
+    directory.join(key.directory_name()).join(file)
 }
 
 /// Whether a file exists under this key's name (not whether it would load).
@@ -211,8 +229,12 @@ pub(crate) fn write(
     file.extend_from_slice(MAGIC);
     file.extend_from_slice(&header_bytes);
     file.extend_from_slice(&checksum_input);
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let temporary = parent.join(format!(
-        ".{STD_TIER_FILE}.{}-{:?}.tmp",
+        ".{file_name}.{}-{:?}.tmp",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -229,6 +251,29 @@ pub(crate) fn write(
     })
 }
 
+/// P4: the key a cache directory's world was written under, read off its
+/// file's header alone (the world itself is never decoded) — `None` when the
+/// directory holds no tier file or its header does not read.
+pub(crate) fn directory_key(directory: &Path) -> Option<Key> {
+    use std::io::Read as _;
+    for file in [STD_TIER_FILE, DEPENDENCIES_TIER_FILE] {
+        let Ok(handle) = std::fs::File::open(directory.join(file)) else {
+            continue;
+        };
+        // The header is the key, the roots and three numbers: a few KB at most.
+        let mut head = Vec::new();
+        if handle.take(64 * 1024).read_to_end(&mut head).is_err() {
+            return None;
+        }
+        if head.len() < MAGIC.len() || &head[..MAGIC.len()] != MAGIC {
+            return None;
+        }
+        let (header, _): (Header, usize) = codec::decode_inline(&head[MAGIC.len()..]).ok()?;
+        return Some(header.key);
+    }
+    None
+}
+
 /// Reads and validates the std tier for `key`. Every failure is a [`Miss`].
 pub(crate) fn read(directory: &Path, key: &Key) -> Result<Loaded, Miss> {
     let started = now();
@@ -240,6 +285,11 @@ pub(crate) fn read(directory: &Path, key: &Key) -> Result<Loaded, Miss> {
     };
     let validated = validate(&bytes, key)?;
     let (body_start, body_end, table_end, std_roots) = validated;
+    // P4: a load is a USE — the write-time bound takes the least recently
+    // used world first. Best effort: a read-only root keeps its write time.
+    if let Ok(handle) = std::fs::File::options().append(true).open(&path) {
+        let _ = handle.set_modified(std::time::SystemTime::now());
+    }
     let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     crate::leak_tally::record(crate::leak_tally::LeakSite::PrefixFile, leaked.len());
     Ok(Loaded {
@@ -355,6 +405,46 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         directory
+    }
+
+    /// M152: a key that names the dependency tier is its own file —
+    /// `dependencies.world` in its own directory, beside a std-only key's
+    /// `std.world` — and neither reads the other's bytes.
+    #[test]
+    fn m152_a_dependency_tier_is_its_own_file_and_never_the_std_tiers() {
+        let directory = scratch("tiers");
+        let std_only = key();
+        let mut with_dependencies = key();
+        with_dependencies.workspace = vec![
+            "package 0 root=/shapes surface=true member=false prelude=false layers=[] deps=[]"
+                .to_string(),
+            "request 0::geometry".to_string(),
+            "content 0123456789abcdef".to_string(),
+        ];
+        with_dependencies.tiers = vec![STD_TIER.to_string(), DEPENDENCIES_TIER.to_string()];
+        assert!(tier_path(&directory, &std_only).ends_with(STD_TIER_FILE));
+        assert!(tier_path(&directory, &with_dependencies).ends_with(DEPENDENCIES_TIER_FILE));
+        assert_ne!(
+            std_only.directory_name(),
+            with_dependencies.directory_name()
+        );
+        let roots = vec![PathBuf::from("/std")];
+        write(&directory, &std_only, &roots, b"std body", b"").expect("write std");
+        assert_eq!(
+            read(&directory, &with_dependencies).err(),
+            Some(Miss::Absent)
+        );
+        write(&directory, &with_dependencies, &roots, b"both", b"").expect("write both");
+        assert_eq!(read(&directory, &std_only).expect("std").body, b"std body");
+        assert_eq!(
+            read(&directory, &with_dependencies).expect("both").body,
+            b"both"
+        );
+        // A content row that moved is another key.
+        let mut edited = with_dependencies.clone();
+        edited.workspace[2] = "content fedcba9876543210".to_string();
+        assert_eq!(read(&directory, &edited).err(), Some(Miss::Absent));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

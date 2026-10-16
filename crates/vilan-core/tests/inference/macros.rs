@@ -5922,6 +5922,8 @@ fn b376_a_users_own_derive_macro_is_not_refused() {
 // estate (kolt's two legs, the eleven examples and all 298 corpus files read
 // zero); `counters::late_round_mints` counts them so a std-prefix P3 key check
 // can refuse a world that grew this way, and so the first instance is seen.
+// tools-52 found the first (B625), and the first round now expands before it
+// mints, so the counter reads zero on it too and stays as P3's backstop.
 
 /// A macro whose generated impl imports `std::path`, plus a user of it. The
 /// entry writes no import of `std::path` itself unless `written_import` is set.
@@ -5989,14 +5991,46 @@ fn late_round_mints_of(source: &str) -> (u64, Vec<String>) {
         .unwrap()
 }
 
+/// B625 (B619's cheaper door): the first round's macro epilogue runs before the
+/// round mints, so `std::path` — named only by the macro's generated impl — is
+/// discovered and minted in the FIRST round, in its canonical place.
 #[test]
-fn b619_a_module_only_generated_code_reaches_mints_in_a_later_round() {
+fn b625_a_module_only_generated_code_reaches_mints_in_the_first_round() {
     let (late, messages) = late_round_mints_of(&generated_std_path_program(false));
     assert!(messages.is_empty(), "{messages:#?}");
+    assert_eq!(
+        late, 0,
+        "`std::path` is named only by the macro's generated impl, which the first round \
+         expands before it mints: no module mints in a later round (got {late})"
+    );
+}
+
+/// B625's observable half (tools-52's repro): the generated-only spelling and the
+/// spelling with a redundant written `import std::path::basename;` emit ONE
+/// bundle. `std::path` minted a round late used to put `basename` after
+/// `std::time`'s `now`; the written import put it before.
+#[test]
+fn b625_the_two_spellings_emit_one_bundle() {
+    let program = |written: bool| {
+        generated_std_path_program(written)
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\n        import std::time::now;",
+            )
+            .replace(
+                "fun main() {",
+                "fun main() {\n            let _started = now();",
+            )
+    };
+    let generated_only = compile(&program(false)).expect("the generated-only spelling compiles");
+    let written = compile(&program(true)).expect("the written spelling compiles");
     assert!(
-        late >= 1,
-        "`std::path` is named only by the macro's generated impl: the drain finds it in the \
-         round after the macro epilogue, and the counter must say so (got {late})"
+        generated_only.contains("function basename") && generated_only.contains("function now"),
+        "both functions are emitted:\n{generated_only}"
+    );
+    assert_eq!(
+        generated_only, written,
+        "a redundant written import of a module the generated code reaches changes nothing"
     );
 }
 

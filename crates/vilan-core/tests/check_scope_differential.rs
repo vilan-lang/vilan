@@ -1930,3 +1930,129 @@ fn a_reused_modules_container_report_is_restored_not_rescanned() {
         rescanned.4.0
     );
 }
+
+/// The M152 leg's observation of `package`: one analysis in its own workspace
+/// (its dependencies as `[library]` packages), as [`observe_in_package`]
+/// renders one, plus whether the world was a std prefix.
+fn observe_dependency_package(
+    package: &replay_harness::packages::Package,
+) -> (ReuseObservation, bool) {
+    let workspace = package.workspace(Vec::new());
+    let entry_source = package.text("main.vl").to_string();
+    let pkg_root = package.directory.clone();
+    let entry_path = package.entry.clone();
+    let platform = package.platform;
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(entry_source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &pkg_root,
+                &entry_path,
+                Some(platform),
+                &workspace,
+            );
+            let diagnostics = format!("{errors:?}");
+            let warnings = program
+                .as_ref()
+                .map(|program| {
+                    format!(
+                        "{:?}#{:?}#{:?}",
+                        program.warnings, program.warning_sources, program.diagnostic_sources
+                    )
+                })
+                .unwrap_or_default();
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            let prefix_world = vilan_core::incremental::census().prefix_world;
+            (
+                (
+                    diagnostics,
+                    warnings,
+                    javascript,
+                    vilan_core::analyzer::reuse_census(),
+                    vilan_core::analyzer::table_reuse_census(),
+                ),
+                prefix_world,
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// **M152's leg** (std-prefix door (b)): the programs with DEPENDENCIES — the
+/// two-package fixture and `examples/fullstack`'s members — in every state,
+/// each analyzed twice (the second hitting the world the first stored, its
+/// modules' checks replayed), canonically and over the forced
+/// std-and-dependencies prefix. Diagnostics, per-file attribution and the
+/// emitted JavaScript agree byte for byte: the dependency tier walks before
+/// the package in both shapes, so the dependency's declarations are numbered
+/// — and emitted — alike. Non-vacuous: every prefixed analysis IS a prefix
+/// world.
+#[test]
+fn m152_dependency_programs_agree_with_and_without_the_std_prefix() {
+    use replay_harness::packages::{DEPENDENCY_FIXTURES, Package};
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::set_world_table_reuse(true);
+    let mut divergences = Vec::new();
+    let mut prefix_worlds = 0;
+    let mut analyses = 0;
+    for fixture in DEPENDENCY_FIXTURES {
+        for (label, files) in fixture.states() {
+            let borrowed: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(file, text)| (file.as_str(), text.as_str()))
+                .collect();
+            let package = Package::write_with(
+                "m152_scope",
+                fixture.platform,
+                &borrowed,
+                fixture.dependencies,
+            );
+            vilan_core::analyzer::base_cache_clear();
+            let _ = observe_dependency_package(&package);
+            let (canonical, _) = observe_dependency_package(&package);
+            vilan_core::analyzer::base_cache_clear();
+            vilan_core::incremental::set_std_prefix(Some(true));
+            let (_, first_prefixed) = observe_dependency_package(&package);
+            let (prefixed, second_prefixed) = observe_dependency_package(&package);
+            vilan_core::incremental::set_std_prefix(None);
+            analyses += 2;
+            prefix_worlds += usize::from(first_prefixed) + usize::from(second_prefixed);
+            package.remove();
+            if prefixed.0 != canonical.0 {
+                divergences.push(format!(
+                    "{label}: diagnostics differ\n  prefixed:  {}\n  canonical: {}",
+                    prefixed.0, canonical.0
+                ));
+            }
+            if prefixed.1 != canonical.1 {
+                divergences.push(format!("{label}: warnings or per-file attribution differ"));
+            }
+            if prefixed.2 != canonical.2 {
+                divergences.push(format!("{label}: emitted JS differs over the prefix"));
+            }
+        }
+    }
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        divergences.is_empty(),
+        "{} state(s) of the dependency programs observe the prefix:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    assert_eq!(
+        prefix_worlds, analyses,
+        "every prefixed analysis of a program with dependencies is a prefix world"
+    );
+}

@@ -47,12 +47,17 @@ fn cache_directory(name: &str) -> PathBuf {
 
 /// Writes one package for `files` — every leg observes the SAME package, since
 /// the rendering names its files by path.
-fn write_package(name: &str, platform: Platform, files: &[(String, String)]) -> Package {
+fn write_package(
+    name: &str,
+    platform: Platform,
+    files: &[(String, String)],
+    dependencies: &[Dependency],
+) -> Package {
     let borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(file, text)| (file.as_str(), text.as_str()))
         .collect();
-    Package::write(name, platform, &borrowed)
+    Package::write_with(name, platform, &borrowed, dependencies)
 }
 
 /// Analyzes `package` over the std prefix with the world cache as `cache`
@@ -114,7 +119,7 @@ fn compare_state(
             .collect::<String>()
     );
     let label = format!("{} / {state}", fixture.name);
-    let package = write_package(&name, fixture.platform, files);
+    let package = write_package(&name, fixture.platform, files, fixture.dependencies);
     let built = observe_fresh(&package, None, Leg::Incremental);
     if !built.census.prefix_world {
         // A program the prefix refuses (a package impl a std question reaches,
@@ -228,12 +233,23 @@ fn every_other_fixture_answers_the_same_over_a_loaded_prefix() {
 /// different world under this key's name — is refused by the checksum and
 /// the key, never served; a file damaged on disk is a miss, and the analysis
 /// over it answers exactly as the built one (it builds).
+/// **M152's leg**: the programs with DEPENDENCIES in every state — the
+/// std-and-dependencies prefix built, written (the file's tier list naming
+/// both tiers, under `dependencies.world`) and loaded — answer alike, and as
+/// the clean canonical analysis does, emitted JavaScript included (the
+/// dependency tier walks before the package in both shapes, so its
+/// declarations are numbered and emitted alike).
+#[test]
+fn m152_programs_with_dependencies_answer_the_same_over_a_loaded_prefix() {
+    compare_fixtures("m152", DEPENDENCY_FIXTURES);
+}
+
 #[test]
 fn a_damaged_or_foreign_file_is_a_miss_and_the_analysis_builds() {
     let cache = cache_directory("damaged");
     let fixture = &LEAF_FIXTURE;
     let (_, files) = fixture.states().into_iter().next().expect("a base state");
-    let package = write_package("prefix_damaged", fixture.platform, &files);
+    let package = write_package("prefix_damaged", fixture.platform, &files, &[]);
     let built = observe_fresh(&package, None, Leg::Incremental);
     assert!(
         built.census.prefix_world,
@@ -298,7 +314,7 @@ fn a_damaged_or_foreign_file_is_a_miss_and_the_analysis_builds() {
         "main.vl".to_string(),
         "import std::time::now;\n\nfun main() {\n\tlet _ = now();\n}\n".to_string(),
     )];
-    let other_package = write_package("prefix_damaged_other", fixture.platform, &other_files);
+    let other_package = write_package("prefix_damaged_other", fixture.platform, &other_files, &[]);
     let other = observe_fresh(&other_package, Some(cache.clone()), Leg::Incremental);
     other_package.remove();
     assert_eq!(other.census.prefix_file, Some("written"));
