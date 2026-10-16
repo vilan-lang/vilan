@@ -23,7 +23,9 @@ written down.
 -->
 
 
-## Unreleased
+## v0.51.1 — 2026-10-16
+
+> Performance: this release was cut over a performance verdict that was not green (no performance verdict at cf8d4247 (perf-cf8d4247ec35ff4d5972ddcc2a1317758dfdffef.json) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine). the patch changes the VS Code debug adapter, its session test and the transformer's source-map MARKS only (the emitted JavaScript and the corpus are byte-identical); no compiler path moved, so the seal's perf leg was not re-run on the patch branch - v0.51.0's verdict (9716b72f) stands for it
 
 <!-- commit: e79fec2d -->
 <!-- family: fix -->
