@@ -1666,11 +1666,11 @@ struct State<'p, 'src> {
     /// program a finaliser runs against is a function of registration order
     /// and not of how many times it was asked for.
     scheduled: Vec<(String, Id)>,
-    /// M110 S4: the shared world declarations' hashes for this pass, by
-    /// address — every site reaches into one lowering, so each declaration is
-    /// hashed once however many sites' keys include it
+    /// M110 S4 / N177: the shared world declarations' content digests for this
+    /// pass, by address — every site reaches into one lowering, so each
+    /// declaration is digested once however many sites' keys include it
     /// ([`crate::const_cache::site_key`]).
-    world_hashes: HashMap<usize, u64>,
+    world_digests: HashMap<usize, u64>,
 }
 
 /// How a const expression's free variable is (or isn't) compile-time-known.
@@ -1705,7 +1705,7 @@ impl<'p, 'src> State<'p, 'src> {
             errors: Vec::new(),
             reader,
             scheduled: Vec::new(),
-            world_hashes: HashMap::default(),
+            world_digests: HashMap::default(),
         }
     }
 
@@ -1864,7 +1864,7 @@ impl<'p, 'src> State<'p, 'src> {
                             EXPLICIT_LIMITS,
                             snapshots,
                             reader,
-                            &mut self.world_hashes,
+                            &mut self.world_digests,
                         ),
                         None => interpreter::eval_const(&site, EXPLICIT_LIMITS, snapshots, None)
                             .map(crate::const_cache::run_of),
