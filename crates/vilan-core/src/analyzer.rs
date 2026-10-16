@@ -73271,10 +73271,105 @@ impl<'src> Analyzer<'src> {
                     variable_id,
                 );
             }
+            self.refuse_unsettled_literal_bindings();
             self.refuse_expression_holes();
         }
 
         // Clear processed constraints
+    }
+
+    /// B638: B580's refusal for a `let` bound to a generic struct LITERAL no
+    /// field grounds — `let both = Page { items = [], first = None };`. The
+    /// literal settles as the declaration's own `Page<T>` (no hole for B580
+    /// to find, and the residual sweep's declaring-file rule passes a struct
+    /// declared in the same file), and a later typed use reconciles with it
+    /// without reaching back — `let n: Page<i32> = both;` and `take(both)`
+    /// ran on JS, while every native build refused the literal ("does not
+    /// emit a value of an unbound generic type parameter"). The program
+    /// never states the parameter where the value is made, as `let o =
+    /// None; let n: Option<i32> = o;` does not, so it is refused the same
+    /// way, at the initializer. A parameter an enclosing declaration binds
+    /// (the struct's own impl, a generic function's parameter) is that
+    /// scope's; user files only.
+    fn refuse_unsettled_literal_bindings(&mut self) {
+        let mut literals: Vec<(Id, Id)> = self
+            .variables
+            .iter()
+            .filter(|(_, variable)| !variable.annotated)
+            .filter_map(|(variable_id, variable)| {
+                let initial = variable.initial?;
+                matches!(
+                    self.expr_id_to_expr_map.get(&initial),
+                    Some(Expr::StructInitializer(..))
+                )
+                .then_some((*variable_id, initial))
+            })
+            .collect();
+        literals.sort_unstable_by_key(|(variable_id, _)| variable_id.0);
+        for (variable_id, initial) in literals {
+            let Some(source) = self.source_of_id(variable_id) else {
+                continue;
+            };
+            if source == DERIVED_SOURCE
+                || self.std_sources.contains(&source)
+                || self.frozen_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+            {
+                continue;
+            }
+            let variable_type = self.infer_type(variable_id, &Type::Unknown, &HashMap::default());
+            let Type::Struct(struct_id, _) = &variable_type else {
+                continue;
+            };
+            let Some(own_parameters) = self
+                .structs
+                .get(struct_id)
+                .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            else {
+                continue;
+            };
+            let mut residuals = Vec::new();
+            self.collect_residual_generics(&variable_type, &mut residuals);
+            residuals.retain(|residual| {
+                own_parameters.contains(residual)
+                    && !self.generic_is_enclosing_binder(*residual, variable_id)
+            });
+            if residuals.is_empty() {
+                continue;
+            }
+            let unknown = Type::Unknown.get_type_id(self);
+            let unsettled: SubstitutionContext = residuals
+                .into_iter()
+                .map(|residual| (residual, unknown))
+                .collect();
+            let name = self
+                .variables
+                .get(&variable_id)
+                .map(|variable| variable.name)
+                .unwrap_or("this binding");
+            let written_type = self.substitute_type(&variable_type, &unsettled);
+            let written = self
+                .pretty_print_type(&written_type, &HashMap::default())
+                .replace("unknown", "…");
+            let span = **self
+                .span_map
+                .get(&initial)
+                .or_else(|| self.span_map.get(&variable_id))
+                .unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "cannot infer the type of `{name}`: it is `{written}`, and inference \
+                         cannot settle the `…` from anything the program does with it. Write the \
+                         type on the binding (`{name}: {written}`)"
+                    ),
+                },
+                variable_id,
+            );
+        }
     }
 
     /// B600: B580's refusal for a hole NO binding holds — `Option::None.

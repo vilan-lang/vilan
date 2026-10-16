@@ -6707,6 +6707,82 @@ fn b627_a_static_receiver_nothing_determines_is_refused() {
     );
 }
 
+const B638_PAGE: &str = r#"
+        import std::debug::Debug;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        [derive(Debug)]
+        struct Page<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        fun take(page: Page<i32>) {
+            print(page.items.len());
+        }
+"#;
+
+/// B638: a `let` bound to a generic struct literal no field grounds keeps the
+/// declaration's own `Page<T>`; a later typed use (`let n: Page<i32> = both;`,
+/// `take(both)`) never reached back, so JS ran and every native build refused
+/// the literal. It is refused at the initializer with B580's steer — as `let o
+/// = None; let n: Option<i32> = o;` is — on both backends.
+#[test]
+fn b638_a_literal_binding_no_field_grounds_is_refused_with_the_annotation_steer() {
+    for body in [
+        "let both = Page { items = [], first = None }; let n: Page<i32> = both; print(n.debug());",
+        "let both = Page { items = [], first = None }; take(both);",
+        "let both = Page { items = [], first = None }; print(both.items.len());",
+        "let both = Page { items = [], first = None }; mut copy = both; copy.items.push(3); \
+         print(copy.items.len());",
+    ] {
+        assert_fails_once_with(
+            &format!("{B638_PAGE}\n        fun main() {{ {body} }}\n"),
+            "cannot infer the type of `both`: it is `Page<…>`, and inference cannot settle the \
+             `…` from anything the program does with it. Write the type on the binding (`both: \
+             Page<…>`)",
+        );
+    }
+}
+
+/// B638's boundary: a literal a field, an annotation or its position grounds,
+/// and one whose parameter an enclosing declaration binds, compile as before.
+#[test]
+fn b638_a_grounded_or_enclosed_literal_binding_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B638_PAGE}{}",
+            r#"
+        impl Page<type T> {
+            fun blank(): Page<T> {
+                let page = Page { items = [], first = None };
+                page
+            }
+        }
+
+        fun wrapped<U>(value: U): Page<U> {
+            let page = Page { items = [value], first = None };
+            page
+        }
+
+        fun main() {
+            let annotated: Page<i32> = Page { items = [], first = None };
+            print(annotated.debug());
+            let grounded = Page { items = [1], first = None };
+            print(grounded.debug());
+            take(Page { items = [], first = None });
+            let blank: Page<str> = Page::blank();
+            print(blank.items.len());
+            print(wrapped(2).items.len());
+        }
+        main();
+        "#
+        ),
+        "Page { items = [], first = None }\nPage { items = [1], first = None }\n0\n0\n1\n",
+    );
+}
+
 /// B640: an undetermined static as the RESULT of a function whose return type
 /// is inferred — its tail, an `if`'s arm in its tail, a `ret` — is followed to
 /// the function's call sites: a call site nothing types is refused with
