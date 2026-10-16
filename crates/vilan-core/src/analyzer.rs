@@ -1113,6 +1113,19 @@ pub fn convention_mode(convention: Convention) -> Mode {
     }
 }
 
+/// Whether one of the branches' trailing expressions is `id` (B640).
+fn if_branch_trails_into(branch: &ExprIfBranch, id: Id) -> bool {
+    match branch {
+        ExprIfBranch::If(_, (_, trailing), next) => {
+            *trailing == id
+                || next
+                    .as_deref()
+                    .is_some_and(|next| if_branch_trails_into(next, id))
+        }
+        ExprIfBranch::Else((_, trailing)) => *trailing == id,
+    }
+}
+
 fn if_branch_has_final_else(branch: &ExprIfBranch) -> bool {
     match branch {
         ExprIfBranch::If(_, _, Some(next)) => if_branch_has_final_else(next),
@@ -23887,8 +23900,28 @@ impl<'src> Analyzer<'src> {
     /// or a landing whose own settled type no longer carries it. A binding
     /// that still carries it, or a carrier only a field read or a statement
     /// consumes, is undetermined.
+    ///
+    /// B640: a value that is the RESULT of a function whose return type is
+    /// inferred — its body's tail, through a block's tail or an `if`'s arms,
+    /// or a `ret`'s value — is typed by nothing there: the function is
+    /// instantiated at each call, so the walk continues at its call sites
+    /// (`fun tail_of() { Holder::build() }` called as `tail_of();` is
+    /// undetermined; `let held: Option<Holder<i32>> = tail_of();` decides it).
     fn undetermined_value_flows_on(&mut self, call_id: Id, generic: TypeId) -> bool {
-        let mut current = call_id;
+        let mut visited_call_sites = HashSet::default();
+        self.undetermined_value_flows_from(call_id, generic, &mut visited_call_sites)
+    }
+
+    /// [`Self::undetermined_value_flows_on`]'s walk from one carrier;
+    /// `visited_call_sites` keeps a recursive function's own call sites from
+    /// being followed twice.
+    fn undetermined_value_flows_from(
+        &mut self,
+        start: Id,
+        generic: TypeId,
+        visited_call_sites: &mut HashSet<Id>,
+    ) -> bool {
+        let mut current = start;
         // Each step moves to an enclosing expression, so the walk is bounded
         // by the nesting depth; the cap only guards a malformed table.
         for _ in 0..64 {
@@ -23921,23 +23954,83 @@ impl<'src> Analyzer<'src> {
             match consumer {
                 Some(consumer_id) if self.settled_type_carries(consumer_id, generic) => {
                     current = consumer_id;
+                    continue;
                 }
                 Some(_) => return false,
-                // A field read off the carrier, or a statement discarding it,
-                // consumes it untyped (`print(Holder::build().unwrap().value)`,
-                // `Holder::build();`): the instance is emitted undetermined.
-                // Any other position (a list element, a tuple, a typed return)
-                // is that position's to type.
-                None => {
-                    return self.expr_id_to_expr_map.values().any(|expr| match expr {
-                        Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..) => {
-                            *subject == current
+                None => {}
+            }
+            // A field read off the carrier, or a statement discarding it,
+            // consumes it untyped (`print(Holder::build().unwrap().value)`,
+            // `Holder::build();`): the instance is emitted undetermined. A
+            // block's tail or an `if`'s arm hands the value to the enclosing
+            // expression (B640). Any other position (a list element, a tuple)
+            // is that position's to type.
+            let mut enclosing = None;
+            for (expr_id, expr) in &self.expr_id_to_expr_map {
+                match expr {
+                    Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..)
+                        if *subject == current =>
+                    {
+                        return true;
+                    }
+                    Expr::Block((statements, tail_id)) => {
+                        if statements.contains(&current) {
+                            return true;
                         }
-                        Expr::Block((statements, _)) => statements.contains(&current),
-                        _ => false,
-                    });
+                        if *tail_id == current {
+                            enclosing = Some(*expr_id);
+                        }
+                    }
+                    Expr::If(branch)
+                        if if_branch_has_final_else(branch)
+                            && if_branch_trails_into(branch, current) =>
+                    {
+                        enclosing = Some(*expr_id);
+                    }
+                    _ => {}
                 }
             }
+            if let Some(enclosing_id) = enclosing {
+                current = enclosing_id;
+                continue;
+            }
+            // A function body's own statement discards the value too (B640:
+            // `result_of();`); the result of a function whose return type is
+            // inferred continues at its call sites.
+            let mut result_of = None;
+            for (function_id, function) in &self.functions {
+                if function.body.0.contains(&current) {
+                    return true;
+                }
+                if function.return_type_id.is_none()
+                    && (function.body.1 == current
+                        || function
+                            .rets
+                            .iter()
+                            .any(|(_, value)| *value == Some(current)))
+                {
+                    result_of = Some(*function_id);
+                }
+            }
+            let Some(function_id) = result_of else {
+                return false;
+            };
+            let call_sites: Vec<Id> = self
+                .function_calls
+                .iter()
+                .filter(|(_, call)| {
+                    matches!(
+                        self.expr_id_to_expr_map.get(&call.subject_id),
+                        Some(Expr::Local(callee)) if *callee == function_id
+                    )
+                })
+                .map(|(call_id, _)| *call_id)
+                .collect();
+            return call_sites.into_iter().any(|call_site| {
+                visited_call_sites.insert(call_site)
+                    && self.settled_type_carries(call_site, generic)
+                    && self.undetermined_value_flows_from(call_site, generic, visited_call_sites)
+            });
         }
         false
     }

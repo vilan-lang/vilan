@@ -6707,6 +6707,75 @@ fn b627_a_static_receiver_nothing_determines_is_refused() {
     );
 }
 
+/// B640: an undetermined static as the RESULT of a function whose return type
+/// is inferred — its tail, an `if`'s arm in its tail, a `ret` — is followed to
+/// the function's call sites: a call site nothing types is refused with
+/// B627's steer (JS reported an internal error, native a backend gap), a
+/// recursive function's own call is not followed twice. A function body's
+/// own statement discards the value as a nested block's does.
+#[test]
+fn b640_an_undetermined_static_as_an_inferred_functions_result_is_refused() {
+    for function in [
+        "fun result_of() { Holder::build() }",
+        "fun result_of() { if true { Holder::build() } else { None } }",
+        "fun result_of() { ret Holder::build(); }",
+        "fun result_of() { { Holder::build() } }",
+    ] {
+        for body in [
+            "result_of();",
+            "let held = result_of(); print(held.is_some());",
+        ] {
+            assert_fails_once_with(
+                &format!("{B627_HOLDER}\n        {function}\n        fun main() {{ {body} }}\n"),
+                "this call's result `Option<Holder<T>>` is never fully determined",
+            );
+        }
+    }
+    // B627's statement door, at a function body's own statement (only a
+    // nested block's statement was followed before).
+    assert_fails_once_with(
+        &format!("{B627_HOLDER}\n        fun main() {{ Holder::build(); }}\n"),
+        "this call's result `Option<Holder<T>>` is never fully determined",
+    );
+    assert_fails_once_with(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun looped(count: i32) {
+            if count > 0 { looped(count - 1) } else { Holder::build() }
+        }
+        fun main() {
+            looped(2);
+        }
+        "#
+        ),
+        "this call's result `Option<Holder<T>>` is never fully determined",
+    );
+}
+
+/// B640's other door: a call site that types the result decides the binder,
+/// through the inferred function, and runs.
+#[test]
+fn b640_an_inferred_functions_typed_call_site_decides_the_binder() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun result_of() {
+            Holder::build()
+        }
+
+        fun main() {
+            let held: Option<Holder<i32>> = result_of();
+            print(held.unwrap().value);
+        }
+        main();
+        "#
+        ),
+        "7\n",
+    );
+}
+
 /// B637: an argument at a NON-generic parameter is a typed position as surely
 /// as an annotated binding — the outer call (a function, a method, a closure)
 /// seeds the argument call's expectation from the concrete parameter type,
