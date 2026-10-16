@@ -32476,6 +32476,192 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// native-53's B?2 (spec §6.4, rule 4: no invalidating mutation under a
+    /// live view): a call lends a place `&mut` — a `&mut self` receiver
+    /// (`log.items.push(..)`, `log.bump(..)`) or a `&mut` argument
+    /// (`add(&mut log.items, ..)`) — and a LATER argument of the same call
+    /// re-binds that place's root binding (`{ log = fresh(); 9 }`). The view is
+    /// taken where it stands, so the call writes the value the binding held
+    /// before the re-bind: JS wrote the old object, and the native emission was
+    /// refused by rustc (E0506, reported as a backend defect). Refused at the
+    /// re-bind, with the value settled first. A binding a closure captures is
+    /// F138's (both backends read it after the later arguments, so the call
+    /// writes the new binding), and a module-level binding is F?3's question;
+    /// neither is refused here.
+    fn check_lent_root_rebinds(&mut self) {
+        // M110 S7b: the live calls only — a call's id is its expression's.
+        // Only a call with two or more arguments can lend one and re-bind it
+        // in another, so the rest cost a length test.
+        let mut module_level: Option<HashSet<Id>> = None;
+        let mut capture_verdicts: HashMap<Id, bool> = HashMap::default();
+        let mut refusals: Vec<(Id, Id, Id, Id, Id)> = Vec::new();
+        for (call_expr_id, function_call) in self.live_entries(&self.function_calls) {
+            let arguments = &function_call.argument_ids;
+            if arguments.len() < 2 {
+                continue;
+            }
+            let Some(Expr::Local(callee_id)) =
+                self.expr_id_to_expr_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let parameters: &[Id] = self
+                .method_signature_ref(*callee_id)
+                .map(|(parameters, _)| parameters)
+                .unwrap_or_default();
+            for (position, argument_id) in arguments.iter().enumerate() {
+                let lent_by_parameter = parameters
+                    .get(position)
+                    .and_then(|parameter| self.parameters.get(parameter))
+                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
+                let lent_by_argument = matches!(
+                    self.expr_id_to_expr_map.get(argument_id),
+                    Some(Expr::Reference(_, true))
+                );
+                if !lent_by_parameter && !lent_by_argument {
+                    continue;
+                }
+                let Some(root) = self.place_root_binding(*argument_id) else {
+                    continue;
+                };
+                for later in &arguments[position + 1..] {
+                    let Some(rebind) = self.rebind_of_within(*later, root) else {
+                        continue;
+                    };
+                    let module_level =
+                        module_level.get_or_insert_with(|| self.module_level_binding_ids());
+                    if module_level.contains(&root) {
+                        continue;
+                    }
+                    let captured = *capture_verdicts
+                        .entry(root)
+                        .or_insert_with(|| self.binding_is_closure_captured(root));
+                    if !captured {
+                        refusals.push((rebind, root, *argument_id, *call_expr_id, *later));
+                    }
+                }
+            }
+        }
+        // Source order, so a program with several reports them in reading order.
+        refusals.sort_unstable_by_key(|(rebind, ..)| rebind.0);
+        for (rebind, root, lent, call_expr_id, later) in refusals {
+            self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+        }
+    }
+
+    /// B?2: the binding a place's spine roots at — `log` for `log.items`,
+    /// `&mut log.items[0]`, `log` — when it is a local or a parameter.
+    fn place_root_binding(&self, place_id: Id) -> Option<Id> {
+        let mut current = place_id;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
+                Expr::TupleIndex(root, ..) | Expr::Reference(root, _) => current = *root,
+                Expr::Local(binding)
+                    if self.variables.contains_key(binding)
+                        || self.parameters.contains_key(binding) =>
+                {
+                    return Some(*binding);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// B?2: an assignment re-binding `binding` WHOLE inside `expr_id`'s
+    /// subtree, closures excluded (a closure's body runs when it is called,
+    /// not where it is written).
+    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<Id> {
+        let mut pending = vec![expr_id];
+        let mut children = Vec::new();
+        while let Some(current) = pending.pop() {
+            if let Some(Expr::Assignment(target, _)) = self.expr_id_to_expr_map.get(&current)
+                && matches!(self.expr_id_to_expr_map.get(target), Some(Expr::Local(named)) if *named == binding)
+            {
+                return Some(current);
+            }
+            children.clear();
+            self.drop_scan_children(current, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        None
+    }
+
+    /// B?2: whether any closure of the program names `binding` from outside
+    /// its own body (F138's captured binding).
+    fn binding_is_closure_captured(&self, binding: Id) -> bool {
+        let targets: HashSet<Id> = std::iter::once(binding).collect();
+        self.closures.values().any(|closure| {
+            let mut declared_inside: HashSet<Id> = closure
+                .parameters
+                .iter()
+                .chain(&closure.parameter_destructures)
+                .copied()
+                .collect();
+            let mut captured: Vec<Id> = Vec::new();
+            self.scan_capture_body(
+                closure.return_,
+                &targets,
+                &mut declared_inside,
+                &mut captured,
+                &mut HashSet::default(),
+                &mut ThunkEffects::default(),
+            );
+            captured.iter().any(|reference| {
+                matches!(self.expr_id_to_expr_map.get(reference), Some(Expr::Local(named)) if *named == binding)
+            }) && !declared_inside.contains(&binding)
+        })
+    }
+
+    fn refuse_lent_root_rebind(
+        &mut self,
+        rebind: Id,
+        root: Id,
+        lent: Id,
+        call_expr_id: Id,
+        later: Id,
+    ) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let name = self
+            .variables
+            .get(&root)
+            .map(|variable| variable.name)
+            .or_else(|| self.parameters.get(&root).map(|parameter| parameter.name))
+            .unwrap_or("the binding");
+        let lent_text = text_of(self, lent).unwrap_or(name);
+        let lent_text = lent_text.strip_prefix("&mut ").unwrap_or(lent_text);
+        // The call as written with the re-binding argument replaced by the
+        // settled value's name, and the value itself when it fits a line.
+        let later_text = text_of(self, later);
+        let settled = text_of(self, call_expr_id)
+            .zip(later_text)
+            .map(|(call_text, argument_text)| call_text.replacen(argument_text, "item", 1))
+            .filter(|rewritten| !rewritten.contains('\n'))
+            .unwrap_or_else(|| format!("{lent_text}.…(item)"));
+        let value = later_text
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("{ … }");
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&rebind).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{name}` is re-bound while `{lent_text}` is lent `&mut` to this call, which \
+                     would write the value `{name}` held before; settle the value first: `let \
+                     item = {value}; {settled}`"
+                ),
+            },
+            rebind,
+        );
+    }
+
     /// F141: the `Shared::read()` call an assignment target's spine roots at —
     /// `cell.read().count`, `cell.read().items[0]`, `cell.read().pair.0` —
     /// walking fields, elements and tuple positions down to the expression
@@ -86565,6 +86751,7 @@ fn analyze_over_world<'src>(
     }
     class_a_checks! {
         analyzer.check_assignment_places();
+        analyzer.check_lent_root_rebinds();
         analyzer.check_readonly_mutation();
         analyzer.check_mutable_arguments();
         analyzer.check_lazy_arguments();

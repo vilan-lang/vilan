@@ -14374,3 +14374,106 @@ fn b626_a_module_scalar_read_only_through_a_view_is_declared() {
         "41\n51\n9\n61\n",
     );
 }
+
+// --- native-53's B?2: a lent place's root re-bound by a later argument --------
+//
+// Spec §6.4 (rule 4): `log.items.push({ log = fresh(); 9 })` re-binds the root
+// of the place the call lends `&mut` while the view is live. It checked clean;
+// JS wrote the object `log` held when the receiver was evaluated (the new `log`
+// stayed empty) and rustc refused the native emission (E0506, reported as a
+// backend defect). Refused at the re-bind. A binding a closure captures is
+// F138's — both backends read it after the later arguments.
+
+const LENT_ROOT_LOG: &str = r#"
+        import std::io::print;
+
+        struct Log {
+            items: List<i32>,
+            count: i32,
+        }
+
+        impl Log {
+            fun bump(&mut self, by: i32) {
+                self.count += by;
+            }
+        }
+
+        fun fresh(): Log {
+            Log { items = [], count = 0 }
+        }
+
+        fun add(target: &mut List<i32>, item: i32) {
+            target.push(item);
+        }
+"#;
+
+#[test]
+fn a_lent_places_root_rebound_by_a_later_argument_is_refused() {
+    for (statement, lent, settled) in [
+        (
+            "log.items.push({ log = fresh(); 9 });",
+            "log.items",
+            "let item = { log = fresh(); 9 }; log.items.push(item)",
+        ),
+        (
+            "log.bump({ log = fresh(); 9 });",
+            "log",
+            "let item = { log = fresh(); 9 }; log.bump(item)",
+        ),
+        (
+            "add(&mut log.items, { log = fresh(); 9 });",
+            "log.items",
+            "let item = { log = fresh(); 9 }; add(&mut log.items, item)",
+        ),
+    ] {
+        let source = format!(
+            "{LENT_ROOT_LOG}
+        fun main() {{
+            mut log = fresh();
+            {statement}
+            print(log.items.len());
+        }}
+        "
+        );
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`log` is re-bound while `{lent}` is lent `&mut` to this call, which would \
+                 write the value `log` held before; settle the value first: `{settled}`"
+            ),
+        );
+    }
+}
+
+/// B?2's boundary: the settled form, a write that does not re-bind the root,
+/// and a CAPTURED binding (F138: read after the later arguments, so the call
+/// writes the new binding) all compile.
+#[test]
+fn a_settled_value_or_a_captured_root_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{LENT_ROOT_LOG}{}",
+            r#"
+        fun main() {
+            mut log = fresh();
+            let item = {
+                log = fresh();
+                9
+            };
+            log.items.push(item);
+            print(log.items.len());
+            mut captured = fresh();
+            let peek = || captured.items.len();
+            captured.items.push({
+                captured = fresh();
+                9
+            });
+            print(captured.items.len());
+            print(peek());
+        }
+        main();
+        "#
+        ),
+        "1\n1\n1\n",
+    );
+}
