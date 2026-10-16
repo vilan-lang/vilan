@@ -320,7 +320,7 @@ pub(crate) fn count_constraint_attempt() {
 
 /// The solver's work, counted (M105 S5, M106): what an analysis or one
 /// constraint cost in units that are the same on every machine — never time.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkCounts {
     /// Constraint resolutions attempted ([`constraint_attempts`]).
     pub attempts: u64,

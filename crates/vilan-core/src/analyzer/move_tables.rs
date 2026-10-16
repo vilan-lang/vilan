@@ -46,7 +46,7 @@ use super::{Analyzer, Expr, IsRefinement};
 /// One region's (or one analysis's live) contributions to the move scan's
 /// helper sets. Every row's FIRST id is the region's own — the partition's
 /// key — and every id a row carries is an entity of the same region.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct MoveRows {
     /// The bindings (variables and parameters) whose type is a resource.
     pub bindings: Vec<Id>,
@@ -68,7 +68,7 @@ pub(super) struct MoveRows {
 
 /// The fold: the restored rows and the live ones, in the shapes the scan and
 /// the drop plan read.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct MoveSets {
     pub bindings: HashSet<Id>,
     pub places: HashSet<Id>,

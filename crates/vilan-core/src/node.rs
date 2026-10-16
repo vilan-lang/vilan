@@ -3,7 +3,8 @@ use std::borrow::Cow;
 
 pub type GenericParameters<'src> = Spanned<Vec<GenericParameter<'src>>>;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct GenericParameter<'src> {
     pub name: &'src str,
     /// The span of the parameter's name (for go-to-definition on a use of it).
@@ -27,7 +28,8 @@ pub struct GenericParameter<'src> {
 // A tuple-arity bound on a generic parameter (`T: (lo..hi : Element)`). Either
 // endpoint may be omitted (`(..)`, `(2..)`, `(..10)`); `element` is the optional
 // per-element trait bound (`(..: Display)`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct TupleBound<'src> {
     pub lo: Option<u32>,
     pub hi: Option<u32>,
@@ -39,7 +41,8 @@ pub type GenericArguments<'src> = Spanned<Vec<Spanned<Node<'src>>>>;
 
 // One `binder in source` of a tuple comprehension — the first of its bindings,
 // or one more that ZIPS with it (B183: `(a in aa, b in bb => e)`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ComprehensionBinding<'src> {
     pub binder: &'src str,
     pub binder_span: Span,
@@ -49,7 +52,8 @@ pub struct ComprehensionBinding<'src> {
 // How an `external` function is bound to the host (JS): a `[extern(..)]`
 // attribute selects the form. The receiver of a method/property is the
 // function's first parameter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum ExternBinding<'src> {
     // `[extern("node:http", "createServer")]` — import `symbol` from `module`
     // (or, with no module, a global/verbatim symbol like `"console.log"`) and
@@ -81,7 +85,8 @@ pub enum ExternBinding<'src> {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Func<'src> {
     pub name: Spanned<&'src str>,
     // Declared with the `async` keyword. For an `external` (a leaf with no body)
@@ -196,7 +201,8 @@ impl<'src> Func<'src> {
 /// A parsed parameter: binder, optional declared type, how it receives its
 /// argument (rule 3 conventions), binder mutability, spread-ness, and the
 /// binder's span (for go-to-definition / hover in the language server).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Parameter<'src> {
     /// The binder: a plain name (`x`) or a tuple destructure (`(a, b)`).
     pub pattern: Pattern<'src>,
@@ -229,7 +235,7 @@ pub struct Parameter<'src> {
 /// How a parameter receives its argument (rule 3). `Bare` is the default (a
 /// readonly view, once the default flip lands); `Ref` / `RefMut` are `&` / `&mut`
 /// views. `Own` (owned value) is added with its keyword later.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Convention {
     Bare,
     Own,
@@ -237,7 +243,8 @@ pub enum Convention {
     RefMut,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Closure<'src> {
     pub parameters: Spanned<Vec<Parameter<'src>>>,
     pub return_type: Option<Box<Spanned<Node<'src>>>>,
@@ -248,7 +255,8 @@ pub struct Closure<'src> {
 /// written order. Desugared to a `style()` method chain before analysis
 /// (`css::rewrite_items`) — the analyzer, transformer, and interpreter never
 /// see this node.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct CssBody<'src> {
     pub items: Vec<CssItem<'src>>,
     /// The `{ … }` span, so the desugar can anchor the generated `style()` on
@@ -267,7 +275,8 @@ pub struct CssBody<'src> {
 /// `.flex_row();`, `.custom(a, b);` — spliced into the chain at its written
 /// position. That is how an app's own helpers and std's combinators reach the
 /// block, and it claims the grammar space css-block.md §10 left free for it.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum CssItem<'src> {
     Declaration(CssDeclaration<'src>),
     Nested(CssNested<'src>),
@@ -295,7 +304,8 @@ impl CssItem<'_> {
 /// and its ARGUMENTS are ordinary vilan expressions — so there is no value
 /// grammar, no `{ }` hole and no CSS token soup, and the type system decides
 /// what a value means exactly where it already lives.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct CssDeclaration<'src> {
     /// The property name's SPAN, not a slice: a hyphenated or custom property
     /// (`flex-direction`, `--color-ink`) spans several tokens carrying no
@@ -320,7 +330,8 @@ pub struct CssDeclaration<'src> {
 /// entirely the method's, which is what lets an app's helpers (`.flex_row()`,
 /// `.ghost()`, `.select_off()`) and std's own combinators be written inside a
 /// block at all.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct CssLink<'src> {
     pub name: Spanned<&'src str>,
     /// The call's arguments, ordinary vilan expressions. A bare member and an
@@ -339,7 +350,8 @@ pub struct CssLink<'src> {
 /// `.name { … }` / `.name(a, b) { … }` — a condition combinator, lowering to
 /// `.name(a, b, style() … )`: the block's own chain appended as the final
 /// argument (§5.3).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct CssNested<'src> {
     pub name: Spanned<&'src str>,
     /// The head's arguments, ordinary vilan expressions; the inner chain is
@@ -356,7 +368,8 @@ pub struct CssNested<'src> {
 /// the head items, and the children. Desugared to a `view("tag")` method
 /// chain before analysis (`elements::rewrite_items`) — the analyzer,
 /// transformer, and interpreter never see this node.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ElementBody<'src> {
     /// The tag name's span (`div` in `<div …>`). A SPAN, not a slice: keyword
     /// tags (`<use>`) and hyphenated custom elements (`<my-widget>`) span
@@ -407,7 +420,8 @@ impl ElementBody<'_> {
 /// both lower to `.child(…)` — but a reprint must know whether braces were
 /// written: `{"x"}` and `"x"` parse to the same inner node and differ in
 /// tokens, and the formatter's re-lex net compares tokens.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum ElementChild<'src> {
     /// `{expression}` — a braced hole.
     Hole(Spanned<Node<'src>>),
@@ -441,7 +455,8 @@ impl<'src> ElementChild<'src> {
 /// One item in an element's head (proposal/element-syntax.md §2): undotted
 /// names are attributes, a leading dot is the builder chain verbatim, `on:` is
 /// the event form.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum ElementHeadItem<'src> {
     /// `.m(args)` — a chain link, spliced verbatim: the `parse_member_call`
     /// node (`Call(Accessor(m), generics, args)`, or a bare `Accessor`).
@@ -454,7 +469,8 @@ pub enum ElementHeadItem<'src> {
     Attribute(Span, Option<Spanned<Node<'src>>>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct If<'src> {
     pub condition: Box<Spanned<Node<'src>>>,
     pub then: Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
@@ -471,7 +487,7 @@ pub struct If<'src> {
 /// are `if c { S; }`, `if c {} else { S; }` and `if c { S; } else { S; }` — so
 /// they parse to this same node and analysis, emission and diagnostics are the
 /// `if`'s.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IfSpelling {
     /// `if c { .. } else { .. }`.
     Keyword,
@@ -488,7 +504,8 @@ pub enum IfSpelling {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum NodeIfBranch<'src> {
     If(Box<If<'src>>),
     Else(Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>),
@@ -502,7 +519,8 @@ pub enum NodeIfBranch<'src> {
 /// module and its inline `mod` blocks" and "the item's own package" — matching
 /// `names.md` §4.2's existing roots, and any other path names the module
 /// subtree it roots (`export(in pkg::a)`).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ExportScope<'src> {
     /// The path's segments with their spans, the reserved head included.
     pub path: Vec<(&'src str, Span)>,
@@ -510,7 +528,8 @@ pub struct ExportScope<'src> {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum ImportBranch<'src> {
     // A path segment: its name, the span of that name, and what follows it.
     // The span drives go-to-definition / hover on imports.
@@ -536,7 +555,8 @@ pub enum ImportBranch<'src> {
 /// One `(impl TYPE)` / `(impl TYPE)::name` / `(impl TYPE)::{ a, b }` selector
 /// (B318, RULED 2026-09-12: the selector is PARENTHESIZED, `_` is its
 /// placeholder, and no binders are written in one).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ImplSelector<'src> {
     /// The subject as a TYPE node, resolved in the IMPORTER's scope — `impl S`
     /// reaches an alias this file's own imports bound, `impl item::Struct` is
@@ -570,7 +590,7 @@ pub struct ImplSelector<'src> {
 }
 
 /// The trailing modifier on an `import` statement (B318 §2.4, RULED).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImportModifier {
     /// No modifier — today's meaning: the statement binds its names, and every
     /// `impl` declared in the files on the path to them arrives with it.
@@ -584,7 +604,8 @@ pub enum ImportModifier {
 /// choice rather than an `Option<continuation>` plus an `Option<alias>`,
 /// because `a::b as c::d` is not a path anyone can write: an alias renames the
 /// LEAF, so the two are alternatives and the type says so (E142).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum ImportTail<'src> {
     /// Nothing follows: this segment is the leaf and binds under its own name.
     Leaf,
@@ -604,7 +625,8 @@ pub type NodeList<'src> = Vec<Spanned<Node<'src>>>;
 /// Both attributes ride ONE node so that a struct carrying both — the
 /// peer-to-peer spelling — expands once and generates one dispatcher rather
 /// than two colliding ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct ServiceAttr<'src> {
     /// `[service(Name)]`'s argument: the generated client type's name.
     /// `None` on a bare `[service]` (the name defaults to `<Struct>Client`)
@@ -640,7 +662,8 @@ pub struct ServiceAttr<'src> {
 /// cannot drift apart.
 pub const ANONYMOUS_TYPE_BINDER: &str = "_";
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum Node<'src> {
     Accessor(&'src str),
     AccessorWithGenerics(&'src str, GenericArguments<'src>),
@@ -1516,7 +1539,8 @@ pub type EnumVariant<'src> = (
 pub type ItemLabels<'src> = Option<Box<Labels<'src>>>;
 
 /// [`ItemLabels`]'s contents, when there are any.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Labels<'src> {
     /// `[deprecated("use …")]` (B382): on a struct, an enum or a trait — and on
     /// an `export import`, where it deprecates the NAME that re-export
@@ -1550,7 +1574,8 @@ pub struct Labels<'src> {
 /// cloned wherever a declaration's labels are recorded (`item_labels`), and a
 /// [`Node`] is deliberately not `Clone` — the argument is one tree, read in
 /// place. Two are equal when they are the SAME written argument.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct HintArgument<'src>(pub std::sync::Arc<Spanned<Node<'src>>>);
 
 impl PartialEq for HintArgument<'_> {
@@ -1573,7 +1598,8 @@ impl PartialEq for HintArgument<'_> {
 // discriminant `0`. For a string the text is the raw source slice, escapes
 // unprocessed, exactly as a `Node::String` carries it. Keeping the spelling
 // lets the analyzer reject what the production does not mean and quote it back.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum BackingLiteral<'src> {
     Int {
         // A leading `-` on the magnitude.
@@ -1638,7 +1664,8 @@ impl std::fmt::Display for BackingLiteral<'_> {
 
 /// Whether a struct field is exposed to a service's client, and in what shape
 /// (`proposal/transport-rpc.md` §4.2; tracker A39, A51).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum Exposure<'src> {
     /// Not exposed.
     #[default]
@@ -1724,7 +1751,8 @@ pub type StructField<'src> = (
 /// `proposal/store.md` Q4 and Q9): the knobs `[derive(Storable)]` reads off
 /// the field through `macro_std::meta::Field`, and nothing else does. The
 /// default is no attribute at all.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Reactivity<'src> {
     /// `coarse` (Q4): the field is ONE slot, diffed whole with `==`, even when
     /// its type derives `Storable` — an `Address` that is always edited as a
@@ -1753,7 +1781,8 @@ impl Reactivity<'_> {
 pub type StructInitializerField<'src> = (&'src str, Option<Spanned<Node<'src>>>);
 
 // A match-leg pattern.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub enum Pattern<'src> {
     // `_` — matches anything without binding it.
     Wildcard,
@@ -1794,7 +1823,7 @@ pub type MatchLeg<'src> = (
     Spanned<Node<'src>>,
 );
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     Add,
     Sub,

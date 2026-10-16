@@ -31,7 +31,7 @@ use super::row_families::RowFamily;
 use super::{Analyzer, Expr, ThunkEffects};
 
 /// One region's contributions to the lazy tables.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct LazyRows {
     /// `(call, argument position, the argument's effects)` — a resolved call
     /// whose callee declares a `lazy` parameter at that position. The call is
@@ -45,7 +45,7 @@ pub(super) struct LazyRows {
 
 /// One region's `dev::stash` value arguments and the bindings a `dev::take`
 /// call initializes (hmr.md §4).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct HmrRows {
     pub stash_values: Vec<Id>,
     pub take_bindings: Vec<Id>,

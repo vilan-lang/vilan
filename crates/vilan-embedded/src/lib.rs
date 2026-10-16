@@ -140,6 +140,17 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
 /// this root beside the std trees, and by the table's own header, which carries
 /// the toolchain version and a hash of `macro_std` and discards the whole file
 /// when either moves.
+/// The persisted std prefix's root (std-prefix P3, `std-prefix.md` §6–7):
+/// `~/.vilan/cache/worlds`, one directory per key under it, each holding the
+/// tiers the format carries (`std.world` today). The CLI and the language
+/// server hand this to `vilan_core::incremental::set_world_cache_default` at
+/// start; `VILAN_WORLD_CACHE=<dir>|off` overrides it in the compiler itself,
+/// and a test process never reaches it (the workspace's `.cargo/config.toml`
+/// says `off`). `vilan cache prune` does not sweep it yet (P4).
+pub fn default_world_cache_root() -> PathBuf {
+    toolchain_cache("cache").join("worlds")
+}
+
 pub fn default_check_cache_root() -> PathBuf {
     // N137: an explicit root wins. The workspace's `.cargo/config.toml` sets it
     // for every test process (and so for every `vilan` a test spawns), which

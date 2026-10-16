@@ -44,7 +44,7 @@ impl RowFamily {
 }
 
 /// Which families a slice FILED.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct FamilySet(u8);
 
 impl FamilySet {
@@ -60,7 +60,7 @@ impl FamilySet {
 
 /// Per family, the id ranges of the restored regions whose slices carried it
 /// — sorted, disjoint after [`FamilyRanges::sort`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct FamilyRanges([Vec<(u32, u32)>; FAMILIES]);
 
 impl FamilyRanges {
@@ -99,7 +99,7 @@ impl FamilyRanges {
 }
 
 /// Per family, the live lane: the complement of its restored ranges.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct FamilyLanes([LiveRanges; FAMILIES]);
 
 impl FamilyLanes {

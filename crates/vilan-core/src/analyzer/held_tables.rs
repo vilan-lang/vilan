@@ -34,7 +34,7 @@ use super::{Analyzer, CellSlot, Expr, SharedCells, WrittenRoots};
 
 /// One region's (or one analysis's live) contributions to the held passes.
 /// Every row's FIRST id is the region's own — the partition's key.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct HeldRows {
     /// `(writer expression, root, in place)` — the written roots.
     pub written: Vec<(Id, Id, bool)>,

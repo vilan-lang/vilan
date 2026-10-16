@@ -176,7 +176,8 @@ impl RestoredTables {
 pub(super) type ItemKey = (u64, u32);
 
 /// One top-level item's remembered checks (M110 S7).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub(super) struct ItemRecord {
     /// The hash of the item's text REGION: from the previous item's end (so
     /// an attribute or doc comment above the item is the item's) to its own
@@ -223,7 +224,7 @@ impl ItemRecord {
 }
 
 /// What one laid-out window is to the records, computed once per analysis.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ItemFacts {
     key: ItemKey,
     text_hash: u64,
@@ -233,7 +234,8 @@ struct ItemFacts {
 }
 
 /// The per-analysis state of the item records, on the [`Analyzer`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub(super) struct ItemState {
     /// Whether this analysis reads and writes item records at all (a seeded
     /// editor analysis over a served world, the windows relocating every

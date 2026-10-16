@@ -28,7 +28,7 @@ use crate::span::Span;
 /// the type. [`Error::trace`] is the escape hatch that already exists for the
 /// one shape that genuinely is a chain (E78's requirement trace), and it is
 /// deliberately NOT this field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Note {
     pub span: Span,
     pub msg: String,
@@ -52,13 +52,13 @@ impl Note {
 /// related information draws no underline — while the elision tail
 /// annotates the last kept hop's span and only ever rides as a label, or
 /// the same location would report twice.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TraceHop {
     pub note: Note,
     pub call: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Error {
     pub span: Span,
     pub msg: String,

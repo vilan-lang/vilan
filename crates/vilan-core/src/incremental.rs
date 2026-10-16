@@ -194,6 +194,70 @@ pub fn set_std_prefix_layering(on: Option<bool>) {
     STD_PREFIX_LAYERING_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
+// --- std-prefix P3: the world cache on disk ---------------------------------
+
+/// Where the persisted std prefix lives, or `None` when no process may touch
+/// it: the test override, else `VILAN_WORLD_CACHE` (`off`, or a directory),
+/// else the default a front end set ([`set_world_cache_default`]: the CLI
+/// and the language server name `~/.vilan/cache/worlds`; a test process has
+/// none — the workspace's `.cargo/config.toml` says `off`, and P5 points the
+/// suite at `target/`). Off under `VILAN_HASH_SHUFFLE` and in a clean
+/// analysis, as the in-process prefix is (Q11).
+pub fn world_cache_dir() -> Option<PathBuf> {
+    let setting = WORLD_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let wanted = match &setting.test_override {
+        Some(forced) => forced.clone(),
+        None => {
+            static FROM_ENV: OnceLock<Option<Option<PathBuf>>> = OnceLock::new();
+            FROM_ENV
+                .get_or_init(|| match std::env::var("VILAN_WORLD_CACHE") {
+                    Ok(value) if value.is_empty() || value == "off" || value == "0" => Some(None),
+                    Ok(value) => Some(Some(PathBuf::from(value))),
+                    Err(_) => None,
+                })
+                .clone()
+                .unwrap_or_else(|| setting.default.clone())
+        }
+    };
+    drop(setting);
+    wanted.filter(|_| !clean_requested() && !crate::fx::shuffling())
+}
+
+#[derive(Default)]
+struct WorldCacheSetting {
+    /// `Some(None)` is off, `Some(Some(dir))` a directory; `None` reads the
+    /// environment and the default.
+    test_override: Option<Option<PathBuf>>,
+    default: Option<PathBuf>,
+}
+
+static WORLD_CACHE: Mutex<WorldCacheSetting> = Mutex::new(WorldCacheSetting {
+    test_override: None,
+    default: None,
+});
+
+/// The process default of [`world_cache_dir`] — a front end that owns a
+/// toolchain home sets it at start.
+pub fn set_world_cache_default(directory: Option<PathBuf>) {
+    WORLD_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .default = directory;
+}
+
+/// Overrides [`world_cache_dir`] for this process: `Some(None)` is off,
+/// `Some(Some(dir))` a directory, `None` restores the environment and the
+/// default — the test surface.
+#[doc(hidden)]
+pub fn set_world_cache(directory: Option<Option<PathBuf>>) {
+    WORLD_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .test_override = directory;
+}
+
 // --- Q3: the clean analysis -------------------------------------------------
 
 /// What a clean analysis on this thread keeps of the incremental machinery.
@@ -468,6 +532,17 @@ pub struct Census {
     pub prefix_hits: u64,
     pub prefix_refusals: u64,
     pub prefix_refusal: Option<&'static str>,
+    /// std-prefix P3: what the persisted prefix did for this analysis —
+    /// `loaded` (the std-only world came from its file), `written` (this
+    /// analysis built it and wrote the file), or the reason the file was a
+    /// miss (`absent`, `corrupt`, `truncated`, `foreign-version`,
+    /// `foreign-key`, `unreadable`, `undecodable`); `None` when no prefix
+    /// key was looked up or the world cache is off.
+    pub prefix_file: Option<&'static str>,
+    /// The file's size and the load's or the write's wall time, for the row
+    /// the report asks for (not a clock the gate reads).
+    pub prefix_file_bytes: u64,
+    pub prefix_file_micros: u64,
 }
 
 thread_local! {
@@ -510,6 +585,9 @@ thread_local! {
             prefix_hits: 0,
             prefix_refusals: 0,
             prefix_refusal: None,
+            prefix_file: None,
+            prefix_file_bytes: 0,
+            prefix_file_micros: 0,
         })
     };
 }
@@ -872,7 +950,7 @@ pub fn report(program: &Program) {
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
              live-entities={} move-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
-             prefix-refusals={}",
+             prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -905,6 +983,9 @@ pub fn report(program: &Program) {
             u8::from(census.prefix_layered),
             census.prefix_hits,
             census.prefix_refusals,
+            census.prefix_file.unwrap_or("-"),
+            census.prefix_file_bytes,
+            census.prefix_file_micros,
         );
     }
 }

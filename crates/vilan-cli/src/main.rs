@@ -410,6 +410,14 @@ fn spawn_scoped_compiler_thread<'scope, 'env, T: Send + 'scope>(
 
 fn main() -> ExitCode {
     vilan_core::counters::arm_from_env();
+    // std-prefix P3: a `vilan check`/`build` under `VILAN_STD_PREFIX=on|layered`
+    // loads the std-only prefix from `~/.vilan/cache/worlds` when a process
+    // already wrote it there, and writes it there when none has;
+    // `VILAN_STD_PREFIX=off` (the CLI's default) never touches it, and
+    // `VILAN_WORLD_CACHE=off|<dir>` overrides the root.
+    vilan_core::incremental::set_world_cache_default(Some(
+        vilan_embedded::default_world_cache_root(),
+    ));
     // Compilation recurses over deeply-nested ASTs and type graphs, which can
     // run past the default main-thread stack on otherwise-valid programs. Do the
     // work on a worker with a generous stack, as rustc and other compilers do;

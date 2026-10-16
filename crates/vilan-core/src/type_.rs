@@ -40,7 +40,7 @@ pub const NUMERIC_SUFFIXES: &[&str] = &[
 // identity never enters the walk — see `dispatch_refine::refined_edges`), and
 // a program mints one id per expression, so keying a selection memo on the id
 // would memoize nothing.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Any,
     // The type of expressions that never produce a value: `panic(..)`,
@@ -153,7 +153,7 @@ pub enum Type {
 /// parameters are the one place it is written INTO a type, because they are
 /// positions, not values. So the mode is a property of the closure type's
 /// parameter slot and of nothing a type variable can stand for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     Value,
     View,
@@ -195,7 +195,7 @@ impl Mode {
 /// Modes take part in `Type`'s equality and hashing: `|str| void` and
 /// `|&str| void` are different calling conventions, so they are different
 /// types (Q4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ParameterMode {
     Written(Mode),
     /// A closure literal's bare parameter, by the parameter's id.
@@ -216,7 +216,7 @@ pub enum ParameterMode {
 /// refusal — reads them through the accessors here; [`TupleLabels::spelled_alike`]
 /// is the comparison that does look, for the one place that interns a type
 /// by its printed form.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TupleLabels(Option<std::sync::Arc<[Box<str>]>>);
 
 impl TupleLabels {
@@ -299,7 +299,7 @@ impl std::hash::Hash for TupleLabels {
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TypeId(pub u32);
 
 /// The program's type slots, indexed by [`TypeId`].
@@ -320,7 +320,7 @@ pub struct TypeId(pub u32);
 /// fills the gap, so an id minted before its slot is written reads `None`
 /// until it is), so that a reader keeps its shape; `keys` and `iter` hand
 /// the id by value, since no id is stored.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TypeTable {
     slots: Vec<Option<Type>>,
     filled: usize,
