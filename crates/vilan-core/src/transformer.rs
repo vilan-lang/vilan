@@ -1281,6 +1281,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_watch",
         "__fs_watch_stop",
         "__stdin_line",
+        "__stdout_write",
         "__local_get",
         "__response_header",
         "__session_get",
@@ -2069,6 +2070,11 @@ fn helper_source(name: &str) -> &'static str {
              \t});\n\
              }"
         }
+        // `std::process::prompt`'s write (A173 S1, E?5): stdout with NO
+        // newline. node writes stdout synchronously to a file and, on Linux, to
+        // a pipe and a TTY, so the text is out before the read that follows
+        // parks — and in order with `console.log`, which writes the same stream.
+        "__stdout_write" => "function __stdout_write(text) {\n\tprocess.stdout.write(text);\n}",
         "__fs_watch_stop" => "function __fs_watch_stop(watcher) {\n\twatcher.stop();\n}",
         // Cryptographically random bytes.
         "__random_bytes" => {
@@ -15403,6 +15409,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__vilan_stdin",
     "__stdin_pump",
     "__stdin_line",
+    "__stdout_write",
     "__parse_i32",
     "__parse_f64",
     "__random_int",

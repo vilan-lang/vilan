@@ -5,9 +5,9 @@
 //! A173 S1 and F?4) as the binary `vilan run` builds.
 //!
 //! The stdin pins drive a `vilan run` child through a PIPE the test holds, and
-//! every step waits on the child's own OUTPUT before the next write — a line
-//! the program has echoed, a tick that has printed — never on a sleep: the
-//! order under test is the harness's sequencing, not the box's timing.
+//! every step waits on the child's own OUTPUT before the next write — a prompt
+//! that has appeared, a tick that has printed — never on a sleep: the order
+//! under test is the harness's sequencing, not the box's timing.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -166,7 +166,8 @@ impl Conversation {
         }
     }
 
-    /// Waits until the program's stdout CONTAINS `text`.
+    /// Waits until the program's stdout CONTAINS `text` — printed with or
+    /// without a newline after it, which is the point for a prompt.
     fn wait_for(&mut self, text: &str) {
         let deadline = Instant::now() + STEP_BOUND;
         while !self.stdout.contains(text) {
@@ -227,6 +228,61 @@ impl Conversation {
             self.stdout.push_str(&String::from_utf8_lossy(&chunk));
         }
         (status.code(), self.stdout)
+    }
+}
+
+/// The interactive prompt (A173 S1, E?5): `prompt` writes its text with no
+/// newline and FLUSHED — the test writes nothing until the text is on the
+/// pipe, so a prompt held in a buffer never gets its answer — then reads the
+/// line typed after it. At the end of input `prompt` is `None`, and the
+/// program exits with its own code through `exit` (natively F?4's `exit`).
+#[test]
+fn a173_a_prompt_appears_before_its_answer_is_typed_and_the_end_is_none() {
+    for backend in BACKENDS {
+        let dir = temp_project(&format!("prompt_{}", backend.unwrap_or("js")));
+        write(
+            &dir,
+            "prompt.vl",
+            r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::{ exit, prompt };
+
+fun main() {
+	match prompt("name? ") {
+		Some(let name) => print(i"hello, {name}"),
+		None => print("no name"),
+	}
+	match prompt("again? ") {
+		Some(let name) => print(i"hello again, {name}"),
+		None => {
+			print("no answer");
+			exit(3);
+		}
+	}
+	print("exit returned");
+}
+"#,
+        );
+        let mut conversation = Conversation::start(&dir, "prompt.vl", backend);
+        conversation.wait_for("name? ");
+        assert_eq!(
+            conversation.stdout, "name? ",
+            "{backend:?}: the prompt is the whole output before the answer"
+        );
+        conversation.write("ann\n");
+        conversation.wait_for("again? ");
+        conversation.close();
+        let (code, stdout) = conversation.finish();
+        assert_eq!(
+            stdout, "name? hello, ann\nagain? no answer\n",
+            "{backend:?}"
+        );
+        assert_eq!(
+            code,
+            Some(3),
+            "{backend:?}: `exit(3)` is the process's code"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

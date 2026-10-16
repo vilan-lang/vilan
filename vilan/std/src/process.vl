@@ -37,12 +37,27 @@ fun scan(): str {
 	read_line().unwrap_or("")
 }
 
+/// Writes `text` with NO newline, flushed so it shows before the program waits,
+/// then reads the answer: the one-line interactive shape (`name? ` with the
+/// cursor after it). `None` once stdin has ended, so a loop that asks again on
+/// a bad answer still stops at the end of its input.
+fun prompt(text: str): Option<str> {
+	stdout_write(text);
+	read_line()
+}
+
 /// The host's line reader behind `read_line`: one shared stdin pump that reads
 /// to the next line ending, hands each line to the oldest waiter, and lets go of
 /// stdin while nobody waits (A173 S1; `transformer.rs`'s `__stdin_line`,
 /// `vilan_rt::process::stdin_line` natively).
 [extern("__stdin_line")]
 export(in mod) async external fun stdin_line(signal: Option<CancelSignal>): Option<str>;
+
+/// Writes `text` to stdout unterminated and flushed — `prompt`'s half. Not
+/// public: the general no-newline `io` write is A173 S2's, where redraws need it
+/// beside cursor control.
+[extern("__stdout_write")]
+export(in mod) external fun stdout_write(text: str): void;
 
 /// The arguments the program was invoked with, excluding the runtime and script
 /// path — e.g. `vilan run prog.vl a b` yields `["a", "b"]`.

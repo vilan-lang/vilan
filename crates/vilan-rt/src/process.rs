@@ -2,11 +2,11 @@
 //!
 //! # What this is a twin OF
 //!
-//! `vilan/std/src/process.vl` binds node's `process` object and one runtime
-//! helper of `transformer.rs::helper_source`, `__stdin_line` (the incremental
-//! line reader behind `read_line` and `scan`). `args`, `cwd` and `exit` are one
-//! call into Rust's own `std` each; `env` is an intrinsic the emitter writes
-//! inline.
+//! `vilan/std/src/process.vl` binds node's `process` object and two runtime
+//! helpers of `transformer.rs::helper_source`: `__stdin_line` (the incremental
+//! line reader behind `read_line`/`scan`/`prompt`) and `__stdout_write`
+//! (`prompt`'s unterminated write). `args`, `cwd` and `exit` are one call into
+//! Rust's own `std` each; `env` is an intrinsic the emitter writes inline.
 //!
 //! # The stdin reader
 //!
@@ -84,6 +84,17 @@ pub fn cwd() -> Str {
 pub fn exit(code: i32) -> ! {
     let _ = std::io::stdout().flush();
     std::process::exit(code)
+}
+
+/// `__stdout_write(text)` — `process.stdout.write(text)`: no newline, and
+/// FLUSHED, so a prompt is on the screen before the read that follows parks
+/// (Rust's stdout is a `LineWriter`, which would hold an unterminated line).
+/// A failed write is dropped, as node's asynchronous `'error'` on a closed
+/// stdout is unobserved by the program.
+pub fn stdout_write(text: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
 }
 
 /// `__stdin_line(signal)` — the next line of stdin without its ending,

@@ -957,6 +957,7 @@ fun env(key: str): Option<str>         // environment variable
 fun exit(code: i32)
 fun read_line(): Option<str>           // the next line of stdin; None at its end
 fun scan(): str                        // read_line(), "" at the end
+fun prompt(text: str): Option<str>     // write `text` (no newline), then read_line()
 ```
 
 `args`, `cwd`, `env`, `exit` and the stdin reads work on both backends — the
@@ -1023,6 +1024,32 @@ The terminal stays in its ordinary (cooked) mode, which is what gives a typed
 line its echo, Backspace, Ctrl-U and Ctrl-W. An idle stdin never holds the
 process open: a program that has read what it wanted ends when `main` does,
 even if the writer of its pipe is still there.
+
+`prompt(text)` writes `text` with **no newline**, flushed so it is on the
+screen before the program waits, then reads the answer — the one-line
+interactive shape. It is `None` at the end of input, so a loop that asks again
+on a bad answer still stops when there is nothing left to read:
+
+```vilan,norun
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::{ exit, prompt };
+
+fun main() {
+	for {
+		match prompt("a number? ") {
+			Some(let answer) => match answer.parse_i32() {
+				Some(let number) => {
+					print(i"twice that is {number * 2}");
+					jump break;
+				}
+				None => print(i"{answer} is not a number"),
+			},
+			None => exit(1),
+		}
+	}
+}
+```
 
 The reads are `async`, so a caller awaits them implicitly and the rest of the
 program keeps running while one waits — a timer still fires, a spawned task

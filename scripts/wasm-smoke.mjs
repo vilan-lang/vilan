@@ -85,11 +85,11 @@ fun main() {
 		"node",
 		`import std::io::print;
 import std::option::Option::{ self, None, Some };
-import std::process::{ read_line, scan };
+import std::process::{ prompt, scan };
 
 fun main() {
 	print(i"first: {scan()}");
-	match read_line() {
+	match prompt("name? ") {
 		Some(let name) => print(i"hello, {name}"),
 		None => print("no name"),
 	}

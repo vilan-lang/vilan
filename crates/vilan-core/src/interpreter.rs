@@ -1464,9 +1464,8 @@ impl<'a> Interpreter<'a> {
         // Free names are host references; the renamer guarantees user bindings
         // never collide with these (they're reserved).
         Err(match name {
-            "__stdin_line" | "__env" | "__args" | "__random_int" | "__random_float" | "__timer" => {
-                Failure::unsupported(format!("`{name}`"))
-            }
+            "__stdin_line" | "__stdout_write" | "__env" | "__args" | "__random_int"
+            | "__random_float" | "__timer" => Failure::unsupported(format!("`{name}`")),
             _ => Failure::internal(format!("`{name}` is not defined")),
         })
     }
@@ -2833,9 +2832,8 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
             "Array.isArray" => Ok(Value::Bool(matches!(take(0), Value::Array(_)))),
-            "__stdin_line" | "__env" | "__args" | "__random_int" | "__random_float" => {
-                Err(Failure::unsupported(format!("`{name}`")))
-            }
+            "__stdin_line" | "__stdout_write" | "__env" | "__args" | "__random_int"
+            | "__random_float" => Err(Failure::unsupported(format!("`{name}`"))),
             // `std::time::Timer`'s handle constructor. A host timer needs an
             // event loop to fire on, and this evaluator has none — so the
             // capability is absent BY DESIGN, exactly like the bare

@@ -478,6 +478,7 @@ fun env(key: str): Option<str>      // an environment variable
 fun exit(code: i32)                 // end the process
 fun read_line(): Option<str>        // the next line of stdin, awaited; None at its end
 fun scan(): str                     // read_line(), "" at the end
+fun prompt(text: str): Option<str>  // write `text` with no newline, then read a line
 ```
 
 One behavior to plan around: **the process exits when `main` finishes.**

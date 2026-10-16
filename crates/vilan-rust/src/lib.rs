@@ -11633,6 +11633,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `vilan_rt::process` (`env` and `args` are intrinsics, below).
             (None, "process.exit", "exit") => one(self, "process::exit"),
             (None, "process.cwd", "cwd") => Ok(Some("vilan_rt::process::cwd()".to_string())),
+            // A173 S1 / E?5: `prompt`'s unterminated, flushed write.
+            (None, "__stdout_write", _) => Ok(Some(format!(
+                "vilan_rt::process::stdout_write(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ))),
             (Some("node:crypto"), "createHash", "create_hash") => Ok(Some(format!(
                 "vilan_rt::crypto::create_hash(&{})",
                 self.place_argument(argument_ids, 0, depth)?
