@@ -1836,6 +1836,111 @@ fn e315_a_middle_segment_is_a_reference_of_its_type() {
     });
 }
 
+/// E327: the MODULE segments of a qualified PATTERN path
+/// (`lib::deep::Mode::On =>`) and of a qualified STRUCT INITIALIZER path
+/// (`lib::deep::Overlay { .. }`) take the Namespace row a value path's and
+/// an annotation's take since E315 - they paint, hover for their module and
+/// are references of it, so find-references from one reaches the others.
+#[test]
+fn e327_the_module_segments_of_a_pattern_and_an_initializer_path_paint() {
+    on_big_stack(|| {
+        let client = "import pkg::lib;\n\n\
+             fun describe(mode: lib::deep::Mode): i32 {\n\
+             \tmatch mode {\n\
+             \t\tlib::deep::Mode::On => 1,\n\
+             \t\tlib::deep::Mode::Off => 0,\n\
+             \t}\n}\n\n\
+             fun main() {\n\
+             \tlet value = lib::deep::Overlay { open = true };\n\
+             \tlet _ = (describe(lib::deep::Mode::On), value);\n}\n";
+        let deep = "export struct Overlay {\n\topen: bool,\n}\n\n\
+             export enum Mode {\n\tOn,\n\tOff,\n}\n";
+        let package = Package::new("e327", &[("client.vl", client)]);
+        std::fs::create_dir_all(package.path("inner")).unwrap();
+        std::fs::write(package.path("inner/deep.vl"), deep).unwrap();
+        std::fs::write(package.path("lib.vl"), "export import pkg::inner::deep;\n").unwrap();
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let pair = |word: &str, kind: &str| (word.to_string(), kind.to_string());
+        for needle in ["lib::deep::Mode::On => 1", "lib::deep::Mode::Off => 0"] {
+            let leaf = if needle.contains("Off") { "Off" } else { "On" };
+            assert_eq!(
+                tokens_over(&document, needle)
+                    .into_iter()
+                    .filter(|(word, _)| word != "1" && word != "0")
+                    .collect::<Vec<_>>(),
+                vec![
+                    pair("lib", "Namespace"),
+                    pair("deep", "Namespace"),
+                    pair("Mode", "Enum"),
+                    pair(leaf, "EnumMember")
+                ],
+                "{needle}"
+            );
+        }
+        assert_eq!(
+            tokens_over(&document, "lib::deep::Overlay {"),
+            vec![
+                pair("lib", "Namespace"),
+                pair("deep", "Namespace"),
+                pair("Overlay", "Struct"),
+            ]
+        );
+        // The segments hover for their module.
+        let hover = |needle: &str| {
+            document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        for needle in ["deep::Mode::On =>", "deep::Overlay {"] {
+            let text = hover(needle);
+            assert!(text.contains("deep"), "{needle}: {text}");
+        }
+        // Find-references from a `deep` in a pattern reaches the value
+        // path's and the initializer's, each exactly `deep`; so does one from
+        // the initializer's.
+        let text = document.analyzed_text().to_string();
+        // Rename from a segment rewrites exactly the identifier at every
+        // spelling in this file - and renaming the STRUCT edits its
+        // initializer's name alone, not the `lib::de` the old derived row
+        // covered.
+        let spelled = |offset: usize, new_name: &str| -> Vec<String> {
+            document
+                .rename_edits(offset, new_name)
+                .expect("a rename")
+                .into_iter()
+                .filter(|(source, _, _)| *source == document.focus)
+                .map(|(_, span, _)| text[span.into_range()].to_string())
+                .collect()
+        };
+        assert_eq!(
+            spelled(at(client, "deep::Overlay {", 0), "layer"),
+            vec!["deep"; 5]
+        );
+        assert_eq!(
+            spelled(at(client, "Overlay {", 0), "Layer"),
+            vec!["Overlay"]
+        );
+        for needle in ["deep::Mode::On =>", "deep::Overlay {"] {
+            let found: Vec<String> = document
+                .references(at(client, needle, 0))
+                .into_iter()
+                .filter(|(source, _)| *source == document.focus)
+                .map(|(_, span)| text[span.into_range()].to_string())
+                .collect();
+            assert!(found.len() >= 5, "{needle}: {found:?}");
+            assert!(
+                found.iter().all(|word| word == "deep"),
+                "{needle}: {found:?}"
+            );
+        }
+    });
+}
+
 /// E316: a function's signature label prints an IMPLICIT parameter's bound -
 /// `username: Signal<str>` - not the binder's bare name (`Signal`). Two
 /// parameters of one trait at different arguments print apart; an explicit
