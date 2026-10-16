@@ -1317,12 +1317,19 @@ fn a_stale_restored_move_row_moves_the_diagnostics() {
 /// language server's; the seed here is the entry itself). With the rows
 /// thrown away the callee has no candidate, the instantiation scans clean,
 /// and the entry's R11 refusal goes.
+///
+/// Observed with R11 door B's instance records OFF (`set_r11_records`):
+/// with them on, the served analysis emits `use_twice`'s refusal from its
+/// record and reads no candidate row at all — the stale row would move
+/// nothing, and the pin would be asserting the records, which the door B
+/// census pin (`edit_replay_differential`) already does.
 #[test]
 fn m155_a_stale_restored_r11_candidate_row_moves_the_diagnostics() {
     let _guard = OVERRIDE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (honest, cold, planted) = honest_cold_planted_under(
+    vilan_core::analyzer::set_r11_records(false);
+    let observed = honest_cold_planted_under(
         "stale_r11_candidates",
         "[resource]\nexport struct Db {\n\thandle: i32,\n}\n\nexport fun use_twice<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}\n\nexport fun sink(own d: Db) {\n\tprint(\"{d.handle}\");\n}\n",
         &|revision| {
@@ -1336,6 +1343,8 @@ fn m155_a_stale_restored_r11_candidate_row_moves_the_diagnostics() {
             ..Workspace::default()
         },
     );
+    vilan_core::analyzer::set_r11_records(true);
+    let (honest, cold, planted) = observed;
     assert!(
         honest
             .0

@@ -1450,6 +1450,84 @@ pub const R11_FIXTURES: &[Fixture] = &[Fixture {
     dependencies: &[],
 }];
 
+// --- R11 door B: instance records served, validated and refused (incr-54b, Order 54) -------
+//
+// A COLD module `shapes.vl` holds the generics the hot leaf instantiates at
+// its resource `Conn`: `split<T>` moves a field out of an owned `Pair<T>` (a
+// destructure exactly while `T` holds no `Drop` inside — the B469 question
+// the record's digest reads), `use_twice<T>` is not move-clean, `pass_once<T>`
+// is, and `outer<T>` passes its `T` on to `inner<T>` in `helpers.vl` (a
+// PROPAGATED instance, reported at the inner call inside `outer`'s body).
+// The first seeded analysis files one record per instance; every later
+// keystroke in the leaf serves them. The four edits are the record's four
+// validators: (a) a `Drop` impl for `Conn` typed into the leaf — the digest
+// moves, `split`'s field move is no destructure, and the instantiation must
+// be refused (the plant `R11RecordUnguarded` serves the stale record past
+// it); (b) `use_twice`'s argument replaced by a number — the instance is no
+// longer seeded, so its recorded refusal must not be spoken; (c) the clean
+// generic in the cold module made dirty with the seed on the leaf — its
+// module is hot, so it is scanned live; (d) the propagated child made dirty
+// in ITS module — `outer`'s record leads to `inner`, whose module is hot.
+
+pub const R11_RECORD_MAIN: &str =
+    "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
+
+pub const R11_RECORD_SHAPES: &str = "import pkg::helpers::inner;\n\nexport struct Pair<T> {\n\tfirst: T,\n\tsecond: i32,\n}\n\nexport fun split<T>(own pair: Pair<T>): T {\n\tpair.first\n}\n\nexport fun use_twice<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}\n\nexport fun pass_once<T>(own x: T): T {\n\tx\n}\n\nexport fun outer<T>(own x: T): T {\n\tinner(x)\n}\n";
+
+pub const R11_RECORD_HELPERS: &str = "export fun inner<T>(own x: T): T {\n\tx\n}\n";
+
+pub const R11_RECORD_VIEWS: &str = "import pkg::shapes::{ Pair, outer, pass_once, split, use_twice };\nimport std::drop::Drop;\n\n[resource]\nstruct Conn {\n\tid: i32,\n}\n\nfun close(own c: Conn) {\n\tprint(\"{c.id}\");\n}\n\nexport fun render(): i32 {\n\tclose(split(Pair { first = Conn { id = 1 }, second = 2 }));\n\tclose(use_twice(Conn { id = 3 }));\n\tclose(pass_once(Conn { id = 4 }));\n\tclose(outer(Conn { id = 5 }));\n\t1\n}\n";
+
+pub const R11_RECORD_FIXTURES: &[Fixture] = &[Fixture {
+    name: "r11_records",
+    platform: NODE,
+    files: &[
+        ("main.vl", R11_RECORD_MAIN),
+        ("shapes.vl", R11_RECORD_SHAPES),
+        ("helpers.vl", R11_RECORD_HELPERS),
+        ("views.vl", R11_RECORD_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a Drop impl for the leaf's resource typed in: the cold generic's field move is no destructure now (door B's digest)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\tid: i32,\n}\n\n",
+                "\tid: i32,\n}\n\nimpl Conn with Drop {\n\tfun drop(&mut self) {\n\t\tprint(\"closed\");\n\t}\n}\n\n",
+            )],
+        },
+        Edit {
+            label: "the refused instantiation's resource argument replaced by a number: its recorded refusal must not be spoken (door B's seeding)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\tclose(use_twice(Conn { id = 3 }));\n",
+                "\tprint(use_twice(3));\n",
+            )],
+        },
+        Edit {
+            label: "the cold module's clean generic made dirty with the seed on the leaf: its module is hot, scanned live (door B's cold validator)",
+            file: "shapes.vl",
+            seed: Some("views.vl"),
+            replacements: &[(
+                "export fun pass_once<T>(own x: T): T {\n\tx\n}",
+                "export fun pass_once<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}",
+            )],
+        },
+        Edit {
+            label: "the propagated child made dirty in its own module: outer's recorded edge leads to a live scan of inner (door B's edges)",
+            file: "helpers.vl",
+            seed: Some("views.vl"),
+            replacements: &[(
+                "export fun inner<T>(own x: T): T {\n\tx\n}",
+                "export fun inner<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}",
+            )],
+        },
+    ],
+    dependencies: &[],
+}];
+
 // --- M110 S6: the id-window classes (incr-50, Order 50; spike-49's two predicted reds) ---
 //
 // Two shapes the spike named as classes to ADD. (1) A std item's resolve

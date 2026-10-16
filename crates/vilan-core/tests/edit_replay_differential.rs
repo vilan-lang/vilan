@@ -203,6 +203,7 @@ fn replay_the_classes() -> Replayed {
         .iter()
         .chain(WINDOW_FIXTURES)
         .chain(R11_FIXTURES)
+        .chain(R11_RECORD_FIXTURES)
     {
         let mut package = fixture.write();
         for edit in fixture.edits {
@@ -1086,6 +1087,7 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
     for fixture in LONE_FIXTURES
         .iter()
         .chain(R11_FIXTURES)
+        .chain(R11_RECORD_FIXTURES)
         .chain(EFFECT_FIXTURES)
         .chain(POST_PASS_FIXTURES)
         .chain(BOUND_FIXTURES)
@@ -1264,6 +1266,113 @@ fn m155_r11_candidate_rows_are_restored_on_a_served_keystroke() {
         served.census.item_records_served > 0,
         "the leaf's generics were served items: {:#?}",
         served.census
+    );
+}
+
+/// **R11 door B** (incr-54b, Order 54; `analyzer/r11_records.rs`): the first
+/// seeded analysis of the door B fixture files one instance record per
+/// instantiation it scanned (every callee is a cold module's), a warm
+/// keystroke on the leaf EMITS every instance from the records and scans
+/// none, and the keystroke that types a `Drop` impl for the leaf's resource
+/// moves the digest (the program's `Drop` set changed) — every instance is
+/// scanned live again and refiled, the analysis answers what a clean one
+/// answers (the field move out of `Pair<Conn>` is refused now that `Conn`
+/// drops), and the next keystroke on the edited text serves every record.
+#[test]
+fn r11_door_b_serves_cold_instances_from_records_and_rescans_a_moved_digest() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let fixture = &R11_RECORD_FIXTURES[0];
+    let mut package = fixture.write();
+    let seed = vec![package.path("views.vl")];
+    let first = observe(&package, seed.clone(), Leg::Incremental);
+    let warm = observe(&package, seed.clone(), Leg::Incremental);
+    let warm_clean = observe(&package, Vec::new(), Leg::Clean);
+    let edited = fixture.edits[0].apply(package.text("views.vl"));
+    package.set("views.vl", edited);
+    let moved = observe(&package, seed.clone(), Leg::Incremental);
+    let served = observe(&package, seed.clone(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert_eq!(
+        warm.rendering, warm_clean.rendering,
+        "the warm keystroke answers clean"
+    );
+    assert!(
+        clean
+            .rendering
+            .contains("a resource-typed field is moved out of a live aggregate"),
+        "the Drop impl makes split's field move an R5 refusal: {}",
+        clean.rendering
+    );
+    assert_eq!(
+        moved.rendering, clean.rendering,
+        "the keystroke that moves the digest answers clean"
+    );
+    assert_eq!(
+        served.rendering, clean.rendering,
+        "the keystroke served past the refiled records answers clean"
+    );
+    eprintln!(
+        "R11 door B: first scanned {} filed {}; warm served {} scanned {}; \
+         moved digest served {} scanned {} filed {}; then served {} scanned {}",
+        first.census.r11_instances_scanned,
+        first.census.r11_records_filed,
+        warm.census.r11_instances_served,
+        warm.census.r11_instances_scanned,
+        moved.census.r11_instances_served,
+        moved.census.r11_instances_scanned,
+        moved.census.r11_records_filed,
+        served.census.r11_instances_served,
+        served.census.r11_instances_scanned,
+    );
+    assert!(
+        first.census.r11_instances_scanned >= 5 && first.census.r11_records_filed >= 5,
+        "the first analysis scans the five instances live and files them: {:#?}",
+        first.census
+    );
+    assert!(
+        warm.census.r11_instances_served == first.census.r11_instances_scanned
+            && warm.census.r11_instances_scanned == 0,
+        "the warm keystroke serves every instance from the records: {:#?}",
+        warm.census
+    );
+    assert!(
+        moved.census.r11_instances_served == 0
+            && moved.census.r11_instances_scanned == first.census.r11_instances_scanned
+            && moved.census.r11_records_filed == first.census.r11_records_filed,
+        "the moved digest rescans every instance and refiles it: {:#?}",
+        moved.census
+    );
+    assert!(
+        served.census.r11_instances_served == first.census.r11_instances_scanned
+            && served.census.r11_instances_scanned == 0,
+        "the keystroke after the refiling serves every record again: {:#?}",
+        served.census
+    );
+}
+
+/// R11 door B's plant: an instance record served without its `Drop` digest
+/// compared. The fixture's first edit types a `Drop` impl for the leaf's
+/// resource; `split`'s field move out of `Pair<Conn>` is then no destructure
+/// (B469) and the instantiation must be refused — the stale record keeps it
+/// admitted, and the differential sees the missing refusal.
+#[test]
+fn the_differential_sees_an_r11_record_served_past_a_moved_drop_digest() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::R11RecordUnguarded);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("door B's digest")),
+        "the unguarded-record plant must turn the Drop impl's edit red; it found: \
+         {divergences:#?}"
     );
 }
 

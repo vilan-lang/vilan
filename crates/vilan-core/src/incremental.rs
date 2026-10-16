@@ -390,6 +390,12 @@ pub enum Plant {
     /// then visits a served item's bodies and derives its output a second
     /// time beside the replay of its record (a doubled diagnostic).
     LiveRangeWalksServed,
+    /// R11 door B (Order 54): an instance record is served without its
+    /// `Drop` digest compared — a `Drop` impl appearing in the entry for a
+    /// type a cold generic is instantiated at then leaves the generic's
+    /// field move admitted as a destructure, and the instantiation's R5
+    /// refusal is never spoken.
+    R11RecordUnguarded,
 }
 
 impl Plant {
@@ -409,6 +415,7 @@ impl Plant {
             Plant::PostSeedFromSettled => 13,
             Plant::ItemRecordUnguarded => 14,
             Plant::LiveRangeWalksServed => 15,
+            Plant::R11RecordUnguarded => 16,
         }
     }
 }
@@ -520,6 +527,13 @@ pub struct Census {
     /// family's live lane (`analyzer/r11_candidates.rs`) when it met an
     /// instantiation — a served keystroke reads a fraction of a filing one's.
     pub r11_rows_live: u64,
+    /// R11 door B (Order 54, `analyzer/r11_records.rs`): the instances this
+    /// analysis EMITTED from the world's records (a cold callee whose key
+    /// has a record with the current `Drop` digest), the ones it scanned
+    /// live, and the records it filed for the next analysis.
+    pub r11_instances_served: u64,
+    pub r11_instances_scanned: u64,
+    pub r11_records_filed: u64,
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
@@ -624,6 +638,9 @@ thread_local! {
             live_entities: 0,
             move_rows_live: 0,
             r11_rows_live: 0,
+            r11_instances_served: 0,
+            r11_instances_scanned: 0,
+            r11_records_filed: 0,
             hover_rows_restored: 0,
             prefix_world: false,
             prefix_layered: false,
@@ -995,7 +1012,9 @@ pub fn report(program: &Program) {
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
-             live-entities={} move-rows-live={} r11-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
+             live-entities={} move-rows-live={} r11-rows-live={} instances-served={} \
+             instances-scanned={} instance-records-filed={} hover-rows-restored={} \
+             prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
              post-seam={}",
             census.base_hits,
@@ -1026,6 +1045,9 @@ pub fn report(program: &Program) {
             census.live_entities,
             census.move_rows_live,
             census.r11_rows_live,
+            census.r11_instances_served,
+            census.r11_instances_scanned,
+            census.r11_records_filed,
             census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
