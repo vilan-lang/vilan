@@ -14332,3 +14332,45 @@ fn f141_writing_through_write_or_into_a_copy_still_compiles() {
         "3\n7\n9\n40\n",
     );
 }
+
+// --- B626: a module scalar read only through a view -------------------------
+//
+// The transformer's module-binding tree-shake (F6) keeps the bindings emitted
+// code referenced, and naming a boxed scalar's CELL for a view (`read(&LIMIT)`)
+// recorded no reference — so a `let`/`const let` scalar read nowhere by value
+// was shaken out and the bundle threw `ReferenceError: LIMIT is not defined`
+// (natively it printed 41). The item's premise — the analyzer's reference count
+// — was wrong: that count was 1.
+
+#[test]
+fn b626_a_module_scalar_read_only_through_a_view_is_declared() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        const let LIMIT = 40;
+        let LOOSE = 50;
+        mut COUNTER = 7;
+        let LATER = 60;
+
+        fun read(value: &i32): i32 {
+            *value + 1
+        }
+
+        fun bump(value: &mut i32) {
+            value += 1;
+        }
+
+        fun main() {
+            print(read(&LIMIT));
+            print(read(&LOOSE));
+            bump(&mut COUNTER);
+            print(read(&COUNTER));
+            let later = || read(&LATER);
+            print(later());
+        }
+        main();
+        "#,
+        "41\n51\n9\n61\n",
+    );
+}

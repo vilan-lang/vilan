@@ -13914,3 +13914,22 @@ fn b627_an_expected_type_through_a_receiver_answers_on_both_backends() {
         "an expectation through a receiver must bind the same natively"
     );
 }
+
+/// B626: a module scalar read only through a view — a `const let`, a `let`, a
+/// `mut` written through `&mut`, a read inside a closure — answers the same on
+/// both backends (JS shook the binding out and threw `ReferenceError`).
+#[test]
+fn b626_a_module_scalar_read_only_through_a_view_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_module_scalar_view.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/module_scalar_view.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a module scalar read through a view must be declared on JS"
+    );
+}
