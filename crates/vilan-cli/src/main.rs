@@ -1456,31 +1456,85 @@ fn scan_vl(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
 /// the two legs agree.
 const WATCH_INTERRUPT_EXIT_CODE: i32 = 130;
 
-/// Installs the `Ctrl-C` exit hook for a watch session.
+/// Installs the interrupt hook for a watch session — [`install_interrupt_hook`],
+/// which every process that writes a temp script installs too.
 ///
 /// [`watch_loop`] never returns from its loop, so without a hook the session's
 /// temp script (`vilan-watch-<pid>.mjs`) outlives it — one leaked file per watch
 /// session (`windows-support.md` §6; the per-round delete in [`run_watch`]
-/// covers only restarts). The hook is deliberately tiny: remove the script,
-/// exit. Removal is silent here, unlike the per-round one — the process is on
-/// its way out and a warning would race the child's own shutdown.
-///
-/// It does not touch the child, and must not: on unix the terminal delivers
-/// `SIGINT` to the whole process group, so the `node` child is already stopping
-/// on its own; on Windows the child's kill-on-close Job object (see [`job`])
-/// reaps its tree the moment this process exits. `ctrlc` runs the closure on
-/// its own thread rather than inside the signal handler, which is what makes
-/// filesystem work legal here at all — a raw `SIGINT` handler may not allocate
-/// the path or run `atexit`.
+/// covers only restarts).
 fn install_watch_interrupt_hook() {
-    // Best effort: a watch session is not worth failing over a handler the OS
-    // (or a second install) refused.
-    let _ = ctrlc::set_handler(|| {
-        let _ = fs::remove_file(watch_script_path());
-        // The round's source map (E257 S6) and sidecar (S7) go with its script.
-        remove_script_maps(&watch_script_path());
-        std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
+    install_interrupt_hook();
+}
+
+/// The exit hook for `Ctrl-C` (and, `ctrlc`'s `termination` feature, `SIGTERM`
+/// and `SIGHUP` — a debugger ending a session, a closed terminal): remove the
+/// temp script this process has on disk, with its map and sidecar, and exit
+/// 130. Installed once per process.
+///
+/// The hook is deliberately tiny, and silent — the process is on its way out
+/// and a warning would race the child's own shutdown. It does not touch the
+/// child, and must not: on unix the terminal delivers `SIGINT` to the whole
+/// process group, so the `node` child is already stopping on its own; on
+/// Windows the child's kill-on-close Job object (see [`job`]) reaps its tree
+/// the moment this process exits. `ctrlc` runs the closure on its own thread
+/// rather than inside the signal handler, which is what makes filesystem work
+/// legal here at all — a raw `SIGINT` handler may not allocate the path or run
+/// `atexit`.
+///
+/// Before the temp-script lock, a plain `vilan run` had no hook at all (an
+/// interrupt left `vilan-run-<pid>.mjs`, its map and its sidecar behind), and
+/// the watch hook removed the round's files WHILE the round could still be
+/// writing them: a removal between the map's write and the sidecar's left the
+/// sidecar (debug-53's orphan `.vdbg.json` files). The hook now takes the lock
+/// every write holds, so it removes a round's files after the round has
+/// written all of them, and holds it until the process is gone.
+fn install_interrupt_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // Best effort: a run is not worth failing over a handler the OS
+        // refused.
+        let _ = ctrlc::set_handler(|| {
+            let _held = clear_temp_script();
+            std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
+        });
     });
+}
+
+/// The temp script this process has on disk — `vilan-run-<pid>.mjs`,
+/// `vilan-watch-<pid>.mjs` or `vilan-test-<pid>.mjs`, with its map and sidecar
+/// beside it — and the lock every write and removal of those files takes, so
+/// the interrupt hook ([`install_interrupt_hook`]) never runs between two of
+/// a script's writes.
+static TEMP_SCRIPT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn temp_script_lock() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
+    TEMP_SCRIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The interrupt hook's work: wait out a write in flight, then remove the temp
+/// script this process has on disk with its map and sidecar. The guard comes
+/// back held, so the hook keeps every later write out until it exits.
+fn clear_temp_script() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
+    let mut held = temp_script_lock();
+    if let Some(script) = held.take() {
+        let _ = fs::remove_file(&script);
+        remove_script_maps(&script);
+    }
+    held
+}
+
+/// Removes a temp script once its run is over — the script, its map and its
+/// sidecar — under the lock its write took.
+fn remove_temp_script(script: &Path) {
+    let mut held = temp_script_lock();
+    let _ = fs::remove_file(script);
+    remove_script_maps(script);
+    if held.as_deref() == Some(script) {
+        *held = None;
+    }
 }
 
 /// Runs `action`, then re-runs it whenever a watched `.vl` file changes — polling
@@ -2341,6 +2395,10 @@ fn watch_script_path() -> PathBuf {
 /// (`windows-support.md` §5). A missing file is success.
 fn remove_watch_script() {
     let script = watch_script_path();
+    let mut held = temp_script_lock();
+    if held.as_deref() == Some(script.as_path()) {
+        *held = None;
+    }
     // Its map (E257 S6) and sidecar (S7) go with it; most rounds have one.
     remove_script_maps(&script);
     if let Err(error) = fs::remove_file(&script)
@@ -6440,8 +6498,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         .args(node_flags(mapped, None))
         .arg(&script)
         .output();
-    let _ = fs::remove_file(&script);
-    remove_script_maps(&script);
+    remove_temp_script(&script);
     match output {
         Ok(result) if result.status.success() => Ok(()),
         Ok(result) => {
@@ -8173,7 +8230,30 @@ fn write_script(
 /// its absolute `file://` URL — the script is nowhere near the project — and
 /// the answer is whether a map was written, which is what decides
 /// `--enable-source-maps`.
+///
+/// The three writes hold the temp-script lock, and the script is registered
+/// for the interrupt hook before the first of them: an interrupt mid-write
+/// waits for the last and then removes all three ([`install_interrupt_hook`]).
+/// A write that fails removes what it wrote.
 fn write_run_script_with_map(
+    script: &Path,
+    javascript: &str,
+    map: Option<&vilan_core::source_map::SourceMap>,
+) -> std::io::Result<bool> {
+    install_interrupt_hook();
+    let mut held = temp_script_lock();
+    *held = Some(script.to_path_buf());
+    let written = write_temp_files(script, javascript, map);
+    if written.is_err() {
+        let _ = fs::remove_file(script);
+        remove_script_maps(script);
+        *held = None;
+    }
+    written
+}
+
+/// [`write_run_script_with_map`]'s writes, under its lock.
+fn write_temp_files(
     script: &Path,
     javascript: &str,
     map: Option<&vilan_core::source_map::SourceMap>,
@@ -8222,8 +8302,7 @@ fn run_node_script(
     };
     let status = spawn_node(&script, &node_flags(mapped, inspect), args, None)
         .and_then(|mut child| child.wait());
-    let _ = fs::remove_file(&script);
-    remove_script_maps(&script);
+    remove_temp_script(&script);
     exit_code_of(status)
 }
 
@@ -9656,8 +9735,75 @@ mod tests {
     // (windows-support.md §5). The restart round removes it once the child that
     // was executing it is killed and reaped; the loop is interactive, so what is
     // pinnable in-process is the cleanup helper itself.
+    /// The temp-script lock is process-wide: the tests that take it run one at
+    /// a time under `cargo test`'s threads too (nextest gives each a process).
+    static TEMP_SCRIPT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn temp_script_test() -> std::sync::MutexGuard<'static, ()> {
+        TEMP_SCRIPT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The orphan-sidecar race (debug-53's find): an interrupt landing while
+    /// a round is writing its script, map and sidecar must remove all three —
+    /// the hook waits for the write in flight, then clears. The old hook
+    /// removed the files unlocked, so a removal between two writes left the
+    /// later file behind.
+    #[test]
+    fn an_interrupt_mid_write_removes_every_file_the_write_makes() {
+        let _serial = temp_script_test();
+        let script = env::temp_dir().join(format!("vilan-run-race-{}.mjs", std::process::id()));
+        let paths = [
+            script.clone(),
+            source_map_path(&script),
+            sidecar_path(&script),
+        ];
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let writer = {
+            let script = script.clone();
+            std::thread::spawn(move || {
+                // A write in flight: the script registered, the map written,
+                // the sidecar still to come when the interrupt arrives.
+                let mut held = temp_script_lock();
+                *held = Some(script.clone());
+                fs::write(source_map_path(&script), "{}").unwrap();
+                started.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                fs::write(sidecar_path(&script), "{}").unwrap();
+                fs::write(&script, "// the round's script\n").unwrap();
+            })
+        };
+        wait_started.recv().unwrap();
+        // What the hook does before it exits.
+        let held = clear_temp_script();
+        assert_eq!(*held, None, "the hook takes the script it removed");
+        drop(held);
+        writer.join().unwrap();
+        for path in &paths {
+            assert!(!path.exists(), "{} outlived the interrupt", path.display());
+        }
+    }
+
+    /// A run's own end removes its files and lets go of them, and a removal
+    /// of a script the process does not hold leaves the held one alone.
+    #[test]
+    fn a_runs_end_removes_its_temp_files_and_forgets_them() {
+        let _serial = temp_script_test();
+        let script = env::temp_dir().join(format!("vilan-run-end-{}.mjs", std::process::id()));
+        write_run_script_with_map(&script, "// a run\n", None).unwrap();
+        assert!(script.exists());
+        assert_eq!(temp_script_lock().as_deref(), Some(script.as_path()));
+        remove_temp_script(&env::temp_dir().join("vilan-run-elsewhere.mjs"));
+        assert_eq!(temp_script_lock().as_deref(), Some(script.as_path()));
+        remove_temp_script(&script);
+        assert!(!script.exists());
+        assert_eq!(*temp_script_lock(), None);
+    }
+
     #[test]
     fn the_watch_script_is_removed_and_a_missing_one_is_not_an_error() {
+        let _serial = temp_script_test();
         let script = watch_script_path();
         assert!(
             script.starts_with(env::temp_dir()),
