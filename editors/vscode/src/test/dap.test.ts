@@ -4,6 +4,8 @@
 // `session.test.ts`.
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
+import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, runCommand } from '../dap/adapter';
 import { Doc, WALKER, children, dbgLine, flat, layout, walker } from '../dap/printer';
 import { Sidecar, parsePath } from '../dap/sidecar';
@@ -30,6 +32,12 @@ test('mappings decode to absolute segments per generated line', () => {
     assert.deepEqual(lines[2], [{ column: 0, source: 1, line: 1, originalColumn: 2 }]);
 });
 
+/// The example map's places, spelled as this platform spells an absolute
+/// path (`D:\work\app\dist` on Windows): a map's sources resolve to the
+/// paths the editor's breakpoints name.
+const DIST = path.resolve('/work/app/dist');
+const STD = path.resolve('/opt/std/list.vl');
+
 /// A map over two sources — the user's, and an ignore-listed std — whose
 /// line 0 is a std helper, line 1 a statement and a call on the user's line
 /// 3, and lines 2 and 3 two emitted copies of the user's line 5.
@@ -46,19 +54,19 @@ function exampleMap(): SourceMap {
     return new SourceMap(
         {
             version: 3,
-            sources: ['main.vl', 'file:///opt/std/list.vl'],
+            sources: ['main.vl', pathToFileURL(STD).href],
             names: [],
             mappings: encode(segments),
             ignoreList: [1],
         },
-        '/work/app/dist/main.mjs.map',
+        path.join(DIST, 'main.mjs.map'),
     );
 }
 
 test('a generated position maps to the last segment at or before it', () => {
     const map = exampleMap();
-    assert.equal(map.sources[0].path, '/work/app/dist/main.vl');
-    assert.equal(map.sources[1].path, '/opt/std/list.vl');
+    assert.equal(map.sources[0].path, path.join(DIST, 'main.vl'));
+    assert.equal(map.sources[1].path, STD);
     assert.deepEqual(map.original({ line: 1, column: 5 }), { source: 0, line: 3, column: 4, name: undefined });
     assert.deepEqual(map.original({ line: 1, column: 20 }), { source: 0, line: 3, column: 12, name: undefined });
     assert.equal(map.original({ line: 1, column: 0 }), undefined, 'before the line\'s first segment');
@@ -67,7 +75,7 @@ test('a generated position maps to the last segment at or before it', () => {
 
 test('a breakpoint binds at the line\'s statement start in every emitted copy, sliding to the next mapped line', () => {
     const map = exampleMap();
-    const source = map.sourceIndex('/work/app/dist/main.vl');
+    const source = map.sourceIndex(path.join(DIST, 'main.vl'));
     assert.equal(source, 0);
     assert.deepEqual(map.breakpointPositions(0, 3), { line: 3, positions: [{ line: 1, column: 1 }] });
     assert.deepEqual(map.breakpointPositions(0, 5), {
