@@ -14676,14 +14676,17 @@ struct SiteWalk<'src> {
 /// What one site reaches in the world — the per-site half of what used to be a
 /// per-site mini-program.
 pub struct SiteReach {
-    /// The concrete functions it reaches, in entity-id order (the order a
-    /// mini-program declared them in).
-    functions: Vec<Id>,
-    /// The `monomorphized` slots it reaches, in emission order.
-    slots: Vec<usize>,
-    /// Every module-level binding its code reads — the prelude's input, and
-    /// what anything not compile-time-known is reported from.
-    globals: HashSet<Id>,
+    /// The union of the site's requirements' closures (M147 (3)): the concrete
+    /// functions it reaches in entity-id order (the order a mini-program
+    /// declared them in), the `monomorphized` slots in emission order, and the
+    /// module-level bindings they read. SHARED with every site whose walk
+    /// required the same set (M161) — kolt's style chain, the same union at
+    /// almost every site — and never copied per site.
+    union: Rc<ReachClosure>,
+    /// The module-level bindings the site's OWN walk read, beside the union's
+    /// — with them, the prelude's input, and what anything not
+    /// compile-time-known is reported from.
+    own_globals: Vec<Id>,
     helpers: Vec<&'static str>,
     imports: Vec<String>,
 }
@@ -14766,19 +14769,25 @@ impl<'src> ConstWorld<'src> {
         // The fixpoint runs against the SITE's reached bindings, in a frame of
         // its own — emitting a binding's initializer can reference more bindings
         // (and, in principle, require more code), and both belong to this site.
+        // M161: the frame starts from the site's OWN rows; the shared union's
+        // bindings join the first round's batch straight from the union, so
+        // neither is copied into a per-site set.
         let frame = transformer.record_enter();
-        transformer.referenced_globals = reach.globals.clone();
+        transformer.referenced_globals = reach.own_globals.iter().copied().collect();
         let mut declared: HashSet<Id> = HashSet::default();
         let mut unresolved: Vec<Id> = Vec::new();
         let mut prelude: Vec<js::Node<'src>> = Vec::new();
+        let mut shared: Option<&HashSet<Id>> = Some(&reach.union.globals);
         loop {
             // `referenced_globals` is a `HashSet`, so sort each round's batch by
             // entity id — the canonical key — or the prelude's declaration order
             // (and any diagnostic order derived from it) would vary run to run
             // (`b33-emission-order.md` §4).
-            let mut pending: Vec<Id> = transformer
-                .referenced_globals
-                .iter()
+            let mut pending: Vec<Id> = shared
+                .take()
+                .into_iter()
+                .flatten()
+                .chain(transformer.referenced_globals.iter())
                 .copied()
                 .filter(|id| is_external(id) && !declared.contains(id))
                 .collect();
@@ -14786,6 +14795,7 @@ impl<'src> ConstWorld<'src> {
                 break;
             }
             pending.sort_by_key(|id| id.0);
+            pending.dedup();
             for binding in pending {
                 declared.insert(binding);
                 // Non-variable references (functions, struct names) emit through
@@ -14844,7 +14854,7 @@ impl<'src> ConstWorld<'src> {
         let closed = transformer.record_leave(frame, None).unwrap_or_default();
         // Whatever the prelude's own walks added belongs to this site too.
         if closed.requires.is_empty() {
-            reach.globals = closed.globals;
+            reach.own_globals = closed.globals.into_iter().collect();
         } else {
             reach = self.reach_from(&closed);
         }
@@ -14878,13 +14888,13 @@ impl<'src> ConstWorld<'src> {
         prelude: Vec<js::Node<'src>>,
     ) -> ConstSite<'world> {
         let mut world: Vec<&'world js::Node<'world>> =
-            Vec::with_capacity(reach.functions.len() + reach.slots.len());
-        for function_id in &reach.functions {
+            Vec::with_capacity(reach.union.functions.len() + reach.union.slots.len());
+        for function_id in &reach.union.functions {
             if let Some(node) = self.transformer.required_functions.get(function_id) {
                 world.push(node);
             }
         }
-        for slot in &reach.slots {
+        for slot in &reach.union.slots {
             if let Some(node) = self.transformer.monomorphized.get(*slot) {
                 world.push(node);
             }
@@ -15018,10 +15028,14 @@ impl<'src> ConstWorld<'src> {
             Some(recorder) => self.union_of(&seed.requires, recorder),
             None => Rc::new(ReachClosure::default()),
         };
-        // The shared union is the large half: copied whole (a table copy, not a
-        // re-hash of every row), the site's own few rows added to the copy.
-        let mut globals = union.globals.clone();
-        globals.extend(seed.globals.iter().copied());
+        // The shared union is the large half: held behind its `Rc` (M161),
+        // the site's own few rows beside it.
+        let own_globals: Vec<Id> = seed
+            .globals
+            .iter()
+            .copied()
+            .filter(|global| !union.globals.contains(global))
+            .collect();
         let mut helpers = union.helpers.clone();
         helpers.extend(seed.helpers.iter().copied());
         let mut imports = union.imports.clone();
@@ -15031,11 +15045,9 @@ impl<'src> ConstWorld<'src> {
                 .or_default()
                 .extend(symbols.iter().cloned());
         }
-        let (functions, slots) = (union.functions.clone(), union.slots.clone());
         SiteReach {
-            functions,
-            slots,
-            globals,
+            union,
+            own_globals,
             helpers: helpers.into_iter().collect(),
             imports: imports
                 .iter()
