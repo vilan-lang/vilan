@@ -143,8 +143,8 @@ fn the_release_preset_is_neutral_on(program: &str) {
         return;
     }
 
-    let release = run(&compared.release, "release", "release");
-    let debug = run(&compared.debug, "release", "debug");
+    let release = run(&compared.release, program, "release", "release");
+    let debug = run(&compared.debug, program, "release", "debug");
     match (release, debug) {
         (Ok(release), Ok(debug)) => assert!(
             release == debug,

@@ -48,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "../stdin_fixture/mod.rs"]
+mod stdin_fixture;
+
 /// Every corpus program, once, handed to the caller's macro.
 ///
 /// The caller passes the name of a `macro_rules!` that accepts
@@ -182,6 +185,7 @@ macro_rules! corpus_manifest {
             signal_update => "signal-update.vl",
             spread_parameters => "spread-parameters.vl",
             ssr_render => "ssr-render.vl",
+            stdin_lines => "stdin-lines.vl",
             string_interpolation => "string-interpolation.vl",
             string_methods => "string-methods.vl",
             struct_literal_call => "struct-literal-call.vl",
@@ -283,13 +287,18 @@ pub fn corpus_dir() -> PathBuf {
 /// 'b' has already been declared`) is the whole diagnosis. A gate comparing node
 /// against something that is not node wants [`run_node_within`] instead.
 pub fn run_node(path: &Path) -> Result<(String, i32), String> {
-    let (stdout, stderr, code) = run_node_within(path, NODE_TIMEOUT)?;
+    run_node_within(path, NODE_TIMEOUT).map(stderr_appended_on_failure)
+}
+
+/// The differentials' policy over one capture: a failing run's stderr rides
+/// along after its stdout.
+fn stderr_appended_on_failure((stdout, stderr, code): (String, String, i32)) -> (String, i32) {
     // `code == 0` is `ExitStatus::success()` on every platform this runs on: a
     // child killed by a signal reports no code at all and lands on -1 below.
     if code == 0 {
-        Ok((stdout, code))
+        (stdout, code)
     } else {
-        Ok((format!("{stdout}--- stderr ---\n{stderr}"), code))
+        (format!("{stdout}--- stderr ---\n{stderr}"), code)
     }
 }
 
@@ -320,6 +329,17 @@ pub fn run_node(path: &Path) -> Result<(String, i32), String> {
 /// run it in processes that know nothing about each other, N54), and a shared
 /// working directory would put their scratch trees on top of each other.
 pub fn run_node_within(path: &Path, limit: Duration) -> Result<(String, String, i32), String> {
+    run_node_fed(path, limit, None)
+}
+
+/// [`run_node_within`] for a build of the corpus program `source` (its `.vl`):
+/// the program's stdin fixture, when it has one, is piped in place of the empty
+/// stdin (`stdin_fixture`, A173 S1).
+pub fn run_node_fed(
+    path: &Path,
+    limit: Duration,
+    source: Option<&Path>,
+) -> Result<(String, String, i32), String> {
     // Resolved BEFORE the child is given a directory of its own.
     let program = vilan_core::util::canonical_path_of_unwritten(path);
     let cwd = scratch_cwd();
@@ -329,7 +349,11 @@ pub fn run_node_within(path: &Path, limit: Duration) -> Result<(String, String, 
             cwd.display()
         )
     })?;
-    let outcome = run_node_in(&program, &cwd, limit);
+    let stdin = match source {
+        Some(source) => stdin_fixture::stdin_for(source),
+        None => Stdio::null(),
+    };
+    let outcome = run_node_in(&program, &cwd, limit, stdin);
     // Best effort, and the only cleanup there is: a run that DIES skips this,
     // which is the whole reason the directory is under TEMP.
     let _ = std::fs::remove_dir_all(&cwd);
@@ -355,11 +379,12 @@ fn run_node_in(
     program: &Path,
     cwd: &Path,
     limit: Duration,
+    stdin: Stdio,
 ) -> Result<(String, String, i32), String> {
     let mut child = Command::new("node")
         .arg(program)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -400,10 +425,16 @@ fn run_node_in(
     }
 }
 
-/// Writes `javascript` to a uniquely named scratch file and runs it. `gate`
-/// names the differential and `label` the side of it, so a leftover file after
-/// a kill says which run wrote it.
-pub fn run(javascript: &str, gate: &str, label: &str) -> Result<(String, i32), String> {
+/// Writes `javascript` — a build of the corpus program `program` — to a
+/// uniquely named scratch file and runs it, with the program's stdin fixture
+/// piped in when it has one. `gate` names the differential and `label` the side
+/// of it, so a leftover file after a kill says which run wrote it.
+pub fn run(
+    javascript: &str,
+    program: &str,
+    gate: &str,
+    label: &str,
+) -> Result<(String, i32), String> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -412,7 +443,8 @@ pub fn run(javascript: &str, gate: &str, label: &str) -> Result<(String, i32), S
         std::process::id()
     ));
     std::fs::write(&path, javascript).map_err(|error| error.to_string())?;
-    let outcome = run_node(&path);
+    let source = corpus_dir().join(program);
+    let outcome = run_node_fed(&path, NODE_TIMEOUT, Some(&source)).map(stderr_appended_on_failure);
     let _ = std::fs::remove_file(&path);
     outcome
 }

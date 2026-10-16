@@ -54,6 +54,8 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../../vilan-core/tests/stdin_fixture/mod.rs"]
+mod stdin_fixture;
 #[path = "../../vilan-core/tests/test_pool/mod.rs"]
 mod test_pool;
 
@@ -1171,6 +1173,10 @@ const PLATFORM_BOUND_REQUIRED: &[&str] = &[
     "asset_bundle.vl",
     "element-syntax.vl",
     "estate.vl",
+    // A173 S1 + F?4: `std::process` natively — `args`/`env`, and the stdin
+    // reader over the program's `.stdin` fixture.
+    "process-env.vl",
+    "stdin-lines.vl",
 ];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
@@ -1475,7 +1481,13 @@ fn compare(staged: &Path, program: &str) -> Verdict {
 
 /// [`compare`] building into `target` ([`legs_in_parallel`]).
 fn compare_in(staged: &Path, program: &str, target: &Path) -> Verdict {
-    let vilan = |staged: &Path| vilan_in(staged, target);
+    // Each leg reads the program's stdin fixture when it has one (A173 S1),
+    // opened afresh per leg: both backends must read the same lines.
+    let vilan = |staged: &Path| {
+        let mut command = vilan_in(staged, target);
+        command.stdin(stdin_fixture::stdin_for(&staged.join(program)));
+        command
+    };
     let native = vilan(staged)
         .args(["run", "--backend", "rust", program])
         .output()
@@ -10153,6 +10165,48 @@ fn a_deref_of_a_blocks_view_reads_the_value_on_both_backends() {
     );
 }
 
+/// A173 S1 / B?1: both backends read `stdin-lines.vl`'s fixture line for line
+/// — `\n`, `\r\n` and a lone `\r` each end one line, a blank line is a line,
+/// a non-ASCII line survives whole, a last line with no ending is still one,
+/// and past the end `read_line()` stays `None` and `scan()` stays `""`.
+///
+/// The expected bytes are WRITTEN OUT rather than only compared across the
+/// legs: a harness that dropped the fixture would hand both backends an empty
+/// stdin, and two programs reading nothing agree perfectly. Under its own
+/// program name, as every native test builds (N158).
+#[test]
+fn a173_both_backends_read_the_corpus_stdin_fixture_line_for_line() {
+    let staged = stage();
+    for extension in ["vl", "stdin"] {
+        std::fs::copy(
+            staged.join(format!("stdin-lines.{extension}")),
+            staged.join(format!("native_probe_stdin_lines.{extension}")),
+        )
+        .expect("stage the stdin program under its own name");
+    }
+    let expected = concat!(
+        "scan: [the first line]\n",
+        "1: [ends with lf] 12\n",
+        "2: [ends with crlf] 14\n",
+        "3: [ends with a lone cr] 19\n",
+        "4: [between two lone crs] 20\n",
+        "5: [] 0\n",
+        "6: [blank above] 11\n",
+        "7: [] 0\n",
+        "8: [wide \u{e9} \u{2713}] 8\n",
+        "9: [  padded  ] 10\n",
+        "10: [no ending] 9\n",
+        "lines after scan: 10\n",
+        "read_line past the end is None: true\n",
+        "scan past the end: []\n",
+    );
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "native_probe_stdin_lines.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
@@ -11839,6 +11893,7 @@ fn run_on_in(staged: &Path, backend: Option<&str>, program: &str, target: &Path)
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
     }
+    command.stdin(stdin_fixture::stdin_for(&staged.join(program)));
     let output = command.arg(program).output().expect("run vilan");
     Run {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

@@ -168,7 +168,7 @@ const KEYS_WITHOUT_A_FRAGMENT: &[(&str, &str)] = &[
     ),
     (
         "`{name}`",
-        "the host-global and host-call refusals (`__scan`, `fetch`, \
+        "the host-global and host-call refusals (`__stdin_line`, `fetch`, \
          `setTimeout`, `__timer`, …), which name the binding and nothing else",
     ),
     (
