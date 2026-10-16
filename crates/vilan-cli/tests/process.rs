@@ -2,10 +2,18 @@
 //! (kolt.local 018) — these run the actual `process.*` bindings rather than
 //! pinning generated JS text, the same posture as `fs.rs`. Each pin runs on
 //! BOTH backends: the JS one under node, and the native one (`--backend rust`,
-//! F?4) as the binary `vilan run` builds.
+//! A173 S1 and F?4) as the binary `vilan run` builds.
+//!
+//! The stdin pins drive a `vilan run` child through a PIPE the test holds, and
+//! every step waits on the child's own OUTPUT before the next write — a line
+//! the program has echoed, a tick that has printed — never on a sleep: the
+//! order under test is the harness's sequencing, not the box's timing.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 mod support;
 
@@ -107,6 +115,257 @@ main();
         "{backend:?}: cwd() should end with the fixture directory `{basename}`, was {reported:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// A173 S1: stdin, read incrementally and awaited, on both backends.
+// ---------------------------------------------------------------------------
+
+/// How long a step waits for the child's next output before calling the run
+/// HUNG. A liveness bound, never a timing claim: a healthy step answers as soon
+/// as the child prints, and on a contended box the native leg's first step
+/// includes a cargo build. The claims below are all "this happens at all, in
+/// this order", so the only cost of the number is how long a red takes.
+const STEP_BOUND: Duration = Duration::from_secs(300);
+
+/// A `vilan run` child the test talks to: its stdin is the test's pipe, and
+/// its stdout streams back through a reader thread, so a step can wait on the
+/// text the program has printed so far.
+struct Conversation {
+    label: String,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    chunks: mpsc::Receiver<Vec<u8>>,
+    stdout: String,
+}
+
+impl Conversation {
+    fn start(dir: &Path, relative: &str, backend: Option<&str>) -> Conversation {
+        let mut child = vilan_run(dir, relative, backend)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn vilan run");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let (sender, chunks) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(count) = stdout.read(&mut buffer) {
+                if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Conversation {
+            label: format!("{relative} on {}", backend.unwrap_or("js")),
+            stdin: child.stdin.take(),
+            child,
+            chunks,
+            stdout: String::new(),
+        }
+    }
+
+    /// Waits until the program's stdout CONTAINS `text`.
+    fn wait_for(&mut self, text: &str) {
+        let deadline = Instant::now() + STEP_BOUND;
+        while !self.stdout.contains(text) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.chunks.recv_timeout(left) {
+                Ok(chunk) => self.stdout.push_str(&String::from_utf8_lossy(&chunk)),
+                Err(_) => {
+                    self.abandon();
+                    panic!(
+                        "{}: waited for {text:?} and the program printed only {:?}",
+                        self.label, self.stdout
+                    );
+                }
+            }
+        }
+    }
+
+    fn write(&mut self, text: &str) {
+        let stdin = self.stdin.as_mut().expect("stdin still open");
+        stdin
+            .write_all(text.as_bytes())
+            .expect("write the child's stdin");
+        stdin.flush().expect("flush the child's stdin");
+    }
+
+    /// Ends the program's input: its next read sees the end.
+    fn close(&mut self) {
+        self.stdin = None;
+    }
+
+    /// A red step's teardown: the input closes FIRST, because killing `vilan
+    /// run` does not reach the program it started (node, or the native
+    /// binary), and a program parked on stdin ends at its end of input.
+    fn abandon(&mut self) {
+        self.close();
+        let _ = self.child.kill();
+    }
+
+    /// Waits for the program to EXIT — with the test's end of the pipe still
+    /// open unless [`Conversation::close`] ran — and answers its exit code and
+    /// everything it printed.
+    fn finish(mut self) -> (Option<i32>, String) {
+        let deadline = Instant::now() + STEP_BOUND;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll the child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                self.abandon();
+                panic!(
+                    "{}: the program did not exit with its stdin pipe open; it printed {:?}",
+                    self.label, self.stdout
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        while let Ok(chunk) = self.chunks.recv_timeout(STEP_BOUND) {
+            self.stdout.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        (status.code(), self.stdout)
+    }
+}
+
+/// The pump lets go of an idle stdin (A173 S1): a program that read the one
+/// line it wanted EXITS when `main` ends, though the writer still holds the
+/// pipe open. Without the JS pump's `unref` (or a native source that stays
+/// live) the program waits for the writer to close — forever, here, since the
+/// test closes it only after the exit. `main` ends on a plain statement on
+/// purpose: a `void` main whose TAIL is a `match` is emitted with a
+/// `process.exit` after it (the find filed beside A173 S1), which would end the
+/// process whatever the pump held and make this pin vacuous on JS.
+#[test]
+fn a173_a_stdin_pipe_held_open_does_not_hold_the_process() {
+    for backend in BACKENDS {
+        let dir = temp_project(&format!("held_open_{}", backend.unwrap_or("js")));
+        write(
+            &dir,
+            "one_line.vl",
+            r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::read_line;
+
+fun main() {
+	match read_line() {
+		Some(let line) => print(i"read [{line}]"),
+		None => print("read the end"),
+	}
+	print("main ends");
+}
+"#,
+        );
+        let mut conversation = Conversation::start(&dir, "one_line.vl", backend);
+        conversation.write("one\ntwo\n");
+        conversation.wait_for("main ends\n");
+        let (code, stdout) = conversation.finish();
+        assert_eq!(code, Some(0), "{backend:?}");
+        assert_eq!(stdout, "read [one]\nmain ends\n", "{backend:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A read AWAITS (A173 S1): while `read_line` waits, the event loop keeps
+/// turning — a sibling task's timer fires and prints three times, and only
+/// then does the test type the line the read answers with. A blocking read
+/// would stop the ticks until input arrived, and the test waits for the third
+/// tick before it writes anything.
+#[test]
+fn a173_a_timer_keeps_ticking_while_a_read_waits() {
+    for backend in BACKENDS {
+        let dir = temp_project(&format!("ticking_{}", backend.unwrap_or("js")));
+        write(
+            &dir,
+            "ticking.vl",
+            r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::read_line;
+import std::task;
+import std::time;
+
+fun main() {
+	task::nursery(|n| {
+		async {
+			for tick in [0, 1, 2] {
+				time::sleep(10);
+				print(i"tick {tick}");
+			}
+		};
+		match read_line() {
+			Some(let line) => print(i"read [{line}]"),
+			None => print("read the end"),
+		}
+	});
+}
+"#,
+        );
+        let mut conversation = Conversation::start(&dir, "ticking.vl", backend);
+        conversation.wait_for("tick 2\n");
+        conversation.write("late\n");
+        conversation.close();
+        let (code, stdout) = conversation.finish();
+        assert_eq!(code, Some(0), "{backend:?}");
+        assert_eq!(
+            stdout, "tick 0\ntick 1\ntick 2\nread [late]\n",
+            "{backend:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The ambient cancel signal reaches a parked read (A173 S1): a child task
+/// waiting on `read_line` inside a nursery is cancelled by its sibling, the
+/// nursery joins, and control returns — with stdin silent and still open. The
+/// read abandoned its WAIT, not stdin: the next read, outside the nursery, gets
+/// the line the test types once the join is printed.
+#[test]
+fn a173_a_cancelled_read_returns_control_and_the_next_read_gets_the_line() {
+    for backend in BACKENDS {
+        let dir = temp_project(&format!("cancelled_{}", backend.unwrap_or("js")));
+        write(
+            &dir,
+            "cancelled.vl",
+            r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::read_line;
+import std::task;
+import std::time;
+
+fun main() {
+	task::nursery(|n| {
+		async {
+			match read_line() {
+				Some(let line) => print(i"the child read [{line}]"),
+				None => print("the child read the end"),
+			}
+		};
+		async {
+			time::sleep(10);
+			n.cancel();
+		};
+	});
+	print("cancelled and joined");
+	match read_line() {
+		Some(let line) => print(i"next read: [{line}]"),
+		None => print("next read: the end"),
+	}
+}
+"#,
+        );
+        let mut conversation = Conversation::start(&dir, "cancelled.vl", backend);
+        conversation.wait_for("cancelled and joined\n");
+        conversation.write("kept\n");
+        let (code, stdout) = conversation.finish();
+        assert_eq!(code, Some(0), "{backend:?}");
+        assert_eq!(
+            stdout, "cancelled and joined\nnext read: [kept]\n",
+            "{backend:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// F?4: `args()` natively — `process.argv.slice(2)`'s twin, the arguments

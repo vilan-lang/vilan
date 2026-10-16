@@ -4,6 +4,7 @@
 [platform("@process")] mod self;
 
 import pkg::option::Option::{ self, None, Some };
+import pkg::task::{ CancelSignal, ambient_signal };
 
 export *;
 
@@ -11,8 +12,37 @@ export *;
 [extern("process.exit")]
 external fun exit(code: i32): void;
 
-/// Reads the next line from standard input (empty string at EOF).
-external fun scan(): str;
+/// The next line of standard input, without its line ending, awaiting one if none
+/// has arrived yet; `None` once stdin has ended and every line was read. `\n`,
+/// `\r\n` and a lone `\r` each end a line, and a last line with no ending is still
+/// a line — so a blank line is `Some("")`, never confused with the end.
+///
+/// Incremental: it reads only as far as the next line ending, so an interactive
+/// program answers each line as it is typed, and a pipe whose writer is still open
+/// does not have to close first. The terminal stays in its ordinary (cooked) mode,
+/// which is what gives a typed line its echo, Backspace, Ctrl-U and Ctrl-W. Async,
+/// so a caller awaits it implicitly and a timer or another task keeps running while
+/// it waits; inside a nursery's dynamic extent the wait carries the ambient cancel
+/// signal, as `time::sleep` and `fs::Watcher::next` do — cancellation abandons the
+/// WAIT, never a line: one that arrives later is kept for the next read. An idle
+/// stdin never holds the process open.
+fun read_line(): Option<str> {
+	stdin_line(ambient_signal())
+}
+
+/// `read_line()`, with `""` once stdin has ended — the short door for a program
+/// that treats a blank line and the end alike. A loop that must stop at the end of
+/// a piped file reads `read_line()` instead.
+fun scan(): str {
+	read_line().unwrap_or("")
+}
+
+/// The host's line reader behind `read_line`: one shared stdin pump that reads
+/// to the next line ending, hands each line to the oldest waiter, and lets go of
+/// stdin while nobody waits (A173 S1; `transformer.rs`'s `__stdin_line`,
+/// `vilan_rt::process::stdin_line` natively).
+[extern("__stdin_line")]
+export(in mod) async external fun stdin_line(signal: Option<CancelSignal>): Option<str>;
 
 /// The arguments the program was invoked with, excluding the runtime and script
 /// path — e.g. `vilan run prog.vl a b` yields `["a", "b"]`.

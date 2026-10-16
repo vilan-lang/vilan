@@ -1280,6 +1280,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_read_dir_all",
         "__fs_watch",
         "__fs_watch_stop",
+        "__stdin_line",
         "__local_get",
         "__response_header",
         "__session_get",
@@ -1306,24 +1307,10 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
 
-/// The JS source for a runtime helper an intrinsic call needs. `__scan` reads
-/// all of stdin once and hands out one line per call; `__parse_i32` returns the
-/// `Option<i32>` array form (`[0, n]` = `Some`, `[1]` = `None`).
+/// The JS source for a runtime helper an intrinsic call needs. `__parse_i32`
+/// returns the `Option<i32>` array form (`[0, n]` = `Some`, `[1]` = `None`).
 fn helper_source(name: &str) -> &'static str {
     match name {
-        "__scan" => {
-            "let __vilan_stdin = null, __vilan_stdin_index = 0;\n\
-             function __scan() {\n\
-             \tif (__vilan_stdin === null) {\n\
-             \t\ttry {\n\
-             \t\t\t__vilan_stdin = require(\"fs\").readFileSync(0, \"utf-8\").split(\"\\n\");\n\
-             \t\t} catch (error) {\n\
-             \t\t\t__vilan_stdin = [];\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn __vilan_stdin_index < __vilan_stdin.length ? __vilan_stdin[__vilan_stdin_index++] : \"\";\n\
-             }"
-        }
         // STRICT parses: the whole (trimmed) text must be the number — trailing
         // garbage, a fractional part on an integer, or an out-of-range value is
         // `None`, not a truncation (`parseInt`'s liberality said the wrong thing).
@@ -1987,6 +1974,101 @@ fn helper_source(name: &str) -> &'static str {
         // Q1's exception. Idempotent: a second stop is a no-op, so the
         // destructor stays benign behind any earlier `drop(watcher)`. No
         // public `stop()` surfaces it — the destructor is the only caller.
+        // `std::process::read_line`'s host half (A173 S1): ONE shared stdin
+        // pump, read incrementally — never to EOF first, so an interactive
+        // program answers each line as it is typed. `'data'` appends to the
+        // buffer and `'end'` marks the end; waiters queue and are answered in
+        // order, a line at a time. `\n`, `\r\n` and a lone `\r` each end a line:
+        // a `\r` answers at once and remembers it (`carriage`), so a `\n`
+        // arriving next — in this chunk or the next — is that same ending, and
+        // the split falls identically whatever the chunk boundaries were. At
+        // the end the remainder (if any) is a last line, then `None` (`[1]`)
+        // for every later read.
+        //
+        // The pump lets go of stdin whenever nobody waits: `pause()` stops the
+        // reads and `unref()` stops the handle holding the event loop — without
+        // it a PIPE whose writer stays open keeps the process alive after
+        // `main` ends (3.4 s against 0.47 s in papers-54's probe). `ref()` +
+        // `resume()` again while a waiter is pending: a pending promise is not
+        // a handle, the `ref()` is what holds the loop for the read. (A file
+        // redirect's stream has no `ref`/`unref`; it ends by itself.)
+        //
+        // An abort of the ambient cancel signal removes that waiter and
+        // rejects it with the signal's reason, as `__sleep` does; a line that
+        // arrives later stays buffered for the next reader — cancellation
+        // abandons the WAIT, never a line. The B?1 history: the helper this
+        // replaced called `require("fs")` inside the emitted ES module (`.mjs`
+        // since B86b, v0.33.0), and its own `catch` turned the
+        // `ReferenceError` into "" for every call.
+        "__stdin_line" => {
+            "const __vilan_stdin = { buffer: \"\", ended: false, carriage: false, started: false, waiters: [] };\n\
+             function __stdin_pump() {\n\
+             \tconst state = __vilan_stdin;\n\
+             \twhile (state.waiters.length > 0) {\n\
+             \t\tif (state.carriage && state.buffer.length > 0) {\n\
+             \t\t\tif (state.buffer[0] === \"\\n\") state.buffer = state.buffer.slice(1);\n\
+             \t\t\tstate.carriage = false;\n\
+             \t\t\tcontinue;\n\
+             \t\t}\n\
+             \t\tconst end = state.buffer.search(/[\\r\\n]/);\n\
+             \t\tif (end >= 0) {\n\
+             \t\t\tconst line = state.buffer.slice(0, end);\n\
+             \t\t\tstate.carriage = state.buffer[end] === \"\\r\";\n\
+             \t\t\tstate.buffer = state.buffer.slice(end + 1);\n\
+             \t\t\tstate.waiters.shift().resolve([ 0, line ]);\n\
+             \t\t} else if (state.ended) {\n\
+             \t\t\tconst rest = state.buffer;\n\
+             \t\t\tstate.buffer = \"\";\n\
+             \t\t\tstate.waiters.shift().resolve(rest.length > 0 ? [ 0, rest ] : [ 1 ]);\n\
+             \t\t} else {\n\
+             \t\t\tprocess.stdin.ref?.();\n\
+             \t\t\tprocess.stdin.resume();\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t}\n\
+             \tif (state.started && !state.ended) {\n\
+             \t\tprocess.stdin.pause();\n\
+             \t\tprocess.stdin.unref?.();\n\
+             \t}\n\
+             }\n\
+             function __stdin_line(signal) {\n\
+             \tconst sig = signal && signal[0] === 0 ? signal[1] : undefined;\n\
+             \treturn new Promise((resolve, reject) => {\n\
+             \t\tif (sig && sig.aborted) {\n\
+             \t\t\treject(sig.reason);\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t\tconst state = __vilan_stdin;\n\
+             \t\tif (!state.started) {\n\
+             \t\t\tstate.started = true;\n\
+             \t\t\tprocess.stdin.setEncoding(\"utf8\");\n\
+             \t\t\tprocess.stdin.on(\"data\", (chunk) => {\n\
+             \t\t\t\tstate.buffer += chunk;\n\
+             \t\t\t\t__stdin_pump();\n\
+             \t\t\t});\n\
+             \t\t\tconst ended = () => {\n\
+             \t\t\t\tstate.ended = true;\n\
+             \t\t\t\t__stdin_pump();\n\
+             \t\t\t};\n\
+             \t\t\tprocess.stdin.on(\"end\", ended);\n\
+             \t\t\tprocess.stdin.on(\"error\", ended);\n\
+             \t\t}\n\
+             \t\tconst abort = () => {\n\
+             \t\t\tconst parked = state.waiters.indexOf(waiter);\n\
+             \t\t\tif (parked >= 0) state.waiters.splice(parked, 1);\n\
+             \t\t\treject(sig.reason);\n\
+             \t\t\t__stdin_pump();\n\
+             \t\t};\n\
+             \t\tconst waiter = { resolve: (line) => {\n\
+             \t\t\tif (sig) sig.removeEventListener(\"abort\", abort);\n\
+             \t\t\tresolve(line);\n\
+             \t\t} };\n\
+             \t\tstate.waiters.push(waiter);\n\
+             \t\tif (sig) sig.addEventListener(\"abort\", abort, { once: true });\n\
+             \t\t__stdin_pump();\n\
+             \t});\n\
+             }"
+        }
         "__fs_watch_stop" => "function __fs_watch_stop(watcher) {\n\twatcher.stop();\n}",
         // Cryptographically random bytes.
         "__random_bytes" => {
@@ -2881,7 +2963,7 @@ struct Transformer<'src> {
     // decided by the analyzer's verdict on each payload, which an instance
     // never re-decides, so one answer serves every call.
     payload_view_variants_memo: HashMap<Id, Vec<usize>>,
-    // Runtime helper functions (`__scan`, `__parse_i32`, `__random_int`) an
+    // Runtime helper functions (`__parse_i32`, `__env`, `__random_int`) an
     // intrinsic call needs; emitted as a prelude only when used.
     used_helpers: BTreeSet<&'static str>,
     // Host imports an `[extern]` call needs, as module -> imported symbols;
@@ -4064,7 +4146,7 @@ impl<'src> Transformer<'src> {
         main_body_start += planted.iter().filter(|at| **at < main_body_start).count();
 
         // Host imports (`import { a, b } from "module";`) from `[extern]` calls,
-        // then runtime helpers (`__scan`, ...) — both a prelude before the body.
+        // then runtime helpers (`__parse_i32`, ...) — both a prelude before the body.
         let imports = self
             .used_imports
             .iter()
@@ -10399,10 +10481,6 @@ impl<'src> Transformer<'src> {
         }
         let mut args = args.into_iter();
         match intrinsic {
-            Intrinsic::Scan => {
-                self.used_helpers.insert("__scan");
-                js::Node::Call(Box::new(js::Node::Local("__scan".to_string())), Vec::new())
-            }
             Intrinsic::StrTrim => native_method(&mut args, "trim"),
             Intrinsic::StrToLowercase => native_method(&mut args, "toLowerCase"),
             Intrinsic::StrToUppercase => native_method(&mut args, "toUpperCase"),
@@ -15322,7 +15400,9 @@ const RESERVED_NAMES: &[&str] = &[
     "__dbg_map",
     "__dbg_set",
     "__dbg_stack",
-    "__scan",
+    "__vilan_stdin",
+    "__stdin_pump",
+    "__stdin_line",
     "__parse_i32",
     "__parse_f64",
     "__random_int",

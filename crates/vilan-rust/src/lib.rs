@@ -10382,6 +10382,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "vilan_rt::executor::timer({})",
                 self.value_argument(argument_ids, 0, depth)?
             ),
+            // A173 S1: `std::process::read_line`'s host read, awaited like
+            // `__sleep` and carrying the ambient signal the same way.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__stdin_line",
+            } => format!(
+                "vilan_rt::process::stdin_line({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
             ExternBinding::Function {
                 module: None,
                 symbol: "__nursery_new",

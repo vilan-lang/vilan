@@ -473,10 +473,11 @@ byte under a content type generated from the `mime-db` registry data.
 ## The process: `std::process`
 
 ```vilan,fragment
-fun args(): List<str>          // CLI arguments (vilan run app.vl -- …)
-fun env(key: str): Option<str> // an environment variable
-fun exit(code: i32)            // end the process
-fun scan(): str                // a line from stdin
+fun args(): List<str>               // CLI arguments (vilan run app.vl -- …)
+fun env(key: str): Option<str>      // an environment variable
+fun exit(code: i32)                 // end the process
+fun read_line(): Option<str>        // the next line of stdin, awaited; None at its end
+fun scan(): str                     // read_line(), "" at the end
 ```
 
 One behavior to plan around: **the process exits when `main` finishes.**

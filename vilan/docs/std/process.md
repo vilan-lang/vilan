@@ -951,15 +951,16 @@ of the same material.
 ## std::process
 
 ```vilan,fragment
-fun args(): List<str>            // CLI arguments
-fun cwd(): str                   // current working directory, absolute
-fun env(key: str): Option<str>   // environment variable
+fun args(): List<str>                  // CLI arguments
+fun cwd(): str                         // current working directory, absolute
+fun env(key: str): Option<str>         // environment variable
 fun exit(code: i32)
-fun scan(): str                  // read a line from stdin
+fun read_line(): Option<str>           // the next line of stdin; None at its end
+fun scan(): str                        // read_line(), "" at the end
 ```
 
-`args`, `cwd`, `env` and `exit` work on both backends — the JS one under
-node and the native one (`--backend rust`).
+`args`, `cwd`, `env`, `exit` and the stdin reads work on both backends — the
+JS one under node and the native one (`--backend rust`).
 
 Every relative path in a `std::fs` or `std::build` call resolves against the
 process's working directory; `cwd()` reads it (absolute), so a boot check can
@@ -986,6 +987,56 @@ fun main() {
 	print(tail.get(0).unwrap_or("?"));
 }
 ```
+
+### Reading stdin
+
+`read_line()` answers the next line of standard input without its line
+ending, **awaiting** one if none has arrived yet, and `None` once stdin has
+ended and every line was read. `\n`, `\r\n` and a lone `\r` each end one
+line; a blank line is `Some("")`, so the end of a piped file is never
+mistaken for an empty line; a last line with no ending is still a line.
+`scan()` is `read_line().unwrap_or("")`, the short door for a program that
+treats a blank line and the end alike — in a loop it never stops at the end of
+its input, so a loop reads `read_line()`:
+
+```vilan,norun
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::read_line;
+
+fun main() {
+	mut total = 0;
+	for {
+		match read_line() {
+			Some(let line) => total += line.len(),
+			None => jump break,
+		}
+	}
+	print(i"{total} characters");
+}
+```
+
+The read is **incremental**: it takes stdin only as far as the next line
+ending, so an interactive program answers each line as it is typed, and
+`some-command | vilan run p.vl` handles each line as the writer produces it.
+The terminal stays in its ordinary (cooked) mode, which is what gives a typed
+line its echo, Backspace, Ctrl-U and Ctrl-W. An idle stdin never holds the
+process open: a program that has read what it wanted ends when `main` does,
+even if the writer of its pipe is still there.
+
+The reads are `async`, so a caller awaits them implicitly and the rest of the
+program keeps running while one waits — a timer still fires, a spawned task
+still prints. Inside a nursery's dynamic extent the wait carries the ambient
+cancel signal (as `time::sleep` does): cancelling the nursery abandons the
+WAIT, never a line — one that arrives afterwards is kept for the next read.
+
+From v0.33.0 until this reader replaced it, `scan()` read nothing at all on
+the JS backend: its helper called `require` inside the ES module every build
+has emitted since then, and answered `""` for every call. Before v0.33.0 it
+read the whole of stdin before answering the first line, so an interactive
+prompt waited for Ctrl-D; and there was no native implementation. Key-by-key
+input (a raw-mode key stream for menus, pagers and games) is a later slice of
+the same design.
 
 Server-side hot-swapping of code is not a thing
 here and is not planned — the node leg restarts.

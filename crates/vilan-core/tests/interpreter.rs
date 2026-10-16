@@ -76,6 +76,12 @@ const EXCLUDED: &[(&str, &str)] = &[
         "async (the turn-follows-continuation section)",
     ),
     ("process-env.vl", "host environment (`__env`, `__args`)"),
+    (
+        "stdin-lines.vl",
+        "async + host stdin (`__stdin_line`; A173 S1) — the macro world's \
+         evaluator has no stdin; the JS and native backends are the program's \
+         two observers, over its `.stdin` fixture",
+    ),
     ("crypto.vl", "async + host WebCrypto (`crypto.subtle`)"),
     ("db.vl", "host database (`node:sqlite`)"),
     (

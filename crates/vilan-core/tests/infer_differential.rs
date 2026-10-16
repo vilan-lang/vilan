@@ -243,8 +243,8 @@ fn inference_is_neutral_on(program: &str) {
         return;
     }
 
-    let folded = run(&compared.with, "infer", "with");
-    let plain = run(&compared.without, "infer", "without");
+    let folded = run(&compared.with, program, "infer", "with");
+    let plain = run(&compared.without, program, "infer", "without");
     match (folded, plain) {
         (Ok(folded), Ok(plain)) => assert!(
             folded == plain,

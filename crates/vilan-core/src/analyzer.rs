@@ -73801,8 +73801,6 @@ pub enum GenericDispatch<'src> {
 /// An `external` std function with a built-in JS lowering.
 #[derive(Debug, Clone, Copy)]
 pub enum Intrinsic {
-    // `scan(): str` — read a line of stdin (runtime helper).
-    Scan,
     // `str.trim()` -> native `.trim()`.
     StrTrim,
     // `str.to_lowercase()` -> native `.toLowerCase()`.
@@ -88690,9 +88688,6 @@ fn analyze_over_world<'src>(
             .and_then(|scope_id| analyzer.scopes.get(scope_id))
             .and_then(|scope| scope.name_to_id_map.get(name).copied())
     };
-    if let Some(scan_id) = module_member("process", "scan") {
-        intrinsics.insert(scan_id, Intrinsic::Scan);
-    }
     if let Some(hash_id) = module_member("hash", "canonical_hash") {
         intrinsics.insert(hash_id, Intrinsic::CanonicalHash);
     }

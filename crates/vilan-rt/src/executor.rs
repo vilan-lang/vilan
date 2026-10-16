@@ -405,7 +405,10 @@ impl CancelSignal {
             .is_some_and(|body| Nursery(body).is_cancelled())
     }
 
-    fn park(&self) {
+    /// Parks the current task on this signal's nursery, so a `cancel` wakes it
+    /// to observe the abort. `pub(crate)` for the leaf futures of sibling
+    /// modules ([`crate::process`]'s stdin read).
+    pub(crate) fn park(&self) {
         if let Some(body) = self.0.upgrade() {
             park_on(&body.cancel_waiters);
         }
@@ -987,6 +990,30 @@ fn park_on(waiters: &RefCell<Vec<TaskId>>) {
     if let Some(task) = current_task() {
         waiters.borrow_mut().push(task);
     }
+}
+
+/// The task polling right now, held by a leaf future in a SIBLING module so
+/// whatever it waits on can wake it later — the cross-module spelling of
+/// [`park_on`], without opening the task slab's ids (A173 S1: `vilan_rt::process`'s
+/// stdin read is woken by its I/O source, not by anything in this file).
+pub(crate) struct Parked(TaskId);
+
+impl Parked {
+    /// The current task, if a task is being polled.
+    pub(crate) fn current() -> Option<Parked> {
+        current_task().map(Parked)
+    }
+
+    /// Re-polls the parked task on the next microtask drain.
+    pub(crate) fn wake(&self) {
+        enqueue(self.0);
+    }
+}
+
+/// Raises the cancellation abort out of the current poll — a sibling module's
+/// leaf future observing its signal, as [`Sleep`] does here.
+pub(crate) fn raise_cancelled() -> ! {
+    raise(Failure::Cancelled)
 }
 
 fn unpark_from(waiters: &RefCell<Vec<TaskId>>) {
