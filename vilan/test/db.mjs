@@ -37,10 +37,9 @@ function integer(self, name) {
 function big_integer(self, name) {
 	return __db_column(self, name);
 }
-function $f($g) {
-	drop($g);
+function $e($f) {
+	drop($f);
 }
-let $a = undefined;
 const db = new DatabaseSync(":memory:");
 try {
 	db.exec("CREATE TABLE task (id INTEGER PRIMARY KEY, title TEXT, done INTEGER)");
@@ -51,28 +50,27 @@ try {
 	for (const row of all(open_tasks, [ 0 ])) {
 		console.log("todo: " + text(row, "title"));
 	}
-	const $b = first(db.prepare("SELECT COUNT(*) AS n FROM task"), [  ]);
-	let $c = null;
-	if ($b[0] === 0) {
-		const row2 = $b[1];
-		$c = console.log("" + integer(row2, "n") + " tasks total");
+	const $a = first(db.prepare("SELECT COUNT(*) AS n FROM task"), [  ]);
+	let $b = null;
+	if ($a[0] === 0) {
+		const row2 = $a[1];
+		$b = console.log("" + integer(row2, "n") + " tasks total");
 	} else {
-		$c = console.log("no rows");
+		$b = console.log("no rows");
 	}
-	$c;
+	$b;
 	db.exec("CREATE TABLE stamp (id INTEGER PRIMARY KEY, at INTEGER)");
 	run(db.prepare("INSERT INTO stamp (at) VALUES (?)"), [ 1720656000000 ]);
-	const $d = first(db.prepare("SELECT at FROM stamp"), [  ]);
-	let $e = null;
-	if ($d[0] === 0) {
-		const row3 = $d[1];
-		$e = console.log("stamp at " + big_integer(row3, "at"));
+	const $c = first(db.prepare("SELECT at FROM stamp"), [  ]);
+	let $d = null;
+	if ($c[0] === 0) {
+		const row3 = $c[1];
+		$d = console.log("stamp at " + big_integer(row3, "at"));
 	} else {
-		$e = console.log("no stamp");
+		$d = console.log("no stamp");
 	}
-	$a = $e;
+	$d;
 } finally {
-	$f(db);
+	$e(db);
 }
-process.exit($a);
 //# sourceMappingURL=db.mjs.map

@@ -4898,6 +4898,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 parameters.join(", ")
             );
         }
+        // std-54's B?1 (its native half): a void `main` whose tail is a call
+        // written without its `;` (`print("x")`) left that call as the
+        // closure's tail expression, and the `run_pending()` appended below
+        // followed it with no `;` between — rustc refused the build. The tail
+        // is `()` (the checker holds a void `main` to it), so ending it as a
+        // statement changes nothing else.
+        if is_main && !is_async && !answers_an_exit_code {
+            let end = body.trim_end().len();
+            if !body[..end].ends_with([';', '}', '{']) && end > 0 {
+                body.insert(end, ';');
+            }
+        }
         out.push_str(&body);
         // F20: node runs its event loop AFTER the module's top level returns, so
         // a synchronous `main` that left a microtask behind — which

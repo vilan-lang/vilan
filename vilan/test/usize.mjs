@@ -276,5 +276,5 @@ if ($w[0] === 0) {
 	const reason2 = $w[1];
 	$x = console.log(reason2);
 }
-process.exit($x);
+$x;
 //# sourceMappingURL=usize.mjs.map

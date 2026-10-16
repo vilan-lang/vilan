@@ -59,5 +59,5 @@ if ($h[0] === 0) {
 	const reason2 = $h[1];
 	$i = print(reason2);
 }
-process.exit($i);
+$i;
 //# sourceMappingURL=prelude.mjs.map

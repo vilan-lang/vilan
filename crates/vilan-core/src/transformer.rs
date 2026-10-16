@@ -3661,10 +3661,7 @@ impl<'src> Transformer<'src> {
         // needs no capture: teardown runs and `main` falls through, the tail's side
         // effects preserved.
         let mut t_main_fn_body = if self.scope_needs_drops(&main_fn.body.0) {
-            let tail_is_void = matches!(
-                self.program.entity_map.get(&main_fn.body.1),
-                Some(Expr::Void) | None
-            );
+            let tail_is_void = self.main_tail_is_void(main_fn.body.1);
             if tail_is_void || !self.program.platform.has_process_exit() {
                 let mut body = self.walk_scope_body(
                     &main_fn.body.0,
@@ -3721,6 +3718,16 @@ impl<'src> Transformer<'src> {
             // disposition — exiting or assigning one emits `process.exit(return)`.
             let tail = match tail {
                 Some(value) if value.is_divergent() => {
+                    t_main_fn_body.push(value);
+                    None
+                }
+                // std-54's B?1: a tail whose TYPE is void — a `match` of void
+                // arms, a call written without its `;` — has no exit code to
+                // forward, so it is a plain statement and `main` falls
+                // through: `process.exit` would end the process under a
+                // spawned task still pending, which the native backend waits
+                // for.
+                Some(value) if self.main_tail_is_void(main_fn.body.1) => {
                     t_main_fn_body.push(value);
                     None
                 }
@@ -16327,6 +16334,51 @@ fn bodyless_refusal_frame(requester: Option<(&str, Option<&str>)>) -> String {
         }
         Some((frame, None)) => format!(". It was first reached while emitting `{frame}`"),
         None => String::new(),
+    }
+}
+
+impl<'src> Transformer<'src> {
+    /// Whether `main`'s tail answers no exit code: none written (a block whose
+    /// last statement carried its `;`), or an expression whose TYPE is void
+    /// (std-54's B?1: decided by the type, not by the tail's syntax).
+    fn main_tail_is_void(&self, tail: Id) -> bool {
+        let is_void = |type_id: TypeId| {
+            self.program
+                .type_id_to_type_map
+                .get(&self.resolve_type_id(type_id))
+                .is_some_and(|type_| matches!(type_, Type::Void))
+        };
+        match self.program.entity_map.get(&tail) {
+            Some(Expr::Void) | None => true,
+            // A call records no type of its own: its callee's return answers
+            // — declared, inferred, or an external's.
+            Some(Expr::Call(call_id)) => self
+                .program
+                .function_calls
+                .get(call_id)
+                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => Some(*target),
+                    _ => None,
+                })
+                .and_then(|target| {
+                    self.program
+                        .functions
+                        .get(&target)
+                        .and_then(|function| {
+                            function.return_type_id.or_else(|| {
+                                self.program.inferred_return_types.get(&target).copied()
+                            })
+                        })
+                        .or_else(|| {
+                            self.program
+                                .external_functions
+                                .get(&target)
+                                .map(|external| external.return_type_id)
+                        })
+                })
+                .is_some_and(is_void),
+            Some(_) => self.expr_type_id(tail).is_some_and(is_void),
+        }
     }
 }
 

@@ -20,5 +20,5 @@ if ($a[0] === 0) {
 } else {
 	$b = console.log(String(-(1)));
 }
-process.exit($b);
+$b;
 //# sourceMappingURL=generic-method-return.mjs.map

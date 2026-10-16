@@ -13606,6 +13606,44 @@ fn a_module_binding_read_by_value_is_copied_once_natively() {
     );
 }
 
+/// std-54's B?1: a void `main` whose TAIL is a void-typed expression — a
+/// `match` of void arms, a std call written without its `;`, a user call the
+/// same — beside a spawned task still pending. The JS lowering decided the
+/// tail's disposition by its syntax and forwarded it to `process.exit`,
+/// which dropped the task's output (`the spawned task finished` printed
+/// natively only); the `;`-less call's native `main` did not build (the
+/// tail ran into the appended `run_pending()`). The disposition is the
+/// tail's TYPE now, and both backends print both lines.
+#[test]
+fn a_void_main_tail_waits_for_pending_work_on_both_backends() {
+    let staged = stage();
+    for (file, source, tail) in [
+        (
+            "native_probe_main_match_tail.vl",
+            include_str!("native/main_match_tail.vl"),
+            "the tail is a match",
+        ),
+        (
+            "native_probe_main_call_tail.vl",
+            include_str!("native/main_call_tail.vl"),
+            "the tail is a call with no semicolon",
+        ),
+        (
+            "native_probe_main_user_tail.vl",
+            include_str!("native/main_user_tail.vl"),
+            "the tail is a user call",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let expected = format!("{tail}\nthe spawned task finished\n");
+        assert_eq!(
+            both_stdouts(&staged, file),
+            (expected.clone(), expected),
+            "{file}"
+        );
+    }
+}
+
 /// The stdout of `file` on the JS and on the native backend.
 fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
     let run = |arguments: &[&str]| {

@@ -1,0 +1,19 @@
+// std-54's B?1: a void `main` whose tail is a void-typed expression (a
+// `match` of void arms, a call without its `;`) was emitted on JS with
+// `process.exit(<tail>)` after it, ending the process under the pending
+// spawned task (natively the `;`-less call did not build). Both print both
+// lines now.
+import std::io::print;
+import std::time;
+
+fun main() {
+	async {
+		time::sleep(50);
+		print("the spawned task finished");
+	};
+	say()
+}
+
+fun say() {
+	print("the tail is a user call");
+}
