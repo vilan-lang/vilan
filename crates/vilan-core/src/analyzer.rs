@@ -32716,12 +32716,23 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         for (target_id, assignment_id) in assignment_targets {
             let Some((non_place_id, what)) = self.first_non_place(target_id) else {
-                // F141: a place inside a `Shared::read()` — the read's copy —
-                // is a place nobody keeps.
-                if !shared_reads.is_empty()
-                    && let Some(read_id) = self.spine_rooted_at_a_read(target_id, &shared_reads)
-                {
-                    self.refuse_write_through_read(target_id, assignment_id, read_id);
+                // F141: a place inside a call's result is a place nobody
+                // keeps — a `Shared::read()`'s copy, or (the widening) any
+                // call that returns a value rather than a view.
+                if let Some(call_expr_id) = self.spine_rooted_at_a_call(target_id) {
+                    match self.call_callee_and_receiver(call_expr_id) {
+                        Some((callee_id, _)) if shared_reads.contains(&callee_id) => {
+                            self.refuse_write_through_read(target_id, assignment_id, call_expr_id);
+                        }
+                        _ if !self.call_result_is_a_view(call_expr_id) => {
+                            self.refuse_write_into_temporary(
+                                target_id,
+                                assignment_id,
+                                call_expr_id,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 continue;
             };
@@ -33045,23 +33056,67 @@ impl<'src> Analyzer<'src> {
         );
     }
 
-    /// F141: the `Shared::read()` call an assignment target's spine roots at —
-    /// `cell.read().count`, `cell.read().items[0]`, `cell.read().pair.0` —
-    /// walking fields, elements and tuple positions down to the expression
-    /// they are read off. `None` when the root is anything else.
-    fn spine_rooted_at_a_read(&self, target_id: Id, shared_reads: &HashSet<Id>) -> Option<Id> {
+    /// F141: the CALL an assignment target's spine roots at —
+    /// `cell.read().count`, `make().items[0]`, `make().pair.0` — walking
+    /// fields, elements and tuple positions down to the expression they are
+    /// read off. `None` when the root is anything else, or when the target
+    /// is the call itself (B522's question).
+    fn spine_rooted_at_a_call(&self, target_id: Id) -> Option<Id> {
         let mut current = target_id;
         loop {
             match self.expr_id_to_expr_map.get(&current)? {
                 Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
                 Expr::TupleIndex(root, ..) => current = *root,
-                Expr::Call(_) if current != target_id => {
-                    let (callee_id, _) = self.call_callee_and_receiver(current)?;
-                    return shared_reads.contains(&callee_id).then_some(current);
-                }
+                Expr::Call(_) if current != target_id => return Some(current),
                 _ => return None,
             }
         }
+    }
+
+    /// F141's widening: whether a call's result is a VIEW an assignment can
+    /// write through — a `borrows` callee (`cell.write()`), a wrapped view
+    /// (`Option<&mut T>`), or a callee whose declared return is a view
+    /// (`fun pick(&mut self): &mut T`) — rather than a value.
+    fn call_result_is_a_view(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&call_expr_id) else {
+            return false;
+        };
+        self.call_returns_view(*call_id) || self.call_hands_back_a_view(*call_id)
+    }
+
+    /// F141's widening (ruled R-f at Order 54's GO): an assignment into a
+    /// place inside a call's VALUE — `make().count = 3`, `make().items[0] =
+    /// 7` — writes a temporary nothing keeps, on both backends (each printed
+    /// the old value afterwards, silently). Refused at the target, with the
+    /// result bound first.
+    fn refuse_write_into_temporary(&mut self, target_id: Id, assignment_id: Id, call_id: Id) {
+        let text_of = |analyzer: &Self, id: Id| {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let call_text = text_of(self, call_id)
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("the call");
+        let rewritten = text_of(self, assignment_id)
+            .and_then(|assignment| assignment.strip_prefix(call_text))
+            .filter(|rest| !rest.contains('\n'))
+            .map(|rest| format!("mut value = {call_text}; value{rest}"))
+            .unwrap_or_else(|| format!("mut value = {call_text}; value.… = …"));
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{call_text}`'s result is a temporary, so this assignment is lost; bind it \
+                     first: `{rewritten}`"
+                ),
+            },
+            target_id,
+        );
     }
 
     /// F141: spec §6.7 — `read()` answers a COPY of the cell's value, so an

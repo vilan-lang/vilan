@@ -14306,6 +14306,107 @@ fn f141_an_assignment_through_a_read_is_refused() {
     }
 }
 
+const F141_PLAIN: &str = r#"
+        import std::io::print;
+
+        struct Plain {
+            count: i32,
+            items: List<i32>,
+            pair: (i32, i32),
+        }
+
+        impl Plain {
+            fun copied(self): Plain {
+                self
+            }
+        }
+
+        fun make(): Plain {
+            Plain { count = 0, items = [1], pair = (2, 3) }
+        }
+
+        fun lend(plain: &mut Plain): &mut Plain borrows plain {
+            plain
+        }
+"#;
+
+/// F141's widening (ruled R-f at Order 54's GO): an assignment into a place
+/// inside ANY call's value — a free call, a method, through an element or a
+/// tuple position, compound — writes a temporary nothing keeps (both backends
+/// lost it silently); refused with the result bound first.
+#[test]
+fn f141_an_assignment_into_a_calls_value_is_refused() {
+    for (statement, call, rewritten) in [
+        (
+            "make().count = 3;",
+            "make()",
+            "mut value = make(); value.count = 3",
+        ),
+        (
+            "make().items[0] = 7;",
+            "make()",
+            "mut value = make(); value.items[0] = 7",
+        ),
+        (
+            "make().count += 1;",
+            "make()",
+            "mut value = make(); value.count += 1",
+        ),
+        (
+            "make().pair.0 = 9;",
+            "make()",
+            "mut value = make(); value.pair.0 = 9",
+        ),
+        (
+            "plain.copied().count = 4;",
+            "plain.copied()",
+            "mut value = plain.copied(); value.count = 4",
+        ),
+    ] {
+        let source = format!(
+            "{F141_PLAIN}
+        fun main() {{
+            mut plain = make();
+            {statement}
+            print(plain.count);
+        }}
+        "
+        );
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`{call}`'s result is a temporary, so this assignment is lost; bind it first: \
+                 `{rewritten}`"
+            ),
+        );
+    }
+}
+
+/// The widening's boundary: a call that returns a VIEW (`borrows`) is written
+/// through, and a bound result is a place.
+#[test]
+fn f141_writing_through_a_view_returning_call_or_a_bound_result_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{F141_PLAIN}{}",
+            r#"
+        fun main() {
+            mut plain = make();
+            lend(&mut plain).count = 3;
+            lend(&mut plain).items[0] = 7;
+            mut value = make();
+            value.count = 5;
+            print(plain.count);
+            print(plain.items[0]);
+            print(value.count);
+        }
+        main();
+        "#
+        ),
+        "3\n7\n5\n",
+    );
+}
+
 /// F141's boundary: the `write()` spelling, a `mut` copy of a read written
 /// whole, and reads themselves are untouched.
 #[test]
