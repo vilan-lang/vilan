@@ -1,0 +1,11 @@
+# E331's gate (`src/test/session.test.ts`): a package of two legs, as kolt's —
+# a browser client and a node server — whose server keeps running, debugged
+# under `vilan run --watch` across a round.
+[package]
+name = "watched"
+default-entry = "server"
+
+[entry.client]
+target = "browser"
+
+[entry.server]

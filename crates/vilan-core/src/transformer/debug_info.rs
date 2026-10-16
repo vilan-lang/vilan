@@ -104,11 +104,24 @@ impl<'src> Transformer<'src> {
             .is_some_and(|source| is_user_source(self.program, source))
         {
             let bindings = self.frame_bindings(&mut recorder, &main.parameters, main.body.2);
+            // An async `main` runs in an arrow the script calls at its top
+            // level, whose head is a mark at `main`'s span (E331): that
+            // frame finds this record by its place, as a closure's does.
+            let origin = self
+                .program
+                .async_functions
+                .contains(&main.id)
+                .then(|| {
+                    let source = self.program.source_of(main.id)?;
+                    let span = self.program.span_map.get(&main.id)?;
+                    (span.start != span.end).then_some((source, span.start))
+                })
+                .flatten();
             recorder.recorded.frames.push(RecordedFrame {
                 kind: FrameKind::Main,
                 name: main.name.to_string(),
                 js: None,
-                origin: None,
+                origin,
                 bindings,
                 dropped: false,
             });
