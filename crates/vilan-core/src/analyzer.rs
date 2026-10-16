@@ -79475,6 +79475,15 @@ pub(crate) struct BaseCacheKey {
     /// `hot` are empty — the world holds no package path, so two packages
     /// whose std closure is one set share it.
     std_prefix: bool,
+    /// M152: a std-and-dependencies prefix's DEPENDENCY TIER, rendered — the
+    /// `<dep>::` modules the package's own modules request (the prefix loads
+    /// them on the package's behalf, as S1's prefix loads a hot set's
+    /// requests), and a hash over every dependency file that tier loads, so an
+    /// edited dependency is a different key before any file is read (the
+    /// persisted file's half; a hit re-validates by content either way).
+    /// Empty for every key but a prefix built for a program with dependencies,
+    /// so every key minted before this field existed is unchanged.
+    dependency_tier: Vec<String>,
 }
 
 /// One retained base world and the claims that keep its borrows alive (M23).
@@ -81697,8 +81706,23 @@ fn prefix_file_key(key: &BaseCacheKey) -> crate::prefix_file::Key {
         },
         macro_limits: key.macro_limits,
         entry_prelude: key.entry_prelude.clone(),
-        workspace: key.workspace.clone(),
-        tiers: vec!["std".to_string()],
+        // M152: the dependency tier's rows (its requests and its content)
+        // ride the workspace rows, and the tier list names it — the format
+        // carried both from its first version.
+        workspace: key
+            .workspace
+            .iter()
+            .chain(&key.dependency_tier)
+            .cloned()
+            .collect(),
+        tiers: if key.dependency_tier.is_empty() {
+            vec![crate::prefix_file::STD_TIER.to_string()]
+        } else {
+            vec![
+                crate::prefix_file::STD_TIER.to_string(),
+                crate::prefix_file::DEPENDENCIES_TIER.to_string(),
+            ]
+        },
     }
 }
 
@@ -83657,6 +83681,153 @@ fn hot_set_of(
     }
 }
 
+/// M152: what a std-and-dependencies prefix's dependency tier is — see
+/// [`dependency_tier`].
+struct DependencyTier {
+    /// The key's rows ([`BaseCacheKey::dependency_tier`]).
+    rows: Vec<String>,
+    /// The `std::` modules the tier's files ask for.
+    std_requests: Vec<&'static str>,
+}
+
+/// M152: the dependency modules a prefix for this package loads, followed the
+/// way the drain's dependency arm follows them — each package's own prelude,
+/// each surface package's `lib.vl`, the entry's and the package modules'
+/// `<dep>::` requests, and from
+/// every module so loaded its own `pkg::` siblings, its ancestors and its
+/// `<subdep>::` references — with the `std::` modules those files request
+/// (written, the `css`/element/`async` seeds, a `[service]`'s), and a content
+/// hash over every file read. Parsing goes through the content-addressed parse
+/// cache the drain reads from, so the load that follows parses nothing twice.
+fn dependency_tier(
+    requests: &[(Origin, &'static str)],
+    base_cache_key: &BaseCacheKey,
+    workspace: &Workspace,
+    platform: Platform,
+) -> DependencyTier {
+    use std::fmt::Write as _;
+    let mut pending: Vec<(usize, String)> = requests
+        .iter()
+        .filter_map(|(origin, module)| match origin {
+            Origin::Dep(index) => Some((*index, module.to_string())),
+            _ => None,
+        })
+        .collect();
+    let mut rows: Vec<String> = pending
+        .iter()
+        .map(|(index, module)| format!("request {index}::{module}"))
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut std_requests: Vec<&'static str> = Vec::new();
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    // `surface` is a `lib.vl`: the drain seeds a surface's written `std::`
+    // imports and its `[service]` macro, not the `css`/element/`async` seeds
+    // a loaded module's discovery adds — and the closure must be the drain's
+    // set exactly, or the prefix is never stored (`prefix_unstorable`).
+    let follow = |index: usize,
+                  ast: &NodeList,
+                  surface: bool,
+                  pending: &mut Vec<(usize, String)>,
+                  std_requests: &mut Vec<&'static str>| {
+        std_requests.extend(
+            collect_module_paths(ast, "std")
+                .into_iter()
+                .map(|(module, _)| interned_display_name(module.to_string())),
+        );
+        if !surface {
+            std_requests.extend(collect_std_item_modules(ast));
+        }
+        std_requests.extend(service_seeds(ast).iter().copied());
+        // A surface's `pkg::` re-exports load from the BASE layer only (the
+        // drain refuses a platform layer's there, L1).
+        let base_root = [workspace.packages[index].base_root.as_path()];
+        pending.extend(
+            collect_module_paths(ast, "pkg")
+                .into_iter()
+                .filter(|(module, _)| {
+                    !surface || longest_module_prefix(&base_root, module).is_some()
+                })
+                .map(|(module, _)| (index, module.to_string())),
+        );
+        for (name, dependency_index) in &workspace.packages[index].dependencies {
+            pending.extend(
+                collect_module_paths(ast, name)
+                    .into_iter()
+                    .map(|(module, _)| (*dependency_index, module.to_string())),
+            );
+        }
+    };
+    for (index, spec) in workspace.packages.iter().enumerate() {
+        // A dependency's own prelude (prelude.md §7) is seeded for every
+        // package, a surface or not: `std::` into std, `pkg::` into itself.
+        if let Some(path) = spec.prelude.module_path()
+            && let Some((root, module)) = path.split_once("::")
+        {
+            match root {
+                "std" => std_requests.push(interned_display_name(module.to_string())),
+                "pkg" => pending.push((index, module.to_string())),
+                _ => {}
+            }
+        }
+        if !spec.surface {
+            continue;
+        }
+        let lib_path = std_module_path(&spec.base_root, "lib.vl");
+        let Some(lib) = load_package_module(&lib_path) else {
+            continue;
+        };
+        files.push((lib_path, crate::content_hash(lib.text)));
+        follow(index, &lib.ast.0, true, &mut pending, &mut std_requests);
+    }
+    // The entry's own `<dep>::` references are the workspace rows' seeds
+    // (`workspace_fingerprint`), already in the key; the tier follows them.
+    for row in &base_cache_key.workspace {
+        if let Some((index, module)) = row
+            .strip_prefix("seed ")
+            .and_then(|seed| seed.split_once("::"))
+            && let Ok(index) = index.parse::<usize>()
+        {
+            pending.push((index, module.to_string()));
+        }
+    }
+    let mut visited: HashSet<(usize, String)> = HashSet::default();
+    while let Some((index, request)) = pending.pop() {
+        let Some(spec) = workspace.packages.get(index) else {
+            continue;
+        };
+        let roots = spec.search_roots(platform);
+        let Some(name) = deepest_module_or_namespace(&roots, &request) else {
+            continue;
+        };
+        if !visited.insert((index, name.clone())) {
+            continue;
+        }
+        pending.extend(
+            name.match_indices("::")
+                .map(|(cut, _)| (index, name[..cut].to_string())),
+        );
+        let Some(resolution) = resolve_module_in_roots(&roots, &name) else {
+            continue;
+        };
+        let Some(module) = load_package_module(&resolution.path) else {
+            continue;
+        };
+        files.push((resolution.path.clone(), crate::content_hash(module.text)));
+        follow(index, &module.ast.0, false, &mut pending, &mut std_requests);
+    }
+    files.sort_unstable();
+    files.dedup();
+    let mut rendered = String::new();
+    for (path, hash) in &files {
+        let _ = write!(rendered, "{}\0{hash:016x}\0", path.display());
+    }
+    rows.push(format!("content {:016x}", crate::content_hash(&rendered)));
+    std_requests.sort_unstable();
+    std_requests.dedup();
+    DependencyTier { rows, std_requests }
+}
+
 /// std-prefix P1/P2: the prefix's key — the std CLOSURE of the entry's seeds
 /// and every module of `set` (§4.3), recording every question std's resolve
 /// asks — and the key a refusal of it is remembered under (per PACKAGE: the
@@ -83669,13 +83840,26 @@ fn std_prefix_keys(
     workspace: &Workspace,
 ) -> (BaseCacheKey, BaseCacheKey) {
     let closure_started = crate::prefix_file::now();
+    // M152: the dependency tier, when the program has one — what it loads,
+    // and the std modules ITS files ask for, which the prefix's std set holds
+    // beside the package's own (the drain's dependency arm seeds them).
+    let tier = (!workspace.packages.is_empty() || !workspace.entry_dependencies.is_empty())
+        .then(|| dependency_tier(&set.requests, base_cache_key, workspace, platform));
     let closure = std_closure(
-        base_cache_key.std_seeds.iter().map(String::as_str).chain(
-            set.requests
-                .iter()
-                .filter(|(origin, _)| *origin == Origin::Std)
-                .map(|(_, module)| *module),
-        ),
+        base_cache_key
+            .std_seeds
+            .iter()
+            .map(String::as_str)
+            .chain(
+                set.requests
+                    .iter()
+                    .filter(|(origin, _)| *origin == Origin::Std)
+                    .map(|(_, module)| *module),
+            )
+            .chain(
+                tier.iter()
+                    .flat_map(|tier| tier.std_requests.iter().copied()),
+            ),
         std,
         platform,
         &workspace.entry_prelude,
@@ -83699,6 +83883,7 @@ fn std_prefix_keys(
             members: Default::default(),
         }),
         std_prefix: true,
+        dependency_tier: tier.map(|tier| tier.rows).unwrap_or_default(),
         ..base_cache_key.clone()
     };
     let package_refusal_key = BaseCacheKey {
@@ -83822,8 +84007,11 @@ fn finish_layered_world(
 /// own and the package resolves over its settled answers. `Err` names why this
 /// package cannot take that shape:
 ///
-/// - `dependencies`: a dependency's modules would load into the prefix (the
-///   prefix is std's alone; a dependency tier is a later slice's question);
+/// A program with DEPENDENCIES takes the prefix too (M152, door (b)): the
+/// dependency modules the package asks for load into the prefix world as its
+/// second TIER, keyed beside std's closure ([`std_prefix_keys`]), and only the
+/// package is hot.
+///
 /// - `package-prelude`: every package module's ambient scope reads a package
 ///   module, which S1 refuses for the same reason;
 /// - `reaches-the-entry`: something names `pkg::<entry>`, whose alias the
@@ -83835,9 +84023,6 @@ fn std_prefix_set(
     pkg_root: &Path,
     workspace: &Workspace,
 ) -> Result<HotSet, &'static str> {
-    if !workspace.packages.is_empty() || !workspace.entry_dependencies.is_empty() {
-        return Err("dependencies");
-    }
     let reach = package_reach(entry_pkg_seeds, entry_path, pkg_root, workspace);
     if reach.prelude_module.is_some() {
         return Err("package-prelude");
@@ -84188,6 +84373,7 @@ fn analyze_inner<'src>(
         hot: None,
         reach: None,
         std_prefix: false,
+        dependency_tier: Vec::new(),
     };
     let base_cacheable = shape.cache
         && !entry_is_inside_std
@@ -86136,83 +86322,152 @@ fn analyze_inner<'src>(
     // nested path needs was discovered with its child (the discovery pushes
     // every ancestor), so the requests `ensure_module_node` writes here name
     // nodes that exist and are dropped, as the hot load drops its own.
-    let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = deferred_mints
-        .into_iter()
-        .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
-    let mut deferred_requests: Vec<(Origin, &str)> = Vec::new();
-    for mint in namespaces.into_iter().chain(bodies) {
-        let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
-            Origin::Std => std_scope_id,
-            Origin::Pkg => pkg_scope_id,
-            Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
-        };
-        match mint {
-            DeferredMint::Namespace {
-                origin,
-                name,
-                children,
-            } => {
-                let origin_scope_id = origin_scope_of(&analyzer, origin);
-                let module_id = ensure_module_node(
-                    &mut analyzer,
-                    &mut module_nodes,
-                    &mut deferred_requests,
-                    origin,
-                    name,
-                    origin_scope_id,
-                    global_scope_id,
-                );
-                analyzer.namespace_only_modules.insert(module_id, children);
-                if origin == Origin::Pkg {
-                    pkg_module_names.insert(name);
+    //
+    // M152: and a DEPENDENCY is whole — its nodes minted, its modules and its
+    // `lib.vl` walked — before the first package node mints. A dependency
+    // never names its consumer, so nothing in it waits on a package node; and
+    // this is the layout a std-and-dependencies prefix holds (the dependency
+    // tier walks in the prefix, the package after it as the hot set), so a
+    // dependency's ids — and the emitted order of its declarations against
+    // the package's — are one answer in both shapes.
+    let (dependency_mints, package_mints): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) =
+        deferred_mints.into_iter().partition(|mint| {
+            matches!(
+                mint,
+                DeferredMint::Namespace {
+                    origin: Origin::Dep(_),
+                    ..
+                } | DeferredMint::Body {
+                    origin: Origin::Dep(_),
+                    ..
                 }
-            }
-            DeferredMint::EntryAlias { name } => {
-                let module_id = analyzer.new_entity_id();
-                analyzer.modules.insert(
-                    module_id,
-                    Module {
-                        id: module_id,
-                        name,
-                        body: (Vec::new(), global_scope_id),
-                    },
-                );
-                analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                analyzer.source_ranges.push(SourceRange {
-                    start: module_id.0,
-                    end: module_id.0 + 1,
-                    source: SourceId(0),
-                });
-                analyzer
-                    .expr_id_to_expr_map
-                    .insert(module_id, Expr::Module(module_id));
-                analyzer
-                    .mut_scope_for_scope_id(pkg_scope_id)
-                    .name_to_id_map
-                    .insert(name, module_id);
-            }
-            DeferredMint::Body {
-                origin,
-                name,
-                module_source_id,
-                directory_holds_a_lib_body,
-                loaded_index,
-            } => {
-                let origin_scope_id = origin_scope_of(&analyzer, origin);
-                let module_scope_id = mint_module_node(
-                    &mut analyzer,
-                    &mut module_nodes,
-                    &mut deferred_requests,
-                    &mut module_scopes,
-                    &mut pkg_module_names,
+            )
+        });
+    let mut deferred_requests: Vec<(Origin, &str)> = Vec::new();
+    for (phase, phase_mints) in [dependency_mints, package_mints].into_iter().enumerate() {
+        let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = phase_mints
+            .into_iter()
+            .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
+        for mint in namespaces.into_iter().chain(bodies) {
+            let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
+                Origin::Std => std_scope_id,
+                Origin::Pkg => pkg_scope_id,
+                Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
+            };
+            match mint {
+                DeferredMint::Namespace {
                     origin,
                     name,
-                    origin_scope_id,
-                    global_scope_id,
+                    children,
+                } => {
+                    let origin_scope_id = origin_scope_of(&analyzer, origin);
+                    let module_id = ensure_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut deferred_requests,
+                        origin,
+                        name,
+                        origin_scope_id,
+                        global_scope_id,
+                    );
+                    analyzer.namespace_only_modules.insert(module_id, children);
+                    if origin == Origin::Pkg {
+                        pkg_module_names.insert(name);
+                    }
+                }
+                DeferredMint::EntryAlias { name } => {
+                    let module_id = analyzer.new_entity_id();
+                    analyzer.modules.insert(
+                        module_id,
+                        Module {
+                            id: module_id,
+                            name,
+                            body: (Vec::new(), global_scope_id),
+                        },
+                    );
+                    analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+                    analyzer.source_ranges.push(SourceRange {
+                        start: module_id.0,
+                        end: module_id.0 + 1,
+                        source: SourceId(0),
+                    });
+                    analyzer
+                        .expr_id_to_expr_map
+                        .insert(module_id, Expr::Module(module_id));
+                    analyzer
+                        .mut_scope_for_scope_id(pkg_scope_id)
+                        .name_to_id_map
+                        .insert(name, module_id);
+                }
+                DeferredMint::Body {
+                    origin,
+                    name,
                     module_source_id,
                     directory_holds_a_lib_body,
+                    loaded_index,
+                } => {
+                    let origin_scope_id = origin_scope_of(&analyzer, origin);
+                    let module_scope_id = mint_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut deferred_requests,
+                        &mut module_scopes,
+                        &mut pkg_module_names,
+                        origin,
+                        name,
+                        origin_scope_id,
+                        global_scope_id,
+                        module_source_id,
+                        directory_holds_a_lib_body,
+                    );
+                    loaded[loaded_index].3 = Some(module_scope_id);
+                }
+            }
+        }
+        if phase == 0 {
+            // M152: the dependencies' modules, then each dependency's `lib.vl`
+            // into its own namespace (its public surface), mirroring the `std` lib
+            // walk above.
+            for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
+                if !matches!(origin, Origin::Dep(_)) {
+                    continue;
+                }
+                let module_scope_id =
+                    module_scope_id.expect("M144: a dependency's node is minted above");
+                walk_module(
+                    &mut analyzer,
+                    ast,
+                    text,
+                    module_scope_id,
+                    *source_id,
+                    *origin,
                 );
-                loaded[loaded_index].3 = Some(module_scope_id);
+            }
+            for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in
+                &dependency_lib_walks
+            {
+                analyzer.set_current_source(*source_id);
+                analyzer.module_scope_ids.insert(*namespace_scope_id);
+                let start = analyzer.entity_id;
+                analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
+                analyzer.source_ranges.push(SourceRange {
+                    start,
+                    end: analyzer.entity_id,
+                    source: *source_id,
+                });
+                // Macro-generated items (derives included) walk into the lib's
+                // namespace — or into the inline `mod` that declared the deriving
+                // item (B201).
+                for generated in generated_by_source.get(source_id).into_iter().flatten() {
+                    let scope_id = analyzer
+                        .declaring_module_scope(*namespace_scope_id, &generated.module_path);
+                    analyzer.walk_generated_expansion(
+                        generated.nodes,
+                        scope_id,
+                        generated.origin,
+                        *source_id,
+                    );
+                }
             }
         }
     }
@@ -86276,9 +86531,10 @@ fn analyze_inner<'src>(
                 .push((module_scope_id, path.to_string(), *source_id));
         }
     }
-    // M144: the non-std modules walk after their nodes.
+    // M144: the package's modules walk after their nodes (a dependency's
+    // walked with its own, M152).
     for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
-        if *origin == Origin::Std {
+        if *origin != Origin::Pkg {
             continue;
         }
         let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
@@ -86290,32 +86546,6 @@ fn analyze_inner<'src>(
             *source_id,
             *origin,
         );
-    }
-    // Walk each dependency's `lib.vl` into its own namespace (its public surface),
-    // mirroring the `std` lib walk above.
-    for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in &dependency_lib_walks
-    {
-        analyzer.set_current_source(*source_id);
-        analyzer.module_scope_ids.insert(*namespace_scope_id);
-        let start = analyzer.entity_id;
-        analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
-        analyzer.source_ranges.push(SourceRange {
-            start,
-            end: analyzer.entity_id,
-            source: *source_id,
-        });
-        // Macro-generated items (derives included) walk into the lib's namespace
-        // — or into the inline `mod` that declared the deriving item (B201).
-        for generated in generated_by_source.get(source_id).into_iter().flatten() {
-            let scope_id =
-                analyzer.declaring_module_scope(*namespace_scope_id, &generated.module_path);
-            analyzer.walk_generated_expansion(
-                generated.nodes,
-                scope_id,
-                generated.origin,
-                *source_id,
-            );
-        }
     }
     // Remember `panic` so its calls can be typed as never and lowered to a throw.
     if let Some(io_scope_id) = module_scopes.get("io") {

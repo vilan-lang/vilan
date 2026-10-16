@@ -1567,3 +1567,93 @@ fn a_keystroke_rewalks_its_hot_set_and_nothing_else() {
          pins above are vacuous: leaf {leaf:?}, cycle {cycle:?}, hub {hub:?}"
     );
 }
+
+/// **M152's gate** (std-prefix door (b)): a program with DEPENDENCIES — the
+/// hand-written two-package fixture and `examples/fullstack`'s two members —
+/// in every state of its script, applied and undone, answers what the
+/// canonical clean analysis answers and emits what a clean analysis of the
+/// same shape emits, three ways: S1's hot sets alone (the default), the std
+/// prefix FORCED ON — the world stored is std plus the dependency tier, and
+/// only the package is hot — and the prefix LAYERED under the world build.
+/// Non-vacuous: every analysis of the forced leg is a prefix world (the
+/// `dependencies` refusal is retired), the prefix is SERVED to the next
+/// state, and nothing refuses it.
+#[test]
+fn m152_programs_with_dependencies_answer_what_a_clean_analysis_answers() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    let mut divergences = Vec::new();
+    let mut forced = Vec::new();
+    let mut layered = Vec::new();
+    for mode in ["hot sets", "forced prefix", "layered prefix"] {
+        vilan_core::analyzer::base_cache_clear();
+        match mode {
+            "forced prefix" => vilan_core::incremental::set_std_prefix(Some(true)),
+            "layered prefix" => vilan_core::incremental::set_std_prefix_layering(Some(true)),
+            _ => {}
+        }
+        for fixture in DEPENDENCY_FIXTURES {
+            let mut package = fixture.write();
+            let seed = package.path(fixture.edits[0].file);
+            let first = observe(&package, vec![seed], Leg::Incremental);
+            let clean = observe(&package, Vec::new(), Leg::Clean);
+            if first.rendering != clean.rendering {
+                divergences.push(format!(
+                    "{} ({mode}): the first analysis differs from the clean one at {}",
+                    fixture.name,
+                    first_difference(&first.rendering, &clean.rendering)
+                ));
+            }
+            let mut step = Vec::new();
+            for edit in fixture.edits {
+                let mut found = Vec::new();
+                step.extend(replay(&mut package, edit, &mut found));
+                divergences.extend(found.into_iter().map(|found| format!("({mode}) {found}")));
+            }
+            match mode {
+                "forced prefix" => {
+                    forced.push(first.census);
+                    forced.extend(step);
+                }
+                "layered prefix" => layered.extend(step),
+                _ => {}
+            }
+            package.remove();
+        }
+        vilan_core::incremental::set_std_prefix(None);
+        vilan_core::incremental::set_std_prefix_layering(None);
+    }
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        divergences.is_empty(),
+        "{} step(s) of the dependency scripts observe the reuse:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let refusals: Vec<&'static str> = forced
+        .iter()
+        .filter_map(|census| census.prefix_refusal)
+        .collect();
+    assert!(
+        refusals.is_empty() && forced.iter().all(|census| census.prefix_world),
+        "every forced analysis of a program with dependencies is a prefix world, refusing \
+         nothing: refusals {refusals:?}, {} of {} prefix worlds",
+        forced.iter().filter(|census| census.prefix_world).count(),
+        forced.len()
+    );
+    let prefix_hits: u64 = forced.iter().map(|census| census.prefix_hits).sum();
+    assert!(
+        prefix_hits >= 4,
+        "the std-and-dependencies prefix must be served to later states ({prefix_hits} hits)"
+    );
+    let layered_builds = layered
+        .iter()
+        .filter(|census| census.prefix_layered)
+        .count();
+    assert!(
+        layered_builds >= 1,
+        "the layered leg must build a world over the prefix ({layered_builds} did)"
+    );
+}
