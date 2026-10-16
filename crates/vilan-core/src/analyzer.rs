@@ -6435,6 +6435,13 @@ pub struct Analyzer<'src> {
     #[serde(skip)]
     const_walk_depth: u32,
     const_walk_entities: Vec<Id>,
+    /// M152: the entity ranges the dependencies' ROOT `lib.vl` walks minted
+    /// (generated expansions included), and where the entry file's walk began
+    /// — what [`Program::canonical_declaration_key`] reads to keep spec §7.1's
+    /// declaration order (dependency roots after the entry package's modules)
+    /// now that a dependency walks whole before the package.
+    dependency_root_ranges: Vec<(u32, u32)>,
+    entry_walk_start: Option<u32>,
     /// G24: the INITIALIZER expression of every `const let NAME = EXPR;`, a
     /// subset of `const_exprs`. The binding is an ordinary `let` whose value
     /// the build computes; what the marker adds over `let x = const e` is the
@@ -8390,6 +8397,8 @@ impl<'src> Analyzer<'src> {
             const_exprs: Vec::new(),
             const_walk_depth: 0,
             const_walk_entities: Vec::new(),
+            dependency_root_ranges: Vec::new(),
+            entry_walk_start: None,
             const_let_initializers: HashSet::default(),
             const_functions: HashSet::default(),
             walk_depth: 0,
@@ -74770,6 +74779,10 @@ pub struct Program<'src> {
     /// the const pass's local-reference index reads these (`const_eval.rs`'s
     /// `LocalIndex`) instead of scanning the whole entity map.
     pub const_walk_entities: Vec<Id>,
+    /// M152: the dependencies' root `lib.vl` walks' entity ranges and the
+    /// entry walk's first id ([`Program::canonical_declaration_key`]).
+    pub dependency_root_ranges: Vec<(u32, u32)>,
+    pub entry_walk_start: Option<u32>,
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
     /// the transformer serializes these in place of the expressions.
     pub const_results: HashMap<Id, crate::interpreter::ConstValue>,
@@ -76090,6 +76103,31 @@ impl<'src> Program<'src> {
         self.trait_method_memo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The canonical DECLARATION order's key (spec §7.1, `b33-emission-order.md`):
+    /// a declaration's entity id, after its walk's tier — std's modules and
+    /// root, the dependencies' modules and the entry package's modules (tier 0,
+    /// by id), then the dependencies' ROOT `lib.vl`s in manifest order (tier
+    /// 1), then the entry file (tier 2). Module-level initialization and
+    /// function emission sort by it. Before M152 the walk order WAS this order
+    /// and the raw id served; a dependency now walks whole — its root included
+    /// — before the package's first node mints (the layout a
+    /// std-and-dependencies prefix holds), so the roots' tier is named here
+    /// rather than read off the id.
+    pub(crate) fn canonical_declaration_key(&self, id: Id) -> u64 {
+        let tier: u64 = if self.entry_walk_start.is_some_and(|start| id.0 >= start) {
+            2
+        } else if self
+            .dependency_root_ranges
+            .iter()
+            .any(|(start, end)| id.0 >= *start && id.0 < *end)
+        {
+            1
+        } else {
+            0
+        };
+        (tier << 32) | u64::from(id.0)
     }
 
     /// `async_infer`'s per-(receiver, member) selection memo (M133), read
@@ -86769,6 +86807,7 @@ fn analyze_inner<'src>(
             for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in
                 &dependency_lib_walks
             {
+                let root_start = analyzer.entity_id;
                 analyzer.set_current_source(*source_id);
                 analyzer.module_scope_ids.insert(*namespace_scope_id);
                 let start = analyzer.entity_id;
@@ -86791,6 +86830,9 @@ fn analyze_inner<'src>(
                         *source_id,
                     );
                 }
+                analyzer
+                    .dependency_root_ranges
+                    .push((root_start, analyzer.entity_id));
             }
         }
     }
@@ -87769,6 +87811,7 @@ fn analyze_over_world<'src>(
             analyzer.select_platform_twins(&nodes.0, entry_text);
         }
         let entry_walk_start = analyzer.entity_id;
+        analyzer.entry_walk_start = Some(entry_walk_start);
         analyzer.walk_module_items(&nodes.0, global_scope_id);
         analyzer.source_ranges.push(SourceRange {
             start: entry_walk_start,
@@ -89815,6 +89858,8 @@ fn analyze_over_world<'src>(
         asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),
         const_walk_entities: analyzer.const_walk_entities.clone(),
+        dependency_root_ranges: analyzer.dependency_root_ranges.clone(),
+        entry_walk_start: analyzer.entry_walk_start,
         const_results: HashMap::default(),
         const_let_initializers: analyzer.const_let_initializers.clone(),
         const_functions: analyzer.const_functions.clone(),
