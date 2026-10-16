@@ -23,6 +23,14 @@ written down.
 -->
 
 
+## v0.51.1 — 2026-10-16
+
+> Performance: this release was cut over a performance verdict that was not green (no performance verdict at cf8d4247 (perf-cf8d4247ec35ff4d5972ddcc2a1317758dfdffef.json) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine). the patch changes the VS Code debug adapter, its session test and the transformer's source-map MARKS only (the emitted JavaScript and the corpus are byte-identical); no compiler path moved, so the seal's perf leg was not re-run on the patch branch - v0.51.0's verdict (9716b72f) stands for it
+
+<!-- commit: e79fec2d -->
+<!-- family: fix -->
+**E331: debugging a `vilan run --watch` server in VS Code no longer ends the session at the first file change — the debugger re-attaches to every round, as it did for a lone script.** The owner's F5 check of v0.51.0 on kolt's server (`"watch": true`, the default integrated terminal) found the session ending at the round boundary. vilan-dap learns `vilan run`'s pid from the round's node (`process.ppid`) when the editor's terminal answers with its shell's pid only, which VS Code's does; it asked before node had bootstrapped, where `process.pid` and `process.ppid` read `null`, and between rounds — while `vilan run` rebuilt and no inspector listened — its liveness check read that `null` as `vilan run` gone and ended the session. The pids are now read at the program's first line and kept only when they are process ids, and an unknown pid is never taken for a dead one; ending a watch session now stops the round's server too (its pid was the same `null`, so the server outlived the session and held its port). An async `main`'s frame is now `main`'s (it runs in an arrow the script calls; that arrow's head is mapped at `main`, and the sidecar's record carries the place), so its bindings print by type. Pins: `editors/vscode` `src/test/session.test.ts` "a two-leg server under --watch in a terminal re-attaches across a round" (a package of two legs like kolt's, its server running, launched in a terminal answered as VS Code answers: re-attached across a round, no `terminated` between rounds, the frame `main` with `origin: Point = Point { x = 1, y = 2 }`, the last round's server stopped with the session; red with the old pid read), the test client's `runInTerminal` now answering with the shell's pid as VS Code does; `vilan-core` `source_maps::e331_an_async_mains_frame_is_found_at_its_arrow`. Reproduced first on a kolt copy through the scripted client: `terminated` 0.2 s after the change, round 2 never attached. Tracker E331.
+
 ## v0.51.0 — 2026-10-16
 
 <!-- family: miscompile -->
