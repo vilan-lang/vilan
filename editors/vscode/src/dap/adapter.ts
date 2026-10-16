@@ -55,6 +55,7 @@ export interface AdapterLaunchArguments {
 export const INSPECT_HOST = '127.0.0.1';
 
 /// What node writes to stderr about its inspector, a line at a time.
+const WAITING_FOR_DISCONNECT = /^Waiting for the debugger to disconnect\.\.\.\r?$/m;
 const INSPECTOR_BANNER =
     /^(?:Debugger listening on ws:\/\/\S+|For help, see: https:\/\/nodejs\.org\/en\/docs\/inspector|Debugger attached\.|Waiting for the debugger to disconnect\.\.\.)\r?\n/gm;
 const THREAD_ID = 1;
@@ -296,6 +297,11 @@ export class VilanDebugAdapter {
             child.stderr?.on('data', (text: string) => {
                 // node's own lines about the inspector this adapter is: the
                 // debug console is the program's.
+                if (WAITING_FOR_DISCONNECT.test(text)) {
+                    // The same end once more, as node writes it: the one
+                    // signal no inspector protocol detail can lose.
+                    this.programEnded();
+                }
                 const shown = text.replace(INSPECTOR_BANNER, '');
                 if (shown) {
                     this.output('stderr', shown);
@@ -368,6 +374,7 @@ export class VilanDebugAdapter {
         this.round++;
         this.scripts = new Map();
         this.contexts = new Set();
+        this.mainContext = undefined;
         const initial = new Promise<void>((resolve) => (this.initialPause = resolve));
         const cdp = await CdpSession.connect(
             url,
@@ -382,6 +389,7 @@ export class VilanDebugAdapter {
         );
         this.cdp = cdp;
         await cdp.send('Runtime.enable');
+        await cdp.send('NodeRuntime.notifyWhenWaitingForDisconnect', { enabled: true }).catch(() => undefined);
         await cdp.send('Debugger.enable');
         await cdp.send('Debugger.setAsyncCallStackDepth', { maxDepth: 32 }).catch(() => undefined);
         await cdp.send('Debugger.setPauseOnExceptions', { state: this.exceptions });
@@ -410,6 +418,23 @@ export class VilanDebugAdapter {
 
     private initialPause: (() => void) | undefined;
     private contexts = new Set<number>();
+    private mainContext: number | undefined;
+
+    /// The round's program has run to its end and node waits for the
+    /// debugger to disconnect: disconnect. A plain run then ends with
+    /// `vilan run`; if `vilan` has not exited a few seconds later, the session
+    /// ends anyway rather than waiting on it.
+    private programEnded(): void {
+        this.cdp?.close();
+        if (!this.launch?.watch) {
+            setTimeout(() => {
+                if (!this.finished) {
+                    this.kill();
+                    this.finish();
+                }
+            }, 5000).unref();
+        }
+    }
 
     private onCdpEvent(method: string, params: any): void {
         switch (method) {
@@ -419,16 +444,26 @@ export class VilanDebugAdapter {
             case 'Debugger.paused':
                 void this.onPaused(params);
                 break;
-            case 'Runtime.executionContextCreated':
-                this.contexts.add(params.context?.id);
-                break;
-            case 'Runtime.executionContextDestroyed':
+            case 'NodeRuntime.waitingForDisconnect':
                 // The program ran to its end: node holds the process open
                 // ("Waiting for the debugger to disconnect") until the
-                // debugger lets go, so let go.
+                // debugger lets go, so let go. Asked for at attach
+                // (`NodeRuntime.notifyWhenWaitingForDisconnect`): node then
+                // sends this instead of destroying the main context.
+                this.programEnded();
+                break;
+            case 'Runtime.executionContextCreated':
+                this.contexts.add(params.context?.id);
+                if (params.context?.auxData?.isDefault) {
+                    this.mainContext = params.context.id;
+                }
+                break;
+            case 'Runtime.executionContextDestroyed':
+                // The same end, from a node without the `NodeRuntime` domain:
+                // its main context goes.
                 this.contexts.delete(params.executionContextId);
-                if (this.contexts.size === 0) {
-                    this.cdp?.close();
+                if (params.executionContextId === this.mainContext || this.contexts.size === 0) {
+                    this.programEnded();
                 }
                 break;
             default:
