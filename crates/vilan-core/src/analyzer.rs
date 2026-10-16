@@ -82617,6 +82617,44 @@ enum DiscoveredModule {
     },
 }
 
+/// M144: a NON-STD module whose NODE — its entity, its item scope, its binding
+/// in its package's namespace — mints after std has walked, so that every std
+/// id is a function of the std module set alone (`std-prefix.md` §3, §4.1).
+///
+/// B603 put std's module nodes first and std's WALK first, but every module of
+/// the program still registered its node before any walk, so a std item's
+/// entity id moved with the package's module count: `basename` was `Id(8149)`
+/// in a single-file program and `Id(8151)` beside two sibling modules, and the
+/// native backend — whose names carry ids — emitted two programs for one std.
+/// The drain now registers a non-std module's SOURCE at discovery (its
+/// `SourceId`, its text, its package, its parse diagnostics: nothing that
+/// mints an entity or a scope) and holds the node back here; std's modules
+/// mint and walk as before, then these mint in the order the hot load mints a
+/// package over a stored prefix (`load_hot_modules`: the pure namespaces,
+/// then the modules), then walk. The canonical world and the std-prefix world
+/// therefore lay out one program's ids identically.
+enum DeferredMint<'src> {
+    /// A pure namespace (`DiscoveredModule::Namespace`).
+    Namespace {
+        origin: Origin,
+        name: &'src str,
+        children: Vec<String>,
+    },
+    /// The `pkg::<entry>` alias (`DiscoveredModule::EntryAlias`): an entity
+    /// whose body is the entry's own global scope.
+    EntryAlias { name: &'src str },
+    /// A module with a body, registered as a source already: `loaded_index`
+    /// is its row in the drain's `loaded` list, whose scope id this mint
+    /// fills in.
+    Body {
+        origin: Origin,
+        name: &'src str,
+        module_source_id: SourceId,
+        directory_holds_a_lib_body: bool,
+        loaded_index: usize,
+    },
+}
+
 /// A65: the entity a module PATH denotes, created if this analysis has not
 /// met it yet — the parent chain first, so `lib::ui` exists before
 /// `lib::ui::widget` registers under it.
@@ -82703,6 +82741,129 @@ fn module_children_scope(analyzer: &mut Analyzer<'_>, module_id: Id, global_scop
     let scope_id = analyzer.push_scope(scope);
     analyzer.module_children_scopes.insert(module_id, scope_id);
     scope_id
+}
+
+/// The NODE of a module with a body — the drain's body arm, and since M144 the
+/// deferred non-std mint ([`DeferredMint::Body`]): its item scope, its entity
+/// (or the namespace node a child created first, adopted — A65), its location
+/// row, its binding in its package's namespace — the origin's root scope for a
+/// top-level module, the parent module's children scope for a nested one — and
+/// the per-origin indexes the primitive captures (`module_scopes`, std only:
+/// a user module named `io` must not shadow the real one) and the
+/// entry-expansion hoist (`pkg_module_names`, M21) read. Returns the module's
+/// scope id. What it does NOT do is register the SOURCE: that is discovery's,
+/// and it mints nothing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drain's per-module state, threaded through one mint"
+)]
+fn mint_module_node<'src>(
+    analyzer: &mut Analyzer<'src>,
+    module_nodes: &mut HashMap<(Origin, &'src str), Id>,
+    to_load: &mut Vec<(Origin, &'src str)>,
+    module_scopes: &mut HashMap<&'src str, Id>,
+    pkg_module_names: &mut HashSet<&'src str>,
+    origin: Origin,
+    name: &'src str,
+    origin_scope_id: Id,
+    global_scope_id: Id,
+    module_source_id: SourceId,
+    directory_holds_a_lib_body: bool,
+) -> Id {
+    let module_scope = analyzer.create_scope(Some(global_scope_id));
+    let module_scope_id = analyzer.push_scope(module_scope);
+    // A65: a module already has an entity when a CHILD of it loaded first
+    // (`lib/util.vl` before `lib/lib.vl`) — adopt that node, so the children
+    // already registered under it stay reachable and `pkg::lib` and
+    // `pkg::lib::util` name one `lib`. Otherwise this is the flat path the
+    // loader has always taken, id for id.
+    let adopted = module_nodes.get(&(origin, name)).copied();
+    let module_id = adopted.unwrap_or_else(|| analyzer.new_entity_id());
+    analyzer.modules.insert(
+        module_id,
+        Module {
+            id: module_id,
+            name: module_leaf_name(name),
+            body: (Vec::new(), module_scope_id),
+        },
+    );
+    // A body: whatever the directory probe concluded before it loaded is no
+    // longer true.
+    analyzer.namespace_only_modules.remove(&module_id);
+    if directory_holds_a_lib_body {
+        analyzer.modules_bodied_by_a_lib_file.insert(module_id);
+    }
+    // Give the module entity a location (its file, at the top) so a path
+    // segment naming it can go-to-definition. A one-id range maps it to its
+    // source; the span is the file start.
+    //
+    // B335: an ADOPTED node already HAS a one-id range — the namespace
+    // placeholder `ensure_module_node` attributed to the entry, because a
+    // namespace has no file of its own. Pushing a second range for the same
+    // id left `source_of` (which takes the FIRST range that contains an id)
+    // answering the ENTRY for every module that owns both `x.vl` and `x/`,
+    // so `program.source_of(segment)` named the importing file — and
+    // `import_module_is_used` (E168/E169) asks exactly that, so Organize
+    // Imports was reading the wrong file. It also made `source_ranges`
+    // non-disjoint, which silently demoted `source_lookup` to the linear scan
+    // M27 exists to avoid. Corrected IN PLACE: the module has a file now, and
+    // the placeholder is the row that should say so.
+    analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+    match analyzer
+        .source_ranges
+        .iter_mut()
+        .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
+    {
+        Some(placeholder) => placeholder.source = module_source_id,
+        None => analyzer.source_ranges.push(SourceRange {
+            start: module_id.0,
+            end: module_id.0 + 1,
+            source: module_source_id,
+        }),
+    }
+    analyzer
+        .expr_id_to_expr_map
+        .insert(module_id, Expr::Module(module_id));
+    // Register the module under its package's namespace: entry modules in
+    // `pkg`, `std` modules in `std`, a dependency's in its own — so no
+    // package's modules collide with or shadow another's (E.10: a local
+    // `ui.vl` and `std::web::ui` coexist, each reachable through its root).
+    //
+    // A65: "its package's namespace" is the origin's root scope for a
+    // top-level module and its PARENT module's submodule scope for a nested
+    // one — `lib/util.vl` is a member of `lib`, not of `pkg`.
+    let namespace_scope_id = match name.rfind("::") {
+        None => origin_scope_id,
+        Some(cut) => {
+            let parent_id = ensure_module_node(
+                analyzer,
+                module_nodes,
+                to_load,
+                origin,
+                &name[..cut],
+                origin_scope_id,
+                global_scope_id,
+            );
+            module_children_scope(analyzer, parent_id, global_scope_id)
+        }
+    };
+    module_nodes.insert((origin, name), module_id);
+    analyzer
+        .mut_scope_for_scope_id(namespace_scope_id)
+        .name_to_id_map
+        .insert(module_leaf_name(name), module_id);
+    if origin == Origin::Std {
+        module_scopes.insert(name, module_scope_id);
+    }
+    if origin == Origin::Pkg {
+        pkg_module_names.insert(name);
+        // A65: and the directory it sits under, which is the segment a
+        // generated `pkg::lib::util` reference is checked by.
+        if let Some(cut) = name.find("::") {
+            pkg_module_names.insert(&name[..cut]);
+        }
+    }
+    module_scope_id
 }
 
 /// M110 S0/S1 (`incremental-analysis.md` §4.1, ruled Q2): the HOT SET of an
@@ -83993,7 +84154,10 @@ fn analyze_inner<'src>(
     // items (or `None`), walked into the module's scope after its body — the general
     // form of the entry's derive expansion, so a derived type imported from another
     // module has its `to_json`/`from_json`/... like one defined in the entry.
-    let mut loaded: Vec<(&str, &Spanned<NodeList>, &str, Id, SourceId, Origin)> = Vec::new();
+    // M144: the scope id is `None` for a non-std module until its node mints
+    // after std's walk ([`DeferredMint`]); every reader of it runs after that.
+    let mut loaded: Vec<(&str, &Spanned<NodeList>, &str, Option<Id>, SourceId, Origin)> =
+        Vec::new();
     // The entry program's package root (`pkg_root`, passed in): the directory its
     // `import pkg::..` siblings live in. When it is one of `std`'s own layer roots
     // we're compiling std itself (or a std file opened in an editor), so every
@@ -84384,6 +84548,9 @@ fn analyze_inner<'src>(
     // the output. `counters::late_round_mints` counts them (a std-prefix P3 key
     // check, closed over WRITTEN imports, refuses a world that grew this way).
     let mut drain_round: u32 = 0;
+    // M144: the non-std module NODES, held back until std has walked (see
+    // [`DeferredMint`]); their sources register at discovery like every other.
+    let mut deferred_mints: Vec<DeferredMint<'src>> = Vec::new();
     loop {
         // Canonical drain (WO-1b, completed by B603 — `std-prefix.md` §4.1): the
         // load order, and therefore every module node, `SourceId`, scope and walk
@@ -84602,6 +84769,15 @@ fn analyze_inner<'src>(
                     Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
                 };
                 let (resolution, parsed) = match module {
+                    // M144: a non-std namespace's node mints after std's walk.
+                    DiscoveredModule::Namespace(children) if origin != Origin::Std => {
+                        deferred_mints.push(DeferredMint::Namespace {
+                            origin,
+                            name,
+                            children,
+                        });
+                        continue;
+                    }
                     DiscoveredModule::Namespace(children) => {
                         let module_id = ensure_module_node(
                             &mut analyzer,
@@ -84629,28 +84805,10 @@ fn analyze_inner<'src>(
                         // instead: `pkg::<entry>::Name` then resolves to the entry's own
                         // declaration, which is exactly what the import asked for, and
                         // nothing is loaded, walked, or typed twice.
-                        let module_id = analyzer.new_entity_id();
-                        analyzer.modules.insert(
-                            module_id,
-                            Module {
-                                id: module_id,
-                                name,
-                                body: (Vec::new(), global_scope_id),
-                            },
-                        );
-                        analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                        analyzer.source_ranges.push(SourceRange {
-                            start: module_id.0,
-                            end: module_id.0 + 1,
-                            source: SourceId(0),
-                        });
-                        analyzer
-                            .expr_id_to_expr_map
-                            .insert(module_id, Expr::Module(module_id));
-                        analyzer
-                            .mut_scope_for_scope_id(pkg_scope_id)
-                            .name_to_id_map
-                            .insert(name, module_id);
+                        //
+                        // M144: the alias is a package node, so its entity mints
+                        // after std's walk with the rest of them.
+                        deferred_mints.push(DeferredMint::EntryAlias { name });
                         // The name is resolvable in `pkg` now, so the entry-expansion
                         // hoist must not rebuild the world for a generated reference
                         // to it (M21's "a module this world never loaded" rule).
@@ -84929,112 +85087,12 @@ fn analyze_inner<'src>(
                     }
                 };
                 analyzer.source_texts.push((module_source_id, module_text));
-                let module_scope = analyzer.create_scope(Some(global_scope_id));
-                let module_scope_id = analyzer.push_scope(module_scope);
-                // A65: a module already has an entity when a CHILD of it loaded
-                // first (`lib/util.vl` before `lib/lib.vl`) — adopt that node, so
-                // the children already registered under it stay reachable and
-                // `pkg::lib` and `pkg::lib::util` name one `lib`. Otherwise this is
-                // the flat path the loader has always taken, id for id.
-                let adopted = module_nodes.get(&(origin, name)).copied();
-                let module_id = adopted.unwrap_or_else(|| analyzer.new_entity_id());
-                analyzer.modules.insert(
-                    module_id,
-                    Module {
-                        id: module_id,
-                        name: module_leaf_name(name),
-                        body: (Vec::new(), module_scope_id),
-                    },
-                );
-                // A body: whatever the directory probe concluded before it loaded is
-                // no longer true.
-                analyzer.namespace_only_modules.remove(&module_id);
-                if directory_holds_a_lib_body {
-                    analyzer.modules_bodied_by_a_lib_file.insert(module_id);
-                }
-                // Give the module entity a location (its file, at the top) so a path
-                // segment naming it can go-to-definition. A one-id range maps it to its
-                // source; the span is the file start.
-                //
-                // B335: an ADOPTED node already HAS a one-id range — the namespace
-                // placeholder `ensure_module_node` attributed to the entry, because
-                // a namespace has no file of its own. Pushing a second range for
-                // the same id left `source_of` (which takes the FIRST range that
-                // contains an id) answering the ENTRY for every module that owns
-                // both `x.vl` and `x/`, so `program.source_of(segment)` named the
-                // importing file — and `import_module_is_used` (E168/E169) asks
-                // exactly that, so Organize Imports was reading the wrong file. It
-                // also made `source_ranges` non-disjoint, which silently demoted
-                // `source_lookup` to the linear scan M27 exists to avoid. Corrected
-                // IN PLACE: the module has a file now, and the placeholder is the
-                // row that should say so.
-                analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                match analyzer
-                    .source_ranges
-                    .iter_mut()
-                    .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
-                {
-                    Some(placeholder) => placeholder.source = module_source_id,
-                    None => analyzer.source_ranges.push(SourceRange {
-                        start: module_id.0,
-                        end: module_id.0 + 1,
-                        source: module_source_id,
-                    }),
-                }
-                analyzer
-                    .expr_id_to_expr_map
-                    .insert(module_id, Expr::Module(module_id));
-                // Register the module under its package's namespace: entry modules in
-                // `pkg`, `std` modules in `std`, a dependency's in its own — so no
-                // package's modules collide with or shadow another's (E.10: a local
-                // `ui.vl` and `std::web::ui` coexist, each reachable through its root).
-                //
-                // A65: "its package's namespace" is the origin's root scope for a
-                // top-level module and its PARENT module's submodule scope for a
-                // nested one — `lib/util.vl` is a member of `lib`, not of `pkg`.
-                let namespace_scope_id = match name.rfind("::") {
-                    None => origin_scope_id,
-                    Some(cut) => {
-                        let parent_id = ensure_module_node(
-                            &mut analyzer,
-                            &mut module_nodes,
-                            &mut to_load,
-                            origin,
-                            &name[..cut],
-                            origin_scope_id,
-                            global_scope_id,
-                        );
-                        module_children_scope(&mut analyzer, parent_id, global_scope_id)
-                    }
-                };
-                module_nodes.insert((origin, name), module_id);
-                analyzer
-                    .mut_scope_for_scope_id(namespace_scope_id)
-                    .name_to_id_map
-                    .insert(module_leaf_name(name), module_id);
-                // `module_scopes` indexes std modules by name for the primitive and
-                // `panic` captures below; other packages' modules must not enter it (a
-                // user or dependency module named `string`/`io`/`json`/... would shadow
-                // the real one and break those captures).
-                if origin == Origin::Std {
-                    module_scopes.insert(name, module_scope_id);
-                }
-                // M21: the entry package's own modules, for the entry-expansion
-                // hoist's "is it already here?" question. A dependency's modules
-                // are not `pkg::` from the entry, so they are not in this set.
-                if origin == Origin::Pkg {
-                    pkg_module_names.insert(name);
-                    // A65: and the directory it sits under, which is the segment a
-                    // generated `pkg::lib::util` reference is checked by.
-                    if let Some(cut) = name.find("::") {
-                        pkg_module_names.insert(&name[..cut]);
-                    }
-                }
-                // Record which package this module's source belongs to, so its imports
-                // resolve `pkg::`/`<dep>::` relative to that package. Std sources always
-                // map (their `pkg::` siblings are std's); entry sources only when the
-                // program has dependencies (otherwise the legacy global resolution
-                // applies, and the global `pkg` namespace is theirs alone).
+                // Which package this module's source belongs to, so its imports
+                // resolve `pkg::`/`<dep>::` relative to that package. Std sources
+                // always map (their `pkg::` siblings are std's); entry sources only
+                // when the program has dependencies (otherwise the legacy global
+                // resolution applies, and the global `pkg` namespace is theirs
+                // alone). A fact about the SOURCE, so it is recorded at discovery.
                 match origin {
                     Origin::Std => {
                         analyzer
@@ -85051,6 +85109,34 @@ fn analyze_inner<'src>(
                     }
                     Origin::Pkg => {}
                 }
+                // M144: a std module's node mints here, in the drain's canonical
+                // order; a non-std node waits for std's walk ([`DeferredMint`]),
+                // and the scope id its row in `loaded` carries is filled in then.
+                let module_scope_id = match origin {
+                    Origin::Std => Some(mint_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut to_load,
+                        &mut module_scopes,
+                        &mut pkg_module_names,
+                        origin,
+                        name,
+                        origin_scope_id,
+                        global_scope_id,
+                        module_source_id,
+                        directory_holds_a_lib_body,
+                    )),
+                    Origin::Pkg | Origin::Dep(_) => {
+                        deferred_mints.push(DeferredMint::Body {
+                            origin,
+                            name,
+                            module_source_id,
+                            directory_holds_a_lib_body,
+                            loaded_index: loaded.len(),
+                        });
+                        None
+                    }
+                };
                 loaded.push((
                     name,
                     ast,
@@ -85395,15 +85481,176 @@ fn analyze_inner<'src>(
         }
     }
 
-    // Every loaded module's importable names, read syntactically before any
+    // One module's walk: its items into its scope, then the macro-generated
+    // items (derives included — expansion is unified) into the DECLARING scope
+    // right after its body, so they see its types: the module's own scope, or
+    // the inline `mod` the deriving item was written inside (B201).
+    let walk_module = |analyzer: &mut Analyzer<'src>,
+                       ast: &'src Spanned<NodeList<'src>>,
+                       text: &'src str,
+                       module_scope_id: Id,
+                       source_id: SourceId,
+                       origin: Origin| {
+        analyzer.set_current_source(source_id);
+        analyzer.module_scope_ids.insert(module_scope_id);
+        // F27 R3: twins are userland's (std's are layer twins, a file each).
+        if !matches!(origin, Origin::Std) {
+            analyzer.select_platform_twins(&ast.0, text);
+        }
+        let start = analyzer.entity_id;
+        analyzer.walk_module_items(&ast.0, module_scope_id);
+        analyzer.source_ranges.push(SourceRange {
+            start,
+            end: analyzer.entity_id,
+            source: source_id,
+        });
+        for generated in generated_by_source.get(&source_id).into_iter().flatten() {
+            let scope_id = analyzer.declaring_module_scope(module_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                source_id,
+            );
+        }
+    };
+    // M144: std walks FIRST — its modules, then its `lib.vl` — while no non-std
+    // node exists yet, so std's walk ids follow std's own nodes and nothing
+    // else. The non-std nodes mint after it (below), in the order the hot load
+    // mints a package over a stored prefix (`load_hot_modules`: the pure
+    // namespaces, then the modules), and walk last; the canonical layout and
+    // the std-prefix layout are therefore one layout, and a std item's id is
+    // a function of the std module set alone (`std-prefix.md` §3).
+    for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
+        if *origin != Origin::Std {
+            continue;
+        }
+        let module_scope_id =
+            module_scope_id.expect("M144: a std module's node is minted by the drain");
+        walk_module(
+            &mut analyzer,
+            ast,
+            text,
+            module_scope_id,
+            *source_id,
+            *origin,
+        );
+    }
+    if let Some(lib_ast) = lib_ast {
+        analyzer.set_current_source(lib_source_id);
+        analyzer.module_scope_ids.insert(std_scope_id);
+        let start = analyzer.entity_id;
+        analyzer.walk_module_items(&lib_ast.0, std_scope_id);
+        analyzer.source_ranges.push(SourceRange {
+            start,
+            end: analyzer.entity_id,
+            source: lib_source_id,
+        });
+    }
+    // M144: the deferred non-std nodes. The pure namespaces first, then the
+    // modules and the entry's alias, each set in discovery order — exactly as
+    // `load_hot_modules` mints a package over a stored prefix. A parent a
+    // nested path needs was discovered with its child (the discovery pushes
+    // every ancestor), so the requests `ensure_module_node` writes here name
+    // nodes that exist and are dropped, as the hot load drops its own.
+    let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = deferred_mints
+        .into_iter()
+        .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
+    let mut deferred_requests: Vec<(Origin, &str)> = Vec::new();
+    for mint in namespaces.into_iter().chain(bodies) {
+        let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
+            Origin::Std => std_scope_id,
+            Origin::Pkg => pkg_scope_id,
+            Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
+        };
+        match mint {
+            DeferredMint::Namespace {
+                origin,
+                name,
+                children,
+            } => {
+                let origin_scope_id = origin_scope_of(&analyzer, origin);
+                let module_id = ensure_module_node(
+                    &mut analyzer,
+                    &mut module_nodes,
+                    &mut deferred_requests,
+                    origin,
+                    name,
+                    origin_scope_id,
+                    global_scope_id,
+                );
+                analyzer.namespace_only_modules.insert(module_id, children);
+                if origin == Origin::Pkg {
+                    pkg_module_names.insert(name);
+                }
+            }
+            DeferredMint::EntryAlias { name } => {
+                let module_id = analyzer.new_entity_id();
+                analyzer.modules.insert(
+                    module_id,
+                    Module {
+                        id: module_id,
+                        name,
+                        body: (Vec::new(), global_scope_id),
+                    },
+                );
+                analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+                analyzer.source_ranges.push(SourceRange {
+                    start: module_id.0,
+                    end: module_id.0 + 1,
+                    source: SourceId(0),
+                });
+                analyzer
+                    .expr_id_to_expr_map
+                    .insert(module_id, Expr::Module(module_id));
+                analyzer
+                    .mut_scope_for_scope_id(pkg_scope_id)
+                    .name_to_id_map
+                    .insert(name, module_id);
+            }
+            DeferredMint::Body {
+                origin,
+                name,
+                module_source_id,
+                directory_holds_a_lib_body,
+                loaded_index,
+            } => {
+                let origin_scope_id = origin_scope_of(&analyzer, origin);
+                let module_scope_id = mint_module_node(
+                    &mut analyzer,
+                    &mut module_nodes,
+                    &mut deferred_requests,
+                    &mut module_scopes,
+                    &mut pkg_module_names,
+                    origin,
+                    name,
+                    origin_scope_id,
+                    global_scope_id,
+                    module_source_id,
+                    directory_holds_a_lib_body,
+                );
+                loaded[loaded_index].3 = Some(module_scope_id);
+            }
+        }
+    }
+    debug_assert!(
+        deferred_requests
+            .iter()
+            .all(|(origin, name)| module_nodes.contains_key(&(*origin, name))),
+        "M144: a deferred mint asked for a module the discovery never reached"
+    );
+    // Every loaded module's importable names, read syntactically before its
     // walk. A prelude module publishes exactly these (prelude.md §8), and
     // reading them here is what lets `seed_preludes` answer "what does
-    // `std::web::prelude` make ambient" without re-parsing anything.
+    // `std::web::prelude` make ambient" without re-parsing anything. (After
+    // std's walk since M144, which reads none of them: `seed_preludes` runs
+    // in the resolve, once everything has walked.)
     for (_name, ast, _text, module_scope_id, _source_id, _origin) in &loaded {
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
         let mut importables = Vec::new();
         collect_importables(&ast.0, &mut importables);
         analyzer.prelude_exports.insert(
-            *module_scope_id,
+            module_scope_id,
             importables
                 .into_iter()
                 .map(|importable| importable.name)
@@ -85434,6 +85681,7 @@ fn analyze_inner<'src>(
     // Queue each module's ambient set, from the prelude ITS OWN package
     // declares (prelude.md §7 — never the consumer's, never inherited).
     for (_name, _ast, _text, module_scope_id, source_id, origin) in &loaded {
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
         let prelude = match origin {
             Origin::Std => &std.prelude,
             Origin::Pkg => &workspace.entry_prelude,
@@ -85442,48 +85690,23 @@ fn analyze_inner<'src>(
         if let Some(path) = prelude.module_path() {
             analyzer
                 .prelude_seeds
-                .push((*module_scope_id, path.to_string(), *source_id));
+                .push((module_scope_id, path.to_string(), *source_id));
         }
     }
+    // M144: the non-std modules walk after their nodes.
     for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
-        analyzer.set_current_source(*source_id);
-        analyzer.module_scope_ids.insert(*module_scope_id);
-        // F27 R3: twins are userland's (std's are layer twins, a file each).
-        if !matches!(origin, Origin::Std) {
-            analyzer.select_platform_twins(&ast.0, text);
+        if *origin == Origin::Std {
+            continue;
         }
-        let start = analyzer.entity_id;
-        analyzer.walk_module_items(&ast.0, *module_scope_id);
-        analyzer.source_ranges.push(SourceRange {
-            start,
-            end: analyzer.entity_id,
-            source: *source_id,
-        });
-        // Macro-generated items (derives included — expansion is unified) walk
-        // into the DECLARING scope right after its body, so they see its types:
-        // the module's own scope, or the inline `mod` the deriving item was
-        // written inside (B201).
-        for generated in generated_by_source.get(source_id).into_iter().flatten() {
-            let scope_id =
-                analyzer.declaring_module_scope(*module_scope_id, &generated.module_path);
-            analyzer.walk_generated_expansion(
-                generated.nodes,
-                scope_id,
-                generated.origin,
-                *source_id,
-            );
-        }
-    }
-    if let Some(lib_ast) = lib_ast {
-        analyzer.set_current_source(lib_source_id);
-        analyzer.module_scope_ids.insert(std_scope_id);
-        let start = analyzer.entity_id;
-        analyzer.walk_module_items(&lib_ast.0, std_scope_id);
-        analyzer.source_ranges.push(SourceRange {
-            start,
-            end: analyzer.entity_id,
-            source: lib_source_id,
-        });
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        walk_module(
+            &mut analyzer,
+            ast,
+            text,
+            module_scope_id,
+            *source_id,
+            *origin,
+        );
     }
     // Walk each dependency's `lib.vl` into its own namespace (its public surface),
     // mirroring the `std` lib walk above.
@@ -85962,7 +86185,11 @@ fn analyze_inner<'src>(
         let prefix_modules: Vec<(&str, &NodeList<'_>, Id)> = loaded
             .iter()
             .filter(|(.., origin)| *origin == Origin::Pkg)
-            .map(|(name, ast, _, scope_id, ..)| (*name, &ast.0, *scope_id))
+            .map(|(name, ast, _, scope_id, ..)| {
+                let scope_id =
+                    scope_id.expect("M144: every module node is minted before the store");
+                (*name, &ast.0, scope_id)
+            })
             .collect();
         if hot_set_imports_a_use_inferred_binding(
             &analyzer,
