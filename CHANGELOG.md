@@ -43,6 +43,16 @@ written down.
 <!-- family: fix -->
 **An interrupted `vilan run` no longer leaves its temp script, source map and `.vdbg.json` sidecar in the temp directory — `Ctrl-C`, a debugger's `SIGTERM` or a closed terminal (`SIGHUP`) now removes all three and exits 130.** debug-53 saw `vilan-run-<pid>.mjs.vdbg.json` files left in `/tmp`. Two windows: a plain `vilan run` had no interrupt hook at all, so the signal killed it while `node` ran and its three files stayed (they were never a watch round's — those are `vilan-watch-<pid>.mjs`); and the watch hook removed a round's files while the round could still be writing them, so a removal between the map's write and the sidecar's left the sidecar. Every temp script's writes now hold one lock and register the script for the hook, which every process that writes one installs; the hook takes the same lock — it waits for a write in flight, removes what was written and keeps later writes out until the process is gone — and `ctrlc`'s `termination` feature brings `SIGTERM` and `SIGHUP` beside `SIGINT`. Pinned end to end (`watch_lifecycle`: a running program's group signalled `INT`, `TERM` and `HUP`; the watch session's sidecar too) and in process (an interrupt mid-write removes every file the write makes).
 
+---
+
+<!-- family: tooling -->
+**E323: the `vilan` debugger prints a type with a written `Debug` impl the way `dbg` does — through the impl (`secret = <redacted>`), not by its structure (`Secret { code = 42 }`).** E275 made a written impl decide what `dbg` prints; the S7 panes read the printer's structural layout only. The `.vdbg.json` sidecar now names, per such type, the functions that print it — its generated printer when a `dbg` or `print` reached the type, the impl's `debug` when anything called it — only ever ones the walk emitted anyway, so the script stays the same bytes with and without the sidecar. vilan-dap looks each name up in the paused frame and hands the walker the first it reaches; a module-scope function V8 did not context-allocate (one only `main`'s top level calls, seen from a function's frame) does not resolve, and the pane reads the structure as before. Pinned by a scripted session (a stop in a function's frame: the reachable impl and the unreachable one), the walker's unit tests and `source_maps::e323_a_written_debug_impl_names_the_function_the_walk_emitted`.
+
+---
+
+<!-- family: tooling -->
+**E324: the `vilan` debugger prints a `dyn` value by the type it holds — `dyn Area(Square { side = 2.0 })` — in a program that never calls `dbg`, where it read `dyn Area(<?>)`.** A trait object's tables carry a `show` slot only when the program prints (S1b), and nothing said which type a table stood for. The sidecar now lists, on each trait-object type, every table the walk emitted for the trait: its methods' emitted functions in slot order and the concrete type; the walker names the table a value holds by its functions' names and prints the value by that type, expandable by field — the `show` slot stays the fallback, then `<?>`. Two types whose tables hold the same functions (one shared blanket body, so one shared table) cannot be told apart and are not listed. Pinned by the same scripted session, the walker's unit tests and `source_maps::e324_*`.
+
 ## v0.51.0 — 2026-10-16
 
 <!-- family: miscompile -->

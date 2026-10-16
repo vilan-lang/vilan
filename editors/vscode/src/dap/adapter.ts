@@ -95,7 +95,16 @@ interface ScriptInfo {
 
 /// What a `variablesReference` stands for while the program is paused.
 type Handle =
-    | { kind: 'scope'; objects: string[]; frame?: ResolvedFrame; sidecar?: Sidecar; main: boolean }
+    | {
+          kind: 'scope';
+          objects: string[];
+          frame?: ResolvedFrame;
+          sidecar?: Sidecar;
+          main: boolean;
+          /// The paused frame the scope is one of: where the program's own
+          /// printers are looked up (E323).
+          callFrameId?: string;
+      }
     | { kind: 'object'; objectId: string }
     | { kind: 'doc'; doc: Doc; path?: string };
 
@@ -693,6 +702,7 @@ export class VilanDebugAdapter {
     private clearPause(): void {
         this.paused = undefined;
         this.frames.clear();
+        this.functions.clear();
         this.handles.clear();
         this.nextHandle = 1;
     }
@@ -977,7 +987,14 @@ export class VilanDebugAdapter {
             scopes.push({
                 name: 'Locals',
                 presentationHint: 'locals',
-                variablesReference: this.handle({ kind: 'scope', objects, frame: info.resolved, sidecar, main }),
+                variablesReference: this.handle({
+                    kind: 'scope',
+                    objects,
+                    frame: info.resolved,
+                    sidecar,
+                    main,
+                    callFrameId: info.callFrame.callFrameId,
+                }),
                 expensive: false,
             });
             for (const scope of chain.filter((candidate) => candidate.type === 'closure')) {
@@ -986,7 +1003,14 @@ export class VilanDebugAdapter {
                     name: owner ? `Captured from ${owner.name}` : `Closure${scope.name ? ` (${scope.name})` : ''}`,
                     variablesReference: this.handle(
                         owner
-                            ? { kind: 'scope', objects: [scope.object.objectId], frame: owner, sidecar, main: false }
+                            ? {
+                                  kind: 'scope',
+                                  objects: [scope.object.objectId],
+                                  frame: owner,
+                                  sidecar,
+                                  main: false,
+                                  callFrameId: info.callFrame.callFrameId,
+                              }
                             : { kind: 'object', objectId: scope.object.objectId },
                     ),
                     expensive: false,
@@ -1075,7 +1099,9 @@ export class VilanDebugAdapter {
                 continue;
             }
             shown.add(binding.js);
-            variables.push(await this.bindingVariable(binding, property.value, property.owner, handle.sidecar));
+            variables.push(
+                await this.bindingVariable(binding, property.value, property.owner, handle.sidecar, handle.callFrameId),
+            );
         }
         if (!handle.main) {
             // Bindings the sidecar has no row for — what the compiler bound
@@ -1094,13 +1120,14 @@ export class VilanDebugAdapter {
         value: any,
         context: string,
         sidecar: Sidecar | undefined,
+        callFrameId: string | undefined,
     ): Promise<unknown> {
         if (sidecar && binding.type !== undefined) {
             if ((!value || value.type === 'undefined') && sidecar.types[binding.type]?.shape !== 'void') {
                 // A `let` the program has not reached yet.
                 return { name: binding.name, value: '<not yet initialized>', type: sidecar.typeText(binding), variablesReference: 0 };
             }
-            const document = await this.walk(value, binding.type, binding.read ?? 'value', context, sidecar);
+            const document = await this.walk(value, binding.type, binding.read ?? 'value', context, sidecar, callFrameId);
             if (document !== undefined) {
                 return {
                     name: binding.name,
@@ -1127,17 +1154,44 @@ export class VilanDebugAdapter {
         read: string,
         context: string,
         sidecar: Sidecar,
+        callFrameId?: string,
     ): Promise<Doc | undefined> {
         const cdp = this.cdp;
         if (!cdp) {
             return undefined;
         }
         const table = sidecar.table(type);
+        // E323: a type a written `Debug` impl prints is handed to the walker
+        // with the program's own function for it — the first of the sidecar's
+        // names the paused frame reaches — as an extra argument.
+        const printers: string[] = [];
+        const types = [];
+        for (const layout of table.types) {
+            let printer: string | undefined;
+            for (const name of layout.debug ?? []) {
+                printer = await this.programFunction(name, callFrameId);
+                if (printer) {
+                    break;
+                }
+            }
+            if (printer) {
+                types.push({ ...layout, fn: printers.length });
+                printers.push(printer);
+            } else {
+                types.push(layout);
+            }
+        }
         try {
             const result = await cdp.send('Runtime.callFunctionOn', {
                 functionDeclaration: WALKER,
                 objectId: context,
-                arguments: [callArgument(value), { value: table.types }, { value: table.root }, { value: read }],
+                arguments: [
+                    callArgument(value),
+                    { value: types },
+                    { value: table.root },
+                    { value: read },
+                    ...printers.map((objectId) => ({ objectId })),
+                ],
                 returnByValue: true,
                 silent: true,
             });
@@ -1149,6 +1203,30 @@ export class VilanDebugAdapter {
             return undefined;
         }
     }
+
+    /// The program's function `name` as the paused frame `callFrameId` (the
+    /// top frame when absent) sees it, or `undefined`: a module-scope function
+    /// is reachable only where V8 context-allocated it — when some other
+    /// function refers to it — so a name that does not resolve leaves the
+    /// structure in charge (E323). Asked once per name per stop.
+    private async programFunction(name: string, callFrameId: string | undefined): Promise<string | undefined> {
+        const frame = callFrameId ?? this.paused?.callFrames[0]?.callFrameId;
+        if (!frame || !this.cdp || !/^[A-Za-z_$][\w$]*$/.test(name)) {
+            return undefined;
+        }
+        const key = `${frame}\u0000${name}`;
+        if (this.functions.has(key)) {
+            return this.functions.get(key) ?? undefined;
+        }
+        const result = await this.cdp
+            .send('Debugger.evaluateOnCallFrame', { callFrameId: frame, expression: name, silent: true })
+            .catch(() => undefined);
+        const found = !result?.exceptionDetails && result?.result?.type === 'function' ? result.result.objectId : undefined;
+        this.functions.set(key, found ?? null);
+        return found;
+    }
+
+    private functions = new Map<string, string | null>();
 
     private async javascriptProperties(objectId: string): Promise<unknown[]> {
         const result = await this.cdp?.send('Runtime.getProperties', { objectId, ownProperties: true });
@@ -1251,7 +1329,7 @@ export class VilanDebugAdapter {
         if (!scopeObject) {
             return undefined;
         }
-        const document = await this.walk(result.result, type, 'value', scopeObject, sidecar);
+        const document = await this.walk(result.result, type, 'value', scopeObject, sidecar, info.callFrame.callFrameId);
         if (document === undefined) {
             return undefined;
         }

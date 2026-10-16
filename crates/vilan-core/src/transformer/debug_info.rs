@@ -38,6 +38,17 @@ pub(super) struct DebugRecorder {
     /// there).
     scope_children: Option<HashMap<Id, Vec<Id>>>,
     closure_scopes: HashSet<Id>,
+    /// E323: each recorded type a WRITTEN `Debug` impl prints — its index,
+    /// its printer key, the grounded type — named at the walk's end, when
+    /// what the walk emitted is known.
+    written: Vec<(u32, String, TypeId)>,
+    /// E324: each recorded trait-object type's index, and its trait.
+    objects: Vec<(u32, Id)>,
+    /// E324: every table the walk emitted, per trait: its methods' JS names
+    /// in slot order and the concrete type's index — `None` when two types'
+    /// tables hold the same functions (M89 shares one object between them),
+    /// so the functions cannot say which type a value is.
+    tables: HashMap<Id, Vec<(Vec<String>, Option<u32>)>>,
 }
 
 impl DebugRecorder {
@@ -169,6 +180,77 @@ impl<'src> Transformer<'src> {
     fn debug_extent(&self, source: SourceId, id: Id) -> Option<(SourceId, usize, usize)> {
         let span = self.program.span_map.get(&id)?;
         (span.start < span.end).then_some((source, span.start, span.end))
+    }
+
+    /// E324: the walk emitted the table `slots` (member, slot) for `type_id`
+    /// as an object of `trait_id`. A table names its concrete type by its
+    /// functions — a slot is the emitted function itself — so one whose every
+    /// method slot names a function is recorded under those names; a table
+    /// with a wrapping arrow (an async, intrinsic or extern member) has no
+    /// name to be found by, and is not.
+    pub(super) fn record_vtable(
+        &mut self,
+        type_id: TypeId,
+        trait_id: Id,
+        slots: &[(String, super::js::Node<'src>)],
+    ) {
+        let Some(mut recorder) = self.debug_recorder.take() else {
+            return;
+        };
+        let methods: Option<Vec<String>> = slots
+            .iter()
+            .filter(|(member, _)| member != "$show")
+            .map(|(_, slot)| match slot {
+                super::js::Node::Local(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Some(methods) = methods.filter(|methods| !methods.is_empty())
+            && let Some(type_index) = self.debug_type(&mut recorder, type_id)
+        {
+            let tables = recorder.tables.entry(trait_id).or_default();
+            match tables.iter_mut().find(|(known, _)| *known == methods) {
+                Some((_, recorded)) if *recorded != Some(type_index) => *recorded = None,
+                Some(_) => {}
+                None => tables.push((methods, Some(type_index))),
+            }
+        }
+        self.debug_recorder = Some(recorder);
+    }
+
+    /// At the walk's end, what only the whole walk knows: the functions that
+    /// print a written-`Debug` type (E323) — its printer if a `dbg` or a
+    /// `print` reached it, the impl's `debug` if anything called it; never one
+    /// the walk did not emit — and every trait object's tables (E324).
+    pub(super) fn finish_debug_recording(&mut self) {
+        let Some(mut recorder) = self.debug_recorder.take() else {
+            return;
+        };
+        for (index, key, grounded) in std::mem::take(&mut recorder.written) {
+            let mut names = Vec::new();
+            if let Some(printer) = self.printers.get(&key) {
+                names.push(printer.clone());
+            }
+            if let Some(member) = crate::printer::written_debug_member(self.program, grounded)
+                && self.required_functions.contains_key(&member)
+                && let Some(name) = self.ng.names.get(&member)
+            {
+                names.push(name.clone());
+            }
+            recorder.recorded.types[index as usize].debug = names;
+        }
+        for (index, trait_id) in std::mem::take(&mut recorder.objects) {
+            if let Some(tables) = recorder.tables.get(&trait_id)
+                && let Layout::Object { impls, .. } =
+                    &mut recorder.recorded.types[index as usize].layout
+            {
+                *impls = tables
+                    .iter()
+                    .filter_map(|(methods, type_index)| Some((methods.clone(), (*type_index)?)))
+                    .collect();
+            }
+        }
+        self.debug_recorder = Some(recorder);
     }
 
     /// The instance minted as `dropped` shares `survivor`'s body (M16): its
@@ -313,11 +395,15 @@ impl<'src> Transformer<'src> {
         // Reserved BEFORE the layout is built: a recursive type's layout
         // points at itself.
         let index = recorder.recorded.types.len() as u32;
-        recorder.type_keys.insert(key, index);
+        recorder.type_keys.insert(key.clone(), index);
         recorder.recorded.types.push(DebugType {
             text,
             layout: Layout::Void,
+            debug: Vec::new(),
         });
+        if crate::printer::written_debug(program, grounded).is_some() {
+            recorder.written.push((index, key.clone(), grounded));
+        }
         let element = |transformer: &mut Self, recorder: &mut DebugRecorder, type_id| {
             transformer
                 .debug_type(recorder, type_id)
@@ -418,7 +504,15 @@ impl<'src> Transformer<'src> {
                     fill,
                 }
             }
-            Shape::Object { label } => Layout::Object { label },
+            Shape::Object { label } => {
+                if let Some(Type::Dyn(trait_id, _)) = program.type_id_to_type_map.get(&grounded) {
+                    recorder.objects.push((index, *trait_id));
+                }
+                Layout::Object {
+                    label,
+                    impls: Vec::new(),
+                }
+            }
         };
         recorder.recorded.types[index as usize].layout = layout;
         Some(index)
@@ -436,6 +530,7 @@ fn unknown_type(recorder: &mut DebugRecorder) -> u32 {
     recorder.recorded.types.push(DebugType {
         text: "?".to_string(),
         layout: Layout::Text("<?>".to_string()),
+        debug: Vec::new(),
     });
     index
 }

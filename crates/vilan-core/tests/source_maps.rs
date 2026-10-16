@@ -1349,7 +1349,7 @@ fun main() {
 }
 
 /// The text a sidecar `span` covers, read back out of the source.
-fn spanned<'text>(source: &'text str, span: (u32, u32, u32, u32, u32)) -> &'text str {
+fn spanned(source: &str, span: (u32, u32, u32, u32, u32)) -> &str {
     let offset = |line: u32, column: u32| {
         let start: usize = source
             .split_inclusive('\n')
@@ -1423,6 +1423,205 @@ fn e326_every_frame_carries_its_whole_text() {
     assert_eq!(
         area_json["span"],
         serde_json::json!([area.0, area.1, area.2, area.3, area.4])
+    );
+}
+
+const IMPLS: &str = r#"
+import std::debug::Debug;
+import std::io::print;
+
+struct Secret {
+    code: i32,
+}
+
+impl Secret with Debug {
+    fun debug(self): str {
+        "<redacted>"
+    }
+}
+
+struct Unused {
+    code: i32,
+}
+
+impl Unused with Debug {
+    fun debug(self): str {
+        "<unused>"
+    }
+}
+
+trait Area {
+    fun area(self): f64;
+}
+
+struct Square {
+    side: f64,
+}
+
+impl Square with Area {
+    fun area(self): f64 {
+        self.side * self.side
+    }
+}
+
+struct Rect {
+    width: f64,
+    height: f64,
+}
+
+impl Rect with Area {
+    fun area(self): f64 {
+        self.width * self.height
+    }
+}
+
+fun reveal(secret: Secret): str {
+    secret.debug()
+}
+
+fun main() {
+    let secret = Secret { code = 42 };
+    let unused = Unused { code = 7 };
+    let square: dyn Area = Square { side = 2.0 };
+    let rect: dyn Area = Rect { width = 2.0, height = 3.0 };
+    print(reveal(secret));
+    print(square.area() + rect.area());
+    print(unused.code);
+}
+"#;
+
+fn type_named<'info>(
+    info: &'info DebugInfo,
+    text: &str,
+) -> &'info vilan_core::debug_info::DebugType {
+    info.types
+        .iter()
+        .find(|type_| type_.text == text)
+        .unwrap_or_else(|| panic!("`{text}` in the table: {:#?}", info.types))
+}
+
+/// E323: a type with a WRITTEN `Debug` impl names the functions that print it
+/// as `dbg` does — only those the walk emitted anyway (the impl's `debug` is
+/// called by `reveal`; `Unused`'s never is, so it names none) — and the script
+/// is the same bytes with and without the sidecar.
+#[test]
+fn e323_a_written_debug_impl_names_the_function_the_walk_emitted() {
+    let (built, _) = build_program("sidecar_written_debug", IMPLS);
+    let info = sidecar(&built);
+    let secret = type_named(info, "Secret");
+    assert_eq!(secret.debug.len(), 1, "{secret:?}");
+    assert!(
+        declares(&built.mapped, &secret.debug[0]),
+        "`{}` is the impl's emitted function:\n{}",
+        secret.debug[0],
+        built.mapped
+    );
+    assert!(
+        type_named(info, "Unused").debug.is_empty(),
+        "not emitted, not named"
+    );
+    // The structure stays beside the name: the fallback.
+    assert!(matches!(secret.layout, Layout::Struct { .. }));
+    // `dbg` reaching the type adds its printer first.
+    let with_dbg = IMPLS.replace(
+        "print(reveal(secret));",
+        "dbg(secret);\n    print(reveal(secret));",
+    );
+    let (built, _) = build_program("sidecar_written_debug_dbg", &with_dbg);
+    let names = &type_named(sidecar(&built), "Secret").debug;
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names[0].starts_with("__show_Secret"), "{names:?}");
+    assert!(declares(&built.mapped, &names[0]) && declares(&built.mapped, &names[1]));
+    let json = sidecar(&built).to_json("main.mjs");
+    assert!(
+        json.contains(&format!("\"debug\":[\"{}\",\"{}\"]", names[0], names[1])),
+        "{json}"
+    );
+}
+
+/// E324: a trait object's layout lists every table the walk emitted for the
+/// trait — its methods' emitted functions in slot order and the concrete
+/// type's index — in a program whose tables carry no `show` slot.
+#[test]
+fn e324_a_trait_object_names_each_table_by_its_functions() {
+    let (built, _) = build_program("sidecar_dyn_tables", IMPLS);
+    let info = sidecar(&built);
+    assert!(
+        !built.mapped.contains("$show"),
+        "no show slot:\n{}",
+        built.mapped
+    );
+    let Layout::Object { impls, .. } = &type_named(info, "dyn Area").layout else {
+        panic!("an object layout");
+    };
+    let mut named: Vec<(String, String)> = impls
+        .iter()
+        .map(|(methods, concrete)| {
+            assert_eq!(methods.len(), 1, "one method: {methods:?}");
+            assert!(
+                declares(&built.mapped, &methods[0]),
+                "`{}` is declared",
+                methods[0]
+            );
+            (
+                info.types[*concrete as usize].text.clone(),
+                methods[0].clone(),
+            )
+        })
+        .collect();
+    named.sort();
+    assert_eq!(
+        named
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["Rect", "Square"]
+    );
+    assert_ne!(named[0].1, named[1].1, "two tables, two functions");
+    let json = info.to_json("main.mjs");
+    assert!(json.contains("\"impls\":[[["), "{json}");
+}
+
+/// E324: two types whose tables hold the SAME functions (one blanket body
+/// both instances share, M16, so M89 shares the table) cannot be told apart
+/// by them: neither is listed, and a debugger falls back to the `show` slot.
+#[test]
+fn e324_tables_two_types_share_are_not_listed() {
+    let source = r#"
+import std::io::print;
+
+trait Area {
+    fun area(self): f64;
+}
+
+impl type T with Area {
+    fun area(self): f64 {
+        1.0
+    }
+}
+
+struct Square {
+    side: f64,
+}
+
+struct Rect {
+    width: f64,
+}
+
+fun main() {
+    let square: dyn Area = Square { side = 2.0 };
+    let rect: dyn Area = Rect { width = 3.0 };
+    print(square.area() + rect.area());
+}
+"#;
+    let (built, _) = build_program("sidecar_shared_tables", source);
+    let Layout::Object { impls, .. } = &type_named(sidecar(&built), "dyn Area").layout else {
+        panic!("an object layout");
+    };
+    assert!(
+        impls.is_empty(),
+        "ambiguous tables are not listed: {impls:?}\n{}",
+        built.mapped
     );
 }
 

@@ -543,6 +543,53 @@ test('a traced wake shows the waking write below its cause, and its line in the 
     }
 });
 
+// E323 and E324: the panes print as `dbg` does where the structure is not
+// what `dbg` prints — a type with a WRITTEN `Debug` impl (E275), printed by
+// calling the impl in the paused program, and a `dyn` binding in a program
+// whose tables carry no `show` slot, printed by the type its table's functions
+// name. A written impl the paused program cannot reach (only `main`'s top
+// level calls it, so V8 never context-allocated it) falls back to the
+// structure — from a function's frame; the module's own frame reaches every
+// module-scope function.
+test('a written Debug impl and a dyn binding print as dbg does without a show slot', { skip }, async () => {
+    const program = copyFixture('impls.vl');
+    const lines = markers(program, 'break');
+    const client = new DapClient();
+    try {
+        const { stopped } = await launch(client, program, [lines.get('values') ?? 0]);
+        const atValues = await stop(client, stopped);
+        assert.deepEqual(
+            [atValues.reason, atValues.frame.name, atValues.frame.line],
+            ['breakpoint', 'look', lines.get('values')],
+        );
+        const secret = variable(atValues, 'secret');
+        assert.deepEqual([secret.value, secret.type], ['<redacted>', 'Secret']);
+        assert.equal(variable(atValues, 'muted').value, 'Muted { level = 3 }');
+        const square = variable(atValues, 'square');
+        assert.deepEqual([square.value, square.type], ['dyn Area(Square { side = 2.0 })', 'dyn Area']);
+        assert.equal(variable(atValues, 'rect').value, 'dyn Area(Rect { width = 2.0, height = 3.0 })');
+        // The erased value expands as its type does.
+        const held = (await client.request('variables', { variablesReference: square.variablesReference })).variables;
+        assert.deepEqual(
+            held.map((child: PaneVariable) => [child.name, child.value]),
+            [['value', 'Square { side = 2.0 }']],
+        );
+        // A hover prints through the impl too.
+        assert.equal(
+            (await client.request('evaluate', { expression: 'secret', frameId: atValues.frame.id, context: 'hover' })).result,
+            '<redacted>',
+        );
+
+        const terminated = client.next('terminated');
+        await client.request('continue', { threadId: 1 });
+        await terminated;
+        assert.deepEqual(client.stdout().trim().split('\n'), ['<redacted>', '10', '<muted>']);
+    } finally {
+        await client.close();
+        removeQuietly(path.dirname(program));
+    }
+});
+
 test('a terminal launch stops on entry and steps line by line', { skip }, async () => {
     const program = copyFixture('steps.vl');
     const lines = markers(program, 'step');

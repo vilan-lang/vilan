@@ -832,7 +832,7 @@ fn e257_s7_the_debug_adapters_scripted_sessions_pass() {
     // The watch shapes (the lone script's, and E331's two-leg server) are
     // pinned on unix, as `watch_lifecycle` is; E326's awaited stop and S8's
     // traced wake run on both.
-    let ran = if cfg!(unix) { 7 } else { 5 };
+    let ran = if cfg!(unix) { 8 } else { 6 };
     assert!(
         report.contains(&format!("# pass {ran}")) || report.contains(&format!("ℹ pass {ran}")),
         "{ran} sessions ran:\n{report}"

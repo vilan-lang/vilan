@@ -154,6 +154,12 @@ pub struct DebugType {
     /// The type as vilan writes it: `List<Point>`, `|i32| i32`.
     pub text: String,
     pub layout: Layout,
+    /// E323: the functions that print it as `dbg` does when the program wrote
+    /// its own `Debug` impl (E275) — the type's generated printer, then the
+    /// impl's `debug` — named only when the walk emitted them anyway; the
+    /// sidecar never causes emission. A debugger calls the first it can reach
+    /// in the paused program, and reads the structure when it reaches none.
+    pub debug: Vec<String>,
 }
 
 /// [`crate::printer::Shape`], with its type ids grounded into the table and
@@ -214,10 +220,14 @@ pub enum Layout {
         element: u32,
         fill: bool,
     },
-    /// A trait object, `[value, table]`: printed by the table's `show` slot
-    /// when the program's tables carry one.
+    /// A trait object, `[value, table]`. E324: every table the program
+    /// emitted for the trait, by its methods' JS names in slot order, with the
+    /// concrete type's index — a debugger names the table a value holds by its
+    /// functions and prints the value by that type, whether or not the
+    /// program's tables carry a `show` slot (S1b).
     Object {
         label: String,
+        impls: Vec<(Vec<String>, u32)>,
     },
 }
 
@@ -258,8 +268,22 @@ pub(crate) struct RecordedDebug {
 
 impl RecordedDebug {
     /// The scope rename's answers (`rename_for_scopes`), applied: a binding's
-    /// and a function's minted name become the names the script declares.
+    /// and a function's minted name become the names the script declares —
+    /// a frame's, a binding's, a written `Debug` impl's and a table's methods'.
     pub fn rename(&mut self, rename: &HashMap<String, String>) {
+        let renamed = |name: &mut String| {
+            if let Some(final_name) = rename.get(name) {
+                *name = final_name.clone();
+            }
+        };
+        for type_ in &mut self.types {
+            type_.debug.iter_mut().for_each(renamed);
+            if let Layout::Object { impls, .. } = &mut type_.layout {
+                for (methods, _) in impls {
+                    methods.iter_mut().for_each(renamed);
+                }
+            }
+        }
         for frame in &mut self.frames {
             if let Some(js) = &mut frame.js
                 && let Some(renamed) = rename.get(js)
@@ -468,6 +492,16 @@ impl DebugInfo {
             json_string(&mut json, &type_.text);
             json.push(',');
             type_.layout.write_json(&mut json);
+            if !type_.debug.is_empty() {
+                json.push_str(",\"debug\":[");
+                for (index, name) in type_.debug.iter().enumerate() {
+                    if index > 0 {
+                        json.push(',');
+                    }
+                    json_string(&mut json, name);
+                }
+                json.push(']');
+            }
             json.push('}');
         }
         json.push_str("\n]}\n");
@@ -607,9 +641,26 @@ impl Layout {
                     json.push_str(",\"fill\":true");
                 }
             }
-            Layout::Object { label: text } => {
+            Layout::Object { label: text, impls } => {
                 shape(json, "object");
                 label(json, text);
+                if !impls.is_empty() {
+                    json.push_str(",\"impls\":[");
+                    for (index, (methods, type_index)) in impls.iter().enumerate() {
+                        if index > 0 {
+                            json.push(',');
+                        }
+                        json.push_str("[[");
+                        for (slot, method) in methods.iter().enumerate() {
+                            if slot > 0 {
+                                json.push(',');
+                            }
+                            json_string(json, method);
+                        }
+                        json.push_str(&format!("],{type_index}]"));
+                    }
+                    json.push(']');
+                }
             }
         }
     }

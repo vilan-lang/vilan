@@ -256,8 +256,9 @@ count: SignalCell<i32> = SignalCell(3)
 first: view i32 = 1
 ```
 
-A struct expands into its fields, a list into its elements, a map into its
-entries. A closure's frame lists what it captured from the function around it
+A type with its own `Debug` impl shows what the impl prints, as `dbg` does,
+and a `dyn` value shows the value it holds by that value's own type. A struct
+expands into its fields, a list into its elements, a map into its entries. A closure's frame lists what it captured from the function around it
 apart from its own bindings. The Watch pane takes a path into a binding —
 `segment.to`, `rows[0]`, `pair.1` — and prints it the same way; anything else
 you type there is evaluated as JavaScript. A hover lays a long value out over

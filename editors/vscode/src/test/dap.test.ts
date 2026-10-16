@@ -426,3 +426,57 @@ test('an internalConsole launch drops the trace\'s stderr lines, which reach the
     // A line that merely mentions the trace is the program's own.
     assert.equal(shownStderr('see [reactive] lines\n'), 'see [reactive] lines\n');
 });
+
+test('a type the program prints itself is printed by its function, the structure kept for a refusal', () => {
+    const types = [
+        { text: 'Secret', shape: 'struct', name: 'Secret', fields: [['code', 1]], fn: 0 },
+        { text: 'i32', shape: 'integer' },
+    ];
+    // A written impl's `debug` answers text; a generated printer a group.
+    assert.equal(walker([42], types, 0, 'value', () => '<redacted>'), '<redacted>');
+    const printed = walker([42], types, 0, 'value', () => ({ o: 'Hidden(', c: ')', p: false, e: [], f: false }));
+    assert.equal(flat(printed), 'Hidden()');
+    // Not a document (or no function at that position): the structure.
+    assert.equal(flat(walker([42], types, 0, 'value', () => 7)), 'Secret { code = 42 }');
+    assert.equal(flat(walker([42], types, 0, 'value')), 'Secret { code = 42 }');
+});
+
+test('a trait object is printed by the type its table\'s functions name, else its show slot', () => {
+    function area() {}
+    function area2() {}
+    const types = [
+        { text: 'dyn Area', shape: 'object', label: 'dyn Area', impls: [[['area'], 1], [['area2'], 3]] },
+        { text: 'Square', shape: 'struct', name: 'Square', fields: [['side', 2]] },
+        { text: 'f64', shape: 'float' },
+        { text: 'Rect', shape: 'struct', name: 'Rect', fields: [['width', 2]] },
+    ];
+    const square = Object.create({ area });
+    const rect = Object.create({ area: area2 });
+    assert.equal(flat(walker([[2], square], types, 0, 'value')), 'dyn Area(Square { side = 2.0 })');
+    assert.equal(flat(walker([[3], rect], types, 0, 'value')), 'dyn Area(Rect { width = 3.0 })');
+    // A table the sidecar does not know: the show slot, else `<?>`.
+    function other() {}
+    const shown = Object.create({ area: other, $show: () => 'Circle' });
+    assert.equal(flat(walker([[1], shown], types, 0, 'value')), 'dyn Area(Circle)');
+    assert.equal(flat(walker([[1], Object.create({ area: other })], types, 0, 'value')), 'dyn Area(<?>)');
+});
+
+test('the walker is sent the tables\' concrete types, renumbered', () => {
+    const sidecar = new Sidecar({
+        version: 1,
+        file: 'main.mjs',
+        frames: [],
+        types: [
+            { text: 'f64', shape: 'float' },
+            { text: 'Square', shape: 'struct', name: 'Square', fields: [['side', 0]] },
+            { text: 'dyn Area', shape: 'object', label: 'dyn Area', impls: [[['area'], 1]] },
+        ],
+    });
+    const table = sidecar.table(2);
+    assert.deepEqual(
+        table.types.map((type) => type.text),
+        ['dyn Area', 'Square', 'f64'],
+    );
+    assert.deepEqual(table.types[0].impls, [[['area'], 1]]);
+    assert.deepEqual(table.types[1].fields, [['side', 2]]);
+});

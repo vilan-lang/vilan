@@ -34,6 +34,9 @@ export interface SidecarFrame {
 export interface SidecarType {
     text: string;
     shape: string;
+    /// E323: the program's functions that print this type as `dbg` does (a
+    /// written `Debug` impl's printer, then its `debug`), first reachable wins.
+    debug?: string[];
     [field: string]: unknown;
 }
 
@@ -288,6 +291,8 @@ function references(type: SidecarType): number[] {
             return [type.value as number];
         case 'map':
             return [type.key as number, type.value as number];
+        case 'object':
+            return ((type.impls as [string[], number][] | undefined) ?? []).map(([, concrete]) => concrete);
         default:
             return [];
     }
@@ -326,6 +331,13 @@ function renumbered(type: SidecarType, renumber: (type: number) => number): Side
             return { ...type, value: renumber(type.value as number) };
         case 'map':
             return { ...type, key: renumber(type.key as number), value: renumber(type.value as number) };
+        case 'object':
+            return type.impls === undefined
+                ? type
+                : {
+                      ...type,
+                      impls: (type.impls as [string[], number][]).map(([methods, concrete]) => [methods, renumber(concrete)]),
+                  };
         default:
             return type;
     }

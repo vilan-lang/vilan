@@ -4041,6 +4041,11 @@ impl<'src> Transformer<'src> {
             });
         }
 
+        // E323/E324: what the sidecar can name only once the walk is over —
+        // the functions a written `Debug` impl prints by, the tables each
+        // trait object can hold (a listed arm: it records, it emits nothing).
+        self.finish_debug_recording();
+
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
         let program = self.program;
         t_functions.sort_by_key(|a| program.canonical_declaration_key(a.0));
@@ -12141,6 +12146,9 @@ impl<'src> Transformer<'src> {
         if let Some(show) = self.object_show_slot(type_id) {
             entries.push(("$show".to_string(), show));
         }
+        // E324: the sidecar names this table by its functions (a listed arm:
+        // it records, it emits nothing).
+        self.record_vtable(type_id, trait_id, &entries);
         // M89: a table whose every slot names a function is a function of its
         // slot set, so a second pair answering every member with the same
         // functions — a blanket's members over two stage types, say — names
