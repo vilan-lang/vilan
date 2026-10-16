@@ -47,9 +47,43 @@ pub struct TypeDefinitions {
 impl TypeDefinitions {
     /// The block rendered for `type_id`, if its type has one (a struct with
     /// fields, an enum with variants, a trait-typed or `dyn` value).
+    /// The rendered blocks, by index.
+    pub(super) fn blocks(&self) -> &[String] {
+        &self.blocks
+    }
+
     pub fn of(&self, type_id: TypeId) -> Option<&str> {
         let index = *self.by_type.get(&type_id)?;
         self.blocks.get(index as usize).map(String::as_str)
+    }
+
+    /// M148: a restored region's block for `type_id`, unless a rendered
+    /// position already answered it — deduplicated by text, as rendering
+    /// deduplicates by label (`by_text` starts from the rendered blocks).
+    pub(super) fn insert_restored(
+        &mut self,
+        type_id: TypeId,
+        text: &str,
+        by_text: &mut HashMap<String, u32>,
+    ) {
+        if self.by_type.contains_key(&type_id) {
+            return;
+        }
+        if by_text.is_empty() {
+            for (index, block) in self.blocks.iter().enumerate() {
+                by_text.entry(block.clone()).or_insert(index as u32);
+            }
+        }
+        let index = match by_text.get(text) {
+            Some(index) => *index,
+            None => {
+                self.blocks.push(text.to_string());
+                let index = (self.blocks.len() - 1) as u32;
+                by_text.insert(text.to_string(), index);
+                index
+            }
+        };
+        self.by_type.insert(type_id, index);
     }
 }
 
@@ -515,7 +549,11 @@ impl<'src> Analyzer<'src> {
         // every file of the world now banks its rows.
         let mut at: HashMap<(SourceId, Span), usize> = HashMap::default();
         for site in &self.pattern_sites {
-            if !self.renders_hover_rows(site.source, rows) {
+            // M148: a region whose record carried its hover rows is not
+            // rendered again (`hover_records.rs`).
+            if !self.renders_hover_rows(site.source, rows)
+                || self.hover_row_restored_at(site.source, site.name_span.start)
+            {
                 continue;
             }
             let earlier = at.get(&(site.source, site.name_span)).copied();
@@ -674,7 +712,10 @@ impl<'src> Analyzer<'src> {
         // for: the id the label is keyed by (the reference) and the id the
         // position's facts are keyed by (the reference, or its call).
         let mut by_binding: HashMap<Id, TypeId> = HashMap::default();
-        for variable in self.variables.values() {
+        // M148: the label lane only — a region whose record carried its
+        // label rows restores these with them (`expr_types`).
+        let live = &self.live_labels;
+        for (_, variable) in super::live_ranges::LiveEntries::over(&self.variables, live) {
             if let Some(initial) = variable.initial
                 && in_scope(initial)
             {
@@ -685,7 +726,7 @@ impl<'src> Analyzer<'src> {
         // The variant constructor calls: (callee, its enum, the call).
         let mut variant_calls: Vec<(Id, Id, Id)> = Vec::new();
         // The cheap, cache-hot test first: most of the world is std's.
-        for (call_id, call) in &self.function_calls {
+        for (call_id, call) in super::live_ranges::LiveEntries::over(&self.function_calls, live) {
             if !in_scope(call.id) {
                 continue;
             }
@@ -739,7 +780,7 @@ impl<'src> Analyzer<'src> {
             consider(callee, enum_id, call_id);
         }
         // A bare variant reference.
-        for id in self.expected_types.keys() {
+        for (id, _) in super::live_ranges::LiveEntries::over(&self.expected_types, live) {
             if in_scope(*id)
                 && let Some(enum_id) = variant_enum(*id)
             {
@@ -777,9 +818,18 @@ impl<'src> Analyzer<'src> {
 
     /// E240: the entry's type-position names that are a type parameter or a
     /// trait, rendered — every other row keeps its plain label.
-    pub(super) fn reference_hovers(&self, rows: &HoverRows) -> Vec<ReferenceHover> {
+    ///
+    /// M148: the TYPE-PARAMETER rows are a function of their region (the
+    /// parameter and the declaration introducing it), so a region whose
+    /// record carried them is not rendered again and the rendered ones are
+    /// answered recordable (the second vector, by index). The TRAIT rows are
+    /// not: E310's `implemented_by` lists every impl the row's FILE reaches,
+    /// which an impl in any other region moves — they render live on every
+    /// analysis.
+    pub(super) fn reference_hovers(&self, rows: &HoverRows) -> (Vec<ReferenceHover>, Vec<bool>) {
         let owners = self.generic_owners(rows);
         let mut hovers: Vec<ReferenceHover> = Vec::new();
+        let mut recordable: Vec<bool> = Vec::new();
         let mut seen: HashSet<(SourceId, Span)> = HashSet::default();
         // E310: the files each user file reaches (B515/B598's rule), asked
         // once, and only when a trait row needs it.
@@ -788,6 +838,7 @@ impl<'src> Analyzer<'src> {
             if !self.renders_hover_rows(*source, rows) || seen.contains(&(*source, *span)) {
                 continue;
             }
+            let restored = self.hover_row_restored_at(*source, span.start);
             match type_id.borrow_type(self) {
                 Type::Generic(constraint_id) => {
                     if self.implicit_generic_scopes.contains_key(constraint_id) {
@@ -813,7 +864,12 @@ impl<'src> Analyzer<'src> {
                                     rows.every_view,
                                 ),
                             });
+                            recordable.push(false);
                         }
+                        continue;
+                    }
+                    // M148: restored with its region's record.
+                    if restored {
                         continue;
                     }
                     let hover = ReferenceHover {
@@ -835,9 +891,11 @@ impl<'src> Analyzer<'src> {
                             span: **binder_span,
                             ..hover.clone()
                         });
+                        recordable.push(true);
                     }
                     seen.insert((*source, *span));
                     hovers.push(hover);
+                    recordable.push(true);
                 }
                 Type::Trait(trait_id, arguments) if *definition == Some(*trait_id) => {
                     let Some(block) = self.type_definition_block(*type_id) else {
@@ -857,11 +915,12 @@ impl<'src> Analyzer<'src> {
                             rows.every_view,
                         ),
                     });
+                    recordable.push(false);
                 }
                 _ => {}
             }
         }
-        hovers
+        (hovers, recordable)
     }
 
     /// E310: the subjects of `trait_id`'s impls that `source` reaches — an
@@ -1044,36 +1103,50 @@ impl<'src> Analyzer<'src> {
     /// E237: the definition blocks for the entry's typed positions — every
     /// binding and parameter it declares, every member it reads, every field
     /// of a struct it declares — deduplicated by rendered type.
+    ///
+    /// M148: a position whose region restored its hover rows is not
+    /// rendered (its block comes back through
+    /// [`Analyzer::restore_type_definitions`]); the rendered positions are
+    /// answered as `(position, field index, block)` rows for the records.
     pub(super) fn type_definitions(
         &self,
         expr_type_ids: &HashMap<Id, TypeId>,
         rows: &HoverRows,
-    ) -> TypeDefinitions {
+    ) -> (TypeDefinitions, Vec<(Id, u32, u32)>) {
         let entry = |id: Id| {
-            self.source_of_id(id)
-                .is_some_and(|source| self.renders_hover_rows(source, rows))
+            !self.hover_row_restored(id)
+                && self
+                    .source_of_id(id)
+                    .is_some_and(|source| self.renders_hover_rows(source, rows))
         };
-        let mut positions: Vec<TypeId> = Vec::new();
+        let none = super::hover_records::FIELD_NONE;
+        let mut positions: Vec<(Id, u32, TypeId)> = Vec::new();
         for (id, variable) in &self.variables {
             if entry(*id) {
-                positions.push(variable.type_id);
+                positions.push((*id, none, variable.type_id));
             }
         }
         for (id, parameter) in &self.parameters {
             if entry(*id) {
-                positions.push(parameter.type_id);
+                positions.push((*id, none, parameter.type_id));
             }
         }
         for id in self.member_name_spans.keys() {
             if entry(*id)
                 && let Some(type_id) = expr_type_ids.get(id)
             {
-                positions.push(*type_id);
+                positions.push((*id, none, *type_id));
             }
         }
         for (id, struct_) in &self.structs {
             if entry(*id) {
-                positions.extend(struct_.fields.iter().map(|field| field.type_id));
+                positions.extend(
+                    struct_
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(index, field)| (*id, index as u32, field.type_id)),
+                );
             }
         }
         let empty = SubstitutionContext::default();
@@ -1084,7 +1157,8 @@ impl<'src> Analyzer<'src> {
         // `Signal<Option<Channel>>` print alike and must not share a block
         // (E313 made the table every file's, where the two met in kolt).
         let mut by_label: HashMap<(String, Option<TypeId>), Option<u32>> = HashMap::default();
-        for type_id in positions {
+        for (_, _, type_id) in &positions {
+            let type_id = *type_id;
             if definitions.by_type.contains_key(&type_id) {
                 continue;
             }
@@ -1106,7 +1180,13 @@ impl<'src> Analyzer<'src> {
                 definitions.by_type.insert(type_id, index);
             }
         }
-        definitions
+        let recorded = positions
+            .into_iter()
+            .filter_map(|(id, field, type_id)| {
+                Some((id, field, *definitions.by_type.get(&type_id)?))
+            })
+            .collect();
+        (definitions, recorded)
     }
 
     /// One type's definition block (E237), or `None` where there is nothing

@@ -134,8 +134,12 @@ pub fn observe(package: &Package, seeds: Vec<PathBuf>, leg: Leg) -> Observation 
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
             let leaked: &'static str = Box::leak(entry_text.into_boxed_str());
+            // The editor's shape (M148): the language server analyzes under
+            // the reading aids, which is what makes every file render — and
+            // record — its hover rows.
             let workspace = Workspace {
                 hot_seeds: seeds,
+                reading_aids: true,
                 ..Workspace::default()
             };
             let analyze = || {
@@ -1025,43 +1029,82 @@ const BOUND_BOUNDED: &str = "import pkg::shapes::{ Bar, Foo, Shine };\n\nfun nee
 
 const BOUND_MAIN: &str = "import pkg::bounded::bounded;\nimport pkg::shine;\nimport pkg::views::render;\n\nfun main() {\n\tprint(bounded());\n\tprint(render());\n}\n";
 
-pub const BOUND_FIXTURES: &[Fixture] = &[Fixture {
-    name: "bound_audit",
-    platform: NODE,
-    files: &[
-        ("main.vl", BOUND_MAIN),
-        ("shapes.vl", BOUND_SHAPES),
-        ("shine.vl", BOUND_SHINE),
-        ("bounded.vl", BOUND_BOUNDED),
-        ("views.vl", POST_PASS_VIEWS),
-    ],
-    edits: &[
-        Edit {
-            label: "a statement typed into the leaf beside the prefix module's bound refusal",
-            file: "views.vl",
-            seed: None,
-            replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
-        },
-        Edit {
-            label: "a statement typed into the entry beside the prefix module's bound refusal",
-            file: "main.vl",
-            seed: None,
-            replacements: &[(
-                "\tprint(render());\n",
-                "\tprint(render());\n\tlet extra = 1;\n",
-            )],
-        },
-        Edit {
-            label: "the impl a prefix module's bound is satisfied through, moved to the other type",
-            file: "shine.vl",
-            seed: None,
-            replacements: &[(
-                "export impl Foo with Shine {",
-                "export impl Bar with Shine {",
-            )],
-        },
-    ],
-}];
+pub const BOUND_FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "bound_audit",
+        platform: NODE,
+        files: &[
+            ("main.vl", BOUND_MAIN),
+            ("shapes.vl", BOUND_SHAPES),
+            ("shine.vl", BOUND_SHINE),
+            ("bounded.vl", BOUND_BOUNDED),
+            ("views.vl", POST_PASS_VIEWS),
+        ],
+        edits: &[
+            Edit {
+                label: "a statement typed into the leaf beside the prefix module's bound refusal",
+                file: "views.vl",
+                seed: None,
+                replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+            },
+            Edit {
+                label: "a statement typed into the entry beside the prefix module's bound refusal",
+                file: "main.vl",
+                seed: None,
+                replacements: &[(
+                    "\tprint(render());\n",
+                    "\tprint(render());\n\tlet extra = 1;\n",
+                )],
+            },
+            Edit {
+                label: "the impl a prefix module's bound is satisfied through, moved to the other type",
+                file: "shine.vl",
+                seed: None,
+                replacements: &[(
+                    "export impl Foo with Shine {",
+                    "export impl Bar with Shine {",
+                )],
+            },
+        ],
+    },
+    // M150: the same shape at a WRITTEN application (B251, `check_written_
+    // nominal_bounds`) — a prefix module annotating `Holder<Foo>` (satisfied
+    // through the hot module's impl) and `Holder<Bar>` (refused) — whose sites
+    // ride M143's module lane: skipped for a reused module, their refusals
+    // replayed from the audit's record under its late-impl guard.
+    Fixture {
+        name: "written_bound_audit",
+        platform: NODE,
+        files: &[
+            ("main.vl", WRITTEN_MAIN),
+            ("shapes.vl", BOUND_SHAPES),
+            ("shine.vl", BOUND_SHINE),
+            ("written.vl", WRITTEN_HELD),
+            ("views.vl", POST_PASS_VIEWS),
+        ],
+        edits: &[
+            Edit {
+                label: "a statement typed into the leaf beside the prefix module's written-bound refusal",
+                file: "views.vl",
+                seed: None,
+                replacements: &[("\t1\n", "\tlet extra = 1;\n\textra\n")],
+            },
+            Edit {
+                label: "the impl a prefix module's written bound is satisfied through, moved to the other type",
+                file: "shine.vl",
+                seed: None,
+                replacements: &[(
+                    "export impl Foo with Shine {",
+                    "export impl Bar with Shine {",
+                )],
+            },
+        ],
+    },
+];
+
+const WRITTEN_HELD: &str = "import pkg::shapes::{ Bar, Foo, Shine };\n\nstruct Holder<T: Shine> {\n\tvalue: T,\n}\n\nexport fun held(foo: Holder<Foo>, bar: Holder<Bar>): i32 {\n\t1\n}\n";
+
+const WRITTEN_MAIN: &str = "import pkg::written::held;\nimport pkg::shine;\nimport pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
 
 // --- M110 S3: the effect classes (incr-50, Order 50; pass map §6, §7.2) ----------
 //

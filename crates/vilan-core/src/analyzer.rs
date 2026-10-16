@@ -22,10 +22,14 @@ mod dbg_stack;
 mod held_tables;
 mod hint_labels;
 mod hover_labels;
+mod hover_records;
 pub mod id_windows;
 mod item_records;
+mod lazy_tables;
 mod live_ranges;
 mod liveness;
+mod move_tables;
+mod row_families;
 mod written_types;
 
 pub use dbg_stack::{
@@ -1899,6 +1903,7 @@ struct ArmMoveState {
 /// Conservative by construction: a variant whose payload cannot be classified
 /// completely counts as carrying one, so the failure mode is an over-report,
 /// never a missed leak.
+#[derive(Clone, Copy, Debug)]
 struct IsRefinement {
     /// The place tested — only a bare `Expr::Local` refines anything.
     binding: Id,
@@ -4300,6 +4305,19 @@ pub struct Analyzer<'src> {
     /// B469: chunk 3's admitted field moves (place -> owned root), published
     /// for the whole-program drop plan beside `resource_value_places`.
     partial_move_roots: HashMap<Id, Id>,
+    /// M149: the live lane's contributions to the move scan's helper sets
+    /// (`move_tables.rs`), partitioned into the records at the tail; whether
+    /// this analysis derived them at all (a program with no resource binding
+    /// files no move rows); and the fold, read by R11 and the drop plan.
+    move_rows_live: move_tables::MoveRows,
+    move_rows_filed: bool,
+    move_sets: Option<move_tables::MoveSets>,
+    /// M150: the live lane's lazy-argument and HMR-site contributions
+    /// (`lazy_tables.rs`), and whether each pass derived them.
+    lazy_rows_live: lazy_tables::LazyRows,
+    lazy_rows_filed: bool,
+    hmr_rows_live: lazy_tables::HmrRows,
+    hmr_rows_filed: bool,
     /// B470: every resource erased into a `dyn` at a coercion site, as
     /// `(site, the value's type, the object type)`, for the post-build
     /// question of whether it may be.
@@ -4688,6 +4706,11 @@ pub struct Analyzer<'src> {
     /// THIS analysis (call, the callee's constraint, the trait), taken into
     /// the module's record by `take_reuse_record`.
     bound_questions_derived: HashMap<u32, Vec<(Id, TypeId, Id)>>,
+    /// M150: the written applications' questions, filed the same way.
+    written_bound_questions_derived: HashMap<u32, Vec<(TypeId, Id)>>,
+    /// M150: the reused sources whose audit re-runs (`bound_recompute_ranges`'
+    /// sources) — the written applications' sites are keyed by source.
+    bound_recompute_sources: HashSet<SourceId>,
     /// M110 S2a: the id ranges of reused sources whose audit must RE-RUN this
     /// analysis — a late impl answers one of their recorded questions, or
     /// their record carries no audit. Sorted, disjoint.
@@ -4763,6 +4786,14 @@ pub struct Analyzer<'src> {
     // M110 S7b: the held table passes' lane — the complement of the modules'
     // and items' ranges whose record carried held rows (`held_tables.rs`).
     live_held: live_ranges::LiveRanges,
+    // M149/M150: the conditionally-filed row families' lanes — per family,
+    // the complement of the ranges whose record carried its rows
+    // (`row_families.rs`).
+    live_families: row_families::FamilyLanes,
+    // M148: the label rows' lane — the complement of the modules' and
+    // items' ranges whose record carried their S2b label rows. E317's
+    // variant labels walk it (`hover_labels.rs`).
+    live_labels: live_ranges::LiveRanges,
     // M110 S7b: the view bindings and the view origins, computed ONCE per
     // analysis for the five checks and the two tail passes that ask (each
     // was a fixpoint over every binding of the program per ask). Cleared
@@ -7874,6 +7905,13 @@ impl<'src> Analyzer<'src> {
             resource_value_places: HashSet::default(),
             trait_self_markers: HashMap::default(),
             partial_move_roots: HashMap::default(),
+            move_rows_live: move_tables::MoveRows::default(),
+            move_rows_filed: false,
+            move_sets: None,
+            lazy_rows_live: lazy_tables::LazyRows::default(),
+            lazy_rows_filed: false,
+            hmr_rows_live: lazy_tables::HmrRows::default(),
+            hmr_rows_filed: false,
             resource_erasures: Vec::new(),
             variant_coercions: HashMap::default(),
             nested_annotation_owners: HashMap::default(),
@@ -7944,6 +7982,8 @@ impl<'src> Analyzer<'src> {
             bound_provider_memo: None,
             bound_proof_cut_floor: usize::MAX,
             bound_questions_derived: HashMap::default(),
+            written_bound_questions_derived: HashMap::default(),
+            bound_recompute_sources: HashSet::default(),
             bound_recompute_ranges: Vec::new(),
             prefix_impl_count: None,
             prefix_entity_end: None,
@@ -7960,6 +8000,8 @@ impl<'src> Analyzer<'src> {
             live_table: live_ranges::LiveRanges::default(),
             live_module: live_ranges::LiveRanges::default(),
             live_held: live_ranges::LiveRanges::default(),
+            live_families: row_families::FamilyLanes::default(),
+            live_labels: live_ranges::LiveRanges::default(),
             view_bindings_memo: std::cell::OnceCell::new(),
             view_origins_memo: std::cell::OnceCell::new(),
             reused_table_sources: Vec::new(),
@@ -10304,9 +10346,24 @@ impl<'src> Analyzer<'src> {
     /// one report per written spelling (B188) — and neither does a path head,
     /// which applies nothing.
     fn check_written_nominal_bounds(&mut self) {
+        // M150: M143's MODULE lane, the bound audit's — a site of a frozen
+        // (std) source has no refusal to find, and a REUSED module's sites
+        // were judged with its record: their refusals ride the audit's
+        // (`bound_diagnostics`, filed by `record_bound_window` below) and
+        // replay under the same guard, the module's questions here being
+        // `(written argument, required trait)` (`written_bound_questions`) —
+        // re-audited when a late impl answers one. A re-walked file's sites
+        // stay live, as the audit's do.
+        let diagnostics_before = self.diagnostics.len();
         for (owner_id, written_arguments, span, source_id, type_id, generics_exempt) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
+            if self.frozen_sources.contains(&source_id)
+                || (self.reused_sources.binary_search(&source_id).is_ok()
+                    && !self.bound_recompute_sources.contains(&source_id))
+            {
+                continue;
+            }
             // M134: the site's own slot is the anchor (the owner is declared
             // elsewhere); a written type that lives in no window stays unanchored.
             self.id_windows.set_check_anchor_type(type_id);
@@ -10375,6 +10432,12 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
                 for (required_trait_id, required_arguments) in &bound_traits {
+                    if source_id != SourceId(0) && source_id != DERIVED_SOURCE {
+                        self.written_bound_questions_derived
+                            .entry(source_id.0)
+                            .or_default()
+                            .push((*argument_type_id, *required_trait_id));
+                    }
                     let required_arguments: Vec<TypeId> = required_arguments
                         .iter()
                         .map(|argument| {
@@ -10439,6 +10502,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        self.record_bound_window(diagnostics_before);
     }
 
     /// The ways a grounded value violates a tuple bound (`T: (2..: Display)`)
@@ -14596,34 +14660,21 @@ impl<'src> Analyzer<'src> {
     /// reactive cell is rejected. Inert unless `std::web::dev` is loaded (the ids are
     /// `None`), so a program that never touches HMR pays nothing.
     fn check_hmr_transfer_bounds(&mut self) {
+        self.hmr_rows_live = lazy_tables::HmrRows::default();
+        self.hmr_rows_filed = false;
         if self.hmr_stash_fn_id.is_none() && self.hmr_take_fn_id.is_none() {
             return;
         }
-        // Collected read-only; the `&mut self` inference/classification runs
-        // after, as in `check_resource_any_coercion`. A `stash` site carries the
-        // value argument (whose type IS `T`); a `take` site carries the call
-        // (whose resolved type is `Option<T>`).
-        let mut stash_value_ids: Vec<Id> = Vec::new();
-        let mut take_call_ids: HashSet<Id> = HashSet::default();
-        for expr in self.expr_id_to_expr_map.values() {
-            let Expr::Call(call_id) = expr else {
-                continue;
-            };
-            let Some(function_call) = self.function_calls.get(call_id) else {
-                continue;
-            };
-            let callee_id = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
-                Some(Expr::Local(callee_id)) => *callee_id,
-                _ => continue,
-            };
-            if Some(callee_id) == self.hmr_stash_fn_id {
-                if let Some(value_id) = function_call.argument_ids.get(1).copied() {
-                    stash_value_ids.push(value_id);
-                }
-            } else if Some(callee_id) == self.hmr_take_fn_id {
-                take_call_ids.insert(*call_id);
-            }
-        }
+        // M150: the sites are rows (`lazy_tables.rs`) — the restored regions'
+        // and the live lane's — and every site's inference below runs on
+        // every analysis, so nothing minted here is ever served.
+        let live = self.live_hmr_rows();
+        let mut stash_value_ids: Vec<Id> = self.restored_tables.hmr.stash_values.clone();
+        stash_value_ids.extend(live.stash_values.iter().copied());
+        let mut take_bindings: Vec<Id> = self.restored_tables.hmr.take_bindings.clone();
+        take_bindings.extend(live.take_bindings.iter().copied());
+        self.hmr_rows_live = live;
+        self.hmr_rows_filed = true;
         // A `stash` value's type is self-determined (a literal, constructor, or
         // place), so re-inferring it against no expectation yields `T` directly —
         // the generic argument isn't recorded on the call when it was inferred,
@@ -14645,35 +14696,33 @@ impl<'src> Analyzer<'src> {
         // no stored result type, and an unconstrained `T` (a `take` whose element
         // never resolves concretely) stays generic and is left alone, so a good
         // `take` never false-rejects.
-        if !take_call_ids.is_empty() {
-            let mut take_sites: Vec<(Id, TypeId)> = Vec::new();
-            for variable in self.variables.values() {
-                let Some(initial) = variable.initial else {
-                    continue;
-                };
-                if !take_call_ids.contains(&initial) {
-                    continue;
+        let mut take_sites: Vec<(Id, TypeId)> = Vec::new();
+        for binding_id in take_bindings {
+            let Some(variable) = self.variables.get(&binding_id) else {
+                continue;
+            };
+            let Some(initial) = variable.initial else {
+                continue;
+            };
+            let element = match variable.type_id.get_type(self) {
+                Type::Enum(id, arguments)
+                    if Some(id) == self.option_enum_id && arguments.len() == 1 =>
+                {
+                    arguments[0]
                 }
-                let element = match variable.type_id.get_type(self) {
-                    Type::Enum(id, arguments)
-                        if Some(id) == self.option_enum_id && arguments.len() == 1 =>
-                    {
-                        arguments[0]
-                    }
-                    _ => continue,
-                };
-                if matches!(
-                    element.get_type(self),
-                    Type::Unresolved | Type::Unknown | Type::Generic(_)
-                ) {
-                    continue;
-                }
-                take_sites.push((initial, element));
+                _ => continue,
+            };
+            if matches!(
+                element.get_type(self),
+                Type::Unresolved | Type::Unknown | Type::Generic(_)
+            ) {
+                continue;
             }
-            for (call_id, element) in take_sites {
-                if !self.transferable_as_value(element) {
-                    self.report_hmr_transfer(call_id, element);
-                }
+            take_sites.push((initial, element));
+        }
+        for (call_id, element) in take_sites {
+            if !self.transferable_as_value(element) {
+                self.report_hmr_transfer(call_id, element);
             }
         }
     }
@@ -14760,93 +14809,6 @@ impl<'src> Analyzer<'src> {
     // moved binding is use-after-move.
     // ---------------------------------------------------------------------
 
-    /// The resource-typed binding entities (variables + parameters), by
-    /// per-instantiation classification. `&mut` because `type_is_resource`
-    /// memoizes; the scan then runs against the returned (owned) set as `&self`.
-    /// Every binding — variable or parameter — whose type is a resource.
-    ///
-    /// **M38, and what MEASURING it decided.** The item asked for a
-    /// per-nominal "can any instantiation of this be a resource" pre-filter
-    /// (M28's `resource_reaching_nominals` / `type_reaches_resource`) ahead of
-    /// the field recursion, on the reading that `type_is_resource` over every
-    /// variable and parameter was ~100 ms on kolt's browser entry. It was
-    /// built, it is answer-identical (M28 proves `type_is_resource(T)` implies
-    /// `type_reaches_resource(T)`), and it was measured: **+2,312,262
-    /// instructions on `vilan check src/client.vl` over the full kolt copy —
-    /// a LOSS, not a win.** It could not be otherwise on a program that
-    /// declares a resource: the filter substitutes one recursive walk over the
-    /// distinct `TypeId`s (`classify_resource`) for another over the same ones
-    /// (`type_mentions_nominal`), and `resource_classification` — the
-    /// analyzer's persistent memo — had already made the first cost once per
-    /// distinct type rather than once per binding. The filter is a wash by
-    /// construction, and pays for the nominals closure on top. It is not here.
-    ///
-    /// **What IS here is the gate the filter was carrying.** A world where
-    /// nothing is declared `resource` has no resource type at all —
-    /// containment bottoms out at a declared leaf — so no binding can be one
-    /// and both sweeps below can be skipped outright. `check_resource_moves`
-    /// tested that only AFTER them, by finding the result empty: two whole-map
-    /// walks and a `type_is_resource` call per binding, on every corpus
-    /// program that owns no resource, for an answer two `.any()` scans give.
-    fn collect_resource_bindings(&mut self) -> HashSet<Id> {
-        let mut bindings = HashSet::default();
-        if !self.declares_a_resource() {
-            return bindings;
-        }
-        let variables: Vec<(Id, TypeId)> =
-            self.variables.values().map(|v| (v.id, v.type_id)).collect();
-        for (id, type_id) in variables {
-            // M134: the planner's mints for a binding belong to its item.
-            self.id_windows.set_anchor(id);
-            if self.type_is_resource(type_id) {
-                bindings.insert(id);
-            }
-        }
-        let parameters: Vec<(Id, TypeId)> = self
-            .parameters
-            .values()
-            .map(|p| (p.id, p.type_id))
-            .collect();
-        for (id, type_id) in parameters {
-            self.id_windows.set_anchor(id);
-            if self.type_is_resource(type_id) {
-                bindings.insert(id);
-            }
-        }
-        bindings
-    }
-
-    /// Every place expression (`Local`, `Field`, `Index`, `TupleIndex`) whose
-    /// value type is a resource. Feeds R5 (a `Field`/element consume is a
-    /// partial move) and — stored on the analyzer — `compute_clone_sites`, which
-    /// must never mark a resource place a clone (R1: resources move, not copy).
-    fn collect_resource_value_places(&mut self) -> HashSet<Id> {
-        let mut places = HashSet::default();
-        let place_ids: Vec<Id> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter(|(_, expr)| {
-                matches!(
-                    expr,
-                    Expr::Local(_)
-                        | Expr::Field(_, _, _)
-                        | Expr::TupleIndex(_, _, _)
-                        | Expr::Index(_, _)
-                )
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in place_ids {
-            if let Some(place_type) = self.place_value_type(id) {
-                let type_id = place_type.get_type_id(self);
-                if self.type_is_resource(type_id) {
-                    places.insert(id);
-                }
-            }
-        }
-        places
-    }
-
     /// Every pattern capture bound by a LOANED subject, mapped to the subject
     /// expression that still owns the payload (B65). R6/§7.2's other half: a
     /// capture of a *consumed* subject owns its payload, but a capture of a
@@ -14861,31 +14823,35 @@ impl<'src> Analyzer<'src> {
     /// Consuming such a capture is the capture-position twin of
     /// `binding_is_loaned_parameter`, and is rejected in `scan_move_touch`.
     fn collect_loaned_pattern_captures(&self) -> HashMap<Id, Id> {
-        let mut loaned: HashMap<Id, Id> = HashMap::default();
+        let mut rows: Vec<(Id, Id)> = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            self.loaned_captures_of(expr, &mut rows);
+        }
+        rows.into_iter().collect()
+    }
+
+    /// One expression's loaned captures, `(capture, subject)` — the per-
+    /// region half of [`Self::collect_loaned_pattern_captures`] (M149).
+    fn loaned_captures_of(&self, expr: &Expr<'src>, into: &mut Vec<(Id, Id)>) {
         let mut record = |pattern: &ExprPattern, subject: Id| {
             let mut captures = Vec::new();
             Self::collect_pattern_captures(pattern, &mut captures);
-            for capture in captures {
-                loaned.insert(capture, subject);
-            }
+            into.extend(captures.into_iter().map(|capture| (capture, subject)));
         };
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                // An `is` test loans unconditionally — `is_some`'s body is
-                // exactly this shape and B60 left it free on a resource.
-                Expr::Is(subject, pattern) => record(pattern, *subject),
-                Expr::Match(subject, legs) if self.pattern_subject_is_loan(*subject) => {
-                    for leg in legs {
-                        record(&leg.pattern, *subject);
-                    }
+        match expr {
+            // An `is` test loans unconditionally — `is_some`'s body is
+            // exactly this shape and B60 left it free on a resource.
+            Expr::Is(subject, pattern) => record(pattern, *subject),
+            Expr::Match(subject, legs) if self.pattern_subject_is_loan(*subject) => {
+                for leg in legs {
+                    record(&leg.pattern, *subject);
                 }
-                Expr::Destructure(subject, pattern) if self.pattern_subject_is_loan(*subject) => {
-                    record(pattern, *subject)
-                }
-                _ => {}
             }
+            Expr::Destructure(subject, pattern) if self.pattern_subject_is_loan(*subject) => {
+                record(pattern, *subject)
+            }
+            _ => {}
         }
-        loaned
     }
 
     /// B67: what every `x is P` test in the program proves about `x`'s payload,
@@ -15052,54 +15018,75 @@ impl<'src> Analyzer<'src> {
     }
 
     fn check_resource_moves(&mut self) {
-        let resource_bindings = self.collect_resource_bindings();
+        // M149: the helper sets are folded from the restored regions' rows
+        // and the live lane's contributions (`move_tables.rs`). The bindings
+        // first: a program holding no resource binding derives nothing else
+        // and files no move rows.
+        self.move_rows_live = move_tables::MoveRows {
+            bindings: self.live_resource_bindings(),
+            ..move_tables::MoveRows::default()
+        };
+        self.move_rows_filed = false;
+        self.move_sets = None;
         // No resource binding => no resource place (a resource-typed field lives
         // only on a resource aggregate, which any owner binds as a resource). Skip
-        // the whole-program place scan on resource-free programs (std / corpus).
-        if resource_bindings.is_empty() {
+        // the place scan on resource-free programs (std / corpus).
+        if self.move_rows_live.bindings.is_empty() && self.restored_tables.moves.bindings.is_empty()
+        {
+            self.move_rows_live = move_tables::MoveRows::default();
             return;
         }
-        let resource_value_places = self.collect_resource_value_places();
+        let mut live = std::mem::take(&mut self.move_rows_live);
+        self.live_move_rows(&mut live);
+        let sets = self.fold_moves(&live);
+        self.move_rows_live = live;
+        self.move_rows_filed = true;
+        if !crate::macros::in_macro_world() {
+            let walked = self.move_rows_live.len() as u64;
+            crate::incremental::update_census(|census| census.move_rows_live += walked);
+        }
         // Published for `compute_clone_sites` (R1: a resource never clones).
-        self.resource_value_places = resource_value_places.clone();
+        self.resource_value_places = sets.places.clone();
         // §5 loan-only corollary: the module-level resources (a subset of the
         // module-level `let`s). Consuming one is rejected wherever a body reads it.
         let module_level_bindings: HashSet<Id> = self
             .module_level_binding_ids()
             .into_iter()
-            .filter(|id| resource_bindings.contains(id))
+            .filter(|id| sets.bindings.contains(id))
             .collect();
-        let loaned_captures = self.collect_loaned_pattern_captures();
-        // The concrete scan knows no generic resources, so the empty constraint
-        // set makes `type_is_resource_with` agree with `type_is_resource`.
-        let is_refinements =
-            self.collect_is_refinements(None, &HashSet::default(), &mut HashMap::default());
-        let value_crossings = self.compute_return_value_crossings();
         // B469: which field moves read as destructures. The concrete scan
         // knows no instantiation, so a generic inside an aggregate's type may
-        // hold a `Drop` and keeps the refusal.
+        // hold a `Drop` and keeps the refusal. Decided over EVERY candidate on
+        // every analysis (M149): the verdict reads the Drop-implementing
+        // nominal set and the root's module-level-ness, which another region
+        // can move.
         let partial_move_roots = self.collect_partial_move_roots(
-            &resource_value_places,
+            &sets.places,
             &module_level_bindings,
-            &loaned_captures,
+            &sets.loaned,
             &HashMap::default(),
         );
         self.partial_move_roots = partial_move_roots.clone();
 
         let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
+        // The concrete scan knows no generic resources, so the empty constraint
+        // set the refinements were classified under makes
+        // `type_is_resource_with` agree with `type_is_resource`.
         let scan = MoveScan {
-            resource_bindings: &resource_bindings,
-            resource_value_places: &resource_value_places,
+            resource_bindings: &sets.bindings,
+            resource_value_places: &sets.places,
             module_level_bindings: &module_level_bindings,
-            loaned_captures: &loaned_captures,
-            is_refinements: &is_refinements,
-            value_crossings: &value_crossings,
+            loaned_captures: &sets.loaned,
+            is_refinements: &sets.is_refinements,
+            value_crossings: &sets.crossings,
             partial_move_roots: &partial_move_roots,
             dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
         self.emit_resource_move_violations(violations);
+        // R11's whole-program sets and the drop plan read the fold too.
+        self.move_sets = Some(sets);
     }
 
     /// The places a by-value return hands back through a VIEW leaf (B109) — the
@@ -15112,7 +15099,7 @@ impl<'src> Analyzer<'src> {
     ///
     /// A view RETURN is excluded — rule 3's sanctioned projection, where the
     /// reference stays a reference and nothing crosses.
-    fn compute_return_value_crossings(&self) -> HashSet<Id> {
+    fn compute_return_value_crossings(&self, include: &dyn Fn(Id) -> bool) -> HashSet<Id> {
         let mut crossings = HashSet::default();
         // Every return position of every by-value function: the tail, and (B116)
         // each `ret`. `return_sites` carries both, for every bodied function —
@@ -15120,6 +15107,7 @@ impl<'src> Analyzer<'src> {
         let seams: Vec<(&Function, Id)> = self
             .return_sites
             .iter()
+            .filter(|(function_id, _)| include(*function_id))
             .filter_map(|(function_id, value_id)| {
                 Some((self.functions.get(function_id)?, *value_id))
             })
@@ -15381,6 +15369,8 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             asked += 1;
+            // M134: the gate's classification mints belong to the body's item.
+            self.id_windows.set_anchor(function.id);
             let mut signature: Vec<TypeId> = function
                 .parameters
                 .iter()
@@ -15402,6 +15392,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             asked += 1;
+            self.id_windows.set_anchor(closure.id);
             let signature: Vec<TypeId> = closure.return_type_id.into_iter().collect();
             let mut seeds: Vec<Id> = closure.parameter_destructures.clone();
             seeds.push(closure.return_);
@@ -15777,7 +15768,16 @@ impl<'src> Analyzer<'src> {
     /// and the overwrite drops. A resource-free program plans nothing, keeping its
     /// output byte-identical.
     fn plan_resource_drops(&mut self) {
-        let bindings = self.collect_resource_bindings();
+        // M149: the move scan's fold (`move_tables.rs`) — no fold means no
+        // resource binding anywhere, so nothing is owned and no name or
+        // component overwrite can hold a resource.
+        let (bindings, place_overwrites) = match self.move_sets.take() {
+            Some(sets) => {
+                let overwrites = self.decide_place_overwrites(&sets);
+                (sets.bindings, overwrites)
+            }
+            None => (HashSet::default(), HashMap::default()),
+        };
         // A loan owns nothing (B94). References are transparent, so `let v = &mut
         // holder` and a `&mut Holder` parameter both mint resource-TYPED bindings
         // whose value belongs to someone else — enrolling them made a view local's
@@ -15787,8 +15787,6 @@ impl<'src> Analyzer<'src> {
             .copied()
             .filter(|binding| !self.binding_or_param_is_view(*binding))
             .collect();
-        let place_overwrites =
-            self.collect_place_overwrites(&bindings, &self.resource_value_places);
         let explicitly_dropped = self.explicitly_dropped_bindings(&owned_bindings);
         let resources = ResourceOwnership {
             owned_bindings,
@@ -16864,6 +16862,7 @@ impl<'src> Analyzer<'src> {
             .map(|function| function.id)
             .collect();
         for function_id in function_ids {
+            self.id_windows.set_anchor(function_id);
             let (calls, _, _) = self.r11_body_calls_and_closures(function_id);
             let types = self.drop_sink_types_of_calls(&calls);
             if !types.is_empty() {
@@ -16877,6 +16876,7 @@ impl<'src> Analyzer<'src> {
             .map(|(id, closure)| (*id, closure.return_))
             .collect();
         for (closure_id, return_id) in closures {
+            self.id_windows.set_anchor(closure_id);
             let mut calls = Vec::new();
             let mut nested = Vec::new();
             let mut visited = HashSet::default();
@@ -17010,6 +17010,9 @@ impl<'src> Analyzer<'src> {
             if !seen.insert(type_id) {
                 continue;
             }
+            // M134: a classification's mints belong to the slot's item (M149
+            // moved a restored region's first classification here).
+            self.id_windows.set_check_anchor_type(type_id);
             if !self.type_is_resource(type_id) {
                 continue;
             }
@@ -19372,8 +19375,16 @@ impl<'src> Analyzer<'src> {
         while let Some(instance) = worklist.pop_front() {
             if sets.is_none() {
                 sets = Some(R11Sets {
-                    loaned_captures: self.collect_loaned_pattern_captures(),
-                    value_crossings: self.compute_return_value_crossings(),
+                    // M149: the move scan's fold when it ran — the same
+                    // whole-program sets, restored and live.
+                    loaned_captures: match &self.move_sets {
+                        Some(sets) => sets.loaned.clone(),
+                        None => self.collect_loaned_pattern_captures(),
+                    },
+                    value_crossings: match &self.move_sets {
+                        Some(sets) => sets.crossings.clone(),
+                        None => self.compute_return_value_crossings(&|_| true),
+                    },
                     binding_candidates: LexicalCandidates::build(
                         self,
                         self.variables
@@ -32278,41 +32289,26 @@ impl<'src> Analyzer<'src> {
     /// tables are the lowering's input, not a diagnostic, and a module whose
     /// checks are replayed still has to emit.
     fn record_lazy_arguments(&mut self) {
+        self.lazy_rows_live = lazy_tables::LazyRows::default();
+        self.lazy_rows_filed = false;
         // Every program that writes no `lazy` parameter pays one set lookup.
         if self.lazy_cells.is_empty() {
             return;
         }
-        let calls: Vec<(Id, Vec<Id>)> = self
-            .function_calls
-            .values()
-            .map(|call| (call.subject_id, call.argument_ids.clone()))
-            .collect();
         // M81's first pass: every (lazy parameter, argument) pair this program
         // actually resolved, banked before anything is recorded, because the
         // elision below is a fact about the PARAMETER and the arguments decide
-        // it together.
-        let mut lazy_pairs: Vec<(Id, Id, &'src str)> = Vec::new();
-        for (subject_id, argument_ids) in calls {
-            let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
-                continue;
-            };
-            let Some(parameter_ids) = self
-                .functions
-                .get(callee_id)
-                .map(|function| function.parameters.clone())
-            else {
-                continue;
-            };
-            for (parameter_id, argument_id) in parameter_ids.iter().zip(argument_ids.iter()) {
-                let Some(parameter) = self.parameters.get(parameter_id) else {
-                    continue;
-                };
-                if !parameter.lazy {
-                    continue;
-                }
-                lazy_pairs.push((*parameter_id, *argument_id, parameter.name));
-            }
-        }
+        // it together. M150: the pairs are rows (`lazy_tables.rs`) — the
+        // restored regions' and the live lane's, in the calls' recorded order
+        // — and the decisions below are taken over every one of them.
+        let live = self.live_lazy_rows();
+        let (pairs, lazy_parameters) = self.fold_lazy(&live);
+        self.lazy_rows_live = live;
+        self.lazy_rows_filed = true;
+        let lazy_pairs: Vec<(Id, Id, &'src str)> = pairs
+            .iter()
+            .map(|(parameter_id, argument_id, name, _)| (*parameter_id, *argument_id, *name))
+            .collect();
         // M81 — **a lazy parameter every call site fills INERTLY is eager in
         // this program.** 111 of A103's 114 `__lazy` emissions carried a
         // literal, an enum constant or `[]`, and each one allocated a memo
@@ -32342,12 +32338,7 @@ impl<'src> Analyzer<'src> {
         // `inner` stays a plain pass-through instead of re-wrapping the value
         // in a cell the way a per-pair decision would. Each round only ever
         // removes, so it terminates in at most one round per parameter.
-        let mut eager_parameters: HashSet<Id> = self
-            .parameters
-            .values()
-            .filter(|parameter| parameter.lazy)
-            .map(|parameter| parameter.id)
-            .collect();
+        let mut eager_parameters: HashSet<Id> = lazy_parameters;
         // B362 (RULED) — **a trait's declaration and every impl of it are ONE
         // convention**, so they are eager together or lazy together.
         //
@@ -32412,20 +32403,12 @@ impl<'src> Analyzer<'src> {
             }
         }
         self.lazy_eager_parameters = eager_parameters;
-        // The effects half, in a second loop so the borrow of `self` the walk
-        // takes does not fight the insert above.
-        let thunks: Vec<Id> = self.lazy_argument_thunks.keys().copied().collect();
-        for argument_id in thunks {
-            let mut effects = ThunkEffects::default();
-            self.scan_capture_body(
-                argument_id,
-                &HashSet::default(),
-                &mut HashSet::default(),
-                &mut Vec::new(),
-                &mut HashSet::default(),
-                &mut effects,
-            );
-            self.lazy_thunk_effects.insert(argument_id, effects);
+        // The effects half: each thunk's, read off its pair (M150: a row the
+        // argument's region contributed), in the thunks' order.
+        for (_, argument_id, _, effects) in pairs {
+            if self.lazy_argument_thunks.contains_key(&argument_id) {
+                self.lazy_thunk_effects.insert(argument_id, effects);
+            }
         }
     }
 
@@ -34643,6 +34626,10 @@ impl<'src> Analyzer<'src> {
         let mut shared: HashSet<Id> = HashSet::default();
         let mut materialized: HashSet<Id> = HashSet::default();
         for &(capture_id, subject_id) in candidates {
+            // M134: the classification's mints belong to the capture's item
+            // (M149 moved the restored regions' first classification here
+            // from the move scan's binding walk, which anchored it).
+            self.id_windows.set_anchor(capture_id);
             let Some((type_id, capture_is_mutable)) = self
                 .variables
                 .get(&capture_id)
@@ -52754,6 +52741,8 @@ impl<'src> Analyzer<'src> {
         let mut label_sources: HashSet<SourceId> = HashSet::default();
         let mut hint_sources: HashSet<SourceId> = HashSet::default();
         let mut held_sources: HashSet<SourceId> = HashSet::default();
+        let mut family_sources: [HashSet<SourceId>; row_families::FAMILIES] = Default::default();
+        let mut hover_sources: HashSet<SourceId> = HashSet::default();
         for source in &with_tables {
             if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
                 self.restored_tables.absorb(tables);
@@ -52766,8 +52755,33 @@ impl<'src> Analyzer<'src> {
                 if tables.held_recorded {
                     held_sources.insert(*source);
                 }
+                for family in row_families::RowFamily::ALL {
+                    if tables.families.contains(family) {
+                        family_sources[family.index()].insert(*source);
+                    }
+                }
+                if tables.hover_recorded {
+                    hover_sources.insert(*source);
+                }
             }
         }
+        self.restored_tables.hover_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| hover_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.restored_tables.hover_ranges.sort_unstable();
+        self.restored_tables.hover_sources = hover_sources;
+        for family in row_families::RowFamily::ALL {
+            *self.restored_tables.family_ranges.of_mut(family) = self
+                .source_ranges
+                .iter()
+                .filter(|range| family_sources[family.index()].contains(&range.source))
+                .map(|range| (range.start, range.end))
+                .collect();
+        }
+        self.restored_tables.family_ranges.sort();
         self.restored_tables.label_ranges = self
             .source_ranges
             .iter()
@@ -52812,12 +52826,18 @@ impl<'src> Analyzer<'src> {
             let label_ranges = std::mem::take(&mut self.restored_tables.label_ranges);
             let hint_ranges = std::mem::take(&mut self.restored_tables.hint_ranges);
             let held_ranges = std::mem::take(&mut self.restored_tables.held_ranges);
+            let family_ranges = std::mem::take(&mut self.restored_tables.family_ranges);
+            let hover_ranges = std::mem::take(&mut self.restored_tables.hover_ranges);
+            let hover_sources = std::mem::take(&mut self.restored_tables.hover_sources);
             self.restored_tables = RestoredTables {
                 drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
                 label_ranges,
                 hint_ranges,
                 held_ranges,
+                family_ranges,
+                hover_ranges,
+                hover_sources,
                 ..RestoredTables::default()
             };
         }
@@ -53250,6 +53270,12 @@ impl<'src> Analyzer<'src> {
             merge(&self.restored_tables.hint_ranges, self.item_hint_ranges());
         self.restored_tables.held_ranges =
             merge(&self.restored_tables.held_ranges, self.item_held_ranges());
+        self.restored_tables.family_ranges = self
+            .restored_tables
+            .family_ranges
+            .merged(self.item_family_ranges());
+        self.restored_tables.hover_ranges =
+            merge(&self.restored_tables.hover_ranges, self.item_hover_ranges());
         // M110 S7b: the complements, over the entity counter's high water —
         // every id this analysis holds lies below it. The Class A lane's
         // plant leaves the served ITEMS' windows live: a pass walking the
@@ -53279,6 +53305,23 @@ impl<'src> Analyzer<'src> {
         self.live_module = live_ranges::LiveRanges::complement(&module_reused, high);
         self.live_held =
             live_ranges::LiveRanges::complement(&self.restored_tables.held_ranges, high);
+        // M149/M150: the conditional families' lanes. The Class A plant
+        // leaves the served windows live here too — a family's sets are
+        // unions, so walking a served window beside its restored rows
+        // changes no answer (the stale-table plant is what proves the rows
+        // load-bearing).
+        let mut family_restored = self.restored_tables.family_ranges.clone();
+        if served_left_live {
+            for family in row_families::RowFamily::ALL {
+                let items: HashSet<(u32, u32)> = self.item_ranges().iter().copied().collect();
+                family_restored
+                    .of_mut(family)
+                    .retain(|range| !items.contains(range));
+            }
+        }
+        self.live_families = row_families::FamilyLanes::complement(&family_restored, high);
+        self.live_labels =
+            live_ranges::LiveRanges::complement(&self.restored_tables.label_ranges, high);
         if !crate::macros::in_macro_world() {
             let ranges = self.live_class_a.ranges().len() as u64;
             let entities = self.live_class_a.count();
@@ -53516,14 +53559,60 @@ impl<'src> Analyzer<'src> {
     /// resolve's questions; the audit's are asked after the store, which is
     /// why they need their own.
     fn late_impl_answers(&self, questions: &[(Id, TypeId, Id)]) -> bool {
-        if crate::incremental::planted(crate::incremental::Plant::BoundRecordUnguarded) {
+        if questions.is_empty() {
             return false;
         }
-        let Some(floor) = self.prefix_impl_count else {
+        let Some(late) = self.late_impls() else {
             return false;
         };
-        if floor >= self.implementations.len() || questions.is_empty() {
+        questions.iter().any(|(call_id, constraint_id, trait_id)| {
+            let Some(value_type_id) = self
+                .method_call_substitution
+                .get(call_id)
+                .and_then(|substitution| substitution.get(constraint_id))
+            else {
+                // A site the stored world no longer records: nothing to
+                // compare, so the module is re-audited.
+                return true;
+            };
+            self.late_impl_admits(&late, *value_type_id, *trait_id)
+        })
+    }
+
+    /// M150: [`Self::late_impl_answers`] for the written applications'
+    /// questions, whose value is the written argument itself.
+    fn late_impl_answers_written(&self, questions: &[(TypeId, Id)]) -> bool {
+        if questions.is_empty() {
             return false;
+        }
+        let Some(late) = self.late_impls() else {
+            return false;
+        };
+        questions
+            .iter()
+            .any(|(argument, trait_id)| self.late_impl_admits(&late, *argument, *trait_id))
+    }
+
+    /// Whether one of the `late` impls provides `trait_id` (or a trait whose
+    /// supertraits reach it) with a subject admitting `value`.
+    fn late_impl_admits(&self, late: &[(Type, Vec<Id>)], value: TypeId, trait_id: Id) -> bool {
+        let value_type = value.get_type(self);
+        late.iter().any(|(subject, traits)| {
+            traits.contains(&trait_id)
+                && self.impl_subject_admits(&value_type, subject, &HashMap::default())
+        })
+    }
+
+    /// The impls past the stored world's floor, each with the traits it
+    /// provides (supertraits included) — `None` when there are none, or under
+    /// the plant that leaves the guard off.
+    fn late_impls(&self) -> Option<Vec<(Type, Vec<Id>)>> {
+        if crate::incremental::planted(crate::incremental::Plant::BoundRecordUnguarded) {
+            return None;
+        }
+        let floor = self.prefix_impl_count?;
+        if floor >= self.implementations.len() {
+            return None;
         }
         let late: Vec<(Type, Vec<Id>)> = self.implementations[floor..]
             .iter()
@@ -53543,22 +53632,7 @@ impl<'src> Analyzer<'src> {
                 (implementation.subject.get_type(self), traits)
             })
             .collect();
-        questions.iter().any(|(call_id, constraint_id, trait_id)| {
-            let Some(value_type_id) = self
-                .method_call_substitution
-                .get(call_id)
-                .and_then(|substitution| substitution.get(constraint_id))
-            else {
-                // A site the stored world no longer records: nothing to
-                // compare, so the module is re-audited.
-                return true;
-            };
-            let value_type = value_type_id.get_type(self);
-            late.iter().any(|(subject, traits)| {
-                traits.contains(trait_id)
-                    && self.impl_subject_admits(&value_type, subject, &HashMap::default())
-            })
-        })
+        Some(late)
     }
 
     /// Whether a module's diagnostic points at the ENTRY — a `Note.source` or
@@ -53639,13 +53713,19 @@ impl<'src> Analyzer<'src> {
         // M110 S2a: the audit's questions, and whether its verdicts may be
         // replayed at all — not when a late impl answered one of them now
         // (the plant records the questions and drops the refusals).
-        let questions = std::mem::take(&mut self.bound_questions_derived);
+        let mut questions = std::mem::take(&mut self.bound_questions_derived);
+        let mut written = std::mem::take(&mut self.written_bound_questions_derived);
         let unrecorded_plant =
             crate::incremental::planted(crate::incremental::Plant::BoundAuditUnrecorded);
-        for (source, asked) in questions {
-            let answered = self.late_impl_answers(&asked);
+        let asking: HashSet<u32> = questions.keys().chain(written.keys()).copied().collect();
+        for source in asking {
+            let asked = questions.remove(&source).unwrap_or_default();
+            let asked_written = written.remove(&source).unwrap_or_default();
+            let answered =
+                self.late_impl_answers(&asked) || self.late_impl_answers_written(&asked_written);
             let module = derived.entry(source).or_default();
             module.bound_questions = asked;
+            module.written_bound_questions = asked_written;
             module.bound_recordable = !answered;
             if unrecorded_plant {
                 module.bound_diagnostics.clear();
@@ -53654,7 +53734,10 @@ impl<'src> Analyzer<'src> {
         // A module that asked nothing recorded no questions above: its
         // (empty) audit is replayable.
         for module in derived.values_mut() {
-            if module.bound_questions.is_empty() && module.bound_diagnostics.is_empty() {
+            if module.bound_questions.is_empty()
+                && module.written_bound_questions.is_empty()
+                && module.bound_diagnostics.is_empty()
+            {
                 module.bound_recordable = true;
             }
         }
@@ -53699,13 +53782,17 @@ impl<'src> Analyzer<'src> {
     fn replay_world_diagnostics(&mut self, records: &HashMap<u32, ModuleDiagnostics>) {
         let reused = self.reused_sources.clone();
         self.bound_recompute_ranges.clear();
+        self.bound_recompute_sources.clear();
         for source in reused {
             let Some(record) = records.get(&source.0) else {
                 continue;
             };
             // M110 S2a: the audit's refusals, replayed only while their
             // condition holds; otherwise the module's sites are re-audited.
-            if record.bound_recordable && !self.late_impl_answers(&record.bound_questions) {
+            if record.bound_recordable
+                && !self.late_impl_answers(&record.bound_questions)
+                && !self.late_impl_answers_written(&record.written_bound_questions)
+            {
                 let from = self.diagnostics.len();
                 self.diagnostics
                     .extend(record.bound_diagnostics.iter().cloned());
@@ -53718,6 +53805,7 @@ impl<'src> Analyzer<'src> {
                     .map(|range| (range.start, range.end))
                     .collect();
                 self.bound_recompute_ranges.extend(ranges);
+                self.bound_recompute_sources.insert(source);
             }
             let from = self.diagnostics.len();
             self.diagnostics.extend(record.diagnostics.iter().cloned());
@@ -79418,6 +79506,12 @@ struct ModuleDiagnostics {
     /// when no analysis has recorded the audit for this module yet.
     bound_diagnostics: Vec<crate::error::Error>,
     bound_questions: Vec<(Id, TypeId, Id)>,
+    /// M150: the WRITTEN applications' questions (`check_written_nominal_
+    /// bounds`, B251's twin of the audit) — `(argument type, required trait)`,
+    /// prefix slots identical on every hit. Their refusals ride
+    /// `bound_diagnostics` and replay under the same condition: no late impl
+    /// answers a question of either kind.
+    written_bound_questions: Vec<(TypeId, Id)>,
     bound_recordable: bool,
 }
 
@@ -79469,6 +79563,15 @@ struct ModuleTables {
     /// and stays live for those passes.
     held: held_tables::HeldRows,
     held_recorded: bool,
+    /// M149: the module's contributions to the move scan's helper sets
+    /// (`move_tables.rs`), filed only by an analysis that derived them —
+    /// [`Self::families`] says which conditional families a slice carries.
+    moves: move_tables::MoveRows,
+    /// M150: the module's lazy-argument candidates and HMR transfer sites
+    /// (`lazy_tables.rs`), filed only by an analysis that ran those passes.
+    lazy: lazy_tables::LazyRows,
+    hmr: lazy_tables::HmrRows,
+    families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
     return_clone_sites: Vec<(Id, CopyDecision)>,
@@ -79521,6 +79624,13 @@ struct ModuleTables {
     /// analysis with reading aids computes them); a record written by any
     /// other analysis carries none, and the stages are hinted live.
     hints_recorded: bool,
+    /// M148: the editor's per-file hover rows for this module's regions
+    /// (E206, E237, E240, E241 — `hover_records.rs`), and whether they were
+    /// FILED: only a seeded analysis under the reading aids renders them for
+    /// a module, and a region whose rows name another re-walked window's
+    /// entity files none.
+    hover: hover_records::RecordedHoverRows,
+    hover_recorded: bool,
 }
 
 impl ModuleTables {
@@ -79582,7 +79692,17 @@ impl ModuleTables {
                     }
             })
             .sum();
-        flat * id + chains + bumps + decisions + labels + hints + self.held.bytes()
+        flat * id
+            + chains
+            + bumps
+            + decisions
+            + labels
+            + hints
+            + self.held.bytes()
+            + self.moves.bytes()
+            + self.lazy.bytes()
+            + self.hmr.bytes()
+            + self.hover.bytes()
     }
 }
 
@@ -79638,6 +79758,18 @@ struct RestoredTables {
     /// items whose record carried them (the regions the held passes skip).
     held: held_tables::HeldRows,
     held_ranges: Vec<(u32, u32)>,
+    /// M149: the restored move rows, and per conditional family the ranges
+    /// of the modules and items whose record carried it.
+    moves: move_tables::MoveRows,
+    lazy: lazy_tables::LazyRows,
+    hmr: lazy_tables::HmrRows,
+    family_ranges: row_families::FamilyRanges,
+    /// M148: the restored hover rows, the entity ranges of the modules and
+    /// items whose record carried them, and the restored MODULES as sources
+    /// (the span-keyed rows' predicate; a served item's is its text region).
+    hover: hover_records::RecordedHoverRows,
+    hover_ranges: Vec<(u32, u32)>,
+    hover_sources: HashSet<SourceId>,
 }
 
 impl Default for RestoredTables {
@@ -79669,6 +79801,13 @@ impl Default for RestoredTables {
             hint_ranges: Vec::new(),
             held: held_tables::HeldRows::default(),
             held_ranges: Vec::new(),
+            moves: move_tables::MoveRows::default(),
+            lazy: lazy_tables::LazyRows::default(),
+            hmr: lazy_tables::HmrRows::default(),
+            family_ranges: row_families::FamilyRanges::default(),
+            hover: hover_records::RecordedHoverRows::default(),
+            hover_ranges: Vec::new(),
+            hover_sources: HashSet::default(),
         }
     }
 }
@@ -79707,6 +79846,18 @@ impl RestoredTables {
         self.stage_hints.extend(tables.stage_hints.iter().cloned());
         if tables.held_recorded {
             self.held.extend(&tables.held);
+        }
+        if tables.families.contains(row_families::RowFamily::Moves) {
+            self.moves.extend(&tables.moves);
+        }
+        if tables.families.contains(row_families::RowFamily::Lazy) {
+            self.lazy.extend(&tables.lazy);
+        }
+        if tables.families.contains(row_families::RowFamily::Hmr) {
+            self.hmr.extend(&tables.hmr);
+        }
+        if tables.hover_recorded {
+            self.hover.extend(&tables.hover);
         }
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
@@ -86671,8 +86822,13 @@ fn analyze_over_world<'src>(
     // E313: the files whose hover rows this analysis renders.
     let hover_rows = hover_labels::HoverRows::new(workspace, &sources);
     let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
+    // M148: the hover rows this analysis RENDERS, for the records — only an
+    // analysis whose records carry them (a seeded one under the reading
+    // aids) keeps the copies.
+    let records_hover = !workspace.hot_seeds.is_empty() && workspace.reading_aids;
+    let mut rendered_call_labels: Vec<(Id, String)> = Vec::new();
     for (call_id, substitution) in &analyzer.method_call_substitution {
-        if substitution.is_empty() {
+        if substitution.is_empty() || analyzer.hover_row_restored(*call_id) {
             continue;
         }
         if !analyzer
@@ -86698,8 +86854,15 @@ fn analyze_over_world<'src>(
         if declaration_labels.get(&function_id) == Some(&computed) {
             continue;
         }
+        if records_hover {
+            rendered_call_labels.push((*call_id, computed.clone()));
+            rendered_call_labels.push((subject_id, computed.clone()));
+        }
         call_signature_labels.insert(*call_id, computed.clone());
         call_signature_labels.insert(subject_id, computed);
+    }
+    if !label_rows_planted {
+        call_signature_labels.extend(analyzer.restored_call_labels(&hover_rows));
     }
     for (function_id, external) in &analyzer.external_functions {
         if analyzer.label_row_restored(*function_id) {
@@ -86772,6 +86935,48 @@ fn analyze_over_world<'src>(
     crate::phase_pass_mark("the label tables");
     let (member_owners, member_headers) = analyzer.member_headers();
     crate::phase_pass_mark("analyzer.member_headers()");
+    // E237: the definition under an entry binding's, member's or field's type.
+    // E313: for every file a view can serve, under the editor's reading aids.
+    // M148: a region whose record carried its hover rows is not rendered —
+    // its rows are restored below (the label plant drops them, keeping the
+    // skip).
+    let (mut type_definitions, rendered_definitions) =
+        analyzer.type_definitions(&expr_type_ids, &hover_rows);
+    // E241: a variant pattern's label, rendered once its types have settled.
+    let mut pattern_labels = analyzer.pattern_labels(&hover_rows);
+    // E240: type parameters and traits named in type position.
+    let (mut reference_hovers, recordable_references) = analyzer.reference_hovers(&hover_rows);
+    let rendered_hover = if records_hover {
+        hover_records::RenderedHoverRows {
+            call_labels: rendered_call_labels,
+            definitions: rendered_definitions,
+            blocks: type_definitions.blocks().to_vec(),
+            patterns: pattern_labels.clone(),
+            references: reference_hovers
+                .iter()
+                .zip(&recordable_references)
+                .filter(|(_, recordable)| **recordable)
+                .map(|(row, _)| row.clone())
+                .collect(),
+        }
+    } else {
+        hover_records::RenderedHoverRows::default()
+    };
+    if !label_rows_planted {
+        analyzer.restore_type_definitions(&mut type_definitions, &expr_type_ids, &hover_rows);
+        let (patterns, references) = analyzer.restored_span_rows(&hover_rows);
+        if !crate::macros::in_macro_world() {
+            let restored = &analyzer.restored_tables.hover;
+            let count = (restored.call_labels.len()
+                + restored.definitions.len()
+                + patterns.len()
+                + references.len()) as u64;
+            crate::incremental::update_census(|census| census.hover_rows_restored += count);
+        }
+        pattern_labels.extend(patterns);
+        reference_hovers.extend(references);
+    }
+    crate::phase_pass_mark("the hover rows");
 
     if let Some(key) = &checks_key
         && !entry_is_module
@@ -86920,6 +87125,48 @@ fn analyze_over_world<'src>(
         if items_enabled {
             held_live.partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M149: the live lane's move rows, per source and per item.
+        analyzer
+            .move_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .move_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
+        // M148: the hover rows, per source and per item — the span rows by
+        // their place in the file.
+        let slice_at = |source: SourceId, _: Span| -> Option<u32> {
+            (source.0 != 0 && !skip(source)).then_some(source.0)
+        };
+        rendered_hover.partition_into(&|id| file_of(&analyzer, id), &slice_at, &mut tables);
+        if items_enabled {
+            let item_at = |source: SourceId, span: Span| -> Option<u32> {
+                analyzer
+                    .item_window_filed_at(source, span.start)
+                    .map(|window| window as u32)
+            };
+            rendered_hover.partition_into(&|id| item_of(&analyzer, id), &item_at, &mut item_tables);
+        }
+        // M150: the lazy and HMR rows likewise.
+        analyzer
+            .lazy_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        analyzer
+            .hmr_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .lazy_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+            analyzer
+                .hmr_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
+        let families = row_families::FamilySet::default()
+            .with(row_families::RowFamily::Moves, analyzer.move_rows_filed)
+            .with(row_families::RowFamily::Lazy, analyzer.lazy_rows_filed)
+            .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed);
         // M110 S7b: the resource slots per SOURCE (an item's window is
         // classified live), by the slot's own source stamp.
         {
@@ -86949,6 +87196,8 @@ fn analyze_over_world<'src>(
             // module's held rows name nothing outside the stored world.
             slice.hints_recorded = workspace.reading_aids;
             slice.held_recorded = true;
+            slice.families = families;
+            slice.hover_recorded = records_hover;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
         // M110 S7: the item records of the re-walked files, with their
@@ -86957,8 +87206,14 @@ fn analyze_over_world<'src>(
         // a truncated item on every later hit).
         if items_enabled && !crate::cancel::cancelled() {
             let digest = analyzer.drop_nominals_world_digest;
-            let (items, purge) =
-                analyzer.take_item_records(item_tables, digest, seeded, workspace.reading_aids);
+            let (items, purge) = analyzer.take_item_records(
+                item_tables,
+                digest,
+                seeded,
+                workspace.reading_aids,
+                families,
+                records_hover,
+            );
             item_records::checked_cache_store_items(
                 key,
                 &source_hashes[..prefix_len],
@@ -86968,14 +87223,7 @@ fn analyze_over_world<'src>(
         }
     }
 
-    // E237: the definition under an entry binding's, member's or field's type.
-    // E313: for every file a view can serve, under the editor's reading aids.
-    let type_definitions = analyzer.type_definitions(&expr_type_ids, &hover_rows);
     crate::phase_pass_mark("the class D partition and the records");
-    // E241: a variant pattern's label, rendered once its types have settled.
-    let pattern_labels = analyzer.pattern_labels(&hover_rows);
-    // E240: type parameters and traits named in type position.
-    let reference_hovers = analyzer.reference_hovers(&hover_rows);
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();

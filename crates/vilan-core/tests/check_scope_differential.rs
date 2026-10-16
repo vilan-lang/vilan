@@ -373,6 +373,17 @@ fn observe_in_package(
     entry_path: &Path,
     entry_source: String,
 ) -> ReuseObservation {
+    observe_in_package_on(pkg_root, entry_path, entry_source, Platform::default())
+}
+
+/// [`observe_in_package`] under `platform` (M150's HMR pin needs the browser
+/// twin of `std::web::dev`).
+fn observe_in_package_on(
+    pkg_root: &Path,
+    entry_path: &Path,
+    entry_source: String,
+    platform: Platform,
+) -> ReuseObservation {
     // N66: the harness's guard, on this binary's own twin of the helper too —
     // the trap is the ARGUMENT, so it has to be refused wherever the argument
     // is taken.
@@ -388,7 +399,7 @@ fn observe_in_package(
                 &std_spec(),
                 &pkg_root,
                 &entry_path,
-                Some(Platform::default()),
+                Some(platform),
                 &Workspace::default(),
             );
             let diagnostics = format!("{errors:?}");
@@ -1238,6 +1249,253 @@ fn a_stale_restored_table_moves_the_emitted_javascript() {
          EMPTY emitted byte-identical JavaScript — so the restored class D \
          tables are not read, and every agreement the differential reports is \
          vacuous"
+    );
+}
+
+/// **M149's stale-row plant.** The move scan's helper sets are folded from
+/// the restored modules' rows and the live regions' contributions
+/// (`analyzer/move_tables.rs`); a reused module's bindings are not
+/// classified again. The module here declares a module-level resource the
+/// ENTRY consumes — the §5 loan-only refusal, which the entry's live scan
+/// can only make if the restored rows still say the module's binding is a
+/// resource. With the rows thrown away and the skip kept (the stale-table
+/// plant), the refusal must go: if it stays, the rows are not read and the
+/// fold's agreement with the clean analysis says nothing.
+#[test]
+fn a_stale_restored_move_row_moves_the_diagnostics() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (honest, cold, planted) = honest_cold_planted(
+        "stale_moves",
+        "[resource]\nexport struct Db {\n\tn: i32,\n}\n\nexport let db = Db { n = 1 };\n\nexport fun consume(own handle: Db) {\n\tprint(\"{handle.n}\");\n}\n",
+        &|revision| {
+            format!(
+                "import pkg::module::{{ db, consume }};\n\nfun main() {{\n\tlet revision = {revision};\n\tprint(\"{{revision}}\");\n\tconsume(db);\n}}\n"
+            )
+        },
+        Platform::default(),
+    );
+    assert!(
+        honest.0.contains("is a module-level resource"),
+        "the fixture's entry must be refused for consuming the module's resource: {}",
+        honest.0
+    );
+    assert_eq!(
+        honest.0, cold.0,
+        "the restored move rows must answer what a cold analysis answers"
+    );
+    assert_ne!(
+        honest.0, planted.0,
+        "a reused module whose move rows came back EMPTY left the entry's \
+         refusal standing — the restored rows are not read"
+    );
+}
+
+/// One module package observed warm (a first analysis files the module's
+/// record, the second is served it) under `entry(revision)`, honestly, with
+/// nothing remembered (cold), and under the stale-table plant (the module's
+/// rows thrown away, its skip kept) — the three observations the M149/M150
+/// row pins compare.
+fn honest_cold_planted(
+    name: &str,
+    module: &str,
+    entry: &dyn Fn(u32) -> String,
+    platform: Platform,
+) -> (ReuseObservation, ReuseObservation, ReuseObservation) {
+    let (directory, entry_path) = write_module_package(name, module);
+    let warm = |directory: &Path, entry_path: &Path| -> ReuseObservation {
+        let _ = observe_in_package_on(directory, entry_path, entry(1), platform);
+        observe_in_package_on(directory, entry_path, entry(2), platform)
+    };
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::set_world_table_reuse(true);
+    vilan_core::analyzer::set_stale_table_plant(false);
+    vilan_core::analyzer::base_cache_clear();
+    let honest = warm(&directory, &entry_path);
+    vilan_core::analyzer::base_cache_clear();
+    let cold = observe_in_package_on(&directory, &entry_path, entry(2), platform);
+    vilan_core::analyzer::set_stale_table_plant(true);
+    vilan_core::analyzer::base_cache_clear();
+    let planted = warm(&directory, &entry_path);
+    vilan_core::analyzer::set_stale_table_plant(false);
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        honest.4 > 0 && planted.4 > 0,
+        "{name}: both legs must have RESTORED the module's tables: honest {}, planted {}",
+        honest.4,
+        planted.4
+    );
+    (honest, cold, planted)
+}
+
+/// **M150's lazy rows.** A reused module's call filling a `lazy` parameter
+/// with an expression that has an effect is a ROW (`analyzer/lazy_tables.rs`):
+/// the call is not swept again, and the eager decision — which needs every
+/// call site of the parameter — reads it back. With the rows thrown away the
+/// parameter has no recorded site, reads as eager, and the emitted thunk goes:
+/// the JavaScript must move.
+#[test]
+fn a_stale_restored_lazy_row_moves_the_emitted_javascript() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (honest, cold, planted) = honest_cold_planted(
+        "stale_lazy",
+        "export fun pick(flag: bool, lazy fallback: i32): i32 {\n\tif flag {\n\t\t1\n\t} else {\n\t\tfallback\n\t}\n}\n\nfun expensive(): i32 {\n\tprint(\"computed\");\n\t2\n}\n\nexport fun chosen(): i32 {\n\tpick(true, expensive())\n}\n",
+        &|revision| {
+            format!(
+                "import pkg::module::chosen;\n\nfun main() {{\n\tlet revision = {revision};\n\tprint(revision);\n\tprint(chosen());\n}}\n"
+            )
+        },
+        Platform::default(),
+    );
+    assert!(
+        honest.2.is_some(),
+        "the fixture must emit JavaScript: {}",
+        honest.0
+    );
+    assert_eq!(
+        honest.2, cold.2,
+        "the restored lazy rows must emit what a cold analysis emits"
+    );
+    assert_ne!(
+        honest.2, planted.2,
+        "a reused module whose lazy rows came back EMPTY emitted the same \
+         JavaScript — the restored rows are not read"
+    );
+}
+
+/// **M150's HMR rows.** A reused module's `dev::stash` site is a row; its
+/// re-inference and refusal run on every analysis (they mint), so the
+/// refusal is re-derived from the restored site. With the rows thrown away
+/// the site is never asked and the refusal goes.
+#[test]
+fn a_stale_restored_hmr_row_moves_the_diagnostics() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (honest, cold, planted) = honest_cold_planted(
+        "stale_hmr",
+        "import std::web::dev;\n\nexport fun keep() {\n\tdev::stash(\"handler\", || 0);\n}\n",
+        &|revision| {
+            format!(
+                "import pkg::module::keep;\n\nfun main() {{\n\tlet revision = {revision};\n\tprint(\"{{revision}}\");\n\tkeep();\n}}\n"
+            )
+        },
+        Platform::Browser,
+    );
+    assert!(
+        honest.0.contains("cannot cross a hot swap"),
+        "the fixture's module must be refused for stashing a closure: {}",
+        honest.0
+    );
+    assert_eq!(
+        honest.0, cold.0,
+        "the restored HMR rows must answer what a cold analysis answers"
+    );
+    assert_ne!(
+        honest.0, planted.0,
+        "a reused module whose HMR rows came back EMPTY kept its refusal — the \
+         restored rows are not read"
+    );
+}
+
+/// The written-application fixture (B251) for M150's module lane: a reused
+/// module's annotation `Holder<i32>` against `T: Shape`.
+const WRITTEN_BOUND_MODULE: &str = "export trait Shape {\n\tfun area(self): i32;\n}\n\nexport struct Holder<T: Shape> {\n\tvalue: T,\n}\n\nexport fun measure(h: Holder<i32>): i32 {\n\t1\n}\n";
+
+/// **M150: the written applications in M143's module lane.** A reused
+/// module's written-bound sites are not asked again; their refusals ride the
+/// bound audit's record and replay with it. The audit's own plant (the
+/// refusals dropped from the record, the questions kept) must therefore take
+/// the written refusal with it — and the honest replay must equal a cold
+/// analysis.
+#[test]
+fn a_reused_modules_written_bound_refusal_is_replayed_from_the_audit_record() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = |revision: u32| {
+        format!(
+            "import pkg::module::measure;\n\nfun main() {{\n\tlet revision = {revision};\n\tprint(\"{{revision}}\");\n}}\n"
+        )
+    };
+    let (directory, entry_path) = write_module_package("written_bound", WRITTEN_BOUND_MODULE);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::set_world_table_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = observe_in_package(&directory, &entry_path, entry(1));
+    let honest = observe_in_package(&directory, &entry_path, entry(2));
+    vilan_core::analyzer::base_cache_clear();
+    let cold = observe_in_package(&directory, &entry_path, entry(2));
+    vilan_core::incremental::set_plant(Some(vilan_core::incremental::Plant::BoundAuditUnrecorded));
+    vilan_core::analyzer::base_cache_clear();
+    let _ = observe_in_package(&directory, &entry_path, entry(1));
+    let planted = observe_in_package(&directory, &entry_path, entry(2));
+    vilan_core::incremental::set_plant(None);
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        honest.3.0 > 0,
+        "the second analysis must have REUSED the module: {:?}",
+        honest.3
+    );
+    assert!(
+        honest.0.contains("does not implement trait 'Shape'"),
+        "the fixture's module must be refused at its written application: {}",
+        honest.0
+    );
+    assert_eq!(honest.0, cold.0, "the replayed refusal is the cold one");
+    assert_ne!(
+        honest.0, planted.0,
+        "the audit's record lost its refusals and the written one stayed — the \
+         reused module's written sites were asked again, not replayed"
+    );
+}
+
+/// **M150's guard.** An impl the ENTRY writes is LATE to the stored world:
+/// when it answers a reused module's written-bound question (`i32` now
+/// implements `Shape`), the module is re-audited rather than its refusal
+/// replayed — warm equals cold, and both are clean.
+#[test]
+fn a_late_impl_answering_a_written_bound_re_audits_the_module() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = |revision: u32| {
+        if revision == 1 {
+            "import pkg::module::measure;\n\nfun main() {\n\tprint(\"1\");\n}\n".to_string()
+        } else {
+            format!(
+                "import pkg::module::{{ measure, Shape }};\n\nimpl i32 with Shape {{\n\tfun area(self): i32 {{\n\t\tself\n\t}}\n}}\n\nfun main() {{\n\tlet revision = {revision};\n\tprint(\"{{revision}}\");\n}}\n"
+            )
+        }
+    };
+    let (directory, entry_path) = write_module_package("written_bound_late", WRITTEN_BOUND_MODULE);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::set_world_table_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+    let first = observe_in_package(&directory, &entry_path, entry(1));
+    let warm = observe_in_package(&directory, &entry_path, entry(2));
+    vilan_core::analyzer::base_cache_clear();
+    let cold = observe_in_package(&directory, &entry_path, entry(2));
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        first.0.contains("does not implement trait 'Shape'"),
+        "without the entry's impl the module is refused: {}",
+        first.0
+    );
+    assert_eq!(
+        warm.0, cold.0,
+        "the late impl must re-audit the reused module"
+    );
+    assert!(
+        !warm.0.contains("does not implement trait 'Shape'"),
+        "the entry's impl answers the question: {}",
+        warm.0
     );
 }
 
