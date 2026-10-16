@@ -165,3 +165,54 @@ fun main() {
         "a `Some(..)` wrap is a call per site: {peek:?}"
     );
 }
+
+/// papers-54's B?2: the context pass threads its argument to a `for` loop's
+/// implicit `next` as to a written call — a sync `Iterator` reading the
+/// ambient nursery, called outside a nursery and inside one. The loop's call
+/// was keyed by the loop in the call graph and had no `FunctionCall` to take
+/// the argument, so `next` ran without it (a `TypeError` on JS).
+#[test]
+fn a_for_loops_next_reading_a_context_is_handed_it() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, None, Some };
+        import std::task;
+
+        struct Countdown {
+            left: i32,
+        }
+
+        impl Countdown with Iterator<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.left == 0 {
+                    ret None;
+                }
+                self.left = self.left - 1;
+                if task::ambient_signal().is_some() {
+                    Some(self.left + 100)
+                } else {
+                    Some(self.left)
+                }
+            }
+        }
+
+        fun count_down(label: str) {
+            let counter = Countdown { left = 2 };
+            for value in counter {
+                print(i"{label} {value}");
+            }
+        }
+
+        fun main() {
+            count_down("outside");
+            task::nursery(|_| {
+                count_down("inside");
+            });
+        }
+        main();
+        "#,
+        "outside 1\noutside 0\ninside 101\ninside 100\n",
+    );
+}

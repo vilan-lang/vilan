@@ -1113,6 +1113,19 @@ pub fn convention_mode(convention: Convention) -> Mode {
     }
 }
 
+/// Whether one of the branches' trailing expressions is `id` (B640).
+fn if_branch_trails_into(branch: &ExprIfBranch, id: Id) -> bool {
+    match branch {
+        ExprIfBranch::If(_, (_, trailing), next) => {
+            *trailing == id
+                || next
+                    .as_deref()
+                    .is_some_and(|next| if_branch_trails_into(next, id))
+        }
+        ExprIfBranch::Else((_, trailing)) => *trailing == id,
+    }
+}
+
 fn if_branch_has_final_else(branch: &ExprIfBranch) -> bool {
     match branch {
         ExprIfBranch::If(_, _, Some(next)) => if_branch_has_final_else(next),
@@ -1617,6 +1630,29 @@ enum PlaceStep {
     Field(usize),
     Slot(usize),
     Element,
+}
+
+/// Whether one place path is a prefix of the other — the two places nest,
+/// so a write of either reaches the other (B639). Elements compare equal.
+fn paths_nest(left: &[PlaceStep], right: &[PlaceStep]) -> bool {
+    left.iter().zip(right).all(|(left, right)| left == right)
+}
+
+/// A write inside a later argument of a call that lends a place `&mut`
+/// (native-53's B?2, B639): the lent place's root re-bound whole, or the
+/// place written in place.
+#[derive(Clone, Copy)]
+enum LentWrite {
+    Rebind(Id),
+    InPlace(Id),
+}
+
+impl LentWrite {
+    fn id(self) -> Id {
+        match self {
+            LentWrite::Rebind(id) | LentWrite::InPlace(id) => id,
+        }
+    }
 }
 
 /// How far below its anchor place a view may point (B529).
@@ -9873,18 +9909,28 @@ impl<'src> Analyzer<'src> {
                     };
                 // array-lengths.md §5.2: a LENGTH nothing binds is the same
                 // refusal, and its explicit form is a number (`zeros<4>()`).
+                // B642: the fix-its spell the call as it was written — a
+                // method call keeps its receiver (`numbers.to_array<4>()`).
                 let message = match self.length_parameters.contains(&constraint_id) {
-                    true => format!(
-                        "cannot infer the length '{generic_label}' for this call: {why}. Write \
-                         it — on the binding the result lands in (`let value: [_; 4] = …`), \
-                         as the call's argument (`{member}<4>(…)`), or ascribe the call"
-                    ),
-                    false => format!(
-                        "cannot infer '{generic_label}' for this call: {why}. Write the type — on \
-                         the binding the result lands in (`let value: … = …`), as the call's \
-                         type argument (`{member}<…>(…)`), or ascribe the call \
-                         (`{member}(…) as …`)"
-                    ),
+                    true => {
+                        let length_argument = self.written_call_form(call_id, member, "<4>");
+                        format!(
+                            "cannot infer the length '{generic_label}' for this call: {why}. \
+                             Write it — on the binding the result lands in (`let value: [_; 4] \
+                             = …`), as the call's argument (`{length_argument}`), or ascribe the \
+                             call"
+                        )
+                    }
+                    false => {
+                        let type_argument = self.written_call_form(call_id, member, "<…>");
+                        let ascribed = self.written_call_form(call_id, member, "");
+                        format!(
+                            "cannot infer '{generic_label}' for this call: {why}. Write the type \
+                             — on the binding the result lands in (`let value: … = …`), as the \
+                             call's type argument (`{type_argument}`), or ascribe the call \
+                             (`{ascribed} as …`)"
+                        )
+                    }
                 };
                 errors.push((
                     call_id,
@@ -23876,6 +23922,38 @@ impl<'src> Analyzer<'src> {
         selected
     }
 
+    /// B642: `member` called with `generic_list` written after its name, in
+    /// the call's own shape — `{receiver}.{member}{generic_list}()` for a
+    /// METHOD call, the receiver as written (`…` when it is not one short
+    /// line), `()` when it passes nothing else and `(…)` when it does; the
+    /// free form `{member}{generic_list}(…)` otherwise, as before.
+    fn written_call_form(&self, call_id: Id, member: &str, generic_list: &str) -> String {
+        let receiver_id = match self.function_calls.get(&call_id) {
+            Some(call) if self.member_name_spans.contains_key(&call_id) => {
+                call.argument_ids.first().copied().map(|receiver| {
+                    let passes_more = call.argument_ids.len() > 1;
+                    (receiver, passes_more)
+                })
+            }
+            _ => None,
+        };
+        let Some((receiver_id, passes_more)) = receiver_id else {
+            return format!("{member}{generic_list}(…)");
+        };
+        let receiver = self
+            .span_map
+            .get(&receiver_id)
+            .zip(self.source_of_id(receiver_id))
+            .and_then(|(span, source)| {
+                self.source_text(source)
+                    .and_then(|text| text.get(span.into_range()))
+            })
+            .filter(|written| !written.contains('\n') && written.chars().count() <= 40)
+            .unwrap_or("…");
+        let arguments = if passes_more { "(…)" } else { "()" };
+        format!("{receiver}.{member}{generic_list}{arguments}")
+    }
+
     /// B627: whether the value of `call_id`, whose settled type still carries
     /// `generic`, ends where nothing decides it. The value is followed through
     /// what it lands in — the binding it initializes, the call it is an
@@ -23887,8 +23965,28 @@ impl<'src> Analyzer<'src> {
     /// or a landing whose own settled type no longer carries it. A binding
     /// that still carries it, or a carrier only a field read or a statement
     /// consumes, is undetermined.
+    ///
+    /// B640: a value that is the RESULT of a function whose return type is
+    /// inferred — its body's tail, through a block's tail or an `if`'s arms,
+    /// or a `ret`'s value — is typed by nothing there: the function is
+    /// instantiated at each call, so the walk continues at its call sites
+    /// (`fun tail_of() { Holder::build() }` called as `tail_of();` is
+    /// undetermined; `let held: Option<Holder<i32>> = tail_of();` decides it).
     fn undetermined_value_flows_on(&mut self, call_id: Id, generic: TypeId) -> bool {
-        let mut current = call_id;
+        let mut visited_call_sites = HashSet::default();
+        self.undetermined_value_flows_from(call_id, generic, &mut visited_call_sites)
+    }
+
+    /// [`Self::undetermined_value_flows_on`]'s walk from one carrier;
+    /// `visited_call_sites` keeps a recursive function's own call sites from
+    /// being followed twice.
+    fn undetermined_value_flows_from(
+        &mut self,
+        start: Id,
+        generic: TypeId,
+        visited_call_sites: &mut HashSet<Id>,
+    ) -> bool {
+        let mut current = start;
         // Each step moves to an enclosing expression, so the walk is bounded
         // by the nesting depth; the cap only guards a malformed table.
         for _ in 0..64 {
@@ -23921,23 +24019,95 @@ impl<'src> Analyzer<'src> {
             match consumer {
                 Some(consumer_id) if self.settled_type_carries(consumer_id, generic) => {
                     current = consumer_id;
+                    continue;
                 }
                 Some(_) => return false,
-                // A field read off the carrier, or a statement discarding it,
-                // consumes it untyped (`print(Holder::build().unwrap().value)`,
-                // `Holder::build();`): the instance is emitted undetermined.
-                // Any other position (a list element, a tuple, a typed return)
-                // is that position's to type.
-                None => {
-                    return self.expr_id_to_expr_map.values().any(|expr| match expr {
-                        Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..) => {
-                            *subject == current
+                None => {}
+            }
+            // A field read off the carrier, or a statement discarding it,
+            // consumes it untyped (`print(Holder::build().unwrap().value)`,
+            // `Holder::build();`): the instance is emitted undetermined. A
+            // block's tail or an `if`'s arm hands the value to the enclosing
+            // expression (B640). Any other position (a list element, a tuple)
+            // is that position's to type.
+            let mut enclosing = None;
+            for (expr_id, expr) in &self.expr_id_to_expr_map {
+                match expr {
+                    Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..)
+                        if *subject == current =>
+                    {
+                        return true;
+                    }
+                    Expr::Block((statements, tail_id)) => {
+                        if statements.contains(&current) {
+                            return true;
                         }
-                        Expr::Block((statements, _)) => statements.contains(&current),
-                        _ => false,
-                    });
+                        if *tail_id == current {
+                            enclosing = Some(*expr_id);
+                        }
+                    }
+                    Expr::If(branch)
+                        if if_branch_has_final_else(branch)
+                            && if_branch_trails_into(branch, current) =>
+                    {
+                        enclosing = Some(*expr_id);
+                    }
+                    _ => {}
                 }
             }
+            if let Some(enclosing_id) = enclosing {
+                current = enclosing_id;
+                continue;
+            }
+            // A function body's own statement discards the value too (B640:
+            // `result_of();`); the result of a function whose return type is
+            // inferred continues at its call sites.
+            let mut result_of = None;
+            for (function_id, function) in &self.functions {
+                if function.body.0.contains(&current) {
+                    return true;
+                }
+                if function.return_type_id.is_none()
+                    && (function.body.1 == current
+                        || function
+                            .rets
+                            .iter()
+                            .any(|(_, value)| *value == Some(current)))
+                {
+                    result_of = Some(*function_id);
+                }
+            }
+            let Some(function_id) = result_of else {
+                // A CLOSURE's result with no declared return type is one
+                // value for every call (a closure is not instantiated per
+                // call site, so no caller's type reaches back into its body):
+                // `let build = || Holder::build(); build();` is undetermined
+                // whatever its call sites say.
+                return self.closures.values().any(|closure| {
+                    closure.return_type_id.is_none()
+                        && (closure.return_ == current
+                            || closure
+                                .rets
+                                .iter()
+                                .any(|(_, value)| *value == Some(current)))
+                });
+            };
+            let call_sites: Vec<Id> = self
+                .function_calls
+                .iter()
+                .filter(|(_, call)| {
+                    matches!(
+                        self.expr_id_to_expr_map.get(&call.subject_id),
+                        Some(Expr::Local(callee)) if *callee == function_id
+                    )
+                })
+                .map(|(call_id, _)| *call_id)
+                .collect();
+            return call_sites.into_iter().any(|call_site| {
+                visited_call_sites.insert(call_site)
+                    && self.settled_type_carries(call_site, generic)
+                    && self.undetermined_value_flows_from(call_site, generic, visited_call_sites)
+            });
         }
         false
     }
@@ -24031,28 +24201,16 @@ impl<'src> Analyzer<'src> {
         member_id: Id,
         subject_type: &Type,
     ) -> Option<Type> {
-        if !matches!(
-            self.expr_id_to_expr_map.get(&subject_id),
-            Some(Expr::Call(_))
-        ) {
-            return None;
-        }
         let expected = self.expected_types.get(&call_id)?.get_type(self);
         if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
             return None;
         }
-        let mut carried = Vec::new();
-        self.collect_generics(subject_type, 0, &mut carried);
-        let open: Vec<TypeId> = carried
-            .into_iter()
-            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
-            .collect();
-        if open.is_empty() {
-            return None;
-        }
-        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
-        let impl_subject = self.implementations.get(implementation_index)?.subject;
-        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        let (open, answered) = self.receiver_generics_the_answer_carries(
+            call_id,
+            subject_id,
+            member_id,
+            subject_type,
+        )?;
         // The member's own generics are open in its answer too (a `map<U>`
         // returning `Option<U>`), but they are the member's to bind, from
         // its arguments; only the receiver's generics are taken from here.
@@ -24085,6 +24243,72 @@ impl<'src> Analyzer<'src> {
             Type::Unresolved | Type::Unknown => None,
             redirected => Some(redirected),
         }
+    }
+
+    /// B627 / B637: the generics of a receiver CALL that nothing at this site
+    /// holds rigid and that `member_id`'s answer (its impl's binders bound
+    /// from the receiver) still carries — the generics an expectation on the
+    /// method call could decide — with that answer. `None` for a receiver
+    /// that is not a call, or one whose open generics the answer drops
+    /// (`HashMap::new().len()`).
+    fn receiver_generics_the_answer_carries(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> Option<(Vec<TypeId>, Type)> {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&subject_id),
+            Some(Expr::Call(_))
+        ) {
+            return None;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(subject_type, 0, &mut carried);
+        let open: Vec<TypeId> = carried
+            .into_iter()
+            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
+        let impl_subject = self.implementations.get(implementation_index)?.subject;
+        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        let mut answered_generics = Vec::new();
+        self.collect_generics(&answered, 0, &mut answered_generics);
+        if !open
+            .iter()
+            .any(|generic| answered_generics.contains(generic))
+        {
+            return None;
+        }
+        Some((open, answered))
+    }
+
+    /// B637: whether a method call should WAIT for its expectation before it
+    /// resolves — B501's rule for an argument call, at the receiver. A call
+    /// standing at another call's parameter (`take(make().unwrap_or(5))`) is
+    /// told that parameter's type only when the outer call is attempted
+    /// (`seed_call_argument_expectations`), which is after the argument —
+    /// the worklist runs the inner call first, so resolving at once settled
+    /// the receiver with `make`'s own `T` open and B627's direction came too
+    /// late. A receiver whose open generics the member's answer carries
+    /// waits while the fixpoint moves; one nothing ever directs resolves at
+    /// the stall, exactly as before.
+    fn method_call_awaits_its_expectation(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> bool {
+        !self.fixpoint_stalled
+            && !self.expected_types.contains_key(&call_id)
+            && self
+                .receiver_generics_the_answer_carries(call_id, subject_id, member_id, subject_type)
+                .is_some()
     }
 
     /// A candidate member's declared return type, with the declaring impl's own
@@ -32504,12 +32728,23 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         for (target_id, assignment_id) in assignment_targets {
             let Some((non_place_id, what)) = self.first_non_place(target_id) else {
-                // F141: a place inside a `Shared::read()` — the read's copy —
-                // is a place nobody keeps.
-                if !shared_reads.is_empty()
-                    && let Some(read_id) = self.spine_rooted_at_a_read(target_id, &shared_reads)
-                {
-                    self.refuse_write_through_read(target_id, assignment_id, read_id);
+                // F141: a place inside a call's result is a place nobody
+                // keeps — a `Shared::read()`'s copy, or (the widening) any
+                // call that returns a value rather than a view.
+                if let Some(call_expr_id) = self.spine_rooted_at_a_call(target_id) {
+                    match self.call_callee_and_receiver(call_expr_id) {
+                        Some((callee_id, _)) if shared_reads.contains(&callee_id) => {
+                            self.refuse_write_through_read(target_id, assignment_id, call_expr_id);
+                        }
+                        _ if !self.call_result_is_a_view(call_expr_id) => {
+                            self.refuse_write_into_temporary(
+                                target_id,
+                                assignment_id,
+                                call_expr_id,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 continue;
             };
@@ -32548,38 +32783,25 @@ impl<'src> Analyzer<'src> {
         // in another, so the rest cost a length test.
         let mut module_level: Option<HashSet<Id>> = None;
         let mut capture_verdicts: HashMap<Id, bool> = HashMap::default();
-        let mut refusals: Vec<(Id, Id, Id, Id, Id)> = Vec::new();
+        let mut refusals: Vec<(LentWrite, Id, Id, Id, Id)> = Vec::new();
         for (call_expr_id, function_call) in self.live_entries(&self.function_calls) {
             let arguments = &function_call.argument_ids;
             if arguments.len() < 2 {
                 continue;
             }
-            let Some(Expr::Local(callee_id)) =
-                self.expr_id_to_expr_map.get(&function_call.subject_id)
-            else {
-                continue;
-            };
-            let parameters: &[Id] = self
-                .method_signature_ref(*callee_id)
-                .map(|(parameters, _)| parameters)
-                .unwrap_or_default();
-            for (position, argument_id) in arguments.iter().enumerate() {
-                let lent_by_parameter = parameters
-                    .get(position)
-                    .and_then(|parameter| self.parameters.get(parameter))
-                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
-                let lent_by_argument = matches!(
-                    self.expr_id_to_expr_map.get(argument_id),
-                    Some(Expr::Reference(_, true))
-                );
-                if !lent_by_parameter && !lent_by_argument {
-                    continue;
-                }
-                let Some(root) = self.place_root_binding(*argument_id) else {
+            for position in self.lent_argument_positions(function_call) {
+                let argument_id = arguments[position];
+                let Some(root) = self.place_root_binding(argument_id) else {
                     continue;
                 };
                 for later in &arguments[position + 1..] {
-                    let Some(rebind) = self.rebind_of_within(*later, root) else {
+                    // B639: a write of the lent place in place — or of a
+                    // place under it, or of one holding it — is the re-bind's
+                    // in-place twin.
+                    let Some(write) = self.rebind_of_within(*later, root).or_else(|| {
+                        self.in_place_write_within(*later, root, argument_id)
+                            .map(LentWrite::InPlace)
+                    }) else {
                         continue;
                     };
                     let module_level =
@@ -32591,16 +32813,146 @@ impl<'src> Analyzer<'src> {
                         .entry(root)
                         .or_insert_with(|| self.binding_is_closure_captured(root));
                     if !captured {
-                        refusals.push((rebind, root, *argument_id, *call_expr_id, *later));
+                        refusals.push((write, root, argument_id, *call_expr_id, *later));
                     }
                 }
             }
         }
         // Source order, so a program with several reports them in reading order.
-        refusals.sort_unstable_by_key(|(rebind, ..)| rebind.0);
-        for (rebind, root, lent, call_expr_id, later) in refusals {
-            self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+        refusals.sort_unstable_by_key(|(write, ..)| write.id().0);
+        for (write, root, lent, call_expr_id, later) in refusals {
+            match write {
+                LentWrite::Rebind(rebind) => {
+                    self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+                }
+                LentWrite::InPlace(write) => {
+                    self.refuse_lent_place_write(write, lent, call_expr_id, later);
+                }
+            }
         }
+    }
+
+    /// The argument positions a call lends `&mut` — a `&mut self` receiver or
+    /// `&mut` parameter (`log.items.push(..)`, `log.bump(..)`), or a written
+    /// `&mut` argument (`add(&mut log.items, ..)`). B?2 / B639.
+    fn lent_argument_positions(&self, function_call: &FunctionCall) -> Vec<usize> {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return Vec::new();
+        };
+        let parameters: &[Id] = self
+            .method_signature_ref(*callee_id)
+            .map(|(parameters, _)| parameters)
+            .unwrap_or_default();
+        function_call
+            .argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(position, argument_id)| {
+                let lent_by_parameter = parameters
+                    .get(*position)
+                    .and_then(|parameter| self.parameters.get(parameter))
+                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
+                lent_by_parameter
+                    || matches!(
+                        self.expr_id_to_expr_map.get(argument_id),
+                        Some(Expr::Reference(_, true))
+                    )
+            })
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    /// B639: an IN-PLACE write inside `expr_id`'s subtree (closures excluded)
+    /// that overlaps the place `lent_id` names under `root` — an assignment
+    /// to it, to a place under it or to one holding it (`log.items[0] = 5`,
+    /// `log.items = []` under a lent `log.items`), or a call lending such a
+    /// place `&mut` (`log.items.push(1)`, `add(&mut log.items, 1)`,
+    /// `log.bump(1)`). Elements are not told apart (`[0]` overlaps `[1]`).
+    /// The writing expression, or `None`.
+    fn in_place_write_within(&self, expr_id: Id, root: Id, lent_id: Id) -> Option<Id> {
+        let lent_place = match self.expr_id_to_expr_map.get(&lent_id) {
+            Some(Expr::Reference(operand, _)) => *operand,
+            _ => lent_id,
+        };
+        let (lent_root, lent_path) = self.place_path(lent_place)?;
+        if lent_root != root {
+            return None;
+        }
+        let overlaps = |analyzer: &Self, place_id: Id| {
+            let place_id = match analyzer.expr_id_to_expr_map.get(&place_id) {
+                Some(Expr::Reference(operand, _)) => *operand,
+                _ => place_id,
+            };
+            analyzer
+                .place_path(place_id)
+                .is_some_and(|(written_root, written_path)| {
+                    written_root == root && paths_nest(&written_path, &lent_path)
+                })
+        };
+        let mut pending = vec![expr_id];
+        let mut children = Vec::new();
+        while let Some(current) = pending.pop() {
+            match self.expr_id_to_expr_map.get(&current) {
+                Some(Expr::Assignment(target, _)) if overlaps(self, *target) => {
+                    return Some(current);
+                }
+                Some(Expr::Call(call_id)) => {
+                    if let Some(function_call) = self.function_calls.get(call_id)
+                        && self
+                            .lent_argument_positions(function_call)
+                            .into_iter()
+                            .any(|position| overlaps(self, function_call.argument_ids[position]))
+                    {
+                        return Some(current);
+                    }
+                }
+                _ => {}
+            }
+            children.clear();
+            self.drop_scan_children(current, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        None
+    }
+
+    /// B639: [`Self::in_place_write_within`]'s refusal, at the write, with
+    /// the re-bind's settle-first steer.
+    fn refuse_lent_place_write(&mut self, write: Id, lent: Id, call_expr_id: Id, later: Id) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let lent_text = text_of(self, lent).unwrap_or("the place");
+        let lent_text = lent_text.strip_prefix("&mut ").unwrap_or(lent_text);
+        let write_text = text_of(self, write)
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("this write");
+        let later_text = text_of(self, later);
+        let settled = text_of(self, call_expr_id)
+            .zip(later_text)
+            .map(|(call_text, argument_text)| call_text.replacen(argument_text, "item", 1))
+            .filter(|rewritten| !rewritten.contains('\n'))
+            .unwrap_or_else(|| format!("{lent_text}.…(item)"));
+        let value = later_text
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("{ … }");
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&write).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{write_text}` writes `{lent_text}` in place while it is lent `&mut` to \
+                     this call, a write under a live `&mut` view; settle the value first: `let \
+                     item = {value}; {settled}`"
+                ),
+            },
+            write,
+        );
     }
 
     /// B?2: the binding a place's spine roots at — `log` for `log.items`,
@@ -32625,14 +32977,14 @@ impl<'src> Analyzer<'src> {
     /// B?2: an assignment re-binding `binding` WHOLE inside `expr_id`'s
     /// subtree, closures excluded (a closure's body runs when it is called,
     /// not where it is written).
-    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<Id> {
+    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<LentWrite> {
         let mut pending = vec![expr_id];
         let mut children = Vec::new();
         while let Some(current) = pending.pop() {
             if let Some(Expr::Assignment(target, _)) = self.expr_id_to_expr_map.get(&current)
                 && matches!(self.expr_id_to_expr_map.get(target), Some(Expr::Local(named)) if *named == binding)
             {
-                return Some(current);
+                return Some(LentWrite::Rebind(current));
             }
             children.clear();
             self.drop_scan_children(current, &mut children);
@@ -32716,23 +33068,67 @@ impl<'src> Analyzer<'src> {
         );
     }
 
-    /// F141: the `Shared::read()` call an assignment target's spine roots at —
-    /// `cell.read().count`, `cell.read().items[0]`, `cell.read().pair.0` —
-    /// walking fields, elements and tuple positions down to the expression
-    /// they are read off. `None` when the root is anything else.
-    fn spine_rooted_at_a_read(&self, target_id: Id, shared_reads: &HashSet<Id>) -> Option<Id> {
+    /// F141: the CALL an assignment target's spine roots at —
+    /// `cell.read().count`, `make().items[0]`, `make().pair.0` — walking
+    /// fields, elements and tuple positions down to the expression they are
+    /// read off. `None` when the root is anything else, or when the target
+    /// is the call itself (B522's question).
+    fn spine_rooted_at_a_call(&self, target_id: Id) -> Option<Id> {
         let mut current = target_id;
         loop {
             match self.expr_id_to_expr_map.get(&current)? {
                 Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
                 Expr::TupleIndex(root, ..) => current = *root,
-                Expr::Call(_) if current != target_id => {
-                    let (callee_id, _) = self.call_callee_and_receiver(current)?;
-                    return shared_reads.contains(&callee_id).then_some(current);
-                }
+                Expr::Call(_) if current != target_id => return Some(current),
                 _ => return None,
             }
         }
+    }
+
+    /// F141's widening: whether a call's result is a VIEW an assignment can
+    /// write through — a `borrows` callee (`cell.write()`), a wrapped view
+    /// (`Option<&mut T>`), or a callee whose declared return is a view
+    /// (`fun pick(&mut self): &mut T`) — rather than a value.
+    fn call_result_is_a_view(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&call_expr_id) else {
+            return false;
+        };
+        self.call_returns_view(*call_id) || self.call_hands_back_a_view(*call_id)
+    }
+
+    /// F141's widening (ruled R-f at Order 54's GO): an assignment into a
+    /// place inside a call's VALUE — `make().count = 3`, `make().items[0] =
+    /// 7` — writes a temporary nothing keeps, on both backends (each printed
+    /// the old value afterwards, silently). Refused at the target, with the
+    /// result bound first.
+    fn refuse_write_into_temporary(&mut self, target_id: Id, assignment_id: Id, call_id: Id) {
+        let text_of = |analyzer: &Self, id: Id| {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let call_text = text_of(self, call_id)
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("the call");
+        let rewritten = text_of(self, assignment_id)
+            .and_then(|assignment| assignment.strip_prefix(call_text))
+            .filter(|rest| !rest.contains('\n'))
+            .map(|rest| format!("mut value = {call_text}; value{rest}"))
+            .unwrap_or_else(|| format!("mut value = {call_text}; value.… = …"));
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{call_text}`'s result is a temporary, so this assignment is lost; bind it \
+                     first: `{rewritten}`"
+                ),
+            },
+            target_id,
+        );
     }
 
     /// F141: spec §6.7 — `read()` answers a COPY of the cell's value, so an
@@ -55398,13 +55794,9 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
     ) {
         for (parameter_id, argument_id) in parameters.iter().zip(argument_ids) {
-            if !matches!(
-                self.expr_id_to_expr_map.get(argument_id),
-                Some(Expr::Call(_))
-            ) || self.expected_types.contains_key(argument_id)
-            {
+            let Some(position) = self.unseeded_argument_call(*argument_id) else {
                 continue;
-            }
+            };
             let Some(parameter_type_id) = self
                 .parameters
                 .get(parameter_id)
@@ -55412,12 +55804,48 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            let parameter_type = parameter_type_id.get_type(self);
-            let decided = self.substitute_type(&parameter_type, substitution_context);
-            let decided_id = decided.get_type_id(self);
-            if self.type_is_ground(decided_id) {
-                self.expected_types.insert(*argument_id, decided_id);
+            // A parameter already ground is its own decision; only an open
+            // one is read through the substitution (and minted).
+            let decided_id = match self.type_is_ground(parameter_type_id) {
+                true => parameter_type_id,
+                false => {
+                    let parameter_type = parameter_type_id.get_type(self);
+                    self.substitute_type(&parameter_type, substitution_context)
+                        .get_type_id(self)
+                }
+            };
+            self.seed_ground_expectation(position, decided_id);
+        }
+    }
+
+    /// The call an argument expectation is told to — `argument_id` itself
+    /// when it is a call nothing nearer has told — or `None`.
+    ///
+    /// B637: a METHOD call still waiting for its expectation
+    /// (`method_call_awaits_its_expectation`) is no `Expr::Call` until it is
+    /// wired, so a member access the walk wrote and nothing has resolved yet
+    /// counts too — `take(make().unwrap_or(5))` under `fun take(value: i32)`
+    /// (a pending FIELD read is told the same; a parameter directs a field
+    /// read as surely as a call). A VIEW of a call at the parameter
+    /// (`peek(&make().unwrap_or(2))`) tells the call: the view's mode is the
+    /// parameter's, its referent the parameter's type.
+    fn unseeded_argument_call(&self, argument_id: Id) -> Option<Id> {
+        let mut position = argument_id;
+        let a_call = loop {
+            match self.expr_id_to_expr_map.get(&position) {
+                Some(Expr::Call(_)) => break true,
+                Some(Expr::Reference(operand, _)) => position = *operand,
+                Some(_) => break false,
+                None => break self.member_name_spans.contains_key(&position),
             }
+        };
+        (a_call && !self.expected_types.contains_key(&position)).then_some(position)
+    }
+
+    /// Records `decided_id` as `position`'s expectation when it is ground.
+    fn seed_ground_expectation(&mut self, position: Id, decided_id: TypeId) {
+        if self.type_is_ground(decided_id) {
+            self.expected_types.insert(position, decided_id);
         }
     }
 
@@ -56451,6 +56879,14 @@ impl<'src> Analyzer<'src> {
                 return Resolution::Failed;
             }
             let substitution_context = HashMap::default();
+            // B637: a closure's declared parameter types direct its argument
+            // calls as a function's do (`f(make().unwrap_or(3))` under
+            // `let f = |x: i32| ..`).
+            for (parameter_type_id, argument_id) in parameter_type_ids.iter().zip(argument_ids) {
+                if let Some(position) = self.unseeded_argument_call(*argument_id) {
+                    self.seed_ground_expectation(position, *parameter_type_id);
+                }
+            }
             for (index, parameter_type_id) in parameter_type_ids.clone().iter().enumerate() {
                 let parameter_type = parameter_type_id.get_type(self);
                 let argument_id = *argument_ids.get(index).unwrap();
@@ -58347,6 +58783,11 @@ impl<'src> Analyzer<'src> {
                     arguments_span,
                 ),
             MethodLookup::Found(member_id) => {
+                if self.method_call_awaits_its_expectation(id, subject_id, member_id, &subject_type)
+                {
+                    self.unwired_method_calls.insert(id, member_id);
+                    return Resolution::Deferred;
+                }
                 // B627 / std-53's A?1: the call's expectation reaches its
                 // RECEIVER before anything reads the receiver's type —
                 // `Holder::build().unwrap()` into a `Holder<i32>` binds the
@@ -73079,10 +73520,105 @@ impl<'src> Analyzer<'src> {
                     variable_id,
                 );
             }
+            self.refuse_unsettled_literal_bindings();
             self.refuse_expression_holes();
         }
 
         // Clear processed constraints
+    }
+
+    /// B638: B580's refusal for a `let` bound to a generic struct LITERAL no
+    /// field grounds — `let both = Page { items = [], first = None };`. The
+    /// literal settles as the declaration's own `Page<T>` (no hole for B580
+    /// to find, and the residual sweep's declaring-file rule passes a struct
+    /// declared in the same file), and a later typed use reconciles with it
+    /// without reaching back — `let n: Page<i32> = both;` and `take(both)`
+    /// ran on JS, while every native build refused the literal ("does not
+    /// emit a value of an unbound generic type parameter"). The program
+    /// never states the parameter where the value is made, as `let o =
+    /// None; let n: Option<i32> = o;` does not, so it is refused the same
+    /// way, at the initializer. A parameter an enclosing declaration binds
+    /// (the struct's own impl, a generic function's parameter) is that
+    /// scope's; user files only.
+    fn refuse_unsettled_literal_bindings(&mut self) {
+        let mut literals: Vec<(Id, Id)> = self
+            .variables
+            .iter()
+            .filter(|(_, variable)| !variable.annotated)
+            .filter_map(|(variable_id, variable)| {
+                let initial = variable.initial?;
+                matches!(
+                    self.expr_id_to_expr_map.get(&initial),
+                    Some(Expr::StructInitializer(..))
+                )
+                .then_some((*variable_id, initial))
+            })
+            .collect();
+        literals.sort_unstable_by_key(|(variable_id, _)| variable_id.0);
+        for (variable_id, initial) in literals {
+            let Some(source) = self.source_of_id(variable_id) else {
+                continue;
+            };
+            if source == DERIVED_SOURCE
+                || self.std_sources.contains(&source)
+                || self.frozen_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+            {
+                continue;
+            }
+            let variable_type = self.infer_type(variable_id, &Type::Unknown, &HashMap::default());
+            let Type::Struct(struct_id, _) = &variable_type else {
+                continue;
+            };
+            let Some(own_parameters) = self
+                .structs
+                .get(struct_id)
+                .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            else {
+                continue;
+            };
+            let mut residuals = Vec::new();
+            self.collect_residual_generics(&variable_type, &mut residuals);
+            residuals.retain(|residual| {
+                own_parameters.contains(residual)
+                    && !self.generic_is_enclosing_binder(*residual, variable_id)
+            });
+            if residuals.is_empty() {
+                continue;
+            }
+            let unknown = Type::Unknown.get_type_id(self);
+            let unsettled: SubstitutionContext = residuals
+                .into_iter()
+                .map(|residual| (residual, unknown))
+                .collect();
+            let name = self
+                .variables
+                .get(&variable_id)
+                .map(|variable| variable.name)
+                .unwrap_or("this binding");
+            let written_type = self.substitute_type(&variable_type, &unsettled);
+            let written = self
+                .pretty_print_type(&written_type, &HashMap::default())
+                .replace("unknown", "…");
+            let span = **self
+                .span_map
+                .get(&initial)
+                .or_else(|| self.span_map.get(&variable_id))
+                .unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "cannot infer the type of `{name}`: it is `{written}`, and inference \
+                         cannot settle the `…` from anything the program does with it. Write the \
+                         type on the binding (`{name}: {written}`)"
+                    ),
+                },
+                variable_id,
+            );
+        }
     }
 
     /// B600: B580's refusal for a hole NO binding holds — `Option::None.
@@ -74935,6 +75471,13 @@ pub struct Program<'src> {
     /// keyed on `parameters` sees plumbing dressed as source. Membership is the
     /// bool: absent means bare.
     pub context_optional_hidden_parameters: HashSet<Id>,
+    /// papers-54's B?2: the context arguments the context pass threads to a
+    /// `for x in subject` loop's implicit `next` call, by the loop's id. The
+    /// call graph records that call as an edge keyed by the loop (no
+    /// `FunctionCall` stands behind it), so the arguments the pass appends to
+    /// a written call's `argument_ids` land here instead; both emitters
+    /// append them after the iterator at every step.
+    pub for_each_context_arguments: HashMap<Id, Vec<Id>>,
     /// B482: the closure TYPES whose `context` clause entry arrives CLEARED
     /// somewhere — a callback position some callee calls under
     /// `context.clear(..)` — as `(closure type, context)`. Every literal that
@@ -89981,6 +90524,7 @@ fn analyze_over_world<'src>(
         unwired_method_calls: analyzer.unwired_method_calls,
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
+        for_each_context_arguments: HashMap::default(),
         cleared_clause_contexts: HashSet::default(),
         context_bindings: Vec::new(),
         bool_enum_id: analyzer.bool_enum_id,

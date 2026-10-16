@@ -1,0 +1,65 @@
+// papers-54's B?2: a `for x in subject` whose `next` reads a CONTEXT - the
+// ambient nursery through `task::ambient_signal()` in a sync `Iterator`, both
+// outside a nursery (`None`) and inside one (`Some`), and `time::sleep` in an
+// awaiting inherent `next(self)` - is handed the threaded context argument at
+// every step, as a written `next()` call is, the same on both backends.
+import std::io::print;
+import std::iterator::Iterator;
+import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
+import std::task;
+import std::time;
+
+struct Countdown {
+	left: i32,
+}
+
+impl Countdown with Iterator<i32> {
+	fun next(&mut self): Option<i32> {
+		if self.left == 0 {
+			ret None;
+		}
+		self.left = self.left - 1;
+		if task::ambient_signal().is_some() {
+			Some(self.left + 100)
+		} else {
+			Some(self.left)
+		}
+	}
+}
+
+struct Ticks {
+	left: Shared<i32>,
+}
+
+impl Ticks {
+	fun next(self): Option<i32> {
+		if self.left.read() == 0 {
+			ret None;
+		}
+		time::sleep(1);
+		self.left.write() = self.left.read() - 1;
+		Some(self.left.read())
+	}
+}
+
+fun count_down(label: str) {
+	let counter = Countdown { left = 2 };
+	for value in counter {
+		print(i"{label} {value}");
+	}
+}
+
+fun main() {
+	mut direct = Countdown { left = 1 };
+	print(i"direct {direct.next().unwrap_or(-1)}");
+	count_down("outside");
+	task::nursery(|_| {
+		count_down("inside");
+	});
+	let ticks = Ticks { left = Shared::new(2) };
+	for tick in ticks {
+		print(i"tick {tick}");
+	}
+	print("done");
+}

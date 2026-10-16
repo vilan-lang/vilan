@@ -689,6 +689,46 @@ fn b571_cannot_infer_offers_the_ascription() {
     );
 }
 
+/// B642: the type refusal's fix-its keep a METHOD call's shape — `bag.get<…>()`
+/// and `bag.get() as …`, the receiver as written — where they spelled the free
+/// call `get<…>(…)`; a call that writes arguments keeps `(…)`.
+#[test]
+fn b642_a_method_calls_type_fix_its_keep_the_receiver() {
+    let prelude = r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        struct Bag {
+            size: i32,
+        }
+
+        impl Bag {
+            fun get<T>(self): Option<T> {
+                None
+            }
+
+            fun pick<T>(self, index: i32): Option<T> {
+                None
+            }
+        }
+    "#;
+    assert_fails_with(
+        &format!(
+            "{prelude}\n        fun main() {{ let bag = Bag {{ size = 1 }}; let got = bag.get(); \
+             print(got.is_none()); }}\n"
+        ),
+        "as the call's type argument (`bag.get<…>()`), or ascribe the call (`bag.get() as …`)",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}\n        fun main() {{ let bag = Bag {{ size = 1 }}; let got = \
+             bag.pick(0); print(got.is_none()); }}\n"
+        ),
+        "as the call's type argument (`bag.pick<…>(…)`), or ascribe the call \
+         (`bag.pick(…) as …`)",
+    );
+}
+
 /// §2.3: E261's steer names the inline form.
 #[test]
 fn b571_the_e261_steer_names_the_ascription() {

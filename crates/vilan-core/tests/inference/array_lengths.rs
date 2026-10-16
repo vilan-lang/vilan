@@ -1390,6 +1390,37 @@ fn a172_a_to_array_whose_length_nothing_binds_is_refused() {
     );
 }
 
+/// B642: the length refusal's fix-it keeps a METHOD call's shape — the
+/// receiver as written and a `.` — where it spelled the free call
+/// `to_array<4>(…)`; a receiver that is not one line reads `…`.
+#[test]
+fn b642_a_method_calls_length_fix_it_keeps_the_receiver() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let numbers = [1, 2];
+            let array = numbers.to_array();
+            print(array.is_some());
+        }
+        "#,
+        "as the call's argument (`numbers.to_array<4>()`), or ascribe the call",
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let array = [
+                1,
+                2,
+            ].to_array();
+            print(array.is_some());
+        }
+        "#,
+        "as the call's argument (`….to_array<4>()`), or ascribe the call",
+    );
+}
+
 // --- A171: an array type as a path head (door (a)) ---------------------------
 
 /// A171: `[T; n]` heads a `::` path as `List<i32>` does — its statics are its

@@ -9849,6 +9849,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let step = |call: String| {
             if awaits { Self::awaited(&call) } else { call }
         };
+        // papers-54's B?2: the context arguments the context pass threaded to
+        // the loop's `next` (`Program::for_each_context_arguments`), after the
+        // receiver — a hidden parameter's read, a `Some(..)` of one, `None`.
+        let mut context_arguments = String::new();
+        for argument_id in self
+            .program
+            .for_each_context_arguments
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+        {
+            context_arguments.push_str(", ");
+            context_arguments.push_str(&self.value_of(argument_id, depth)?);
+        }
         // F95: `for e in &mut c` drives `next_mut` on the container ITSELF —
         // each element a writable view into it — so the place is borrowed
         // for every step rather than copied.
@@ -9861,7 +9875,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let mut body = String::new();
             self.emit_block(statements, tail, &mut body, depth + 1)?;
             let pad = Self::indent(depth);
-            let next_step = step(format!("{next}(&mut {place_text})"));
+            let next_step = step(format!("{next}(&mut {place_text}{context_arguments})"));
             return Ok(format!(
                 "while let Some({binder}) = {next_step} {{\n{body}{pad}}}"
             ));
@@ -9877,7 +9891,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.emit_block(statements, tail, &mut body, depth + 2)?;
         let pad = Self::indent(depth);
         let inner = Self::indent(depth + 1);
-        let next_step = step(format!("{next}(&mut iterator)"));
+        let next_step = step(format!("{next}(&mut iterator{context_arguments})"));
         Ok(format!(
             "{{\n{inner}let mut iterator = {iterable_text};\n\
              {inner}while let Some({binder}) = {next_step} {{\n{body}{inner}}}\n{pad}}}"

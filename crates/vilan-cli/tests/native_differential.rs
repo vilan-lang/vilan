@@ -14312,6 +14312,64 @@ fn b627_an_expected_type_through_a_receiver_answers_on_both_backends() {
     );
 }
 
+/// B637: an argument at a non-generic parameter — a function's, a method's, a
+/// closure's, through a view — directs its receiver call's generic, the same
+/// on both backends.
+#[test]
+fn b637_an_argument_expectation_through_a_receiver_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_argument_expectation_through_a_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/argument_expectation_through_a_receiver.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an argument's expectation through a receiver must bind the same natively"
+    );
+}
+
+/// B639's boundary: a later argument writing a disjoint place of the lent
+/// place's root, another binding, or a captured root compiles and answers the
+/// same on both backends (the overlapping writes are refused by the checker).
+#[test]
+fn b639_a_disjoint_write_beside_a_lent_place_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_lent_place_disjoint_write.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/lent_place_disjoint_write.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a disjoint write beside a lent place must answer the same natively"
+    );
+}
+
+/// papers-54's B?2: a `for` loop whose `next` reads a context — the ambient
+/// nursery in a sync `Iterator` (outside a nursery and inside one), a sleep in
+/// an awaiting inherent `next` — is handed the threaded context argument at
+/// every step on both backends (JS threw a `TypeError`, cargo refused E0061).
+#[test]
+fn a_for_loops_next_reading_a_context_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_for_in_context_next.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/for_in_context_next.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a for loop's context-reading `next` must answer the same natively"
+    );
+}
+
 /// B626: a module scalar read only through a view — a `const let`, a `let`, a
 /// `mut` written through `&mut`, a read inside a closure — answers the same on
 /// both backends (JS shook the binding out and threw `ReferenceError`).
