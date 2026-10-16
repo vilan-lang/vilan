@@ -14331,6 +14331,25 @@ fn b637_an_argument_expectation_through_a_receiver_answers_on_both_backends() {
     );
 }
 
+/// B639's boundary: a later argument writing a disjoint place of the lent
+/// place's root, another binding, or a captured root compiles and answers the
+/// same on both backends (the overlapping writes are refused by the checker).
+#[test]
+fn b639_a_disjoint_write_beside_a_lent_place_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_lent_place_disjoint_write.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/lent_place_disjoint_write.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a disjoint write beside a lent place must answer the same natively"
+    );
+}
+
 /// B626: a module scalar read only through a view — a `const let`, a `let`, a
 /// `mut` written through `&mut`, a read inside a closure — answers the same on
 /// both backends (JS shook the binding out and threw `ReferenceError`).

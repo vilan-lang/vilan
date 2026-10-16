@@ -14445,6 +14445,135 @@ fn a_lent_places_root_rebound_by_a_later_argument_is_refused() {
     }
 }
 
+/// B639 (spec §6.4 rule 4): the re-bind's IN-PLACE twin — a later argument
+/// writing the lent place, a place under it or one holding it (an assignment,
+/// or a call lending it `&mut`) — is refused at the write with the same
+/// settle-first steer. `log.items.push({ log.items.push(1); 9 })` checked
+/// clean; JS printed 2 and rustc refused the native emission (E0499).
+#[test]
+fn b639_a_lent_place_written_in_place_by_a_later_argument_is_refused() {
+    for (statement, write, lent, settled) in [
+        (
+            "log.items.push({ log.items.push(1); 9 });",
+            "log.items.push(1)",
+            "log.items",
+            "let item = { log.items.push(1); 9 }; log.items.push(item)",
+        ),
+        (
+            "log.items.push({ log.items[0] = 5; 9 });",
+            "log.items[0] = 5",
+            "log.items",
+            "let item = { log.items[0] = 5; 9 }; log.items.push(item)",
+        ),
+        (
+            "log.items.push({ add(&mut log.items, 1); 9 });",
+            "add(&mut log.items, 1)",
+            "log.items",
+            "let item = { add(&mut log.items, 1); 9 }; log.items.push(item)",
+        ),
+        (
+            "log.items.push({ log.items = [4]; 9 });",
+            "log.items = [4]",
+            "log.items",
+            "let item = { log.items = [4]; 9 }; log.items.push(item)",
+        ),
+        (
+            "add(&mut log.items, { log.items.push(2); 9 });",
+            "log.items.push(2)",
+            "log.items",
+            "let item = { log.items.push(2); 9 }; add(&mut log.items, item)",
+        ),
+        (
+            "log.bump({ log.count += 1; 9 });",
+            "log.count += 1",
+            "log",
+            "let item = { log.count += 1; 9 }; log.bump(item)",
+        ),
+        (
+            "log.items.push({ log.bump(1); 9 });",
+            "log.bump(1)",
+            "log.items",
+            "let item = { log.bump(1); 9 }; log.items.push(item)",
+        ),
+    ] {
+        let source = format!(
+            "{LENT_ROOT_LOG}
+        fun main() {{
+            mut log = fresh();
+            log.items.push(0);
+            {statement}
+            print(log.items.len());
+        }}
+        "
+        );
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`{write}` writes `{lent}` in place while it is lent `&mut` to this call, a write \
+                 under a live `&mut` view; settle the value first: `{settled}`"
+            ),
+        );
+    }
+    // A `&mut self` method writing its own lent field.
+    assert_fails_once_with(
+        &format!(
+            "{LENT_ROOT_LOG}{}",
+            r#"
+        impl Log {
+            fun twice(&mut self) {
+                self.items.push({ self.items.push(1); 9 });
+            }
+        }
+        fun main() {
+            mut log = fresh();
+            log.twice();
+            print(log.items.len());
+        }
+        "#
+        ),
+        "`self.items.push(1)` writes `self.items` in place while it is lent `&mut` to this call",
+    );
+}
+
+/// B639's boundary: a write to a DISJOINT place of the same root, a write to
+/// another binding, and a CAPTURED root (F138's) compile and answer the same
+/// on both backends (`native/lent_place_disjoint_write.vl`).
+#[test]
+fn b639_a_disjoint_or_captured_write_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{LENT_ROOT_LOG}{}",
+            r#"
+        fun main() {
+            mut log = fresh();
+            log.items.push({
+                log.count = 2;
+                9
+            });
+            print(log.items.len());
+            print(log.count);
+            mut other = fresh();
+            log.items.push({
+                other.items.push(1);
+                3
+            });
+            print(log.items.len());
+            mut captured = fresh();
+            let peek = || captured.items.len();
+            captured.items.push({
+                captured.items.push(1);
+                9
+            });
+            print(captured.items.len());
+            print(peek());
+        }
+        main();
+        "#
+        ),
+        "1\n2\n2\n2\n2\n",
+    );
+}
+
 /// B?2's boundary: the settled form, a write that does not re-bind the root,
 /// and a CAPTURED binding (F138: read after the later arguments, so the call
 /// writes the new binding) all compile.

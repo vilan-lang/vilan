@@ -1632,6 +1632,29 @@ enum PlaceStep {
     Element,
 }
 
+/// Whether one place path is a prefix of the other — the two places nest,
+/// so a write of either reaches the other (B639). Elements compare equal.
+fn paths_nest(left: &[PlaceStep], right: &[PlaceStep]) -> bool {
+    left.iter().zip(right).all(|(left, right)| left == right)
+}
+
+/// A write inside a later argument of a call that lends a place `&mut`
+/// (native-53's B?2, B639): the lent place's root re-bound whole, or the
+/// place written in place.
+#[derive(Clone, Copy)]
+enum LentWrite {
+    Rebind(Id),
+    InPlace(Id),
+}
+
+impl LentWrite {
+    fn id(self) -> Id {
+        match self {
+            LentWrite::Rebind(id) | LentWrite::InPlace(id) => id,
+        }
+    }
+}
+
 /// How far below its anchor place a view may point (B529).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AnchorDepth {
@@ -32737,38 +32760,25 @@ impl<'src> Analyzer<'src> {
         // in another, so the rest cost a length test.
         let mut module_level: Option<HashSet<Id>> = None;
         let mut capture_verdicts: HashMap<Id, bool> = HashMap::default();
-        let mut refusals: Vec<(Id, Id, Id, Id, Id)> = Vec::new();
+        let mut refusals: Vec<(LentWrite, Id, Id, Id, Id)> = Vec::new();
         for (call_expr_id, function_call) in self.live_entries(&self.function_calls) {
             let arguments = &function_call.argument_ids;
             if arguments.len() < 2 {
                 continue;
             }
-            let Some(Expr::Local(callee_id)) =
-                self.expr_id_to_expr_map.get(&function_call.subject_id)
-            else {
-                continue;
-            };
-            let parameters: &[Id] = self
-                .method_signature_ref(*callee_id)
-                .map(|(parameters, _)| parameters)
-                .unwrap_or_default();
-            for (position, argument_id) in arguments.iter().enumerate() {
-                let lent_by_parameter = parameters
-                    .get(position)
-                    .and_then(|parameter| self.parameters.get(parameter))
-                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
-                let lent_by_argument = matches!(
-                    self.expr_id_to_expr_map.get(argument_id),
-                    Some(Expr::Reference(_, true))
-                );
-                if !lent_by_parameter && !lent_by_argument {
-                    continue;
-                }
-                let Some(root) = self.place_root_binding(*argument_id) else {
+            for position in self.lent_argument_positions(function_call) {
+                let argument_id = arguments[position];
+                let Some(root) = self.place_root_binding(argument_id) else {
                     continue;
                 };
                 for later in &arguments[position + 1..] {
-                    let Some(rebind) = self.rebind_of_within(*later, root) else {
+                    // B639: a write of the lent place in place — or of a
+                    // place under it, or of one holding it — is the re-bind's
+                    // in-place twin.
+                    let Some(write) = self.rebind_of_within(*later, root).or_else(|| {
+                        self.in_place_write_within(*later, root, argument_id)
+                            .map(LentWrite::InPlace)
+                    }) else {
                         continue;
                     };
                     let module_level =
@@ -32780,16 +32790,146 @@ impl<'src> Analyzer<'src> {
                         .entry(root)
                         .or_insert_with(|| self.binding_is_closure_captured(root));
                     if !captured {
-                        refusals.push((rebind, root, *argument_id, *call_expr_id, *later));
+                        refusals.push((write, root, argument_id, *call_expr_id, *later));
                     }
                 }
             }
         }
         // Source order, so a program with several reports them in reading order.
-        refusals.sort_unstable_by_key(|(rebind, ..)| rebind.0);
-        for (rebind, root, lent, call_expr_id, later) in refusals {
-            self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+        refusals.sort_unstable_by_key(|(write, ..)| write.id().0);
+        for (write, root, lent, call_expr_id, later) in refusals {
+            match write {
+                LentWrite::Rebind(rebind) => {
+                    self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+                }
+                LentWrite::InPlace(write) => {
+                    self.refuse_lent_place_write(write, lent, call_expr_id, later);
+                }
+            }
         }
+    }
+
+    /// The argument positions a call lends `&mut` — a `&mut self` receiver or
+    /// `&mut` parameter (`log.items.push(..)`, `log.bump(..)`), or a written
+    /// `&mut` argument (`add(&mut log.items, ..)`). B?2 / B639.
+    fn lent_argument_positions(&self, function_call: &FunctionCall) -> Vec<usize> {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return Vec::new();
+        };
+        let parameters: &[Id] = self
+            .method_signature_ref(*callee_id)
+            .map(|(parameters, _)| parameters)
+            .unwrap_or_default();
+        function_call
+            .argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(position, argument_id)| {
+                let lent_by_parameter = parameters
+                    .get(*position)
+                    .and_then(|parameter| self.parameters.get(parameter))
+                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
+                lent_by_parameter
+                    || matches!(
+                        self.expr_id_to_expr_map.get(argument_id),
+                        Some(Expr::Reference(_, true))
+                    )
+            })
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    /// B639: an IN-PLACE write inside `expr_id`'s subtree (closures excluded)
+    /// that overlaps the place `lent_id` names under `root` — an assignment
+    /// to it, to a place under it or to one holding it (`log.items[0] = 5`,
+    /// `log.items = []` under a lent `log.items`), or a call lending such a
+    /// place `&mut` (`log.items.push(1)`, `add(&mut log.items, 1)`,
+    /// `log.bump(1)`). Elements are not told apart (`[0]` overlaps `[1]`).
+    /// The writing expression, or `None`.
+    fn in_place_write_within(&self, expr_id: Id, root: Id, lent_id: Id) -> Option<Id> {
+        let lent_place = match self.expr_id_to_expr_map.get(&lent_id) {
+            Some(Expr::Reference(operand, _)) => *operand,
+            _ => lent_id,
+        };
+        let (lent_root, lent_path) = self.place_path(lent_place)?;
+        if lent_root != root {
+            return None;
+        }
+        let overlaps = |analyzer: &Self, place_id: Id| {
+            let place_id = match analyzer.expr_id_to_expr_map.get(&place_id) {
+                Some(Expr::Reference(operand, _)) => *operand,
+                _ => place_id,
+            };
+            analyzer
+                .place_path(place_id)
+                .is_some_and(|(written_root, written_path)| {
+                    written_root == root && paths_nest(&written_path, &lent_path)
+                })
+        };
+        let mut pending = vec![expr_id];
+        let mut children = Vec::new();
+        while let Some(current) = pending.pop() {
+            match self.expr_id_to_expr_map.get(&current) {
+                Some(Expr::Assignment(target, _)) if overlaps(self, *target) => {
+                    return Some(current);
+                }
+                Some(Expr::Call(call_id)) => {
+                    if let Some(function_call) = self.function_calls.get(call_id)
+                        && self
+                            .lent_argument_positions(function_call)
+                            .into_iter()
+                            .any(|position| overlaps(self, function_call.argument_ids[position]))
+                    {
+                        return Some(current);
+                    }
+                }
+                _ => {}
+            }
+            children.clear();
+            self.drop_scan_children(current, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        None
+    }
+
+    /// B639: [`Self::in_place_write_within`]'s refusal, at the write, with
+    /// the re-bind's settle-first steer.
+    fn refuse_lent_place_write(&mut self, write: Id, lent: Id, call_expr_id: Id, later: Id) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let lent_text = text_of(self, lent).unwrap_or("the place");
+        let lent_text = lent_text.strip_prefix("&mut ").unwrap_or(lent_text);
+        let write_text = text_of(self, write)
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("this write");
+        let later_text = text_of(self, later);
+        let settled = text_of(self, call_expr_id)
+            .zip(later_text)
+            .map(|(call_text, argument_text)| call_text.replacen(argument_text, "item", 1))
+            .filter(|rewritten| !rewritten.contains('\n'))
+            .unwrap_or_else(|| format!("{lent_text}.…(item)"));
+        let value = later_text
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("{ … }");
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&write).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{write_text}` writes `{lent_text}` in place while it is lent `&mut` to \
+                     this call, a write under a live `&mut` view; settle the value first: `let \
+                     item = {value}; {settled}`"
+                ),
+            },
+            write,
+        );
     }
 
     /// B?2: the binding a place's spine roots at — `log` for `log.items`,
@@ -32814,14 +32954,14 @@ impl<'src> Analyzer<'src> {
     /// B?2: an assignment re-binding `binding` WHOLE inside `expr_id`'s
     /// subtree, closures excluded (a closure's body runs when it is called,
     /// not where it is written).
-    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<Id> {
+    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<LentWrite> {
         let mut pending = vec![expr_id];
         let mut children = Vec::new();
         while let Some(current) = pending.pop() {
             if let Some(Expr::Assignment(target, _)) = self.expr_id_to_expr_map.get(&current)
                 && matches!(self.expr_id_to_expr_map.get(target), Some(Expr::Local(named)) if *named == binding)
             {
-                return Some(current);
+                return Some(LentWrite::Rebind(current));
             }
             children.clear();
             self.drop_scan_children(current, &mut children);
