@@ -26,6 +26,7 @@ mod bounds;
 mod callable;
 mod collections;
 mod const_eval;
+mod contexts;
 mod contextual_keywords;
 mod debugging;
 mod dyn_objects;
