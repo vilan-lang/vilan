@@ -6427,6 +6427,14 @@ pub struct Analyzer<'src> {
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
+    /// M147 (2): how many `const` expressions the walk is inside, and every
+    /// entity it minted while inside one — the const pass's local-reference
+    /// index reads these instead of scanning the whole entity map for the
+    /// `Expr::Local`s whose span a `const` expression covers (an identifier
+    /// resolved to a local later keeps the entity the walk minted for it).
+    #[serde(skip)]
+    const_walk_depth: u32,
+    const_walk_entities: Vec<Id>,
     /// G24: the INITIALIZER expression of every `const let NAME = EXPR;`, a
     /// subset of `const_exprs`. The binding is an ordinary `let` whose value
     /// the build computes; what the marker adds over `let x = const e` is the
@@ -8380,6 +8388,8 @@ impl<'src> Analyzer<'src> {
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
+            const_walk_depth: 0,
+            const_walk_entities: Vec::new(),
             const_let_initializers: HashSet::default(),
             const_functions: HashSet::default(),
             walk_depth: 0,
@@ -8415,15 +8425,20 @@ impl<'src> Analyzer<'src> {
     }
 
     fn new_entity_id(&mut self) -> Id {
-        if self.id_windows.on() {
+        let id = if self.id_windows.on() {
             let (id, _) = self
                 .id_windows
                 .mint(id_windows::Lane::Entity, &mut self.entity_id);
-            return Id(id);
+            Id(id)
+        } else {
+            let id = self.entity_id;
+            self.entity_id += 1;
+            Id(id)
+        };
+        if self.const_walk_depth > 0 {
+            self.const_walk_entities.push(id);
         }
-        let id = self.entity_id;
-        self.entity_id += 1;
-        Id(id)
+        id
     }
 
     /// M110 S5: walks a module-level node list one ITEM at a time, each under
@@ -40071,12 +40086,17 @@ impl<'src> Analyzer<'src> {
             // beside the entity — so nothing downstream needs a second shape
             // for a declaration that happens to be compile-time.
             if matches!(&inner.0, Node::Let(..) | Node::LetDestructure(..)) {
-                return self.walk_const_let(inner, scope_id);
+                self.const_walk_depth += 1;
+                let id = self.walk_const_let(inner, scope_id);
+                self.const_walk_depth -= 1;
+                return id;
             }
             if matches!(&inner.0, Node::Func(_)) {
                 return self.walk_const_fun(inner, scope_id);
             }
+            self.const_walk_depth += 1;
             let inner_id = self.walk_expr_node(inner, scope_id);
+            self.const_walk_depth -= 1;
             self.const_exprs.push(inner_id);
             return inner_id;
         }
@@ -74746,6 +74766,10 @@ pub struct Program<'src> {
     pub asset_channel_fns: Vec<(Id, &'static str)>,
     /// `const`-marked expression ids in walk order (const-eval.md §1).
     pub const_exprs: Vec<Id>,
+    /// M147 (2): every entity the walk minted inside a `const` expression —
+    /// the const pass's local-reference index reads these (`const_eval.rs`'s
+    /// `LocalIndex`) instead of scanning the whole entity map.
+    pub const_walk_entities: Vec<Id>,
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
     /// the transformer serializes these in place of the expressions.
     pub const_results: HashMap<Id, crate::interpreter::ConstValue>,
@@ -89790,6 +89814,7 @@ fn analyze_over_world<'src>(
         drop_fn_id: analyzer.drop_fn_id,
         asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),
+        const_walk_entities: analyzer.const_walk_entities.clone(),
         const_results: HashMap::default(),
         const_let_initializers: analyzer.const_let_initializers.clone(),
         const_functions: analyzer.const_functions.clone(),
