@@ -104,13 +104,19 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
 
 /// debug-53's orphan sidecars: a plain `vilan run` had no interrupt hook at
 /// all, so a `Ctrl-C` (or a debugger's `SIGTERM`) while its program ran left
-/// `vilan-run-<pid>.mjs`, its map and its sidecar in the temp directory. Each
-/// signal is delivered to the run's process GROUP, as a terminal delivers
-/// `Ctrl-C` (the program stops with it): the run exits 130 and leaves nothing.
+/// `vilan-run-<pid>.mjs`, its map and its sidecar in the temp directory.
+///
+/// `SIGTERM` and `SIGHUP` go to `vilan` ALONE, as a debugger ending a session
+/// sends them: the program keeps running, so only the hook can answer — it
+/// removes the three files and exits 130. `SIGINT` goes to the run's process
+/// GROUP, as a terminal's `Ctrl-C` does: the program stops with it, so the
+/// hook and the run's own end race to the same removal, and the run exits
+/// with a code either way. Without the hook, every signal killed `vilan`
+/// outright: no code, and every file stayed.
 #[test]
 fn an_interrupted_run_removes_its_script_map_and_sidecar() {
     use std::os::unix::process::CommandExt;
-    for signal in ["INT", "TERM", "HUP"] {
+    for (signal, to_the_group) in [("INT", true), ("TERM", false), ("HUP", false)] {
         let dir = temp_package(&format!("interrupted_{signal}"));
         std::fs::write(
             dir.join("src/main.vl"),
@@ -141,20 +147,30 @@ fn an_interrupted_run_removes_its_script_map_and_sidecar() {
             files.iter().all(|file| file.exists()),
             "SIG{signal}: the run's files exist while it runs: {files:?}"
         );
+        let target = if to_the_group {
+            format!("-{}", run.id())
+        } else {
+            run.id().to_string()
+        };
         let signalled = Command::new("kill")
-            .args([
-                format!("-{signal}"),
-                "--".to_string(),
-                format!("-{}", run.id()),
-            ])
+            .args([format!("-{signal}"), "--".to_string(), target])
             .status()
-            .expect("signal the run's group");
+            .expect("signal the run");
         assert!(signalled.success(), "kill -{signal} must succeed");
         let status = run.wait().expect("reap the run");
+        // The program a lone signal to `vilan` left running.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", run.id())])
+            .status();
         let _ = std::fs::remove_dir_all(&dir);
-        // Without the hook the run dies by the signal: no code, and every
-        // file stays.
-        assert_eq!(status.code(), Some(130), "SIG{signal}: the run exits 130");
+        if to_the_group {
+            assert!(
+                status.code().is_some(),
+                "SIG{signal}: the run exits, not killed: {status:?}"
+            );
+        } else {
+            assert_eq!(status.code(), Some(130), "SIG{signal}: the hook exits 130");
+        }
         for file in &files {
             assert!(
                 !file.exists(),
