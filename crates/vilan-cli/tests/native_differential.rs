@@ -1171,6 +1171,8 @@ const PLATFORM_BOUND_REQUIRED: &[&str] = &[
     "asset_bundle.vl",
     "element-syntax.vl",
     "estate.vl",
+    // F?4: `std::process` natively — `args` and `env`.
+    "process-env.vl",
 ];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot

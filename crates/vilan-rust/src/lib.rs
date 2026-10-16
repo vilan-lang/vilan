@@ -11620,6 +11620,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             (None, "Date.now", "now_millis") => {
                 Ok(Some("vilan_rt::time::now_millis()".to_string()))
             }
+            // F?4: `std::process`'s host bindings, each one call into
+            // `vilan_rt::process` (`env` and `args` are intrinsics, below).
+            (None, "process.exit", "exit") => one(self, "process::exit"),
+            (None, "process.cwd", "cwd") => Ok(Some("vilan_rt::process::cwd()".to_string())),
             (Some("node:crypto"), "createHash", "create_hash") => Ok(Some(format!(
                 "vilan_rt::crypto::create_hash(&{})",
                 self.place_argument(argument_ids, 0, depth)?
@@ -15941,6 +15945,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "std::env::var(&*{}).ok().map(|value| vilan_rt::str_new(&value))",
                 next()
             ),
+            // `std::process::args()` — `process.argv.slice(2)` (F?4).
+            Intrinsic::Args => "vilan_rt::process::args()".to_string(),
             other => return self.host_gap(format!("the intrinsic `{other:?}`"), span),
         };
         Ok(rendered)

@@ -958,6 +958,9 @@ fun exit(code: i32)
 fun scan(): str                  // read a line from stdin
 ```
 
+`args`, `cwd`, `env` and `exit` work on both backends — the JS one under
+node and the native one (`--backend rust`).
+
 Every relative path in a `std::fs` or `std::build` call resolves against the
 process's working directory; `cwd()` reads it (absolute), so a boot check can
 say which directory the server actually ran from instead of guessing. It is
