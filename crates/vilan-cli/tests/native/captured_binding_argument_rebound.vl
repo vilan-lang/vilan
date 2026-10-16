@@ -117,6 +117,15 @@ fun rebind_log(): i32 {
 	9
 }
 
+fun refill(): List<i32> {
+	module_items = [9];
+	[1]
+}
+
+fun both(items: &mut List<i32>, more: &List<i32>) {
+	items.push(more.len().as_i32());
+}
+
 fun write_log(): i32 {
 	module_log.items.push(9);
 	module_log.count = 5;
@@ -225,4 +234,7 @@ fun main() {
 	print(maybe_of(&module_log.maybe, write_log()));
 	module_log = fresh();
 	print(counted(module_log.count, write_log()));
+	module_items = [];
+	both(&mut module_items, &refill());
+	print(module_items.len());
 }

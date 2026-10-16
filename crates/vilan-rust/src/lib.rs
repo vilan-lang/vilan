@@ -12934,6 +12934,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
             .collect();
         let defers_copies = defers_a_copy.contains(&true);
+        // F143: a `&mut` argument over a MODULE-LEVEL binding borrows its
+        // `thread_local!` cell for the call, taken where the call is made —
+        // so a `&` argument that runs code (`both(&mut global, &reset())`,
+        // `reset` re-binding `global`) is settled ahead of it as the by-value
+        // ones are, rather than evaluated under the borrow (the runtime's
+        // reentrancy stop; JS reads `global` after `reset()`).
+        let borrows_a_module_cell = argument_ids.iter().enumerate().any(|(index, argument)| {
+            matches!(conventions.get(index), Some(Receiving::RefMut))
+                && self
+                    .module_place_subscripts_run_code(match self.program.entity_map.get(argument) {
+                        Some(&Expr::Reference(operand, _)) => operand,
+                        _ => *argument,
+                    })
+                    .is_some()
+        });
         let borrows_a_cell =
             borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies;
         let mut deferred_copies = String::new();
@@ -13072,7 +13087,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // settled in order with the by-value ones, ahead of it.
             let lent = matches!(conventions.get(index), Some(Receiving::Ref));
             let lends = lent && !already_a_reference;
-            if defers_a_copy[index] || (defers_copies && lent && !self.runs_no_code(*argument)) {
+            if defers_a_copy[index]
+                || ((defers_copies || borrows_a_module_cell)
+                    && lent
+                    && !self.runs_no_code(*argument))
+            {
                 let name = if defers_a_copy[index] {
                     format!("__copied{index}")
                 } else {

@@ -13728,6 +13728,10 @@ fn f138_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same
 /// binding's `&` waits whatever its type). The base answered differently on
 /// the two backends at six of the fourteen and read the binding where it
 /// stood on both at seven more; the scalar by value (`9`) is the control.
+/// A `&mut` argument over a module binding beside a `&` one that runs code
+/// (`both(&mut module_items, &refill())`, `refill` re-binding it) settles the
+/// `&` one first natively, where it had been evaluated under the cell's
+/// borrow and stopped with the reentrancy sentence (JS: `2`).
 #[test]
 fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_arguments_on_both_backends()
  {
@@ -13739,7 +13743,7 @@ fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_argumen
     )
     .expect("write the probe program");
     let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n\
-                    true\ntrue\ntrue\ntrue\n2\n3\n3\ntrue\ntrue\ntrue\n9\n5\nSome(3)\n9\n";
+                    true\ntrue\ntrue\ntrue\n2\n3\n3\ntrue\ntrue\ntrue\n9\n5\nSome(3)\n9\n2\n";
     assert_eq!(
         both_stdouts(&staged, file),
         (expected.to_string(), expected.to_string()),
