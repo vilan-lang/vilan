@@ -1348,6 +1348,84 @@ fun main() {
     );
 }
 
+/// The text a sidecar `span` covers, read back out of the source.
+fn spanned<'text>(source: &'text str, span: (u32, u32, u32, u32, u32)) -> &'text str {
+    let offset = |line: u32, column: u32| {
+        let start: usize = source
+            .split_inclusive('\n')
+            .take(line as usize)
+            .map(str::len)
+            .sum();
+        // ASCII sources: a UTF-16 column is a byte column.
+        start + column as usize
+    };
+    &source[offset(span.1, span.2)..offset(span.3, span.4)]
+}
+
+/// E326: every frame carries its whole text (`span`), so an AWAITING frame of
+/// an async stack — which names only the place it stands, never where its
+/// function starts — finds its record as the innermost text holding that
+/// place: a closure's inside its function's, `main`'s for the top level's
+/// body. A synchronous `main` has no head but has a text.
+#[test]
+fn e326_every_frame_carries_its_whole_text() {
+    let (built, source) = build_program("sidecar_spans", VALUES);
+    let info = sidecar(&built);
+    let entry = built
+        .map
+        .sources
+        .iter()
+        .position(|entry| entry.path.ends_with("main.vl"))
+        .expect("the user's file") as u32;
+
+    let area = frame(info, "area").span.expect("a function's text");
+    assert_eq!(area.0, entry);
+    let text = spanned(&source, area);
+    assert!(
+        text.starts_with("fun area(shape: Shape): f64 {") && text.ends_with("}"),
+        "area's text:\n{text}"
+    );
+    assert!(text.contains("radius * radius * scale"));
+
+    let closure = frame(info, "a closure in scaled")
+        .span
+        .expect("a closure's text");
+    let text = spanned(&source, closure);
+    assert!(
+        text.starts_with("|value: i32| {") && text.ends_with("}"),
+        "the closure's text:\n{text}"
+    );
+    // The closure's text lies inside its function's.
+    let scaled = frame(info, "scaled").span.expect("scaled's text");
+    assert!(
+        (scaled.1, scaled.2) < (closure.1, closure.2)
+            && (closure.3, closure.4) <= (scaled.3, scaled.4),
+        "{closure:?} inside {scaled:?}"
+    );
+
+    let main = frame(info, "main");
+    assert_eq!(main.at, None, "a synchronous main has no head");
+    let text = spanned(&source, main.span.expect("main's text"));
+    assert!(
+        text.starts_with("fun main() {") && text.contains("print(pair.0);"),
+        "main's text:\n{text}"
+    );
+
+    // The JSON carries it as `[source, line, column, end line, end column]`.
+    let json = info.to_json("main.mjs");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("the sidecar is JSON");
+    let area_json = parsed["frames"]
+        .as_array()
+        .expect("frames")
+        .iter()
+        .find(|frame| frame["name"] == "area")
+        .expect("area's frame");
+    assert_eq!(
+        area_json["span"],
+        serde_json::json!([area.0, area.1, area.2, area.3, area.4])
+    );
+}
+
 /// E331: an async `main` runs in an arrow the script's top level calls, not
 /// at the top level itself — so its frame is not the module's. The arrow's
 /// head is marked at `main`, and `main`'s record carries that place, so a

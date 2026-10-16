@@ -1,0 +1,22 @@
+// E326's gate (`src/test/session.test.ts`): a stop in an awaited call after
+// it resumed, where the synchronous stack holds the callee alone and its
+// callers wait below as async parents. A `// break:` comment names a line the
+// session stops on, an `// awaits:` comment a line an awaiting frame stands on.
+import std::io::print;
+import std::time::sleep;
+
+fun fetch_total(base: i32): i32 {
+	sleep(1);
+	let total = base * 2; // break: resumed
+	total
+}
+
+fun outer(seed: i32): i32 {
+	let got = fetch_total(seed); // awaits: outer
+	got + 1
+}
+
+fun main() {
+	let seed = 20;
+	print(outer(seed)); // awaits: main
+}

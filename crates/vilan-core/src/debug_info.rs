@@ -99,6 +99,12 @@ pub struct DebugFrame {
     /// 0-based line, 0-based UTF-16 column). `None` for a synchronous `main`; an
     /// async one runs in an arrow whose head is marked at `main` (E331).
     pub at: Option<(u32, u32, u32)>,
+    /// The function's whole text, in the same coordinates: (`sources` index,
+    /// start line, start column, end line, end column), the end exclusive. An
+    /// awaiting frame of an async stack names no function start, only where it
+    /// stands; the innermost record whose text holds that place is its own
+    /// (E326). `None` where the map does not reach the source.
+    pub span: Option<(u32, u32, u32, u32, u32)>,
     pub bindings: Vec<DebugBinding>,
 }
 
@@ -224,6 +230,8 @@ pub(crate) struct RecordedFrame {
     pub js: Option<String>,
     /// The head's place: its source and a byte offset into it.
     pub origin: Option<(SourceId, usize)>,
+    /// The function's whole text: its source and the byte offsets it spans.
+    pub extent: Option<(SourceId, usize, usize)>,
     pub bindings: Vec<RecordedBinding>,
     /// Merged into the instance whose body it turned out to share (M16).
     pub dropped: bool,
@@ -284,9 +292,10 @@ pub(crate) fn merge_shared_frame(survivor: &mut RecordedFrame, dropped: &Recorde
     }
 }
 
-/// The finished sidecar: each frame's head placed in the map's coordinates.
-/// A frame whose head the map does not reach (its source is not among the
-/// map's) keeps no `at` — for a function the adapter still finds it by name.
+/// The finished sidecar: each frame's head and text placed in the map's
+/// coordinates. A frame whose head the map does not reach (its source is not
+/// among the map's) keeps no `at` — for a function the adapter still finds it
+/// by name.
 pub(crate) fn finish(program: &Program, recorded: RecordedDebug, map: &SourceMap) -> DebugInfo {
     let frames: Vec<RecordedFrame> = recorded
         .frames
@@ -308,16 +317,27 @@ pub(crate) fn finish(program: &Program, recorded: RecordedDebug, map: &SourceMap
                 .map(|position| position as u32)
         })
     };
-    // One sweep per source in offset order, as the map's own `locate` does.
-    let mut anchored: Vec<(SourceId, usize, usize)> = frames
-        .iter()
-        .enumerate()
-        .filter_map(|(index, frame)| frame.origin.map(|(source, offset)| (source, offset, index)))
-        .collect();
+    // Every offset to place — a head, a text's start, a text's end — as
+    // (source, offset, which frame, which of the three), placed by one sweep
+    // per source in offset order, as the map's own `locate` does.
+    const HEAD: usize = 0;
+    const START: usize = 1;
+    const END: usize = 2;
+    let mut anchored: Vec<(SourceId, usize, usize, usize)> = Vec::with_capacity(frames.len() * 3);
+    for (index, frame) in frames.iter().enumerate() {
+        if let Some((source, offset)) = frame.origin {
+            anchored.push((source, offset, index, HEAD));
+        }
+        if let Some((source, start, end)) = frame.extent {
+            anchored.push((source, start, index, START));
+            anchored.push((source, end, index, END));
+        }
+    }
     anchored.sort_unstable();
-    let mut placed: Vec<Option<(u32, u32, u32)>> = vec![None; frames.len()];
+    // Per frame, its three places as (slot, line, column).
+    let mut placed: Vec<[Option<(u32, u32, u32)>; 3]> = vec![[None; 3]; frames.len()];
     let mut sweep: Option<(SourceId, usize, u32, usize)> = None;
-    for (source, offset, index) in anchored {
+    for (source, offset, index, which) in anchored {
         let Some(text) = program
             .source_texts
             .iter()
@@ -342,17 +362,23 @@ pub(crate) fn finish(program: &Program, recorded: RecordedDebug, map: &SourceMap
             line_start = swept + last;
         }
         sweep = Some((source, offset, line, line_start));
-        placed[index] = Some((slot, line, utf16_length(&text[line_start..offset])));
+        placed[index][which] = Some((slot, line, utf16_length(&text[line_start..offset])));
     }
     DebugInfo {
         frames: frames
             .into_iter()
             .zip(placed)
-            .map(|(frame, at)| DebugFrame {
+            .map(|(frame, [at, start, end])| DebugFrame {
                 kind: frame.kind,
                 name: frame.name,
                 js: frame.js,
                 at,
+                span: match (start, end) {
+                    (Some((slot, line, column)), Some((_, end_line, end_column))) => {
+                        Some((slot, line, column, end_line, end_column))
+                    }
+                    _ => None,
+                },
                 bindings: frame
                     .bindings
                     .into_iter()
@@ -401,6 +427,11 @@ impl DebugInfo {
             }
             if let Some((source, line, column)) = frame.at {
                 json.push_str(&format!(",\"at\":[{source},{line},{column}]"));
+            }
+            if let Some((source, line, column, end_line, end_column)) = frame.span {
+                json.push_str(&format!(
+                    ",\"span\":[{source},{line},{column},{end_line},{end_column}]"
+                ));
             }
             json.push_str(",\"bindings\":[");
             for (index, binding) in frame.bindings.iter().enumerate() {

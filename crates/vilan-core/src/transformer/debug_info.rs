@@ -12,7 +12,7 @@
 //! sidecar (`tests/source_maps.rs` pins the identity over the corpus).
 
 use super::Transformer;
-use crate::analyzer::Function;
+use crate::analyzer::{Function, SourceId};
 use crate::debug_info::{
     BindingRead, DebugType, FrameKind, Layout, RecordedBinding, RecordedDebug, RecordedFrame,
     is_user_source, merge_shared_frame,
@@ -77,6 +77,7 @@ impl<'src> Transformer<'src> {
         {
             let origin = (function.name_span.start != function.name_span.end)
                 .then_some((source, function.name_span.start));
+            let extent = self.debug_extent(source, function.id);
             let bindings =
                 self.frame_bindings(&mut recorder, &function.parameters, function.body.2);
             let index = recorder.recorded.frames.len();
@@ -85,6 +86,7 @@ impl<'src> Transformer<'src> {
                 name: function.name.to_string(),
                 js: Some(js_name.to_string()),
                 origin,
+                extent,
                 bindings,
                 dropped: false,
             });
@@ -98,10 +100,10 @@ impl<'src> Transformer<'src> {
         let Some(mut recorder) = self.debug_recorder.take() else {
             return;
         };
-        if self
+        if let Some(source) = self
             .program
             .source_of(main.id)
-            .is_some_and(|source| is_user_source(self.program, source))
+            .filter(|source| is_user_source(self.program, *source))
         {
             let bindings = self.frame_bindings(&mut recorder, &main.parameters, main.body.2);
             // An async `main` runs in an arrow the script calls at its top
@@ -112,16 +114,17 @@ impl<'src> Transformer<'src> {
                 .async_functions
                 .contains(&main.id)
                 .then(|| {
-                    let source = self.program.source_of(main.id)?;
                     let span = self.program.span_map.get(&main.id)?;
                     (span.start != span.end).then_some((source, span.start))
                 })
                 .flatten();
+            let extent = self.debug_extent(source, main.id);
             recorder.recorded.frames.push(RecordedFrame {
                 kind: FrameKind::Main,
                 name: main.name.to_string(),
                 js: None,
                 origin,
+                extent,
                 bindings,
                 dropped: false,
             });
@@ -152,11 +155,20 @@ impl<'src> Transformer<'src> {
                 name,
                 js: None,
                 origin: Some((source, span.start)),
+                extent: Some((source, span.start, span.end)),
                 bindings,
                 dropped: false,
             });
         }
         self.debug_recorder = Some(recorder);
+    }
+
+    /// `id`'s whole declaration as the sidecar's `span` holds it: where an
+    /// awaiting frame, which names only the place it stands, finds its record
+    /// (E326).
+    fn debug_extent(&self, source: SourceId, id: Id) -> Option<(SourceId, usize, usize)> {
+        let span = self.program.span_map.get(&id)?;
+        (span.start < span.end).then_some((source, span.start, span.end))
     }
 
     /// The instance minted as `dropped` shares `survivor`'s body (M16): its

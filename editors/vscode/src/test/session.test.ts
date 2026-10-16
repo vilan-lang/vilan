@@ -434,6 +434,60 @@ test('a two-leg server under --watch in a terminal re-attaches across a round', 
     await until(() => !alive(serverPid as number), "the last round's server to stop", 10000);
 });
 
+// E326: a stop in an awaited call after it resumed. The synchronous stack
+// is the callee alone; the callers that await it are node's async parents
+// (`asyncStackTrace`), listed below a label frame naming the await — mapped to
+// their `.vl` lines and named by their records like any frame, with no scopes
+// of their own (V8 keeps none).
+test('a stop in an awaited call shows its callers below an await label', { skip }, async () => {
+    const program = copyFixture('awaits.vl');
+    const breaks = markers(program, 'break');
+    const awaits = markers(program, 'awaits');
+    const client = new DapClient();
+    try {
+        let { stopped } = await launch(client, program, [breaks.get('resumed') ?? 0]);
+        const resumed = await stop(client, stopped);
+        assert.deepEqual([resumed.reason, resumed.frame.name, resumed.frame.line], ['breakpoint', 'fetch_total', breaks.get('resumed')]);
+        assert.equal(variable(resumed, 'base').value, '20');
+
+        const trace = await client.request('stackTrace', { threadId: 1 });
+        const frames: any[] = trace.stackFrames;
+        assert.equal(trace.totalFrames, frames.length);
+        const label = frames.findIndex((frame) => frame.presentationHint === 'label');
+        assert.ok(label > 0, `a label frame below the stop: ${JSON.stringify(frames)}`);
+        assert.equal(frames[label].name, 'await');
+        // Below the label, the user's frames in order: the caller that awaits
+        // `fetch_total`, then `main` awaiting it in turn.
+        const below = frames.slice(label + 1).filter((frame) => frame.presentationHint === 'normal');
+        assert.deepEqual(
+            below.slice(0, 2).map((frame) => [frame.name, frame.line, path.basename(frame.source?.path ?? '')]),
+            [
+                ['outer', awaits.get('outer'), 'awaits.vl'],
+                ['main', awaits.get('main'), 'awaits.vl'],
+            ],
+            JSON.stringify(frames),
+        );
+        // The awaiting frames keep no scopes, and evaluate nothing.
+        const outerFrame = below[0];
+        assert.deepEqual((await client.request('scopes', { frameId: outerFrame.id })).scopes, []);
+        await assert.rejects(
+            client.request('evaluate', { expression: 'seed', frameId: outerFrame.id, context: 'watch' }),
+            /awaiting frame/,
+        );
+        // Paged as VS Code asks: the first frame, then the rest.
+        const first = await client.request('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+        assert.deepEqual([first.stackFrames.length, first.totalFrames], [1, frames.length]);
+
+        const terminated = client.next('terminated');
+        await client.request('continue', { threadId: 1 });
+        await terminated;
+        assert.ok(client.stdout().includes('41'), `the program's output: ${client.stdout()}`);
+    } finally {
+        await client.close();
+        removeQuietly(path.dirname(program));
+    }
+});
+
 test('a terminal launch stops on entry and steps line by line', { skip }, async () => {
     const program = copyFixture('steps.vl');
     const lines = markers(program, 'step');

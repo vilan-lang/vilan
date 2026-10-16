@@ -263,6 +263,10 @@ apart from its own bindings. The Watch pane takes a path into a binding —
 you type there is evaluated as JavaScript. A hover lays a long value out over
 lines, as `dbg` does.
 
+A stop in a function that has awaited lists the functions waiting on it below
+an `await` label in the Call Stack: they are where the program comes back to,
+not where it stands, so they show no variables.
+
 `"watch": true` debugs a `vilan run --watch` session: each round's program is
 held at its first line until the debugger has attached to it again, so a
 breakpoint binds in every round. `"stopOnEntry": true` stops at `main`'s first

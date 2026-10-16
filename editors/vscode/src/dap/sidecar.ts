@@ -24,6 +24,9 @@ export interface SidecarFrame {
     js?: string;
     /// The head's original place: `[sources index, line, column]`, 0-based.
     at?: [number, number, number];
+    /// The function's whole text: `[sources index, line, column, end line,
+    /// end column]`, 0-based, the end exclusive (E326).
+    span?: [number, number, number, number, number];
     bindings: SidecarBinding[];
 }
 
@@ -81,6 +84,33 @@ export class Sidecar {
             candidates = this.frames.filter((frame) => frame.kind === 'function' && frame.js === functionName);
         }
         return merge(candidates);
+    }
+
+    /// The record for an AWAITING frame of an async stack (E326), which names
+    /// its function but not where the function starts — only the place it
+    /// stands, `place`. A named function is found by its emitted name; an
+    /// anonymous one (a closure, an async `main`'s arrow, the script's top
+    /// level) is the innermost record whose text holds the place.
+    resolveAt(functionName: string, place: OriginalPosition | undefined): ResolvedFrame | undefined {
+        if (functionName) {
+            const named = this.frames.filter((frame) => frame.kind === 'function' && frame.js === functionName);
+            if (named.length > 0) {
+                return merge(named);
+            }
+        }
+        if (!place) {
+            return undefined;
+        }
+        const holding = this.frames.filter((frame) => frame.span !== undefined && holds(frame.span, place));
+        if (holding.length === 0) {
+            return undefined;
+        }
+        // Innermost: the text that starts last (texts nest, they never cross).
+        const innermost = holding.reduce((best, frame) =>
+            before(best.span as Span, frame.span as Span) ? frame : best,
+        );
+        const span = innermost.span as Span;
+        return merge(holding.filter((frame) => sameSpan(frame.span as Span, span)));
     }
 
     /// The text a binding's type reads as in a pane: `view i32`, `List<Point>`.
@@ -197,6 +227,28 @@ export function parsePath(expression: string): { root: string; segments: PathSeg
         return undefined;
     }
     return { root: head[0], segments };
+}
+
+type Span = [number, number, number, number, number];
+
+/// Whether `span` holds `place` (its source, and between its start and its end).
+function holds(span: Span, place: OriginalPosition): boolean {
+    const [source, line, column, endLine, endColumn] = span;
+    if (source !== place.source) {
+        return false;
+    }
+    const afterStart = place.line > line || (place.line === line && place.column >= column);
+    const beforeEnd = place.line < endLine || (place.line === endLine && place.column < endColumn);
+    return afterStart && beforeEnd;
+}
+
+/// Whether `outer` starts before `inner` does.
+function before(outer: Span, inner: Span): boolean {
+    return outer[1] < inner[1] || (outer[1] === inner[1] && outer[2] < inner[2]);
+}
+
+function sameSpan(left: Span, right: Span): boolean {
+    return left.every((value, index) => value === right[index]);
 }
 
 /// One record, or the rows several agree on: a binding keeps its type only

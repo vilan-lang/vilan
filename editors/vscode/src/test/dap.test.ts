@@ -299,6 +299,31 @@ test('a frame is found by its head and its name; copies that disagree lose the t
     assert.throws(() => new Sidecar({ version: 2 }), /version/);
 });
 
+test('an awaiting frame is found by its name, or by the innermost text holding its place', () => {
+    const sidecar = new Sidecar({
+        version: 1,
+        file: 'main.mjs',
+        frames: [
+            { kind: 'main', name: 'main', span: [0, 12, 0, 30, 1], bindings: [] },
+            { kind: 'function', name: 'outer', js: 'outer', at: [0, 2, 4], span: [0, 2, 0, 10, 1], bindings: [] },
+            { kind: 'closure', name: 'a closure in outer', at: [0, 4, 12], span: [0, 4, 12, 6, 2], bindings: [] },
+            { kind: 'closure', name: 'a closure in main', at: [0, 14, 8], span: [0, 14, 8, 14, 20], bindings: [] },
+        ],
+        types: [],
+    });
+    // A named function by its emitted name, wherever it stands.
+    assert.equal(sidecar.resolveAt('outer', { source: 0, line: 3, column: 0 })?.name, 'outer');
+    // An anonymous frame by the innermost text holding its place.
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 5, column: 0 })?.name, 'a closure in outer');
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 8, column: 3 })?.name, 'outer');
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 14, column: 9 })?.name, 'a closure in main');
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 20, column: 1 })?.name, 'main');
+    // The end is exclusive; another source, or no place, finds nothing.
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 14, column: 20 })?.name, 'main');
+    assert.equal(sidecar.resolveAt('', { source: 1, line: 5, column: 0 }), undefined);
+    assert.equal(sidecar.resolveAt('', undefined), undefined);
+});
+
 test('the walker is sent only the types its root reaches, renumbered', () => {
     const table = new Sidecar(SIDECAR).table(14);
     assert.deepEqual(

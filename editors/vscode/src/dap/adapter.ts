@@ -93,6 +93,9 @@ interface FrameInfo {
     callFrame: any;
     script?: ScriptInfo;
     resolved?: ResolvedFrame;
+    /// A frame of an async parent (E326): a place the program will come back
+    /// to, not one it stands in — its scopes are gone.
+    awaiting?: boolean;
 }
 
 interface BreakpointRequest {
@@ -124,7 +127,9 @@ export class VilanDebugAdapter {
     private configured = false;
     private configuredWaiters: (() => void)[] = [];
     private round = 0;
-    private paused: { callFrames: any[]; reason: string; data?: any; hit: string[] } | undefined;
+    private paused:
+        | { callFrames: any[]; asyncStackTrace?: any; reason: string; data?: any; hit: string[] }
+        | undefined;
     private frames = new Map<number, FrameInfo>();
     private handles = new Map<number, Handle>();
     private nextHandle = 1;
@@ -699,6 +704,7 @@ export class VilanDebugAdapter {
         this.clearPause();
         this.paused = {
             callFrames: params.callFrames ?? [],
+            asyncStackTrace: params.asyncStackTrace,
             reason,
             data: params.data,
             hit: params.hitBreakpoints ?? [],
@@ -777,14 +783,69 @@ export class VilanDebugAdapter {
 
     private stackTrace(args: any): unknown {
         const callFrames = this.paused?.callFrames ?? [];
-        const stackFrames = callFrames.map((callFrame, index) => {
-            const id = index + 1;
-            const script = this.scripts.get(callFrame.location.scriptId);
-            const info: FrameInfo = { callFrame, script };
-            const generated = { line: callFrame.location.lineNumber, column: callFrame.location.columnNumber ?? 0 };
-            const original = script?.map?.original(generated);
-            const topLevel = !callFrame.functionName && (callFrame.functionLocation?.lineNumber ?? 0) === 0 && (callFrame.functionLocation?.columnNumber ?? 0) === 0;
-            if (script?.sidecar && script.map) {
+        const stackFrames = callFrames.map((callFrame, index) => this.stackFrame(index + 1, callFrame, false));
+        stackFrames.push(...this.awaitingFrames(stackFrames.length + 1));
+        const start = args.startFrame ?? 0;
+        const levels = args.levels || stackFrames.length;
+        return { stackFrames: stackFrames.slice(start, start + levels), totalFrames: stackFrames.length };
+    }
+
+    /// E326: the async parents below the stack the program stands in — node's
+    /// `asyncStackTrace` (asked for at attach, `setAsyncCallStackDepth`): each
+    /// segment under a label frame naming it (`await`, or the task a queued
+    /// reactive wake ran in, S8), its frames mapped as the synchronous ones
+    /// are. A segment that never reaches a script with a map is node's own —
+    /// its module loader awaiting the program — and is left out.
+    private awaitingFrames(firstId: number): unknown[] {
+        const frames: unknown[] = [];
+        let id = firstId;
+        for (let segment = this.paused?.asyncStackTrace; segment; segment = segment.parent) {
+            const callFrames: any[] = segment.callFrames ?? [];
+            if (!callFrames.some((callFrame) => this.scripts.get(callFrame.scriptId)?.map)) {
+                continue;
+            }
+            frames.push({
+                id: id++,
+                name: segment.description || 'async',
+                line: 0,
+                column: 0,
+                presentationHint: 'label',
+            });
+            for (const callFrame of callFrames) {
+                // A `Runtime.CallFrame` is flat; the paused stack's frames
+                // nest their place under `location`.
+                const located = {
+                    functionName: callFrame.functionName,
+                    url: callFrame.url,
+                    location: {
+                        scriptId: callFrame.scriptId,
+                        lineNumber: callFrame.lineNumber,
+                        columnNumber: callFrame.columnNumber,
+                    },
+                };
+                frames.push(this.stackFrame(id++, located, true));
+            }
+        }
+        return frames;
+    }
+
+    /// One frame of the Call Stack, mapped to its `.vl` place and named by its
+    /// sidecar record where one resolves.
+    private stackFrame(id: number, callFrame: any, awaiting: boolean): unknown {
+        const script = this.scripts.get(callFrame.location.scriptId);
+        const info: FrameInfo = { callFrame, script, awaiting };
+        const generated = { line: callFrame.location.lineNumber, column: callFrame.location.columnNumber ?? 0 };
+        const original = script?.map?.original(generated);
+        const topLevel =
+            !awaiting &&
+            !callFrame.functionName &&
+            (callFrame.functionLocation?.lineNumber ?? 0) === 0 &&
+            (callFrame.functionLocation?.columnNumber ?? 0) === 0;
+        if (script?.sidecar && script.map) {
+            if (awaiting) {
+                // No function start to go by: the place it stands in is.
+                info.resolved = script.sidecar.resolveAt(callFrame.functionName ?? '', original);
+            } else {
                 const head = callFrame.functionLocation
                     ? script.map.original({
                           line: callFrame.functionLocation.lineNumber,
@@ -793,32 +854,29 @@ export class VilanDebugAdapter {
                     : undefined;
                 info.resolved = script.sidecar.resolve(callFrame.functionName ?? '', head, topLevel);
             }
-            this.frames.set(id, info);
-            const name = info.resolved?.name ?? (callFrame.functionName || (topLevel ? 'main' : '(anonymous)'));
-            if (original && script?.map) {
-                const source = script.map.sources[original.source];
-                return {
-                    id,
-                    name,
-                    source: this.dapSource(source.path, source.url, source.content, source.ignored),
-                    line: original.line + 1,
-                    column: original.column + 1,
-                    presentationHint: source.ignored ? 'subtle' : 'normal',
-                };
-            }
-            const file = callFrame.url?.startsWith('file:') ? safePath(callFrame.url) : undefined;
+        }
+        this.frames.set(id, info);
+        const name = info.resolved?.name ?? (callFrame.functionName || (topLevel ? 'main' : '(anonymous)'));
+        if (original && script?.map) {
+            const source = script.map.sources[original.source];
             return {
                 id,
                 name,
-                source: file ? { name: path.basename(file), path: file } : undefined,
-                line: generated.line + 1,
-                column: generated.column + 1,
-                presentationHint: 'subtle',
+                source: this.dapSource(source.path, source.url, source.content, source.ignored),
+                line: original.line + 1,
+                column: original.column + 1,
+                presentationHint: source.ignored ? 'subtle' : 'normal',
             };
-        });
-        const start = args.startFrame ?? 0;
-        const levels = args.levels || stackFrames.length;
-        return { stackFrames: stackFrames.slice(start, start + levels), totalFrames: stackFrames.length };
+        }
+        const file = callFrame.url?.startsWith('file:') ? safePath(callFrame.url) : undefined;
+        return {
+            id,
+            name,
+            source: file ? { name: path.basename(file), path: file } : undefined,
+            line: generated.line + 1,
+            column: generated.column + 1,
+            presentationHint: 'subtle',
+        };
     }
 
     private dapSource(file: string | undefined, url: string, content: string | undefined, ignored: boolean): unknown {
@@ -850,7 +908,8 @@ export class VilanDebugAdapter {
 
     private async scopes(frameId: number): Promise<unknown[]> {
         const info = this.frames.get(frameId);
-        if (!info) {
+        if (!info || info.awaiting) {
+            // A label, or an awaiting frame: V8 keeps no scopes for either.
             return [];
         }
         const chain: any[] = info.callFrame.scopeChain ?? [];
@@ -1074,6 +1133,9 @@ export class VilanDebugAdapter {
             throw new Error('the program is not running');
         }
         const info = frameId !== undefined ? this.frames.get(frameId) : undefined;
+        if (info?.awaiting) {
+            throw new Error('an awaiting frame keeps no values to evaluate in: pick a frame above the first label');
+        }
         if (info) {
             const vilan = await this.evaluatePath(expression, info, context);
             if (vilan) {
