@@ -434,3 +434,114 @@ fn m152_a_dependency_names_its_items_the_same_over_a_loaded_prefix() {
     let _ = std::fs::remove_dir_all(&cache);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `vilan cache <arguments>` with the world cache at `cache` and the home at
+/// `home` (so nothing reaches the developer's own `~/.vilan`).
+fn vilan_cache(home: &Path, cache: &Path, arguments: &[&str]) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("cache")
+        .args(arguments)
+        .env("HOME", home)
+        .env("VILAN_STD", std_dir())
+        .env("VILAN_WORLD_CACHE", cache)
+        .output()
+        .expect("run vilan cache");
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+/// **std-prefix P4**: `vilan cache warm` writes a program's prefix file and a
+/// second warm finds it present; `vilan cache prune` takes a world another
+/// BUILD of the analyzer wrote (its header names the build — G28's stamp) once
+/// it is past the seven-day guard, and never this build's; `vilan cache clean`
+/// takes everything, the std import index included.
+#[test]
+fn p4_cache_warm_prune_and_clean_keep_this_builds_worlds() {
+    let home = support::scratch_dir("p4-cache-home");
+    let cache = support::scratch_dir("p4-cache-worlds");
+    let program = support::scratch_dir("p4-cache-program");
+    std::fs::create_dir_all(&program).expect("program dir");
+    let entry = program.join("main.vl");
+    std::fs::write(
+        &entry,
+        "import std::io::print;\nimport std::path::basename;\n\nfun main() {\n\tprint(basename(\"a/b.txt\"));\n}\n",
+    )
+    .expect("entry");
+    let entry_arg = entry.to_str().expect("a utf-8 path");
+
+    let (ok, text) = vilan_cache(&home, &cache, &["warm", entry_arg]);
+    assert!(ok, "`cache warm` failed:\n{text}");
+    assert!(text.contains("wrote 1 prefix file"), "{text}");
+    let (ok, text) = vilan_cache(&home, &cache, &["warm", entry_arg]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("wrote 0 prefix files, 1 already present"),
+        "a second warm loads what the first wrote:\n{text}"
+    );
+    let worlds: Vec<PathBuf> = files_under(&cache)
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "world")
+        })
+        .collect();
+    assert_eq!(worlds.len(), 1, "{worlds:?}");
+
+    // A FOREIGN build's world: the same file under another key directory, its
+    // header's build id rewritten (same length), aged past the guard.
+    let mine = worlds[0].parent().expect("the key directory").to_path_buf();
+    let foreign = cache.join("0000000000000000");
+    std::fs::create_dir_all(&foreign).expect("foreign dir");
+    let mut bytes = std::fs::read(&worlds[0]).expect("read the world");
+    let build = vilan_core::BUILD_ID.as_bytes();
+    let at = bytes
+        .windows(build.len())
+        .position(|window| window == build)
+        .expect("the header names the build in clear");
+    bytes[at..at + build.len()].copy_from_slice(b"ffffffffffffffff");
+    let foreign_world = foreign.join("std.world");
+    std::fs::write(&foreign_world, &bytes).expect("write the foreign world");
+    let month_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+    for world in [&foreign_world, &worlds[0]] {
+        std::fs::File::options()
+            .append(true)
+            .open(world)
+            .expect("open a world")
+            .set_modified(month_ago)
+            .expect("age it");
+    }
+
+    let (ok, text) = vilan_cache(&home, &cache, &["prune", "--dry-run"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("would prune 1 entry") && text.contains("build ffffffffffffffff"),
+        "the dry run names the foreign build:\n{text}"
+    );
+    assert!(foreign.is_dir(), "a dry run deletes nothing");
+    let (ok, text) = vilan_cache(&home, &cache, &["prune"]);
+    assert!(ok, "{text}");
+    assert!(
+        !foreign.exists(),
+        "the foreign build's world is pruned:\n{text}"
+    );
+    assert!(
+        mine.is_dir(),
+        "this build's world is kept, however old:\n{text}"
+    );
+
+    let (ok, text) = vilan_cache(&home, &cache, &["clean"]);
+    assert!(ok, "{text}");
+    assert!(
+        files_under(&cache).is_empty(),
+        "clean takes every world and the std index:\n{text}"
+    );
+    for directory in [&home, &cache, &program] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}

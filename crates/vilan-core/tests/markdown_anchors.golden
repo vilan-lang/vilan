@@ -27,6 +27,7 @@ appendix/cli.md h3 scope
 appendix/cli.md h2 vilan-upgrade
 appendix/cli.md h2 vilan-cache-prune
 appendix/cli.md h2 vilan-cache-clean
+appendix/cli.md h2 vilan-cache-warm
 appendix/editor.md h1 the-editor
 appendix/editor.md h2 getting-it
 appendix/editor.md h2 what-it-gives-you

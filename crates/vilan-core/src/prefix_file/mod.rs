@@ -251,6 +251,29 @@ pub(crate) fn write(
     })
 }
 
+/// P4: the key a cache directory's world was written under, read off its
+/// file's header alone (the world itself is never decoded) — `None` when the
+/// directory holds no tier file or its header does not read.
+pub(crate) fn directory_key(directory: &Path) -> Option<Key> {
+    use std::io::Read as _;
+    for file in [STD_TIER_FILE, DEPENDENCIES_TIER_FILE] {
+        let Ok(handle) = std::fs::File::open(directory.join(file)) else {
+            continue;
+        };
+        // The header is the key, the roots and three numbers: a few KB at most.
+        let mut head = Vec::new();
+        if handle.take(64 * 1024).read_to_end(&mut head).is_err() {
+            return None;
+        }
+        if head.len() < MAGIC.len() || &head[..MAGIC.len()] != MAGIC {
+            return None;
+        }
+        let (header, _): (Header, usize) = codec::decode_inline(&head[MAGIC.len()..]).ok()?;
+        return Some(header.key);
+    }
+    None
+}
+
 /// Reads and validates the std tier for `key`. Every failure is a [`Miss`].
 pub(crate) fn read(directory: &Path, key: &Key) -> Result<Loaded, Miss> {
     let started = now();
@@ -262,6 +285,11 @@ pub(crate) fn read(directory: &Path, key: &Key) -> Result<Loaded, Miss> {
     };
     let validated = validate(&bytes, key)?;
     let (body_start, body_end, table_end, std_roots) = validated;
+    // P4: a load is a USE — the write-time bound takes the least recently
+    // used world first. Best effort: a read-only root keeps its write time.
+    if let Ok(handle) = std::fs::File::options().append(true).open(&path) {
+        let _ = handle.set_modified(std::time::SystemTime::now());
+    }
     let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     crate::leak_tally::record(crate::leak_tally::LeakSite::PrefixFile, leaked.len());
     Ok(Loaded {

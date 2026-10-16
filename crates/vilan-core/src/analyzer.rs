@@ -81937,6 +81937,16 @@ fn prefix_file_write(
     match outcome {
         Ok(written) => {
             PREFIX_FILE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // P4: the root held to its byte budget, the least recently used
+            // worlds first, never the one just written.
+            let evicted = crate::world_cache::bound(
+                &directory,
+                crate::world_cache::max_bytes(),
+                written.path.parent(),
+            );
+            if !evicted.is_empty() && crate::phase_timing_enabled() {
+                eprintln!("[vilan phase] prefix-file-evicted {}", evicted.len());
+            }
             let micros = written.took.as_micros() as u64;
             crate::incremental::update_census(|census| {
                 census.prefix_file = Some("written");
