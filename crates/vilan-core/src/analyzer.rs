@@ -9886,18 +9886,28 @@ impl<'src> Analyzer<'src> {
                     };
                 // array-lengths.md §5.2: a LENGTH nothing binds is the same
                 // refusal, and its explicit form is a number (`zeros<4>()`).
+                // B642: the fix-its spell the call as it was written — a
+                // method call keeps its receiver (`numbers.to_array<4>()`).
                 let message = match self.length_parameters.contains(&constraint_id) {
-                    true => format!(
-                        "cannot infer the length '{generic_label}' for this call: {why}. Write \
-                         it — on the binding the result lands in (`let value: [_; 4] = …`), \
-                         as the call's argument (`{member}<4>(…)`), or ascribe the call"
-                    ),
-                    false => format!(
-                        "cannot infer '{generic_label}' for this call: {why}. Write the type — on \
-                         the binding the result lands in (`let value: … = …`), as the call's \
-                         type argument (`{member}<…>(…)`), or ascribe the call \
-                         (`{member}(…) as …`)"
-                    ),
+                    true => {
+                        let length_argument = self.written_call_form(call_id, member, "<4>");
+                        format!(
+                            "cannot infer the length '{generic_label}' for this call: {why}. \
+                             Write it — on the binding the result lands in (`let value: [_; 4] \
+                             = …`), as the call's argument (`{length_argument}`), or ascribe the \
+                             call"
+                        )
+                    }
+                    false => {
+                        let type_argument = self.written_call_form(call_id, member, "<…>");
+                        let ascribed = self.written_call_form(call_id, member, "");
+                        format!(
+                            "cannot infer '{generic_label}' for this call: {why}. Write the type \
+                             — on the binding the result lands in (`let value: … = …`), as the \
+                             call's type argument (`{type_argument}`), or ascribe the call \
+                             (`{ascribed} as …`)"
+                        )
+                    }
                 };
                 errors.push((
                     call_id,
@@ -23887,6 +23897,38 @@ impl<'src> Analyzer<'src> {
             selected = Some((*member_id, *impl_subject));
         }
         selected
+    }
+
+    /// B642: `member` called with `generic_list` written after its name, in
+    /// the call's own shape — `{receiver}.{member}{generic_list}()` for a
+    /// METHOD call, the receiver as written (`…` when it is not one short
+    /// line), `()` when it passes nothing else and `(…)` when it does; the
+    /// free form `{member}{generic_list}(…)` otherwise, as before.
+    fn written_call_form(&self, call_id: Id, member: &str, generic_list: &str) -> String {
+        let receiver_id = match self.function_calls.get(&call_id) {
+            Some(call) if self.member_name_spans.contains_key(&call_id) => {
+                call.argument_ids.first().copied().map(|receiver| {
+                    let passes_more = call.argument_ids.len() > 1;
+                    (receiver, passes_more)
+                })
+            }
+            _ => None,
+        };
+        let Some((receiver_id, passes_more)) = receiver_id else {
+            return format!("{member}{generic_list}(…)");
+        };
+        let receiver = self
+            .span_map
+            .get(&receiver_id)
+            .zip(self.source_of_id(receiver_id))
+            .and_then(|(span, source)| {
+                self.source_text(source)
+                    .and_then(|text| text.get(span.into_range()))
+            })
+            .filter(|written| !written.contains('\n') && written.chars().count() <= 40)
+            .unwrap_or("…");
+        let arguments = if passes_more { "(…)" } else { "()" };
+        format!("{receiver}.{member}{generic_list}{arguments}")
     }
 
     /// B627: whether the value of `call_id`, whose settled type still carries

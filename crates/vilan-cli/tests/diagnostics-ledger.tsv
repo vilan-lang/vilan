@@ -602,7 +602,7 @@ row	flagship	key
 578	-	a `{got}` does not become a `{expected}` as a whole: an object is built where ONE value lands, and each `{concrete}` inside this one was built already; {steer}
 579	-	`-` on an unsigned value: `{name}` has no negative values, so its negation is out of range on every backend. Convert it to a signed type first (`.as_i53()`) and negate that
 580	-	`{name}` is unsigned ({range}), and this constant folds to `{value}`: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
-581	-	cannot infer '{generic_label}' for this call: {why}. Write the type — on the binding the result lands in (`let value: … = …`), as the call's type argument (`{member}<…>(…)`), or ascribe the call (`{member}(…) as …`)
+581	-	cannot infer '{generic_label}' for this call: {why}. Write the type — on the binding the result lands in (`let value: … = …`), as the call's type argument (`{type_argument}`), or ascribe the call (`{ascribed} as …`)
 582	-	a function cannot be named `Self`: `Self` names the type an `impl` or `trait` is about, so `value.Self()` reads as that type and never reaches this member. Give it another name
 583	-	`map` over a tuple takes one closure LITERAL with one parameter: its body is checked once per position, at that position's element, and a closure value has one type. Write `t.map(|x| f(x))`
 584	-	'{value_label}' is a mapped tuple whose family is not bound to guarantee '{bound_label}', which this argument's parameter requires
@@ -739,7 +739,7 @@ row	flagship	key
 716	-	this position is a length parameter, so its binder is `const {binder_name}`, not `type {binder_name}`
 717	-	`{parameter_name}` is a length parameter: give it a number (`<4>`) or another length parameter, not the type `{rendered}`
 718	-	`{rendered}` is a length, and `{parameter_name}` takes a type
-719	-	cannot infer the length '{generic_label}' for this call: {why}. Write it — on the binding the result lands in (`let value: [_; 4] = …`), as the call's argument (`{member}<4>(…)`), or ascribe the call
+719	-	cannot infer the length '{generic_label}' for this call: {why}. Write it — on the binding the result lands in (`let value: [_; 4] = …`), as the call's argument (`{length_argument}`), or ascribe the call
 720	-	`{whole}` is too large for an array length
 721	-	an array length is a count: write it as a whole number, unsuffixed or `usize` (`3`, `3usize`), not `{whole}{fraction}{suffix}`
 722	-	`{current_name}` is a parameter, a value known only when the function runs; an array length is a number, a length parameter (`<const N>`), or a name bound to a number
