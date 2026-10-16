@@ -14161,6 +14161,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(self.copy_a_consumed_place_read(id, rendered))
     }
 
+    /// Whether `id` is a module-level binding read by value — rendered
+    /// `cell.get()`, a copy already — or a field or tuple slot spine over one.
+    fn reads_a_module_binding_copy(&self, id: Id) -> bool {
+        let mut current = id;
+        loop {
+            match self.program.entity_map.get(&current) {
+                Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
+                    current = subject;
+                }
+                Some(Expr::Local(binding)) => return self.module_bindings.contains(binding),
+                _ => return false,
+            }
+        }
+    }
+
     /// Rule 1's copy at a position that CONSUMES its value, for the reads
     /// `clone_sites` deliberately elides (F20).
     ///
@@ -14184,6 +14199,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // boxed binding, or the boxed binding itself — is a copy already
         // (F62, F103); a second one copied it twice.
         if self.reads_through_a_shared_view(id) || self.boxed_root(id).is_some() {
+            return rendered;
+        }
+        // native-54's N?3: so is a read of a MODULE-LEVEL binding — `cell.get()`
+        // out of its `thread_local!` — and a field or tuple slot of one, moved
+        // out of that owned copy. (An element is not: moving out of a `Vec`
+        // temporary's element is refused, E0507, so it keeps its copy.)
+        if self.reads_a_module_binding_copy(id) {
             return rendered;
         }
         let reads_a_place = match self.program.entity_map.get(&id) {

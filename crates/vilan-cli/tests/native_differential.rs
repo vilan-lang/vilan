@@ -13580,6 +13580,32 @@ fn an_option_take_through_a_cell_writes_the_cell_on_both_backends() {
     );
 }
 
+/// native-54's N?3: a by-value read of a module-level binding at a consuming
+/// position — `has(module_items, 9)` beside a later read, a field and a tuple
+/// slot of one — is `cell.get()` natively, a whole-value copy already, and
+/// rule 1's consumed-place copy cloned it again (`(MODULE.with(|cell|
+/// cell.get())).clone()`). The emission pin: no module read is cloned twice.
+#[test]
+fn a_module_binding_read_by_value_is_copied_once_natively() {
+    let staged = stage();
+    let file = "native_probe_module_read_copied_once.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/module_read_copied_once.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "false\ntrue\ntrue\ntrue\nfalse\n4\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        !main.contains("cell.get())).clone()") && !main.contains("cell.get()).items).clone()"),
+        "a module binding's read is copied once:\n{main}"
+    );
+}
+
 /// The stdout of `file` on the JS and on the native backend.
 fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
     let run = |arguments: &[&str]| {

@@ -1,0 +1,26 @@
+// native-54's N?3: a by-value read of a module-level binding (and of a field
+// of one) is `cell.get()` natively, a copy already - rule 1's consumed-place
+// copy cloned it a second time. Each read is copied once now.
+import std::io::print;
+
+struct Log {
+	items: List<i32>,
+	pair: (List<i32>, i32),
+}
+
+mut module_items: List<i32> = [1, 2, 3];
+mut module_log = Log { items = [4], pair = ([5], 6) };
+
+fun has(items: List<i32>, value: i32): bool {
+	items.contains(value)
+}
+
+fun main() {
+	print(has(module_items, 9));
+	print(has(module_items, 1));
+	print(has(module_log.items, 4));
+	print(has(module_log.pair.0, 5));
+	print(has(module_log.items, 5));
+	module_items.push(4);
+	print(module_items.len());
+}
