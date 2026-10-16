@@ -14229,3 +14229,106 @@ fn b578_a_view_of_a_call_result_in_a_generic_body_pairs_per_instance() {
         "[5]\n[s]\n[7]\n[t]\n",
     );
 }
+
+// --- F141: an assignment through `Shared::read()` ---------------------------
+//
+// Spec §6.7: `read()` answers a COPY of the cell's value, so `cell.read().count
+// = 3` writes a copy nothing keeps. It checked clean and the backends split:
+// natively the write was lost (0, 1), while JS — whose read aliased the cell —
+// wrote the cell (3, 7). Refused at the target, rewritten through `write()`.
+
+const F141_BAG: &str = r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        struct Bag {
+            count: i32,
+            items: List<i32>,
+            pair: (i32, i32),
+        }
+
+        fun fresh(): Shared<Bag> {
+            Shared::new(Bag { count = 0, items = [1], pair = (2, 3) })
+        }
+"#;
+
+#[test]
+fn f141_an_assignment_through_a_read_is_refused() {
+    for (statement, read, rewritten) in [
+        (
+            "cell.read().count = 3;",
+            "cell.read()",
+            "cell.write().count = 3",
+        ),
+        (
+            "cell.read().items[0] = 7;",
+            "cell.read()",
+            "cell.write().items[0] = 7",
+        ),
+        (
+            "cell.read().count += 1;",
+            "cell.read()",
+            "cell.write().count += 1",
+        ),
+        (
+            "cell.read().pair.0 = 9;",
+            "cell.read()",
+            "cell.write().pair.0 = 9",
+        ),
+        (
+            "holder.cell.read().count = 4;",
+            "holder.cell.read()",
+            "holder.cell.write().count = 4",
+        ),
+    ] {
+        let source = format!(
+            "{F141_BAG}
+        struct Holder {{
+            cell: Shared<Bag>,
+        }}
+
+        fun main() {{
+            let cell = fresh();
+            let holder = Holder {{ cell = fresh() }};
+            {statement}
+            print(cell.read().count + holder.cell.read().count);
+        }}
+        "
+        );
+        let write = read.replace("read()", "write()");
+        assert_fails_once_with(
+            &source,
+            &format!(
+                "`{read}` is a copy, so this assignment is lost; write through `{write}`: \
+                 `{rewritten}`"
+            ),
+        );
+    }
+}
+
+/// F141's boundary: the `write()` spelling, a `mut` copy of a read written
+/// whole, and reads themselves are untouched.
+#[test]
+fn f141_writing_through_write_or_into_a_copy_still_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{F141_BAG}{}",
+            r#"
+        fun main() {
+            let cell = fresh();
+            cell.write().count = 3;
+            cell.write().items[0] = 7;
+            cell.write().pair.0 = 9;
+            mut copy = cell.read();
+            copy.count = 40;
+            print(cell.read().count);
+            print(cell.read().items[0]);
+            print(cell.read().pair.0);
+            print(copy.count);
+        }
+        main();
+        "#
+        ),
+        "3\n7\n9\n40\n",
+    );
+}

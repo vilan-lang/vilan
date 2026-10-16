@@ -32433,19 +32433,30 @@ impl<'src> Analyzer<'src> {
     /// `*` target and a lifted chain already carry their own refusal.
     fn check_assignment_places(&mut self) {
         // M110 S7b: the live assignments only, walked.
-        let mut assignment_targets: Vec<Id> = self
+        let mut assignment_targets: Vec<(Id, Id)> = self
             .live_entries_where(&self.expr_id_to_expr_map, |expr| {
                 matches!(expr, Expr::Assignment(..))
             })
-            .filter_map(|(_, expr)| match expr {
-                Expr::Assignment(target_id, _) => Some(*target_id),
+            .filter_map(|(assignment_id, expr)| match expr {
+                Expr::Assignment(target_id, _) => Some((*target_id, *assignment_id)),
                 _ => None,
             })
             .collect();
         // Source order, so a program with several reports them in reading order.
-        assignment_targets.sort_unstable_by_key(|target_id| target_id.0);
-        for target_id in assignment_targets {
+        assignment_targets.sort_unstable_by_key(|(target_id, _)| target_id.0);
+        let shared_reads = self
+            .shared_members()
+            .map(|[_, reads, _, _]| reads)
+            .unwrap_or_default();
+        for (target_id, assignment_id) in assignment_targets {
             let Some((non_place_id, what)) = self.first_non_place(target_id) else {
+                // F141: a place inside a `Shared::read()` — the read's copy —
+                // is a place nobody keeps.
+                if !shared_reads.is_empty()
+                    && let Some(read_id) = self.spine_rooted_at_a_read(target_id, &shared_reads)
+                {
+                    self.refuse_write_through_read(target_id, assignment_id, read_id);
+                }
                 continue;
             };
             self.push_anchored(
@@ -32463,6 +32474,62 @@ impl<'src> Analyzer<'src> {
                 target_id,
             );
         }
+    }
+
+    /// F141: the `Shared::read()` call an assignment target's spine roots at —
+    /// `cell.read().count`, `cell.read().items[0]`, `cell.read().pair.0` —
+    /// walking fields, elements and tuple positions down to the expression
+    /// they are read off. `None` when the root is anything else.
+    fn spine_rooted_at_a_read(&self, target_id: Id, shared_reads: &HashSet<Id>) -> Option<Id> {
+        let mut current = target_id;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
+                Expr::TupleIndex(root, ..) => current = *root,
+                Expr::Call(_) if current != target_id => {
+                    let (callee_id, _) = self.call_callee_and_receiver(current)?;
+                    return shared_reads.contains(&callee_id).then_some(current);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// F141: spec §6.7 — `read()` answers a COPY of the cell's value, so an
+    /// assignment into it writes the copy, which nothing keeps: natively the
+    /// write was lost, while JS (whose read aliased the cell) wrote the cell.
+    /// Refused at the target, with the assignment rewritten through `write()`.
+    fn refuse_write_through_read(&mut self, target_id: Id, assignment_id: Id, read_id: Id) {
+        let text_of = |analyzer: &Self, id: Id| {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let read_text = text_of(self, read_id).unwrap_or("cell.read()");
+        let handle_text = read_text
+            .strip_suffix("read()")
+            .and_then(|head| head.strip_suffix('.'))
+            .unwrap_or("cell");
+        let write_text = format!("{handle_text}.write()");
+        let rewritten = text_of(self, assignment_id)
+            .and_then(|assignment| assignment.strip_prefix(read_text))
+            .filter(|rest| !rest.contains('\n'))
+            .map(|rest| format!("{write_text}{rest}"))
+            .unwrap_or_else(|| format!("{write_text}.… = …"));
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{read_text}` is a copy, so this assignment is lost; write through \
+                     `{write_text}`: `{rewritten}`"
+                ),
+            },
+            target_id,
+        );
     }
 
     /// The first sub-expression of an assignment target that is not a place,
