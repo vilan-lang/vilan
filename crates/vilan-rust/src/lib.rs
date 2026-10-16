@@ -13515,28 +13515,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(&Expr::Reference(operand, false)) => operand,
             _ => argument,
         };
-        let Some((root, steps)) = self.cell_spine(place) else {
-            return false;
+        // F143: a spine over a MODULE-LEVEL `mut` binding is a copy out of its
+        // `thread_local!` cell, and any call a later argument makes can reach
+        // the binding — so it waits as a captured binding's copy does. It is
+        // never a view (`takes_a_cell_view`): a callee reaching the binding
+        // would meet the borrow.
+        let (module_root, subscripts_run_code) = match self.cell_spine(place) {
+            // F135 (R-a, door (1)): a spine through a `Shared` view is a
+            // `read()`, which COPIES where it is evaluated (spec §6.7) — on
+            // JS too, which copies such an argument when a later one writes
+            // the cell (the analyzer's `clone_sites`) — so it is read where
+            // it stands.
+            Some((CellRoot::View(_), _)) => return false,
+            Some((CellRoot::Boxed(_), steps)) => (
+                false,
+                steps.iter().any(|step| {
+                    matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript))
+                }),
+            ),
+            None => match self.module_place_subscripts_run_code(place) {
+                Some(subscripts_run_code) => (true, subscripts_run_code),
+                None => return false,
+            },
         };
-        // F135 (R-a, door (1)): a spine through a `Shared` view is a
-        // `read()`, which COPIES where it is evaluated (spec §6.7) — on JS
-        // too, which copies such an argument when a later one writes the cell
-        // (the analyzer's `clone_sites`) — so it is read where it stands.
-        if matches!(root, CellRoot::View(_)) {
-            return false;
-        }
-        let subscripts_run_code = steps.iter().any(
-            |step| matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript)),
-        );
         // A `&` of a scalar place (a number, `bool`, `str`) is a `(base, key)`
         // pair on JS, read through when the callee reads it — after the later
         // arguments, as spec §6.9's view of the binding is — so it waits as an
         // aggregate does. (A `&` of an enum or a tuple is the value JS held
-        // when it was evaluated, as natively.)
-        let read_late_on_js = self.type_of(place).is_some_and(|type_id| {
-            self.aliases_on_the_js_backend(type_id)
-                || (!by_value && self.views_as_a_pair_on_the_js_backend(type_id))
-        });
+        // when it was evaluated, as natively — save over a module-level
+        // binding, whose `&` the JS backend reads after the later arguments
+        // whatever its type, F143.)
+        let read_late_on_js = (!by_value && module_root)
+            || self.type_of(place).is_some_and(|type_id| {
+                self.aliases_on_the_js_backend(type_id)
+                    || (!by_value && self.views_as_a_pair_on_the_js_backend(type_id))
+            });
         if subscripts_run_code
             || !read_late_on_js
             || (by_value && self.copy_applies(self.program.clone_sites.get(&argument)))
@@ -13558,6 +13571,35 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         Some(Receiving::RefMut) => false,
                     }
             })
+    }
+
+    /// F143: whether `place` is a spine — fields, tuple slots, subscripts —
+    /// over a module-level `mut` binding (a `thread_local!` cell, F30), and
+    /// then whether any of its subscripts runs code. `None` for any other
+    /// place.
+    fn module_place_subscripts_run_code(&self, place: Id) -> Option<bool> {
+        let mut subscripts_run_code = false;
+        let mut current = place;
+        loop {
+            match *self.program.entity_map.get(&current)? {
+                Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => current = subject,
+                Expr::Index(subject, subscript) => {
+                    subscripts_run_code |= !self.runs_no_code(subscript);
+                    current = subject;
+                }
+                Expr::Local(binding)
+                    if self.module_bindings.contains(&binding)
+                        && self
+                            .program
+                            .variables
+                            .get(&binding)
+                            .is_some_and(|variable| variable.mutable) =>
+                {
+                    return Some(subscripts_run_code);
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// F129: whether the JS backend hands a value of `type_id` on BY REFERENCE
@@ -15656,6 +15698,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{view_borrows}{rendered} }}"));
+        }
+        // F143: a READING intrinsic's receiver over a module-level `mut`
+        // binding — `names.contains(rename())`, `log.items.get(index())` — is
+        // copied out of its `thread_local!` cell AFTER the other arguments
+        // when one of them runs code (any call can reach the binding), as a
+        // captured binding's view above is taken last and as the JS backend
+        // reads the receiver.
+        if !mutating
+            && reads_its_receiver_in_place(intrinsic)
+            && argument_ids.first().is_some_and(|receiver| {
+                let place = match self.program.entity_map.get(receiver) {
+                    Some(&Expr::Reference(operand, _)) => operand,
+                    _ => *receiver,
+                };
+                !self.is_natively_copy(place)
+                    && self.module_place_subscripts_run_code(place) == Some(false)
+            })
+            && argument_ids
+                .iter()
+                .skip(1)
+                .any(|argument| !self.runs_no_code(*argument))
+        {
+            let mut prelude = String::new();
+            let mut arguments = Vec::new();
+            for (index, argument) in argument_ids.iter().enumerate().skip(1) {
+                let expecting = self.intrinsic_argument_expectation(intrinsic, index);
+                let value = self.value_of_expecting(*argument, expecting, depth)?;
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {value}; ");
+                arguments.push(name);
+            }
+            let expecting = self.intrinsic_argument_expectation(intrinsic, 0);
+            let saved = std::mem::replace(&mut self.expected_type, expecting);
+            let receiver = self.expression(argument_ids[0], depth);
+            self.expected_type = saved;
+            arguments.insert(0, receiver?);
+            let rendered = self.intrinsic(intrinsic, arguments, span)?;
+            return Ok(format!("{{ {prelude}{rendered} }}"));
         }
         // F42: the expectation in force here is the one for the intrinsic's
         // RESULT, and an argument is not its result. Rendered under it, the

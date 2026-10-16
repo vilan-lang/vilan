@@ -8,6 +8,13 @@
 // the native view had been taken last. The earlier arguments still run first,
 // and the controls — a scalar by value, an `&Option` beside a closure that
 // writes it (a copy taken in order) — read where they stand.
+//
+// F143: a MODULE-LEVEL `mut` binding is a place every function shares, so any
+// call a later argument makes can reach it — it follows the same order on
+// both backends (by value, `&`, a `&self` and a `&mut` receiver, a reading
+// intrinsic's receiver; a re-bind and an in-place write), natively a copy out
+// of its `thread_local!` cell taken after the later arguments. A `&` of it
+// waits whatever its type (`&Option`); a scalar by value is the control.
 import std::hash_set::HashSet;
 import std::io::print;
 
@@ -74,6 +81,47 @@ fun traced(first: i32, items: List<i32>, value: i32): usize {
 
 fun fresh(): Log {
 	Log { items = [], set = HashSet::new(), name = "old", count = 0, maybe = None }
+}
+
+fun count_of(count: &i32, value: i32): i32 {
+	*count
+}
+
+mut module_items: List<i32> = [];
+mut module_words = Words { items = ["a"] };
+mut module_log = fresh();
+
+fun grow_items(): i32 {
+	module_items.push(9);
+	9
+}
+
+fun reset_items(): i32 {
+	module_items = [9];
+	9
+}
+
+fun swap_words(): i32 {
+	module_words = Words { items = ["x", "y", "z"] };
+	0
+}
+
+fun rebind_log(): i32 {
+	module_log = Log {
+		items = [9],
+		set = HashSet::new(),
+		name = "new9",
+		count = 1,
+		maybe = Some(1),
+	};
+	9
+}
+
+fun write_log(): i32 {
+	module_log.items.push(9);
+	module_log.count = 5;
+	module_log.maybe = Some(3);
+	9
 }
 
 fun main() {
@@ -144,4 +192,37 @@ fun main() {
 		log.maybe = Some(2);
 		0
 	}));
+	print(has(module_items, grow_items()));
+	module_items = [];
+	print(has(module_items, reset_items()));
+	module_items = [];
+	print(lent(&module_items, grow_items()));
+	module_items = [];
+	print(lent(&module_items, reset_items()));
+	module_items = [];
+	module_items.push(reset_items());
+	print(module_items.len());
+	print(module_words.measured(swap_words()));
+	module_words = Words { items = ["a"] };
+	print(generic_measure(&module_words, swap_words()));
+	print(has(module_log.items, rebind_log()));
+	module_log = fresh();
+	print(has(module_log.items, write_log()));
+	module_log = fresh();
+	print(module_log.name.contains({
+		rebind_log();
+		"9"
+	}));
+	module_log = fresh();
+	module_log.bump({
+		module_log = fresh();
+		9
+	});
+	print(module_log.count);
+	module_log = fresh();
+	print(count_of(&module_log.count, write_log()));
+	module_log = fresh();
+	print(maybe_of(&module_log.maybe, write_log()));
+	module_log = fresh();
+	print(counted(module_log.count, write_log()));
 }

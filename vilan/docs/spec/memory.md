@@ -1141,6 +1141,19 @@ a field orders its arguments the same way; a closure literal applied where
 it is written binds its parameters in order, as `let`s, and so does a call
 whose callee is itself computed (`make()(items, swap())`).
 
+A **module-level** `mut` binding follows the same order. It is a place
+every function shares, so any call a later argument makes can reach it —
+`has(global, grow())` with `grow` pushing into `global`, or
+`global.push(reset())` with `reset` re-binding it. An argument rooted at
+one is read after the call's later arguments when they run code, on both
+backends: a `&self` or `&mut self` receiver, a reading intrinsic's
+receiver, a `&` argument of any type, and a by-value place of a value
+JavaScript hands on by reference. Natively the binding lives in a
+thread-local cell, and the argument is a copy out of that cell taken after
+the later arguments, never a view held for the call, because the callee
+itself can reach the binding. A scalar, `str`, `Option`, tuple or enum by
+value is still the value the binding held where the argument stands.
+
 ## 6.10 `lazy` — a binding initialized at first use
 
 *(Design: [`lazy`](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lazy.md) §2.)*

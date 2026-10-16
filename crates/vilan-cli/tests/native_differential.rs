@@ -13672,6 +13672,15 @@ fn f138_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same
 /// an `&Option` beside a closure that writes it (`None` — a copy taken in
 /// order), while the same `&Option` beside a block that writes it is a view
 /// taken last (`Some(2)`).
+///
+/// F143: the same order for a MODULE-LEVEL `mut` binding, which any call a
+/// later argument makes can reach — by value (an in-place write and a
+/// re-bind), a `&`, a `&self` receiver direct and through a generic callee,
+/// a `push` and a user `&mut self` receiver beside a re-bind, a field spine,
+/// a reading intrinsic's receiver, a scalar `&` and an `&Option` (a module
+/// binding's `&` waits whatever its type). The base answered differently on
+/// the two backends at six of the fourteen and read the binding where it
+/// stood on both at seven more; the scalar by value (`9`) is the control.
 #[test]
 fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_arguments_on_both_backends()
  {
@@ -13682,7 +13691,8 @@ fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_argumen
         include_str!("native/captured_binding_argument_rebound.vl"),
     )
     .expect("write the probe program");
-    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n";
+    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n\
+                    true\ntrue\ntrue\ntrue\n2\n3\n3\ntrue\ntrue\ntrue\n9\n5\nSome(3)\n9\n";
     assert_eq!(
         both_stdouts(&staged, file),
         (expected.to_string(), expected.to_string()),
