@@ -2595,10 +2595,11 @@ fun attach<T>(signal: SignalCell<T>, subscriber: Subscriber): Subscription {
 export impl SignalCell<type T> with Signal<T> {
 	/// Reached through the trait — a `S: Signal<T>` bound, a `dyn Signal` — where
 	/// no call site names a location (a `[track_caller]` trait member is refused):
-	/// the inherent `set` below is what a concrete cell's `cell.set(v)` calls.
+	/// the inherent `set` below is what a concrete cell's `cell.set(v)` calls, and
+	/// this is that write, made from here (std's place, which the trace leaves
+	/// out).
 	fun set(self, value: T) {
-		self.value.write() = value;
-		self.notify();
+		self.set(value);
 	}
 
 	/// Publish this signal's current value to its observers — the notification half

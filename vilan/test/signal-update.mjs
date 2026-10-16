@@ -444,12 +444,18 @@ function batch(body, $L) {
 	}
 	return $N;
 }
-function set(self, value, $P) {
+function set(self, value, $Q, caller) {
+	if (tracing.v) {
+		trace_hooks.v[1](caller);
+	}
 	self[0].v = __clone(value);
-	notify2(self, $P);
+	notify2(self, $Q);
+}
+function set2(self, value, $P) {
+	set(self, value, $P, "std/src/reactive.vl:2602:8");
 }
 function set_with(self, transform, $O) {
-	set(self, transform(get(self)), $O);
+	set2(self, transform(get(self)), $O);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);

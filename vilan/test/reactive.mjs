@@ -908,8 +908,7 @@ function sub(self, observer) {
 	}, true);
 }
 function set2(self, value, $aP) {
-	self[0].v = __clone(value);
-	notify(self, $aP);
+	set(self, value, $aP, "std/src/reactive.vl:2602:8");
 }
 function set_with(self, transform, $aO) {
 	set2(self, transform(get(self)), $aO);
