@@ -199,7 +199,11 @@ fn replay_the_classes() -> Replayed {
     // M110 S2a: the bound audit's verdicts at PREFIX sites are recorded and
     // replayed; the plants that serve a stale record (the audit skipped
     // without recording, the impl guard off) must turn this package red.
-    for fixture in BOUND_FIXTURES.iter().chain(WINDOW_FIXTURES) {
+    for fixture in BOUND_FIXTURES
+        .iter()
+        .chain(WINDOW_FIXTURES)
+        .chain(R11_FIXTURES)
+    {
         let mut package = fixture.write();
         for edit in fixture.edits {
             censuses.extend(replay(&mut package, edit, &mut divergences));
@@ -1018,6 +1022,248 @@ fn the_differential_sees_a_fixpoint_seeded_from_the_settled_set() {
             .iter()
             .any(|divergence| divergence.contains("the async set must shrink")),
         "the settled-seed plant must turn the sleep's removal red; it found: {divergences:#?}"
+    );
+}
+
+// --- M159: the LONE open document (M104's hybrid, the editor's common row) ---
+
+/// [`replay`] for a LONE open document: `edit.file` is the analysis's entry
+/// in file mode, seeded with its own path as the language server seeds it
+/// (M159 door (a)); each phase is compared with the clean analysis of the
+/// same open file. A seed that is the entry names no hot module, so the
+/// canonical clean analysis is the JS comparison's too.
+fn replay_lone(package: &mut Package, edit: &Edit, divergences: &mut Vec<String>) -> Vec<Census> {
+    let before = package.text(edit.file).to_string();
+    let after = edit.apply(&before);
+    let mut censuses = Vec::new();
+    for (phase, text) in [("edit", after), ("undo", before)] {
+        package.set(edit.file, text);
+        let incremental = observe_lone(package, edit.file, Leg::Incremental);
+        let clean = observe_lone(package, edit.file, Leg::Clean);
+        compare_lone(
+            &format!("{} ({phase}, {} open alone)", edit.label, edit.file),
+            &incremental,
+            &clean,
+            divergences,
+        );
+        censuses.push(incremental.census);
+    }
+    censuses
+}
+
+/// The lone leg's comparison: the rendering, the emitted JS, and whether
+/// the program emits at all.
+fn compare_lone(
+    label: &str,
+    incremental: &Observation,
+    clean: &Observation,
+    divergences: &mut Vec<String>,
+) {
+    if incremental.rendering != clean.rendering {
+        divergences.push(format!(
+            "{label}: the incremental analysis differs from the clean one at {}",
+            first_difference(&incremental.rendering, &clean.rendering)
+        ));
+    }
+    if incremental.javascript != clean.javascript {
+        divergences.push(format!(
+            "{label}: the emitted JS differs from a clean analysis (incremental {} bytes, \
+             clean {} bytes)",
+            incremental.javascript.as_ref().map_or(0, String::len),
+            clean.javascript.as_ref().map_or(0, String::len),
+        ));
+    }
+}
+
+/// Every fixture edit typed into a package MODULE, replayed with that module
+/// open ALONE (M159): the open analysis files the world's records, each
+/// keystroke and its undo is served from them. Answers the divergences and
+/// the warm censuses (the open's excluded).
+fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
+    let mut divergences = Vec::new();
+    let mut censuses = Vec::new();
+    vilan_core::analyzer::base_cache_clear();
+    for fixture in LONE_FIXTURES
+        .iter()
+        .chain(R11_FIXTURES)
+        .chain(EFFECT_FIXTURES)
+        .chain(POST_PASS_FIXTURES)
+        .chain(BOUND_FIXTURES)
+        .chain(WINDOW_FIXTURES)
+    {
+        let mut package = fixture.write();
+        let mut opened: Vec<&str> = Vec::new();
+        for edit in fixture
+            .edits
+            .iter()
+            .filter(|edit| edit.seed.is_none() && edit.file != "main.vl")
+        {
+            if !opened.contains(&edit.file) {
+                opened.push(edit.file);
+                let open = observe_lone(&package, edit.file, Leg::Incremental);
+                let clean = observe_lone(&package, edit.file, Leg::Clean);
+                compare_lone(
+                    &format!("{}: {} opened alone", fixture.name, edit.file),
+                    &open,
+                    &clean,
+                    &mut divergences,
+                );
+            }
+            censuses.extend(replay_lone(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
+    (divergences, censuses)
+}
+
+/// **M159** (door (a), the owner's ruling): a LONE open document — the
+/// editor's common row, a file that is the only open document of its world
+/// (M104's hybrid) — is analyzed as its own entry, SEEDED with its own path,
+/// and answers what a clean analysis of the same open file answers on every
+/// fixture keystroke and undo. Non-vacuous: every warm keystroke found the
+/// post passes' seam seeded, its record filed and matching, S3b's async cold
+/// seed in it (the acceptance incr-53c's probe read `seeded false` on); the
+/// call graphs were replayed and the async fixpoint seeded from the record;
+/// the hover rows were restored.
+#[test]
+fn m159_a_lone_open_document_answers_what_a_clean_analysis_answers() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    let (divergences, censuses) = replay_the_lone_documents();
+    assert!(
+        divergences.is_empty(),
+        "{} step(s) of the lone-document script observe the incremental analysis:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    let full_seam = vilan_core::incremental::PostSeamState {
+        seeded: true,
+        record: true,
+        matches: true,
+        cold: true,
+    };
+    let served: Vec<&Census> = censuses
+        .iter()
+        .filter(|census| census.base_hits > 0)
+        .collect();
+    assert!(
+        !served.is_empty() && served.len() * 2 >= censuses.len(),
+        "the lone keystrokes are served from the world the open stored ({} of {})",
+        served.len(),
+        censuses.len()
+    );
+    assert!(
+        served.iter().all(|census| census
+            .post_seam
+            .is_some_and(|seam| seam.seeded && seam.record)),
+        "every served lone keystroke is seeded and finds the post-pass record: {served:#?}"
+    );
+    let full = served
+        .iter()
+        .filter(|census| census.post_seam == Some(full_seam))
+        .count();
+    let graphs: u64 = censuses.iter().map(|census| census.graphs_replayed).sum();
+    let seeded: u64 = censuses.iter().map(|census| census.seeded_passes).sum();
+    let hover: u64 = censuses
+        .iter()
+        .map(|census| census.hover_rows_restored)
+        .sum();
+    eprintln!(
+        "M159: {} lone keystrokes, {} served, {full} with the full seam; {graphs} graphs \
+         replayed, {seeded} seeded fixpoints, {hover} hover rows restored",
+        censuses.len(),
+        served.len()
+    );
+    assert!(
+        full > 0 && graphs > 0 && seeded > 0 && hover > 0,
+        "the lone keystrokes read the post-pass record (full seam {full}, graphs {graphs}, \
+         seeded {seeded}) and the hover rows ({hover})"
+    );
+}
+
+/// M159's plant: S3b's settled-seed plant (the async fixpoint seeded from the
+/// recording analysis's SETTLED set) turns the LONE leg red too — the sleep
+/// removed from `lone.vl` open alone leaves `pause_once` async in the seed,
+/// and the module binding's initializer keeps a refusal a clean analysis
+/// drops — so the lone keystrokes really do read the record. (A file-mode
+/// program emits no JS, so the world-mode leg's `wait` cannot show it here.)
+#[test]
+fn m159_the_lone_leg_sees_a_fixpoint_seeded_from_the_settled_set() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(Some(Plant::PostSeedFromSettled));
+    let replayed = std::panic::catch_unwind(replay_the_lone_documents);
+    set_plant(None);
+    let (divergences, _) = replayed.expect("the lone leg panicked under a plant");
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("the initializer's refusal must go")),
+        "the settled-seed plant must turn the lone sleep removal red; it found: \
+         {divergences:#?}"
+    );
+}
+
+/// **M155**: R11's candidate rows are filed by the leaf's first (seeded)
+/// analysis and restored on its keystrokes — the served keystroke walks a
+/// fraction of the rows the filing one did — and the instantiation that
+/// slices a SERVED item's re-based rows still refuses (the fixture's R11
+/// refusal stands on every step; the classes leg compares every step with
+/// the clean analysis).
+#[test]
+fn m155_r11_candidate_rows_are_restored_on_a_served_keystroke() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let fixture = &R11_FIXTURES[0];
+    let mut package = fixture.write();
+    let seed = vec![package.path("views.vl")];
+    let first = observe(&package, seed.clone(), Leg::Incremental);
+    let warm = observe(&package, seed.clone(), Leg::Incremental);
+    let edited = fixture.edits[0].apply(package.text("views.vl"));
+    package.set("views.vl", edited);
+    let served = observe(&package, seed.clone(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        clean
+            .rendering
+            .contains("is not move-clean when instantiated with a resource"),
+        "the fixture's R11 refusal: {}",
+        clean.rendering
+    );
+    assert_eq!(
+        served.rendering, clean.rendering,
+        "the served keystroke answers clean"
+    );
+    eprintln!(
+        "M155: r11 rows live: first {} warm {} served {} (items served {})",
+        first.census.r11_rows_live,
+        warm.census.r11_rows_live,
+        served.census.r11_rows_live,
+        served.census.item_records_served
+    );
+    assert!(
+        first.census.r11_rows_live > 0
+            && warm.census.r11_rows_live * 4 < first.census.r11_rows_live
+            && served.census.r11_rows_live * 4 < first.census.r11_rows_live,
+        "the warm and served keystrokes restore R11's rows rather than walking them \
+         (first {}, warm {}, served {})",
+        first.census.r11_rows_live,
+        warm.census.r11_rows_live,
+        served.census.r11_rows_live
+    );
+    assert!(
+        served.census.item_records_served > 0,
+        "the leaf's generics were served items: {:#?}",
+        served.census
     );
 }
 

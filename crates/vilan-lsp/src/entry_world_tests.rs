@@ -804,6 +804,37 @@ async fn m104_a_lone_module_keeps_its_own_cheap_analysis() {
     assert!(server.worlds.is_empty());
 }
 
+/// M159 (door (a), the owner's ruling): a file open ALONE is its own
+/// analysis's entry and that analysis is SEEDED with its own path, so the
+/// post passes' record (the context rewrite's replayed graph, S3b's async
+/// cold seed) is filed and read on the editor's common row, as on the
+/// world-mode path. Unseeded, the lone keystroke read none of it.
+#[tokio::test]
+async fn m159_a_lone_modules_keystroke_analysis_is_seeded() {
+    let package = Package::new("lone-seeded");
+    let (service, _socket) = backend();
+    let server = service.inner();
+    open_all(server, &package, &[("views.vl", VIEWS)]).await;
+    edit(
+        server,
+        &package.uri("views.vl"),
+        2,
+        &VIEWS.replace("count = 2", "count = 4"),
+    )
+    .await;
+    at_rest(server).await;
+    let document = server
+        .documents
+        .get(&package.uri("views.vl"))
+        .expect("open");
+    assert_eq!(document.world_root(), None, "the lone path, not a world");
+    assert!(document.holds_program());
+    assert!(
+        document.post_seam_seeded(),
+        "the lone document's analysis is seeded with its own path"
+    );
+}
+
 /// THE CONDITION: Find References on a lone module's exported name returns
 /// its uses in files that are NOT open — the entry's whole world, built on
 /// demand — before an edit and after it. Rename answers the same set.

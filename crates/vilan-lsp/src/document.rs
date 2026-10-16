@@ -3483,6 +3483,15 @@ impl Document {
         self.program.is_some()
     }
 
+    /// M159: whether this document's analysis was SEEDED (its post-pass
+    /// seam's record filed and read) — the pins' window on the lone path.
+    #[cfg(test)]
+    pub fn post_seam_seeded(&self) -> bool {
+        self.program
+            .as_ref()
+            .is_some_and(|program| program.post_seam_seeded())
+    }
+
     /// Whether this document is answering from [`ReleasedTables`] — it held a
     /// program, and [`release_analysis`](Document::release_analysis) took it.
     ///

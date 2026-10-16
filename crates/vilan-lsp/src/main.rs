@@ -2216,10 +2216,26 @@ fn analyze_world(
     // the cheap one, for keystroke diagnostics — and remembers the world it
     // belongs to, which cross-file requests read (`Backend::reference_world`).
     // A second open document of the world is what makes the world serve them.
+    //
+    // M159 (door (a), the owner's ruling): the lone analysis is SEEDED with
+    // the document's own path. The file is its own analysis's entry, so the
+    // seed names no hot module (in file mode the entry walks after the stored
+    // world already) and the world is the one it always was — but the seam
+    // is then a seeded one: M110 S3's post-pass record (the context rewrite's
+    // replayed graph, S3b's async cold seed), the S2b label rows and M148's
+    // hover rows are filed by this analysis and read by the next keystroke's,
+    // as they are on the world-mode path. Unseeded, the editor's COMMON row —
+    // one open document — never read any of them.
     if let Some(entry) = roots.primary.as_ref()
         && members(entry) < 2
     {
-        let mut own = Document::analyze_cancellable(&trigger_text, std_dir, trigger_path, cancel)?;
+        let mut own = Document::analyze_cancellable_editing(
+            &trigger_text,
+            std_dir,
+            trigger_path,
+            vec![trigger_canonical.clone()],
+            cancel,
+        )?;
         own.set_lone_world(entry.clone());
         return (!cancel.is_cancelled()).then_some(WorldAnalysis {
             root_path: trigger_canonical,

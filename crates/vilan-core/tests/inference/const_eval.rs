@@ -559,3 +559,31 @@ fn g25_a_const_holding_a_trait_object_is_refused_by_name() {
         );
     }
 }
+
+/// incr-54a's find (Order 54, B?2): a `const` site that both calls a function
+/// and reads a `const let` CLOSURE. The closure's snapshot is written into the
+/// site's prelude, and the prelude's walk requires the closure's callee —
+/// which used to REPLACE the site's reach with the prelude's, dropping the
+/// function the expression itself calls ("unknown host call `twice`").
+#[test]
+fn a_const_site_calling_a_function_beside_a_const_let_closure_keeps_its_own_reach() {
+    assert_compiles_and_runs(
+        r#"
+        fun helper(n: i32): i32 {
+            n + 1
+        }
+
+        fun twice(n: i32): i32 {
+            n * 2
+        }
+
+        const let add = |n: i32| helper(n);
+
+        fun main() {
+            let x = const twice(add(1));
+            print(i"{x}");
+        }
+        "#,
+        "4\n",
+    );
+}

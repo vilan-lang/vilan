@@ -1251,3 +1251,149 @@ fn b570_a_cold_check_under_the_opt_in_renders_only_what_it_covers() {
     // local `count` never is, so it is not even typed.
     assert_eq!(rendered, 2, "only the two returns are considered");
 }
+
+// --- M154: the editor's type-reference labels and alias spans ---------------
+
+/// Analyzes `source` as `test.vl` under `workspace`, answering per side —
+/// the entry's references, then every other file's (std's here) — how many
+/// type references it records and how many carry a hover label.
+fn type_reference_labels(source: &'static str, workspace: Workspace) -> [(usize, usize); 2] {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                std::path::Path::new("."),
+                std::path::Path::new("test.vl"),
+                Some(Platform::default()),
+                &workspace,
+            );
+            assert!(errors.is_empty(), "the fixture compiles: {errors:?}");
+            let program = program.expect("a program");
+            let mut counts = [(0, 0); 2];
+            for (source, _, _, label) in &program.type_references {
+                let side = &mut counts[usize::from(source.0 != 0)];
+                side.0 += 1;
+                side.1 += usize::from(!label.is_empty());
+            }
+            counts
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("analysis thread")
+}
+
+/// M154: a type reference's hover label is hover's alone, so it is rendered
+/// only where a document can ask for it — the editor's analysis (the reading
+/// aids), in a file that banks hover rows. std's references carry none (no
+/// document's focus is a std file of another program's world), and a cold
+/// `vilan check` renders none at all; the references themselves — what
+/// go-to-definition and find-references read — are recorded either way.
+#[test]
+fn m154_type_reference_labels_are_rendered_only_where_hover_reads_them() {
+    let [(entry, entry_labeled), (std, std_labeled)] = type_reference_labels(
+        READING_AIDS_FIXTURE,
+        Workspace {
+            reading_aids: true,
+            ..Workspace::default()
+        },
+    );
+    assert!(
+        entry > 0 && std > 0,
+        "the fixture references types: {entry} / {std}"
+    );
+    assert_eq!(
+        entry_labeled, entry,
+        "every entry reference hovers with its label"
+    );
+    assert_eq!(std_labeled, 0, "no std reference renders a label");
+    let [(cold_entry, cold_labeled), (cold_std, cold_std_labeled)] =
+        type_reference_labels(READING_AIDS_FIXTURE, Workspace::default());
+    assert_eq!(
+        (cold_entry, cold_std),
+        (entry, std),
+        "the references are the same"
+    );
+    assert_eq!(
+        (cold_labeled, cold_std_labeled),
+        (0, 0),
+        "a cold check renders no label"
+    );
+}
+
+/// M154: E145's alias spans are found where an alias can be SPELLED — the
+/// file that declares it, at a use of its target — in a package MODULE as in
+/// the entry, and a use of the target under its own name, or in a file that
+/// does not alias it, is not one. (The collection passes every other
+/// reference over on its target alone.)
+#[test]
+fn m154_alias_spans_are_found_in_the_declaring_module_only() {
+    let directory = scratch_dir("m154_alias_spans");
+    std::fs::create_dir_all(&directory).expect("the package directory");
+    let helper = "import std::math::max as biggest;\nimport std::math::min;\n\nexport fun twice(n: i32): i32 {\n\tbiggest(n, 1) + biggest(min(n, 0), 2)\n}\n";
+    let other = "import std::math::max;\n\nexport fun plain(n: i32): i32 {\n\tmax(n, 3)\n}\n";
+    let entry = "import pkg::helper::twice;\nimport pkg::other::plain;\nimport std::math::max as largest;\n\nfun main() {\n\tprint(twice(2) + plain(1) + largest(4, 5));\n}\n";
+    std::fs::write(directory.join("helper.vl"), helper).expect("write helper.vl");
+    std::fs::write(directory.join("other.vl"), other).expect("write other.vl");
+    let entry_path = directory.join("main.vl");
+    std::fs::write(&entry_path, entry).expect("write main.vl");
+    let spelled: Vec<String> = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                entry,
+                &std_spec(),
+                &directory,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "the fixture compiles: {errors:?}");
+            let program = program.expect("a program");
+            let text_of = |source: u32| match source {
+                0 => entry,
+                _ => {
+                    let path = &program.sources[source as usize];
+                    if path.ends_with("helper.vl") {
+                        helper
+                    } else if path.ends_with("other.vl") {
+                        other
+                    } else {
+                        ""
+                    }
+                }
+            };
+            let mut spelled: Vec<String> = program
+                .import_alias_spans
+                .keys()
+                .map(|(source, span)| {
+                    let file = match source.0 {
+                        0 => "main",
+                        _ if program.sources[source.0 as usize].ends_with("helper.vl") => "helper",
+                        _ => "elsewhere",
+                    };
+                    format!(
+                        "{file}:{}",
+                        text_of(source.0).get(span.into_range()).unwrap_or("?")
+                    )
+                })
+                .collect();
+            spelled.sort();
+            spelled
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("analysis thread");
+    assert_eq!(
+        spelled,
+        [
+            "helper:biggest",
+            "helper:biggest",
+            "helper:biggest",
+            "main:largest",
+            "main:largest"
+        ],
+        "the alias declarations and their uses, in their own files only"
+    );
+}

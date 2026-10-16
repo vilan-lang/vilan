@@ -516,6 +516,10 @@ pub struct Census {
     /// are not walked, so a served keystroke reads a fraction of a filing
     /// one's.
     pub move_rows_live: u64,
+    /// M155: R11's candidate rows this analysis derived by walking the
+    /// family's live lane (`analyzer/r11_candidates.rs`) when it met an
+    /// instantiation — a served keystroke reads a fraction of a filing one's.
+    pub r11_rows_live: u64,
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
@@ -543,6 +547,46 @@ pub struct Census {
     /// the report asks for (not a clock the gate reads).
     pub prefix_file_bytes: u64,
     pub prefix_file_micros: u64,
+    /// M159: the post passes' reuse seam as the async pass found it — `None`
+    /// when the analysis built no seam (a cold `vilan check` of a world it
+    /// did not reuse, a clean analysis, an entry-shaped world).
+    pub post_seam: Option<PostSeamState>,
+}
+
+/// M159: what the post passes' reuse seam (M110 S3) offered one analysis,
+/// read where the async pass starts — the instrument that showed the lone
+/// open document's keystroke unseeded (incr-53c's probe, kept).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostSeamState {
+    /// A front end seeded the analysis (`Workspace::hot_seeds`): the record is
+    /// filed and read only then.
+    pub seeded: bool,
+    /// The world's post-pass record for this cold set was filed already.
+    pub record: bool,
+    /// The record's context log is this analysis's (the context pass set it).
+    pub matches: bool,
+    /// The record carries S3b's async cold seed.
+    pub cold: bool,
+}
+
+impl PostSeamState {
+    /// `seeded+record+matches+cold` — the parts that hold, `none` when none.
+    pub fn render(&self) -> String {
+        let parts: Vec<&str> = [
+            (self.seeded, "seeded"),
+            (self.record, "record"),
+            (self.matches, "matches"),
+            (self.cold, "cold"),
+        ]
+        .into_iter()
+        .filter_map(|(holds, name)| holds.then_some(name))
+        .collect();
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join("+")
+        }
+    }
 }
 
 thread_local! {
@@ -579,6 +623,7 @@ thread_local! {
             live_ranges: 0,
             live_entities: 0,
             move_rows_live: 0,
+            r11_rows_live: 0,
             hover_rows_restored: 0,
             prefix_world: false,
             prefix_layered: false,
@@ -588,6 +633,7 @@ thread_local! {
             prefix_file: None,
             prefix_file_bytes: 0,
             prefix_file_micros: 0,
+            post_seam: None,
         })
     };
 }
@@ -949,8 +995,9 @@ pub fn report(program: &Program) {
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
-             live-entities={} move-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
-             prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={}",
+             live-entities={} move-rows-live={} r11-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
+             prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
+             post-seam={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -978,6 +1025,7 @@ pub fn report(program: &Program) {
             census.live_ranges,
             census.live_entities,
             census.move_rows_live,
+            census.r11_rows_live,
             census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
@@ -986,6 +1034,9 @@ pub fn report(program: &Program) {
             census.prefix_file.unwrap_or("-"),
             census.prefix_file_bytes,
             census.prefix_file_micros,
+            census
+                .post_seam
+                .map_or_else(|| "-".to_string(), |seam| seam.render()),
         );
     }
 }
