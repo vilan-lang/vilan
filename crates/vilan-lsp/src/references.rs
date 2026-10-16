@@ -59,9 +59,9 @@
 //!    all (its type LABEL survives, so hover is unchanged). The invariant now
 //!    holds with NO exception and no enumeration beside it.
 //! 2. **No two rows share a span IN A FILE.** The analyzer records some
-//!    references more than once (a struct's constructor name lands in both
-//!    `type_references` and `struct_initializer_to_def`; a match pattern's
-//!    segments are re-recorded on every type-check pass), so the table is
+//!    references more than once (a struct's constructor name is recorded on
+//!    every resolution pass; a match pattern's segments are re-recorded on
+//!    every type-check pass), so the table is
 //!    deduplicated at build time. This is what makes a rename's edit set
 //!    applicable — and it is why the invariant stops at the file boundary.
 //!    Derive-generated rows index a TEMPLATE, and two expansions of one
@@ -672,28 +672,6 @@ impl ReferenceIndex {
                         false,
                     );
                 }
-                // `Point { … }` — the name leads the initializer span. (The
-                // analyzer also records this through `record_reference`; the
-                // duplicate is removed below.)
-                Expr::StructInitializer(initializer_id, _) => {
-                    let Some(struct_id) = program.struct_initializer_to_def.get(initializer_id)
-                    else {
-                        continue;
-                    };
-                    let Some(name) = name_of(program, Definition::Entity(*struct_id)) else {
-                        continue;
-                    };
-                    push(
-                        &mut rows,
-                        &mut dropped,
-                        source_of.of(*use_id),
-                        span_of(program, *use_id),
-                        name,
-                        Anchor::Start,
-                        Definition::Entity(*struct_id),
-                        false,
-                    );
-                }
                 _ => {}
             }
         }
@@ -759,8 +737,7 @@ impl ReferenceIndex {
         // A group has one of three shapes.
         //
         //  - The SAME definition recorded twice — a struct's constructor name
-        //    landing in both `type_references` and `struct_initializer_to_def`,
-        //    a match pattern's segments re-recorded per type-check pass, a
+        //    recorded on each resolution pass, a match pattern's segments re-recorded per type-check pass, a
         //    declaration name that is also a `type_references` row. A true
         //    duplicate: keep one, drop the rest.
         //  - A FIELD KEY and a LOCAL READ, the struct-init shorthand `A { x }`

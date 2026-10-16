@@ -43846,6 +43846,7 @@ impl<'src> Analyzer<'src> {
         path: &[&'src str],
         lookup_scope_id: Id,
         expected_type_id: TypeId,
+        module_segments: &mut Vec<(usize, Id)>,
     ) -> Option<Id> {
         if let [name] = path {
             if let Some(entity) = self.try_get_expr_id_by_name(name, lookup_scope_id) {
@@ -43874,10 +43875,17 @@ impl<'src> Analyzer<'src> {
         let mut segments = path.iter();
         let head = segments.next()?;
         let mut current = self.try_get_expr_id_by_name(head, lookup_scope_id)?;
-        for segment in segments {
+        for (index, segment) in segments.enumerate() {
             let scope_id = match self.expr_id_to_expr_map.get(&current)? {
                 Expr::Enum(enum_id) => self.enums.get(enum_id)?.variants_scope_id,
-                Expr::Module(module_id) => self.modules.get(module_id)?.body.1,
+                Expr::Module(module_id) => {
+                    // E327: a module segment of the written path (`lib` and
+                    // `deep` in `lib::deep::Mode::On`); `index` is the
+                    // segment BEFORE this one, as `segments` has skipped the
+                    // head.
+                    module_segments.push((index, *module_id));
+                    self.modules.get(module_id)?.body.1
+                }
                 _ => return None,
             };
             current = self
@@ -44031,20 +44039,25 @@ impl<'src> Analyzer<'src> {
                 let span = *span;
                 let source_id = *source_id;
                 let name = path.join("::");
-                let entity =
-                    match self.resolve_variant_path(path, lookup_scope_id, expected_type_id) {
-                        Some(entity) => entity,
-                        None => {
-                            let steer = self.scope_miss_steer(path, lookup_scope_id);
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span,
-                                msg: format!("cannot find '{}' in this scope{}", name, steer),
-                            });
-                            return None;
-                        }
-                    };
+                let mut module_segments: Vec<(usize, Id)> = Vec::new();
+                let entity = match self.resolve_variant_path(
+                    path,
+                    lookup_scope_id,
+                    expected_type_id,
+                    &mut module_segments,
+                ) {
+                    Some(entity) => entity,
+                    None => {
+                        let steer = self.scope_miss_steer(path, lookup_scope_id);
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!("cannot find '{}' in this scope{}", name, steer),
+                        });
+                        return None;
+                    }
+                };
                 let (enum_id, variant_index) = match self.expr_id_to_expr_map.get(&entity) {
                     Some(Expr::EnumVariant(enum_id, variant_index)) => (*enum_id, *variant_index),
                     _ => {
@@ -44072,6 +44085,21 @@ impl<'src> Analyzer<'src> {
                             segment_span,
                             Some(entity),
                             enum_type_id,
+                        ));
+                    } else if let Some((_, module_id)) =
+                        module_segments.iter().find(|(at, _)| *at == index)
+                    {
+                        // E327: a MODULE segment (`lib`, `deep` in
+                        // `lib::deep::Mode::On`) takes the row a value
+                        // path's and an annotation's take (E315). One
+                        // directly before the variant is a module too, not
+                        // the enum the arm below would have called it.
+                        let module_type_id = Type::Module(*module_id).get_type_id(self);
+                        self.type_references.push((
+                            source_id,
+                            segment_span,
+                            Some(*module_id),
+                            module_type_id,
                         ));
                     } else if index + 1 == last {
                         self.type_references.push((
@@ -65703,15 +65731,24 @@ impl<'src> Analyzer<'src> {
     fn resolve_initializer_head(
         &mut self,
         constraint: &StructInitializerConstraint<'src>,
+        module_segments: &mut Vec<(usize, Id)>,
     ) -> Option<Id> {
         let Some((first, rest)) = constraint.namespace.split_first() else {
             return self.try_get_expr_id_by_name(constraint.struct_name, constraint.scope_id);
         };
         let head = self.try_get_expr_id_by_name(first, constraint.scope_id)?;
         let mut scope_id = self.namespace_body_scope(head)?;
-        for segment in rest {
+        // E327: the namespace segments that are MODULES (an enum in the
+        // middle namespaces its variants and is no module), by position.
+        if let Some(Expr::Module(module_id)) = self.expr_id_to_expr_map.get(&head) {
+            module_segments.push((0, *module_id));
+        }
+        for (index, segment) in rest.iter().enumerate() {
             let member = self.member_in_namespace(segment, scope_id)?;
             scope_id = self.namespace_body_scope(member)?;
+            if let Some(Expr::Module(module_id)) = self.expr_id_to_expr_map.get(&member) {
+                module_segments.push((index + 1, *module_id));
+            }
         }
         self.member_in_namespace(constraint.struct_name, scope_id)
     }
@@ -65746,7 +65783,8 @@ impl<'src> Analyzer<'src> {
         &mut self,
         constraint: &StructInitializerConstraint<'src>,
     ) -> Resolution {
-        let struct_id = match self.resolve_initializer_head(constraint) {
+        let mut module_segments: Vec<(usize, Id)> = Vec::new();
+        let struct_id = match self.resolve_initializer_head(constraint, &mut module_segments) {
             Some(expr_id) => expr_id,
             None => {
                 let span = self
@@ -65799,6 +65837,25 @@ impl<'src> Analyzer<'src> {
         // literal's start would have drawn the label over the module prefix.
         if let Some(source) = self.source_of_id(constraint.initializer_id) {
             self.record_reference(source, constraint.struct_name_span, struct_id);
+            // E327: each MODULE segment of a qualified head records the row
+            // its member records in a value path or an annotation (E315). The
+            // spans are laid back from the name's own, one `::` between
+            // segments.
+            let mut end = constraint.struct_name_span.start;
+            for (index, segment) in constraint.namespace.iter().enumerate().rev() {
+                end = end.saturating_sub("::".len());
+                let start = end.saturating_sub(segment.len());
+                if let Some((_, module_id)) = module_segments.iter().find(|(at, _)| *at == index) {
+                    let module_type_id = Type::Module(*module_id).get_type_id(self);
+                    self.type_references.push((
+                        source,
+                        (start..end).into(),
+                        Some(*module_id),
+                        module_type_id,
+                    ));
+                }
+                end = start;
+            }
         }
         let struct_ = self.structs.get(&struct_id).expect("checked above");
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();

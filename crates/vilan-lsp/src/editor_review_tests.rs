@@ -1836,6 +1836,111 @@ fn e315_a_middle_segment_is_a_reference_of_its_type() {
     });
 }
 
+/// E327: the MODULE segments of a qualified PATTERN path
+/// (`lib::deep::Mode::On =>`) and of a qualified STRUCT INITIALIZER path
+/// (`lib::deep::Overlay { .. }`) take the Namespace row a value path's and
+/// an annotation's take since E315 - they paint, hover for their module and
+/// are references of it, so find-references from one reaches the others.
+#[test]
+fn e327_the_module_segments_of_a_pattern_and_an_initializer_path_paint() {
+    on_big_stack(|| {
+        let client = "import pkg::lib;\n\n\
+             fun describe(mode: lib::deep::Mode): i32 {\n\
+             \tmatch mode {\n\
+             \t\tlib::deep::Mode::On => 1,\n\
+             \t\tlib::deep::Mode::Off => 0,\n\
+             \t}\n}\n\n\
+             fun main() {\n\
+             \tlet value = lib::deep::Overlay { open = true };\n\
+             \tlet _ = (describe(lib::deep::Mode::On), value);\n}\n";
+        let deep = "export struct Overlay {\n\topen: bool,\n}\n\n\
+             export enum Mode {\n\tOn,\n\tOff,\n}\n";
+        let package = Package::new("e327", &[("client.vl", client)]);
+        std::fs::create_dir_all(package.path("inner")).unwrap();
+        std::fs::write(package.path("inner/deep.vl"), deep).unwrap();
+        std::fs::write(package.path("lib.vl"), "export import pkg::inner::deep;\n").unwrap();
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let pair = |word: &str, kind: &str| (word.to_string(), kind.to_string());
+        for needle in ["lib::deep::Mode::On => 1", "lib::deep::Mode::Off => 0"] {
+            let leaf = if needle.contains("Off") { "Off" } else { "On" };
+            assert_eq!(
+                tokens_over(&document, needle)
+                    .into_iter()
+                    .filter(|(word, _)| word != "1" && word != "0")
+                    .collect::<Vec<_>>(),
+                vec![
+                    pair("lib", "Namespace"),
+                    pair("deep", "Namespace"),
+                    pair("Mode", "Enum"),
+                    pair(leaf, "EnumMember")
+                ],
+                "{needle}"
+            );
+        }
+        assert_eq!(
+            tokens_over(&document, "lib::deep::Overlay {"),
+            vec![
+                pair("lib", "Namespace"),
+                pair("deep", "Namespace"),
+                pair("Overlay", "Struct"),
+            ]
+        );
+        // The segments hover for their module.
+        let hover = |needle: &str| {
+            document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"))
+        };
+        for needle in ["deep::Mode::On =>", "deep::Overlay {"] {
+            let text = hover(needle);
+            assert!(text.contains("deep"), "{needle}: {text}");
+        }
+        // Find-references from a `deep` in a pattern reaches the value
+        // path's and the initializer's, each exactly `deep`; so does one from
+        // the initializer's.
+        let text = document.analyzed_text().to_string();
+        // Rename from a segment rewrites exactly the identifier at every
+        // spelling in this file - and renaming the STRUCT edits its
+        // initializer's name alone, not the `lib::de` the old derived row
+        // covered.
+        let spelled = |offset: usize, new_name: &str| -> Vec<String> {
+            document
+                .rename_edits(offset, new_name)
+                .expect("a rename")
+                .into_iter()
+                .filter(|(source, _, _)| *source == document.focus)
+                .map(|(_, span, _)| text[span.into_range()].to_string())
+                .collect()
+        };
+        assert_eq!(
+            spelled(at(client, "deep::Overlay {", 0), "layer"),
+            vec!["deep"; 5]
+        );
+        assert_eq!(
+            spelled(at(client, "Overlay {", 0), "Layer"),
+            vec!["Overlay"]
+        );
+        for needle in ["deep::Mode::On =>", "deep::Overlay {"] {
+            let found: Vec<String> = document
+                .references(at(client, needle, 0))
+                .into_iter()
+                .filter(|(source, _)| *source == document.focus)
+                .map(|(_, span)| text[span.into_range()].to_string())
+                .collect();
+            assert!(found.len() >= 5, "{needle}: {found:?}");
+            assert!(
+                found.iter().all(|word| word == "deep"),
+                "{needle}: {found:?}"
+            );
+        }
+    });
+}
+
 /// E316: a function's signature label prints an IMPLICIT parameter's bound -
 /// `username: Signal<str>` - not the binder's bare name (`Signal`). Two
 /// parameters of one trait at different arguments print apart; an explicit
@@ -1915,12 +2020,69 @@ fn e317_a_returned_variant_hovers_with_the_expected_instantiation() {
         };
         assert_eq!(first_line("None\n}"), "Option<i32>::None");
         assert_eq!(first_line("None;\n\t}\n\tSome"), "Option<str>::None");
-        assert_eq!(first_line("Some(\"x\")"), "Option<str>::Some");
+        assert_eq!(first_line("Some(\"x\")"), "Option<str>::Some(str)");
         assert_eq!(first_line("None;\n\tlet some"), "Option<i32>::None");
-        assert_eq!(first_line("Some(1);"), "Option<i32>::Some");
+        assert_eq!(first_line("Some(1);"), "Option<i32>::Some(i32)");
         assert_eq!(first_line("None);\n}"), "Option<f64>::None");
-        assert_eq!(first_line("Ok(1)"), "Result<i32, str>::Ok");
-        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err");
+        assert_eq!(first_line("Ok(1)"), "Result<i32, str>::Ok(i32)");
+        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err(str)");
+    });
+}
+
+/// E328: a generic enum's payload variant in value position spells its
+/// PAYLOAD under the instantiation the position settled - `Option<i32>::Some(i32)`,
+/// as a pattern's label does (E241) - in a return, a binding and an argument; a
+/// variant of a non-generic enum reads its declared payload as before.
+#[test]
+fn e328_a_generic_payload_variant_hovers_with_its_instantiated_payload() {
+    on_big_stack(|| {
+        let client = "enum Shape {\n\tDot,\n\tCircle(f64),\n}\n\n\
+             fun some(): Option<i32> {\n\tSome(1)\n}\n\n\
+             fun ok(): Result<i32, str> {\n\tret Ok(2);\n}\n\n\
+             fun err(): Result<i32, str> {\n\tErr(\"no\")\n}\n\n\
+             fun pairs(): Result<List<i32>, (str, bool)> {\n\tErr((\"x\", true))\n}\n\n\
+             fun take(value: Option<f64>, other: Result<str, i32>): i32 {\n\t\
+             match (value, other) {\n\t\t(Some(_), _) => 1,\n\t\t_ => 0,\n\t}\n}\n\n\
+             fun main() {\n\
+             \tlet bound: Option<str> = Some(\"b\");\n\
+             \tlet inferred = Some(3);\n\
+             \tlet shape = Shape::Circle(1.0);\n\
+             \tlet dot = Shape::Dot;\n\
+             \tlet _ = (bound, inferred, shape, dot, some(), ok(), err(), pairs());\n\
+             \tlet _ = take(Some(1.5), Ok(\"s\"));\n\
+             \tlet _ = take(None, Err(4));\n}\n";
+        let package = Package::new("e328", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let first_line = |needle: &str| {
+            let hover = document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover.lines().nth(1).unwrap_or_default().to_string()
+        };
+        // A return: the tail, a `ret`, and an `Err`.
+        assert_eq!(first_line("Some(1)\n}"), "Option<i32>::Some(i32)");
+        assert_eq!(first_line("Ok(2)"), "Result<i32, str>::Ok(i32)");
+        assert_eq!(first_line("Err(\"no\")"), "Result<i32, str>::Err(str)");
+        assert_eq!(
+            first_line("Err((\"x\""),
+            "Result<List<i32>, (str, bool)>::Err((str, bool))"
+        );
+        // A binding: annotated, and inferred from the value.
+        assert_eq!(first_line("Some(\"b\")"), "Option<str>::Some(str)");
+        assert_eq!(first_line("Some(3)"), "Option<i32>::Some(i32)");
+        // An argument: against the declared parameter's instantiation.
+        assert_eq!(first_line("Some(1.5)"), "Option<f64>::Some(f64)");
+        assert_eq!(first_line("Ok(\"s\")"), "Result<str, i32>::Ok(str)");
+        assert_eq!(first_line("Err(4)"), "Result<str, i32>::Err(i32)");
+        assert_eq!(first_line("None, Err"), "Option<f64>::None");
+        // A non-generic enum is unchanged.
+        assert_eq!(first_line("Circle(1.0)"), "Shape::Circle(f64)");
+        assert_eq!(first_line("Dot;"), "Shape::Dot");
     });
 }
 
