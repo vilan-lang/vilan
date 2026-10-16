@@ -1131,20 +1131,17 @@ fn subject_head(program: &Program, subject: TypeId) -> Option<Id> {
 /// Like [`dispatch_candidates`], but with a resolved concrete RECEIVER type
 /// when a per-instantiation walk has one (platform coloring's refinement):
 /// only the members that type actually selects — its own impl's declared
-/// member, else the trait defaults its impls inherit. Nominal matching
+/// member, else the trait defaults its impls inherit, else (M133) the members
+/// of the BLANKET impls whose subject applies to it. Nominal matching
 /// (conditional impls over the same head both match) keeps it a sound
 /// over-approximation. A `None` receiver is the plain over-approximation.
 pub(crate) fn dispatch_candidates_for(
     program: &Program,
     call_id: Id,
-    receiver: Option<&Type>,
+    receiver: Option<TypeId>,
 ) -> Vec<Id> {
     let Some(receiver) = receiver else {
         return dispatch_candidates(program, call_id);
-    };
-    let receiver_head = match receiver {
-        Type::Struct(id, _) | Type::Enum(id, _) => *id,
-        _ => return dispatch_candidates(program, call_id),
     };
     let Some(dispatch) = dispatch_at(program, call_id) else {
         return Vec::new();
@@ -1152,14 +1149,40 @@ pub(crate) fn dispatch_candidates_for(
     let member = match dispatch {
         GenericDispatch::OnConstraint(_, member) | GenericDispatch::OnType(_, member) => member,
     };
+    let key = (receiver, member.to_string());
+    let cached = program.receiver_dispatch_memo().get(&key).cloned();
+    let selected = match cached {
+        Some(selected) => selected,
+        None => {
+            let computed =
+                std::sync::Arc::new(receiver_selected_members(program, receiver, member));
+            program
+                .receiver_dispatch_memo()
+                .insert(key, computed.clone());
+            computed
+        }
+    };
+    match selected.as_ref() {
+        Some(members) => members.clone(),
+        // Nothing the receiver selects is known (an unexpected receiver shape,
+        // or a generic left in it): stay sound.
+        None => dispatch_candidates(program, call_id),
+    }
+}
+
+/// [`dispatch_candidates_for`]'s memoized half: what a dispatch of `member`
+/// on the concrete `receiver` can select, or `None` when that cannot be told
+/// from the receiver (the caller takes every candidate).
+fn receiver_selected_members(program: &Program, receiver: TypeId, member: &str) -> Option<Vec<Id>> {
+    let receiver_head = match program.type_id_to_type_map.get(&receiver) {
+        Some(Type::Struct(id, _) | Type::Enum(id, _)) => *id,
+        _ => return None,
+    };
     let matching: Vec<&crate::analyzer::Implementation> = program
         .implementations
         .iter()
         .filter(|implementation| {
-            matches!(
-                program.type_id_to_type_map.get(&implementation.subject),
-                Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) if *id == receiver_head
-            )
+            subject_head(program, implementation.subject) == Some(receiver_head)
         })
         .collect();
     // The receiver's own impls: a declared member wins outright.
@@ -1168,10 +1191,60 @@ pub(crate) fn dispatch_candidates_for(
         .filter_map(|implementation| implementation.declarations.get(member).copied())
         .collect();
     if !declared.is_empty() {
-        return declared;
+        return Some(declared);
     }
     // Else the trait defaults those impls inherit.
-    let defaults: Vec<Id> = matching
+    let defaults = inherited_defaults(program, &matching, member);
+    if !defaults.is_empty() {
+        return Some(defaults);
+    }
+    // M133: no impl of the receiver's own head names the member, so what it
+    // reaches comes through a BLANKET impl — `impl type S: Flow<str> with
+    // Slot` for a `SignalCell<str>` receiver. Only the blankets whose subject
+    // APPLIES (the shape matches and every binder's bounds hold) can be
+    // selected at monomorphization, which is the same proof impl selection
+    // makes there; before this, a receiver that implements `Slot` through a
+    // blanket walked every `Slot` impl in std. The proof needs the receiver
+    // whole: a type still carrying a generic cannot be proved against a bound,
+    // and is left to the whole list.
+    if !type_is_ground(program, receiver, 0) {
+        return None;
+    }
+    let blankets: Vec<&crate::analyzer::Implementation> = program
+        .implementations
+        .iter()
+        .filter(|implementation| {
+            subject_head(program, implementation.subject).is_none()
+                && (implementation.declarations.contains_key(member)
+                    || implementation.trait_ids.iter().any(|trait_id| {
+                        program
+                            .traits
+                            .get(trait_id)
+                            .is_some_and(|trait_| trait_.declarations.contains_key(member))
+                    }))
+                && crate::impl_select::subject_applies(program, implementation.subject, receiver)
+        })
+        .collect();
+    let mut selected: Vec<Id> = Vec::new();
+    for implementation in &blankets {
+        match implementation.declarations.get(member) {
+            Some(declared) => selected.push(*declared),
+            None => selected.extend(inherited_defaults(program, &[implementation], member)),
+        }
+    }
+    selected.dedup();
+    // A ground receiver that applies to no blanket either is a shape this
+    // narrowing does not know: stay sound.
+    (!selected.is_empty()).then_some(selected)
+}
+
+/// The trait defaults for `member` that `implementations` inherit.
+fn inherited_defaults(
+    program: &Program,
+    implementations: &[&crate::analyzer::Implementation],
+    member: &str,
+) -> Vec<Id> {
+    implementations
         .iter()
         .flat_map(|implementation| implementation.trait_ids.iter())
         .filter_map(|trait_id| {
@@ -1180,12 +1253,31 @@ pub(crate) fn dispatch_candidates_for(
                 .get(trait_id)
                 .and_then(|trait_| trait_.declarations.get(member).copied())
         })
-        .collect();
-    if !defaults.is_empty() {
-        return defaults;
+        .collect()
+}
+
+/// Whether `type_id` names a type with no generic left in it — the only kind
+/// a blanket impl's bounds can be proved against outside an instantiation.
+fn type_is_ground(program: &Program, type_id: TypeId, depth: u32) -> bool {
+    if depth > 16 {
+        return false;
     }
-    // Nothing nominal matched (an unexpected receiver shape): stay sound.
-    dispatch_candidates(program, call_id)
+    let all = |ids: &[TypeId]| ids.iter().all(|id| type_is_ground(program, *id, depth + 1));
+    match program.type_id_to_type_map.get(&type_id) {
+        Some(
+            Type::Struct(_, arguments)
+            | Type::Enum(_, arguments)
+            | Type::Trait(_, arguments)
+            | Type::Dyn(_, arguments),
+        ) => all(arguments),
+        Some(Type::Tuple(elements, _)) => all(elements),
+        Some(Type::Array(element, length)) => all(&[*element, *length]),
+        Some(Type::Closure(parameters, return_type, _, _)) => {
+            all(parameters) && type_is_ground(program, *return_type, depth + 1)
+        }
+        Some(Type::Length(_) | Type::Function(_) | Type::Module(_) | Type::Never) => true,
+        _ => false,
+    }
 }
 
 /// The `GenericDispatch` recorded for a call site — keyed by the call id (an

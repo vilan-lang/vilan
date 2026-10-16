@@ -326,6 +326,143 @@ fn instantiation_bindings_compose_through_nested_generics() {
     );
 }
 
+/// M133: a concrete receiver that implements the trait only through a BLANKET
+/// impl dispatches to the blankets whose subject applies to it — not to every
+/// impl of the trait. `Mem` is `Save` through `impl type T: Marker with Save`;
+/// the walk used to find no impl of `Mem`'s own head naming `save`, fall back to
+/// every `save` there is, and charge the browser build for `DiskStore`'s.
+#[test]
+fn m133_a_blanket_selected_receiver_dispatches_to_the_blankets_that_apply() {
+    assert_compiles_browser(
+        r#"
+        import std::fs::write_file;
+
+        trait Save {
+            fun save(self): bool;
+        }
+
+        trait Marker {}
+
+        struct Mem { last: str }
+        struct DiskStore { path: str }
+
+        impl Mem with Marker {}
+
+        impl type T: Marker with Save {
+            fun save(self): bool { true }
+        }
+
+        impl DiskStore with Save {
+            fun save(self): bool {
+                write_file(self.path, "state");
+                true
+            }
+        }
+
+        fun save_it<T: Save>(store: T): bool {
+            store.save()
+        }
+
+        fun main() {
+            save_it(Mem { last = "" });
+        }
+        "#,
+    );
+}
+
+/// M133: a dispatch candidate an impl declares runs with the impl's own binders
+/// bound from the receiver, as monomorphization binds them. `Wrap<Mem>`'s
+/// `save` forwards to `self.inner.save()`, whose `C` the call's recorded
+/// substitution never carries; walked with `C` a hole, it reached every `save`
+/// and charged the browser build for `DiskStore`'s.
+#[test]
+fn m133_an_impl_candidate_binds_its_binders_from_the_receiver() {
+    assert_compiles_browser(
+        r#"
+        import std::fs::write_file;
+
+        trait Save {
+            fun save(self): bool;
+        }
+
+        struct Mem { last: str }
+        struct DiskStore { path: str }
+        struct Wrap<C> { inner: C }
+
+        impl Mem with Save {
+            fun save(self): bool { true }
+        }
+
+        impl DiskStore with Save {
+            fun save(self): bool {
+                write_file(self.path, "state");
+                true
+            }
+        }
+
+        impl Wrap<type C: Save> with Save {
+            fun save(self): bool {
+                self.inner.save()
+            }
+        }
+
+        fun save_it<T: Save>(store: T): bool {
+            store.save()
+        }
+
+        fun main() {
+            save_it(Wrap { inner = Mem { last = "" } });
+        }
+        "#,
+    );
+}
+
+/// M133's soundness half: the same `Wrap` around the off-platform store still
+/// rejects, chained through the impl the binding selects.
+#[test]
+fn m133_a_bound_impl_binder_still_rejects_the_off_platform_instance() {
+    assert_fails_browser_with(
+        r#"
+        import std::fs::write_file;
+
+        trait Save {
+            fun save(self): bool;
+        }
+
+        struct Mem { last: str }
+        struct DiskStore { path: str }
+        struct Wrap<C> { inner: C }
+
+        impl Mem with Save {
+            fun save(self): bool { true }
+        }
+
+        impl DiskStore with Save {
+            fun save(self): bool {
+                write_file(self.path, "state");
+                true
+            }
+        }
+
+        impl Wrap<type C: Save> with Save {
+            fun save(self): bool {
+                self.inner.save()
+            }
+        }
+
+        fun save_it<T: Save>(store: T): bool {
+            store.save()
+        }
+
+        fun main() {
+            save_it(Wrap { inner = Mem { last = "" } });
+            save_it(Wrap { inner = DiskStore { path = "s.txt" } });
+        }
+        "#,
+        "write_file (std::fs)",
+    );
+}
+
 #[test]
 fn a_never_instantiated_impls_globals_leave_no_residue() {
     // The emission side moves with the refinement (emitted ⊆ admitted): a
