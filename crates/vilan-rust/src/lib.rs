@@ -9826,6 +9826,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         };
+        // papers-54's F?3: an INHERENT `next` that awaits (`next(self):
+        // Option<T>` whose body suspends — the shape `fs::Watcher` and
+        // `BodyReader` pull by hand) is awaited at every step, as the JS
+        // lowering awaits it (`for_each_next_dispatch`'s `async_functions`
+        // answer). The trait form stays refused for an async `next` by the
+        // `&mut`-across-suspension rule, so the recorded member is the one
+        // asked.
+        let awaits = self.program.async_functions.contains(&next_id);
+        let step = |call: String| {
+            if awaits { Self::awaited(&call) } else { call }
+        };
         // F95: `for e in &mut c` drives `next_mut` on the container ITSELF —
         // each element a writable view into it — so the place is borrowed
         // for every step rather than copied.
@@ -9838,8 +9849,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let mut body = String::new();
             self.emit_block(statements, tail, &mut body, depth + 1)?;
             let pad = Self::indent(depth);
+            let next_step = step(format!("{next}(&mut {place_text})"));
             return Ok(format!(
-                "while let Some({binder}) = {next}(&mut {place_text}) {{\n{body}{pad}}}"
+                "while let Some({binder}) = {next_step} {{\n{body}{pad}}}"
             ));
         }
         // The iterable is CONSUMED by the loop (the iterator is advanced), so a
@@ -9853,9 +9865,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.emit_block(statements, tail, &mut body, depth + 2)?;
         let pad = Self::indent(depth);
         let inner = Self::indent(depth + 1);
+        let next_step = step(format!("{next}(&mut iterator)"));
         Ok(format!(
             "{{\n{inner}let mut iterator = {iterable_text};\n\
-             {inner}while let Some({binder}) = {next}(&mut iterator) {{\n{body}{inner}}}\n{pad}}}"
+             {inner}while let Some({binder}) = {next_step} {{\n{body}{inner}}}\n{pad}}}"
         ))
     }
 

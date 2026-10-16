@@ -13533,6 +13533,28 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
     );
 }
 
+/// papers-54's F?3: a `for x in subject` over a type whose INHERENT
+/// `next(self): Option<T>` awaits — the shape `fs::Watcher` and `BodyReader`
+/// pull by hand with a bare loop — was emitted `while let Some(x) =
+/// next(&mut iterator)` with no `.await`, which cargo refused (E0308,
+/// "expected future, found `Option`"); the JS lowering awaited it. The step
+/// is awaited natively now, and both print the same.
+#[test]
+fn an_awaiting_inherent_next_drives_a_for_loop_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_async_inherent_for_in.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/async_inherent_for_in.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "tick 2\ntick 1\ntick 0\ndone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// The stdout of `file` on the JS and on the native backend.
 fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
     let run = |arguments: &[&str]| {
