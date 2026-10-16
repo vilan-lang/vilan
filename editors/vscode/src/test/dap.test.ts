@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { describe, runCommand } from '../dap/adapter';
+import { describe, runCommand, shownStderr } from '../dap/adapter';
 import { Doc, WALKER, children, dbgLine, flat, layout, walker } from '../dap/printer';
 import { Sidecar, parsePath } from '../dap/sidecar';
 import { SourceMap, decodeMappings, decodeVlq } from '../dap/sourceMap';
@@ -299,6 +299,31 @@ test('a frame is found by its head and its name; copies that disagree lose the t
     assert.throws(() => new Sidecar({ version: 2 }), /version/);
 });
 
+test('an awaiting frame is found by its name, or by the innermost text holding its place', () => {
+    const sidecar = new Sidecar({
+        version: 1,
+        file: 'main.mjs',
+        frames: [
+            { kind: 'main', name: 'main', span: [0, 12, 0, 30, 1], bindings: [] },
+            { kind: 'function', name: 'outer', js: 'outer', at: [0, 2, 4], span: [0, 2, 0, 10, 1], bindings: [] },
+            { kind: 'closure', name: 'a closure in outer', at: [0, 4, 12], span: [0, 4, 12, 6, 2], bindings: [] },
+            { kind: 'closure', name: 'a closure in main', at: [0, 14, 8], span: [0, 14, 8, 14, 20], bindings: [] },
+        ],
+        types: [],
+    });
+    // A named function by its emitted name, wherever it stands.
+    assert.equal(sidecar.resolveAt('outer', { source: 0, line: 3, column: 0 })?.name, 'outer');
+    // An anonymous frame by the innermost text holding its place.
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 5, column: 0 })?.name, 'a closure in outer');
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 8, column: 3 })?.name, 'outer');
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 14, column: 9 })?.name, 'a closure in main');
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 20, column: 1 })?.name, 'main');
+    // The end is exclusive; another source, or no place, finds nothing.
+    assert.equal(sidecar.resolveAt('', { source: 0, line: 14, column: 20 })?.name, 'main');
+    assert.equal(sidecar.resolveAt('', { source: 1, line: 5, column: 0 }), undefined);
+    assert.equal(sidecar.resolveAt('', undefined), undefined);
+});
+
 test('the walker is sent only the types its root reaches, renumbered', () => {
     const table = new Sidecar(SIDECAR).table(14);
     assert.deepEqual(
@@ -393,3 +418,65 @@ function vlq(value: number): string {
     } while (rest > 0);
     return out;
 }
+
+test('an internalConsole launch drops the trace\'s stderr lines, which reach the console from the inspector', () => {
+    const text =
+        'Debugger attached.\n[reactive] effect #0 woken by cell #1, set at main.vl:4:7\ncount is 2\n[reactive] derivation #2 woken by cell #1\n';
+    assert.equal(shownStderr(text), 'count is 2\n');
+    // A line that merely mentions the trace is the program's own.
+    assert.equal(shownStderr('see [reactive] lines\n'), 'see [reactive] lines\n');
+});
+
+test('a type the program prints itself is printed by its function, the structure kept for a refusal', () => {
+    const types = [
+        { text: 'Secret', shape: 'struct', name: 'Secret', fields: [['code', 1]], fn: 0 },
+        { text: 'i32', shape: 'integer' },
+    ];
+    // A written impl's `debug` answers text; a generated printer a group.
+    assert.equal(walker([42], types, 0, 'value', () => '<redacted>'), '<redacted>');
+    const printed = walker([42], types, 0, 'value', () => ({ o: 'Hidden(', c: ')', p: false, e: [], f: false }));
+    assert.equal(flat(printed), 'Hidden()');
+    // Not a document (or no function at that position): the structure.
+    assert.equal(flat(walker([42], types, 0, 'value', () => 7)), 'Secret { code = 42 }');
+    assert.equal(flat(walker([42], types, 0, 'value')), 'Secret { code = 42 }');
+});
+
+test('a trait object is printed by the type its table\'s functions name, else its show slot', () => {
+    function area() {}
+    function area2() {}
+    const types = [
+        { text: 'dyn Area', shape: 'object', label: 'dyn Area', impls: [[['area'], 1], [['area2'], 3]] },
+        { text: 'Square', shape: 'struct', name: 'Square', fields: [['side', 2]] },
+        { text: 'f64', shape: 'float' },
+        { text: 'Rect', shape: 'struct', name: 'Rect', fields: [['width', 2]] },
+    ];
+    const square = Object.create({ area });
+    const rect = Object.create({ area: area2 });
+    assert.equal(flat(walker([[2], square], types, 0, 'value')), 'dyn Area(Square { side = 2.0 })');
+    assert.equal(flat(walker([[3], rect], types, 0, 'value')), 'dyn Area(Rect { width = 3.0 })');
+    // A table the sidecar does not know: the show slot, else `<?>`.
+    function other() {}
+    const shown = Object.create({ area: other, $show: () => 'Circle' });
+    assert.equal(flat(walker([[1], shown], types, 0, 'value')), 'dyn Area(Circle)');
+    assert.equal(flat(walker([[1], Object.create({ area: other })], types, 0, 'value')), 'dyn Area(<?>)');
+});
+
+test('the walker is sent the tables\' concrete types, renumbered', () => {
+    const sidecar = new Sidecar({
+        version: 1,
+        file: 'main.mjs',
+        frames: [],
+        types: [
+            { text: 'f64', shape: 'float' },
+            { text: 'Square', shape: 'struct', name: 'Square', fields: [['side', 0]] },
+            { text: 'dyn Area', shape: 'object', label: 'dyn Area', impls: [[['area'], 1]] },
+        ],
+    });
+    const table = sidecar.table(2);
+    assert.deepEqual(
+        table.types.map((type) => type.text),
+        ['dyn Area', 'Square', 'f64'],
+    );
+    assert.deepEqual(table.types[0].impls, [[['area'], 1]]);
+    assert.deepEqual(table.types[1].fields, [['side', 2]]);
+});

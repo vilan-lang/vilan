@@ -4,6 +4,10 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+let __shared_identity_next = 1;
+function __shared_identity(cell) {
+	return cell.__id ??= __shared_identity_next++;
+}
 function __shared_new(value) {
 	return { v: value };
 }
@@ -111,12 +115,16 @@ function render(view2) {
 function row(label) {
 	return child(attr2(view("li"), "class", "item"), label);
 }
-function new2(value) {
+function new2(value, caller) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	const cell = [ __shared_new(value), __shared_new(subscribers) ];
+	if (tracing.v) {
+		trace_hooks.v[0](__shared_identity(cell[0]), caller);
+	}
+	return cell;
 }
 function new3(value) {
-	return new2(value);
+	return new2(value, "std/src/reactive.vl:2448:15");
 }
 function get(self) {
 	return __clone(self[0].v);
@@ -176,6 +184,24 @@ function child3(self, content) {
 	place3(content, self);
 	return __clone(self);
 }
+const tracing = __shared_new(false);
+const trace_hooks = __shared_new([ (_identity, _site) => {
+	return;
+}, (_site) => {
+	return;
+}, (_identity) => {
+	return "";
+}, (_turn, _id) => {
+	return;
+}, (_turn, _subscriber) => {
+	return;
+}, (_subscriber, _cause) => {
+	return;
+}, (_subscriber, _draining) => {
+	return false;
+}, (_turn, _id) => {
+	return;
+} ]);
 const name = new3("world & <you>");
 console.log(render(child3(child(child2(child(attr2(attr(view("p"), "data-live", __clone(name)), "title", "hi"), "Take "), child(view("code"), "vilan upgrade")), " & enjoy. "), name)));
 console.log(render(attr2(attr2(attr2(view("input"), "type", "checkbox"), "aria-label", "Done"), "disabled", "")));

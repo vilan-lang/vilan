@@ -12073,6 +12073,139 @@ fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
 }
 
 // ---------------------------------------------------------------------------
+// E257 S8 (debugging.md §6.2): the reactive trace.
+// ---------------------------------------------------------------------------
+
+const REACTIVE_TRACE: &str = include_str!("native/reactive_trace.vl");
+const REACTIVE_TRACE_FILE: &str = "native_probe_reactive_trace.vl";
+
+/// E257 S8: `std::reactive::trace(true)` writes one line per wake to stderr —
+/// the woken subscriber, the cell that woke it with where it was made, and the
+/// write's place (a `[track_caller]` location, S0) — the same bytes on both
+/// backends, one pin per wake path: a write with no turn (inline), a write
+/// queued in an ambient turn (`batch`), a derivation's write joining the
+/// DRAINING turn (`set by`), a write after its turn settled (one microtask
+/// drains it), a relay's wake (`distinct`), `update`, a cell made by
+/// `Signal::new` and written through a bound (no place: a `[track_caller]`
+/// trait member is refused), and the trace off. Native has no host task to
+/// tag a queued wake with (`console.createTask` is the JS backend's): the
+/// lines are the same, only a debugger's async stack differs.
+#[test]
+fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
+    let staged = stage();
+    let made = |file: &str| {
+        site_of(
+            file,
+            REACTIVE_TRACE,
+            "let count = SignalCell::new(1)",
+            "new",
+        )
+    };
+    let site = |file: &str, line: &str, column: &str| site_of(file, REACTIVE_TRACE, line, column);
+    type Expected =
+        fn(&str, &dyn Fn(&str) -> String, &dyn Fn(&str, &str, &str) -> String) -> (String, String);
+    let cases: Vec<(&str, Expected)> = vec![
+        ("inline", |file, made, site| {
+            (
+                "inline 1\ninline 2\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "count.set(2)", "set")
+                ),
+            )
+        }),
+        ("turn", |file, made, site| {
+            (
+                "turn 1\nqueued\nturn 3\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "count.set(3)", "set")
+                ),
+            )
+        }),
+        ("draining", |file, made, site| {
+            (
+                "draining 2\ndraining 8\n".to_string(),
+                format!(
+                    "[reactive] derivation #0 woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] effect #1 woken by cell #3, set by derivation #0\n",
+                    made(file),
+                    site(file, "batch(|| count.set(4))", "set")
+                ),
+            )
+        }),
+        ("late", |file, made, site| {
+            (
+                "late 1\nbefore the microtask\nlate 5\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "later = Some(|| count.set(5))", "set")
+                ),
+            )
+        }),
+        ("relay", |file, made, site| {
+            (
+                "relay 1\nrelay 6\n".to_string(),
+                format!(
+                    "[reactive] derivation #1 woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] effect #0 woken by derivation #1\n",
+                    made(file),
+                    site(file, "count.set(6)", "set")
+                ),
+            )
+        }),
+        ("update", |file, made, site| {
+            (
+                "update 1\nupdate 2\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "count.update(", "update")
+                ),
+            )
+        }),
+        ("unplaced", |_, _, _| {
+            (
+                "unplaced 10\nunplaced 11\n".to_string(),
+                "[reactive] effect #0 woken by cell #2\n".to_string(),
+            )
+        }),
+        ("off", |_, _, _| {
+            ("off 1\noff 7\n".to_string(), String::new())
+        }),
+    ];
+    // One program per path, each under its OWN file name (N158), so a place
+    // names that file.
+    let legs = legs_in_parallel("trace", cases, |(path, expected), target| {
+        let file = REACTIVE_TRACE_FILE.replace(".vl", &format!("_{path}.vl"));
+        std::fs::write(
+            staged.join(&file),
+            REACTIVE_TRACE.replace("\"PATH\"", &format!("{path:?}")),
+        )
+        .expect("write the probe program");
+        let (stdout, stderr) = expected(&file, &made, &site);
+        let mut wrong = Vec::new();
+        for (backend, run) in [
+            ("native", run_on_in(&staged, Some("rust"), &file, target)),
+            ("node", run_on_in(&staged, None, &file, target)),
+        ] {
+            if run.code != Some(0) || run.stdout != stdout || run.stderr != stderr {
+                wrong.push(format!(
+                    "{path} on {backend}: exited {:?}\nstdout {:?}\nexpected {stdout:?}\nstderr {:?}\nexpected {stderr:?}",
+                    run.code, run.stdout, run.stderr
+                ));
+            }
+        }
+        wrong
+    });
+    let wrong: Vec<String> = legs.into_iter().flatten().collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+// ---------------------------------------------------------------------------
 // debugging.md S1: `dbg(..)`.
 // ---------------------------------------------------------------------------
 
