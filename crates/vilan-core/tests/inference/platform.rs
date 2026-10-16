@@ -463,6 +463,141 @@ fn m133_a_bound_impl_binder_still_rejects_the_off_platform_instance() {
     );
 }
 
+/// The program M160's pins share: a trait DEFAULT (`persist`) whose body
+/// calls `self.save()` — `GenericDispatch::OnType(None, save)` — and two
+/// impls that inherit it, one of whose `save` is node-only. `main` reaches the
+/// default on the receivers `receivers` names — through the generic `keep`,
+/// or, `direct`, by calling it on each value (`OnType(Some(receiver))`).
+fn m160_default_program(body: &str, receivers: &[&str], direct: bool) -> String {
+    let calls: String = receivers
+        .iter()
+        .map(|receiver| match direct {
+            true => format!("            ({receiver}).persist();\n"),
+            false => format!("            keep({receiver});\n"),
+        })
+        .collect();
+    format!(
+        r#"
+        import std::fs::write_file;
+
+        trait Save {{
+            fun save(self): bool;
+            fun persist(self): bool {{
+{body}
+            }}
+        }}
+
+        struct Mem {{ last: str }}
+        struct DiskStore {{ path: str }}
+
+        impl Mem with Save {{
+            fun save(self): bool {{ true }}
+        }}
+
+        impl DiskStore with Save {{
+            fun save(self): bool {{
+                write_file(self.path, "state");
+                true
+            }}
+        }}
+
+        fun keep<T: Save>(store: T): bool {{
+            store.persist()
+        }}
+
+        fun store_it<U: Save>(store: U): bool {{
+            store.save()
+        }}
+
+        fun main() {{
+{calls}        }}
+        "#
+    )
+}
+
+/// M160: a trait DEFAULT reached on a concrete receiver is walked with that
+/// receiver as its `Self`, so a `self` call inside it dispatches on the
+/// receiver — as emission specializes the default. `persist`'s `self.save()`
+/// on `Mem` used to keep every `save` (the walk had no `Self`) and charged the
+/// browser build for `DiskStore`'s node-only one.
+#[test]
+fn m160_a_trait_defaults_self_call_dispatches_on_the_receiver_it_was_reached_on() {
+    assert_compiles_browser(&m160_default_program(
+        "                self.save()",
+        &["Mem { last = \"\" }"],
+        false,
+    ));
+}
+
+/// M160: a default that hands `self` ON — to a generic function bounded by
+/// the trait — binds that function's parameter to the trait's `Self` marker,
+/// which names no impl; grounded through the default's receiver, the
+/// function's `store.save()` dispatches on `Mem` alone (as emission
+/// specializes it), where it used to walk every `save`.
+#[test]
+fn m160_a_default_handing_self_on_binds_the_callee_to_its_receiver() {
+    assert_compiles_browser(&m160_default_program(
+        "                store_it(self)",
+        &["Mem { last = \"\" }"],
+        false,
+    ));
+    assert_fails_browser_with(
+        &m160_default_program(
+            "                store_it(self)",
+            &["Mem { last = \"\" }", "DiskStore { path = \"s.txt\" }"],
+            false,
+        ),
+        "write_file (std::fs)",
+    );
+}
+
+/// M160: a closure inside the default is its creator's code — its `self` is
+/// the default's receiver too.
+#[test]
+fn m160_a_closure_in_a_trait_default_keeps_the_defaults_receiver() {
+    assert_compiles_browser(&m160_default_program(
+        "                let again = || self.save();\n                again()",
+        &["Mem { last = \"\" }"],
+        false,
+    ));
+}
+
+/// M160's soundness half: the default reached on TWO receivers is walked once
+/// per receiver, and each colours by its own — the off-platform one still
+/// refuses, chained through its own `save`.
+#[test]
+fn m160_a_default_reached_on_two_receivers_colours_each_by_its_own() {
+    assert_fails_browser_with(
+        &m160_default_program(
+            "                self.save()",
+            &["Mem { last = \"\" }", "DiskStore { path = \"s.txt\" }"],
+            false,
+        ),
+        "write_file (std::fs)",
+    );
+}
+
+/// M160's soundness half, called on the values directly: the default's two
+/// walks differ in nothing but their `Self` (no generic binds the receiver),
+/// so the walk's visited key carries it — or the second receiver's walk is
+/// taken for the first's and the off-platform `save` goes unseen.
+#[test]
+fn m160_a_default_called_on_two_values_colours_each_by_its_own() {
+    assert_compiles_browser(&m160_default_program(
+        "                self.save()",
+        &["Mem { last = \"\" }"],
+        true,
+    ));
+    assert_fails_browser_with(
+        &m160_default_program(
+            "                self.save()",
+            &["Mem { last = \"\" }", "DiskStore { path = \"s.txt\" }"],
+            true,
+        ),
+        "write_file (std::fs)",
+    );
+}
+
 #[test]
 fn a_never_instantiated_impls_globals_leave_no_residue() {
     // The emission side moves with the refinement (emitted ⊆ admitted): a
