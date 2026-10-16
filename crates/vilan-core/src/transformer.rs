@@ -8233,11 +8233,22 @@ impl<'src> Transformer<'src> {
                     let next_dispatch = self.for_each_next_dispatch(id, next_id);
                     let iterator_name = self.ng.next_name();
                     let next_value_name = self.ng.next_name();
-                    let next_call = self.emit_dispatch(
-                        next_dispatch,
-                        vec![js::Node::Local(iterator_name.clone())],
-                        None,
-                    );
+                    // papers-54's B?2: the context arguments the context
+                    // pass threaded to the loop's `next`, after the iterator.
+                    let mut next_arguments = vec![js::Node::Local(iterator_name.clone())];
+                    for argument_id in self
+                        .program
+                        .for_each_context_arguments
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        next_arguments.push(
+                            self.walk_entity(argument_id, block)
+                                .unwrap_or(js::Node::Void),
+                        );
+                    }
+                    let next_call = self.emit_dispatch(next_dispatch, next_arguments, None);
                     block.push(js::Node::ConstVariable(js::Variable {
                         name: iterator_name.clone(),
                         value: Box::new(t_iterable),

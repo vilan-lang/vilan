@@ -14350,6 +14350,26 @@ fn b639_a_disjoint_write_beside_a_lent_place_answers_on_both_backends() {
     );
 }
 
+/// papers-54's B?2: a `for` loop whose `next` reads a context — the ambient
+/// nursery in a sync `Iterator` (outside a nursery and inside one), a sleep in
+/// an awaiting inherent `next` — is handed the threaded context argument at
+/// every step on both backends (JS threw a `TypeError`, cargo refused E0061).
+#[test]
+fn a_for_loops_next_reading_a_context_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_for_in_context_next.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/for_in_context_next.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a for loop's context-reading `next` must answer the same natively"
+    );
+}
+
 /// B626: a module scalar read only through a view — a `const let`, a `let`, a
 /// `mut` written through `&mut`, a read inside a closure — answers the same on
 /// both backends (JS shook the binding out and threw `ReferenceError`).

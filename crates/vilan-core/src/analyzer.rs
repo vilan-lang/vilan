@@ -75459,6 +75459,13 @@ pub struct Program<'src> {
     /// keyed on `parameters` sees plumbing dressed as source. Membership is the
     /// bool: absent means bare.
     pub context_optional_hidden_parameters: HashSet<Id>,
+    /// papers-54's B?2: the context arguments the context pass threads to a
+    /// `for x in subject` loop's implicit `next` call, by the loop's id. The
+    /// call graph records that call as an edge keyed by the loop (no
+    /// `FunctionCall` stands behind it), so the arguments the pass appends to
+    /// a written call's `argument_ids` land here instead; both emitters
+    /// append them after the iterator at every step.
+    pub for_each_context_arguments: HashMap<Id, Vec<Id>>,
     /// B482: the closure TYPES whose `context` clause entry arrives CLEARED
     /// somewhere — a callback position some callee calls under
     /// `context.clear(..)` — as `(closure type, context)`. Every literal that
@@ -90505,6 +90512,7 @@ fn analyze_over_world<'src>(
         unwired_method_calls: analyzer.unwired_method_calls,
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
+        for_each_context_arguments: HashMap::default(),
         cleared_clause_contexts: HashSet::default(),
         context_bindings: Vec::new(),
         bool_enum_id: analyzer.bool_enum_id,

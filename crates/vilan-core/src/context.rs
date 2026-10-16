@@ -3965,6 +3965,16 @@ fn apply(program: &mut Program, plan: Plan, canonical: bool) {
         };
         if let Some(call) = program.function_calls.get_mut(&call_id) {
             call.argument_ids.push(argument);
+        } else if program.for_each_next.contains_key(&call_id) {
+            // papers-54's B?2: a `for` loop's implicit `next` call is an edge
+            // keyed by the loop (`call_graph.rs`), with no `FunctionCall` to
+            // append to — the argument was minted and dropped, and the loop
+            // called `next` without it on both backends.
+            program
+                .for_each_context_arguments
+                .entry(call_id)
+                .or_default()
+                .push(argument);
         }
     }
 
