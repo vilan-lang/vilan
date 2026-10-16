@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use vilan_core::incremental::{
     Census, clean_analysis, clean_analysis_keeping_hot_shape, render_observation,
 };
-use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
+use vilan_core::{
+    BuildOptions, EntryMode, PackageSpec, Platform, Workspace, analyze_source, transform,
+};
 
 use super::std_spec;
 
@@ -230,6 +232,69 @@ pub fn observe(package: &Package, seeds: Vec<PathBuf>, leg: Leg) -> Observation 
                 Leg::Incremental => analyze(),
                 Leg::Clean => clean_analysis(analyze),
                 Leg::CleanSameShape => clean_analysis_keeping_hot_shape(analyze),
+            };
+            let census = vilan_core::incremental::census();
+            let rendering = program
+                .as_ref()
+                .map(|program| render_observation(program, &errors))
+                .unwrap_or_else(|| format!("no program: {errors:?}"));
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            Observation {
+                rendering,
+                javascript,
+                census,
+            }
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// M159: one analysis of `file` as a LONE open document — the language
+/// server's M104 hybrid, the editor's common row: the module is the entry
+/// (file mode, the package's `main` named as its declared program, as a
+/// manifest would name it), and the incremental leg is SEEDED with the
+/// document's own path (door (a)), so the post passes' record is filed and
+/// read as on the world-mode path. A seed that is the entry names no hot
+/// module: there is no hot-set shape, so the clean leg is the canonical one
+/// for both comparisons.
+pub fn observe_lone(package: &Package, file: &str, leg: Leg) -> Observation {
+    let entry_text = package.text(file).to_string();
+    let pkg_root = package.directory.clone();
+    let entry = package.path(file);
+    let platform = package.platform;
+    let seeds = match leg {
+        Leg::Incremental => vec![entry.clone()],
+        Leg::Clean | Leg::CleanSameShape => Vec::new(),
+    };
+    let workspace = Workspace {
+        entry_mode: EntryMode::OpenFile {
+            declared_entries: vec!["main".to_string()],
+        },
+        ..package.workspace(seeds)
+    };
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(entry_text.into_boxed_str());
+            let analyze = || {
+                analyze_source(
+                    leaked,
+                    &std_spec(),
+                    &pkg_root,
+                    &entry,
+                    Some(platform),
+                    &workspace,
+                )
+            };
+            let (program, errors) = match leg {
+                Leg::Incremental => analyze(),
+                Leg::Clean | Leg::CleanSameShape => clean_analysis(analyze),
             };
             let census = vilan_core::incremental::census();
             let rendering = program
@@ -1297,6 +1362,37 @@ pub const EFFECT_FIXTURES: &[Fixture] = &[
         dependencies: &[],
     },
 ];
+
+// --- M159: the LONE open document's own class --------------------------------
+//
+// A module opened ALONE (the language server's M104 hybrid: file mode, seeded
+// with its own path) whose keystroke removes an effect the post passes decide
+// over the whole world: a `sleep` that made a function async, whose module
+// binding's initializer is refused while it is. A file-mode program emits no
+// JS, so the S3b seed's staleness has to show as a diagnostic here — the
+// refusal a clean analysis drops once the sleep goes.
+
+pub const LONE_MAIN: &str = "import pkg::lone::{ paused, pause_once };\nimport pkg::views::render;\n\nfun main() {\n\tprint(paused);\n\tprint(pause_once());\n\tprint(render());\n}\n";
+
+pub const LONE_LONE: &str = "import std::time;\nimport pkg::ctx::read_mood;\n\nexport fun pause_once(): i32 {\n\ttime::sleep(1);\n\tread_mood()\n}\n\nexport let paused = pause_once();\n";
+
+pub const LONE_FIXTURES: &[Fixture] = &[Fixture {
+    name: "lone",
+    platform: NODE,
+    files: &[
+        ("main.vl", LONE_MAIN),
+        ("ctx.vl", EFFECT_CTX),
+        ("lone.vl", LONE_LONE),
+        ("views.vl", POST_PASS_VIEWS),
+    ],
+    edits: &[Edit {
+        label: "a sleep removed from the lone document: the initializer's refusal must go (M159)",
+        file: "lone.vl",
+        seed: None,
+        replacements: &[("\ttime::sleep(1);\n", "")],
+    }],
+    dependencies: &[],
+}];
 
 // --- M110 S6: the id-window classes (incr-50, Order 50; spike-49's two predicted reds) ---
 //

@@ -99,6 +99,22 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // rewrite state: a lowered `run` is a call of its body, so the cold
     // result moves with the rewrite (a hot edit that stands it down makes a
     // prefix function synchronous again).
+    // M159: the seam as this pass finds it, on the census (the counters line
+    // prints it; the lone-document differential asserts it).
+    if let Some(seam) = program.seam.as_ref()
+        && !crate::macros::in_macro_world()
+    {
+        let state = crate::incremental::PostSeamState {
+            seeded: seam.seeded,
+            record: seam.record.is_some(),
+            matches: seam.record_matches,
+            cold: seam
+                .record
+                .as_ref()
+                .is_some_and(|record| record.async_cold.get().is_some()),
+        };
+        crate::incremental::update_census(|census| census.post_seam = Some(state));
+    }
     let record = program
         .seam
         .as_ref()

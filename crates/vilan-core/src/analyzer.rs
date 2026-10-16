@@ -79469,6 +79469,14 @@ impl Program<'_> {
             .partition_point(|(start, _)| *start <= id.0);
         !(index > 0 && id.0 < seam.warm_ranges[index - 1].1)
     }
+
+    /// M159: whether a front end SEEDED this analysis's post-pass seam — the
+    /// language server's every analysis, a lone open document's included
+    /// (door (a)) — so the post passes' record was filed and read. `false`
+    /// when no seam was built.
+    pub fn post_seam_seeded(&self) -> bool {
+        self.seam.as_ref().is_some_and(|seam| seam.seeded)
+    }
 }
 
 /// What a resolved pre-entry world is a function of, apart from the loaded
