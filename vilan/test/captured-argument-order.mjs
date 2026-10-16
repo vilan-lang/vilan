@@ -18,6 +18,10 @@ function as_usize(self) {
 	const widened = Number(self);
 	return Number(saturate_unsigned(widened));
 }
+function restock() {
+	shelf = [ [ "x", "y", "z" ] ];
+	return 0;
+}
 function measured(self, extra) {
 	return self[0].length + as_usize(extra);
 }
@@ -48,6 +52,7 @@ function unwrap_or(self, fallback) {
 	}
 	return $f;
 }
+let shelf = [ [ "a" ] ];
 let words = [ [ "a" ] ];
 let count = 0;
 const swap = () => {
@@ -69,4 +74,9 @@ let plain = [ [ "a" ] ];
 const $g = plain;
 plain = [ [ "x", "y" ] ];
 console.log(String(size($g, 0)));
+const $h = restock();
+console.log(String(measured(shelf, $h)));
+shelf = [ [ "a" ] ];
+const $i = restock();
+console.log(String(size(shelf, $i)));
 //# sourceMappingURL=captured-argument-order.mjs.map

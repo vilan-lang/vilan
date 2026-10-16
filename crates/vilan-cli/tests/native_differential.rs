@@ -13533,6 +13533,117 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
     );
 }
 
+/// papers-54's F?3: a `for x in subject` over a type whose INHERENT
+/// `next(self): Option<T>` awaits — the shape `fs::Watcher` and `BodyReader`
+/// pull by hand with a bare loop — was emitted `while let Some(x) =
+/// next(&mut iterator)` with no `.await`, which cargo refused (E0308,
+/// "expected future, found `Option`"); the JS lowering awaited it. The step
+/// is awaited natively now, and both print the same.
+#[test]
+fn an_awaiting_inherent_next_drives_a_for_loop_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_async_inherent_for_in.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/async_inherent_for_in.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "tick 2\ntick 1\ntick 0\ndone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// native-54's F?1: `Option::take` / `Option::replace` over a receiver that
+/// lives in a CELL natively — a module-level binding (`module_maybe.take()`),
+/// a field of one, a captured binding, a `Shared` view's field
+/// (`cell.write().maybe.take()`) — rendered the receiver through the reading
+/// arm, a copy out of the cell, so the take answered the value and left the
+/// binding holding it (`Some(1)` where JS prints `None`). The receiver is a
+/// place now, as a `List`'s `pop` receiver is; a plain local, its field and a
+/// `&mut self` field are the controls (they were places already).
+#[test]
+fn an_option_take_through_a_cell_writes_the_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_option_take_through_a_cell.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/option_take_through_a_cell.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "Some(1)\nNone\nSome(1)\nNone\nSome(2)\nNone\nNone\nSome(4)\nSome(4)\nNone\n\
+                    Some(1)\nNone\nSome(1)\nSome(6)\nSome(1)\nNone\nSome(1)\nNone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// native-54's N?3: a by-value read of a module-level binding at a consuming
+/// position — `has(module_items, 9)` beside a later read, a field and a tuple
+/// slot of one — is `cell.get()` natively, a whole-value copy already, and
+/// rule 1's consumed-place copy cloned it again (`(MODULE.with(|cell|
+/// cell.get())).clone()`). The emission pin: no module read is cloned twice.
+#[test]
+fn a_module_binding_read_by_value_is_copied_once_natively() {
+    let staged = stage();
+    let file = "native_probe_module_read_copied_once.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/module_read_copied_once.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "false\ntrue\ntrue\ntrue\nfalse\n4\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        !main.contains("cell.get())).clone()") && !main.contains("cell.get()).items).clone()"),
+        "a module binding's read is copied once:\n{main}"
+    );
+}
+
+/// std-54's B?1: a void `main` whose TAIL is a void-typed expression — a
+/// `match` of void arms, a std call written without its `;`, a user call the
+/// same — beside a spawned task still pending. The JS lowering decided the
+/// tail's disposition by its syntax and forwarded it to `process.exit`,
+/// which dropped the task's output (`the spawned task finished` printed
+/// natively only); the `;`-less call's native `main` did not build (the
+/// tail ran into the appended `run_pending()`). The disposition is the
+/// tail's TYPE now, and both backends print both lines.
+#[test]
+fn a_void_main_tail_waits_for_pending_work_on_both_backends() {
+    let staged = stage();
+    for (file, source, tail) in [
+        (
+            "native_probe_main_match_tail.vl",
+            include_str!("native/main_match_tail.vl"),
+            "the tail is a match",
+        ),
+        (
+            "native_probe_main_call_tail.vl",
+            include_str!("native/main_call_tail.vl"),
+            "the tail is a call with no semicolon",
+        ),
+        (
+            "native_probe_main_user_tail.vl",
+            include_str!("native/main_user_tail.vl"),
+            "the tail is a user call",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let expected = format!("{tail}\nthe spawned task finished\n");
+        assert_eq!(
+            both_stdouts(&staged, file),
+            (expected.clone(), expected),
+            "{file}"
+        );
+    }
+}
+
 /// The stdout of `file` on the JS and on the native backend.
 fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
     let run = |arguments: &[&str]| {
@@ -13672,6 +13783,19 @@ fn f138_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same
 /// an `&Option` beside a closure that writes it (`None` — a copy taken in
 /// order), while the same `&Option` beside a block that writes it is a view
 /// taken last (`Some(2)`).
+///
+/// F143: the same order for a MODULE-LEVEL `mut` binding, which any call a
+/// later argument makes can reach — by value (an in-place write and a
+/// re-bind), a `&`, a `&self` receiver direct and through a generic callee,
+/// a `push` and a user `&mut self` receiver beside a re-bind, a field spine,
+/// a reading intrinsic's receiver, a scalar `&` and an `&Option` (a module
+/// binding's `&` waits whatever its type). The base answered differently on
+/// the two backends at six of the fourteen and read the binding where it
+/// stood on both at seven more; the scalar by value (`9`) is the control.
+/// A `&mut` argument over a module binding beside a `&` one that runs code
+/// (`both(&mut module_items, &refill())`, `refill` re-binding it) settles the
+/// `&` one first natively, where it had been evaluated under the cell's
+/// borrow and stopped with the reentrancy sentence (JS: `2`).
 #[test]
 fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_arguments_on_both_backends()
  {
@@ -13682,7 +13806,8 @@ fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_argumen
         include_str!("native/captured_binding_argument_rebound.vl"),
     )
     .expect("write the probe program");
-    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n";
+    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n\
+                    true\ntrue\ntrue\ntrue\n2\n3\n3\ntrue\ntrue\ntrue\n9\n5\nSome(3)\n9\n2\n";
     assert_eq!(
         both_stdouts(&staged, file),
         (expected.to_string(), expected.to_string()),

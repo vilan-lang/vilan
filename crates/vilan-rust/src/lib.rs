@@ -4898,6 +4898,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 parameters.join(", ")
             );
         }
+        // std-54's B?1 (its native half): a void `main` whose tail is a call
+        // written without its `;` (`print("x")`) left that call as the
+        // closure's tail expression, and the `run_pending()` appended below
+        // followed it with no `;` between — rustc refused the build. The tail
+        // is `()` (the checker holds a void `main` to it), so ending it as a
+        // statement changes nothing else.
+        if is_main && !is_async && !answers_an_exit_code {
+            let end = body.trim_end().len();
+            if !body[..end].ends_with([';', '}', '{']) && end > 0 {
+                body.insert(end, ';');
+            }
+        }
         out.push_str(&body);
         // F20: node runs its event loop AFTER the module's top level returns, so
         // a synchronous `main` that left a microtask behind — which
@@ -9826,6 +9838,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         };
+        // papers-54's F?3: an INHERENT `next` that awaits (`next(self):
+        // Option<T>` whose body suspends — the shape `fs::Watcher` and
+        // `BodyReader` pull by hand) is awaited at every step, as the JS
+        // lowering awaits it (`for_each_next_dispatch`'s `async_functions`
+        // answer). The trait form stays refused for an async `next` by the
+        // `&mut`-across-suspension rule, so the recorded member is the one
+        // asked.
+        let awaits = self.program.async_functions.contains(&next_id);
+        let step = |call: String| {
+            if awaits { Self::awaited(&call) } else { call }
+        };
         // F95: `for e in &mut c` drives `next_mut` on the container ITSELF —
         // each element a writable view into it — so the place is borrowed
         // for every step rather than copied.
@@ -9838,8 +9861,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let mut body = String::new();
             self.emit_block(statements, tail, &mut body, depth + 1)?;
             let pad = Self::indent(depth);
+            let next_step = step(format!("{next}(&mut {place_text})"));
             return Ok(format!(
-                "while let Some({binder}) = {next}(&mut {place_text}) {{\n{body}{pad}}}"
+                "while let Some({binder}) = {next_step} {{\n{body}{pad}}}"
             ));
         }
         // The iterable is CONSUMED by the loop (the iterator is advanced), so a
@@ -9853,9 +9877,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.emit_block(statements, tail, &mut body, depth + 2)?;
         let pad = Self::indent(depth);
         let inner = Self::indent(depth + 1);
+        let next_step = step(format!("{next}(&mut iterator)"));
         Ok(format!(
             "{{\n{inner}let mut iterator = {iterable_text};\n\
-             {inner}while let Some({binder}) = {next}(&mut iterator) {{\n{body}{inner}}}\n{pad}}}"
+             {inner}while let Some({binder}) = {next_step} {{\n{body}{inner}}}\n{pad}}}"
         ))
     }
 
@@ -12921,6 +12946,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
             .collect();
         let defers_copies = defers_a_copy.contains(&true);
+        // F143: a `&mut` argument over a MODULE-LEVEL binding borrows its
+        // `thread_local!` cell for the call, taken where the call is made —
+        // so a `&` argument that runs code (`both(&mut global, &reset())`,
+        // `reset` re-binding `global`) is settled ahead of it as the by-value
+        // ones are, rather than evaluated under the borrow (the runtime's
+        // reentrancy stop; JS reads `global` after `reset()`).
+        let borrows_a_module_cell = argument_ids.iter().enumerate().any(|(index, argument)| {
+            matches!(conventions.get(index), Some(Receiving::RefMut))
+                && self
+                    .module_place_subscripts_run_code(match self.program.entity_map.get(argument) {
+                        Some(&Expr::Reference(operand, _)) => operand,
+                        _ => *argument,
+                    })
+                    .is_some()
+        });
         let borrows_a_cell =
             borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies;
         let mut deferred_copies = String::new();
@@ -13059,7 +13099,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // settled in order with the by-value ones, ahead of it.
             let lent = matches!(conventions.get(index), Some(Receiving::Ref));
             let lends = lent && !already_a_reference;
-            if defers_a_copy[index] || (defers_copies && lent && !self.runs_no_code(*argument)) {
+            if defers_a_copy[index]
+                || ((defers_copies || borrows_a_module_cell)
+                    && lent
+                    && !self.runs_no_code(*argument))
+            {
                 let name = if defers_a_copy[index] {
                     format!("__copied{index}")
                 } else {
@@ -13515,28 +13559,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(&Expr::Reference(operand, false)) => operand,
             _ => argument,
         };
-        let Some((root, steps)) = self.cell_spine(place) else {
-            return false;
+        // F143: a spine over a MODULE-LEVEL `mut` binding is a copy out of its
+        // `thread_local!` cell, and any call a later argument makes can reach
+        // the binding — so it waits as a captured binding's copy does. It is
+        // never a view (`takes_a_cell_view`): a callee reaching the binding
+        // would meet the borrow.
+        let (module_root, subscripts_run_code) = match self.cell_spine(place) {
+            // F135 (R-a, door (1)): a spine through a `Shared` view is a
+            // `read()`, which COPIES where it is evaluated (spec §6.7) — on
+            // JS too, which copies such an argument when a later one writes
+            // the cell (the analyzer's `clone_sites`) — so it is read where
+            // it stands.
+            Some((CellRoot::View(_), _)) => return false,
+            Some((CellRoot::Boxed(_), steps)) => (
+                false,
+                steps.iter().any(|step| {
+                    matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript))
+                }),
+            ),
+            None => match self.module_place_subscripts_run_code(place) {
+                Some(subscripts_run_code) => (true, subscripts_run_code),
+                None => return false,
+            },
         };
-        // F135 (R-a, door (1)): a spine through a `Shared` view is a
-        // `read()`, which COPIES where it is evaluated (spec §6.7) — on JS
-        // too, which copies such an argument when a later one writes the cell
-        // (the analyzer's `clone_sites`) — so it is read where it stands.
-        if matches!(root, CellRoot::View(_)) {
-            return false;
-        }
-        let subscripts_run_code = steps.iter().any(
-            |step| matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript)),
-        );
         // A `&` of a scalar place (a number, `bool`, `str`) is a `(base, key)`
         // pair on JS, read through when the callee reads it — after the later
         // arguments, as spec §6.9's view of the binding is — so it waits as an
         // aggregate does. (A `&` of an enum or a tuple is the value JS held
-        // when it was evaluated, as natively.)
-        let read_late_on_js = self.type_of(place).is_some_and(|type_id| {
-            self.aliases_on_the_js_backend(type_id)
-                || (!by_value && self.views_as_a_pair_on_the_js_backend(type_id))
-        });
+        // when it was evaluated, as natively — save over a module-level
+        // binding, whose `&` the JS backend reads after the later arguments
+        // whatever its type, F143.)
+        let read_late_on_js = (!by_value && module_root)
+            || self.type_of(place).is_some_and(|type_id| {
+                self.aliases_on_the_js_backend(type_id)
+                    || (!by_value && self.views_as_a_pair_on_the_js_backend(type_id))
+            });
         if subscripts_run_code
             || !read_late_on_js
             || (by_value && self.copy_applies(self.program.clone_sites.get(&argument)))
@@ -13558,6 +13615,35 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         Some(Receiving::RefMut) => false,
                     }
             })
+    }
+
+    /// F143: whether `place` is a spine — fields, tuple slots, subscripts —
+    /// over a module-level `mut` binding (a `thread_local!` cell, F30), and
+    /// then whether any of its subscripts runs code. `None` for any other
+    /// place.
+    fn module_place_subscripts_run_code(&self, place: Id) -> Option<bool> {
+        let mut subscripts_run_code = false;
+        let mut current = place;
+        loop {
+            match *self.program.entity_map.get(&current)? {
+                Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => current = subject,
+                Expr::Index(subject, subscript) => {
+                    subscripts_run_code |= !self.runs_no_code(subscript);
+                    current = subject;
+                }
+                Expr::Local(binding)
+                    if self.module_bindings.contains(&binding)
+                        && self
+                            .program
+                            .variables
+                            .get(&binding)
+                            .is_some_and(|variable| variable.mutable) =>
+                {
+                    return Some(subscripts_run_code);
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// F129: whether the JS backend hands a value of `type_id` on BY REFERENCE
@@ -14087,6 +14173,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(self.copy_a_consumed_place_read(id, rendered))
     }
 
+    /// Whether `id` is a module-level binding read by value — rendered
+    /// `cell.get()`, a copy already — or a field or tuple slot spine over one.
+    fn reads_a_module_binding_copy(&self, id: Id) -> bool {
+        let mut current = id;
+        loop {
+            match self.program.entity_map.get(&current) {
+                Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
+                    current = subject;
+                }
+                Some(Expr::Local(binding)) => return self.module_bindings.contains(binding),
+                _ => return false,
+            }
+        }
+    }
+
     /// Rule 1's copy at a position that CONSUMES its value, for the reads
     /// `clone_sites` deliberately elides (F20).
     ///
@@ -14110,6 +14211,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // boxed binding, or the boxed binding itself — is a copy already
         // (F62, F103); a second one copied it twice.
         if self.reads_through_a_shared_view(id) || self.boxed_root(id).is_some() {
+            return rendered;
+        }
+        // native-54's N?3: so is a read of a MODULE-LEVEL binding — `cell.get()`
+        // out of its `thread_local!` — and a field or tuple slot of one, moved
+        // out of that owned copy. (An element is not: moving out of a `Vec`
+        // temporary's element is refused, E0507, so it keeps its copy.)
+        if self.reads_a_module_binding_copy(id) {
             return rendered;
         }
         let reads_a_place = match self.program.entity_map.get(&id) {
@@ -15582,7 +15690,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest
         // are values.
-        let mutating = mutates_its_receiver(intrinsic);
+        // F?1 (native-54's find): `Option::take` and `Option::replace` write
+        // their receiver too. Rendered through the reading arm, a receiver
+        // that lives in a cell — a module-level binding's `thread_local!`, a
+        // captured binding, a `Shared` view's field — was a COPY out of it, so
+        // `module_maybe.take()` answered the value and left the binding
+        // holding it (JS: `None` after the take).
+        let mutating = mutates_its_receiver(intrinsic)
+            || matches!(intrinsic, Intrinsic::OptionTake | Intrinsic::OptionReplace);
         // F30: a mutating receiver that lives in a CELL holds a borrow of it
         // for the whole call, and Rust evaluates the receiver BEFORE the
         // arguments — so `counts.push(counts.len())` met its own live borrow
@@ -15656,6 +15771,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{view_borrows}{rendered} }}"));
+        }
+        // F143: a READING intrinsic's receiver over a module-level `mut`
+        // binding — `names.contains(rename())`, `log.items.get(index())` — is
+        // copied out of its `thread_local!` cell AFTER the other arguments
+        // when one of them runs code (any call can reach the binding), as a
+        // captured binding's view above is taken last and as the JS backend
+        // reads the receiver.
+        if !mutating
+            && reads_its_receiver_in_place(intrinsic)
+            && argument_ids.first().is_some_and(|receiver| {
+                let place = match self.program.entity_map.get(receiver) {
+                    Some(&Expr::Reference(operand, _)) => operand,
+                    _ => *receiver,
+                };
+                !self.is_natively_copy(place)
+                    && self.module_place_subscripts_run_code(place) == Some(false)
+            })
+            && argument_ids
+                .iter()
+                .skip(1)
+                .any(|argument| !self.runs_no_code(*argument))
+        {
+            let mut prelude = String::new();
+            let mut arguments = Vec::new();
+            for (index, argument) in argument_ids.iter().enumerate().skip(1) {
+                let expecting = self.intrinsic_argument_expectation(intrinsic, index);
+                let value = self.value_of_expecting(*argument, expecting, depth)?;
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {value}; ");
+                arguments.push(name);
+            }
+            let expecting = self.intrinsic_argument_expectation(intrinsic, 0);
+            let saved = std::mem::replace(&mut self.expected_type, expecting);
+            let receiver = self.expression(argument_ids[0], depth);
+            self.expected_type = saved;
+            arguments.insert(0, receiver?);
+            let rendered = self.intrinsic(intrinsic, arguments, span)?;
+            return Ok(format!("{{ {prelude}{rendered} }}"));
         }
         // F42: the expectation in force here is the one for the intrinsic's
         // RESULT, and an argument is not its result. Rendered under it, the

@@ -13,13 +13,28 @@
 // (`count`) by value is read where it stands too; and a variant built from
 // settled values (`Some(1)`) runs no code, so nothing waits beside it.
 //
+// F143: a MODULE-LEVEL `mut` binding (`shelf`) waits the same way — any call
+// a later argument makes can reach it, so `shelf.measured(restock())` hands
+// the callee the re-bound `shelf` (3), by value too, natively a copy out of
+// its `thread_local!` cell taken after the later arguments.
+//
 // witness: const $a = swap(); console.log(String(measured(words, $a)));
 // witness: const $b = note("first"); const $c = swap(); console.log(String(traced($b, words, $c)));
 // witness: console.log(String(size(words, 0)));
 // witness: console.log(String(sized(words, [ 0, 1 ])));
 // witness: const $d = plain;
 // witness-absent: measured(words, swap())
+// witness: const $h = restock(); console.log(String(measured(shelf, $h)));
+// witness: const $i = restock(); console.log(String(size(shelf, $i)));
+// witness-absent: measured(shelf, restock())
 import std::io::print;
+
+mut shelf = Words { items = ["a"] };
+
+fun restock(): i32 {
+	shelf = Words { items = ["x", "y", "z"] };
+	0
+}
 
 struct Words {
 	items: List<str>,
@@ -72,4 +87,7 @@ fun main() {
 		plain = Words { items = ["x", "y"] };
 		0
 	}));
+	print(shelf.measured(restock()));
+	shelf = Words { items = ["a"] };
+	print(size(shelf, restock()));
 }
