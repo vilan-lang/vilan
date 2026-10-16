@@ -13894,3 +13894,23 @@ fn b628_a_literal_none_field_answers_on_both_backends() {
         "a literal's `None` field must type the same natively"
     );
 }
+
+/// B627 / std-53's A?1: an expected type reaching a receiver call through a
+/// method — a static's impl binder (an internal error on JS before), a derived
+/// decode, a free call's own generic, an external member's own length —
+/// answers the same on both backends.
+#[test]
+fn b627_an_expected_type_through_a_receiver_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_expected_type_through_a_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/expected_type_through_a_receiver.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an expectation through a receiver must bind the same natively"
+    );
+}

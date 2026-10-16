@@ -5945,6 +5945,10 @@ pub struct Analyzer<'src> {
     // E309: those refusals, held: the message and the entity the name
     // resolved to.
     deferred_not_a_value: HashMap<Id, (String, Id)>,
+    // B627: the generics the binding residual sweep (`finalize_build`)
+    // already reported as "never fully determined" — the bound check's
+    // undetermined-call refusal stands down for them (one refusal per root).
+    swept_residual_generics: HashSet<TypeId>,
     // B569 §4.1: a labelled literal matched BY NAME against a labelled type
     // whose order differs — `let p: (x: f64, y: f64) = (y = 7, x = 5);` —
     // keyed by the literal: the written entry each storage slot takes, and
@@ -8227,6 +8231,7 @@ impl<'src> Analyzer<'src> {
             spaced_generic_calls: HashMap::default(),
             spaced_generic_operands: HashSet::default(),
             deferred_not_a_value: HashMap::default(),
+            swept_residual_generics: HashSet::default(),
             tuple_literal_layouts: HashMap::default(),
             tuple_literal_label_problems: HashMap::default(),
             named_arguments: Vec::new(),
@@ -9656,6 +9661,7 @@ impl<'src> Analyzer<'src> {
             // the native build emitted one instance for every instantiation
             // (`A A` for a `Holder<B>`) — so it is this invariant's case.
             let mut unbindable = Vec::new();
+            let mut undetermined: Vec<(TypeId, Type)> = Vec::new();
             if self
                 .function_calls
                 .get(&call_id)
@@ -9671,11 +9677,87 @@ impl<'src> Analyzer<'src> {
                     let return_type = return_type_id.get_type(self);
                     self.collect_generics(&return_type, 0, &mut in_return);
                 }
-                unbindable = self
-                    .impl_binder_generics(member_id)
+                let binders = self.impl_binder_generics(member_id);
+                // B627: a bounded binder the RETURN mentions is bound where the
+                // result lands — and when nothing it lands in names it (`let
+                // held = Holder::build().unwrap();`), the call's settled type
+                // still carries the binder itself, and so does what it lands
+                // in (`undetermined_value_flows_on`; a result landing in a
+                // position its consumer typed — `Signal::new(HashMap::new())`
+                // under an annotated binding — is that position's to type).
+                // JS then reached the bound trait's body-less requirement (an
+                // internal error) and the native build refused the unbound
+                // parameter as a backend gap; the program is incomplete, so it
+                // is refused here. The cheap tests first — a bounded binder the return carries
+                // that the call recorded no binding for, outside the enclosing
+                // declaration and not already named by the residual sweep —
+                // and the settled type only for a call that has one.
+                let open: Vec<TypeId> = binders
+                    .iter()
+                    .copied()
+                    .filter(|generic| {
+                        in_return.contains(generic)
+                            && !self.swept_residual_generics.contains(generic)
+                            && !self
+                                .method_call_substitution
+                                .get(&call_id)
+                                .is_some_and(|substitution| substitution.contains_key(generic))
+                            && !self.generic_bound_traits(*generic).is_empty()
+                            && !self.generic_is_enclosing_binder(*generic, call_id)
+                    })
+                    .collect();
+                if !open.is_empty() {
+                    let settled = self.infer_type(call_id, &Type::Unknown, &HashMap::default());
+                    let mut carried = Vec::new();
+                    self.collect_generics(&settled, 0, &mut carried);
+                    for generic in open {
+                        if carried.contains(&generic)
+                            && self.undetermined_value_flows_on(call_id, generic)
+                        {
+                            undetermined.push((generic, settled.clone()));
+                        }
+                    }
+                }
+                unbindable = binders
                     .into_iter()
                     .filter(|generic| !in_return.contains(generic))
                     .collect();
+            }
+            for (generic, settled) in std::mem::take(&mut undetermined) {
+                let generic_label =
+                    self.pretty_print_type(&Type::Generic(generic), &HashMap::default());
+                let settled_label = self.pretty_print_type(&settled, &HashMap::default());
+                // The path door names the impl's subject with its arguments
+                // written (`Holder<…>::build()`), when the subject is nominal.
+                let path_door = self
+                    .implementation_by_declaration
+                    .get(&member_id)
+                    .and_then(|index| self.implementations.get(*index))
+                    .and_then(
+                        |implementation| match implementation.subject.get_type(self) {
+                            Type::Struct(struct_id, _) => {
+                                self.structs.get(&struct_id).map(|s| s.name)
+                            }
+                            Type::Enum(enum_id, _) => self.enums.get(&enum_id).map(|e| e.name),
+                            _ => None,
+                        },
+                    )
+                    .zip(self.callable_name(member_id))
+                    .map(|(subject, member)| {
+                        format!(", or on the path (`{subject}<…>::{member}(…)`)")
+                    })
+                    .unwrap_or_default();
+                errors.push((
+                    call_id,
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    format!(
+                        "this call's result `{settled_label}` is never fully determined: nothing \
+                         it is passed binds '{generic_label}' and nothing its result lands in \
+                         names it. Write the type on the binding the result lands in (`let \
+                         value: … = …`){path_door}"
+                    ),
+                    generic,
+                ));
             }
             // B424, door (a) (the owner's ruling, 2026-09-28): an UNBOUNDED
             // own generic the call left free is refused too when the call's
@@ -23724,6 +23806,217 @@ impl<'src> Analyzer<'src> {
             selected = Some((*member_id, *impl_subject));
         }
         selected
+    }
+
+    /// B627: whether the value of `call_id`, whose settled type still carries
+    /// `generic`, ends where nothing decides it. The value is followed through
+    /// what it lands in — the binding it initializes, the call it is an
+    /// argument (or receiver) of — while each carrier's settled type still
+    /// carries the generic. A carrier the program TYPED decides it: a
+    /// position with an expectation that does not carry it (a struct
+    /// literal's field, an annotated binding, a parameter the callee fixes —
+    /// `Shared::new(HashMap::new())` as a `Shared<HashMap<str, Node>>` field),
+    /// or a landing whose own settled type no longer carries it. A binding
+    /// that still carries it, or a carrier only a field read or a statement
+    /// consumes, is undetermined.
+    fn undetermined_value_flows_on(&mut self, call_id: Id, generic: TypeId) -> bool {
+        let mut current = call_id;
+        // Each step moves to an enclosing expression, so the walk is bounded
+        // by the nesting depth; the cap only guards a malformed table.
+        for _ in 0..64 {
+            if let Some(expected_id) = self.expected_types.get(&current).copied() {
+                let expected = expected_id.get_type(self);
+                let mut carried = Vec::new();
+                self.collect_generics(&expected, 0, &mut carried);
+                if !matches!(expected, Type::Unknown | Type::Unresolved | Type::Any)
+                    && !carried.contains(&generic)
+                {
+                    return false;
+                }
+            }
+            let initialized: Vec<Id> = self
+                .variables
+                .iter()
+                .filter(|(_, variable)| variable.initial == Some(current))
+                .map(|(variable_id, _)| *variable_id)
+                .collect();
+            if !initialized.is_empty() {
+                return initialized
+                    .into_iter()
+                    .any(|variable_id| self.settled_type_carries(variable_id, generic));
+            }
+            let consumer = self
+                .function_calls
+                .iter()
+                .find(|(_, consumer)| consumer.argument_ids.contains(&current))
+                .map(|(consumer_id, _)| *consumer_id);
+            match consumer {
+                Some(consumer_id) if self.settled_type_carries(consumer_id, generic) => {
+                    current = consumer_id;
+                }
+                Some(_) => return false,
+                // A field read off the carrier, or a statement discarding it,
+                // consumes it untyped (`print(Holder::build().unwrap().value)`,
+                // `Holder::build();`): the instance is emitted undetermined.
+                // Any other position (a list element, a tuple, a typed return)
+                // is that position's to type.
+                None => {
+                    return self.expr_id_to_expr_map.values().any(|expr| match expr {
+                        Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..) => {
+                            *subject == current
+                        }
+                        Expr::Block((statements, _)) => statements.contains(&current),
+                        _ => false,
+                    });
+                }
+            }
+        }
+        false
+    }
+
+    /// B627: whether `id`'s settled type mentions `generic`.
+    fn settled_type_carries(&mut self, id: Id, generic: TypeId) -> bool {
+        let settled = self.infer_type(id, &Type::Unknown, &HashMap::default());
+        let mut carried = Vec::new();
+        self.collect_generics(&settled, 0, &mut carried);
+        carried.contains(&generic)
+    }
+
+    /// [`Self::infer_type_path`]'s external-callee arm: the external's OWN
+    /// generics its return alone carries, bound by reconciling the (receiver-
+    /// substituted) return with the call's expectation and recorded on the
+    /// call — the bodied arm's reconcile-and-record, narrowed to the generics
+    /// the external itself declares (B627).
+    fn record_external_return_generics(
+        &mut self,
+        call_id: Id,
+        function_id: Id,
+        return_type: &Type,
+        constraint: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        if matches!(constraint, Type::Unknown | Type::Unresolved | Type::Any) {
+            return;
+        }
+        let Some(own_generics) = self
+            .external_functions
+            .get(&function_id)
+            .map(|function| function.generic_parameter_constraint_ids.clone())
+        else {
+            return;
+        };
+        if own_generics.is_empty() {
+            return;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(return_type, 0, &mut carried);
+        if !own_generics.iter().any(|generic| carried.contains(generic)) {
+            return;
+        }
+        let previously_inferable =
+            std::mem::replace(&mut self.inferable_generics, own_generics.clone());
+        let reconciled = self.reconcile_type(return_type, constraint, substitution_context);
+        self.inferable_generics = previously_inferable;
+        let Some((_, bindings)) = reconciled else {
+            return;
+        };
+        for (generic, bound_to) in bindings {
+            let foreign = match *bound_to.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
+            if own_generics.contains(&generic)
+                && !foreign
+                && !self.generic_is_enclosing_binder(generic, call_id)
+            {
+                self.method_call_substitution
+                    .entry(call_id)
+                    .or_default()
+                    .entry(generic)
+                    .or_insert(bound_to);
+            }
+        }
+    }
+
+    /// B627 / std-53's A?1: a method call's EXPECTATION reaches its receiver.
+    /// `let held: Holder<i32> = Holder::build().unwrap();` expects `unwrap`'s
+    /// result to be a `Holder<i32>`, and `unwrap` on an `Option<Holder<T>>`
+    /// answers that `Holder<T>` — so the receiver call is `Option<Holder<i32>>`,
+    /// and the static's impl binder `T` is `i32`. Method resolution runs
+    /// receiver-first, so the receiver call settled before the expectation
+    /// reached the method: its generic stayed the impl's binder (JS reached
+    /// `Make`'s body-less `make`, an internal error, while the native build
+    /// read the binding's type and ran), and a free call's own generic
+    /// (`make().unwrap_or(3)`, `xs.to_array().unwrap()`) was refused "cannot
+    /// infer". The receiver is re-inferred DIRECTED at the type the
+    /// expectation implies — `resolve_try_assert`'s precedent for `call()!`,
+    /// whose call arm records the bindings for monomorphization.
+    ///
+    /// Only a receiver that is a CALL and still carries a generic nothing at
+    /// this site holds rigid is directed, and only through what the member's
+    /// return type (its impl's binders bound from the receiver) says about
+    /// those generics; `None` when the expectation decides nothing new.
+    fn receiver_directed_by_expectation(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> Option<Type> {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&subject_id),
+            Some(Expr::Call(_))
+        ) {
+            return None;
+        }
+        let expected = self.expected_types.get(&call_id)?.get_type(self);
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+            return None;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(subject_type, 0, &mut carried);
+        let open: Vec<TypeId> = carried
+            .into_iter()
+            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
+        let impl_subject = self.implementations.get(implementation_index)?.subject;
+        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        // The member's own generics are open in its answer too (a `map<U>`
+        // returning `Option<U>`), but they are the member's to bind, from
+        // its arguments; only the receiver's generics are taken from here.
+        let mut inferable = open.clone();
+        if let Some((_, own_generics)) = self.method_signature_ref(member_id) {
+            inferable.extend_from_slice(own_generics);
+        }
+        let previously_inferable = std::mem::replace(&mut self.inferable_generics, inferable);
+        let reconciled = self.reconcile_type(&answered, &expected, &HashMap::default());
+        self.inferable_generics = previously_inferable;
+        let (_, bindings) = reconciled?;
+        let mut directed_by: SubstitutionContext = HashMap::default();
+        for (generic, bound_to) in bindings {
+            // B351's rule, the value side: an expectation that is itself some
+            // other call's abstract generic is not evidence.
+            let foreign = match *bound_to.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
+            if open.contains(&generic) && !foreign {
+                directed_by.entry(generic).or_insert(bound_to);
+            }
+        }
+        if directed_by.is_empty() {
+            return None;
+        }
+        let directed = self.substitute_type(subject_type, &directed_by);
+        let redirected = self.infer_type(subject_id, &directed, &HashMap::default());
+        match redirected {
+            Type::Unresolved | Type::Unknown => None,
+            redirected => Some(redirected),
+        }
     }
 
     /// A candidate member's declared return type, with the declaring impl's own
@@ -47985,6 +48278,23 @@ impl<'src> Analyzer<'src> {
                             } else {
                                 return_type
                             };
+                            // B627 / std-53's A?1: an external member's OWN
+                            // generic fixed only by its return (`to_array<const
+                            // N>(self): Option<[T; N]>`) is recorded from the
+                            // call's expectation, as the declared path below
+                            // records a bodied one's — B424's check reads the
+                            // same substitution, and `xs.to_array().unwrap()`
+                            // reaches its receiver only through this
+                            // directed re-read. The impl's binders are not
+                            // the external's own and stay as the receiver and
+                            // the slot freshening below decide them.
+                            self.record_external_return_generics(
+                                id,
+                                function_id,
+                                &return_type,
+                                &constraint,
+                                substitution_context,
+                            );
                             // B280: the same guard the DECLARED return takes
                             // below (B263), plus the one thing the external
                             // path needs that the declared one does not.
@@ -57648,6 +57958,14 @@ impl<'src> Analyzer<'src> {
                     arguments_span,
                 ),
             MethodLookup::Found(member_id) => {
+                // B627 / std-53's A?1: the call's expectation reaches its
+                // RECEIVER before anything reads the receiver's type —
+                // `Holder::build().unwrap()` into a `Holder<i32>` binds the
+                // static's impl binder, `make().unwrap_or(3)` into an `i32`
+                // binds `make`'s own `T`.
+                let subject_type = self
+                    .receiver_directed_by_expectation(id, subject_id, member_id, &subject_type)
+                    .unwrap_or_else(|| subject_type.clone());
                 // Drive bidirectional inference of any closure arguments against the
                 // method's parameter types, and defer a full argument type-check.
                 let mut substitution = self
@@ -72075,6 +72393,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        self.swept_residual_generics.clear();
         let variable_ids: Vec<Id> = self.variables.keys().copied().collect();
         for variable_id in variable_ids {
             // The hazard is USES checking vacuously — a binding nothing reads
@@ -72115,6 +72434,8 @@ impl<'src> Analyzer<'src> {
                     .is_some_and(|declared_in| !declared_in.contains(&source))
             });
             if leaked {
+                self.swept_residual_generics
+                    .extend(residuals.iter().copied());
                 let name = self
                     .variables
                     .get(&variable_id)
