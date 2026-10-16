@@ -909,9 +909,19 @@ fn e309_a_spaced_comparison_of_values_or_a_plain_function_keeps_its_refusals() {
 // held for the site like the type in value position, and the site steers when
 // the receiver's type has a generic method of that name.
 
-const E319_HEAD: &str = "struct Holder {\n    tag: i32,\n}\n\
-impl Holder {\n    fun make<U>(self, u: U): U {\n        u\n    }\n    \
-fun plain(self, u: i32): i32 {\n        u\n    }\n}\n";
+const E319_HEAD: &str = r#"
+struct Holder {
+    tag: i32,
+}
+impl Holder {
+    fun make<U>(self, u: U): U {
+        u
+    }
+    fun plain(self, u: i32): i32 {
+        u
+    }
+}
+"#;
 
 #[test]
 fn e319_a_spaced_generic_method_call_gets_one_steer_naming_the_spacing() {
@@ -984,10 +994,23 @@ fn e319_a_spaced_non_generic_method_or_a_field_keeps_its_refusals() {
 
 // --- E320: a method named without its parentheses ---------------------------
 
-const E320_POINT: &str = "struct Point {\n    x: i32,\n    y: i32,\n}\n\
-impl Point {\n    fun norm(self): i32 {\n        self.x + self.y\n    }\n    \
-fun scaled(self, by: i32): i32 {\n        self.x * by\n    }\n    \
-fun origin(): Point {\n        Point { x = 0, y = 0 }\n    }\n}\n";
+const E320_POINT: &str = r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+impl Point {
+    fun norm(self): i32 {
+        self.x + self.y
+    }
+    fun scaled(self, by: i32): i32 {
+        self.x * by
+    }
+    fun origin(): Point {
+        Point { x = 0, y = 0 }
+    }
+}
+"#;
 
 /// `p.norm` was "struct 'Point' has no field 'norm'"; the refusal now says
 /// `norm` is a method and writes the call as the reader wrote the access —
