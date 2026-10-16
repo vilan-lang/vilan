@@ -6829,6 +6829,42 @@ fn b640_an_undetermined_static_as_an_inferred_functions_result_is_refused() {
     );
 }
 
+/// B640's closure residue: a CLOSURE is one value for every call — not
+/// instantiated per call site — so an undetermined static as its unannotated
+/// result is refused whatever its call sites say (JS reported the internal
+/// error for both); a closure literal at a position its consumer types
+/// (`run(|| Holder::build())` into an annotated binding) is decided there.
+#[test]
+fn b640_an_undetermined_static_as_a_closures_result_is_refused() {
+    for body in [
+        "let build = || Holder::build(); build();",
+        "let build = || Holder::build(); let held: Option<Holder<i32>> = build(); \
+         print(held.is_some());",
+    ] {
+        assert_fails_once_with(
+            &format!("{B627_HOLDER}\n        fun main() {{ {body} }}\n"),
+            "this call's result `Option<Holder<T>>` is never fully determined",
+        );
+    }
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun run<R>(body: || R): R {
+            body()
+        }
+
+        fun main() {
+            let held: Option<Holder<i32>> = run(|| Holder::build());
+            print(held.unwrap().value);
+        }
+        main();
+        "#
+        ),
+        "7\n",
+    );
+}
+
 /// B640's other door: a call site that types the result decides the binder,
 /// through the inferred function, and runs.
 #[test]

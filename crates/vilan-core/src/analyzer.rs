@@ -24078,7 +24078,19 @@ impl<'src> Analyzer<'src> {
                 }
             }
             let Some(function_id) = result_of else {
-                return false;
+                // A CLOSURE's result with no declared return type is one
+                // value for every call (a closure is not instantiated per
+                // call site, so no caller's type reaches back into its body):
+                // `let build = || Holder::build(); build();` is undetermined
+                // whatever its call sites say.
+                return self.closures.values().any(|closure| {
+                    closure.return_type_id.is_none()
+                        && (closure.return_ == current
+                            || closure
+                                .rets
+                                .iter()
+                                .any(|(_, value)| *value == Some(current)))
+                });
             };
             let call_sites: Vec<Id> = self
                 .function_calls
