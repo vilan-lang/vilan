@@ -491,7 +491,11 @@ fun pending_with(pending: Pending, touch: StoreTouch): Pending {
 	mut noted = pending;
 	match touch {
 		StoreTouch::Key(let hash) => noted.keys.push(hash),
-		StoreTouch::Span(let at, let removed, let inserted) => noted.spans.push((at, removed, inserted)),
+		StoreTouch::Span(let at, let removed, let inserted) => noted.spans.push((
+			at,
+			removed,
+			inserted
+		)),
 		StoreTouch::Whole => {
 			noted.whole = true;
 		},
@@ -1489,7 +1493,12 @@ export impl List<type T: StoreWire> with StoreWire {
 					serializer.begin_list(taking.as_i32());
 					mut index: usize = 0;
 					for index < taking {
-						let _described = self[first + index].store_describe_at(path, path.len(), serializer, true);
+						let _described = self[first + index].store_describe_at(
+							path,
+							path.len(),
+							serializer,
+							true,
+						);
 						index += 1;
 					}
 					serializer.end_list();
@@ -1791,7 +1800,9 @@ export impl RemoteStoreSome<Option<type P>> {
 export impl RemoteStore<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
 	fun at(self, key: K): RemoteStore<Option<V>> {
 		let local = self.local.at(key);
-		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)));
+		let at = self.at.below(
+			MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)),
+		);
 		RemoteStore {
 			local,
 			at = MirrorAt {
@@ -1806,7 +1817,9 @@ export impl RemoteStore<HashMap<type K: Hashable + Wire, type V: StoreWire + Sto
 export impl RemoteStoreSome<HashMap<type K: Hashable + Wire, type V: StoreWire + Storable>> {
 	fun at(self, key: K): RemoteStoreSome<Option<V>> {
 		let local = self.local.at(key);
-		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)));
+		let at = self.at.below(
+			MirrorStep::Key(|serializer: &mut Serializer| key.describe(serializer)),
+		);
 		// Through a variant the key's handle is a `StoreSome`: its applier writes
 		// only while the variant is live, through `patch`.
 		RemoteStoreSome {
@@ -1828,7 +1841,9 @@ export impl RemoteStoreSome<HashMap<type K: Hashable + Wire, type V: StoreWire +
 export impl RemoteStore<HashSet<type T: Hashable + Wire>> {
 	fun contains(self, member: T): RemoteStore<bool> {
 		let local = self.local.contains(member);
-		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)));
+		let at = self.at.below(
+			MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)),
+		);
 		RemoteStore {
 			local,
 			at = MirrorAt {
@@ -1848,7 +1863,9 @@ export impl RemoteStoreSome<HashSet<type T: Hashable + Wire>> {
 
 	fun contains(self, member: T): RemoteStoreSome<bool> {
 		let local = self.local.contains(member);
-		let at = self.at.below(MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)));
+		let at = self.at.below(
+			MirrorStep::Key(|serializer: &mut Serializer| member.describe(serializer)),
+		);
 		RemoteStoreSome {
 			local,
 			at = MirrorAt {
@@ -2271,7 +2288,9 @@ export macro fun store_struct_impls(target: StructItem): str {
 	mut store_impl = impl_of(i"Store<{target.name}{store_bare_binders(target.generics)}>");
 	mut some_impl = impl_of(i"StoreSome<{target.name}{store_bare_binders(target.generics)}>");
 	mut remote_impl = impl_of(i"RemoteStore<{target.name}{store_bare_binders(target.generics)}>");
-	mut remote_some_impl = impl_of(i"RemoteStoreSome<{target.name}{store_bare_binders(target.generics)}>");
+	mut remote_some_impl = impl_of(
+		i"RemoteStoreSome<{target.name}{store_bare_binders(target.generics)}>",
+	);
 	mut index: usize = 0;
 	for field in target.fields {
 		let method = if field.reactive_name != "" { field.reactive_name } else { field.name };
@@ -2288,10 +2307,32 @@ export macro fun store_struct_impls(target: StructItem): str {
 			"store_diff"
 		};
 		diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
-		store_impl = store_impl.member(store_projection("Store", subject, method, field.name, index, field.type_));
-		some_impl = some_impl.member(store_projection("StoreSome", subject, method, field.name, index, field.type_));
-		remote_impl = remote_impl.member(store_remote_projection("RemoteStore", "Store", subject, method, index, field.type_.render()));
-		remote_some_impl = remote_some_impl.member(store_remote_projection("RemoteStoreSome", "StoreSome", subject, method, index, field.type_.render()));
+		store_impl = store_impl.member(
+			store_projection("Store", subject, method, field.name, index, field.type_),
+		);
+		some_impl = some_impl.member(
+			store_projection("StoreSome", subject, method, field.name, index, field.type_),
+		);
+		remote_impl = remote_impl.member(
+			store_remote_projection(
+				"RemoteStore",
+				"Store",
+				subject,
+				method,
+				index,
+				field.type_.render(),
+			),
+		);
+		remote_some_impl = remote_some_impl.member(
+			store_remote_projection(
+				"RemoteStoreSome",
+				"StoreSome",
+				subject,
+				method,
+				index,
+				field.type_.render(),
+			),
+		);
 		index = index + 1;
 	}
 	diff = diff.line("store_wake_me(node, changed, woken);").expr("changed");
@@ -2550,7 +2591,9 @@ export macro fun store_struct_wire(target: StructItem): str {
 			steps.push(store_wire_if(i"index == {index}", [
 				i"ret self.{field.name}.store_describe_at(path, from + 1, serializer, write);",
 			]));
-			apply_whole.push(i"let _f{index} = self.{field.name}.store_apply_at(path, from, deserializer);");
+			apply_whole.push(
+				i"let _f{index} = self.{field.name}.store_apply_at(path, from, deserializer);",
+			);
 			apply_steps.push(store_wire_if(i"index == {index}", [
 				i"ret self.{field.name}.store_apply_at(path, from + 1, deserializer);",
 			]));
@@ -2710,7 +2753,9 @@ export macro fun store_enum_wire(target: EnumItem): str {
 				payload_reads.push(i"let __p{position}: {type_.render()} = store_wire_closure();");
 			} else {
 				described.push(i"let _p{position} = p{position}.store_describe_at(path, from, serializer, true);");
-				payload_reads.push(i"let __p{position} = store_fresh_of<{type_.render()}>(deserializer);");
+				payload_reads.push(
+					i"let __p{position} = store_fresh_of<{type_.render()}>(deserializer);",
+				);
 			}
 			fresh_parts.push(i"__p{position}");
 			position = position + 1;
@@ -2756,7 +2801,9 @@ export macro fun store_enum_wire(target: EnumItem): str {
 					merged.push(i"let m{position}: {type_.render()} = store_wire_closure();");
 				} else {
 					merged.push(i"mut m{position} = p{position};");
-					merged.push(i"let _m{position} = m{position}.store_apply_at(path, from, deserializer);");
+					merged.push(
+						i"let _m{position} = m{position}.store_apply_at(path, from, deserializer);",
+					);
 				}
 				spread.push(i"m{position}");
 				position = position + 1;

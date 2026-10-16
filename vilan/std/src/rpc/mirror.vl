@@ -708,51 +708,53 @@ impl MirrorChannel {
 			ret;
 		}
 		let session = self.session;
-		session.transport.send(encode_patch(session.codec, self.channel, |mut serializer: Serializer| {
-			serializer.begin_list(ops.len().as_i32());
-			for op in ops {
-				match op.kind {
-					MirrorOpKind::Seed => {
-						serializer.begin_variant("Seed", 2);
-						serializer.i32_value(op.slot);
-						let _seed = (op.describe)(op.at, serializer);
-						serializer.end_variant();
-					},
-					MirrorOpKind::Set => {
-						serializer.begin_variant("Set", 3);
-						serializer.i32_value(op.slot);
-						describe_steps(op.rel, &mut serializer);
-						let _set = (op.describe)(op.at, serializer);
-						serializer.end_variant();
-					},
-					MirrorOpKind::Gone => {
-						serializer.begin_variant("Gone", 1);
-						serializer.i32_value(op.slot);
-						serializer.end_variant();
-					},
-					MirrorOpKind::Seq(let at, let removed) => {
-						serializer.begin_variant("Seq", 3);
-						serializer.i32_value(op.slot);
-						describe_steps(op.rel, &mut serializer);
-						serializer.begin_variant("Splice", 3);
-						serializer.i32_value(at.as_i32());
-						serializer.i32_value(removed.as_i32());
-						let _inserted = (op.describe)(op.at, serializer);
-						serializer.end_variant();
-						serializer.end_variant();
-					},
-					MirrorOpKind::Keys => {
-						serializer.begin_variant("Keys", 2);
-						serializer.i32_value(op.slot);
-						serializer.begin_variant("Reset", 1);
-						let _keys = (op.describe)(op.at, serializer);
-						serializer.end_variant();
-						serializer.end_variant();
-					},
+		session.transport.send(
+			encode_patch(session.codec, self.channel, |mut serializer: Serializer| {
+				serializer.begin_list(ops.len().as_i32());
+				for op in ops {
+					match op.kind {
+						MirrorOpKind::Seed => {
+							serializer.begin_variant("Seed", 2);
+							serializer.i32_value(op.slot);
+							let _seed = (op.describe)(op.at, serializer);
+							serializer.end_variant();
+						},
+						MirrorOpKind::Set => {
+							serializer.begin_variant("Set", 3);
+							serializer.i32_value(op.slot);
+							describe_steps(op.rel, &mut serializer);
+							let _set = (op.describe)(op.at, serializer);
+							serializer.end_variant();
+						},
+						MirrorOpKind::Gone => {
+							serializer.begin_variant("Gone", 1);
+							serializer.i32_value(op.slot);
+							serializer.end_variant();
+						},
+						MirrorOpKind::Seq(let at, let removed) => {
+							serializer.begin_variant("Seq", 3);
+							serializer.i32_value(op.slot);
+							describe_steps(op.rel, &mut serializer);
+							serializer.begin_variant("Splice", 3);
+							serializer.i32_value(at.as_i32());
+							serializer.i32_value(removed.as_i32());
+							let _inserted = (op.describe)(op.at, serializer);
+							serializer.end_variant();
+							serializer.end_variant();
+						},
+						MirrorOpKind::Keys => {
+							serializer.begin_variant("Keys", 2);
+							serializer.i32_value(op.slot);
+							serializer.begin_variant("Reset", 1);
+							let _keys = (op.describe)(op.at, serializer);
+							serializer.end_variant();
+							serializer.end_variant();
+						},
+					}
 				}
-			}
-			serializer.end_list();
-		}));
+				serializer.end_list();
+			}),
+		);
 	}
 }
 
@@ -803,7 +805,10 @@ fun plan(ops: &mut List<MirrorOp>, grant: MirrorGrant, held: MirrorSlot, writes:
 	if held.keys {
 		for write in writes {
 			let at_or_above = starts_with(held.path, write.path);
-			let a_key = write.path.len() == held.path.len() + 1 && starts_with(write.path, held.path);
+			let a_key = write.path.len() == held.path.len() + 1 && starts_with(
+				write.path,
+				held.path,
+			);
 			if at_or_above || a_key {
 				ops.push(seed_or_gone(grant, held));
 				ret;
@@ -1255,7 +1260,10 @@ impl MirrorView {
 		for parked in self.parked.read() {
 			mut below = false;
 			for held in self.slots.read() {
-				if held.boundary.place.len() > parked.boundary.place.len() && starts_with(held.boundary.place, parked.boundary.place) {
+				if held.boundary.place.len() > parked.boundary.place.len() && starts_with(
+					held.boundary.place,
+					parked.boundary.place,
+				) {
 					below = true;
 				}
 			}
@@ -1954,7 +1962,11 @@ export fun origin_store<T: StoreWire + Storable>(
 		},
 		None => {
 			let retire: Shared<List<|| void>> = Shared::new([]);
-			let mirror: RemoteStoreSome<T> = minted_store(client, || call(method, describers), retire);
+			let mirror: RemoteStoreSome<T> = minted_store(
+				client,
+				|| call(method, describers),
+				retire,
+			);
 			let stamp = retire.identity();
 			table.entries.write().insert(key, (stamp, mirror));
 			retire.write().push(|| table.forget(key, stamp));

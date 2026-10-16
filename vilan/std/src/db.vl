@@ -255,7 +255,9 @@ export impl Database {
 		// Sampled per step, inside the transaction: a step that never finishes
 		// records when it started applying, which is the more useful of the two
 		// readings for a stalled boot's table.
-		let recorder = self.prepare("INSERT INTO vilan_migrations (name, applied_at_ms) VALUES (?, ?)");
+		let recorder = self.prepare(
+			"INSERT INTO vilan_migrations (name, applied_at_ms) VALUES (?, ?)",
+		);
 		match run_guarded(recorder, [step.name, now().millis]) {
 			Some(let message) => {
 				self.rollback_migration();

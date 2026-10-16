@@ -125,7 +125,10 @@ fun persist(list: List<Todo>) {
 // is corrupt: the codec's decode is validating.
 fun load(): List<Todo> {
 	if fs::stat(storage).is_some() {
-		let stored: Result<List<Todo>, str> = decode(json_codec(), Frame::Text(fs::read_file_to_str(storage)));
+		let stored: Result<List<Todo>, str> = decode(
+			json_codec(),
+			Frame::Text(fs::read_file_to_str(storage)),
+		);
 		match stored {
 			Ok(let list) => list,
 			Err(let _reason) => [],

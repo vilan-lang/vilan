@@ -82,5 +82,7 @@ fun main() {
 	let maybe = Store::new(Maybe::Just(1));
 	print(i"maybe: {maybe.just().get().unwrap_or(0)} {maybe.just().patch(2)} {maybe.just().get().unwrap_or(0)}");
 	maybe.set(Maybe::Nothing);
-	print(i"nothing: {maybe.just().patch(3)} {maybe.is_nothing().get()} just={maybe.is_just().get()}");
+	print(
+		i"nothing: {maybe.just().patch(3)} {maybe.is_nothing().get()} just={maybe.is_just().get()}",
+	);
 }

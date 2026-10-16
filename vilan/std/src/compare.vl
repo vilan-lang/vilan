@@ -277,7 +277,10 @@ macro fun PartialEq(item: Item): Source {
 		for variant in target.variants {
 			let arity = variant.payload.len();
 			if arity == 0 {
-				arms = arms.arm(i"({target.name}::{variant.name}, {target.name}::{variant.name})", "true");
+				arms = arms.arm(
+					i"({target.name}::{variant.name}, {target.name}::{variant.name})",
+					"true",
+				);
 			} else {
 				mut self_binds: List<str> = [];
 				mut other_binds: List<str> = [];
@@ -291,7 +294,10 @@ macro fun PartialEq(item: Item): Source {
 				}
 				let self_pattern = join(self_binds, ", ");
 				let other_pattern = join(other_binds, ", ");
-				arms = arms.arm(i"({target.name}::{variant.name}({self_pattern}), {target.name}::{variant.name}({other_pattern}))", join(comparisons, " && "));
+				arms = arms.arm(
+					i"({target.name}::{variant.name}({self_pattern}), {target.name}::{variant.name}({other_pattern}))",
+					join(comparisons, " && "),
+				);
 			}
 		}
 		arms = arms.arm("_", "false");

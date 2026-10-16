@@ -71,7 +71,9 @@ fun main() {
 	grid.write()[0][1] += 1000;
 	let names = Shared::new(["a", "b"]);
 	names.write()[1] += "c";
-	print(i"element: {points.read()[1].x} {tuples.read()[0].1} {grid.read()[0][1]} {names.read()[1]}");
+	print(
+		i"element: {points.read()[1].x} {tuples.read()[0].1} {grid.read()[0][1]} {names.read()[1]}",
+	);
 
 	print(i"same statement: {grid.write()[1][2]} {grid.read()[0][1]}");
 	grid.write()[0] = grid.read()[1];

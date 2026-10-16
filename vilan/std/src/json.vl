@@ -961,7 +961,9 @@ export macro fun struct_json_impls(target: StructItem): str {
 	// reachable wherever the derive is; its variants may not be in scope).
 	for field in target.fields {
 		let label = quote(field.name);
-		from_json_value = from_json_value.line(i"if !value.has_field({label}) \{ ret Result::Err(\"missing field {field.name}\") \}");
+		from_json_value = from_json_value.line(
+			i"if !value.has_field({label}) \{ ret Result::Err(\"missing field {field.name}\") \}",
+		);
 	}
 	mut literal = init_of(target.name);
 	for field in target.fields {
@@ -1011,7 +1013,9 @@ export macro fun struct_wire_impls(target: StructItem): str {
 	for field in target.fields {
 		let label = quote(field.name);
 		rebuild = rebuild.line(i"deserializer.field({label});");
-		rebuild = rebuild.line(i"let __{field.name} = {field.type_.render()}::rebuild(deserializer);");
+		rebuild = rebuild.line(
+			i"let __{field.name} = {field.type_.render()}::rebuild(deserializer);",
+		);
 		literal = literal.field(field.name, i"__{field.name}");
 	}
 	rebuild = rebuild.line("deserializer.end_struct();").expr(literal.render());
@@ -1053,7 +1057,9 @@ export macro fun enum_json_impls(target: EnumItem): str {
 		let backed_from_json = fun_of("from_json")
 			.parameter("text: str")
 			.returns(backed_result)
-			.expr(i"{target.name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)");
+			.expr(
+				i"{target.name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)",
+			);
 		let backed_from_json_value = fun_of("from_json_value")
 			.parameter("value: JsonValue")
 			.returns(backed_result)
@@ -1124,10 +1130,16 @@ export macro fun enum_json_impls(target: EnumItem): str {
 				index = index + 1;
 			}
 			let element_list = join(elements, ", ");
-			from_arms = from_arms.arm(tag, i"Result::Ok({target.name}::{variant.name}({element_list}))");
+			from_arms = from_arms.arm(
+				tag,
+				i"Result::Ok({target.name}::{variant.name}({element_list}))",
+			);
 		}
 	}
-	from_arms = from_arms.arm("_", i"Result::Err(\"unknown variant in JSON for enum {target.name}\")");
+	from_arms = from_arms.arm(
+		"_",
+		i"Result::Err(\"unknown variant in JSON for enum {target.name}\")",
+	);
 	let result_type = i"Result<{subject}, str>";
 	let to_json = fun_of("to_json").parameter("self").returns("str").expr(to_arms.render());
 	let from_json = fun_of("from_json")
@@ -1220,7 +1232,10 @@ export macro fun enum_wire_impls(target: EnumItem): str {
 			describe_arms = describe_arms.arm_block(i"{target.name}::{variant.name}", statements);
 		} else {
 			let bind_pattern = join(binds, ", ");
-			describe_arms = describe_arms.arm_block(i"{target.name}::{variant.name}({bind_pattern})", statements);
+			describe_arms = describe_arms.arm_block(
+				i"{target.name}::{variant.name}({bind_pattern})",
+				statements,
+			);
 		}
 	}
 	mut rebuild_arms = match_of("tag");

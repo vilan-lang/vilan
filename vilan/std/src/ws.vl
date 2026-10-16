@@ -157,7 +157,10 @@ impl WsParser {
 						if masked {
 							mut index = 0;
 							for index < length.as_usize() {
-								payload.set(index, payload.get(index) ^ buffer.get(mask_at + (index & 3)));
+								payload.set(
+									index,
+									payload.get(index) ^ buffer.get(mask_at + (index & 3)),
+								);
 								index += 1;
 							}
 						}

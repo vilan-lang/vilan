@@ -1046,7 +1046,9 @@ fun dial_with_backoff(
 	dispatch: |Frame| void,
 	serve: |Frame| void,
 ): Result<(WebSocket, i32), DialFailure> {
-	mut outcome: Result<(WebSocket, i32), DialFailure> = Err(DialFailure::Unreachable(i"could not reach {url}"));
+	mut outcome: Result<(WebSocket, i32), DialFailure> = Err(
+		DialFailure::Unreachable(i"could not reach {url}"),
+	);
 	mut attempt = 0;
 	mut delay = 250i53;
 	for attempt < 10 {
@@ -2496,7 +2498,16 @@ export impl ReactiveServer {
 		});
 		self.sources
 			.write()
-			.push((channel, Capability { start = starter, resolve = None, dynamic = false, identity = 0 - 1, control = None }));
+			.push((
+				channel,
+				Capability {
+					start = starter,
+					resolve = None,
+					dynamic = false,
+					identity = 0 - 1,
+					control = None,
+				}
+			));
 		channel
 	}
 
@@ -2546,7 +2557,16 @@ export impl ReactiveServer {
 				});
 				self.sources
 					.write()
-					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity = cell_identity(source), control = None }));
+					.push((
+						channel,
+						Capability {
+							start = starter,
+							resolve = None,
+							dynamic = true,
+							identity = cell_identity(source),
+							control = None,
+						}
+					));
 				channel
 			},
 		}
@@ -2575,7 +2595,16 @@ export impl ReactiveServer {
 				});
 				self.sources
 					.write()
-					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity, control = None }));
+					.push((
+						channel,
+						Capability {
+							start = starter,
+							resolve = None,
+							dynamic = true,
+							identity,
+							control = None,
+						}
+					));
 				channel
 			},
 		}
@@ -2617,7 +2646,16 @@ export impl ReactiveServer {
 		let control = make(channel);
 		self.sources
 			.write()
-			.push((channel, Capability { start, resolve = None, dynamic = true, identity, control = Some(control) }));
+			.push((
+				channel,
+				Capability {
+					start,
+					resolve = None,
+					dynamic = true,
+					identity,
+					control = Some(control),
+				}
+			));
 		channel
 	}
 
@@ -2690,12 +2728,29 @@ export impl ReactiveServer {
 			let key: K = K::rebuild(&mut deserializer);
 			KeySubscription {
 				key = key.hash(),
-				start = || keyed_key_forward(transport, codec, channel, source, elements, key_of, key),
+				start = || keyed_key_forward(
+					transport,
+					codec,
+					channel,
+					source,
+					elements,
+					key_of,
+					key,
+				),
 			}
 		};
 		self.sources
 			.write()
-			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1, control = None }));
+			.push((
+				channel,
+				Capability {
+					start,
+					resolve = Some(resolve),
+					dynamic = false,
+					identity = 0 - 1,
+					control = None,
+				}
+			));
 		channel
 	}
 
@@ -2731,7 +2786,16 @@ export impl ReactiveServer {
 		};
 		self.sources
 			.write()
-			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1, control = None }));
+			.push((
+				channel,
+				Capability {
+					start,
+					resolve = Some(resolve),
+					dynamic = false,
+					identity = 0 - 1,
+					control = None,
+				}
+			));
 		channel
 	}
 
@@ -2764,7 +2828,16 @@ export impl ReactiveServer {
 				};
 				self.sources
 					.write()
-					.push((channel, Capability { start, resolve = Some(resolve), dynamic = true, identity = cell_identity(cell.elements), control = None }));
+					.push((
+						channel,
+						Capability {
+							start,
+							resolve = Some(resolve),
+							dynamic = true,
+							identity = cell_identity(cell.elements),
+							control = None,
+						}
+					));
 				channel
 			},
 		}
@@ -3646,12 +3719,16 @@ export impl WireDemand {
 		}
 		for entry in now_keys {
 			if !carries(was_keys, entry.key) {
-				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", channel, entry.describe));
+				(self.transport).send(
+					encode_control_keyed(self.codec, "Subscribe", channel, entry.describe),
+				);
 			}
 		}
 		for entry in was_keys {
 			if !carries(now_keys, entry.key) {
-				(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", channel, entry.describe));
+				(self.transport).send(
+					encode_control_keyed(self.codec, "Unsubscribe", channel, entry.describe),
+				);
 			}
 		}
 		if was_whole && !now_whole {
@@ -4001,9 +4078,11 @@ export impl ReactiveClient {
 				ret None;
 			}
 			match cache.get() {
-				Some(let value) => Some(encode_update(codec, channel_cell.read(), |mut serializer: Serializer| {
-					value.describe(&mut serializer);
-				})),
+				Some(let value) => Some(
+					encode_update(codec, channel_cell.read(), |mut serializer: Serializer| {
+						value.describe(&mut serializer);
+					}),
+				),
 				None => None,
 			}
 		};
@@ -4071,10 +4150,12 @@ export impl ReactiveClient {
 				ret None;
 			}
 			match cache.get() {
-				Some(let list) => Some(encode_patch(codec, channel_cell.read(), |mut serializer: Serializer| {
-					let ops: List<Delta<K, T>> = [Delta::Reset(list)];
-					ops.describe(&mut serializer);
-				})),
+				Some(let list) => Some(
+					encode_patch(codec, channel_cell.read(), |mut serializer: Serializer| {
+						let ops: List<Delta<K, T>> = [Delta::Reset(list)];
+						ops.describe(&mut serializer);
+					}),
+				),
 				None => None,
 			}
 		};
@@ -4922,7 +5003,10 @@ export impl RemoteSource<type T> {
 				// re-subscribes for whatever demand exists by then.
 				self.released.write() = false;
 				let _reminting = async {
-					let fresh: Result<Option<i32>, RpcError> = (origin.reissue)(origin.method, origin.describers);
+					let fresh: Result<Option<i32>, RpcError> = (origin.reissue)(
+						origin.method,
+						origin.describers,
+					);
 					match fresh {
 						// The call failed. Under A92 this is a REACHABLE arm and
 						// the mirror's only way to say so: the sync stub handed out
@@ -4943,7 +5027,10 @@ export impl RemoteSource<type T> {
 								self.released.write() = true;
 								self.mint.set(Some(Status::Absent));
 							},
-							Some(let channel) => self.rebind(channel, encode_control(self.codec, "Subscribe", channel)),
+							Some(let channel) => self.rebind(
+								channel,
+								encode_control(self.codec, "Subscribe", channel),
+							),
 						},
 					}
 				};
@@ -4976,7 +5063,9 @@ export impl RemoteSource<type T> {
 				// sibling's demand keeps it, and this `Unsubscribe` would release
 				// the sibling's forward instead.
 				if !self.wire.holds(self.channel.read()) {
-					(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+					(self.transport).send(
+						encode_control(self.codec, "Unsubscribe", self.channel.read()),
+					);
 				}
 			}
 			self.retired();
@@ -5378,7 +5467,9 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 							for offset < arriving {
 								match inserted.get(offset) {
 									Some(let element) => {
-										ops.push(Delta::Insert(element.key, element.value, at + offset));
+										ops.push(
+											Delta::Insert(element.key, element.value, at + offset),
+										);
 									},
 									None => {},
 								}
@@ -5726,7 +5817,10 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 			Some(let origin) => {
 				self.released.write() = false;
 				let _reminting = async {
-					let fresh: Result<Option<i32>, RpcError> = (origin.reissue)(origin.method, origin.describers);
+					let fresh: Result<Option<i32>, RpcError> = (origin.reissue)(
+						origin.method,
+						origin.describers,
+					);
 					match fresh {
 						Err(let failure) => {
 							self.released.write() = true;
@@ -5761,7 +5855,9 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				// sibling's demand keeps it, and this `Unsubscribe` would release
 				// the sibling's forward instead.
 				if !self.wire.holds(self.channel.read()) {
-					(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+					(self.transport).send(
+						encode_control(self.codec, "Unsubscribe", self.channel.read()),
+					);
 				}
 			}
 			self.retired();
@@ -6056,7 +6152,12 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				self.remint();
 			} else {
 				lease.on_wire.write() = true;
-				self.wire.open(self.channel.read(), self.channel.identity(), Some(lease.key), lease.describe);
+				self.wire.open(
+					self.channel.read(),
+					self.channel.identity(),
+					Some(lease.key),
+					lease.describe,
+				);
 				(self.join_key.read())(lease.key);
 			}
 		}
@@ -7068,7 +7169,9 @@ export macro fun service(item: Item): Source {
 			if parameter.name == "self" {
 				jump continue;
 			}
-			statements.push(i"let {parameter.name}: {parameter.type_.render()} = rpc::arg(__request, {arity});");
+			statements.push(
+				i"let {parameter.name}: {parameter.type_.render()} = rpc::arg(__request, {arity});",
+			);
 			arguments.push(parameter.name);
 			arity = arity + 1;
 		}
@@ -7138,7 +7241,9 @@ export macro fun service(item: Item): Source {
 				exposures.push(i"session.expose_keyed_cell(self.{field_name})");
 			} else {
 				let exposer = if is_map { "expose_keyed_map" } else { "expose_keyed" };
-				exposures.push(i"session.{exposer}(self.{field_name}, |element: {element}| element.key())");
+				exposures.push(
+					i"session.{exposer}(self.{field_name}, |element: {element}| element.key())",
+				);
 			}
 		}
 		exposure_index = exposure_index + 1;
@@ -7261,7 +7366,9 @@ export macro fun service(item: Item): Source {
 				jump continue;
 			}
 			stub = stub.parameter(i"{parameter.name}: {parameter.type_.render()}");
-			describers.push(i"|mut serializer: Serializer| {parameter.name}.describe(&mut serializer)");
+			describers.push(
+				i"|mut serializer: Serializer| {parameter.name}.describe(&mut serializer)",
+			);
 		}
 		let label = quote(method.name);
 		let describer_list = join(describers, ", ");
@@ -7319,7 +7426,9 @@ export macro fun service(item: Item): Source {
 			// mirror is minted unleased and its first hold issues the method;
 			// deduped per origin in this method's table (A134).
 			let table_name = i"__stores_{target.client_name}_{method.name}";
-			origin_tables.push(i"let {table_name}: MirrorTable<RemoteStoreSome<{element}>> = MirrorTable::new();");
+			origin_tables.push(
+				i"let {table_name}: MirrorTable<RemoteStoreSome<{element}>> = MirrorTable::new();",
+			);
 			let wrapped = if kind == "store_some" { "true" } else { "false" };
 			let issue = "|handle_method: str, handle_args: List<|Serializer| void>| rpc::call_reading(self.transport, self.codec, handle_method, handle_args, |handle_reply: Deserializer| mirror::read_store_reply<"
 				+ element
@@ -7388,7 +7497,9 @@ export macro fun service(item: Item): Source {
 			} else {
 				i"RemoteSource<{element}>"
 			};
-			origin_tables.push(i"let {table_name}: MirrorTable<{mirror_type}> = MirrorTable::new();");
+			origin_tables.push(
+				i"let {table_name}: MirrorTable<{mirror_type}> = MirrorTable::new();",
+			);
 			let minting = if kind == "keyed" {
 				i"let handle_mirror: {mirror_type} = self.reactive.origin_keyed_source({table_name}, {origin});"
 			} else {
@@ -7451,13 +7562,17 @@ export macro fun service(item: Item): Source {
 		};
 		if key == "" {
 			body.push(i"let mirror_{field_name}: RemoteSource<{element}> = reactive.attached_source(channels[{channel_index}]);");
-			rebind_lines.push(i"|channel: i32, subscribe: Frame| mirror_{field_name}.rebind(channel, subscribe)");
+			rebind_lines.push(
+				i"|channel: i32, subscribe: Frame| mirror_{field_name}.rebind(channel, subscribe)",
+			);
 		} else {
 			body.push(i"let mirror_{field_name}: KeyedSource<{key}, {element}> = reactive.attached_keyed_source(channels[{channel_index}]);");
 			// A keyed mirror re-encodes its own `Subscribe` frames — one per demand
 			// it still holds — so the positional frame the plain path rebinds with
 			// is not its to use.
-			rebind_lines.push(i"|channel: i32, _subscribe: Frame| mirror_{field_name}.rebind(channel)");
+			rebind_lines.push(
+				i"|channel: i32, _subscribe: Frame| mirror_{field_name}.rebind(channel)",
+			);
 		}
 		ok_fields.push(i"{field_name} = mirror_{field_name}");
 		channel_index = channel_index + 1;
@@ -7616,14 +7731,18 @@ export macro fun service(item: Item): Source {
 					jump continue;
 				}
 				stub = stub.parameter(i"{parameter.name}: {parameter.type_.render()}");
-				describers.push(i"|mut serializer: Serializer| {parameter.name}.describe(&mut serializer)");
+				describers.push(
+					i"|mut serializer: Serializer| {parameter.name}.describe(&mut serializer)",
+				);
 			}
 			let label = quote(method.name);
 			let describer_list = join(describers, ", ");
 			// SYNC and void, by R4: a notification has no reply to await, so
 			// calling one is not a suspension point and cannot hold the caller's
 			// wire turn open for a round trip.
-			proxy_impl = proxy_impl.method(stub.expr(i"rpc::notify(self.connection, {label}, [{describer_list}])"));
+			proxy_impl = proxy_impl.method(
+				stub.expr(i"rpc::notify(self.connection, {label}, [{describer_list}])"),
+			);
 		}
 		proxy_source = proxy_struct + proxy_ctor + proxy_impl.render();
 	}

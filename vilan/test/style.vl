@@ -160,7 +160,10 @@ fun main() {
 	// so they stay in the base cascade band (B35).
 	let open = const attribute("data-open").eq("true");
 	let disclosed = const style()
-		.on(md() + within(attribute("data-theme").eq("dark")) + open + hover(), style().color(Color::gray(50)))
+		.on(
+			md() + within(attribute("data-theme").eq("dark")) + open + hover(),
+			style().color(Color::gray(50)),
+		)
 		.on(within(attribute("data-theme").eq("dark")) + open, style().background(Color::gray(800)))
 		.on(open, style().display(Display::Flex))
 		.on(open + hover(), style().background(Color::gray(100)));
