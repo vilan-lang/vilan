@@ -83207,6 +83207,154 @@ enum DiscoveredModule {
     },
 }
 
+/// B625: one file the drain's FIRST round registers (a macro definition is
+/// reachable without expansion, so the registry is the first round's) or
+/// expands before that round mints.
+struct PremintFile<'src> {
+    key: crate::macros::ModuleKey,
+    package: crate::macros::FilePackage,
+    ast: &'src NodeList<'src>,
+    text: &'src str,
+    path: PathBuf,
+    /// The `SourceId` the round's minting gives the file — taken in
+    /// `load_order_key` order exactly as the minting takes them, so the ids
+    /// this expansion attributes to are the minted ones.
+    source: SourceId,
+    origin: Origin,
+    /// The round's module this file is (`None` for the entry and a
+    /// dependency's surface).
+    module: Option<(Origin, &'src str)>,
+}
+
+/// B625: what [`premint_expansion`] produced, held until the round mints and
+/// committed then — or dropped, when what it generated asked for a module the
+/// round had not discovered (the round re-discovers and expands again).
+struct Premint<'src> {
+    registry: crate::macros::MacroRegistry,
+    /// Each file's diagnostics (registration's, then expansion's), grouped as
+    /// the epilogue attributes them: one group per file, in order.
+    diagnostics: Vec<(SourceId, Vec<Error>)>,
+    generated: Vec<(SourceId, Vec<crate::macros::GeneratedItems>)>,
+    item_sites: Vec<usize>,
+    failed_sites: Vec<usize>,
+    expressions: Vec<(usize, &'static Spanned<Node<'static>>)>,
+    expanded: Vec<SourceId>,
+    site_counter: u32,
+    /// The module requests the generated code makes — the drain's next
+    /// discovery pass follows them before anything mints.
+    requests: Vec<(Origin, &'src str)>,
+}
+
+/// B625: the macro epilogue's first round, run BEFORE the round mints — the
+/// registry built from `register` (the entry, the round's modules, the
+/// dependency surfaces), then `expand` expanded in the epilogue's order with
+/// the same site counter — so a module only GENERATED code reaches is
+/// discovered in the round that generates it and mints in its canonical place
+/// beside every other module of the round, where it minted a round later
+/// (B619): a derive whose generated impl imports `std::path::basename` minted
+/// `std::path` after `std::time`, and a redundant written import of it moved
+/// `basename` ahead of `now` in the emitted bundle. Nothing here touches the
+/// analyzer: diagnostics are collected per file, attributed when committed.
+fn premint_expansion<'src>(
+    register: &[&PremintFile<'src>],
+    expand: &[&PremintFile<'src>],
+    std: &PackageSpec,
+    workspace: &Workspace,
+    site_counter: u32,
+) -> Premint<'src> {
+    let mut diagnostics: Vec<(SourceId, Vec<Error>)> = Vec::new();
+    let mut registry = crate::macros::MacroRegistry::default();
+    // Inside a macro WORLD, register nothing (see IN_MACRO_WORLD): expansion
+    // still runs with the empty registry, so std's own derives generate
+    // through the Rust fallback. E212: a SPLIT toolchain is refused once,
+    // before the first registration, attributed to the entry.
+    if !crate::macros::in_macro_world() {
+        if crate::macros::split_toolchain_refusal(std).is_some() {
+            let mut refusal = Vec::new();
+            crate::macros::push_split_toolchain_refusal(std, &mut refusal);
+            diagnostics.push((SourceId(0), refusal));
+        } else {
+            for file in register {
+                let mut found = Vec::new();
+                crate::macros::register_file(
+                    &mut registry,
+                    file.key.clone(),
+                    file.ast,
+                    file.text,
+                    &file.path,
+                    file.source,
+                    std,
+                    &mut found,
+                );
+                diagnostics.push((file.source, found));
+            }
+        }
+    }
+    let mut site_counter = site_counter;
+    let mut generated = Vec::new();
+    let mut item_sites = Vec::new();
+    let mut failed_sites = Vec::new();
+    let mut expressions = Vec::new();
+    let mut expanded = Vec::new();
+    let mut requests: Vec<(Origin, &'src str)> = Vec::new();
+    for file in expand {
+        let scope =
+            crate::macros::scope_for(&registry, workspace, &file.package, &file.key, file.ast);
+        let mut found = Vec::new();
+        let output = crate::macros::expand_source(
+            &scope,
+            std,
+            workspace.macro_limits,
+            file.ast,
+            file.text,
+            &mut found,
+            &mut site_counter,
+            workspace.macro_expansion_cache.as_deref(),
+            0,
+        );
+        diagnostics.push((file.source, found));
+        // Lazy world-compile failures carry the DEFINING file's spans.
+        for (defining_source, error) in output.world_errors {
+            diagnostics.push((defining_source, vec![error]));
+        }
+        for list in output.items.iter().map(|items| items.nodes) {
+            requests.extend(
+                collect_module_paths(list, "std")
+                    .into_iter()
+                    .map(|(module, _)| (Origin::Std, module)),
+            );
+            requests.extend(
+                collect_module_paths(list, "pkg")
+                    .into_iter()
+                    .map(|(module, _)| (file.origin, module)),
+            );
+            for (dependency, index) in &workspace.entry_dependencies {
+                requests.extend(
+                    collect_module_paths(list, dependency)
+                        .into_iter()
+                        .map(|(module, _)| (Origin::Dep(*index), module)),
+                );
+            }
+        }
+        generated.push((file.source, output.items));
+        item_sites.extend(output.item_sites);
+        failed_sites.extend(output.failed_sites);
+        expressions.extend(output.expressions);
+        expanded.push(file.source);
+    }
+    Premint {
+        registry,
+        diagnostics,
+        generated,
+        item_sites,
+        failed_sites,
+        expressions,
+        expanded,
+        site_counter,
+        requests,
+    }
+}
+
 /// M144: a NON-STD module whose NODE — its entity, its item scope, its binding
 /// in its package's namespace — mints after std has walked, so that every std
 /// id is a function of the std module set alone (`std-prefix.md` §3, §4.1).
@@ -85349,181 +85497,311 @@ fn analyze_inner<'src>(
         // expansion.)
         while !to_load.is_empty() {
             let mut discovered: Vec<(Origin, &str, DiscoveredModule)> = Vec::new();
-            while let Some((origin, request)) = to_load.pop() {
-                // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
-                // the loader loads MODULES. Map every one to the longest prefix that
-                // names a module here — or, failing that, the module DIRECTORY it
-                // addresses — so the canonical order below is taken over module
-                // paths rather than over import paths.
-                let resolved = *resolved_requests
-                    .entry((origin, request))
-                    .or_insert_with(|| {
-                        let roots: Vec<&Path> = match origin {
-                            Origin::Std => std.search_roots(platform),
-                            Origin::Pkg => vec![pkg_root],
-                            Origin::Dep(index) => workspace.packages[index].search_roots(platform),
-                        };
-                        // B337: the LONGER of the two answers, not the first
-                        // that answers. `a::c` where `a.vl` is a module and
-                        // `a/c/` is a pure namespace resolved to `a` — the
-                        // module prefix truncated by a segment, and the
-                        // namespace fallback never ran because the module one
-                        // had answered. So `a::c` was never registered as `a`'s
-                        // child, and A67's collision rule (which reads the
-                        // children scope) could not see a declaration shadowing
-                        // it: `a.vl` declaring `c` beside `a/c/x.vl` bound the
-                        // declaration in silence, the one silent winner A67
-                        // exists to close. The shorter answer is a PREFIX of the
-                        // longer one and loads anyway — `ensure_module_node`
-                        // walks the path and ensures every parent — so taking
-                        // the longer one only ever adds the namespace node
-                        // itself, which contributes no items.
-                        //
-                        // The second call is made only where the first
-                        // truncated: a request the module walk answers whole is
-                        // the deepest answer there is, and that is every
-                        // `pkg::<module>` in a package with no module directory.
-                        deepest_module_or_namespace(&roots, request).map(|path| {
-                            match path == request {
-                                // The whole request IS the module: keep the caller's
-                                // own slice rather than interning a copy of it.
-                                true => request,
-                                false => interned_display_name(path),
-                            }
-                        })
-                    });
-                // A resolved path resolves to itself (it is the longest prefix
-                // naming a module or namespace), so it is resolved once.
-                let Some(name) = resolved else {
-                    continue;
-                };
-                // M110 S1: a hot module waits for `load_hot_modules`, after the store.
-                if origin == Origin::Pkg && (defer_package || hot_deferred.contains(name)) {
-                    continue;
-                }
-                if !loaded_keys.insert((origin, name)) {
-                    continue;
-                }
-                // The roots to search for this module. `std`/`pkg` are single-root; a
-                // dependency library is layered — its overlay for the build target, then its
-                // base, then other overlays (so a cross-target module still loads for typing).
-                let search_roots: Vec<&Path> = match origin {
-                    Origin::Std => std.search_roots(platform),
-                    Origin::Pkg => vec![pkg_root],
-                    Origin::Dep(index) => workspace.packages[index].search_roots(platform),
-                };
-                // A65: a nested module depends on each of its ANCESTORS (the
-                // minting below ensures the parent's node, and the parent's own
-                // file adopts it), so they are discovered with it — which is what
-                // lets them mint in their canonical place, before their children,
-                // rather than wherever the first child happened to ask for them.
-                for (cut, _) in name.match_indices("::") {
-                    to_load.push((origin, &name[..cut]));
-                }
-                // A platform-gated std module (e.g. `std::http` in a browser build) is *not*
-                // skipped here: it loads so its signatures bind and the rest of the file
-                // types cleanly. The cross-target diagnostic is reported once, at the user's
-                // `import`, where the load is seeded (P3/L1).
-                let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
-                    // A65: no body under any root — but the path may still name a
-                    // module DIRECTORY, a **pure namespace** whose children are
-                    // importable through it. Registered below (so `pkg::lib::util`
-                    // can walk through `lib`) with what the directory holds, so an
-                    // `import pkg::lib` that lands on it is refused with the
-                    // children named.
-                    let children = submodules_in_roots(&search_roots, name);
-                    if !children.is_empty() {
-                        discovered.push((origin, name, DiscoveredModule::Namespace(children)));
+            // B625: the first round's macro epilogue runs BEFORE the round
+            // mints ([`premint_expansion`]), and what its generated code asks
+            // for is discovered in the same round — so a module only generated
+            // code reaches mints in its canonical place, not a round later. A
+            // request that finds a module the round had not discovered drops
+            // the expansion (its `SourceId`s were the old set's) and the round
+            // discovers and expands again; the registry stays the WRITTEN
+            // closure's (macro definitions are reachable without expansion).
+            let mut premint: Option<Premint<'src>> = None;
+            let mut registered: Option<HashSet<(Origin, &str)>> = None;
+            loop {
+                let discovered_before = discovered.len();
+                while let Some((origin, request)) = to_load.pop() {
+                    // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
+                    // the loader loads MODULES. Map every one to the longest prefix that
+                    // names a module here — or, failing that, the module DIRECTORY it
+                    // addresses — so the canonical order below is taken over module
+                    // paths rather than over import paths.
+                    let resolved =
+                        *resolved_requests
+                            .entry((origin, request))
+                            .or_insert_with(|| {
+                                let roots: Vec<&Path> = match origin {
+                                    Origin::Std => std.search_roots(platform),
+                                    Origin::Pkg => vec![pkg_root],
+                                    Origin::Dep(index) => {
+                                        workspace.packages[index].search_roots(platform)
+                                    }
+                                };
+                                // B337: the LONGER of the two answers, not the first
+                                // that answers. `a::c` where `a.vl` is a module and
+                                // `a/c/` is a pure namespace resolved to `a` — the
+                                // module prefix truncated by a segment, and the
+                                // namespace fallback never ran because the module one
+                                // had answered. So `a::c` was never registered as `a`'s
+                                // child, and A67's collision rule (which reads the
+                                // children scope) could not see a declaration shadowing
+                                // it: `a.vl` declaring `c` beside `a/c/x.vl` bound the
+                                // declaration in silence, the one silent winner A67
+                                // exists to close. The shorter answer is a PREFIX of the
+                                // longer one and loads anyway — `ensure_module_node`
+                                // walks the path and ensures every parent — so taking
+                                // the longer one only ever adds the namespace node
+                                // itself, which contributes no items.
+                                //
+                                // The second call is made only where the first
+                                // truncated: a request the module walk answers whole is
+                                // the deepest answer there is, and that is every
+                                // `pkg::<module>` in a package with no module directory.
+                                deepest_module_or_namespace(&roots, request).map(|path| {
+                                    match path == request {
+                                        // The whole request IS the module: keep the caller's
+                                        // own slice rather than interning a copy of it.
+                                        true => request,
+                                        false => interned_display_name(path),
+                                    }
+                                })
+                            });
+                    // A resolved path resolves to itself (it is the longest prefix
+                    // naming a module or namespace), so it is resolved once.
+                    let Some(name) = resolved else {
+                        continue;
+                    };
+                    // M110 S1: a hot module waits for `load_hot_modules`, after the store.
+                    if origin == Origin::Pkg && (defer_package || hot_deferred.contains(name)) {
+                        continue;
                     }
-                    // Not a module file here (a non-module name, or a missing import
-                    // the resolver below will report) — skip, as the previous loader
-                    // did.
-                    continue;
-                };
-                // This module file IS the entry buffer. Two unrelated situations
-                // reach that equality and only the ORIGIN tells them apart (B226):
-                // a library file opened directly in an editor (`Std`/`Dep`), and a
-                // `pkg::<entry>` reference that walks back into the program's own
-                // entry.
-                let is_entry_file = crate::util::canonical_path(&resolution.path)
-                    == crate::util::canonical_path(entry_path);
-                if is_entry_file && origin == Origin::Pkg {
-                    // The `pkg::` re-entry (B226): aliased below, never loaded, and
-                    // its requests are the entry's own, seeded before the drain.
-                    discovered.push((origin, name, DiscoveredModule::EntryAlias));
-                    continue;
-                }
-                // A std or dependency file opened directly (the editor case below)
-                // is analyzed from the entry's buffer; every other module parses
-                // from disk.
-                let parsed = match is_entry_file {
-                    true => None,
-                    false => match load_package_module(&resolution.path) {
-                        Some(parsed) => Some(parsed),
-                        None => continue,
-                    },
-                };
-                let ast: &Spanned<NodeList> = parsed.map_or(nodes, |parsed| parsed.ast);
-                // A module's `pkg::` siblings inherit its package; a user/dependency
-                // module's `std::` imports are std, and its `<dep>::` references seed that
-                // dependency. (Std modules reference each other via `pkg::` only, so
-                // collecting their `std::` imports would be a no-op — skip it to keep the
-                // std load byte-for-byte unchanged.)
-                to_load.extend(
-                    collect_module_paths(&ast.0, "pkg")
-                        .into_iter()
-                        .map(|(sibling, _)| (origin, sibling)),
-                );
-                // A `[service]` item means the std `service` macro (hosted in
-                // `std::rpc`, too heavy to always-load) must be in the prelude.
-                for seed in service_seeds(&ast.0) {
-                    to_load.push((Origin::Std, seed));
-                }
-                // B270, the entry's twin: a loaded module's own `css` blocks and
-                // elements seed their std modules, whatever package it belongs to.
-                to_load.extend(
-                    collect_std_item_modules(&ast.0)
-                        .into_iter()
-                        .map(|module| (Origin::Std, module)),
-                );
-                // Seed the module's `std::` and `<dep>::` references. Only the *building*
-                // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
-                // (`Dep`) are its internals, loaded for typing without a gate (the
-                // dependency's compatibility was checked at the user's import). Std modules
-                // reference each other only via `pkg::`, so they seed nothing here.
-                match origin {
-                    Origin::Std => {}
-                    Origin::Pkg => {
-                        let std_refs = collect_module_paths(&ast.0, "std");
-                        to_load.extend(
-                            std_refs
-                                .into_iter()
-                                .map(|(module, _)| (Origin::Std, module)),
-                        );
-                        for (name, index) in &workspace.entry_dependencies {
-                            let refs = collect_module_paths(&ast.0, name);
-                            to_load.extend(
-                                refs.into_iter()
-                                    .map(|(module, _)| (Origin::Dep(*index), module)),
-                            );
+                    if !loaded_keys.insert((origin, name)) {
+                        continue;
+                    }
+                    // The roots to search for this module. `std`/`pkg` are single-root; a
+                    // dependency library is layered — its overlay for the build target, then its
+                    // base, then other overlays (so a cross-target module still loads for typing).
+                    let search_roots: Vec<&Path> = match origin {
+                        Origin::Std => std.search_roots(platform),
+                        Origin::Pkg => vec![pkg_root],
+                        Origin::Dep(index) => workspace.packages[index].search_roots(platform),
+                    };
+                    // A65: a nested module depends on each of its ANCESTORS (the
+                    // minting below ensures the parent's node, and the parent's own
+                    // file adopts it), so they are discovered with it — which is what
+                    // lets them mint in their canonical place, before their children,
+                    // rather than wherever the first child happened to ask for them.
+                    for (cut, _) in name.match_indices("::") {
+                        to_load.push((origin, &name[..cut]));
+                    }
+                    // A platform-gated std module (e.g. `std::http` in a browser build) is *not*
+                    // skipped here: it loads so its signatures bind and the rest of the file
+                    // types cleanly. The cross-target diagnostic is reported once, at the user's
+                    // `import`, where the load is seeded (P3/L1).
+                    let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
+                        // A65: no body under any root — but the path may still name a
+                        // module DIRECTORY, a **pure namespace** whose children are
+                        // importable through it. Registered below (so `pkg::lib::util`
+                        // can walk through `lib`) with what the directory holds, so an
+                        // `import pkg::lib` that lands on it is refused with the
+                        // children named.
+                        let children = submodules_in_roots(&search_roots, name);
+                        if !children.is_empty() {
+                            discovered.push((origin, name, DiscoveredModule::Namespace(children)));
                         }
+                        // Not a module file here (a non-module name, or a missing import
+                        // the resolver below will report) — skip, as the previous loader
+                        // did.
+                        continue;
+                    };
+                    // This module file IS the entry buffer. Two unrelated situations
+                    // reach that equality and only the ORIGIN tells them apart (B226):
+                    // a library file opened directly in an editor (`Std`/`Dep`), and a
+                    // `pkg::<entry>` reference that walks back into the program's own
+                    // entry.
+                    let is_entry_file = crate::util::canonical_path(&resolution.path)
+                        == crate::util::canonical_path(entry_path);
+                    if is_entry_file && origin == Origin::Pkg {
+                        // The `pkg::` re-entry (B226): aliased below, never loaded, and
+                        // its requests are the entry's own, seeded before the drain.
+                        discovered.push((origin, name, DiscoveredModule::EntryAlias));
+                        continue;
                     }
-                    Origin::Dep(index) => {
-                        to_load.extend(
-                            collect_module_paths(&ast.0, "std")
-                                .into_iter()
-                                .map(|(module, _)| (Origin::Std, module)),
-                        );
-                        for (name, dependency_index) in &workspace.packages[index].dependencies {
+                    // A std or dependency file opened directly (the editor case below)
+                    // is analyzed from the entry's buffer; every other module parses
+                    // from disk.
+                    let parsed = match is_entry_file {
+                        true => None,
+                        false => match load_package_module(&resolution.path) {
+                            Some(parsed) => Some(parsed),
+                            None => continue,
+                        },
+                    };
+                    let ast: &Spanned<NodeList> = parsed.map_or(nodes, |parsed| parsed.ast);
+                    // A module's `pkg::` siblings inherit its package; a user/dependency
+                    // module's `std::` imports are std, and its `<dep>::` references seed that
+                    // dependency. (Std modules reference each other via `pkg::` only, so
+                    // collecting their `std::` imports would be a no-op — skip it to keep the
+                    // std load byte-for-byte unchanged.)
+                    to_load.extend(
+                        collect_module_paths(&ast.0, "pkg")
+                            .into_iter()
+                            .map(|(sibling, _)| (origin, sibling)),
+                    );
+                    // A `[service]` item means the std `service` macro (hosted in
+                    // `std::rpc`, too heavy to always-load) must be in the prelude.
+                    for seed in service_seeds(&ast.0) {
+                        to_load.push((Origin::Std, seed));
+                    }
+                    // B270, the entry's twin: a loaded module's own `css` blocks and
+                    // elements seed their std modules, whatever package it belongs to.
+                    to_load.extend(
+                        collect_std_item_modules(&ast.0)
+                            .into_iter()
+                            .map(|module| (Origin::Std, module)),
+                    );
+                    // Seed the module's `std::` and `<dep>::` references. Only the *building*
+                    // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
+                    // (`Dep`) are its internals, loaded for typing without a gate (the
+                    // dependency's compatibility was checked at the user's import). Std modules
+                    // reference each other only via `pkg::`, so they seed nothing here.
+                    match origin {
+                        Origin::Std => {}
+                        Origin::Pkg => {
+                            let std_refs = collect_module_paths(&ast.0, "std");
                             to_load.extend(
-                                collect_module_paths(&ast.0, name)
+                                std_refs
                                     .into_iter()
-                                    .map(|(module, _)| (Origin::Dep(*dependency_index), module)),
+                                    .map(|(module, _)| (Origin::Std, module)),
                             );
+                            for (name, index) in &workspace.entry_dependencies {
+                                let refs = collect_module_paths(&ast.0, name);
+                                to_load.extend(
+                                    refs.into_iter()
+                                        .map(|(module, _)| (Origin::Dep(*index), module)),
+                                );
+                            }
+                        }
+                        Origin::Dep(index) => {
+                            to_load.extend(
+                                collect_module_paths(&ast.0, "std")
+                                    .into_iter()
+                                    .map(|(module, _)| (Origin::Std, module)),
+                            );
+                            for (name, dependency_index) in &workspace.packages[index].dependencies
+                            {
+                                to_load.extend(
+                                    collect_module_paths(&ast.0, name).into_iter().map(
+                                        |(module, _)| (Origin::Dep(*dependency_index), module),
+                                    ),
+                                );
+                            }
                         }
                     }
+                    discovered.push((origin, name, DiscoveredModule::Body { resolution, parsed }));
                 }
-                discovered.push((origin, name, DiscoveredModule::Body { resolution, parsed }));
+                if macro_registry.is_some()
+                    || discovered.is_empty()
+                    || (premint.is_some() && discovered.len() == discovered_before)
+                {
+                    break;
+                }
+                discovered
+                    .sort_unstable_by_key(|(origin, name, _)| load_order_key((*origin, name)));
+                let registered = registered.get_or_insert_with(|| {
+                    discovered
+                        .iter()
+                        .map(|(origin, name, _)| (*origin, *name))
+                        .collect()
+                });
+                let module_key = |origin: Origin, name: &str| match origin {
+                    Origin::Std => crate::macros::ModuleKey::Std(name.to_string()),
+                    Origin::Pkg => crate::macros::ModuleKey::Pkg(name.to_string()),
+                    Origin::Dep(index) => crate::macros::ModuleKey::Dep(index, name.to_string()),
+                };
+                let module_package = |origin: Origin| match origin {
+                    Origin::Std => crate::macros::FilePackage::Std,
+                    Origin::Pkg => crate::macros::FilePackage::Entry,
+                    Origin::Dep(index) => crate::macros::FilePackage::Dep(index),
+                };
+                // The round's modules with the ids its minting will give them:
+                // `load_order_key` order, a body loaded from disk the next
+                // `SourceId`, the entry opened as a module `SourceId(0)`.
+                let mut next_source = sources.len() as u32;
+                let mut entry_is_module_here = false;
+                let mut modules: Vec<PremintFile<'src>> = Vec::new();
+                for (origin, name, module) in &discovered {
+                    let DiscoveredModule::Body { resolution, parsed } = module else {
+                        continue;
+                    };
+                    let (ast, text, source): (&'src NodeList<'src>, &'src str, SourceId) =
+                        match parsed {
+                            Some(loaded) => {
+                                let source = SourceId(next_source);
+                                next_source += 1;
+                                (&loaded.ast.0, loaded.text, source)
+                            }
+                            None => {
+                                entry_is_module_here = true;
+                                (&nodes.0, entry_source, SourceId(0))
+                            }
+                        };
+                    modules.push(PremintFile {
+                        key: module_key(*origin, name),
+                        package: module_package(*origin),
+                        ast,
+                        text,
+                        path: match parsed {
+                            Some(_) => resolution.path.clone(),
+                            None => sources[0].clone(),
+                        },
+                        source,
+                        origin: *origin,
+                        module: Some((*origin, *name)),
+                    });
+                }
+                let entry_file = PremintFile {
+                    key: crate::macros::ModuleKey::Entry,
+                    package: match entry_pkg_origin {
+                        Origin::Std => crate::macros::FilePackage::Std,
+                        _ => crate::macros::FilePackage::Entry,
+                    },
+                    ast: &nodes.0,
+                    text: entry_source,
+                    path: entry_path.to_path_buf(),
+                    source: SourceId(0),
+                    origin: entry_pkg_origin,
+                    module: None,
+                };
+                let library_files: Vec<PremintFile<'src>> = dependency_lib_walks
+                    .iter()
+                    .map(
+                        |(lib_source_id, _, lib_ast, package_index, lib_text)| PremintFile {
+                            key: crate::macros::ModuleKey::DepLib(*package_index),
+                            package: crate::macros::FilePackage::Dep(*package_index),
+                            ast: &lib_ast.0,
+                            text: lib_text,
+                            path: sources[lib_source_id.0 as usize].clone(),
+                            source: *lib_source_id,
+                            origin: Origin::Dep(*package_index),
+                            module: None,
+                        },
+                    )
+                    .collect();
+                let mut register: Vec<&PremintFile<'src>> = vec![&entry_file];
+                register.extend(modules.iter().filter(|file| {
+                    file.module
+                        .is_some_and(|module| registered.contains(&module))
+                }));
+                register.extend(library_files.iter());
+                let mut expand: Vec<&PremintFile<'src>> = Vec::new();
+                if !entry_is_module_here && !expanded_sources.contains(&SourceId(0)) {
+                    expand.push(&entry_file);
+                }
+                expand.extend(modules.iter().filter(|file| {
+                    file.source == SourceId(0) || !expanded_sources.contains(&file.source)
+                }));
+                expand.extend(
+                    library_files
+                        .iter()
+                        .filter(|file| !expanded_sources.contains(&file.source)),
+                );
+                let computed =
+                    premint_expansion(&register, &expand, std, workspace, macro_site_counter);
+                to_load.extend(computed.requests.iter().copied());
+                premint = Some(computed);
+                if to_load.is_empty() {
+                    break;
+                }
             }
             discovered.sort_unstable_by_key(|(origin, name, _)| load_order_key((*origin, name)));
             for (origin, name, module) in discovered {
@@ -85914,6 +86192,27 @@ fn analyze_inner<'src>(
                     module_source_id,
                     origin,
                 ));
+            }
+            // B625: the round's expansion, committed now that its ids exist —
+            // exactly what the epilogue below would have written for these
+            // files, which it now finds expanded.
+            if let Some(premint) = premint {
+                macro_registry = Some(premint.registry);
+                for (source, errors) in premint.diagnostics {
+                    let before = analyzer.diagnostics.len();
+                    analyzer.diagnostics.extend(errors);
+                    analyzer.attribute_new_diagnostics(before, source);
+                }
+                for (source, items) in premint.generated {
+                    generated_by_source.entry(source).or_default().extend(items);
+                }
+                analyzer.macro_item_invocations.extend(premint.item_sites);
+                analyzer.macro_failed_sites.extend(premint.failed_sites);
+                analyzer
+                    .macro_expression_expansions
+                    .extend(premint.expressions);
+                expanded_sources.extend(premint.expanded);
+                macro_site_counter = premint.site_counter;
             }
         }
 
