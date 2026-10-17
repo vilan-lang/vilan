@@ -20,7 +20,18 @@ VILAN_CHECK_CACHE = { value = "target/test-check-cache", relative = true }
 # std-prefix P3: no test process — and no `vilan` a test spawns — reads or
 # writes the persisted std prefix under `~/.vilan/cache/worlds` (the CLI and the
 # language server set that default for themselves). The pins that exercise the
-# file point `VILAN_WORLD_CACHE` at a scratch directory of their own; P5 (N157)
-# points the whole suite at `target/` once the file's key and bound have held a
-# release. The shell still wins (no `force`).
+# file point `VILAN_WORLD_CACHE` at a scratch directory of their own. The shell
+# still wins (no `force`).
 VILAN_WORLD_CACHE = "off"
+# std-prefix P5 (N157, Order 54): the SUITE's world cache. The file is read only
+# by an analysis built over the std prefix, which no test process is by default
+# — so the binaries that gain from it opt in and point their world cache here
+# (`inference`: `tests/inference/support.rs`; `docs`: `tests/docs.rs`; both
+# all single-file programs, the shape in which the prefix and the canonical
+# path are one layout), while every other process keeps
+# the `off` above: the differentials' forced-prefix legs measure the in-process
+# prefix, and a file another test process wrote must not decide what they
+# observe. The key names the analyzer's build, so every rebuild of vilan-core
+# writes new files beside the old; P4's byte bound (256 MiB) holds the
+# directory, least recently used first.
+VILAN_TEST_WORLD_CACHE = { value = "target/world-cache", relative = true }
