@@ -416,6 +416,12 @@ pub enum Plant {
     /// field move admitted as a destructure, and the instantiation's R5
     /// refusal is never spoken.
     R11RecordUnguarded,
+    /// M138 (Order 54): the async pass's cold instance record is served
+    /// without validating what its keys READ — a hot edit that makes an id a
+    /// cold key read async (a dispatch candidate, a closure a cold call
+    /// passes, a value a hot module assigns into a cold binding) then leaves
+    /// the key's recorded verdict, its discoveries and its decision in place.
+    AsyncRecordUnguarded,
 }
 
 impl Plant {
@@ -436,6 +442,7 @@ impl Plant {
             Plant::ItemRecordUnguarded => 14,
             Plant::LiveRangeWalksServed => 15,
             Plant::R11RecordUnguarded => 16,
+            Plant::AsyncRecordUnguarded => 17,
         }
     }
 }
@@ -562,6 +569,15 @@ pub struct Census {
     /// whole over the same tree — 0 by construction, counted only while the
     /// switch is on.
     pub graph_replay_mismatches: u64,
+    /// M138 (Order 54): the recorded cold instance keys this analysis's async
+    /// worklist answered from the world's cold instance record, the ones it
+    /// RE-WALKED (something a key read moved, or a callee it read flipped),
+    /// and the records it filed.
+    pub async_keys_served: u64,
+    pub async_keys_rewalked: u64,
+    pub async_records_filed: u64,
+    /// What the record this analysis filed retains, in bytes.
+    pub async_record_bytes: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -668,6 +684,10 @@ thread_local! {
             r11_records_filed: 0,
             hover_rows_restored: 0,
             graph_replay_mismatches: 0,
+            async_keys_served: 0,
+            async_keys_rewalked: 0,
+            async_records_filed: 0,
+            async_record_bytes: 0,
             prefix_world: false,
             prefix_layered: false,
             prefix_hits: 0,
@@ -1039,7 +1059,8 @@ pub fn report(program: &Program) {
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
              live-entities={} move-rows-live={} r11-rows-live={} instances-served={} \
-             instances-scanned={} instance-records-filed={} hover-rows-restored={} \
+             instances-scanned={} instance-records-filed={} async-seeded={}/{} \
+             async-records-filed={} async-record-bytes={} hover-rows-restored={} \
              prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
              post-seam={}",
@@ -1074,6 +1095,10 @@ pub fn report(program: &Program) {
             census.r11_instances_served,
             census.r11_instances_scanned,
             census.r11_records_filed,
+            census.async_keys_served,
+            census.async_keys_rewalked,
+            census.async_records_filed,
+            census.async_record_bytes,
             census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),

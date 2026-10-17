@@ -400,6 +400,7 @@ fn file_post_record_cut(
         context_log: log,
         rewrite_base,
         async_cold: std::sync::OnceLock::new(),
+        async_instances: std::sync::OnceLock::new(),
         bytes,
     });
     crate::analyzer::checked_cache_store_post(

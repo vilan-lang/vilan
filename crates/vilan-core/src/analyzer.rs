@@ -80246,8 +80246,27 @@ pub(crate) struct PostRecord {
     /// analysis's fixpoint starts from (`async_infer::infer`). Set once, by
     /// the first analysis that reads the record after filing it; sorted.
     pub async_cold: std::sync::OnceLock<Vec<Id>>,
+    /// M138 (Order 54): the async pass's COLD instance record — the
+    /// adaptation worklist and its decisions over the cold nodes alone, each
+    /// key's reads logged — which a served analysis's worklist restarts from
+    /// (`async_infer::AsyncInstanceRecord`). Set once, beside S3b's cold
+    /// result; its bytes are its own (`AsyncInstanceRecord::bytes`).
+    pub async_instances:
+        std::sync::OnceLock<std::sync::Arc<crate::async_infer::AsyncInstanceRecord>>,
     /// What the record retains, in bytes (M46's currency).
     pub bytes: usize,
+}
+
+impl PostRecord {
+    /// What the record retains now: what it was filed with, and the async
+    /// pass's cold instance record once one is set (M138).
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes
+            + self
+                .async_instances
+                .get()
+                .map_or(0, |instances| instances.bytes)
+    }
 }
 
 impl Program<'_> {
@@ -81670,7 +81689,10 @@ impl WorldChecks {
     /// table slices.
     fn compute_bytes(&self) -> usize {
         let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
-        let post = self.post.as_ref().map_or(0, |(_, record)| record.bytes);
+        let post = self
+            .post
+            .as_ref()
+            .map_or(0, |(_, record)| record.retained_bytes());
         let r11 = self.r11.as_ref().map_or(0, |records| records.bytes);
         let items: usize = self.per_item.values().map(|record| record.bytes()).sum();
         let modules: usize = self
@@ -82064,8 +82086,11 @@ pub(crate) fn checked_cache_store_post(
     {
         return;
     }
-    let was = recorded.post.as_ref().map_or(0, |(_, record)| record.bytes);
-    recorded.bytes = recorded.bytes.saturating_sub(was) + record.bytes;
+    let was = recorded
+        .post
+        .as_ref()
+        .map_or(0, |(_, record)| record.retained_bytes());
+    recorded.bytes = recorded.bytes.saturating_sub(was) + record.retained_bytes();
     recorded.post = Some((cold_fingerprint, record));
     let bytes = recorded.bytes;
     let tick = state.next_tick();
@@ -82076,6 +82101,41 @@ pub(crate) fn checked_cache_store_post(
         .bytes
         .saturating_sub(previous_bytes)
         .saturating_add(bytes);
+    state.evict_to_budget(Some(key));
+}
+
+/// M138: a post record that gained a part after it was filed (the async
+/// pass's cold instance record, set once by the first analysis that reads the
+/// record) has those bytes join its checks record's total, so the budget
+/// (M46) bounds them as it bounds what was filed with it.
+pub(crate) fn checked_cache_grow_post(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    cold_fingerprint: u64,
+    bytes: usize,
+) {
+    let Some(cache) = CHECKED_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tick = state.next_tick();
+    let Some(recorded) = state.records.get_mut(key) else {
+        return;
+    };
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+        || !recorded
+            .post
+            .as_ref()
+            .is_some_and(|(fingerprint, _)| *fingerprint == cold_fingerprint)
+    {
+        return;
+    }
+    recorded.bytes += bytes;
+    recorded.last_used = tick;
+    state.bytes = state.bytes.saturating_add(bytes);
     state.evict_to_budget(Some(key));
 }
 

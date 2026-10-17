@@ -1363,6 +1363,92 @@ pub const EFFECT_FIXTURES: &[Fixture] = &[
     },
 ];
 
+// --- M138: the async worklist restarted from the world's cold instance record --
+//
+// A cold module whose instance verdicts the HOT set decides through each of
+// the reads M138's record logs: `relay` hands `twice` a closure that calls a
+// trait dispatch (`via`), and a hot impl of the trait turning async makes the
+// closure async — so `relay` discovers `twice`'s adapted instance and awaits
+// it; `twice_hook` hands `twice` a cold binding a hot module assigns, and an
+// async closure assigned there does the same; `slow_twice` instantiates
+// `twice` at an always-async closure, so the record holds `(twice, [f])` and
+// `(apply, [f])` and the hot caller whose closure turns async is SERVED them.
+// The world's record is filed over the base text; each edit moves one read.
+
+pub const ASYNC_RECORD_MAIN: &str =
+    "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
+
+pub const ASYNC_RECORD_LIB: &str = "import std::time;\n\nexport trait Fetch {\n\tfun fetch(self): i32;\n}\n\nexport struct Plain {\n\tn: i32,\n}\n\nimpl Plain with Fetch {\n\tfun fetch(self): i32 {\n\t\tself.n\n\t}\n}\n\nexport fun via<T: Fetch>(source: T): i32 {\n\tsource.fetch()\n}\n\nexport fun apply(f: || i32): i32 {\n\tf()\n}\n\nexport fun twice(f: || i32): i32 {\n\tapply(f) + apply(f)\n}\n\nexport fun relay(): i32 {\n\tlet source = Plain { n = 1 };\n\ttwice(|| via(source))\n}\n\nexport mut hook = || 1;\n\nexport fun twice_hook(): i32 {\n\ttwice(hook)\n}\n\nexport fun slow_twice(): i32 {\n\ttwice(|| {\n\t\ttime::sleep(1);\n\t\t1\n\t})\n}\n";
+
+pub const ASYNC_RECORD_VIEWS: &str = "import std::time;\nimport pkg::lib::{ Fetch, hook, relay, slow_twice, twice, twice_hook };\n\nstruct Quick {\n\tn: i32,\n}\n\nimpl Quick with Fetch {\n\tfun fetch(self): i32 {\n\t\tself.n\n\t}\n}\n\nexport fun render(): i32 {\n\trelay() + twice_hook() + slow_twice() + twice(|| 3)\n}\n";
+
+pub const ASYNC_RECORD_FIXTURES: &[Fixture] = &[Fixture {
+    name: "async_record",
+    platform: NODE,
+    files: &[
+        ("main.vl", ASYNC_RECORD_MAIN),
+        ("lib.vl", ASYNC_RECORD_LIB),
+        ("views.vl", ASYNC_RECORD_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a hot impl turns async under a cold generic's dispatch: the cold closure's caller must adapt (M138)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[("\t\tself.n\n", "\t\ttime::sleep(1);\n\t\tself.n\n")],
+        },
+        Edit {
+            label: "a hot assignment hands a cold binding an async closure: the cold caller must adapt (M138)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "export fun render(): i32 {\n",
+                "export fun render(): i32 {\n\thook = || {\n\t\ttime::sleep(1);\n\t\t2\n\t};\n",
+            )],
+        },
+        Edit {
+            label: "a hot call's closure turns async: the cold callee's recorded instance is served (M138)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "twice(|| 3)",
+                "twice(|| {\n\t\ttime::sleep(1);\n\t\t3\n\t})",
+            )],
+        },
+    ],
+    dependencies: &[],
+}];
+
+// --- M138's find: S3b's cold result over a value a HOT module holds ----------
+//
+// A cold binding a hot module assigns an `async || T` FIELD READ into: S3b's
+// cold result (the base fixpoint over the cold nodes) asked the binding's held
+// values without asking where they came from, so `call_hook` entered the cold
+// set through the hot assignment, and the keystroke that removes it was served
+// a seed it could not shrink from.
+
+pub const S3B_HELD_LIB: &str =
+    "export mut hook = || 1;\n\nexport fun call_hook(): i32 {\n\thook()\n}\n";
+
+pub const S3B_HELD_VIEWS: &str = "import std::time;\nimport pkg::lib::{ call_hook, hook };\n\nstruct Holder {\n\trun: async || i32,\n}\n\nexport fun render(): i32 {\n\tlet holder = Holder { run = || {\n\t\ttime::sleep(1);\n\t\t2\n\t} };\n\thook = holder.run;\n\tcall_hook()\n}\n";
+
+pub const S3B_HELD_FIXTURES: &[Fixture] = &[Fixture {
+    name: "s3b_held",
+    platform: NODE,
+    files: &[
+        ("main.vl", ASYNC_RECORD_MAIN),
+        ("lib.vl", S3B_HELD_LIB),
+        ("views.vl", S3B_HELD_VIEWS),
+    ],
+    edits: &[Edit {
+        label: "a hot assignment of an async field read into a cold binding removed: the cold caller must turn sync (S3b)",
+        file: "views.vl",
+        seed: None,
+        replacements: &[("\thook = holder.run;\n", "")],
+    }],
+    dependencies: &[],
+}];
+
 // --- B635: the cold rewrite's mints, a function of the cold rows alone --------
 //
 // A cold covered-to-safe boundary — `read_mood`'s strict read calls `peek`,
