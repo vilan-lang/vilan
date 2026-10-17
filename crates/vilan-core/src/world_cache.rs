@@ -3,7 +3,8 @@
 //! ways it shrinks.
 //!
 //! P3 writes one directory per key — `<key hash>/std.world`, or
-//! `dependencies.world` for a program with dependencies (M152) — and the std
+//! `dependencies.world` for a program with dependencies (M152), with the key's
+//! checks record beside it (`std.checks` / `dependencies.checks`, M158) — and the std
 //! import index beside them (`std-index/<std hash>.index`, 3 KB each), and never
 //! removes a sibling. Every dev build of vilan-core is a new build id, so a
 //! developer's root gains a set of files per rebuild (incr-53b's N?1). This

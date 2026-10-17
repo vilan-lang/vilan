@@ -598,6 +598,14 @@ pub struct Census {
     /// `foreign-key`, `unreadable`, `undecodable`); `None` when no prefix
     /// key was looked up or the world cache is off.
     pub prefix_file: Option<&'static str>,
+    /// M158 (Order 54): what loading the prefix key's persisted CHECKS record
+    /// did for this analysis — `loaded` (inserted beside the loaded world, so
+    /// std's Class A checks replay) or the reason the record was a miss;
+    /// `None` when no prefix file was loaded.
+    pub prefix_checks: Option<&'static str>,
+    /// M158: whether this analysis WROTE the record — the one that built the
+    /// prefix's world, or one served a world whose record was a miss.
+    pub prefix_checks_written: bool,
     /// The file's size and the load's or the write's wall time, for the row
     /// the report asks for (not a clock the gate reads).
     pub prefix_file_bytes: u64,
@@ -694,6 +702,8 @@ thread_local! {
             prefix_refusals: 0,
             prefix_refusal: None,
             prefix_file: None,
+            prefix_checks: None,
+            prefix_checks_written: false,
             prefix_file_bytes: 0,
             prefix_file_micros: 0,
             post_seam: None,
@@ -1063,6 +1073,7 @@ pub fn report(program: &Program) {
              async-records-filed={} async-record-bytes={} hover-rows-restored={} \
              prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
+             prefix-checks={} prefix-checks-written={} \
              post-seam={}",
             census.base_hits,
             census.base_misses,
@@ -1107,6 +1118,8 @@ pub fn report(program: &Program) {
             census.prefix_file.unwrap_or("-"),
             census.prefix_file_bytes,
             census.prefix_file_micros,
+            census.prefix_checks.unwrap_or("-"),
+            u8::from(census.prefix_checks_written),
             census
                 .post_seam
                 .map_or_else(|| "-".to_string(), |seam| seam.render()),
