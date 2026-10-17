@@ -323,6 +323,26 @@ pub(crate) fn clean_keeps_hot_shape() -> bool {
     CLEAN.with(Cell::get) == Clean::KeepingHotShape
 }
 
+// --- B635: the replayed graph, verified ------------------------------------
+
+static VERIFY_GRAPH_REPLAYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// B635's test surface: while on, an analysis that REPLAYS the world's
+/// recorded post-rewrite cold graph also builds the graph whole over the same
+/// rewritten tree and counts the cold calls the two name differently
+/// ([`Census::graph_replay_mismatches`]). A replayed graph is meant to be
+/// exact, and the call ids the cold rewrite mints are the part a uniform
+/// renumbering could get wrong.
+#[doc(hidden)]
+pub fn set_verify_graph_replays(on: bool) {
+    VERIFY_GRAPH_REPLAYS.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn verify_graph_replays() -> bool {
+    VERIFY_GRAPH_REPLAYS.load(Ordering::Relaxed)
+}
+
 // --- the planted bugs (Q3's non-vacuity) ------------------------------------
 
 /// A bug a slice plants so its differential can be watched going red
@@ -537,6 +557,11 @@ pub struct Census {
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
+    /// B635's instrument ([`set_verify_graph_replays`]): the cold calls a
+    /// REPLAYED post-rewrite graph names differently from the graph built
+    /// whole over the same tree — 0 by construction, counted only while the
+    /// switch is on.
+    pub graph_replay_mismatches: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -642,6 +667,7 @@ thread_local! {
             r11_instances_scanned: 0,
             r11_records_filed: 0,
             hover_rows_restored: 0,
+            graph_replay_mismatches: 0,
             prefix_world: false,
             prefix_layered: false,
             prefix_hits: 0,

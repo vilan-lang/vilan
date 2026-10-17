@@ -214,7 +214,9 @@ fn replay_the_classes() -> Replayed {
     // M110 S3: the effect classes start from a served analysis of the BASE
     // text — the world's record is filed with every effect present, and each
     // edit then removes one (a seed that cannot shrink is the planted bug).
-    for fixture in EFFECT_FIXTURES {
+    // B635's cold wraps start the same way: the record is filed over the base
+    // text, and the keystroke replays its cold graph.
+    for fixture in EFFECT_FIXTURES.iter().chain(B635_FIXTURES) {
         let mut package = fixture.write();
         let first = observe(&package, vec![package.path("effects.vl")], Leg::Incremental);
         let clean = observe(&package, Vec::new(), Leg::Clean);
@@ -1089,6 +1091,7 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
         .chain(R11_FIXTURES)
         .chain(R11_RECORD_FIXTURES)
         .chain(EFFECT_FIXTURES)
+        .chain(B635_FIXTURES)
         .chain(POST_PASS_FIXTURES)
         .chain(BOUND_FIXTURES)
         .chain(WINDOW_FIXTURES)
@@ -1207,6 +1210,61 @@ fn m159_the_lone_leg_sees_a_fixpoint_seeded_from_the_settled_set() {
             .any(|divergence| divergence.contains("the initializer's refusal must go")),
         "the settled-seed plant must turn the lone sleep removal red; it found: \
          {divergences:#?}"
+    );
+}
+
+/// **B635**: the context rewrite mints every section's COLD rows before any
+/// section's hot rows, so the recorded post-rewrite cold graph — replayed
+/// whenever the cold rewrite log matches, renumbered by a uniform base shift —
+/// names exactly the cold calls a graph built whole over the rewritten tree
+/// names, whatever the hot rows mint. The fixture's keystroke makes a hot
+/// function need the context beside a cold covered-to-safe wrap (a minted
+/// `Some(..)` call); until B635 the hot hidden parameter minted before the cold
+/// threaded arguments and moved the wrap's id under the replay. Non-vacuous:
+/// the keystroke and its undo replay the recorded graph.
+#[test]
+fn b635_a_replayed_cold_graph_names_the_calls_a_rebuilt_one_names() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_verify_graph_replays(true);
+    let mut divergences = Vec::new();
+    let mut censuses = Vec::new();
+    for fixture in B635_FIXTURES {
+        let mut package = fixture.write();
+        let first = observe(&package, vec![package.path("views.vl")], Leg::Incremental);
+        censuses.push(first.census);
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::incremental::set_verify_graph_replays(false);
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        divergences.is_empty(),
+        "the B635 fixture observes the incremental analysis:\n{}",
+        divergences.join("\n")
+    );
+    let replayed: u64 = censuses
+        .iter()
+        .map(|census| census.context_log_replayed)
+        .sum();
+    let mismatches: u64 = censuses
+        .iter()
+        .map(|census| census.graph_replay_mismatches)
+        .sum();
+    assert!(
+        replayed >= 2,
+        "the keystroke and its undo replay the recorded post-rewrite graph ({replayed}): \
+         {censuses:#?}"
+    );
+    assert_eq!(
+        mismatches, 0,
+        "a replayed cold graph names cold calls a graph built whole does not ({replayed} \
+         replays): the cold rewrite's mints moved with the hot rows"
     );
 }
 

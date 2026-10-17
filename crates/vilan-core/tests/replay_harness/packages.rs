@@ -1363,6 +1363,43 @@ pub const EFFECT_FIXTURES: &[Fixture] = &[
     },
 ];
 
+// --- B635: the cold rewrite's mints, a function of the cold rows alone --------
+//
+// A cold covered-to-safe boundary — `read_mood`'s strict read calls `peek`,
+// whose safe read takes `Option<i32>`, so the threaded argument is a minted
+// `Some(..)` wrap CALL — beside a hot leaf whose keystroke makes a hot function
+// need the context (a hidden parameter minted, and a threaded argument at its
+// caller). The cold log is the same on every keystroke, so the recorded
+// post-rewrite cold graph is replayed; until B635 the hot parameter minted
+// before the cold threaded arguments and every cold wrap's id moved under the
+// replay.
+
+pub const B635_CTX: &str = "import std::context::Context;\nimport std::option::Option::{ Some, None };\n\nexport let mood = Context<i32>::new();\n\nfun peek(): i32 {\n\tmatch mood.get_safe() {\n\t\tSome(let value) => value,\n\t\tNone => 0,\n\t}\n}\n\nexport fun read_mood(): i32 {\n\tmood.get() + peek()\n}\n";
+
+pub const B635_VIEWS: &str = "import std::option::Option::{ Some, None };\nimport pkg::ctx::{ mood, read_mood };\n\nexport fun render(): i32 {\n\tmood.run(5, || read_mood())\n}\n\nexport fun extra(): i32 {\n\t1\n}\n";
+
+pub const B635_MAIN: &str = "import pkg::views::{ extra, render };\n\nfun main() {\n\tprint(render());\n\tprint(extra());\n}\n";
+
+pub const B635_FIXTURES: &[Fixture] = &[Fixture {
+    name: "b635_wraps",
+    platform: NODE,
+    files: &[
+        ("main.vl", B635_MAIN),
+        ("ctx.vl", B635_CTX),
+        ("views.vl", B635_VIEWS),
+    ],
+    edits: &[Edit {
+        label: "a hot function gains a safe context read beside a cold covered-to-safe wrap (B635)",
+        file: "views.vl",
+        seed: None,
+        replacements: &[(
+            "\t1\n",
+            "\tmatch mood.get_safe() {\n\t\tSome(let value) => value,\n\t\tNone => 1,\n\t}\n",
+        )],
+    }],
+    dependencies: &[],
+}];
+
 // --- M159: the LONE open document's own class --------------------------------
 //
 // A module opened ALONE (the language server's M104 hybrid: file mode, seeded

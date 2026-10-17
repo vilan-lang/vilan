@@ -315,6 +315,32 @@ impl CallGraph {
         names(&self.calls) || names(&self.initializer_calls) || names(&self.const_initializer_calls)
     }
 
+    /// B635: how many `(node, call)` rows of this graph and `other` the two do
+    /// not share — every call list (body, initializer, const initializer)
+    /// compared by the node it sits in and the call's id.
+    pub fn call_rows_not_shared(&self, other: &CallGraph) -> u64 {
+        fn rows(graph: &CallGraph) -> HashSet<(u8, Id, Id)> {
+            let mut rows = HashSet::default();
+            for (list, calls) in [
+                &graph.calls,
+                &graph.initializer_calls,
+                &graph.const_initializer_calls,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (node, node_calls) in calls {
+                    for call in node_calls {
+                        rows.insert((list as u8, *node, call.call_id));
+                    }
+                }
+            }
+            rows
+        }
+        let (ours, theirs) = (rows(self), rows(other));
+        (ours.symmetric_difference(&theirs).count()) as u64
+    }
+
     /// M110 S3: renumbers the call entities the recorded rewrite minted —
     /// every call id at or past `from` — onto this analysis's base `to`.
     pub fn remap_minted(&mut self, from: u32, to: u32) {
