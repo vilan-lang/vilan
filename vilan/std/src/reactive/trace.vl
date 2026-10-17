@@ -1,0 +1,299 @@
+// `std::reactive::trace` — the reactive trace (debugging.md §6.2, E257 S8): who
+// woke what.
+//
+// `trace(true)` writes a line per WAKE — each subscriber a write reached, as it
+// runs — naming what woke it:
+//
+//     [reactive] effect #4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
+//     [reactive] derivation #2 woken by cell #1, set at src/main.vl:9:7
+//     [reactive] effect #5 woken by cell #3, set by derivation #2
+//     [reactive] effect #6 woken by derivation #2
+//
+// A subscriber is an `effect` (it acts on a value) or a `derivation` (it publishes
+// one, a relay included), numbered by its id; a cell by its identity. A place is a
+// `[track_caller]` location (S0): where the cell was made (`SignalCell::new`) and
+// the write that woke it (a concrete cell's `set` or `update`), each named only
+// when it is the program's own — std's are left out — and `set by` names the traced
+// wake a write ran inside. A write through the trait (`S: Signal<T>`, `dyn Signal`)
+// and a cell made by `Signal::new` carry no place: a `[track_caller]` trait member
+// is refused, so nothing passes one. A relay's `wake` is woken by the relay.
+//
+// A wake that waits in a turn's queue runs later, on another stack — at the
+// extent's end, or on a microtask. Queued under the trace, it is wrapped in a host
+// TASK named by its cause (`console.createTask` on the JS backend; nothing
+// natively), so a debugger shows the waking write's stack under the woken frame,
+// below a label naming the cause (E326's async frames).
+//
+// The lines go to stderr (the browser's console), byte-identical on both backends.
+// The scheduler (`std::reactive`) reaches this module only through the hooks
+// `trace(true)` installs, so a program that never imports it carries none of it.
+import pkg::debug::Location;
+import pkg::hash::{ Hash, Hashable };
+import pkg::js::native_map::NativeMap;
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::{ Subscriber, TraceHooks, Turn, queue_wakes, trace_hooks, tracing, waking };
+import pkg::shared::Shared;
+
+/// Turn the reactive trace on or off: on, every wake a write causes is a line on
+/// stderr naming the woken subscriber and its cause. Turn it on before the cells
+/// whose places you want named are made.
+export fun trace(on: bool) {
+	if on {
+		trace_hooks.write() = TraceHooks {
+			made = |identity: i32, site: Location| note_made(identity, site),
+			written = |site: Location| note_write(site),
+			cause = |identity: i32| cell_cause(identity),
+			queued = |turn: Turn, id: i32| note_queued_wake(turn, id),
+			run_queued = |turn: Turn, subscriber: Subscriber| run_queued_wake(turn, subscriber),
+			run = |subscriber: Subscriber, cause: str| run_traced(subscriber, cause, None),
+			relay = |subscriber: Subscriber, draining: Option<Turn>| relay_traced(
+				subscriber,
+				draining,
+			),
+			forget = |turn: Turn, id: i32| forget_queued_wake(turn, id),
+		};
+	} else {
+		queued_wakes.write() = NativeMap::new();
+	}
+	tracing.write() = on;
+}
+
+/// A trace line, to stderr (`console.error`; `console.log` in the browser, as `dbg`
+/// writes).
+[extern("__trace_line")]
+external fun trace_line(line: str);
+
+/// Make the host task a queued wake will run in, named `name`, under `token`: its
+/// stack is the waking write's (`console.createTask`; nothing natively).
+[extern("__trace_task")]
+external fun trace_task(token: i32, name: str);
+
+/// Run `body` in the task `token` names, and forget it (`task.run`; a plain call
+/// natively, or where the host has no tasks).
+[extern("__trace_run")]
+external fun trace_run(token: i32, body: || void);
+
+/// The runtime's `try`/`finally` (`std::reactive`'s, tracker B292).
+[extern("__with_finally")]
+external fun with_finally(body: || void, after: || void);
+
+/// The place a traced write was made at, for the `notify` it calls to name: set by
+/// `set`/`update` (the trait's `notify` takes no location) and taken by the first
+/// `notify` after it.
+let write_site: Shared<Option<Location>> = Shared::new(None);
+
+/// The traced wake running now (`effect #4`), for a relay's `wake` and a write
+/// inside it to name.
+let running_wake: Shared<Option<str>> = Shared::new(None);
+
+/// Where each cell made under the trace was made, by its identity.
+let made_at: Shared<NativeMap<str>> = Shared::new(NativeMap::new());
+
+/// Each queued wake's cause and task, oldest first, by turn and subscriber. A list,
+/// because a subscriber taken out with a wave can be queued again before that wave
+/// runs it: the run takes the oldest, a scrub the newest.
+let queued_wakes: Shared<NativeMap<List<QueuedWake>>> = Shared::new(NativeMap::new());
+
+/// The last task token minted.
+let trace_tokens: Shared<i32> = Shared::new(0);
+
+/// One queued wake under the trace: its cause and its task's token.
+struct QueuedWake {
+	cause: str,
+	token: i32,
+}
+
+/// `site`'s text, when it is the program's own place and not std's.
+fun program_place(site: Location): Option<str> {
+	let text = site.text();
+	if text.starts_with("std/") {
+		None
+	} else {
+		Some(text)
+	}
+}
+
+/// Remember where the cell `identity` was made.
+fun note_made(identity: i32, site: Location) {
+	match program_place(site) {
+		Some(let place) => made_at.write().insert(identity.hash(), place),
+		None => {},
+	}
+}
+
+/// Hand the write's place to the `notify` it is about to call.
+fun note_write(site: Location) {
+	write_site.write() = Some(site);
+}
+
+/// The cause a traced notify of the cell `identity` names: the cell, where it was
+/// made, and the write — its place, or the traced wake it ran inside.
+fun cell_cause(identity: i32): str {
+	mut cause = i"cell #{identity}";
+	match made_at.read().get(identity.hash()) {
+		Some(let place) => {
+			cause = cause + i" (made at {place})";
+		},
+		None => {},
+	}
+	let site = write_site.read();
+	write_site.write() = None;
+	let written_at = match site {
+		Some(let location) => program_place(location),
+		None => None,
+	};
+	match written_at {
+		Some(let place) => {
+			cause = cause + i", set at {place}";
+		},
+		None => {
+			match running_wake.read() {
+				Some(let inside) => {
+					cause = cause + i", set by {inside}";
+				},
+				None => {},
+			}
+		},
+	}
+	cause
+}
+
+/// `turn` and `id`'s key in `queued_wakes`.
+fun wake_key(turn: Turn, id: i32): Hash {
+	i"{turn.pending.identity()}:{id}".hash()
+}
+
+/// `enqueue` queued `id` into `turn`: under a traced cause, keep the cause and make
+/// the task its run will be wrapped in. The task is made HERE, on the waking
+/// write's stack, which is the stack a debugger then shows.
+fun note_queued_wake(turn: Turn, id: i32) {
+	match waking.read() {
+		Some(let cause) => {
+			let token = trace_tokens.read() + 1;
+			trace_tokens.write() = token;
+			trace_task(token, cause);
+			let key = wake_key(turn, id);
+			mut held = match queued_wakes.read().get(key) {
+				Some(let queued) => queued,
+				None => [],
+			};
+			held.push(QueuedWake { cause, token });
+			queued_wakes.write().insert(key, held);
+		},
+		None => {},
+	}
+}
+
+/// The oldest wake queued for `id` in `turn`, taken out.
+fun take_queued_wake(turn: Turn, id: i32): Option<QueuedWake> {
+	let key = wake_key(turn, id);
+	match queued_wakes.read().get(key) {
+		Some(let held) => {
+			if held.len() <= 1 {
+				queued_wakes.write().remove(key);
+			} else {
+				mut rest: List<QueuedWake> = [];
+				mut index: usize = 1;
+				for index < held.len() {
+					rest.push(held[index]);
+					index += 1;
+				}
+				queued_wakes.write().insert(key, rest);
+			}
+			held.first()
+		},
+		None => None,
+	}
+}
+
+/// A scrub took `id` out of `turn`'s queue: its newest wake goes too, and its task.
+fun forget_queued_wake(turn: Turn, id: i32) {
+	let key = wake_key(turn, id);
+	match queued_wakes.read().get(key) {
+		Some(let held) => {
+			mut rest = held;
+			match rest.pop() {
+				Some(let dropped) => trace_run(dropped.token, || {}),
+				None => {},
+			}
+			if rest.is_empty() {
+				queued_wakes.write().remove(key);
+			} else {
+				queued_wakes.write().insert(key, rest);
+			}
+		},
+		None => {},
+	}
+}
+
+/// `drain`'s run of a queued `subscriber` under the trace: traced if it was queued
+/// with a cause, plainly if not (a deferred action, or a wake queued before the
+/// trace was on); a lowered one does not fire, and its task is let go.
+fun run_queued_wake(turn: Turn, subscriber: Subscriber) {
+	let queued = take_queued_wake(turn, subscriber.id);
+	if subscriber.live.read() {
+		match queued {
+			Some(let wake) => run_traced(subscriber, wake.cause, Some(wake.token)),
+			None => (subscriber.notify)(),
+		}
+	} else {
+		match queued {
+			Some(let wake) => trace_run(wake.token, || {}),
+			None => {},
+		}
+	}
+}
+
+/// Run `subscriber`, woken by `cause`: its line, then its notify — in the task
+/// `token` names when the wake was queued — with `running_wake` naming it for a
+/// relay it wakes and a write it makes.
+fun run_traced(subscriber: Subscriber, cause: str, token: Option<i32>) {
+	let woken = if subscriber.derived {
+		i"derivation #{subscriber.id}"
+	} else {
+		i"effect #{subscriber.id}"
+	};
+	trace_line(i"[reactive] {woken} woken by {cause}");
+	let outer = running_wake.read();
+	running_wake.write() = Some(woken);
+	with_finally(|| {
+		match token {
+			Some(let held) => trace_run(held, subscriber.notify),
+			None => (subscriber.notify)(),
+		}
+	}, || {
+		running_wake.write() = outer;
+	});
+}
+
+/// `wake` from inside a traced wake (a relay): the downstream joins the draining
+/// turn with the relay as its cause, or runs now — `wake`'s answer, traced. `false`
+/// outside a traced wake: an untraced wake.
+fun relay_traced(subscriber: Subscriber, draining: Option<Turn>): bool {
+	match running_wake.read() {
+		Some(let relay) => {
+			match draining {
+				Some(let turn) => queue_wakes(
+					turn,
+					[
+						Subscriber {
+							id = subscriber.id,
+							notify = subscriber.notify,
+							live = subscriber.live,
+							derived = subscriber.derived,
+						},
+					],
+					true,
+					relay,
+				),
+				None => {
+					if subscriber.live.read() {
+						run_traced(subscriber, relay, None);
+					}
+				},
+			}
+			true
+		},
+		None => false,
+	}
+}

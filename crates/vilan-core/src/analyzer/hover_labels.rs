@@ -661,8 +661,12 @@ impl<'src> Analyzer<'src> {
     ///   that type has no open parameter in it.
     ///
     /// For a payload variant the label belongs to the CALLEE (`Some` of
-    /// `Some(1)`), read through the call. A label with a hole in it
-    /// (`Unknown`) says nothing and is not tabled. Editor-only: empty without
+    /// `Some(1)`), read through the call. The label is the WHOLE variant line
+    /// (E328): `Option<i32>::Some(i32)`, the payload spelled under the
+    /// instantiation's arguments as `pattern_labels` spells a pattern's; the
+    /// language server reads a generic enum's label (it holds `>::`) as the
+    /// line itself. A label with a hole in it (`Unknown`) says nothing and is
+    /// not tabled. Editor-only: empty without
     /// the reading aids.
     pub(super) fn variant_use_labels(
         &self,
@@ -674,17 +678,19 @@ impl<'src> Analyzer<'src> {
         }
         // The variant a reference names, where it is a variant of a generic
         // enum, and which enum that is.
-        let variant_enum = |id: Id| -> Option<Id> {
+        let variant_enum = |id: Id| -> Option<(Id, usize)> {
             let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&id) else {
                 return None;
             };
-            let Some(Expr::EnumVariant(enum_id, _)) = self.expr_id_to_expr_map.get(target) else {
+            let Some(Expr::EnumVariant(enum_id, variant_index)) =
+                self.expr_id_to_expr_map.get(target)
+            else {
                 return None;
             };
             self.enums
                 .get(enum_id)
                 .is_some_and(|enum_| !enum_.generic_parameter_constraint_ids.is_empty())
-                .then_some(*enum_id)
+                .then_some((*enum_id, *variant_index))
         };
         let in_scope = |id: Id| -> bool {
             !self.label_row_restored(id)
@@ -694,20 +700,39 @@ impl<'src> Analyzer<'src> {
         };
         let wanted = |id: Id| -> bool { !expr_types.contains_key(&id) && in_scope(id) };
         let empty = SubstitutionContext::default();
-        // The label of `type_id` where it is an instantiation of `enum_id`.
-        let label_of = |type_id: TypeId, enum_id: Id, ground: bool| -> Option<String> {
-            let Type::Enum(found, arguments) = type_id.borrow_type(self) else {
-                return None;
+        // The label of `type_id` where it is an instantiation of `enum_id`:
+        // the WHOLE variant line (E328), `Option<i32>::Some(i32)` - the
+        // instantiation, the variant, and the declared payload under the
+        // instantiation's arguments, as a pattern's label spells it.
+        let label_of =
+            |type_id: TypeId, enum_id: Id, variant_index: usize, ground: bool| -> Option<String> {
+                let Type::Enum(found, arguments) = type_id.borrow_type(self) else {
+                    return None;
+                };
+                if *found != enum_id || arguments.is_empty() {
+                    return None;
+                }
+                if ground && !self.type_is_ground(type_id) {
+                    return None;
+                }
+                let enum_ = self.enums.get(&enum_id)?;
+                let variant = enum_.variants.get(variant_index)?;
+                let head = self.pretty_print_type(type_id.borrow_type(self), &empty);
+                let mut label = format!("{head}::{}", variant.name);
+                if !variant.data_type_ids.is_empty() {
+                    let substitution =
+                        applied_substitution(&enum_.generic_parameter_constraint_ids, arguments);
+                    let payload: Vec<String> = variant
+                        .data_type_ids
+                        .iter()
+                        .map(|payload| {
+                            self.pretty_print_type(payload.borrow_type(self), &substitution)
+                        })
+                        .collect();
+                    label.push_str(&format!("({})", payload.join(", ")));
+                }
+                (!label.contains("Unknown") && !label.contains('?')).then_some(label)
             };
-            if *found != enum_id || arguments.is_empty() {
-                return None;
-            }
-            if ground && !self.type_is_ground(type_id) {
-                return None;
-            }
-            let label = self.pretty_print_type(type_id.borrow_type(self), &empty);
-            (!label.contains("Unknown") && !label.contains('?')).then_some(label)
-        };
         // What a bare variant reference or a variant constructor CALL stands
         // for: the id the label is keyed by (the reference) and the id the
         // position's facts are keyed by (the reference, or its call).
@@ -724,14 +749,14 @@ impl<'src> Analyzer<'src> {
         }
         let mut by_parameter: HashMap<Id, TypeId> = HashMap::default();
         // The variant constructor calls: (callee, its enum, the call).
-        let mut variant_calls: Vec<(Id, Id, Id)> = Vec::new();
+        let mut variant_calls: Vec<(Id, (Id, usize), Id)> = Vec::new();
         // The cheap, cache-hot test first: most of the world is std's.
         for (call_id, call) in super::live_ranges::LiveEntries::over(&self.function_calls, live) {
             if !in_scope(call.id) {
                 continue;
             }
-            if let Some(enum_id) = variant_enum(call.subject_id) {
-                variant_calls.push((call.subject_id, enum_id, *call_id));
+            if let Some(variant) = variant_enum(call.subject_id) {
+                variant_calls.push((call.subject_id, variant, *call_id));
                 continue;
             }
             if call.argument_ids.is_empty() {
@@ -753,43 +778,43 @@ impl<'src> Analyzer<'src> {
             }
         }
         let mut labels: HashMap<Id, String> = HashMap::default();
-        let mut consider = |reference: Id, enum_id: Id, position: Id| {
+        let mut consider = |reference: Id, (enum_id, variant_index): (Id, usize), position: Id| {
             if labels.contains_key(&reference) || !wanted(reference) {
                 return;
             }
             let label = self
                 .expected_types
                 .get(&position)
-                .and_then(|expected| label_of(*expected, enum_id, false))
+                .and_then(|expected| label_of(*expected, enum_id, variant_index, false))
                 .or_else(|| {
                     by_binding
                         .get(&position)
-                        .and_then(|bound| label_of(*bound, enum_id, false))
+                        .and_then(|bound| label_of(*bound, enum_id, variant_index, false))
                 })
                 .or_else(|| {
                     by_parameter
                         .get(&position)
-                        .and_then(|declared| label_of(*declared, enum_id, true))
+                        .and_then(|declared| label_of(*declared, enum_id, variant_index, true))
                 });
             if let Some(label) = label {
                 labels.insert(reference, label);
             }
         };
         // A variant constructor call: the label belongs to the callee.
-        for (callee, enum_id, call_id) in variant_calls {
-            consider(callee, enum_id, call_id);
+        for (callee, variant, call_id) in variant_calls {
+            consider(callee, variant, call_id);
         }
         // A bare variant reference.
         for (id, _) in super::live_ranges::LiveEntries::over(&self.expected_types, live) {
             if in_scope(*id)
-                && let Some(enum_id) = variant_enum(*id)
+                && let Some(variant) = variant_enum(*id)
             {
-                consider(*id, enum_id, *id);
+                consider(*id, variant, *id);
             }
         }
         for id in by_binding.keys().chain(by_parameter.keys()) {
-            if let Some(enum_id) = variant_enum(*id) {
-                consider(*id, enum_id, *id);
+            if let Some(variant) = variant_enum(*id) {
+                consider(*id, variant, *id);
             }
         }
         labels.into_iter().collect()

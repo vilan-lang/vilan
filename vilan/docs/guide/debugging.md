@@ -256,12 +256,17 @@ count: SignalCell<i32> = SignalCell(3)
 first: view i32 = 1
 ```
 
-A struct expands into its fields, a list into its elements, a map into its
-entries. A closure's frame lists what it captured from the function around it
+A type with its own `Debug` impl shows what the impl prints, as `dbg` does,
+and a `dyn` value shows the value it holds by that value's own type. A struct
+expands into its fields, a list into its elements, a map into its entries. A closure's frame lists what it captured from the function around it
 apart from its own bindings. The Watch pane takes a path into a binding —
 `segment.to`, `rows[0]`, `pair.1` — and prints it the same way; anything else
 you type there is evaluated as JavaScript. A hover lays a long value out over
 lines, as `dbg` does.
+
+A stop in a function that has awaited lists the functions waiting on it below
+an `await` label in the Call Stack: they are where the program comes back to,
+not where it stands, so they show no variables.
 
 `"watch": true` debugs a `vilan run --watch` session: each round's program is
 held at its first line until the debugger has attached to it again, so a
@@ -281,3 +286,17 @@ or for a single build with `vilan build --source-maps`; `--inspect` writes one
 whatever the preset says. `source-maps = false` turns the `debug` preset's off.
 A map changes no byte of the program it describes: the script is the same with
 it and without it, but for the comment that names it.
+
+## Who woke this effect: the reactive trace
+
+`trace(true)` (`std::reactive::trace::trace`) writes a line to stderr for every subscriber a
+write wakes, naming the write and the cell:
+
+```text
+[reactive] effect #4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
+```
+
+In the VS Code debugger the lines are in the Debug Console too, and a stop in
+an effect a turn ran later — at the end of a `batch`, or on a microtask — has
+the write that woke it below a label naming the cause in the Call Stack. The
+[`trace` reference](../std/reactive.md#trace--who-woke-what) has the details.

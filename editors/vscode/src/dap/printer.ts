@@ -161,11 +161,16 @@ export function expandable(document: Doc): boolean {
 ///
 /// It answers the document, or throws on a value the layout does not
 /// describe (an uninitialized binding); the adapter then shows the JavaScript
-/// value. Self-contained — it is sent as text — and kept in the runtime's own
+/// value. A type whose layout carries `fn` is printed by the program's own
+/// function at that position of `printers` (E323: the type's printer, or its
+/// written `Debug` impl's `debug`, which the adapter found in the paused
+/// program) — what `dbg` prints, since a written impl decides that (E275). A
+/// trait object is printed by the type its table's functions name (E324),
+/// else by the table's `show` slot. Self-contained — it is sent as text — and kept in the runtime's own
 /// spelling (`__dbg_str`, `__dbg_float`, `__dbg_list`, `__dbg_members`,
 /// `__dbg_map`, the generated `__show_*` bodies), so it reads exactly what
 /// they read.
-export function walker(value: any, types: any[], root: number, read: string): Doc {
+export function walker(value: any, types: any[], root: number, read: string, ...printers: any[]): Doc {
     let budget = 20000;
     const seen: unknown[] = [];
     const group = (o: string, c: string, p: boolean, e: [string, Doc][], f: boolean, k: string): Group => ({
@@ -217,9 +222,34 @@ export function walker(value: any, types: any[], root: number, read: string): Do
         }
         return group(open, '}', true, entries, fill, kind);
     };
+    const document = (printed: any): Doc | undefined =>
+        typeof printed === 'string' ||
+        (printed !== null && typeof printed === 'object' && typeof printed.o === 'string' && Array.isArray(printed.e))
+            ? printed
+            : undefined;
+    const tableOf = (object: any, impls: any[]): number | undefined => {
+        if (!object || !Array.isArray(impls)) return undefined;
+        const slots = Object.getPrototypeOf(object) || object;
+        const names: string[] = [];
+        for (const member of Object.keys(slots)) {
+            if (member === '$show') continue;
+            names.push(typeof slots[member] === 'function' ? slots[member].name : '');
+        }
+        for (const known of impls) {
+            const methods = known[0];
+            if (methods.length === names.length && methods.every((name: string, slot: number) => name === names[slot])) {
+                return known[1];
+            }
+        }
+        return undefined;
+    };
     const show = (current: any, index: number): Doc => {
         if (--budget < 0) return '\u2026';
         const type = types[index];
+        if (typeof type.fn === 'number' && typeof printers[type.fn] === 'function') {
+            const printed = document(printers[type.fn](current));
+            if (printed !== undefined) return printed;
+        }
         switch (type.shape) {
             case 'integer':
             case 'bigint':
@@ -302,7 +332,13 @@ export function walker(value: any, types: any[], root: number, read: string): Do
                 );
             case 'object': {
                 const table = current[1];
-                const inner: Doc = table && typeof table.$show === 'function' ? table.$show(current[0]) : '<?>';
+                const concrete = tableOf(table, type.impls);
+                const inner: Doc =
+                    concrete !== undefined
+                        ? show(current[0], concrete)
+                        : table && typeof table.$show === 'function'
+                          ? table.$show(current[0])
+                          : '<?>';
                 return group(type.label + '(', ')', false, [['', inner]], false, 'o');
             }
             case 'enum': {

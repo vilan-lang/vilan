@@ -1120,7 +1120,10 @@ export macro fun enum_json_impls(target: EnumItem): str {
 				Some(let type_) => decoded(type_, i"value.field({tag})"),
 				None => i"_::from_json_value(value.field({tag}))",
 			};
-			from_arms = from_arms.arm(tag, i"Result::Ok({target.name}::{variant.name}({payload}!))");
+			from_arms = from_arms.arm(
+				tag,
+				i"Result::Ok({target.name}::{variant.name}({payload}!))",
+			);
 		} else {
 			mut elements: List<str> = [];
 			mut index = 0;

@@ -161,5 +161,5 @@ if ($s[0] === 0) {
 } else {
 	$t = console.log("none");
 }
-process.exit($t);
+$t;
 //# sourceMappingURL=keyword-members.mjs.map

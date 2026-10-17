@@ -2099,8 +2099,7 @@ impl<'p, 'src> State<'p, 'src> {
         matches!(
             self.program.intrinsics.get(&target),
             Some(
-                crate::analyzer::Intrinsic::Scan
-                    | crate::analyzer::Intrinsic::Args
+                crate::analyzer::Intrinsic::Args
                     | crate::analyzer::Intrinsic::Env
                     | crate::analyzer::Intrinsic::RandomInt
                     | crate::analyzer::Intrinsic::RandomFloat

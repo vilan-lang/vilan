@@ -61,6 +61,7 @@ guide/debugging.md h2 where-panics-name-their-line
 guide/debugging.md h3 track_caller
 guide/debugging.md h2 in-a-debugger
 guide/debugging.md h3 in-vs-code
+guide/debugging.md h2 who-woke-this-effect-the-reactive-trace
 guide/dev-loop.md h1 the-dev-loop
 guide/dev-loop.md h2 what-each-edit-does
 guide/dev-loop.md h2 when-a-round-fails
@@ -436,6 +437,7 @@ std/process.md h2 stdfs
 std/process.md h2 stdbuild
 std/process.md h2 stdwebdocument
 std/process.md h2 stdprocess
+std/process.md h3 reading-stdin
 std/process.md h2 stdwatch
 std/reactive.md h1 stdreactive-reference
 std/reactive.md h2 at-a-glance
@@ -456,6 +458,7 @@ std/reactive.md h3 unzip--a-tuple-cell-split
 std/reactive.md h2 subscription-disposable
 std/reactive.md h2 owner
 std/reactive.md h2 turns
+std/reactive.md h2 trace--who-woke-what
 std/reactive.md h2 optimistic
 std/reactive.md h2 optimistic--the-observable-lifecycle
 std/reactive.md h2 draft--local-first-cells

@@ -8977,6 +8977,8 @@ fn filler_program(header: &str, functions: usize) -> String {
 
 #[test]
 fn r11_instantiations_do_not_mint_a_type_slot_per_place_in_the_program() {
+    // Cold analyses, counted: the persisted prefix would serve std's slots.
+    without_the_std_prefix();
     const SMALL: usize = 10;
     const LARGE: usize = 60;
     // The same filler grows the program by the same slots with or without the

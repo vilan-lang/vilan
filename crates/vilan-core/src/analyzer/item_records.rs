@@ -146,6 +146,12 @@ impl RestoredTables {
         {
             self.hmr.extend(&tables.hmr.rebased(rebase));
         }
+        if tables
+            .families
+            .contains(super::row_families::RowFamily::R11)
+        {
+            self.r11.extend(&tables.r11.rebased(rebase, shift, source));
+        }
         if tables.hover_recorded {
             self.hover
                 .extend(&tables.hover.rebased(rebase, shift, source));
@@ -1314,6 +1320,7 @@ impl<'src> Analyzer<'src> {
                         && tables.moves.fits(&own)
                         && tables.lazy.fits(&own)
                         && tables.hmr.fits(&own)
+                        && tables.r11.fits(&own)
                         && tables.resource_slots.is_empty()
                         && tables
                             .stage_hints

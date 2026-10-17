@@ -1,0 +1,33 @@
+// papers-54's F?3: a `for x in subject` over a type whose INHERENT
+// `next(self): Option<T>` awaits (here through `settle`, an `async fun`) is
+// awaited at every step natively, as on JS - the emitted `while let` had
+// no `.await`, and cargo refused it (E0308, expected future).
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
+
+struct Ticks {
+	left: Shared<i32>,
+}
+
+async fun settle(value: i32): i32 {
+	value
+}
+
+impl Ticks {
+	fun next(self): Option<i32> {
+		if self.left.read() == 0 {
+			ret None;
+		}
+		self.left.write() = settle(self.left.read() - 1);
+		Some(self.left.read())
+	}
+}
+
+fun main() {
+	let ticks = Ticks { left = Shared::new(3) };
+	for tick in ticks {
+		print(i"tick {tick}");
+	}
+	print("done");
+}

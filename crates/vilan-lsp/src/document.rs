@@ -3483,6 +3483,15 @@ impl Document {
         self.program.is_some()
     }
 
+    /// M159: whether this document's analysis was SEEDED (its post-pass
+    /// seam's record filed and read) — the pins' window on the lone path.
+    #[cfg(test)]
+    pub fn post_seam_seeded(&self) -> bool {
+        self.program
+            .as_ref()
+            .is_some_and(|program| program.post_seam_seeded())
+    }
+
     /// Whether this document is answering from [`ReleasedTables`] — it held a
     /// program, and [`release_analysis`](Document::release_analysis) took it.
     ///
@@ -4552,13 +4561,21 @@ impl Document {
         };
         let enumeration = program.enums.get(enum_id)?;
         let variant = enumeration.variants.get(*index)?;
-        let head = program
+        let label = program
             .expr_types
             .get(&id)
-            .filter(|label| label.starts_with(enumeration.name) && !label.contains("Unknown"))
+            .filter(|label| label.starts_with(enumeration.name) && !label.contains("Unknown"));
+        // E328: a generic enum's label is already the whole variant line
+        // (`Option<i32>::Some(i32)`, the payload under the instantiation); a
+        // bare label is the head alone.
+        let whole = label.filter(|label| label.contains(&format!(">::{}", variant.name)));
+        let head = label
             .cloned()
             .unwrap_or_else(|| enumeration.name.to_string());
-        let mut line = format!("{head}::{}", variant.name);
+        let mut line = match whole {
+            Some(line) => line.clone(),
+            None => format!("{head}::{}", variant.name),
+        };
         // The payload as declared, where the enum has no parameters to
         // substitute (a generic one's instantiation is the head's).
         if enumeration.generic_parameter_constraint_ids.is_empty()

@@ -1,0 +1,70 @@
+// B637: an argument at a NON-generic parameter - a free function's, a
+// method's, a closure's, and through a view (`&make().unwrap_or(2)`) - tells
+// the argument call its type, so B627's receiver path fixes `make`'s own `T`
+// and a static's impl binder there too, the same on both backends.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+trait Make {
+	fun make(): Self;
+}
+
+impl i32 with Make {
+	fun make(): i32 {
+		7
+	}
+}
+
+struct Holder<T> {
+	value: T,
+}
+
+impl Holder<type T: Make> {
+	fun build(): Option<Holder<T>> {
+		Some(Holder { value = T::make() })
+	}
+}
+
+fun make<T>(): Option<T> {
+	None
+}
+
+fun take(value: i32): i32 {
+	value + 1
+}
+
+fun peek(value: &i32): i32 {
+	*value + 100
+}
+
+fun held_value(held: Holder<i32>): i32 {
+	held.value
+}
+
+struct Counter {
+	total: i32,
+}
+
+impl Counter {
+	fun fresh(): Counter {
+		Counter { total = 10 }
+	}
+
+	fun add(&mut self, amount: i32): Counter {
+		self.total = self.total + amount;
+		Counter { total = self.total }
+	}
+}
+
+fun main() {
+	print(take(make().unwrap_or(5)));
+	print(take(take(make().unwrap_or(7))));
+	print(held_value(Holder::build().unwrap()));
+	mut counter = Counter::fresh();
+	print(counter.add(make().unwrap_or(2)).total);
+	print(Counter::fresh().add(make().unwrap_or(4)).total);
+	let double = |value: i32| value * 2;
+	print(double(make().unwrap_or(3)));
+	print(peek(&make().unwrap_or(2)));
+	print([take(make().unwrap_or(6))].len());
+}

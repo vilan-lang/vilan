@@ -1,0 +1,74 @@
+// E323/E324's gate (`src/test/session.test.ts`): types with a WRITTEN `Debug`
+// impl, and two `dyn` bindings, in a program that never calls `dbg` and never
+// prints an object — so its tables carry no `show` slot. `Secret`'s impl is
+// called from a function (so a paused function's frame can reach it);
+// `Muted`'s only from `main`'s top level (so it cannot, and the pane reads the
+// structure). A `// break:` comment names a line the session stops on.
+import std::debug::Debug;
+import std::io::print;
+
+struct Secret {
+	code: i32,
+}
+
+impl Secret with Debug {
+	fun debug(self): str {
+		"<redacted>"
+	}
+}
+
+struct Muted {
+	level: i32,
+}
+
+impl Muted with Debug {
+	fun debug(self): str {
+		"<muted>"
+	}
+}
+
+trait Area {
+	fun area(self): f64;
+}
+
+struct Square {
+	side: f64,
+}
+
+impl Square with Area {
+	fun area(self): f64 {
+		self.side * self.side
+	}
+}
+
+struct Rect {
+	width: f64,
+	height: f64,
+}
+
+impl Rect with Area {
+	fun area(self): f64 {
+		self.width * self.height
+	}
+}
+
+/// The impl's `debug`, called by a function: what `print` shows of a secret.
+fun reveal(secret: Secret): str {
+	secret.debug()
+}
+
+/// The stop: a function's frame, where the program's module-scope functions are
+/// reachable only if V8 context-allocated them.
+fun look(secret: Secret, muted: Muted, square: dyn Area, rect: dyn Area) {
+	print(reveal(secret)); // break: values
+	print(square.area() + rect.area());
+}
+
+fun main() {
+	let secret = Secret { code = 42 };
+	let muted = Muted { level = 3 };
+	let square: dyn Area = Square { side = 2.0 };
+	let rect: dyn Area = Rect { width = 2.0, height = 3.0 };
+	look(secret, muted, square, rect);
+	print(muted.debug());
+}

@@ -63,7 +63,9 @@ fun main() {
 		presence.effect_on_change(|_p| mark("presence"));
 	});
 	presence.set(Presence::Online(Device { name = "laptop", since = 2 }));
-	print(i"same-variant write: [{drained()}] since={presence.online().since().get().unwrap_or(0)}");
+	print(
+		i"same-variant write: [{drained()}] since={presence.online().since().get().unwrap_or(0)}",
+	);
 	presence.set(Presence::Offline);
 	print(i"to Offline: [{drained()}] name={name.get().unwrap_or("-")}");
 	print(i"patch through the dead variant: {name.patch("ghost")} [{drained()}]");

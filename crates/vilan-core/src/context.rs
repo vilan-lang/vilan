@@ -310,6 +310,16 @@ fn graph_after_rewrite(
                 census.graphs_replayed += 1;
                 census.context_log_replayed += 1;
             });
+            // B635's instrument: the replayed cold half against the graph
+            // built whole over this rewritten tree.
+            if crate::incremental::verify_graph_replays() {
+                let cold = |id: Id| program.cold_entity(id);
+                let rebuilt = CallGraph::build(program).restricted(cold);
+                let mismatches = graph.restricted(cold).call_rows_not_shared(&rebuilt);
+                crate::incremental::update_census(|census| {
+                    census.graph_replay_mismatches += mismatches;
+                });
+            }
             note_record_state(program, &log);
             graph
         }
@@ -390,6 +400,7 @@ fn file_post_record_cut(
         context_log: log,
         rewrite_base,
         async_cold: std::sync::OnceLock::new(),
+        async_instances: std::sync::OnceLock::new(),
         bytes,
     });
     crate::analyzer::checked_cache_store_post(
@@ -523,6 +534,7 @@ struct ClearSite {
 /// own parameter (bare or already-`Option`), that parameter `Some`-wrapped
 /// (the covered→safe boundary), or a literal `None` (an entry point with no
 /// value — a top-level call, or the inlined entry `main`).
+#[derive(Clone, Copy)]
 enum ThreadForm {
     Param { owner: Node },
     WrapSome { owner: Node },
@@ -587,36 +599,59 @@ impl Plan {
     /// M110 S3: the minting rows (hidden parameters, spawn references, `get`
     /// rewrites, threaded arguments) reordered so the rows over COLD entities
     /// come first, sorted by their anchor and context; the hot rows keep the
-    /// order the analysis listed them in. See [`apply`].
-    fn cold_rows_first(mut self, program: &Program) -> Plan {
-        fn order<T>(rows: &mut Vec<T>, cold: impl Fn(&T) -> bool, key: impl Fn(&T) -> (u32, u32)) {
+    /// order the analysis listed them in. Answers how many cold rows lead each
+    /// section, which [`apply`] applies in a pass of their own (B635).
+    fn cold_rows_first(mut self, program: &Program) -> (Plan, MintCounts) {
+        fn order<T>(
+            rows: &mut Vec<T>,
+            cold: impl Fn(&T) -> bool,
+            key: impl Fn(&T) -> (u32, u32),
+        ) -> usize {
             let (mut first, rest): (Vec<T>, Vec<T>) =
                 std::mem::take(rows).into_iter().partition(&cold);
             first.sort_by_key(&key);
+            let cold_count = first.len();
             first.extend(rest);
             *rows = first;
+            cold_count
         }
-        order(
+        let param_nodes = order(
             &mut self.param_nodes,
             |(_, node, _)| program.cold_entity(*node),
             |(context, node, _)| (node.0, context.0),
         );
-        order(
+        let spawns = order(
             &mut self.spawns,
             |(entity, ..)| program.cold_entity(*entity),
             |(entity, context, ..)| (entity.0, context.0),
         );
-        order(
+        let gets = order(
             &mut self.gets,
             |(call_id, ..)| program.cold_entity(*call_id),
             |(call_id, context, ..)| (call_id.0, context.0),
         );
-        order(
+        let thread_calls = order(
             &mut self.thread_calls,
             |(call_id, ..)| program.cold_entity(*call_id),
             |(call_id, context, _)| (call_id.0, context.0),
         );
-        self
+        let counts = MintCounts {
+            param_nodes,
+            spawns,
+            gets,
+            thread_calls,
+        };
+        (self, counts)
+    }
+
+    /// Every minting row as one leading run — a plan applied as listed.
+    fn minting_counts(&self) -> MintCounts {
+        MintCounts {
+            param_nodes: self.param_nodes.len(),
+            spawns: self.spawns.len(),
+            gets: self.gets.len(),
+            thread_calls: self.thread_calls.len(),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -3780,193 +3815,95 @@ fn apply(program: &mut Program, plan: Plan, canonical: bool) {
     // relative to that base (`PostRecord::rewrite_base`). A call's arguments
     // keep their order (a call's rows are one per context, and contexts are
     // sorted), as does a node's hidden parameters.
-    let plan = if canonical {
+    //
+    // B635: cold first across the WHOLE plan, not per section. The sections
+    // mint in turn (hidden parameters, spawn references, `get` rewrites,
+    // threaded arguments), and cold-first within each one still minted the
+    // hot parameters, spawns and gets before the cold threaded arguments — so
+    // a keystroke that made a hot function need a context (or stop needing
+    // one) moved every cold `Some(..)` wrap's id, and the replayed cold graph
+    // (renumbered by a uniform base shift, `CallGraph::remap_minted`) named
+    // calls that were not there. Every section's cold rows are applied in a
+    // first pass and every section's hot rows in a second, so the cold mint
+    // sequence is a function of the cold rows alone.
+    let (plan, cold) = if canonical {
         plan.cold_rows_first(program)
     } else {
-        plan
+        let all = plan.minting_counts();
+        (plan, all)
     };
     // B482: the cleared clause positions, for a backend that writes the type.
     program
         .cleared_clause_contexts
         .extend(plan.cleared_types.iter().copied());
-    let mut next_id = program.next_entity_id;
-    let mut fresh = || {
-        let id = Id(next_id);
-        next_id += 1;
-        id
+    let mut minting = Minting {
+        next_id: program.next_entity_id,
+        source: HashMap::default(),
+        pass_through: HashMap::default(),
     };
-
-    // (context, node) -> the parameter id that holds the value inside that node.
-    let mut source: HashMap<(Id, Id), Id> = HashMap::default();
-
-    // Give each function and `run` closure its own hidden parameter. The
-    // parameter is deliberately record-less (no `parameters` entry, no span,
-    // no `expr_types` label — it is not source), so it is marked in
-    // `context_hidden_parameters` for tooling to recognize and answer
-    // honestly (editing-dx.md §19.3).
-    for &(context, node, holds_bare) in &plan.param_nodes {
-        let parameter = fresh();
-        program
-            .entity_map
-            .insert(parameter, Expr::Parameter(parameter));
-        program.context_hidden_parameters.insert(parameter, context);
-        // F23: and its FLAVOUR, which the analysis settled from the node's own
-        // provider. Recorded here rather than inferred downstream from the
-        // arguments the call sites pass.
-        if !holds_bare {
-            program.context_optional_hidden_parameters.insert(parameter);
-        }
-        if let Some(function) = program.functions.get_mut(&node) {
-            function.parameters.push(parameter);
-        } else if let Some(closure) = program.closures.get_mut(&node) {
-            closure.parameters.push(parameter);
-        }
-        source.insert((context, node), parameter);
-    }
-
-    // A captured closure reuses its provider's parameter.
-    for &(context, closure, provider) in &plan.captures {
-        if let Some(&parameter) = source.get(&(context, provider)) {
-            source.insert((context, closure), parameter);
-        }
-    }
-
-    // Spawn registration: each spawn reads the ambient nursery from its
-    // owner's in-scope parameter. The transformer passes the value as
-    // `__task`'s third argument (unwrapping the `Option` of a safe holder).
-    for &(spawn_entity, context, owner, bare) in &plan.spawns {
-        if let Some(&parameter) = source.get(&(context, owner.id())) {
-            let reference = fresh();
-            program.entity_map.insert(reference, Expr::Local(parameter));
-            program
-                .spawn_nursery_sources
-                .insert(spawn_entity, (reference, !bare));
-        }
-    }
-
-    let empty_span = crate::span::Span { start: 0, end: 0 };
-    // Synthesizes `Some(parameter)`: a fresh call to the `Option::Some`
-    // variant constructor. The transformer lowers a variant-subject call to
-    // the variant value directly, so no method records are needed.
-    let wrap_in_some = |program: &mut Program, parameter: Id, next: &mut dyn FnMut() -> Id| {
-        let some_variant = plan
-            .some_variant
-            .expect("safe sites resolved the Option variants");
-        let subject = next();
-        program
-            .entity_map
-            .insert(subject, Expr::Local(some_variant));
-        let value_reference = next();
-        program
-            .entity_map
-            .insert(value_reference, Expr::Local(parameter));
-        let call = next();
-        program.function_calls.insert(
-            call,
-            crate::analyzer::FunctionCall {
-                id: call,
-                subject_id: subject,
-                generic_argument_ids: Vec::new(),
-                argument_ids: vec![value_reference],
-                arguments_span: empty_span,
-            },
-        );
-        program.entity_map.insert(call, Expr::Call(call));
-        call
-    };
-
-    // `get()` becomes a read of the in-scope parameter; a safe read of a
-    // BARE holder becomes `Some(parameter)` (the get's own call entity is
-    // rewritten into the wrap, its method records purged like `run`'s).
-    for &(call_id, context, owner, wrap_some) in &plan.gets {
-        if let Some(&parameter) = source.get(&(context, owner.id())) {
-            if wrap_some {
-                let some_variant = plan
-                    .some_variant
-                    .expect("safe sites resolved the Option variants");
-                let subject = fresh();
-                program
-                    .entity_map
-                    .insert(subject, Expr::Local(some_variant));
-                let value_reference = fresh();
-                program
-                    .entity_map
-                    .insert(value_reference, Expr::Local(parameter));
-                if let Some(call) = program.function_calls.get_mut(&call_id) {
-                    // Record the subject this rewire erases — the wired
-                    // `Local(get_safe_fn)` naming the SOURCE callee — so
-                    // tooling can still answer it (editing-dx.md §19.3).
-                    let erased_subject = call.subject_id;
-                    call.subject_id = subject;
-                    call.generic_argument_ids = Vec::new();
-                    call.argument_ids = vec![value_reference];
-                    program
-                        .context_erased_subjects
-                        .insert(call_id, erased_subject);
-                }
-                program.method_call_substitution.remove(&call_id);
-                program.generic_dispatch.remove(&call_id);
-            } else {
-                program.entity_map.insert(call_id, Expr::Local(parameter));
-            }
-        }
-    }
-
-    // Each call to a needs-context function gets the value appended as an
-    // argument — the caller's parameter, `Some`-wrapped at a covered→safe
-    // boundary.
-    //
-    // M137: a bare pass-through is ONE reference entity per (context, node) —
-    // the same `Expr::Local(parameter)` read in every threaded call the node
-    // makes — not a fresh one per call: kolt's client threads 66k arguments
-    // out of ~6.9k hidden parameters, and minting each one doubled the entity
-    // map on every analysis. A read entity carries no position of its own
-    // (no span, no type label, no clone decision — the analyzer's tables were
-    // settled before this pass), and the native backend's last-use walk
-    // exempts a hidden parameter's reads (M151), the one reader that keyed a
-    // decision by the read entity. The node is the CALLER (the graph node the
-    // call sits in), so a closure keeps its own entity even where it reads its
-    // provider's parameter. A `Some(..)` wrap stays per call: it is a CALL,
-    // and a call entity is a position (awaits, dispatch records, spans).
-    // The cold rows come first (`cold_rows_first`), and a cold call's node is
-    // cold, so a shared cold entity is minted by the first cold row that asks
-    // and the cold mint sequence is still a function of the cold rows alone.
-    let mut pass_through: HashMap<(Id, Id), Id> = HashMap::default();
-    for &(call_id, context, ref form) in &plan.thread_calls {
-        let argument = match *form {
-            ThreadForm::Param { owner } => {
-                let Some(&parameter) = source.get(&(context, owner.id())) else {
-                    continue;
-                };
-                *pass_through
-                    .entry((context, owner.id()))
-                    .or_insert_with(|| {
-                        let reference = fresh();
-                        program.entity_map.insert(reference, Expr::Local(parameter));
-                        reference
-                    })
-            }
-            ThreadForm::WrapSome { owner } => {
-                let Some(&parameter) = source.get(&(context, owner.id())) else {
-                    continue;
-                };
-                wrap_in_some(program, parameter, &mut fresh)
-            }
-            ThreadForm::NoneLiteral => {
-                let none_variant = plan
-                    .none_variant
-                    .expect("safe sites resolved the Option variants");
-                let reference = fresh();
-                program
-                    .entity_map
-                    .insert(reference, Expr::Local(none_variant));
-                reference
-            }
+    // The cold pass's rows whose node had no hidden parameter yet. None is
+    // possible by construction — a cold row's node is the anchor's own node,
+    // in the anchor's (cold) source, and a captured closure's provider
+    // encloses it — but a row is never dropped for it: it is applied in the
+    // hot pass, and only the id stability of the replay is lost.
+    let mut deferred = Deferred::default();
+    for pass in [Pass::Cold, Pass::Hot] {
+        let rows = |cold_count: usize, len: usize| match pass {
+            Pass::Cold => 0..cold_count,
+            Pass::Hot => cold_count..len,
         };
-        if let Some(call) = program.function_calls.get_mut(&call_id) {
-            call.argument_ids.push(argument);
+        // Give each function and `run` closure its own hidden parameter.
+        mint_hidden_parameters(
+            program,
+            &mut minting,
+            &plan.param_nodes[rows(cold.param_nodes, plan.param_nodes.len())],
+        );
+        // A captured closure reuses its provider's parameter (idempotent, so
+        // asked again once the hot parameters exist).
+        for &(context, closure, provider) in &plan.captures {
+            if let Some(&parameter) = minting.source.get(&(context, provider)) {
+                minting.source.insert((context, closure), parameter);
+            }
         }
+        let defer = matches!(pass, Pass::Cold) && canonical;
+        if matches!(pass, Pass::Hot) {
+            debug_assert!(
+                deferred.is_empty(),
+                "B635: a cold context row's node had no cold hidden parameter"
+            );
+            let spawns = std::mem::take(&mut deferred.spawns);
+            mint_spawn_references(program, &mut minting, &spawns, None);
+        }
+        mint_spawn_references(
+            program,
+            &mut minting,
+            &plan.spawns[rows(cold.spawns, plan.spawns.len())],
+            defer.then_some(&mut deferred.spawns),
+        );
+        if matches!(pass, Pass::Hot) {
+            let gets = std::mem::take(&mut deferred.gets);
+            rewrite_gets(program, &mut minting, &plan, &gets, None);
+        }
+        rewrite_gets(
+            program,
+            &mut minting,
+            &plan,
+            &plan.gets[rows(cold.gets, plan.gets.len())],
+            defer.then_some(&mut deferred.gets),
+        );
+        if matches!(pass, Pass::Hot) {
+            let thread_calls = std::mem::take(&mut deferred.thread_calls);
+            thread_arguments(program, &mut minting, &plan, &thread_calls, None);
+        }
+        thread_arguments(
+            program,
+            &mut minting,
+            &plan,
+            &plan.thread_calls[rows(cold.thread_calls, plan.thread_calls.len())],
+            defer.then_some(&mut deferred.thread_calls),
+        );
     }
+    let next_id = minting.next_id;
 
     // Safe reads inside the inlined entry `main` are literal `None`s.
     for &call_id in &plan.none_gets {
@@ -4022,4 +3959,291 @@ fn apply(program: &mut Program, plan: Plan, canonical: bool) {
     }
 
     program.next_entity_id = next_id;
+}
+
+/// What [`apply`]'s minting rows thread through its two passes (B635).
+struct Minting {
+    next_id: u32,
+    /// (context, node) -> the parameter id that holds the value inside that node.
+    source: HashMap<(Id, Id), Id>,
+    /// M137: a bare pass-through argument is ONE reference entity per
+    /// (context, caller node) — see [`thread_arguments`].
+    pass_through: HashMap<(Id, Id), Id>,
+}
+
+impl Minting {
+    fn fresh(&mut self) -> Id {
+        let id = Id(self.next_id);
+        self.next_id += 1;
+        id
+    }
+}
+
+/// [`apply`]'s two passes over the minting rows (B635): every section's cold
+/// rows, then every section's hot rows.
+#[derive(Clone, Copy)]
+enum Pass {
+    Cold,
+    Hot,
+}
+
+/// How many of each minting section's rows lead it as COLD rows
+/// ([`Plan::cold_rows_first`]); a plan applied as listed counts every row.
+struct MintCounts {
+    param_nodes: usize,
+    spawns: usize,
+    gets: usize,
+    thread_calls: usize,
+}
+
+/// The cold pass's rows [`apply`] carried into the hot pass (none by
+/// construction; see there).
+#[derive(Default)]
+struct Deferred {
+    spawns: Vec<(Id, Id, Node, bool)>,
+    gets: Vec<(Id, Id, Node, bool)>,
+    thread_calls: Vec<(Id, Id, ThreadForm)>,
+}
+
+impl Deferred {
+    fn is_empty(&self) -> bool {
+        self.spawns.is_empty() && self.gets.is_empty() && self.thread_calls.is_empty()
+    }
+}
+
+/// Gives each function and `run` closure its own hidden parameter. The
+/// parameter is deliberately record-less (no `parameters` entry, no span, no
+/// `expr_types` label — it is not source), so it is marked in
+/// `context_hidden_parameters` for tooling to recognize and answer honestly
+/// (editing-dx.md §19.3).
+fn mint_hidden_parameters(program: &mut Program, minting: &mut Minting, rows: &[(Id, Id, bool)]) {
+    for &(context, node, holds_bare) in rows {
+        let parameter = minting.fresh();
+        program
+            .entity_map
+            .insert(parameter, Expr::Parameter(parameter));
+        program.context_hidden_parameters.insert(parameter, context);
+        // F23: and its FLAVOUR, which the analysis settled from the node's own
+        // provider. Recorded here rather than inferred downstream from the
+        // arguments the call sites pass.
+        if !holds_bare {
+            program.context_optional_hidden_parameters.insert(parameter);
+        }
+        if let Some(function) = program.functions.get_mut(&node) {
+            function.parameters.push(parameter);
+        } else if let Some(closure) = program.closures.get_mut(&node) {
+            closure.parameters.push(parameter);
+        }
+        minting.source.insert((context, node), parameter);
+    }
+}
+
+/// Spawn registration: each spawn reads the ambient nursery from its owner's
+/// in-scope parameter. The transformer passes the value as `__task`'s third
+/// argument (unwrapping the `Option` of a safe holder). A row whose owner has
+/// no parameter yet goes to `defer` when one is given.
+fn mint_spawn_references(
+    program: &mut Program,
+    minting: &mut Minting,
+    rows: &[(Id, Id, Node, bool)],
+    mut defer: Option<&mut Vec<(Id, Id, Node, bool)>>,
+) {
+    for &row in rows {
+        let (spawn_entity, context, owner, bare) = row;
+        let Some(&parameter) = minting.source.get(&(context, owner.id())) else {
+            if let Some(defer) = defer.as_deref_mut() {
+                defer.push(row);
+            }
+            continue;
+        };
+        let reference = minting.fresh();
+        program.entity_map.insert(reference, Expr::Local(parameter));
+        program
+            .spawn_nursery_sources
+            .insert(spawn_entity, (reference, !bare));
+    }
+}
+
+/// Synthesizes `Some(parameter)`: a fresh call to the `Option::Some` variant
+/// constructor. The transformer lowers a variant-subject call to the variant
+/// value directly, so no method records are needed.
+fn wrap_in_some(program: &mut Program, minting: &mut Minting, plan: &Plan, parameter: Id) -> Id {
+    let some_variant = plan
+        .some_variant
+        .expect("safe sites resolved the Option variants");
+    let subject = minting.fresh();
+    program
+        .entity_map
+        .insert(subject, Expr::Local(some_variant));
+    let value_reference = minting.fresh();
+    program
+        .entity_map
+        .insert(value_reference, Expr::Local(parameter));
+    let call = minting.fresh();
+    program.function_calls.insert(
+        call,
+        crate::analyzer::FunctionCall {
+            id: call,
+            subject_id: subject,
+            generic_argument_ids: Vec::new(),
+            argument_ids: vec![value_reference],
+            arguments_span: crate::span::Span { start: 0, end: 0 },
+        },
+    );
+    program.entity_map.insert(call, Expr::Call(call));
+    call
+}
+
+/// `get()` becomes a read of the in-scope parameter; a safe read of a BARE
+/// holder becomes `Some(parameter)` (the get's own call entity is rewritten
+/// into the wrap, its method records purged like `run`'s). A row whose owner
+/// has no parameter yet goes to `defer` when one is given.
+fn rewrite_gets(
+    program: &mut Program,
+    minting: &mut Minting,
+    plan: &Plan,
+    rows: &[(Id, Id, Node, bool)],
+    mut defer: Option<&mut Vec<(Id, Id, Node, bool)>>,
+) {
+    for &row in rows {
+        let (call_id, context, owner, wrap_some) = row;
+        let Some(&parameter) = minting.source.get(&(context, owner.id())) else {
+            if let Some(defer) = defer.as_deref_mut() {
+                defer.push(row);
+            }
+            continue;
+        };
+        if wrap_some {
+            let some_variant = plan
+                .some_variant
+                .expect("safe sites resolved the Option variants");
+            let subject = minting.fresh();
+            program
+                .entity_map
+                .insert(subject, Expr::Local(some_variant));
+            let value_reference = minting.fresh();
+            program
+                .entity_map
+                .insert(value_reference, Expr::Local(parameter));
+            if let Some(call) = program.function_calls.get_mut(&call_id) {
+                // Record the subject this rewire erases — the wired
+                // `Local(get_safe_fn)` naming the SOURCE callee — so
+                // tooling can still answer it (editing-dx.md §19.3).
+                let erased_subject = call.subject_id;
+                call.subject_id = subject;
+                call.generic_argument_ids = Vec::new();
+                call.argument_ids = vec![value_reference];
+                program
+                    .context_erased_subjects
+                    .insert(call_id, erased_subject);
+            }
+            program.method_call_substitution.remove(&call_id);
+            program.generic_dispatch.remove(&call_id);
+        } else {
+            program.entity_map.insert(call_id, Expr::Local(parameter));
+        }
+    }
+}
+
+/// Each call to a needs-context function gets the value appended as an
+/// argument — the caller's parameter, `Some`-wrapped at a covered→safe
+/// boundary.
+///
+/// M137: a bare pass-through is ONE reference entity per (context, node) —
+/// the same `Expr::Local(parameter)` read in every threaded call the node
+/// makes — not a fresh one per call: kolt's client threads 66k arguments out
+/// of ~6.9k hidden parameters, and minting each one doubled the entity map on
+/// every analysis. A read entity carries no position of its own (no span, no
+/// type label, no clone decision — the analyzer's tables were settled before
+/// this pass), and the native backend's last-use walk exempts a hidden
+/// parameter's reads (M151), the one reader that keyed a decision by the read
+/// entity. The node is the CALLER (the graph node the call sits in), so a
+/// closure keeps its own entity even where it reads its provider's parameter.
+/// A `Some(..)` wrap stays per call: it is a CALL, and a call entity is a
+/// position (awaits, dispatch records, spans). The cold rows come first (B635:
+/// in a pass of their own), and a cold call's node is cold, so a shared cold
+/// entity is minted by the first cold row that asks and the cold mint
+/// sequence is a function of the cold rows alone.
+///
+/// A row whose owner has no parameter yet goes to `defer` when one is given —
+/// and so does every later row of the same call, which keeps a call's
+/// arguments in `contexts` order.
+fn thread_arguments(
+    program: &mut Program,
+    minting: &mut Minting,
+    plan: &Plan,
+    rows: &[(Id, Id, ThreadForm)],
+    mut defer: Option<&mut Vec<(Id, Id, ThreadForm)>>,
+) {
+    let mut deferred_calls: HashSet<Id> = HashSet::default();
+    for &row in rows {
+        let (call_id, context, form) = row;
+        let owner_parameter = |minting: &Minting, owner: Node| -> Option<Id> {
+            if deferred_calls.contains(&call_id) {
+                return None;
+            }
+            minting.source.get(&(context, owner.id())).copied()
+        };
+        let argument = match form {
+            ThreadForm::Param { owner } => {
+                let Some(parameter) = owner_parameter(minting, owner) else {
+                    if let Some(defer) = defer.as_deref_mut() {
+                        defer.push(row);
+                        deferred_calls.insert(call_id);
+                    }
+                    continue;
+                };
+                match minting.pass_through.get(&(context, owner.id())) {
+                    Some(&reference) => reference,
+                    None => {
+                        let reference = minting.fresh();
+                        program.entity_map.insert(reference, Expr::Local(parameter));
+                        minting
+                            .pass_through
+                            .insert((context, owner.id()), reference);
+                        reference
+                    }
+                }
+            }
+            ThreadForm::WrapSome { owner } => {
+                let Some(parameter) = owner_parameter(minting, owner) else {
+                    if let Some(defer) = defer.as_deref_mut() {
+                        defer.push(row);
+                        deferred_calls.insert(call_id);
+                    }
+                    continue;
+                };
+                wrap_in_some(program, minting, plan, parameter)
+            }
+            ThreadForm::NoneLiteral => {
+                if deferred_calls.contains(&call_id) {
+                    if let Some(defer) = defer.as_deref_mut() {
+                        defer.push(row);
+                    }
+                    continue;
+                }
+                let none_variant = plan
+                    .none_variant
+                    .expect("safe sites resolved the Option variants");
+                let reference = minting.fresh();
+                program
+                    .entity_map
+                    .insert(reference, Expr::Local(none_variant));
+                reference
+            }
+        };
+        if let Some(call) = program.function_calls.get_mut(&call_id) {
+            call.argument_ids.push(argument);
+        } else if program.for_each_next.contains_key(&call_id) {
+            // papers-54's B?2: a `for` loop's implicit `next` call is an edge
+            // keyed by the loop (`call_graph.rs`), with no `FunctionCall` to
+            // append to — the argument was minted and dropped, and the loop
+            // called `next` without it on both backends.
+            program
+                .for_each_context_arguments
+                .entry(call_id)
+                .or_default()
+                .push(argument);
+        }
+    }
 }

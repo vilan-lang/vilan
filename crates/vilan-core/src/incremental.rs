@@ -323,6 +323,26 @@ pub(crate) fn clean_keeps_hot_shape() -> bool {
     CLEAN.with(Cell::get) == Clean::KeepingHotShape
 }
 
+// --- B635: the replayed graph, verified ------------------------------------
+
+static VERIFY_GRAPH_REPLAYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// B635's test surface: while on, an analysis that REPLAYS the world's
+/// recorded post-rewrite cold graph also builds the graph whole over the same
+/// rewritten tree and counts the cold calls the two name differently
+/// ([`Census::graph_replay_mismatches`]). A replayed graph is meant to be
+/// exact, and the call ids the cold rewrite mints are the part a uniform
+/// renumbering could get wrong.
+#[doc(hidden)]
+pub fn set_verify_graph_replays(on: bool) {
+    VERIFY_GRAPH_REPLAYS.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn verify_graph_replays() -> bool {
+    VERIFY_GRAPH_REPLAYS.load(Ordering::Relaxed)
+}
+
 // --- the planted bugs (Q3's non-vacuity) ------------------------------------
 
 /// A bug a slice plants so its differential can be watched going red
@@ -390,6 +410,18 @@ pub enum Plant {
     /// then visits a served item's bodies and derives its output a second
     /// time beside the replay of its record (a doubled diagnostic).
     LiveRangeWalksServed,
+    /// R11 door B (Order 54): an instance record is served without its
+    /// `Drop` digest compared — a `Drop` impl appearing in the entry for a
+    /// type a cold generic is instantiated at then leaves the generic's
+    /// field move admitted as a destructure, and the instantiation's R5
+    /// refusal is never spoken.
+    R11RecordUnguarded,
+    /// M138 (Order 54): the async pass's cold instance record is served
+    /// without validating what its keys READ — a hot edit that makes an id a
+    /// cold key read async (a dispatch candidate, a closure a cold call
+    /// passes, a value a hot module assigns into a cold binding) then leaves
+    /// the key's recorded verdict, its discoveries and its decision in place.
+    AsyncRecordUnguarded,
 }
 
 impl Plant {
@@ -409,6 +441,8 @@ impl Plant {
             Plant::PostSeedFromSettled => 13,
             Plant::ItemRecordUnguarded => 14,
             Plant::LiveRangeWalksServed => 15,
+            Plant::R11RecordUnguarded => 16,
+            Plant::AsyncRecordUnguarded => 17,
         }
     }
 }
@@ -516,9 +550,34 @@ pub struct Census {
     /// are not walked, so a served keystroke reads a fraction of a filing
     /// one's.
     pub move_rows_live: u64,
+    /// M155: R11's candidate rows this analysis derived by walking the
+    /// family's live lane (`analyzer/r11_candidates.rs`) when it met an
+    /// instantiation — a served keystroke reads a fraction of a filing one's.
+    pub r11_rows_live: u64,
+    /// R11 door B (Order 54, `analyzer/r11_records.rs`): the instances this
+    /// analysis EMITTED from the world's records (a cold callee whose key
+    /// has a record with the current `Drop` digest), the ones it scanned
+    /// live, and the records it filed for the next analysis.
+    pub r11_instances_served: u64,
+    pub r11_instances_scanned: u64,
+    pub r11_records_filed: u64,
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
+    /// B635's instrument ([`set_verify_graph_replays`]): the cold calls a
+    /// REPLAYED post-rewrite graph names differently from the graph built
+    /// whole over the same tree — 0 by construction, counted only while the
+    /// switch is on.
+    pub graph_replay_mismatches: u64,
+    /// M138 (Order 54): the recorded cold instance keys this analysis's async
+    /// worklist answered from the world's cold instance record, the ones it
+    /// RE-WALKED (something a key read moved, or a callee it read flipped),
+    /// and the records it filed.
+    pub async_keys_served: u64,
+    pub async_keys_rewalked: u64,
+    pub async_records_filed: u64,
+    /// What the record this analysis filed retains, in bytes.
+    pub async_record_bytes: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -539,10 +598,58 @@ pub struct Census {
     /// `foreign-key`, `unreadable`, `undecodable`); `None` when no prefix
     /// key was looked up or the world cache is off.
     pub prefix_file: Option<&'static str>,
+    /// M158 (Order 54): what loading the prefix key's persisted CHECKS record
+    /// did for this analysis — `loaded` (inserted beside the loaded world, so
+    /// std's Class A checks replay) or the reason the record was a miss;
+    /// `None` when no prefix file was loaded.
+    pub prefix_checks: Option<&'static str>,
+    /// M158: whether this analysis WROTE the record — the one that built the
+    /// prefix's world, or one served a world whose record was a miss.
+    pub prefix_checks_written: bool,
     /// The file's size and the load's or the write's wall time, for the row
     /// the report asks for (not a clock the gate reads).
     pub prefix_file_bytes: u64,
     pub prefix_file_micros: u64,
+    /// M159: the post passes' reuse seam as the async pass found it — `None`
+    /// when the analysis built no seam (a cold `vilan check` of a world it
+    /// did not reuse, a clean analysis, an entry-shaped world).
+    pub post_seam: Option<PostSeamState>,
+}
+
+/// M159: what the post passes' reuse seam (M110 S3) offered one analysis,
+/// read where the async pass starts — the instrument that showed the lone
+/// open document's keystroke unseeded (incr-53c's probe, kept).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostSeamState {
+    /// A front end seeded the analysis (`Workspace::hot_seeds`): the record is
+    /// filed and read only then.
+    pub seeded: bool,
+    /// The world's post-pass record for this cold set was filed already.
+    pub record: bool,
+    /// The record's context log is this analysis's (the context pass set it).
+    pub matches: bool,
+    /// The record carries S3b's async cold seed.
+    pub cold: bool,
+}
+
+impl PostSeamState {
+    /// `seeded+record+matches+cold` — the parts that hold, `none` when none.
+    pub fn render(&self) -> String {
+        let parts: Vec<&str> = [
+            (self.seeded, "seeded"),
+            (self.record, "record"),
+            (self.matches, "matches"),
+            (self.cold, "cold"),
+        ]
+        .into_iter()
+        .filter_map(|(holds, name)| holds.then_some(name))
+        .collect();
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join("+")
+        }
+    }
 }
 
 thread_local! {
@@ -579,15 +686,27 @@ thread_local! {
             live_ranges: 0,
             live_entities: 0,
             move_rows_live: 0,
+            r11_rows_live: 0,
+            r11_instances_served: 0,
+            r11_instances_scanned: 0,
+            r11_records_filed: 0,
             hover_rows_restored: 0,
+            graph_replay_mismatches: 0,
+            async_keys_served: 0,
+            async_keys_rewalked: 0,
+            async_records_filed: 0,
+            async_record_bytes: 0,
             prefix_world: false,
             prefix_layered: false,
             prefix_hits: 0,
             prefix_refusals: 0,
             prefix_refusal: None,
             prefix_file: None,
+            prefix_checks: None,
+            prefix_checks_written: false,
             prefix_file_bytes: 0,
             prefix_file_micros: 0,
+            post_seam: None,
         })
     };
 }
@@ -949,8 +1068,13 @@ pub fn report(program: &Program) {
              seeded-passes={} post-records-filed={} windows-laid-out={} windows-inherited={} \
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
-             live-entities={} move-rows-live={} hover-rows-restored={} prefix-world={} prefix-layered={} prefix-hits={} \
-             prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={}",
+             live-entities={} move-rows-live={} r11-rows-live={} instances-served={} \
+             instances-scanned={} instance-records-filed={} async-seeded={}/{} \
+             async-records-filed={} async-record-bytes={} hover-rows-restored={} \
+             prefix-world={} prefix-layered={} prefix-hits={} \
+             prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
+             prefix-checks={} prefix-checks-written={} \
+             post-seam={}",
             census.base_hits,
             census.base_misses,
             census.base_stores,
@@ -978,6 +1102,14 @@ pub fn report(program: &Program) {
             census.live_ranges,
             census.live_entities,
             census.move_rows_live,
+            census.r11_rows_live,
+            census.r11_instances_served,
+            census.r11_instances_scanned,
+            census.r11_records_filed,
+            census.async_keys_served,
+            census.async_keys_rewalked,
+            census.async_records_filed,
+            census.async_record_bytes,
             census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
@@ -986,6 +1118,11 @@ pub fn report(program: &Program) {
             census.prefix_file.unwrap_or("-"),
             census.prefix_file_bytes,
             census.prefix_file_micros,
+            census.prefix_checks.unwrap_or("-"),
+            u8::from(census.prefix_checks_written),
+            census
+                .post_seam
+                .map_or_else(|| "-".to_string(), |seam| seam.render()),
         );
     }
 }

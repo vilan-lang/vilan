@@ -78,6 +78,24 @@ fun main() {
 }
 `,
 	],
+	// A173 S1: stdin is an async host read; the playground's node leg is
+	// check-only, so it compiles the reader and never runs its pump.
+	[
+		"a process program reading stdin",
+		"node",
+		`import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::{ prompt, scan };
+
+fun main() {
+	print(i"first: {scan()}");
+	match prompt("name? ") {
+		Some(let name) => print(i"hello, {name}"),
+		None => print("no name"),
+	}
+}
+`,
+	],
 ];
 for (const [name, platform, source] of programs) {
 	let result;

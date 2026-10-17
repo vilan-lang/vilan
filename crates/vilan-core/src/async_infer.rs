@@ -41,20 +41,49 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
 
     // Every value each binding ever holds — its initializer plus every
     // reassignment (`mut` rebinds) — for async ADOPTION: a binding holding
-    // an async closure through any of them awaits when called.
+    // an async closure through any of them awaits when called. The same one
+    // walk of the entity map finds the `async { .. }` blocks.
     let mut held_values: HashMap<Id, Vec<Id>> = HashMap::default();
     for (variable_id, variable) in &program.variables {
         if let Some(initial) = variable.initial {
             held_values.entry(*variable_id).or_default().push(initial);
         }
     }
+    let mut async_blocks: Vec<Id> = Vec::new();
+    // And A.4's escape positions: every store into a struct field, filtered
+    // to the plain closure-typed ones below (`Escapes`).
+    let mut field_stores: Vec<FieldStore> = Vec::new();
     for expr in program.entity_map.values() {
-        if let Expr::Assignment(target_id, value_id) = expr
-            && let Some(Expr::Local(variable_id)) = program.entity_map.get(target_id)
-        {
-            held_values.entry(*variable_id).or_default().push(*value_id);
+        match expr {
+            Expr::Assignment(target_id, value_id) => match program.entity_map.get(target_id) {
+                Some(Expr::Local(variable_id)) => {
+                    held_values.entry(*variable_id).or_default().push(*value_id);
+                }
+                Some(Expr::Field(_, struct_id, field_index)) => field_stores.push(FieldStore {
+                    struct_id: *struct_id,
+                    field_index: *field_index,
+                    value_id: *value_id,
+                }),
+                _ => {}
+            },
+            // The initializer expr carries its OWN id; the struct def
+            // resolves through `struct_initializer_to_def`.
+            Expr::StructInitializer(initializer_id, field_values) => {
+                if let Some(struct_id) = program.struct_initializer_to_def.get(initializer_id) {
+                    field_stores.extend(field_values.iter().map(|(field_index, value_id)| {
+                        FieldStore {
+                            struct_id: *struct_id,
+                            field_index: *field_index,
+                            value_id: *value_id,
+                        }
+                    }));
+                }
+            }
+            Expr::Async(closure_id) => async_blocks.push(*closure_id),
+            _ => {}
         }
     }
+    let escapes = Escapes::of(program, field_stores);
 
     // --- Seeds ---
     // Declared-async functions and externs (an extern is async only by
@@ -76,11 +105,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         }
     }
     // An `async { .. }` block lowers to an always-async closure.
-    for expr in program.entity_map.values() {
-        if let Expr::Async(closure_id) = expr {
-            async_set.insert(*closure_id);
-        }
-    }
+    async_set.extend(async_blocks);
 
     // --- Fixpoint: a node that calls an async function/extern implicitly
     // awaits it, so it is async too — interleaved with the ADAPTATION
@@ -99,6 +124,22 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // rewrite state: a lowered `run` is a call of its body, so the cold
     // result moves with the rewrite (a hot edit that stands it down makes a
     // prefix function synchronous again).
+    // M159: the seam as this pass finds it, on the census (the counters line
+    // prints it; the lone-document differential asserts it).
+    if let Some(seam) = program.seam.as_ref()
+        && !crate::macros::in_macro_world()
+    {
+        let state = crate::incremental::PostSeamState {
+            seeded: seam.seeded,
+            record: seam.record.is_some(),
+            matches: seam.record_matches,
+            cold: seam
+                .record
+                .as_ref()
+                .is_some_and(|record| record.async_cold.get().is_some()),
+        };
+        crate::incremental::update_census(|census| census.post_seam = Some(state));
+    }
     let record = program
         .seam
         .as_ref()
@@ -108,11 +149,24 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         .as_ref()
         .and_then(|record| record.async_cold.get())
         .is_some();
+    // M138: the program's OWN seeds — what the cold computations below start
+    // from — before any recorded result joins them.
+    let own_seeds = async_set.clone();
+    // M138's seeded form: the cold instance record's settled set holds S3b's
+    // cold result and the worklist's cold flips, so the first round grows the
+    // set only by what the hot set makes async.
+    let instances = record
+        .as_ref()
+        .and_then(|record| record.async_instances.get().cloned());
+    if let Some(instances) = instances.as_ref() {
+        async_set.extend(instances.settled.iter().copied());
+    }
     if let Some(cold) = record.as_ref().and_then(|record| record.async_cold.get()) {
         async_set.extend(cold.iter().copied());
+    }
+    if seeded || instances.is_some() {
         crate::incremental::update_census(|census| census.seeded_passes += 1);
     }
-    let seeds = async_set.clone();
     // M138: the worklist re-runs whole while a round grows the async set, but
     // the DECISIONS pass (each instance's emission data and its diagnostics,
     // which reads the set and moves nothing) runs once, over the last round's
@@ -120,165 +174,195 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // last threw its answer away.
     let adaptive = adaptive_params_of(program);
     ADAPTATION_INFERS.with(|count| count.set(count.get() + 1));
-    let worklist = loop {
-        base_fixpoint(program, graph, &held_values, &mut async_set);
-        let before = async_set.len();
-        let worklist = adaptation_worklist(program, graph, &held_values, &adaptive, &mut async_set);
-        if async_set.len() == before {
-            break worklist;
+    let (adaptation, cold_result, filed) = {
+        let adapt = Adapt {
+            program,
+            graph,
+            held_values: &held_values,
+            adaptive: &adaptive,
+            escapes: &escapes,
+        };
+        let mut seeding = instances.as_deref().map(Seeding::new);
+        let worklist = loop {
+            base_fixpoint(program, graph, &held_values, &mut async_set);
+            let before = async_set.len();
+            let worklist = adaptation_worklist(adapt, &mut async_set, seeding.as_mut());
+            if async_set.len() == before {
+                break worklist;
+            }
+        };
+        let adaptation = adaptation_decisions(adapt, &async_set, worklist, seeding.as_ref());
+        if let Some(seeding) = seeding.as_ref() {
+            let rewalked = seeding.rewalked;
+            let served = seeding.record.keys.len() as u64 - rewalked;
+            crate::incremental::update_census(|census| {
+                census.async_keys_served += served;
+                census.async_keys_rewalked += rewalked;
+            });
         }
+        // The record this analysis filed (or read without a cold result yet)
+        // takes the cold result now: the base fixpoint over the cold nodes
+        // alone, in the cold view, from the program's own seeds, so a hot
+        // callee is never in the set and never counts as suspending. The
+        // plant records the settled set instead.
+        let cold_result = record.as_ref().filter(|_| !seeded).map(|_| {
+            if crate::incremental::planted(crate::incremental::Plant::PostSeedFromSettled) {
+                async_set.clone()
+            } else {
+                let mut cold: HashSet<Id> = own_seeds
+                    .iter()
+                    .copied()
+                    .filter(|id| program.cold_entity(*id))
+                    .collect();
+                cold_base_fixpoint(adapt, &mut cold);
+                cold
+            }
+        });
+        // M138: and the cold instance record, once per post-pass record.
+        let filed = record
+            .as_ref()
+            .filter(|record| record.async_instances.get().is_none())
+            .filter(|_| !crate::macros::in_macro_world())
+            .map(|_| std::sync::Arc::new(cold_instance_record(adapt, &own_seeds)));
+        (adaptation, cold_result, filed)
     };
-    let adaptation = adaptation_decisions(
-        program,
-        graph,
-        &held_values,
-        &adaptive,
-        &async_set,
-        worklist,
-    );
     for (error, source) in adaptation.diagnostics {
         program.push_diagnostic(error, source);
     }
     program.adapted_instances = adaptation.instances;
-    // The record this analysis filed (or read without a cold result yet)
-    // takes the cold result now: the base fixpoint over the cold nodes alone,
-    // from the program's own seeds, so a hot callee is never in the set and
-    // never counts as suspending. The plant records the settled set instead.
-    if let Some(record) = record.as_ref().filter(|_| !seeded) {
-        let settled = crate::incremental::planted(crate::incremental::Plant::PostSeedFromSettled);
-        let mut cold: HashSet<Id> = if settled {
-            async_set.clone()
-        } else {
-            seeds
-                .iter()
-                .copied()
-                .filter(|id| program.cold_entity(*id))
-                .collect()
-        };
-        if !settled {
-            loop {
-                let mut changed = false;
-                for node in graph.nodes() {
-                    let id = node.id();
-                    if cold.contains(&id) || !program.cold_entity(id) {
-                        continue;
-                    }
-                    if graph
-                        .calls_of(id)
-                        .iter()
-                        .any(|call| call_suspends(program, call, &held_values, &cold))
-                    {
-                        cold.insert(id);
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-        }
+    if let (Some(record), Some(cold)) = (record.as_ref(), cold_result) {
         let mut cold: Vec<Id> = cold.into_iter().collect();
         cold.sort_unstable_by_key(|id| id.0);
         let _ = record.async_cold.set(cold);
+    }
+    if let (Some(record), Some(filed)) = (record.as_ref(), filed) {
+        let bytes = filed.bytes;
+        if record.async_instances.set(filed).is_ok() {
+            // The record's bytes join its post record's under the checks
+            // cache's budget (M46), as if it had been filed with it.
+            if let Some(seam) = program.seam.as_ref() {
+                crate::analyzer::checked_cache_grow_post(
+                    &seam.key,
+                    &seam.prefix_hashes,
+                    seam.cold_fingerprint,
+                    bytes,
+                );
+            }
+            crate::incremental::update_census(|census| {
+                census.async_records_filed += 1;
+                census.async_record_bytes += bytes as u64;
+            });
+        }
     }
 
     // --- Materialize the value-flow channels for emission (J2): adopted
     // bindings — unannotated ones holding an async closure — join
     // `async_values`, so the transformer's Local-subject await covers them;
     // calls through an async field or an async-returning call land in
-    // `awaited_calls` for the transformer's non-Local subjects. Done before
-    // the divergence and initializer checks so both see the full set.
+    // `awaited_calls` for the transformer's non-Local subjects (in the
+    // divergence check's pass over the calls, below). The adopted bindings
+    // join before the divergence and initializer checks so both see the full
+    // set.
     let adopted: Vec<Id> = program
         .variables
         .keys()
         .filter(|variable| {
             !program.async_values.contains(variable)
-                && binding_holds_async(program, **variable, &held_values, &async_set, 0)
+                && binding_holds_async(
+                    program,
+                    **variable,
+                    &held_values,
+                    View::plain(&async_set),
+                    0,
+                )
         })
         .copied()
         .collect();
     program.async_values.extend(adopted);
-    let awaited: Vec<Id> = program
-        .function_calls
-        .iter()
-        .filter(
-            |(_, function_call)| match program.entity_map.get(&function_call.subject_id) {
-                Some(Expr::Field(_, struct_id, index)) => {
-                    program.async_fields.contains(&(*struct_id, *index))
-                }
-                Some(Expr::Call(inner)) => call_returns_async_closure(program, *inner),
-                // A directly-applied async closure literal (the lowered
-                // `run` body): a statically-known await point.
-                Some(Expr::Closure(closure_id)) => async_set.contains(closure_id),
-                _ => false,
-            },
-        )
-        .map(|(call_id, _)| *call_id)
-        .collect();
-    program.awaited_calls.extend(awaited);
-
     // --- The J2 divergence check, post-adaptation: an async closure into a
     // `sync`-contract parameter, or into a host (`external`) callback that
     // cannot await it, is refused. (A PLAIN value-returning parameter now
     // ADAPTS instead of erroring — the worklist above; void-returning
-    // parameters stay legal as spawn semantics.)
+    // parameters stay legal as spawn semantics.) M138: one pass over the
+    // calls answers both checks and the value-flow awaits above (each call's
+    // subject read once); the host refusals still follow every `sync` one.
+    let mut awaited: Vec<Id> = Vec::new();
     let mut divergences: Vec<(crate::error::Error, SourceId)> = Vec::new();
+    let mut host_divergences: Vec<(crate::error::Error, SourceId)> = Vec::new();
     let no_flags: HashMap<Id, bool> = HashMap::default();
-    for function_call in program.function_calls.values() {
-        let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id) else {
-            continue;
+    for (call_id, function_call) in &program.function_calls {
+        let subject = program.entity_map.get(&function_call.subject_id);
+        let awaits = match subject {
+            Some(Expr::Field(_, struct_id, index)) => {
+                program.async_fields.contains(&(*struct_id, *index))
+            }
+            Some(Expr::Call(inner)) => call_returns_async_closure(program, *inner),
+            // A directly-applied async closure literal (the lowered `run`
+            // body): a statically-known await point.
+            Some(Expr::Closure(closure_id)) => async_set.contains(closure_id),
+            _ => false,
         };
-        let Some(function) = program.functions.get(target) else {
-            continue;
-        };
-        for (argument, parameter) in function_call.argument_ids.iter().zip(&function.parameters) {
-            if program.async_values.contains(parameter) {
-                continue;
-            }
-            let Some(parameter_record) = program.parameters.get(parameter) else {
-                continue;
-            };
-            // A `sync`-marked parameter is a deliberate contract
-            // (async-polymorphism.md A.2) — refused, with the contract's
-            // steer. The marker is the whole test: WHAT the callback returns
-            // decides adaptation, not the contract. Without it there is
-            // nothing to diverge from here — a plain value-returning
-            // parameter ADAPTS (the instance worklist handled it), a void one
-            // is spawn semantics, and an unresolved return can't be a known
-            // lie. (B61: gating this on a resolved non-void return let
-            // `sync || void` accept an awaiting closure that `sync || i32`
-            // refused, so the marker did not bite on a void callback.)
-            if !program.sync_values.contains(parameter) {
-                continue;
-            }
-            if !parameter_is_closure(program, *parameter) {
-                continue;
-            }
-            // The argument VALUE is async through any channel — a literal, a
-            // declared/adopted binding or parameter, an `async` field read,
-            // an async-returning call (the same shapes that make a call
-            // through it await).
-            if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *argument) {
-                continue;
-            }
-            divergences.push(anchored(
-                program,
-                *parameter,
-                format!(
-                    "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol; move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
-                    parameter_record.name
-                ),
-                None,
-            ));
+        if awaits {
+            awaited.push(*call_id);
         }
-    }
-    // Host boundary: an `external` function cannot await a vilan closure —
-    // its value-returning closure parameters are implicitly `sync`
-    // (async-polymorphism.md A.4); void ones keep spawn semantics.
-    for function_call in program.function_calls.values() {
-        let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id) else {
+        let Some(Expr::Local(target)) = subject else {
             continue;
         };
+        if let Some(function) = program.functions.get(target) {
+            for (argument, parameter) in function_call.argument_ids.iter().zip(&function.parameters)
+            {
+                if program.async_values.contains(parameter) {
+                    continue;
+                }
+                let Some(parameter_record) = program.parameters.get(parameter) else {
+                    continue;
+                };
+                // A `sync`-marked parameter is a deliberate contract
+                // (async-polymorphism.md A.2) — refused, with the contract's
+                // steer. The marker is the whole test: WHAT the callback returns
+                // decides adaptation, not the contract. Without it there is
+                // nothing to diverge from here — a plain value-returning
+                // parameter ADAPTS (the instance worklist handled it), a void one
+                // is spawn semantics, and an unresolved return can't be a known
+                // lie. (B61: gating this on a resolved non-void return let
+                // `sync || void` accept an awaiting closure that `sync || i32`
+                // refused, so the marker did not bite on a void callback.)
+                if !program.sync_values.contains(parameter) {
+                    continue;
+                }
+                if !parameter_is_closure(program, *parameter) {
+                    continue;
+                }
+                // The argument VALUE is async through any channel — a literal, a
+                // declared/adopted binding or parameter, an `async` field read,
+                // an async-returning call (the same shapes that make a call
+                // through it await).
+                if !value_async_in(
+                    program,
+                    &held_values,
+                    View::plain(&async_set),
+                    &no_flags,
+                    &[],
+                    *argument,
+                ) {
+                    continue;
+                }
+                divergences.push(anchored(
+                    program,
+                    *parameter,
+                    format!(
+                        "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol; move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
+                        parameter_record.name
+                    ),
+                    None,
+                ));
+            }
+            continue;
+        }
+        // Host boundary: an `external` function cannot await a vilan closure
+        // — its value-returning closure parameters are implicitly `sync`
+        // (async-polymorphism.md A.4); void ones keep spawn semantics.
+        //
         // `Context::run` is `external` only as a type-checking fiction: the
         // context threading pass erases every `run` call it accepts (the body
         // becomes a direct call), so `run` is never a host boundary at
@@ -318,10 +402,17 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
             ) {
                 continue;
             }
-            if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *argument) {
+            if !value_async_in(
+                program,
+                &held_values,
+                View::plain(&async_set),
+                &no_flags,
+                &[],
+                *argument,
+            ) {
                 continue;
             }
-            divergences.push(anchored(
+            host_divergences.push(anchored(
                 program,
                 *argument,
                 format!(
@@ -332,15 +423,17 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
             ));
         }
     }
+    program.awaited_calls.extend(awaited);
+    divergences.extend(host_divergences);
     // The same divergence through the FIELD channel: an async closure stored
     // into a plain closure field (struct literal or field assignment) with a
     // non-void return — every later read-and-call would hand back a promise
     // typed `T`. Declared `async || T` fields are exempt (that is the fix).
-    for escape in plain_closure_field_stores(program) {
+    for escape in &escapes.field_stores {
         if !value_async_in(
             program,
             &held_values,
-            &async_set,
+            View::plain(&async_set),
             &no_flags,
             &[],
             escape.value_id,
@@ -350,7 +443,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         divergences.push(anchored(
             program,
             escape.value_id,
-            field_escape_message(program, &escape),
+            field_escape_message(program, escape),
             None,
         ));
     }
@@ -358,8 +451,15 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // And through the RETURN channel: a function whose declared return type
     // is a plain closure (non-void) returning an async closure. The declared
     // `async || T` return marker is the fix.
-    for (function_id, value_id) in plain_closure_return_sites(program) {
-        if !value_async_in(program, &held_values, &async_set, &no_flags, &[], value_id) {
+    for &(function_id, value_id) in &escapes.return_sites {
+        if !value_async_in(
+            program,
+            &held_values,
+            View::plain(&async_set),
+            &no_flags,
+            &[],
+            value_id,
+        ) {
             continue;
         }
         divergences.push(anchored(
@@ -411,7 +511,6 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // derived first, per binding, and the walk is paid only when one exists.
     // Deriving is pure (the targets are read, nothing is written), so the
     // order of the refusals that survive is the bindings' order either way.
-    let initializer_adaptive = adaptive_params_of(program);
     let module_bindings: HashSet<Id> = program.module_level_bindings().into_iter().collect();
     let mut initializer_refusals: Vec<(crate::error::Error, SourceId)> = Vec::new();
     let mut refusal_bindings: Vec<(Id, usize)> = Vec::new();
@@ -427,8 +526,8 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
                         let bits = bits_for_call(
                             program,
                             &held_values,
-                            &async_set,
-                            &initializer_adaptive,
+                            View::plain(&async_set),
+                            &adaptive,
                             &HashMap::default(),
                             &[],
                             callee,
@@ -764,19 +863,19 @@ fn subject_awaits(
     program: &Program,
     subject_id: Id,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     depth: u32,
 ) -> bool {
     match program.entity_map.get(&subject_id) {
         Some(Expr::Local(target)) => {
             program.async_values.contains(target)
-                || binding_holds_async(program, *target, held_values, async_set, depth)
+                || binding_holds_async(program, *target, held_values, view, depth)
         }
         Some(Expr::Field(_, struct_id, index)) => {
             program.async_fields.contains(&(*struct_id, *index))
         }
         Some(Expr::Call(inner)) => call_returns_async_closure(program, *inner),
-        Some(Expr::Closure(closure_id)) => async_set.contains(closure_id),
+        Some(Expr::Closure(closure_id)) => view.contains(program, *closure_id),
         _ => false,
     }
 }
@@ -790,24 +889,26 @@ fn binding_holds_async(
     program: &Program,
     variable_id: Id,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     depth: u32,
 ) -> bool {
     if depth > 4 {
         return false;
     }
+    view.note_held(variable_id);
     let Some(held) = held_values.get(&variable_id) else {
         return false;
     };
     held.iter()
+        .filter(|value_id| view.admits_held(program, **value_id))
         .any(|value_id| match program.entity_map.get(value_id) {
-            Some(Expr::Closure(closure_id)) => async_set.contains(closure_id),
+            Some(Expr::Closure(closure_id)) => view.contains(program, *closure_id),
             Some(Expr::Field(_, struct_id, index)) => {
                 program.async_fields.contains(&(*struct_id, *index))
             }
             Some(Expr::Call(inner)) => call_returns_async_closure(program, *inner),
             Some(Expr::Local(source)) => {
-                binding_holds_async(program, *source, held_values, async_set, depth + 1)
+                binding_holds_async(program, *source, held_values, view, depth + 1)
             }
             _ => false,
         })
@@ -1490,8 +1591,113 @@ pub fn reset_adaptation_counts() {
     ADAPTATION_DECISIONS.with(|count| count.set(0));
 }
 
+/// What every step of the adaptation reads and never writes.
+#[derive(Clone, Copy)]
+struct Adapt<'p, 'src> {
+    program: &'p Program<'src>,
+    graph: &'p CallGraph,
+    held_values: &'p HashMap<Id, Vec<Id>>,
+    adaptive: &'p HashMap<Id, HashSet<Id>>,
+    /// A.4's escape positions, collected once per analysis — shared by the
+    /// per-instance escape check and the global divergence checks.
+    escapes: &'p Escapes,
+}
+
+/// The plain closure-typed positions an async value would lie through: the
+/// stores into plain closure fields and the returns from plain closure-typed
+/// functions (A.4).
+struct Escapes {
+    field_stores: Vec<FieldStore>,
+    return_sites: Vec<(Id, Id)>,
+}
+
+impl Escapes {
+    /// The plain positions among every field store (`stores`, gathered by the
+    /// pass's one walk of the entity map) and every return site.
+    fn of(program: &Program, stores: Vec<FieldStore>) -> Escapes {
+        Escapes {
+            field_stores: plain_closure_field_stores(program, stores),
+            return_sites: plain_closure_return_sites(program),
+        }
+    }
+}
+
+/// One evaluation of an instance against the current verdicts: every member
+/// of its component flagged until stable, each callee instance a call names
+/// handed to `encounter` (which answers that instance's flag, discovering it
+/// when it is new). Answers the member flags; the instance awaits when its
+/// root's flag holds.
+fn evaluate_instance(
+    adapt: Adapt,
+    view: View,
+    key: &InstanceKey,
+    encounter: &mut dyn FnMut(InstanceKey, Id) -> bool,
+) -> HashMap<Id, bool> {
+    let program = adapt.program;
+    let (root, ref bits) = *key;
+    let members = component_of(adapt.graph, root);
+    let mut flags: HashMap<Id, bool> = members
+        .iter()
+        .map(|member| (*member, view.contains(program, *member)))
+        .collect();
+    loop {
+        let mut changed = false;
+        for member in &members {
+            for call in adapt.graph.calls_of(*member) {
+                let awaits = match call.target {
+                    CallTarget::Function(callee) => {
+                        let callee_bits = bits_for_call(
+                            program,
+                            adapt.held_values,
+                            view,
+                            adapt.adaptive,
+                            &flags,
+                            bits,
+                            callee,
+                            call.call_id,
+                        );
+                        if callee_bits.is_empty() {
+                            view.contains(program, callee)
+                        } else {
+                            encounter((callee, callee_bits), call.call_id)
+                        }
+                    }
+                    CallTarget::External(callee) => view.contains(program, callee),
+                    CallTarget::Indirect(
+                        IndirectReason::GenericMember | IndirectReason::TraitDispatch,
+                    ) => view.dispatch_async(program, call.call_id),
+                    _ => {
+                        subject_adapted_here(program, adapt.held_values, &flags, bits, call.call_id)
+                            || program.function_calls.get(&call.call_id).is_some_and(
+                                |function_call| {
+                                    subject_awaits(
+                                        program,
+                                        function_call.subject_id,
+                                        adapt.held_values,
+                                        view,
+                                        0,
+                                    )
+                                },
+                            )
+                    }
+                };
+                if awaits && !flags[member] {
+                    flags.insert(*member, true);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    flags
+}
+
 /// One round of the instance worklist's answer: every instance key the round
-/// discovered with its async flag, and the call each was first instantiated by.
+/// evaluated or discovered with its async flag, and the call each was first
+/// instantiated by. Over a world's record (M138) the recorded cold keys the
+/// round never re-walked are NOT here: [`Seeding`] answers them.
 struct Worklist {
     instance_async: HashMap<InstanceKey, bool>,
     origins: HashMap<InstanceKey, Id>,
@@ -1501,37 +1707,1043 @@ struct Worklist {
 /// function as its base instance, every instance a call discovers, until each
 /// flag is stable over `async_set` — which a base instance's flips extend.
 /// The caller re-runs a round from scratch while a round grows the set.
+///
+/// M138: over a world's cold instance record (`seeding`), the round starts
+/// from the recorded cold verdicts — the hot functions' base instances are
+/// what it evaluates, and a recorded key is re-walked only when something it
+/// READ moved (an id it read as not async became async, a binding it read
+/// gained a value from outside the cold set, a dispatch it read gained an
+/// async candidate) or a callee instance it read flipped. Without one it is
+/// the whole-program round it always was.
 fn adaptation_worklist(
-    program: &Program,
-    graph: &CallGraph,
-    held_values: &HashMap<Id, Vec<Id>>,
-    adaptive: &HashMap<Id, HashSet<Id>>,
+    adapt: Adapt,
     async_set: &mut HashSet<Id>,
+    mut seeding: Option<&mut Seeding>,
 ) -> Worklist {
     ADAPTATION_ROUNDS.with(|count| count.set(count.get() + 1));
-    let component = |root: Id| component_of(graph, root);
-
+    let program = adapt.program;
     let mut instance_async: HashMap<InstanceKey, bool> = HashMap::default();
     let mut origins: HashMap<InstanceKey, Id> = HashMap::default();
     let mut dependents: HashMap<InstanceKey, HashSet<InstanceKey>> = HashMap::default();
-    let mut pending: Vec<InstanceKey> = program
-        .functions
-        .keys()
-        .map(|function_id| (*function_id, Vec::new()))
-        .collect();
-    let mut queued: HashSet<InstanceKey> = pending.iter().cloned().collect();
+    let mut pending: Vec<InstanceKey> = Vec::new();
+    let mut queued: HashSet<InstanceKey> = HashSet::default();
+    fn push(pending: &mut Vec<InstanceKey>, queued: &mut HashSet<InstanceKey>, key: InstanceKey) {
+        if queued.insert(key.clone()) {
+            pending.push(key);
+        }
+    }
+    match seeding.as_deref_mut() {
+        None => {
+            for function_id in program.functions.keys() {
+                push(&mut pending, &mut queued, (*function_id, Vec::new()));
+            }
+        }
+        Some(seeding) => {
+            for function_id in program.functions.keys() {
+                if !program.cold_entity(*function_id) {
+                    push(&mut pending, &mut queued, (*function_id, Vec::new()));
+                }
+            }
+            seeding.round_start(adapt, async_set);
+            for key in seeding.rewalked_keys() {
+                instance_async.insert(key.clone(), seeding.recorded_flag_of(&key));
+                push(&mut pending, &mut queued, key);
+            }
+        }
+    }
 
     // Module initializers can also instantiate adapted callees (a top-level
     // `let ids = xs.map(async)`); discover those instances up front so the
     // module-initializer check can refuse the await (an initializer cannot).
+    // Asked live on every round, records or not: the reads are no key's.
     for binding in program.module_level_bindings() {
-        for call in graph.initializer_calls_of(binding) {
+        for call in adapt.graph.initializer_calls_of(binding) {
             if let CallTarget::Function(callee) = call.target {
                 let bits = bits_for_call(
                     program,
-                    held_values,
-                    async_set,
-                    adaptive,
+                    adapt.held_values,
+                    View::plain(async_set),
+                    adapt.adaptive,
+                    &HashMap::default(),
+                    &[],
+                    callee,
+                    call.call_id,
+                );
+                if !bits.is_empty() {
+                    let key = (callee, bits);
+                    record_origin(&mut origins, &key, call.call_id);
+                    let known = instance_async.contains_key(&key)
+                        || seeding
+                            .as_deref()
+                            .is_some_and(|seeding| seeding.serves(&key));
+                    if !known {
+                        instance_async.insert(key.clone(), false);
+                        push(&mut pending, &mut queued, key);
+                    }
+                }
+            }
+        }
+    }
+
+    // --- The worklist: process instances until every async flag is stable.
+    // Flags only move false -> true, so this terminates. Every call of every
+    // member is enumerated on every pass — even members already known async
+    // — because enumeration is also DISCOVERY: a call with async closure
+    // arguments mints the callee's adapted instance.
+    while let Some(key) = pending.pop() {
+        queued.remove(&key);
+        let flags = {
+            let seeding_view = seeding.as_deref();
+            let mut encounter = |callee_key: InstanceKey, call_id: Id| -> bool {
+                dependents
+                    .entry(callee_key.clone())
+                    .or_default()
+                    .insert(key.clone());
+                // Every encounter, not just the discovering one: the worklist
+                // is seeded from a hash-ordered key set, so "the call that
+                // discovered it first" is not a stable answer, and this id
+                // becomes the SPAN a transitive violation reports at.
+                record_origin(&mut origins, &callee_key, call_id);
+                if let Some(flag) = instance_async.get(&callee_key) {
+                    return *flag;
+                }
+                if let Some(flag) =
+                    seeding_view.and_then(|seeding| seeding.served_flag(&callee_key))
+                {
+                    return flag;
+                }
+                // Discover the callee instance; re-run this one when its flag
+                // lands.
+                instance_async.insert(callee_key.clone(), false);
+                if queued.insert(callee_key.clone()) {
+                    pending.push(callee_key);
+                }
+                false
+            };
+            evaluate_instance(adapt, View::plain(async_set), &key, &mut encounter)
+        };
+        let root_flag = flags[&key.0];
+        let previous = instance_async.insert(key.clone(), root_flag).or_else(|| {
+            seeding
+                .as_deref()
+                .and_then(|seeding| seeding.served_flag(&key))
+        });
+        if root_flag && previous != Some(true) {
+            // The flag flipped on: dependents must re-evaluate — the round's
+            // own, and the recorded keys that read this instance.
+            for dependent in dependents.get(&key).cloned().unwrap_or_default() {
+                push(&mut pending, &mut queued, dependent);
+            }
+            if let Some(seeding) = seeding.as_deref_mut() {
+                for dependent in seeding.recorded_dependents(&key) {
+                    if let Some(rewalked) = seeding.rewalk(dependent) {
+                        instance_async
+                            .entry(rewalked.clone())
+                            .or_insert_with(|| seeding.recorded_flag_of(&rewalked));
+                        push(&mut pending, &mut queued, rewalked);
+                    }
+                }
+            }
+        }
+        // A base instance's flips are ordinary coloring: the plain emission
+        // of this function/those closures is async.
+        if key.1.is_empty() {
+            for (member, flag) in &flags {
+                if *flag && async_set.insert(*member) {
+                    // M138: a member the record's cold world did not make
+                    // async re-walks the recorded keys that read it.
+                    if let Some(seeding) = seeding.as_deref_mut() {
+                        for rewalked in seeding.moved(program, *member) {
+                            instance_async
+                                .entry(rewalked.clone())
+                                .or_insert_with(|| seeding.recorded_flag_of(&rewalked));
+                            push(&mut pending, &mut queued, rewalked);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Worklist {
+        instance_async,
+        origins,
+    }
+}
+
+/// One instance's emission data and the diagnostics it would report, before
+/// the first-wins dedup (`reported`): the unit the decisions pass computes per
+/// key, and what M138's record keeps per cold key.
+#[derive(Clone, Debug, Default)]
+struct KeyDecision {
+    info: crate::analyzer::AdaptedInstance,
+    /// Whether the instance earns an `adapted_instances` entry: an adapted
+    /// instance always (the caller emits it by key), a base one only when it
+    /// carries emission data.
+    kept: bool,
+    reports: Vec<Report>,
+}
+
+impl KeyDecision {
+    fn has_output(&self) -> bool {
+        self.kept || !self.reports.is_empty()
+    }
+
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + (self.info.awaited_calls.len() + self.info.async_closures.len())
+                * std::mem::size_of::<Id>()
+            + self
+                .info
+                .callee_bits
+                .values()
+                .map(|bits| std::mem::size_of::<(Id, Vec<Id>)>() + bits.len() * 4)
+                .sum::<usize>()
+            + self.reports.len() * std::mem::size_of::<Report>()
+    }
+}
+
+/// A diagnostic one instance would report, as the dedup keys it — the
+/// message is spelled at emission, at the instance's CURRENT origin.
+#[derive(Clone, Copy, Debug)]
+enum Report {
+    /// A transitive `sync` violation: an argument async only through the
+    /// instance's bits, into a `sync` parameter.
+    Sync { call_id: Id, parameter: Id },
+    /// The host-boundary twin: into an `external` function's value-returning
+    /// closure parameter.
+    Extern {
+        call_id: Id,
+        parameter: Id,
+        callee: Id,
+    },
+    /// An async closure argument at a trait/generic dispatch whose candidates
+    /// would need adaptation.
+    Dispatch { call_id: Id, position: usize },
+    /// A.4's adapted-instance escape into a plain closure field.
+    FieldEscape(FieldStore),
+    /// A.4's adapted-instance escape through a plain closure-typed return.
+    ReturnEscape { function_id: Id, value_id: Id },
+}
+
+/// The decisions for ONE instance over the round's final verdicts (every flag
+/// stable, the async set final): its emission data and the diagnostics it
+/// would report. `flag_of` answers a callee instance's verdict; every one it
+/// is asked is handed to `callee_read` too (the cold record's dependents).
+fn decide_instance(
+    adapt: Adapt,
+    view: View,
+    key: &InstanceKey,
+    flag_of: &dyn Fn(&InstanceKey) -> Option<bool>,
+    callee_read: &mut dyn FnMut(&InstanceKey),
+) -> KeyDecision {
+    let program = adapt.program;
+    let (root, ref bits) = *key;
+    let members = component_of(adapt.graph, root);
+    // Recompute the stable flags for this context (cheap; flags are final so
+    // one pass over the loop from the worklist would converge identically —
+    // reuse the same evaluation by seeding from the global set and iterating).
+    let mut flags: HashMap<Id, bool> = members
+        .iter()
+        .map(|member| (*member, view.contains(program, *member)))
+        .collect();
+    let mut callee_flag = |callee_key: &InstanceKey| {
+        callee_read(callee_key);
+        flag_of(callee_key) == Some(true)
+    };
+    // A BASE instance's flags are the async set's already: the last round
+    // re-evaluated it against every final callee verdict (a flip re-queues its
+    // dependents) and wrote each member it flipped into the set — and that
+    // round wrote nothing new, or it would not have been the last. So the loop
+    // below would find no member to flip, and only an adapted instance (whose
+    // bits make its members async where the set does not) runs it.
+    loop {
+        if bits.is_empty() {
+            break;
+        }
+        let mut changed = false;
+        for member in &members {
+            if flags[member] {
+                continue;
+            }
+            let awaits = adapt
+                .graph
+                .calls_of(*member)
+                .iter()
+                .any(|call| match call.target {
+                    CallTarget::Function(callee) => {
+                        view.contains(program, callee) || {
+                            let callee_bits = bits_for_call(
+                                program,
+                                adapt.held_values,
+                                view,
+                                adapt.adaptive,
+                                &flags,
+                                bits,
+                                callee,
+                                call.call_id,
+                            );
+                            !callee_bits.is_empty() && callee_flag(&(callee, callee_bits))
+                        }
+                    }
+                    CallTarget::External(callee) => view.contains(program, callee),
+                    CallTarget::Indirect(
+                        IndirectReason::GenericMember | IndirectReason::TraitDispatch,
+                    ) => view.dispatch_async(program, call.call_id),
+                    _ => {
+                        subject_adapted_here(program, adapt.held_values, &flags, bits, call.call_id)
+                            || program.function_calls.get(&call.call_id).is_some_and(
+                                |function_call| {
+                                    subject_awaits(
+                                        program,
+                                        function_call.subject_id,
+                                        adapt.held_values,
+                                        view,
+                                        0,
+                                    )
+                                },
+                            )
+                    }
+                });
+            if awaits {
+                flags.insert(*member, true);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut decision = KeyDecision {
+        info: crate::analyzer::AdaptedInstance {
+            is_async: flags[&root],
+            ..Default::default()
+        },
+        kept: false,
+        reports: Vec::new(),
+    };
+    for member in &members {
+        if *flags.get(member).unwrap_or(&false) && !bits.is_empty() && *member != root {
+            decision.info.async_closures.insert(*member);
+        }
+        for call in adapt.graph.calls_of(*member) {
+            match call.target {
+                CallTarget::Function(callee) => {
+                    let callee_bits = bits_for_call(
+                        program,
+                        adapt.held_values,
+                        view,
+                        adapt.adaptive,
+                        &flags,
+                        bits,
+                        callee,
+                        call.call_id,
+                    );
+                    if !callee_bits.is_empty() {
+                        if callee_flag(&(callee, callee_bits.clone())) {
+                            decision.info.awaited_calls.insert(call.call_id);
+                        }
+                        decision.info.callee_bits.insert(call.call_id, callee_bits);
+                    }
+                    // Transitive `sync`/host violations: an argument that is
+                    // async ONLY through this instance's bits, flowing into a
+                    // refusing position.
+                    sync_violations_at(
+                        program,
+                        adapt.held_values,
+                        view,
+                        &flags,
+                        bits,
+                        callee,
+                        call.call_id,
+                        &mut decision.reports,
+                    );
+                }
+                CallTarget::External(callee) => {
+                    extern_violations_at(
+                        program,
+                        adapt.held_values,
+                        view,
+                        &flags,
+                        bits,
+                        callee,
+                        call.call_id,
+                        &mut decision.reports,
+                    );
+                }
+                CallTarget::Indirect(
+                    IndirectReason::GenericMember | IndirectReason::TraitDispatch,
+                ) => {
+                    dispatch_refusals_at(
+                        program,
+                        adapt.held_values,
+                        view,
+                        &flags,
+                        bits,
+                        call.call_id,
+                        &mut decision.reports,
+                    );
+                }
+                _ => {}
+            }
+            if subject_adapted_here(program, adapt.held_values, &flags, bits, call.call_id) {
+                decision.info.awaited_calls.insert(call.call_id);
+            }
+        }
+    }
+    // A.4's adapted-instance escape: a value async only through THESE bits
+    // leaving the instance through a plain field or a plain declared return.
+    // A base instance carries no bits and so can escape nothing the global
+    // checks did not already see.
+    if !bits.is_empty() {
+        escape_violations_in(
+            program,
+            adapt.held_values,
+            view,
+            &flags,
+            bits,
+            adapt.escapes,
+            &mut decision.reports,
+        );
+    }
+    // Base instances only earn an entry when they carry emission data;
+    // adapted instances always do (the caller emits them by key).
+    decision.kept = !bits.is_empty()
+        || !decision.info.awaited_calls.is_empty()
+        || !decision.info.callee_bits.is_empty()
+        || !decision.info.async_closures.is_empty();
+    decision
+}
+
+/// The worklist's decisions, over its LAST round (every flag stable, the async
+/// set final): each instance's emission data and the context-dependent
+/// diagnostics. Reads the set; moves nothing. Over a world's record (M138) a
+/// recorded cold key the rounds never re-walked replays its recorded decision.
+fn adaptation_decisions(
+    adapt: Adapt,
+    async_set: &HashSet<Id>,
+    worklist: Worklist,
+    seeding: Option<&Seeding>,
+) -> Adaptation {
+    let Worklist {
+        instance_async,
+        origins,
+    } = worklist;
+    ADAPTATION_DECISIONS.with(|count| count.set(count.get() + 1));
+    let program = adapt.program;
+    let flag_of = |callee_key: &InstanceKey| {
+        instance_async
+            .get(callee_key)
+            .copied()
+            .or_else(|| seeding.and_then(|seeding| seeding.served_flag(callee_key)))
+    };
+    // Every key with output: the live keys' decisions, then the recorded
+    // decisions the rounds left standing.
+    let mut decided: Vec<(InstanceKey, std::borrow::Cow<KeyDecision>)> = Vec::new();
+    for key in instance_async.keys() {
+        let decision = decide_instance(adapt, View::plain(async_set), key, &flag_of, &mut |_| {});
+        if decision.has_output() {
+            decided.push((key.clone(), std::borrow::Cow::Owned(decision)));
+        }
+    }
+    if let Some(seeding) = seeding {
+        for (key, decision) in seeding.served_decisions() {
+            decided.push((key.clone(), std::borrow::Cow::Borrowed(decision)));
+        }
+    }
+    let origin_of = |key: &InstanceKey| {
+        let live = origins.get(key).copied();
+        let recorded = seeding.and_then(|seeding| seeding.recorded_origin(key));
+        match (live, recorded) {
+            (Some(live), Some(recorded)) => {
+                Some(if live.0 <= recorded.0 { live } else { recorded })
+            }
+            (live, recorded) => live.or(recorded),
+        }
+    };
+    // C1: this pass is FIRST-WINS across instances — `reported` and
+    // `reported_escapes` let one instance claim a violation and silence the
+    // others — and each instance anchors its diagnostic at its OWN origin. So
+    // a hash-ordered walk chose WHICH call site a transitive `sync` / host /
+    // escape violation named, and whether a note attached at all. Walk the
+    // instances in origin order instead: the earliest-minted instantiating
+    // call wins, base instances (no origin, and no diagnostics of their own)
+    // first. Only an instance that reports can be ordered against another.
+    let mut reporting: Vec<(Option<u32>, u32, Vec<u32>, usize)> = decided
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, decision))| !decision.reports.is_empty())
+        .map(|(position, (key, _))| {
+            (
+                origin_of(key).map(|origin| origin.0),
+                key.0.0,
+                key.1.iter().map(|bit| bit.0).collect::<Vec<u32>>(),
+                position,
+            )
+        })
+        .collect();
+    reporting.sort();
+    let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
+    let mut reported: HashSet<(Id, Id)> = HashSet::default();
+    // Deduplicated by value expression, so one escaping store reports once
+    // however many instances reach it.
+    let mut reported_escapes: HashSet<Id> = HashSet::default();
+    for (_, _, _, position) in reporting {
+        let (key, decision) = &decided[position];
+        let origin = origin_of(key);
+        for report in &decision.reports {
+            emit_report(
+                program,
+                *report,
+                origin,
+                &mut reported,
+                &mut reported_escapes,
+                &mut diagnostics,
+            );
+        }
+    }
+    let instances = decided
+        .into_iter()
+        .filter(|(_, decision)| decision.kept)
+        .map(|(key, decision)| (key, decision.into_owned().info))
+        .collect();
+    Adaptation {
+        instances,
+        diagnostics,
+    }
+}
+
+/// Speaks one instance's report, unless an earlier instance claimed it, at
+/// the instance's origin (the call that instantiated it) with a note at the
+/// violating call when the two differ.
+fn emit_report(
+    program: &Program,
+    report: Report,
+    origin: Option<Id>,
+    reported: &mut HashSet<(Id, Id)>,
+    reported_escapes: &mut HashSet<Id>,
+    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
+) {
+    match report {
+        Report::Sync { call_id, parameter } => {
+            if !reported.insert((call_id, parameter)) {
+                return;
+            }
+            let parameter_name = program
+                .parameters
+                .get(&parameter)
+                .map(|parameter| parameter.name)
+                .unwrap_or("the parameter");
+            let primary = origin.unwrap_or(call_id);
+            let note = (primary != call_id).then(|| crate::error::Note {
+                span: span_of(program, call_id),
+                msg: format!("forwarded into the `sync` parameter `{parameter_name}` here"),
+                source: program.note_source_of(call_id),
+            });
+            diagnostics.push(anchored(
+                program,
+                primary,
+                format!(
+                    "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`); move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
+                ),
+                note,
+            ));
+        }
+        Report::Extern {
+            call_id,
+            parameter,
+            callee,
+        } => {
+            if !reported.insert((call_id, parameter)) {
+                return;
+            }
+            let external_name = program
+                .external_functions
+                .get(&callee)
+                .map(|external| external.name)
+                .unwrap_or("the host function");
+            let primary = origin.unwrap_or(call_id);
+            let note = (primary != call_id).then(|| crate::error::Note {
+                span: span_of(program, call_id),
+                msg: format!("forwarded to the host function `{external_name}` here"),
+                source: program.note_source_of(call_id),
+            });
+            diagnostics.push(anchored(
+                program,
+                primary,
+                format!(
+                    "this call passes an async closure that reaches the host (`external`) function `{external_name}`, which cannot await a Vilan closure: only synchronous closures can cross"
+                ),
+                note,
+            ));
+        }
+        Report::Dispatch { call_id, position } => {
+            if !reported.insert((call_id, Id(position as u32))) {
+                return;
+            }
+            diagnostics.push(anchored(
+                program,
+                call_id,
+                "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation); bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
+                None,
+            ));
+        }
+        Report::FieldEscape(store) => {
+            if !reported_escapes.insert(store.value_id) {
+                return;
+            }
+            let field_name = field_of(program, &store)
+                .map(|field| field.name)
+                .unwrap_or("the field");
+            let struct_name = program
+                .structs
+                .get(&store.struct_id)
+                .map(|struct_| struct_.name)
+                .unwrap_or("the struct");
+            escape_report(
+                program,
+                origin,
+                store.value_id,
+                format!(
+                    "this call passes an async closure that reaches `{struct_name}`'s field `{field_name}`, which awaits nothing — a later call through the field would hand back a promise; declare the field `async || T` (or return void for spawn semantics)"
+                ),
+                format!("stored into the plain field `{field_name}` here"),
+                diagnostics,
+            );
+        }
+        Report::ReturnEscape {
+            function_id,
+            value_id,
+        } => {
+            if !reported_escapes.insert(value_id) {
+                return;
+            }
+            let name = program
+                .functions
+                .get(&function_id)
+                .map(|function| function.name)
+                .unwrap_or("this function");
+            escape_report(
+                program,
+                origin,
+                value_id,
+                format!(
+                    "this call passes an async closure that reaches `{name}`'s declared return type, which awaits nothing — the caller would hold a promise typed as a plain closure; declare it `async || T` (or return void for spawn semantics)"
+                ),
+                format!("returned from `{name}` here"),
+                diagnostics,
+            );
+        }
+    }
+}
+
+/// An escape's diagnostic: at the instance's origin, with a note at the
+/// escaping value when the two differ.
+fn escape_report(
+    program: &Program,
+    origin: Option<Id>,
+    value_id: Id,
+    message: String,
+    note_msg: String,
+    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
+) {
+    let primary = origin.unwrap_or(value_id);
+    let note = (primary != value_id).then(|| crate::error::Note {
+        span: span_of(program, value_id),
+        msg: note_msg,
+        source: program.note_source_of(value_id),
+    });
+    diagnostics.push(anchored(program, primary, message, note));
+}
+
+// ---------------------------------------------------------------------------
+// M138 (Order 54): the seeded form — the adaptation over a world's COLD
+// instance record.
+// ---------------------------------------------------------------------------
+
+/// The async set as the adaptation reads it: the plain set, or the COLD view
+/// the world's record is computed in — the cold-only set, every value a
+/// non-cold module holds in a cold binding skipped — with, in the record's
+/// own run, every read a key's verdict depends on LOGGED.
+#[derive(Clone, Copy)]
+struct View<'a> {
+    set: &'a HashSet<Id>,
+    /// The cold view: a held value outside the cold set is not the cold
+    /// world's (`admits_held`). A non-cold id is never in the cold set, so a
+    /// read of one answers "not async" by itself.
+    cold: bool,
+    /// The record's run: the reads of the key being evaluated.
+    reads: Option<&'a std::cell::RefCell<KeyReads>>,
+}
+
+impl<'a> View<'a> {
+    fn plain(set: &'a HashSet<Id>) -> View<'a> {
+        View {
+            set,
+            cold: false,
+            reads: None,
+        }
+    }
+
+    /// Whether `id` is async. Logged when it answers "no" — an answer of
+    /// "yes" cannot move (a later analysis's set only holds more) — by id when
+    /// the id is cold, and as a read the record cannot validate when it is not
+    /// (no cold key names a non-cold entity directly; one that ever does is
+    /// re-walked on every analysis).
+    fn contains(&self, program: &Program, id: Id) -> bool {
+        let async_ = self.set.contains(&id);
+        if !async_ && let Some(reads) = self.reads {
+            let mut reads = reads.borrow_mut();
+            if program.cold_entity(id) {
+                reads.ids.push(id);
+            } else {
+                reads.unrecordable = true;
+            }
+        }
+        async_
+    }
+
+    /// Whether any candidate of the trait/generic dispatch at `call_id` is
+    /// async — the fixpoint's over-approximation. Logged by CALL when it
+    /// answers "no": a later analysis's hot impls can widen the candidates as
+    /// well as make one async, so the record asks the dispatch again.
+    fn dispatch_async(&self, program: &Program, call_id: Id) -> bool {
+        let async_ = dispatch_candidates(program, call_id)
+            .iter()
+            .any(|candidate| self.set.contains(candidate));
+        if !async_ && let Some(reads) = self.reads {
+            reads.borrow_mut().dispatches.push(call_id);
+        }
+        async_
+    }
+
+    /// Logs a read of `binding`'s held values: a later analysis's hot module
+    /// may assign it a value the cold world never held.
+    fn note_held(&self, binding: Id) {
+        if let Some(reads) = self.reads {
+            reads.borrow_mut().bindings.push(binding);
+        }
+    }
+
+    /// Whether a held value counts: in the cold view, only a cold one.
+    fn admits_held(&self, program: &Program, value_id: Id) -> bool {
+        !self.cold || program.cold_entity(value_id)
+    }
+}
+
+/// What one key's evaluations and decision READ, in the record's run.
+#[derive(Default)]
+struct KeyReads {
+    /// Cold ids read as not async.
+    ids: Vec<Id>,
+    /// Bindings whose held values were read.
+    bindings: Vec<Id>,
+    /// Dispatch calls whose candidates read as not async.
+    dispatches: Vec<Id>,
+    /// A non-cold id was read directly: the verdict is re-walked always.
+    unrecordable: bool,
+}
+
+impl KeyReads {
+    fn absorb(&mut self, other: KeyReads) {
+        self.ids.extend(other.ids);
+        self.bindings.extend(other.bindings);
+        self.dispatches.extend(other.dispatches);
+        self.unrecordable |= other.unrecordable;
+    }
+}
+
+/// One cold key of the record.
+#[derive(Debug)]
+struct RecordedKey {
+    key: InstanceKey,
+    /// Its verdict over the cold nodes alone — a lower bound of every later
+    /// analysis's, since the cold view reads nothing the hot set decides.
+    flag: bool,
+    /// The least cold call that instantiated it.
+    origin: Option<Id>,
+    /// The recorded keys that read its verdict.
+    dependents: Vec<u32>,
+    /// Its decision, when it has output (boxed: most keys have none, and the
+    /// record holds one row per cold key).
+    decision: Option<Box<KeyDecision>>,
+}
+
+/// M138 (Order 54): the async pass's COLD instance record — the adaptation
+/// (base fixpoint, worklist rounds, decisions) run over the cold nodes alone,
+/// every non-cold id unknown (not async) and every value a non-cold module
+/// holds in a cold binding skipped, with each key's reads logged. Filed once
+/// per post-pass record (`PostRecord::async_instances`) by the first analysis
+/// that reads the record while its context log matches; read by every later
+/// one. A pure function of the cold tree in that rewrite state, so the hot
+/// set never enters it.
+pub(crate) struct AsyncInstanceRecord {
+    /// The cold run's settled async set — the seed, a lower bound of every
+    /// served analysis's set (the cold view is monotone below it).
+    settled: HashSet<Id>,
+    keys: Vec<RecordedKey>,
+    index: HashMap<InstanceKey, u32>,
+    /// The keys that read an id as not async, by id.
+    readers_by_id: HashMap<Id, Vec<u32>>,
+    /// The keys that read a binding's held values, by binding.
+    readers_by_binding: HashMap<Id, Vec<u32>>,
+    /// The keys that read a dispatch, by the dispatched member's NAME — a
+    /// candidate that becomes async mid-round re-walks them.
+    readers_by_name: HashMap<String, Vec<u32>>,
+    /// The keys that read each dispatch call, asked again at every round's
+    /// start (a hot impl can widen the candidates).
+    dispatch_reads: Vec<(Id, Vec<u32>)>,
+    /// The keys whose reads the record cannot validate.
+    unrecordable: Vec<u32>,
+    /// The keys whose decision has output.
+    with_output: Vec<u32>,
+    /// What the record retains, in bytes (M46's currency).
+    pub bytes: usize,
+}
+
+impl std::fmt::Debug for AsyncInstanceRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AsyncInstanceRecord")
+            .field("settled", &self.settled.len())
+            .field("keys", &self.keys.len())
+            .field("with_output", &self.with_output.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// The record's own run (see [`AsyncInstanceRecord`]): `seeds` are the
+/// program's own seeds (declared async, awaiting nodes, async blocks).
+fn cold_instance_record(adapt: Adapt, seeds: &HashSet<Id>) -> AsyncInstanceRecord {
+    let program = adapt.program;
+    let mut cold: HashSet<Id> = seeds
+        .iter()
+        .copied()
+        .filter(|id| program.cold_entity(*id))
+        .collect();
+    let round = loop {
+        cold_base_fixpoint(adapt, &mut cold);
+        let before = cold.len();
+        let round = cold_round(adapt, &mut cold);
+        if cold.len() == before {
+            break round;
+        }
+    };
+    let ColdRound {
+        instance_async,
+        origins,
+        mut dependents,
+        mut reads,
+    } = round;
+    // The decisions over the cold run's final verdicts, logged into the same
+    // reads; a callee verdict a decision reads is a dependency too.
+    let current = std::cell::RefCell::new(KeyReads::default());
+    let view = View {
+        set: &cold,
+        cold: true,
+        reads: Some(&current),
+    };
+    let flag_of = |key: &InstanceKey| instance_async.get(key).copied();
+    let mut decisions: HashMap<InstanceKey, KeyDecision> = HashMap::default();
+    for key in instance_async.keys() {
+        let decision = decide_instance(adapt, view, key, &flag_of, &mut |callee_key| {
+            dependents
+                .entry(callee_key.clone())
+                .or_default()
+                .insert(key.clone());
+        });
+        reads.entry(key.clone()).or_default().absorb(current.take());
+        if decision.has_output() {
+            decisions.insert(key.clone(), decision);
+        }
+    }
+    let mut ordered: Vec<&InstanceKey> = instance_async.keys().collect();
+    ordered
+        .sort_by_cached_key(|key| (key.0.0, key.1.iter().map(|bit| bit.0).collect::<Vec<u32>>()));
+    let index: HashMap<InstanceKey, u32> = ordered
+        .iter()
+        .enumerate()
+        .map(|(position, key)| ((*key).clone(), position as u32))
+        .collect();
+    let mut record = AsyncInstanceRecord {
+        settled: HashSet::default(),
+        keys: Vec::with_capacity(ordered.len()),
+        index: HashMap::default(),
+        readers_by_id: HashMap::default(),
+        readers_by_binding: HashMap::default(),
+        readers_by_name: HashMap::default(),
+        dispatch_reads: Vec::new(),
+        unrecordable: Vec::new(),
+        with_output: Vec::new(),
+        bytes: 0,
+    };
+    let mut dispatch_readers: HashMap<Id, Vec<u32>> = HashMap::default();
+    let mut bytes = 0usize;
+    for (position, key) in ordered.iter().enumerate() {
+        let position = position as u32;
+        let mut key_dependents: Vec<u32> = dependents
+            .get(*key)
+            .into_iter()
+            .flatten()
+            .filter_map(|dependent| index.get(dependent).copied())
+            .collect();
+        key_dependents.sort_unstable();
+        key_dependents.dedup();
+        let mut key_reads = reads.remove(*key).unwrap_or_default();
+        if key_reads.unrecordable {
+            record.unrecordable.push(position);
+        }
+        key_reads.ids.sort_unstable_by_key(|id| id.0);
+        key_reads.ids.dedup();
+        for id in &key_reads.ids {
+            record.readers_by_id.entry(*id).or_default().push(position);
+        }
+        key_reads.bindings.sort_unstable_by_key(|id| id.0);
+        key_reads.bindings.dedup();
+        for binding in &key_reads.bindings {
+            record
+                .readers_by_binding
+                .entry(*binding)
+                .or_default()
+                .push(position);
+        }
+        key_reads.dispatches.sort_unstable_by_key(|id| id.0);
+        key_reads.dispatches.dedup();
+        for call_id in &key_reads.dispatches {
+            dispatch_readers.entry(*call_id).or_default().push(position);
+            if let Some(member) = dispatched_member(program, *call_id) {
+                let readers = record
+                    .readers_by_name
+                    .entry(member.to_string())
+                    .or_default();
+                if readers.last() != Some(&position) {
+                    readers.push(position);
+                }
+            }
+        }
+        let decision = decisions.remove(*key).map(Box::new);
+        if decision.is_some() {
+            record.with_output.push(position);
+        }
+        bytes += std::mem::size_of::<RecordedKey>()
+            + key.1.len() * std::mem::size_of::<Id>()
+            + key_dependents.len() * 4
+            + (key_reads.ids.len() + key_reads.bindings.len() + key_reads.dispatches.len()) * 8
+            + decision.as_deref().map_or(0, KeyDecision::bytes);
+        record.keys.push(RecordedKey {
+            key: (*key).clone(),
+            flag: instance_async[*key],
+            origin: origins.get(*key).copied(),
+            dependents: key_dependents,
+            decision,
+        });
+    }
+    let mut dispatch_reads: Vec<(Id, Vec<u32>)> = dispatch_readers.into_iter().collect();
+    dispatch_reads.sort_unstable_by_key(|(call_id, _)| call_id.0);
+    record.dispatch_reads = dispatch_reads;
+    record.index = index;
+    bytes += cold.len() * std::mem::size_of::<Id>() * 2;
+    record.settled = cold;
+    record.bytes = bytes;
+    record
+}
+
+/// The member a dispatch call names, by the record that dispatches it.
+fn dispatched_member<'src>(program: &Program<'src>, call_id: Id) -> Option<&'src str> {
+    if let Some(member) = program.dyn_method_calls.get(&call_id) {
+        return Some(member);
+    }
+    match dispatch_at(program, call_id)? {
+        GenericDispatch::OnConstraint(_, member) | GenericDispatch::OnType(_, member) => {
+            Some(member)
+        }
+    }
+}
+
+/// The base fixpoint over the COLD nodes in the cold view: S3b's cold result,
+/// and the record's run's half of each round.
+fn cold_base_fixpoint(adapt: Adapt, cold: &mut HashSet<Id>) {
+    let program = adapt.program;
+    loop {
+        let mut changed = false;
+        for node in adapt.graph.nodes() {
+            let id = node.id();
+            if cold.contains(&id) || !program.cold_entity(id) {
+                continue;
+            }
+            let view = View {
+                set: cold,
+                cold: true,
+                reads: None,
+            };
+            if adapt
+                .graph
+                .calls_of(id)
+                .iter()
+                .any(|call| call_suspends(program, call, adapt.held_values, view))
+            {
+                cold.insert(id);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// One worklist round of the record's run, from scratch, over the cold keys:
+/// the cold functions' base instances and what cold calls discover, read in
+/// the cold view with every key's reads logged.
+struct ColdRound {
+    instance_async: HashMap<InstanceKey, bool>,
+    origins: HashMap<InstanceKey, Id>,
+    dependents: HashMap<InstanceKey, HashSet<InstanceKey>>,
+    reads: HashMap<InstanceKey, KeyReads>,
+}
+
+fn cold_round(adapt: Adapt, cold: &mut HashSet<Id>) -> ColdRound {
+    let program = adapt.program;
+    let mut instance_async: HashMap<InstanceKey, bool> = HashMap::default();
+    let mut origins: HashMap<InstanceKey, Id> = HashMap::default();
+    let mut dependents: HashMap<InstanceKey, HashSet<InstanceKey>> = HashMap::default();
+    let mut reads: HashMap<InstanceKey, KeyReads> = HashMap::default();
+    let mut pending: Vec<InstanceKey> = Vec::new();
+    let mut queued: HashSet<InstanceKey> = HashSet::default();
+    // Sorted, so the record's run is a function of the cold tree alone and
+    // not of the map's iteration order.
+    let mut roots: Vec<Id> = program
+        .functions
+        .keys()
+        .copied()
+        .filter(|function_id| program.cold_entity(*function_id))
+        .collect();
+    roots.sort_unstable_by_key(|id| std::cmp::Reverse(id.0));
+    for root in roots {
+        let key = (root, Vec::new());
+        queued.insert(key.clone());
+        pending.push(key);
+    }
+    for binding in program.module_level_bindings() {
+        if !program.cold_entity(binding) {
+            continue;
+        }
+        for call in adapt.graph.initializer_calls_of(binding) {
+            if let CallTarget::Function(callee) = call.target
+                && program.cold_entity(callee)
+            {
+                let view = View {
+                    set: cold,
+                    cold: true,
+                    reads: None,
+                };
+                let bits = bits_for_call(
+                    program,
+                    adapt.held_values,
+                    view,
+                    adapt.adaptive,
                     &HashMap::default(),
                     &[],
                     callee,
@@ -1548,357 +2760,259 @@ fn adaptation_worklist(
             }
         }
     }
-
-    // --- The worklist: process instances until every async flag is stable.
-    // Flags only move false -> true, so this terminates. Every call of every
-    // member is enumerated on every pass — even members already known async
-    // — because enumeration is also DISCOVERY: a call with async closure
-    // arguments mints the callee's adapted instance.
+    let current = std::cell::RefCell::new(KeyReads::default());
     while let Some(key) = pending.pop() {
         queued.remove(&key);
-        let (root, ref bits) = key;
-        let members = component(root);
-        let mut flags: HashMap<Id, bool> = members
-            .iter()
-            .map(|member| (*member, async_set.contains(member)))
-            .collect();
-        loop {
-            let mut changed = false;
-            for member in &members {
-                for call in graph.calls_of(*member) {
-                    let awaits = match call.target {
-                        CallTarget::Function(callee) => {
-                            let callee_bits = bits_for_call(
-                                program,
-                                held_values,
-                                async_set,
-                                adaptive,
-                                &flags,
-                                bits,
-                                callee,
-                                call.call_id,
-                            );
-                            if callee_bits.is_empty() {
-                                async_set.contains(&callee)
-                            } else {
-                                let callee_key = (callee, callee_bits);
-                                dependents
-                                    .entry(callee_key.clone())
-                                    .or_default()
-                                    .insert(key.clone());
-                                // Every encounter, not just the discovering one:
-                                // the worklist is seeded from a hash-ordered key
-                                // set, so "the call that discovered it first" is
-                                // not a stable answer, and this id becomes the
-                                // SPAN a transitive violation reports at.
-                                record_origin(&mut origins, &callee_key, call.call_id);
-                                match instance_async.get(&callee_key) {
-                                    Some(flag) => *flag,
-                                    None => {
-                                        // Discover the callee instance;
-                                        // re-run this one when its flag
-                                        // lands.
-                                        instance_async.insert(callee_key.clone(), false);
-                                        if queued.insert(callee_key.clone()) {
-                                            pending.push(callee_key);
-                                        }
-                                        false
-                                    }
-                                }
-                            }
+        let flags = {
+            let view = View {
+                set: cold,
+                cold: true,
+                reads: Some(&current),
+            };
+            let mut encounter = |callee_key: InstanceKey, call_id: Id| -> bool {
+                // A cold body naming a non-cold callee's instance is not the
+                // cold world's to record: its verdict is re-walked always.
+                if !program.cold_entity(callee_key.0) {
+                    current.borrow_mut().unrecordable = true;
+                    return false;
+                }
+                dependents
+                    .entry(callee_key.clone())
+                    .or_default()
+                    .insert(key.clone());
+                record_origin(&mut origins, &callee_key, call_id);
+                match instance_async.get(&callee_key) {
+                    Some(flag) => *flag,
+                    None => {
+                        instance_async.insert(callee_key.clone(), false);
+                        if queued.insert(callee_key.clone()) {
+                            pending.push(callee_key);
                         }
-                        CallTarget::External(callee) => async_set.contains(&callee),
-                        CallTarget::Indirect(
-                            IndirectReason::GenericMember | IndirectReason::TraitDispatch,
-                        ) => dispatch_candidates(program, call.call_id)
-                            .iter()
-                            .any(|candidate| async_set.contains(candidate)),
-                        _ => {
-                            subject_adapted_here(program, held_values, &flags, bits, call.call_id)
-                                || program.function_calls.get(&call.call_id).is_some_and(
-                                    |function_call| {
-                                        subject_awaits(
-                                            program,
-                                            function_call.subject_id,
-                                            held_values,
-                                            async_set,
-                                            0,
-                                        )
-                                    },
-                                )
-                        }
-                    };
-                    if awaits && !flags[member] {
-                        flags.insert(*member, true);
-                        changed = true;
+                        false
                     }
                 }
-            }
-            if !changed {
-                break;
-            }
-        }
-        let root_flag = flags[&root];
+            };
+            evaluate_instance(adapt, view, &key, &mut encounter)
+        };
+        reads.entry(key.clone()).or_default().absorb(current.take());
+        let root_flag = flags[&key.0];
         let previous = instance_async.insert(key.clone(), root_flag);
         if root_flag && previous != Some(true) {
-            // The flag flipped on: dependents must re-evaluate.
             for dependent in dependents.get(&key).cloned().unwrap_or_default() {
                 if queued.insert(dependent.clone()) {
                     pending.push(dependent);
                 }
             }
         }
-        // A base instance's flips are ordinary coloring: the plain emission
-        // of this function/those closures is async.
-        if bits.is_empty() {
+        if key.1.is_empty() {
             for (member, flag) in &flags {
                 if *flag {
-                    async_set.insert(*member);
+                    cold.insert(*member);
                 }
             }
         }
     }
-
-    Worklist {
+    ColdRound {
         instance_async,
         origins,
+        dependents,
+        reads,
     }
 }
 
-/// The worklist's decisions, over its LAST round (every flag stable, the async
-/// set final): each instance's emission data and the context-dependent
-/// diagnostics. Reads the set; moves nothing.
-fn adaptation_decisions(
-    program: &Program,
-    graph: &CallGraph,
-    held_values: &HashMap<Id, Vec<Id>>,
-    adaptive: &HashMap<Id, HashSet<Id>>,
-    async_set: &HashSet<Id>,
-    worklist: Worklist,
-) -> Adaptation {
-    let Worklist {
-        instance_async,
-        origins,
-    } = worklist;
-    ADAPTATION_DECISIONS.with(|count| count.set(count.get() + 1));
-    let component = |root: Id| component_of(graph, root);
-    let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::default();
-    let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
-    let mut reported: HashSet<(Id, Id)> = HashSet::default();
-    // A.4's escape positions, collected once — the same positions the global
-    // divergence checks refuse, asked again per instance (`escape_violations_in`).
-    // Deduplicated by value expression, so one escaping store reports once
-    // however many instances reach it.
-    let field_stores = plain_closure_field_stores(program);
-    let return_sites = plain_closure_return_sites(program);
-    let mut reported_escapes: HashSet<Id> = HashSet::default();
-    // C1: this pass is FIRST-WINS across instances — `reported` and
-    // `reported_escapes` let one instance claim a violation and silence the
-    // others — and each instance anchors its diagnostic at its OWN origin. So a
-    // hash-ordered walk chose WHICH call site a transitive `sync` / host /
-    // escape violation named, and whether a note attached at all. Walk the
-    // instances in origin order instead: the earliest-minted instantiating call
-    // wins, base instances (no origin, and no diagnostics of their own) first.
-    let mut keys: Vec<InstanceKey> = instance_async.keys().cloned().collect();
-    keys.sort_by_key(|key| {
-        (
-            origins.get(key).map(|origin| origin.0),
-            key.0.0,
-            key.1.iter().map(|bit| bit.0).collect::<Vec<u32>>(),
-        )
-    });
-    for key in keys {
-        let (root, ref bits) = key;
-        let members = component(root);
-        // Recompute the stable flags for this context (cheap; flags are
-        // final so one pass over the loop from the worklist would converge
-        // identically — reuse the same evaluation by seeding from the
-        // global set and iterating).
-        let mut flags: HashMap<Id, bool> = members
-            .iter()
-            .map(|member| (*member, async_set.contains(member)))
-            .collect();
-        // A BASE instance's flags are the async set's already: the last round
-        // re-evaluated it against every final callee verdict (a flip re-queues
-        // its dependents) and wrote each member it flipped into the set — and
-        // that round wrote nothing new, or it would not have been the last. So
-        // the loop below would find no member to flip, and only an adapted
-        // instance (whose bits make its members async where the set does not)
-        // runs it.
-        loop {
-            if bits.is_empty() {
-                break;
-            }
-            let mut changed = false;
-            for member in &members {
-                if flags[member] {
-                    continue;
-                }
-                let awaits = graph
-                    .calls_of(*member)
-                    .iter()
-                    .any(|call| match call.target {
-                        CallTarget::Function(callee) => {
-                            async_set.contains(&callee) || {
-                                let callee_bits = bits_for_call(
-                                    program,
-                                    held_values,
-                                    async_set,
-                                    adaptive,
-                                    &flags,
-                                    bits,
-                                    callee,
-                                    call.call_id,
-                                );
-                                !callee_bits.is_empty()
-                                    && instance_async.get(&(callee, callee_bits)).copied()
-                                        == Some(true)
-                            }
-                        }
-                        CallTarget::External(callee) => async_set.contains(&callee),
-                        CallTarget::Indirect(
-                            IndirectReason::GenericMember | IndirectReason::TraitDispatch,
-                        ) => dispatch_candidates(program, call.call_id)
-                            .iter()
-                            .any(|candidate| async_set.contains(candidate)),
-                        _ => {
-                            subject_adapted_here(program, held_values, &flags, bits, call.call_id)
-                                || program.function_calls.get(&call.call_id).is_some_and(
-                                    |function_call| {
-                                        subject_awaits(
-                                            program,
-                                            function_call.subject_id,
-                                            held_values,
-                                            async_set,
-                                            0,
-                                        )
-                                    },
-                                )
-                        }
-                    });
-                if awaits {
-                    flags.insert(*member, true);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+/// A served analysis's replay state over a world's [`AsyncInstanceRecord`]:
+/// which recorded keys it re-walks (something they read moved), the rest
+/// answered from the record.
+struct Seeding<'r> {
+    record: &'r AsyncInstanceRecord,
+    /// The recorded keys re-walked — by index.
+    invalid: Vec<bool>,
+    rewalked: u64,
+    /// The ids of the async set already compared with the record's.
+    seen: HashSet<Id>,
+    /// Whether the once-per-analysis invalidations ran.
+    started: bool,
+    /// `false` under [`crate::incremental::Plant::AsyncRecordUnguarded`]: no
+    /// read is validated.
+    guarded: bool,
+}
 
-        let mut info = crate::analyzer::AdaptedInstance {
-            is_async: flags[&root],
-            ..Default::default()
-        };
-        for member in &members {
-            if *flags.get(member).unwrap_or(&false) && !bits.is_empty() && *member != root {
-                info.async_closures.insert(*member);
-            }
-            for call in graph.calls_of(*member) {
-                match call.target {
-                    CallTarget::Function(callee) => {
-                        let callee_bits = bits_for_call(
-                            program,
-                            held_values,
-                            async_set,
-                            adaptive,
-                            &flags,
-                            bits,
-                            callee,
-                            call.call_id,
-                        );
-                        if !callee_bits.is_empty() {
-                            let callee_async =
-                                instance_async.get(&(callee, callee_bits.clone())).copied()
-                                    == Some(true);
-                            if callee_async {
-                                info.awaited_calls.insert(call.call_id);
-                            }
-                            info.callee_bits.insert(call.call_id, callee_bits);
-                        }
-                        // Transitive `sync`/host violations: an argument
-                        // that is async ONLY through this instance's bits,
-                        // flowing into a refusing position.
-                        sync_violations_at(
-                            program,
-                            held_values,
-                            async_set,
-                            &flags,
-                            bits,
-                            callee,
-                            call.call_id,
-                            origins.get(&key).copied(),
-                            &mut reported,
-                            &mut diagnostics,
-                        );
-                    }
-                    CallTarget::External(callee) => {
-                        extern_violations_at(
-                            program,
-                            held_values,
-                            async_set,
-                            &flags,
-                            bits,
-                            callee,
-                            call.call_id,
-                            origins.get(&key).copied(),
-                            &mut reported,
-                            &mut diagnostics,
-                        );
-                    }
-                    CallTarget::Indirect(
-                        IndirectReason::GenericMember | IndirectReason::TraitDispatch,
-                    ) => {
-                        dispatch_refusals_at(
-                            program,
-                            held_values,
-                            async_set,
-                            &flags,
-                            bits,
-                            call.call_id,
-                            &mut reported,
-                            &mut diagnostics,
-                        );
-                    }
-                    _ => {}
-                }
-                if subject_adapted_here(program, held_values, &flags, bits, call.call_id) {
-                    info.awaited_calls.insert(call.call_id);
-                }
-            }
-        }
-        // A.4's adapted-instance escape: a value async only through THESE bits
-        // leaving the instance through a plain field or a plain declared
-        // return. A base instance carries no bits and so can escape nothing
-        // the global checks did not already see.
-        if !bits.is_empty() {
-            escape_violations_in(
-                program,
-                held_values,
-                async_set,
-                &flags,
-                bits,
-                &field_stores,
-                &return_sites,
-                origins.get(&key).copied(),
-                &mut reported_escapes,
-                &mut diagnostics,
-            );
-        }
-        // Base instances only earn an entry when they carry emission data;
-        // adapted instances always do (the caller emits them by key).
-        if !bits.is_empty()
-            || !info.awaited_calls.is_empty()
-            || !info.callee_bits.is_empty()
-            || !info.async_closures.is_empty()
-        {
-            instances.insert(key, info);
+impl<'r> Seeding<'r> {
+    fn new(record: &'r AsyncInstanceRecord) -> Seeding<'r> {
+        Seeding {
+            record,
+            invalid: vec![false; record.keys.len()],
+            rewalked: 0,
+            seen: HashSet::default(),
+            started: false,
+            guarded: !crate::incremental::planted(crate::incremental::Plant::AsyncRecordUnguarded),
         }
     }
 
-    Adaptation {
-        instances,
-        diagnostics,
+    fn index_of(&self, key: &InstanceKey) -> Option<usize> {
+        self.record.index.get(key).map(|index| *index as usize)
+    }
+
+    /// Whether the record answers `key` (recorded and not re-walked).
+    fn serves(&self, key: &InstanceKey) -> bool {
+        self.index_of(key).is_some_and(|index| !self.invalid[index])
+    }
+
+    /// The recorded verdict of a key the record answers.
+    fn served_flag(&self, key: &InstanceKey) -> Option<bool> {
+        self.index_of(key)
+            .filter(|index| !self.invalid[*index])
+            .map(|index| self.record.keys[index].flag)
+    }
+
+    /// The recorded verdict — a re-walked key's starting point (a lower
+    /// bound of its verdict now).
+    fn recorded_flag_of(&self, key: &InstanceKey) -> bool {
+        self.index_of(key)
+            .is_some_and(|index| self.record.keys[index].flag)
+    }
+
+    fn recorded_origin(&self, key: &InstanceKey) -> Option<Id> {
+        self.index_of(key)
+            .and_then(|index| self.record.keys[index].origin)
+    }
+
+    fn recorded_dependents(&self, key: &InstanceKey) -> Vec<u32> {
+        self.index_of(key)
+            .map(|index| self.record.keys[index].dependents.clone())
+            .unwrap_or_default()
+    }
+
+    /// Marks a recorded key re-walked; answers it when it was not already.
+    fn rewalk(&mut self, index: u32) -> Option<InstanceKey> {
+        let index = index as usize;
+        if self.invalid[index] {
+            return None;
+        }
+        self.invalid[index] = true;
+        self.rewalked += 1;
+        Some(self.record.keys[index].key.clone())
+    }
+
+    fn rewalk_all(&mut self, indices: &[u32]) -> Vec<InstanceKey> {
+        indices
+            .iter()
+            .filter_map(|index| self.rewalk(*index))
+            .collect()
+    }
+
+    /// `id` is async in this analysis: when the record's cold world did not
+    /// make it so, the keys that read it as not async — by id, and by name
+    /// for a dispatch candidate — are re-walked.
+    fn moved(&mut self, program: &Program, id: Id) -> Vec<InstanceKey> {
+        if !self.guarded || self.record.settled.contains(&id) || !self.seen.insert(id) {
+            return Vec::new();
+        }
+        let mut rewalked = Vec::new();
+        if let Some(readers) = self.record.readers_by_id.get(&id) {
+            rewalked.extend(self.rewalk_all(readers));
+        }
+        let name = program
+            .functions
+            .get(&id)
+            .map(|function| function.name)
+            .or_else(|| {
+                program
+                    .external_functions
+                    .get(&id)
+                    .map(|external| external.name)
+            });
+        if let Some(readers) = name.and_then(|name| self.record.readers_by_name.get(name)) {
+            rewalked.extend(self.rewalk_all(readers));
+        }
+        rewalked
+    }
+
+    /// A round's start: once per analysis the keys the record cannot
+    /// validate and the readers of a binding a non-cold module now assigns;
+    /// every round the async set's ids the record's set lacks and every
+    /// dispatch a recorded key read, asked again.
+    fn round_start(&mut self, adapt: Adapt, async_set: &HashSet<Id>) {
+        if !self.guarded {
+            return;
+        }
+        let program = adapt.program;
+        if !self.started {
+            self.started = true;
+            let unrecordable = self.record.unrecordable.clone();
+            self.rewalk_all(&unrecordable);
+            for (binding, readers) in &self.record.readers_by_binding {
+                let foreign = adapt.held_values.get(binding).is_some_and(|held| {
+                    held.iter().any(|value_id| !program.cold_entity(*value_id))
+                });
+                if foreign {
+                    for reader in readers {
+                        self.rewalk(*reader);
+                    }
+                }
+            }
+        }
+        let mut moved: Vec<Id> = async_set
+            .iter()
+            .copied()
+            .filter(|id| !self.record.settled.contains(id) && !self.seen.contains(id))
+            .collect();
+        moved.sort_unstable_by_key(|id| id.0);
+        for id in moved {
+            self.moved(program, id);
+        }
+        let view = View::plain(async_set);
+        let mut verdicts: HashMap<(bool, Option<TypeId>, &str), bool> = HashMap::default();
+        for (call_id, readers) in &self.record.dispatch_reads {
+            if readers.iter().all(|reader| self.invalid[*reader as usize]) {
+                continue;
+            }
+            let async_ = match dispatch_at(program, *call_id) {
+                Some(dispatch) if !program.dyn_method_calls.contains_key(call_id) => {
+                    let key = match dispatch {
+                        GenericDispatch::OnConstraint(constraint_id, member) => {
+                            (true, Some(constraint_id), member)
+                        }
+                        GenericDispatch::OnType(type_id, member) => (false, type_id, member),
+                    };
+                    *verdicts
+                        .entry(key)
+                        .or_insert_with(|| view.dispatch_async(program, *call_id))
+                }
+                _ => view.dispatch_async(program, *call_id),
+            };
+            if async_ {
+                for reader in readers {
+                    self.rewalk(*reader);
+                }
+            }
+        }
+    }
+
+    /// Every recorded key re-walked so far.
+    fn rewalked_keys(&self) -> Vec<InstanceKey> {
+        self.invalid
+            .iter()
+            .enumerate()
+            .filter(|(_, invalid)| **invalid)
+            .map(|(index, _)| self.record.keys[index].key.clone())
+            .collect()
+    }
+
+    /// The recorded decisions with output of the keys never re-walked.
+    fn served_decisions(&self) -> impl Iterator<Item = (&'r InstanceKey, &'r KeyDecision)> + '_ {
+        self.record
+            .with_output
+            .iter()
+            .map(|index| *index as usize)
+            .filter(|index| !self.invalid[*index])
+            .filter_map(|index| {
+                let recorded = &self.record.keys[index];
+                recorded
+                    .decision
+                    .as_deref()
+                    .map(|decision| (&recorded.key, decision))
+            })
     }
 }
 
@@ -1971,7 +3085,7 @@ fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
 /// (`Program::anchored`), which is the only location a reader can act on.
 /// One store into a closure-typed struct field: which field, and the value
 /// expression that lands in it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct FieldStore {
     struct_id: Id,
     field_index: usize,
@@ -1992,44 +3106,14 @@ fn plain_closure_position(program: &Program, type_id: TypeId) -> bool {
     )
 }
 
-/// Every store — struct literal or field assignment — whose target is a PLAIN
+/// The stores — struct literals and field assignments, gathered by `infer`'s
+/// one walk of the entity map — whose target is a PLAIN
 /// (non-`async`) closure-typed field with a non-void return: the positions
 /// where an async value would lie about what a later call through the field
 /// hands back. Collected in one place because two checks ask the same question
 /// of the same positions: the global divergence check, and its per-instance
 /// twin (A.4's adapted-instance escape, closed 2026-08-04).
-fn plain_closure_field_stores(program: &Program) -> Vec<FieldStore> {
-    let mut stores: Vec<FieldStore> = Vec::new();
-    for expr in program.entity_map.values() {
-        match expr {
-            // The initializer expr carries its OWN id; the struct def resolves
-            // through `struct_initializer_to_def`.
-            Expr::StructInitializer(initializer_id, field_values) => {
-                let Some(struct_id) = program.struct_initializer_to_def.get(initializer_id) else {
-                    continue;
-                };
-                for (field_index, value_id) in field_values {
-                    stores.push(FieldStore {
-                        struct_id: *struct_id,
-                        field_index: *field_index,
-                        value_id: *value_id,
-                    });
-                }
-            }
-            Expr::Assignment(target_id, value_id) => {
-                if let Some(Expr::Field(_, struct_id, field_index)) =
-                    program.entity_map.get(target_id)
-                {
-                    stores.push(FieldStore {
-                        struct_id: *struct_id,
-                        field_index: *field_index,
-                        value_id: *value_id,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
+fn plain_closure_field_stores(program: &Program, mut stores: Vec<FieldStore>) -> Vec<FieldStore> {
     stores.retain(|store| {
         !program
             .async_fields
@@ -2131,14 +3215,12 @@ fn span_of(program: &Program, id: Id) -> crate::span::Span {
 fn sync_violations_at(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     flags: &HashMap<Id, bool>,
     bits: &[Id],
     callee: Id,
     call_id: Id,
-    origin: Option<Id>,
-    reported: &mut HashSet<(Id, Id)>,
-    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
+    reports: &mut Vec<Report>,
 ) {
     let Some(function) = program.functions.get(&callee) else {
         return;
@@ -2153,42 +3235,17 @@ fn sync_violations_at(
         if !program.sync_values.contains(parameter) || !parameter_is_closure(program, *parameter) {
             continue;
         }
-        if !value_async_in(program, held_values, async_set, flags, bits, *argument) {
+        if !value_async_in(program, held_values, view, flags, bits, *argument) {
             continue;
         }
         // Direct violations report at the global check with the plain steer.
-        if value_async_in(
-            program,
-            held_values,
-            async_set,
-            &empty_flags,
-            &[],
-            *argument,
-        ) {
+        if value_async_in(program, held_values, view, &empty_flags, &[], *argument) {
             continue;
         }
-        if !reported.insert((call_id, *parameter)) {
-            continue;
-        }
-        let parameter_name = program
-            .parameters
-            .get(parameter)
-            .map(|parameter| parameter.name)
-            .unwrap_or("the parameter");
-        let primary = origin.unwrap_or(call_id);
-        let note = (primary != call_id).then(|| crate::error::Note {
-            span: span_of(program, call_id),
-            msg: format!("forwarded into the `sync` parameter `{parameter_name}` here"),
-            source: program.note_source_of(call_id),
+        reports.push(Report::Sync {
+            call_id,
+            parameter: *parameter,
         });
-        diagnostics.push(anchored(
-            program,
-            primary,
-            format!(
-                "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`); move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
-            ),
-            note,
-        ));
     }
 }
 
@@ -2198,14 +3255,12 @@ fn sync_violations_at(
 fn extern_violations_at(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     flags: &HashMap<Id, bool>,
     bits: &[Id],
     callee: Id,
     call_id: Id,
-    origin: Option<Id>,
-    reported: &mut HashSet<(Id, Id)>,
-    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
+    reports: &mut Vec<Report>,
 ) {
     // The `Context::run` intrinsic is not a host boundary — see the direct
     // host-boundary check in `infer` (E68): a surviving `run` call means
@@ -2229,37 +3284,17 @@ fn extern_violations_at(
         if !closure_return_is_value(program, *parameter) {
             continue;
         }
-        if !value_async_in(program, held_values, async_set, flags, bits, *argument) {
+        if !value_async_in(program, held_values, view, flags, bits, *argument) {
             continue;
         }
-        if value_async_in(
-            program,
-            held_values,
-            async_set,
-            &empty_flags,
-            &[],
-            *argument,
-        ) {
+        if value_async_in(program, held_values, view, &empty_flags, &[], *argument) {
             continue;
         }
-        if !reported.insert((call_id, *parameter)) {
-            continue;
-        }
-        let primary = origin.unwrap_or(call_id);
-        let note = (primary != call_id).then(|| crate::error::Note {
-            span: span_of(program, call_id),
-            msg: format!("forwarded to the host function `{}` here", external.name),
-            source: program.note_source_of(call_id),
+        reports.push(Report::Extern {
+            call_id,
+            parameter: *parameter,
+            callee,
         });
-        diagnostics.push(anchored(
-            program,
-            primary,
-            format!(
-                "this call passes an async closure that reaches the host (`external`) function `{}`, which cannot await a Vilan closure: only synchronous closures can cross",
-                external.name
-            ),
-            note,
-        ));
     }
 }
 
@@ -2270,12 +3305,11 @@ fn extern_violations_at(
 fn dispatch_refusals_at(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     flags: &HashMap<Id, bool>,
     bits: &[Id],
     call_id: Id,
-    reported: &mut HashSet<(Id, Id)>,
-    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
+    reports: &mut Vec<Report>,
 ) {
     let Some(function_call) = program.function_calls.get(&call_id) else {
         return;
@@ -2285,7 +3319,7 @@ fn dispatch_refusals_at(
         return;
     }
     for (position, argument) in function_call.argument_ids.iter().enumerate() {
-        if !value_async_in(program, held_values, async_set, flags, bits, *argument) {
+        if !value_async_in(program, held_values, view, flags, bits, *argument) {
             continue;
         }
         // Refuse only where a candidate would need ADAPTATION: a plain,
@@ -2305,15 +3339,7 @@ fn dispatch_refusals_at(
         if !needs_adaptation {
             continue;
         }
-        if !reported.insert((call_id, Id(position as u32))) {
-            continue;
-        }
-        diagnostics.push(anchored(
-            program,
-            call_id,
-            "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation); bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
-            None,
-        ));
+        reports.push(Report::Dispatch { call_id, position });
     }
 }
 
@@ -2344,65 +3370,33 @@ fn dispatch_refusals_at(
 fn escape_violations_in(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     flags: &HashMap<Id, bool>,
     bits: &[Id],
-    field_stores: &[FieldStore],
-    return_sites: &[(Id, Id)],
-    origin: Option<Id>,
-    reported: &mut HashSet<Id>,
-    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
+    escapes: &Escapes,
+    reports: &mut Vec<Report>,
 ) {
     let empty_flags = HashMap::default();
     let escapes_here = |value_id: Id| {
-        value_async_in(program, held_values, async_set, flags, bits, value_id)
-            && !value_async_in(program, held_values, async_set, &empty_flags, &[], value_id)
+        value_async_in(program, held_values, view, flags, bits, value_id)
+            && !value_async_in(program, held_values, view, &empty_flags, &[], value_id)
     };
-    let mut report = |value_id: Id, message: String, note_msg: String| {
-        let primary = origin.unwrap_or(value_id);
-        let note = (primary != value_id).then(|| crate::error::Note {
-            span: span_of(program, value_id),
-            msg: note_msg,
-            source: program.note_source_of(value_id),
-        });
-        diagnostics.push(anchored(program, primary, message, note));
-    };
-    for store in field_stores {
-        if !escapes_here(store.value_id) || !reported.insert(store.value_id) {
-            continue;
+    // In the cold view a position outside the cold set is not asked at all:
+    // it cannot pass both halves (above), and asking would read the hot
+    // set's own ids.
+    let asked = |value_id: Id| !view.cold || program.cold_entity(value_id);
+    for store in &escapes.field_stores {
+        if asked(store.value_id) && escapes_here(store.value_id) {
+            reports.push(Report::FieldEscape(*store));
         }
-        let field_name = field_of(program, store)
-            .map(|field| field.name)
-            .unwrap_or("the field");
-        let struct_name = program
-            .structs
-            .get(&store.struct_id)
-            .map(|struct_| struct_.name)
-            .unwrap_or("the struct");
-        report(
-            store.value_id,
-            format!(
-                "this call passes an async closure that reaches `{struct_name}`'s field `{field_name}`, which awaits nothing — a later call through the field would hand back a promise; declare the field `async || T` (or return void for spawn semantics)"
-            ),
-            format!("stored into the plain field `{field_name}` here"),
-        );
     }
-    for (function_id, value_id) in return_sites {
-        if !escapes_here(*value_id) || !reported.insert(*value_id) {
-            continue;
+    for (function_id, value_id) in &escapes.return_sites {
+        if asked(*value_id) && escapes_here(*value_id) {
+            reports.push(Report::ReturnEscape {
+                function_id: *function_id,
+                value_id: *value_id,
+            });
         }
-        let name = program
-            .functions
-            .get(function_id)
-            .map(|function| function.name)
-            .unwrap_or("this function");
-        report(
-            *value_id,
-            format!(
-                "this call passes an async closure that reaches `{name}`'s declared return type, which awaits nothing — the caller would hold a promise typed as a plain closure; declare it `async || T` (or return void for spawn semantics)"
-            ),
-            format!("returned from `{name}` here"),
-        );
     }
 }
 
@@ -2413,26 +3407,29 @@ fn escape_violations_in(
 fn value_async_in(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     flags: &HashMap<Id, bool>,
     bits: &[Id],
     value_id: Id,
 ) -> bool {
-    match program.entity_map.get(&value_id) {
-        Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id)) => flags
+    let closure_async = |closure_id: &Id| {
+        flags
             .get(closure_id)
             .copied()
-            .unwrap_or_else(|| async_set.contains(closure_id)),
+            .unwrap_or_else(|| view.contains(program, *closure_id))
+    };
+    match program.entity_map.get(&value_id) {
+        Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id)) => {
+            closure_async(closure_id)
+        }
         Some(Expr::Local(target)) => {
-            bits.contains(target)
-                || program.async_values.contains(target)
-                || held_values.get(target).is_some_and(|held| {
+            bits.contains(target) || program.async_values.contains(target) || {
+                view.note_held(*target);
+                held_values.get(target).is_some_and(|held| {
                     held.iter()
+                        .filter(|held_id| view.admits_held(program, **held_id))
                         .any(|held_id| match program.entity_map.get(held_id) {
-                            Some(Expr::Closure(closure_id)) => flags
-                                .get(closure_id)
-                                .copied()
-                                .unwrap_or_else(|| async_set.contains(closure_id)),
+                            Some(Expr::Closure(closure_id)) => closure_async(closure_id),
                             Some(Expr::Field(_, struct_id, index)) => {
                                 program.async_fields.contains(&(*struct_id, *index))
                             }
@@ -2440,6 +3437,7 @@ fn value_async_in(
                             _ => false,
                         })
                 })
+            }
         }
         Some(Expr::Field(_, struct_id, index)) => {
             program.async_fields.contains(&(*struct_id, *index))
@@ -2454,7 +3452,7 @@ fn value_async_in(
 fn bits_for_call(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
     adaptive: &HashMap<Id, HashSet<Id>>,
     flags: &HashMap<Id, bool>,
     bits: &[Id],
@@ -2476,7 +3474,7 @@ fn bits_for_call(
         .zip(&function.parameters)
         .filter(|(argument, parameter)| {
             adaptive_params.contains(*parameter)
-                && value_async_in(program, held_values, async_set, flags, bits, **argument)
+                && value_async_in(program, held_values, view, flags, bits, **argument)
         })
         .map(|(_, parameter)| *parameter)
         .collect();
@@ -2500,10 +3498,11 @@ fn base_fixpoint(
             if async_set.contains(&id) {
                 continue;
             }
+            let view = View::plain(async_set);
             let calls_async = graph
                 .calls_of(id)
                 .iter()
-                .any(|call| call_suspends(program, call, held_values, async_set));
+                .any(|call| call_suspends(program, call, held_values, view));
             if calls_async {
                 async_set.insert(id);
                 changed = true;
@@ -2532,14 +3531,14 @@ fn call_suspends(
     program: &Program,
     call: &Call,
     held_values: &HashMap<Id, Vec<Id>>,
-    async_set: &HashSet<Id>,
+    view: View,
 ) -> bool {
     match call.target {
-        CallTarget::Function(callee) | CallTarget::External(callee) => async_set.contains(&callee),
+        CallTarget::Function(callee) | CallTarget::External(callee) => {
+            view.contains(program, callee)
+        }
         CallTarget::Indirect(IndirectReason::GenericMember | IndirectReason::TraitDispatch) => {
-            dispatch_candidates(program, call.call_id)
-                .iter()
-                .any(|member| async_set.contains(member))
+            view.dispatch_async(program, call.call_id)
         }
         // A call through an `async || T`-typed value IS an await point —
         // asyncness rides the type (J2), or the VALUE FLOW: a binding holding
@@ -2551,7 +3550,7 @@ fn call_suspends(
             .function_calls
             .get(&call.call_id)
             .is_some_and(|function_call| {
-                subject_awaits(program, function_call.subject_id, held_values, async_set, 0)
+                subject_awaits(program, function_call.subject_id, held_values, view, 0)
             }),
     }
 }
@@ -2580,7 +3579,7 @@ fn call_suspends_memoized<'src>(
         call.target,
         CallTarget::Indirect(IndirectReason::GenericMember | IndirectReason::TraitDispatch)
     ) {
-        return call_suspends(program, call, held_values, async_set);
+        return call_suspends(program, call, held_values, View::plain(async_set));
     }
     // No dispatch record is `dispatch_candidates`' own empty answer.
     let Some(dispatch) = dispatch_at(program, call.call_id) else {

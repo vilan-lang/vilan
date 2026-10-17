@@ -97,6 +97,88 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
     );
     // E257 S6: nor its source map.
     assert!(!map.exists(), "nor its map: {}", map.display());
+    // S7: nor its sidecar.
+    let sidecar = std::env::temp_dir().join(format!("vilan-watch-{}.mjs.vdbg.json", watcher.id()));
+    assert!(!sidecar.exists(), "nor its sidecar: {}", sidecar.display());
+}
+
+/// debug-53's orphan sidecars: a plain `vilan run` had no interrupt hook at
+/// all, so a `Ctrl-C` (or a debugger's `SIGTERM`) while its program ran left
+/// `vilan-run-<pid>.mjs`, its map and its sidecar in the temp directory.
+///
+/// `SIGTERM` and `SIGHUP` go to `vilan` ALONE, as a debugger ending a session
+/// sends them: the program keeps running, so only the hook can answer — it
+/// removes the three files and exits 130. `SIGINT` goes to the run's process
+/// GROUP, as a terminal's `Ctrl-C` does: the program stops with it, so the
+/// hook and the run's own end race to the same removal, and the run exits
+/// with a code either way. Without the hook, every signal killed `vilan`
+/// outright: no code, and every file stayed.
+#[test]
+fn an_interrupted_run_removes_its_script_map_and_sidecar() {
+    use std::os::unix::process::CommandExt;
+    for (signal, to_the_group) in [("INT", true), ("TERM", false), ("HUP", false)] {
+        let dir = temp_package(&format!("interrupted_{signal}"));
+        std::fs::write(
+            dir.join("src/main.vl"),
+            "import std::io::print;\nimport std::time::sleep;\n\nfun main() {\n\tprint(\"started\");\n\tsleep(20000);\n}\n",
+        )
+        .unwrap();
+        let mut run = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["run", dir.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the run");
+        // The program printed: its script, map and sidecar are on disk and
+        // node is running it.
+        let lines = lines_of(&mut run);
+        let mut seen = Vec::new();
+        wait_for_line(&lines, &mut seen, "the program to start", |line| {
+            line == "started"
+        });
+        let script = std::env::temp_dir().join(format!("vilan-run-{}.mjs", run.id()));
+        let files = [
+            script.clone(),
+            std::env::temp_dir().join(format!("vilan-run-{}.mjs.map", run.id())),
+            std::env::temp_dir().join(format!("vilan-run-{}.mjs.vdbg.json", run.id())),
+        ];
+        assert!(
+            files.iter().all(|file| file.exists()),
+            "SIG{signal}: the run's files exist while it runs: {files:?}"
+        );
+        let target = if to_the_group {
+            format!("-{}", run.id())
+        } else {
+            run.id().to_string()
+        };
+        let signalled = Command::new("kill")
+            .args([format!("-{signal}"), "--".to_string(), target])
+            .status()
+            .expect("signal the run");
+        assert!(signalled.success(), "kill -{signal} must succeed");
+        let status = run.wait().expect("reap the run");
+        // The program a lone signal to `vilan` left running.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", run.id())])
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+        if to_the_group {
+            assert!(
+                status.code().is_some(),
+                "SIG{signal}: the run exits, not killed: {status:?}"
+            );
+        } else {
+            assert_eq!(status.code(), Some(130), "SIG{signal}: the hook exits 130");
+        }
+        for file in &files {
+            assert!(
+                !file.exists(),
+                "SIG{signal}: {} outlived the run",
+                file.display()
+            );
+        }
+    }
 }
 
 /// A9: the `[build] run` hooks belong to the *round*, not to the session — a

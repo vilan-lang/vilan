@@ -5346,6 +5346,8 @@ fn m107_impls_of_one_trait_over_distinct_types_are_never_compared() {
 /// instructions with this and the other M107 indices.
 #[test]
 fn m107_impl_lookups_examine_rows_linear_in_the_package() {
+    // Base-cache hits of one canonical world, counted (see `served` below).
+    without_the_std_prefix();
     fn rows(types: usize) -> (usize, bool) {
         // `performance-gates.md` §6.2's plain module, one per type, in one
         // file: derived `PartialEq` and `Debug`, a list built and walked, an

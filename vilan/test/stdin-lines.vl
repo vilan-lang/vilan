@@ -1,0 +1,29 @@
+// `std::process`'s stdin (A173 S1, B?1): every run of this program reads the
+// fixture beside it, `stdin-lines.stdin` — the corpus harnesses and the native
+// differential pipe a program's `<name>.stdin` in place of an empty stdin. It
+// pins what both backends must agree on: `\n`, `\r\n` and a lone `\r` each end
+// one line; a blank line is `Some("")`, distinct from the end; a non-ASCII
+// line survives whole; a last line with no ending is still a line; and past
+// the end `read_line()` stays `None` and `scan()` stays `""`.
+
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::{ read_line, scan };
+
+fun main() {
+	// `scan()` is `read_line()` with `""` at the end: here it reads line one.
+	print(i"scan: [{scan()}]");
+	mut count = 0;
+	for {
+		match read_line() {
+			Some(let line) => {
+				count += 1;
+				print(i"{count}: [{line}] {line.len()}");
+			}
+			None => jump break,
+		}
+	}
+	print(i"lines after scan: {count}");
+	print(i"read_line past the end is None: {read_line().is_none()}");
+	print(i"scan past the end: [{scan()}]");
+}

@@ -176,7 +176,9 @@ fun open_database(): Database {
 	let database = Database::open("notes.db");
 	database.exec("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, username TEXT UNIQUE, salt TEXT, password_hash TEXT)");
 	database.exec("CREATE TABLE IF NOT EXISTS session (token TEXT PRIMARY KEY, username TEXT)");
-	database.exec("CREATE TABLE IF NOT EXISTS note (id INTEGER PRIMARY KEY, title TEXT, body TEXT)");
+	database.exec(
+		"CREATE TABLE IF NOT EXISTS note (id INTEGER PRIMARY KEY, title TEXT, body TEXT)",
+	);
 	database
 }
 

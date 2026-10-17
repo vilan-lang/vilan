@@ -6707,6 +6707,272 @@ fn b627_a_static_receiver_nothing_determines_is_refused() {
     );
 }
 
+const B638_PAGE: &str = r#"
+        import std::debug::Debug;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        [derive(Debug)]
+        struct Page<T> {
+            items: List<T>,
+            first: Option<T>,
+        }
+
+        fun take(page: Page<i32>) {
+            print(page.items.len());
+        }
+"#;
+
+/// B638: a `let` bound to a generic struct literal no field grounds keeps the
+/// declaration's own `Page<T>`; a later typed use (`let n: Page<i32> = both;`,
+/// `take(both)`) never reached back, so JS ran and every native build refused
+/// the literal. It is refused at the initializer with B580's steer — as `let o
+/// = None; let n: Option<i32> = o;` is — on both backends.
+#[test]
+fn b638_a_literal_binding_no_field_grounds_is_refused_with_the_annotation_steer() {
+    for body in [
+        "let both = Page { items = [], first = None }; let n: Page<i32> = both; print(n.debug());",
+        "let both = Page { items = [], first = None }; take(both);",
+        "let both = Page { items = [], first = None }; print(both.items.len());",
+        "let both = Page { items = [], first = None }; mut copy = both; copy.items.push(3); \
+         print(copy.items.len());",
+    ] {
+        assert_fails_once_with(
+            &format!("{B638_PAGE}\n        fun main() {{ {body} }}\n"),
+            "cannot infer the type of `both`: it is `Page<…>`, and inference cannot settle the \
+             `…` from anything the program does with it. Write the type on the binding (`both: \
+             Page<…>`)",
+        );
+    }
+}
+
+/// B638's boundary: a literal a field, an annotation or its position grounds,
+/// and one whose parameter an enclosing declaration binds, compile as before.
+#[test]
+fn b638_a_grounded_or_enclosed_literal_binding_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B638_PAGE}{}",
+            r#"
+        impl Page<type T> {
+            fun blank(): Page<T> {
+                let page = Page { items = [], first = None };
+                page
+            }
+        }
+
+        fun wrapped<U>(value: U): Page<U> {
+            let page = Page { items = [value], first = None };
+            page
+        }
+
+        fun main() {
+            let annotated: Page<i32> = Page { items = [], first = None };
+            print(annotated.debug());
+            let grounded = Page { items = [1], first = None };
+            print(grounded.debug());
+            take(Page { items = [], first = None });
+            let blank: Page<str> = Page::blank();
+            print(blank.items.len());
+            print(wrapped(2).items.len());
+        }
+        main();
+        "#
+        ),
+        "Page { items = [], first = None }\nPage { items = [1], first = None }\n0\n0\n1\n",
+    );
+}
+
+/// B640: an undetermined static as the RESULT of a function whose return type
+/// is inferred — its tail, an `if`'s arm in its tail, a `ret` — is followed to
+/// the function's call sites: a call site nothing types is refused with
+/// B627's steer (JS reported an internal error, native a backend gap), a
+/// recursive function's own call is not followed twice. A function body's
+/// own statement discards the value as a nested block's does.
+#[test]
+fn b640_an_undetermined_static_as_an_inferred_functions_result_is_refused() {
+    for function in [
+        "fun result_of() { Holder::build() }",
+        "fun result_of() { if true { Holder::build() } else { None } }",
+        "fun result_of() { ret Holder::build(); }",
+        "fun result_of() { { Holder::build() } }",
+    ] {
+        for body in [
+            "result_of();",
+            "let held = result_of(); print(held.is_some());",
+        ] {
+            assert_fails_once_with(
+                &format!("{B627_HOLDER}\n        {function}\n        fun main() {{ {body} }}\n"),
+                "this call's result `Option<Holder<T>>` is never fully determined",
+            );
+        }
+    }
+    // B627's statement door, at a function body's own statement (only a
+    // nested block's statement was followed before).
+    assert_fails_once_with(
+        &format!("{B627_HOLDER}\n        fun main() {{ Holder::build(); }}\n"),
+        "this call's result `Option<Holder<T>>` is never fully determined",
+    );
+    assert_fails_once_with(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun looped(count: i32) {
+            if count > 0 { looped(count - 1) } else { Holder::build() }
+        }
+        fun main() {
+            looped(2);
+        }
+        "#
+        ),
+        "this call's result `Option<Holder<T>>` is never fully determined",
+    );
+}
+
+/// B640's closure residue: a CLOSURE is one value for every call — not
+/// instantiated per call site — so an undetermined static as its unannotated
+/// result is refused whatever its call sites say (JS reported the internal
+/// error for both); a closure literal at a position its consumer types
+/// (`run(|| Holder::build())` into an annotated binding) is decided there.
+#[test]
+fn b640_an_undetermined_static_as_a_closures_result_is_refused() {
+    for body in [
+        "let build = || Holder::build(); build();",
+        "let build = || Holder::build(); let held: Option<Holder<i32>> = build(); \
+         print(held.is_some());",
+    ] {
+        assert_fails_once_with(
+            &format!("{B627_HOLDER}\n        fun main() {{ {body} }}\n"),
+            "this call's result `Option<Holder<T>>` is never fully determined",
+        );
+    }
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun run<R>(body: || R): R {
+            body()
+        }
+
+        fun main() {
+            let held: Option<Holder<i32>> = run(|| Holder::build());
+            print(held.unwrap().value);
+        }
+        main();
+        "#
+        ),
+        "7\n",
+    );
+}
+
+/// B640's other door: a call site that types the result decides the binder,
+/// through the inferred function, and runs.
+#[test]
+fn b640_an_inferred_functions_typed_call_site_decides_the_binder() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun result_of() {
+            Holder::build()
+        }
+
+        fun main() {
+            let held: Option<Holder<i32>> = result_of();
+            print(held.unwrap().value);
+        }
+        main();
+        "#
+        ),
+        "7\n",
+    );
+}
+
+/// B637: an argument at a NON-generic parameter is a typed position as surely
+/// as an annotated binding — the outer call (a function, a method, a closure)
+/// seeds the argument call's expectation from the concrete parameter type,
+/// through a view too, and the method call waits for it, so B627's receiver
+/// path fixes `make`'s own `T` (and a static's impl binder) there.
+#[test]
+fn b637_an_argument_at_a_concrete_parameter_directs_a_receiver_calls_generic() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B627_HOLDER}{}",
+            r#"
+        fun make<T>(): Option<T> {
+            None
+        }
+
+        fun take(value: i32): i32 {
+            value + 1
+        }
+
+        fun held_value(held: Holder<i32>): i32 {
+            held.value
+        }
+
+        fun peek(value: &i32): i32 {
+            *value + 100
+        }
+
+        struct Counter {
+            total: i32,
+        }
+
+        impl Counter {
+            fun fresh(): Counter {
+                Counter { total = 10 }
+            }
+
+            fun add(&mut self, amount: i32): Counter {
+                self.total = self.total + amount;
+                Counter { total = self.total }
+            }
+        }
+
+        fun main() {
+            print(take(make().unwrap_or(5)));
+            print(take(take(make().unwrap_or(7))));
+            print(held_value(Holder::build().unwrap()));
+            mut counter = Counter::fresh();
+            print(counter.add(make().unwrap_or(2)).total);
+            print(Counter::fresh().add(make().unwrap_or(4)).total);
+            let double = |value: i32| value * 2;
+            print(double(make().unwrap_or(3)));
+            print(peek(&make().unwrap_or(2)));
+        }
+        main();
+        "#
+        ),
+        "6\n9\n7\n12\n14\n6\n102\n",
+    );
+}
+
+/// B637's boundary: a GENERIC parameter decides nothing, so the argument's
+/// own generic is still refused "cannot infer", as before.
+#[test]
+fn b637_an_argument_at_a_generic_parameter_still_cannot_infer() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun make<T>(): Option<T> {
+            None
+        }
+
+        fun keep<U>(value: U): U {
+            value
+        }
+
+        fun main() {
+            keep(make().unwrap_or(5));
+        }
+        "#,
+        "cannot infer 'T' for this call",
+    );
+}
+
 #[test]
 fn b188_a_path_head_is_not_an_under_supplied_application() {
     // `Option::None` and `List::new()` name a NAMESPACE to look a member up

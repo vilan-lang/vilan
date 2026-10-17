@@ -26,9 +26,30 @@ use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source,
 mod test_pool;
 
 fn std_spec() -> PackageSpec {
+    std_prefix_for_this_binary();
     vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
     )
+}
+
+/// std-prefix P5 (N157, Order 54): the docs gate's analyses build over the
+/// std prefix in the suite's world cache, as `inference`'s do
+/// (`tests/inference/support.rs`) — the fences are single files, the shape in
+/// which the prefix and the canonical path are one layout, and the gate's
+/// analyses then share each std closure's world in-process (P1) and across
+/// processes (the file). `VILAN_TEST_WORLD_CACHE=off` keeps it canonical.
+fn std_prefix_for_this_binary() {
+    static OPTED_IN: std::sync::Once = std::sync::Once::new();
+    OPTED_IN.call_once(|| {
+        let Some(directory) = std::env::var_os("VILAN_TEST_WORLD_CACHE") else {
+            return;
+        };
+        if directory.is_empty() || directory == "off" || directory == "0" {
+            return;
+        }
+        vilan_core::incremental::set_world_cache(Some(Some(PathBuf::from(directory))));
+        vilan_core::incremental::set_std_prefix(Some(true));
+    });
 }
 
 fn docs_root() -> PathBuf {

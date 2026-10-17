@@ -147,6 +147,19 @@ fn compare_state(
             "{label}: the loaded leg was not built over the prefix"
         ));
     }
+    // M158: the prefix key's checks record rides beside the world, written by
+    // the analysis that built it and inserted on load — so the loaded leg
+    // replays std's Class A checks rather than deriving them. Except where
+    // no analysis over the prefix key ever completes: an entry impl a stored
+    // module calls (B553) resolves the world once, after the entry walks, in
+    // another shape, so the record is never filed under the prefix key (and
+    // never read there either).
+    if !loaded.census.resolve_deferred && loaded.census.prefix_checks != Some("loaded") {
+        divergences.push(format!(
+            "{label}: the loaded leg did not load the prefix's checks record: {:?}",
+            loaded.census.prefix_checks
+        ));
+    }
     let clean = observe_fresh(&package, None, Leg::Clean);
     package.remove();
     for (other_name, other) in [("written", &written), ("loaded", &loaded)] {
@@ -336,6 +349,166 @@ fn a_damaged_or_foreign_file_is_a_miss_and_the_analysis_builds() {
     );
     assert_eq!(over_foreign.rendering, built.rendering);
     package.remove();
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// **M158**: the prefix key's checks record (`std.checks`, beside the world)
+/// damaged, truncated or another closure's is a miss of the RECORD alone:
+/// the world still loads, std's checks are derived as they were before the
+/// record existed, and the analysis answers exactly as the built one — and,
+/// having filed the record, writes it again, so the next process loads it.
+#[test]
+fn m158_a_damaged_or_foreign_checks_record_is_a_miss_of_the_record_alone() {
+    let cache = cache_directory("checks");
+    let fixture = &LEAF_FIXTURE;
+    let (_, files) = fixture.states().into_iter().next().expect("a base state");
+    let package = write_package("prefix_checks", fixture.platform, &files, &[]);
+    let built = observe_fresh(&package, None, Leg::Incremental);
+    assert!(
+        built.census.prefix_world,
+        "the leaf package takes the prefix"
+    );
+    let written = observe_fresh(&package, Some(cache.clone()), Leg::Incremental);
+    assert_eq!(written.census.prefix_file, Some("written"));
+    assert!(written.census.prefix_checks_written);
+    let loaded = observe_fresh(&package, Some(cache.clone()), Leg::Incremental);
+    assert_eq!(loaded.census.prefix_checks, Some("loaded"));
+    assert!(
+        loaded.census.records_replayed > 0 && written.census.records_replayed == 0,
+        "the loaded record replays std's checks (replayed {} over the record, {} building it)",
+        loaded.census.records_replayed,
+        written.census.records_replayed
+    );
+    assert_eq!(loaded.rendering, built.rendering);
+    assert_eq!(loaded.javascript, built.javascript);
+    let checks: Vec<PathBuf> = walk(&cache)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "std.checks"))
+        .collect();
+    assert_eq!(checks.len(), 1, "one checks record: {checks:?}");
+    let checks = &checks[0];
+    let whole = std::fs::read(checks).expect("read the record");
+    let other_files: Vec<(String, String)> = vec![(
+        "main.vl".to_string(),
+        "import std::time::now;\n\nfun main() {\n\tlet _ = now();\n}\n".to_string(),
+    )];
+    let other_package = write_package("prefix_checks_other", fixture.platform, &other_files, &[]);
+    let other = observe_fresh(&other_package, Some(cache.clone()), Leg::Incremental);
+    other_package.remove();
+    assert!(other.census.prefix_checks_written);
+    let foreign: Vec<PathBuf> = walk(&cache)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "std.checks") && path != checks)
+        .collect();
+    assert_eq!(foreign.len(), 1, "the other closure's record: {foreign:?}");
+    let foreign = std::fs::read(&foreign[0]).expect("read the other record");
+    for (damage, bytes, expected) in [
+        ("truncated", whole[..whole.len() / 2].to_vec(), "truncated"),
+        (
+            "corrupt",
+            {
+                let mut flipped = whole.clone();
+                let middle = flipped.len() / 2;
+                flipped[middle] ^= 0x55;
+                flipped
+            },
+            "corrupt",
+        ),
+        ("foreign", foreign, "foreign-key"),
+    ] {
+        std::fs::write(checks, &bytes).expect("damage the record");
+        let over_damage = observe_fresh(&package, Some(cache.clone()), Leg::Incremental);
+        assert_eq!(
+            over_damage.census.prefix_file,
+            Some("loaded"),
+            "a {damage} record leaves the world's file alone"
+        );
+        assert_eq!(
+            over_damage.census.prefix_checks,
+            Some(expected),
+            "a {damage} record is a miss of the record"
+        );
+        assert_eq!(
+            over_damage.census.records_replayed, 0,
+            "over a {damage} record"
+        );
+        assert!(
+            over_damage.census.prefix_checks_written,
+            "the analysis over a {damage} record writes it again"
+        );
+        assert_eq!(
+            over_damage.rendering, built.rendering,
+            "over a {damage} record"
+        );
+        assert_eq!(
+            over_damage.javascript, built.javascript,
+            "over a {damage} record"
+        );
+        let healed = observe_fresh(&package, Some(cache.clone()), Leg::Incremental);
+        assert_eq!(
+            healed.census.prefix_checks,
+            Some("loaded"),
+            "the rewritten record loads after a {damage} one"
+        );
+        assert_eq!(healed.rendering, built.rendering, "after a {damage} record");
+    }
+    package.remove();
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// **incr-54c's find (P5)**: a std namespace a program's import names
+/// (`std::web`, a directory with no body) is part of the prefix world —
+/// `namespace_only_modules` — so it is part of the prefix's KEY. Before the
+/// fix the closure skipped it, so a prefix built for a program that never
+/// named `std::web` was served to one that does, which then resolved
+/// `std::web::dmo` as the moved web prelude ("`std::web` moved to
+/// `std::web::prelude`") instead of a miss under the namespace — over the
+/// persisted file and over the in-process prefix alike.
+#[test]
+fn a_std_namespace_the_import_names_is_part_of_the_prefix_key() {
+    let cache = cache_directory("namespace");
+    let empty: Vec<(String, String)> = vec![("main.vl".to_string(), "fun main() {}\n".to_string())];
+    let dmo: Vec<(String, String)> = vec![(
+        "main.vl".to_string(),
+        "import std::web::dmo;\n\nfun main() {}\n".to_string(),
+    )];
+    let first = write_package("prefix_namespace_empty", Platform::default(), &empty, &[]);
+    let second = write_package("prefix_namespace_dmo", Platform::default(), &dmo, &[]);
+    let clean = observe_fresh(&second, None, Leg::Clean);
+    assert!(
+        clean
+            .rendering
+            .contains("cannot find 'dmo' in the imported path"),
+        "the canonical analysis misses `dmo` under the namespace: {}",
+        clean.rendering
+    );
+    // Over the persisted file the empty program wrote.
+    let written = observe_fresh(&first, Some(cache.clone()), Leg::Incremental);
+    assert_eq!(written.census.prefix_file, Some("written"));
+    let over_file = observe_fresh(&second, Some(cache.clone()), Leg::Incremental);
+    assert_eq!(
+        over_file.rendering, clean.rendering,
+        "over the empty program's file"
+    );
+    // Over the in-process prefix the empty program stored.
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::prefix_files_forget();
+    set_world_cache(Some(None));
+    set_std_prefix(Some(true));
+    let _ = observe(&first, Vec::new(), Leg::Incremental);
+    let in_process = observe(&second, Vec::new(), Leg::Incremental);
+    set_std_prefix(None);
+    set_world_cache(None);
+    assert!(
+        in_process.census.prefix_world,
+        "the program builds over the prefix"
+    );
+    assert_eq!(
+        in_process.rendering, clean.rendering,
+        "over the empty program's in-process prefix"
+    );
+    first.remove();
+    second.remove();
     let _ = std::fs::remove_dir_all(&cache);
 }
 

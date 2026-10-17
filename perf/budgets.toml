@@ -47,180 +47,180 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 253_309_219
-measured_at = "v0.50.0's seal"
+ceiling = 246_054_728
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 316_493_354
-measured_at = "v0.47.0's seal"
+ceiling = 307_292_719
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_330_572_454
-measured_at = "v0.51.0's seal"
+ceiling = 1_311_684_500
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_828_515_825
-measured_at = "v0.50.0's seal"
+ceiling = 2_713_464_567
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_449_723_044
-measured_at = "v0.51.0's seal"
+ceiling = 1_416_572_330
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_559_323_849
-measured_at = "v0.51.0's seal"
+ceiling = 1_463_358_948
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_117_145_554
-measured_at = "v0.51.0's seal"
+ceiling = 3_054_378_898
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_338_608_120
-measured_at = "v0.51.0's seal"
+ceiling = 1_319_862_769
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_571_179_502
-measured_at = "v0.51.0's seal"
+ceiling = 1_539_280_769
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_866_819_166
-measured_at = "v0.51.0's seal"
+ceiling = 3_697_041_969
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_992_720_534
-measured_at = "v0.51.0's seal"
+ceiling = 3_851_874_960
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 7_413_799_197
-measured_at = "v0.51.0's seal"
+ceiling = 7_143_071_807
+measured_at = "v0.52.0's seal"
 
 [[row]]
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 267_222_148
-measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
+ceiling = 260_077_866
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 331_406_296
-measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
+ceiling = 323_287_445
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_431_983_790
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 1_372_402_463
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_951_829_992
-measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
+ceiling = 2_835_535_459
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_597_123_616
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 1_477_623_205
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_730_363_917
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 1_526_402_468
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_591_690_202
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 3_187_994_729
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_437_544_701
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 1_379_069_413
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_837_079_174
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 1_607_419_678
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_421_353_089
-measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
+ceiling = 3_857_160_752
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_491_333_782
-measured_at = "v0.50.0's seal (ci rows from CI's perf job at 99b6013ed4)"
+ceiling = 4_017_955_112
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 8_056_352_548
-measured_at = "v0.48.0's seal (ci rows from CI's perf job at 68f25eb163)"
+ceiling = 7_433_236_819
+measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
 tolerance = 0.005
 
 [[growth]]
@@ -232,7 +232,7 @@ max_ratio = 2.3
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 2
+green_seals = 3
 blocking = true
 mandate = true
 
@@ -240,14 +240,14 @@ mandate = true
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 5
+green_seals = 6
 blocking = true
 
 [[e121]]
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 4
+green_seals = 5
 blocking = true
 series = "Order 52 (N174): the keystroke edit is unchanged; the Find References probe moved from `fun messages(self)` (gone from model.vl) to `fun global()`, the mirrored store reader, so that probe starts a new series."
 
@@ -255,8 +255,8 @@ series = "Order 52 (N174): the keystroke edit is unchanged; the Find References 
 scenario = "model.vl keystroke, importers open"
 metric = "cpu_ms"
 target_ms = 500
-green_seals = 1
-blocking = false
+green_seals = 2
+blocking = true
 
 [[e121]]
 scenario = "css keystroke"

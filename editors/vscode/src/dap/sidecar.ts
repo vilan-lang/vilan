@@ -24,6 +24,9 @@ export interface SidecarFrame {
     js?: string;
     /// The head's original place: `[sources index, line, column]`, 0-based.
     at?: [number, number, number];
+    /// The function's whole text: `[sources index, line, column, end line,
+    /// end column]`, 0-based, the end exclusive (E326).
+    span?: [number, number, number, number, number];
     bindings: SidecarBinding[];
 }
 
@@ -31,6 +34,9 @@ export interface SidecarFrame {
 export interface SidecarType {
     text: string;
     shape: string;
+    /// E323: the program's functions that print this type as `dbg` does (a
+    /// written `Debug` impl's printer, then its `debug`), first reachable wins.
+    debug?: string[];
     [field: string]: unknown;
 }
 
@@ -81,6 +87,33 @@ export class Sidecar {
             candidates = this.frames.filter((frame) => frame.kind === 'function' && frame.js === functionName);
         }
         return merge(candidates);
+    }
+
+    /// The record for an AWAITING frame of an async stack (E326), which names
+    /// its function but not where the function starts — only the place it
+    /// stands, `place`. A named function is found by its emitted name; an
+    /// anonymous one (a closure, an async `main`'s arrow, the script's top
+    /// level) is the innermost record whose text holds the place.
+    resolveAt(functionName: string, place: OriginalPosition | undefined): ResolvedFrame | undefined {
+        if (functionName) {
+            const named = this.frames.filter((frame) => frame.kind === 'function' && frame.js === functionName);
+            if (named.length > 0) {
+                return merge(named);
+            }
+        }
+        if (!place) {
+            return undefined;
+        }
+        const holding = this.frames.filter((frame) => frame.span !== undefined && holds(frame.span, place));
+        if (holding.length === 0) {
+            return undefined;
+        }
+        // Innermost: the text that starts last (texts nest, they never cross).
+        const innermost = holding.reduce((best, frame) =>
+            before(best.span as Span, frame.span as Span) ? frame : best,
+        );
+        const span = innermost.span as Span;
+        return merge(holding.filter((frame) => sameSpan(frame.span as Span, span)));
     }
 
     /// The text a binding's type reads as in a pane: `view i32`, `List<Point>`.
@@ -199,6 +232,28 @@ export function parsePath(expression: string): { root: string; segments: PathSeg
     return { root: head[0], segments };
 }
 
+type Span = [number, number, number, number, number];
+
+/// Whether `span` holds `place` (its source, and between its start and its end).
+function holds(span: Span, place: OriginalPosition): boolean {
+    const [source, line, column, endLine, endColumn] = span;
+    if (source !== place.source) {
+        return false;
+    }
+    const afterStart = place.line > line || (place.line === line && place.column >= column);
+    const beforeEnd = place.line < endLine || (place.line === endLine && place.column < endColumn);
+    return afterStart && beforeEnd;
+}
+
+/// Whether `outer` starts before `inner` does.
+function before(outer: Span, inner: Span): boolean {
+    return outer[1] < inner[1] || (outer[1] === inner[1] && outer[2] < inner[2]);
+}
+
+function sameSpan(left: Span, right: Span): boolean {
+    return left.every((value, index) => value === right[index]);
+}
+
 /// One record, or the rows several agree on: a binding keeps its type only
 /// where every record that lists it gives the same one.
 function merge(frames: SidecarFrame[]): ResolvedFrame | undefined {
@@ -236,6 +291,8 @@ function references(type: SidecarType): number[] {
             return [type.value as number];
         case 'map':
             return [type.key as number, type.value as number];
+        case 'object':
+            return ((type.impls as [string[], number][] | undefined) ?? []).map(([, concrete]) => concrete);
         default:
             return [];
     }
@@ -274,6 +331,13 @@ function renumbered(type: SidecarType, renumber: (type: number) => number): Side
             return { ...type, value: renumber(type.value as number) };
         case 'map':
             return { ...type, key: renumber(type.key as number), value: renumber(type.value as number) };
+        case 'object':
+            return type.impls === undefined
+                ? type
+                : {
+                      ...type,
+                      impls: (type.impls as [string[], number][]).map(([methods, concrete]) => [methods, renumber(concrete)]),
+                  };
         default:
             return type;
     }

@@ -29,6 +29,8 @@ mod lazy_tables;
 mod live_ranges;
 mod liveness;
 mod move_tables;
+mod r11_candidates;
+mod r11_records;
 mod row_families;
 mod written_types;
 
@@ -1112,6 +1114,19 @@ pub fn convention_mode(convention: Convention) -> Mode {
     }
 }
 
+/// Whether one of the branches' trailing expressions is `id` (B640).
+fn if_branch_trails_into(branch: &ExprIfBranch, id: Id) -> bool {
+    match branch {
+        ExprIfBranch::If(_, (_, trailing), next) => {
+            *trailing == id
+                || next
+                    .as_deref()
+                    .is_some_and(|next| if_branch_trails_into(next, id))
+        }
+        ExprIfBranch::Else((_, trailing)) => *trailing == id,
+    }
+}
+
 fn if_branch_has_final_else(branch: &ExprIfBranch) -> bool {
     match branch {
         ExprIfBranch::If(_, _, Some(next)) => if_branch_has_final_else(next),
@@ -1618,6 +1633,29 @@ enum PlaceStep {
     Element,
 }
 
+/// Whether one place path is a prefix of the other — the two places nest,
+/// so a write of either reaches the other (B639). Elements compare equal.
+fn paths_nest(left: &[PlaceStep], right: &[PlaceStep]) -> bool {
+    left.iter().zip(right).all(|(left, right)| left == right)
+}
+
+/// A write inside a later argument of a call that lends a place `&mut`
+/// (native-53's B?2, B639): the lent place's root re-bound whole, or the
+/// place written in place.
+#[derive(Clone, Copy)]
+enum LentWrite {
+    Rebind(Id),
+    InPlace(Id),
+}
+
+impl LentWrite {
+    fn id(self) -> Id {
+        match self {
+            LentWrite::Rebind(id) | LentWrite::InPlace(id) => id,
+        }
+    }
+}
+
 /// How far below its anchor place a view may point (B529).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AnchorDepth {
@@ -1935,6 +1973,7 @@ struct PlanArm {
 /// Which value a generic body would have to destroy and cannot (R11,
 /// destruction.md §6). One rule — "a generic body cannot destroy a `T`" — read
 /// at every place the drop planner can schedule a destruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum GenericLeak {
     /// An `own T` parameter still owned at the body's fall-through end: never
     /// moved out, so the caller's value has no destroyer.
@@ -1995,7 +2034,10 @@ impl MoveFlow {
 }
 
 /// One affine-rule violation (destruction.md §4), collected by the `&self` scan
-/// and rendered to a diagnostic by the `&mut self` driver.
+/// and rendered to a diagnostic by the `&mut self` driver. Recorded per R11
+/// instance (`r11_records.rs`): every field is an id or a span of the scanned
+/// body.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum ResourceMoveViolation {
     /// R1/R3/R4/R6: a resource binding used after it was moved. Primary at the
     /// use, note ("moved here") at the move site.
@@ -2123,9 +2165,9 @@ struct R11Instance {
 
 /// Candidate ids indexed by their source span, so a question about one
 /// region reads the candidates lexically inside it rather than every one in
-/// the program: R11's bindings, place expressions and `is` tests, sliced per
-/// instantiated callee (M94), and B457's calls, sliced per function and per
-/// loop (M96).
+/// the program: B457's calls, sliced per function and per loop (M96). (R11's
+/// bindings, places and `is` tests, M94's first use of it, are a row family
+/// since M155: `analyzer/r11_candidates.rs`.)
 ///
 /// A slice comes back in the order the candidates were handed in, which is
 /// what lets a reader that used to filter a whole map keep that map's
@@ -2135,35 +2177,25 @@ struct LexicalCandidates {
     /// Per source, `(start, end, position, id)` sorted by `start`, where
     /// `position` is the id's place in the order it was handed in.
     by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>>,
-    unplaced: Vec<Id>,
-    all: Vec<Id>,
 }
 
 impl LexicalCandidates {
     fn build(analyzer: &Analyzer<'_>, ids: impl Iterator<Item = Id>) -> Self {
         let mut by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>> = HashMap::default();
-        let mut unplaced = Vec::new();
-        let mut all = Vec::new();
         for (position, id) in ids.enumerate() {
-            all.push(id);
-            match (analyzer.source_of_id(id), analyzer.span_map.get(&id)) {
-                (Some(source), Some(span)) => {
-                    by_source
-                        .entry(source)
-                        .or_default()
-                        .push((span.start, span.end, position, id));
-                }
-                _ => unplaced.push(id),
+            if let (Some(source), Some(span)) =
+                (analyzer.source_of_id(id), analyzer.span_map.get(&id))
+            {
+                by_source
+                    .entry(source)
+                    .or_default()
+                    .push((span.start, span.end, position, id));
             }
         }
         for entries in by_source.values_mut() {
             entries.sort_unstable_by_key(|(start, _, position, _)| (*start, *position));
         }
-        LexicalCandidates {
-            by_source,
-            unplaced,
-            all,
-        }
+        LexicalCandidates { by_source }
     }
 
     /// The PLACED candidates whose span lies inside `start..end` of `source`,
@@ -2182,23 +2214,17 @@ impl LexicalCandidates {
         inside.sort_unstable_by_key(|(position, _)| *position);
         inside.into_iter().map(|(_, id)| id).collect()
     }
+}
 
-    /// R11's slice (M94): the candidates inside `callee`'s declaration span,
-    /// plus every candidate the index could not place — and every candidate
-    /// at all when the callee itself cannot be placed. Both widen the slice
-    /// back toward the whole-program set R11's readers were always correct
-    /// over, so a missing span costs time, never an answer.
-    fn within(&self, analyzer: &Analyzer<'_>, callee: Id) -> Vec<Id> {
-        let (Some(source), Some(span)) = (
-            analyzer.source_of_id(callee),
-            analyzer.span_map.get(&callee),
-        ) else {
-            return self.all.clone();
-        };
-        let mut within = self.unplaced.clone();
-        within.extend(self.inside(source, span.start, span.end));
-        within
-    }
+/// What one instance's live scan answers (R11 door B): the record of its
+/// verdicts, and what the live path keeps in hand where a replay re-reads it
+/// from the record's ids — the propagation edges with the callee and
+/// resources each instantiates, and the container check's sites with their
+/// types and spans.
+struct R11LiveScan {
+    record: r11_records::R11InstanceRecord,
+    edges: Vec<(Id, Id, Vec<TypeId>)>,
+    typed_sites: Vec<(Id, TypeId, Span)>,
 }
 
 /// How an [`R11Instance`] was reached (B463).
@@ -4346,6 +4372,23 @@ pub struct Analyzer<'src> {
     /// files no move rows); and the fold, read by R11 and the drop plan.
     move_rows_live: move_tables::MoveRows,
     move_rows_filed: bool,
+    /// M155: the live lane's R11 candidate rows, and whether this analysis
+    /// derived them (it met an instantiation).
+    r11_rows_live: r11_candidates::CandidateRows,
+    r11_rows_filed: bool,
+    /// R11 door B (`r11_records.rs`): the world's instance records served to
+    /// this analysis (a hit's), whether it FILES the instances it scans (a
+    /// seeded analysis with a key), the records it derived, and the sources
+    /// cold for it — M110 S3's cold set, sealed before the checks so the
+    /// pass can ask it of a callee.
+    #[serde(skip)]
+    r11_records_served: Option<std::sync::Arc<r11_records::R11Records>>,
+    #[serde(skip)]
+    r11_records_filing: bool,
+    #[serde(skip)]
+    r11_records_derived: Vec<(r11_records::R11InstanceKey, r11_records::R11InstanceRecord)>,
+    #[serde(skip)]
+    r11_cold_sources: Vec<SourceId>,
     move_sets: Option<move_tables::MoveSets>,
     /// M150: the live lane's lazy-argument and HMR-site contributions
     /// (`lazy_tables.rs`), and whether each pass derived them.
@@ -7995,6 +8038,12 @@ impl<'src> Analyzer<'src> {
             partial_move_roots: HashMap::default(),
             move_rows_live: move_tables::MoveRows::default(),
             move_rows_filed: false,
+            r11_rows_live: r11_candidates::CandidateRows::default(),
+            r11_rows_filed: false,
+            r11_records_served: None,
+            r11_records_filing: false,
+            r11_records_derived: Vec::new(),
+            r11_cold_sources: Vec::new(),
             move_sets: None,
             lazy_rows_live: lazy_tables::LazyRows::default(),
             lazy_rows_filed: false,
@@ -9893,18 +9942,28 @@ impl<'src> Analyzer<'src> {
                     };
                 // array-lengths.md §5.2: a LENGTH nothing binds is the same
                 // refusal, and its explicit form is a number (`zeros<4>()`).
+                // B642: the fix-its spell the call as it was written — a
+                // method call keeps its receiver (`numbers.to_array<4>()`).
                 let message = match self.length_parameters.contains(&constraint_id) {
-                    true => format!(
-                        "cannot infer the length '{generic_label}' for this call: {why}. Write \
-                         it — on the binding the result lands in (`let value: [_; 4] = …`), \
-                         as the call's argument (`{member}<4>(…)`), or ascribe the call"
-                    ),
-                    false => format!(
-                        "cannot infer '{generic_label}' for this call: {why}. Write the type — on \
-                         the binding the result lands in (`let value: … = …`), as the call's \
-                         type argument (`{member}<…>(…)`), or ascribe the call \
-                         (`{member}(…) as …`)"
-                    ),
+                    true => {
+                        let length_argument = self.written_call_form(call_id, member, "<4>");
+                        format!(
+                            "cannot infer the length '{generic_label}' for this call: {why}. \
+                             Write it — on the binding the result lands in (`let value: [_; 4] \
+                             = …`), as the call's argument (`{length_argument}`), or ascribe the \
+                             call"
+                        )
+                    }
+                    false => {
+                        let type_argument = self.written_call_form(call_id, member, "<…>");
+                        let ascribed = self.written_call_form(call_id, member, "");
+                        format!(
+                            "cannot infer '{generic_label}' for this call: {why}. Write the type \
+                             — on the binding the result lands in (`let value: … = …`), as the \
+                             call's type argument (`{type_argument}`), or ascribe the call \
+                             (`{ascribed} as …`)"
+                        )
+                    }
                 };
                 errors.push((
                     call_id,
@@ -19549,168 +19608,282 @@ impl<'src> Analyzer<'src> {
         // callee's own body and the closures lexical to it, so an instance
         // slices out the candidates inside the callee's declaration instead
         // of re-classifying the whole program — which, with `Flow`/`Pipe` as
-        // `[resource]` traits, made R11 O(instances × program).
+        // `[resource]` traits, made R11 O(instances × program). M155: the
+        // indexes are folded from per-region rows (`r11_candidates.rs`) —
+        // restored for a reused module or served item, walked for the live
+        // lane — rather than swept from the whole program.
         struct R11Sets {
             loaned_captures: HashMap<Id, Id>,
             value_crossings: HashSet<Id>,
-            binding_candidates: LexicalCandidates,
-            place_candidates: LexicalCandidates,
-            test_candidates: LexicalCandidates,
+            candidates: r11_candidates::R11Candidates,
         }
         let mut sets: Option<R11Sets> = None;
 
+        // R11 door B (`r11_records.rs`): the world's instance records, served
+        // and filed. An instance whose callee is COLD and whose key has a
+        // record with the current `Drop` digest is EMITTED from the record at
+        // this reporting site and its edges re-discovered — scanning nothing,
+        // building no set; every other instance is scanned live, as before,
+        // and filed when its callee is cold. The worklist above and below is
+        // unchanged, so WHO reports stays what a clean analysis reports.
+        let replay = self.r11_replay_context();
+        let mut instances_served: u64 = 0;
+        let mut instances_scanned: u64 = 0;
+
         while let Some(instance) = worklist.pop_front() {
-            if sets.is_none() {
-                sets = Some(R11Sets {
-                    // M149: the move scan's fold when it ran — the same
-                    // whole-program sets, restored and live.
-                    loaned_captures: match &self.move_sets {
-                        Some(sets) => sets.loaned.clone(),
-                        None => self.collect_loaned_pattern_captures(),
-                    },
-                    value_crossings: match &self.move_sets {
-                        Some(sets) => sets.crossings.clone(),
-                        None => self.compute_return_value_crossings(&|_| true),
-                    },
-                    binding_candidates: LexicalCandidates::build(
-                        self,
-                        self.variables
-                            .values()
-                            .map(|variable| variable.id)
-                            .chain(self.parameters.values().map(|parameter| parameter.id)),
-                    ),
-                    place_candidates: LexicalCandidates::build(
-                        self,
-                        self.expr_id_to_expr_map
-                            .iter()
-                            .filter(|(_, expr)| {
-                                matches!(
-                                    expr,
-                                    Expr::Local(_)
-                                        | Expr::Field(_, _, _)
-                                        | Expr::TupleIndex(_, _, _)
-                                        | Expr::Index(_, _)
-                                )
-                            })
-                            .map(|(id, _)| *id),
-                    ),
-                    test_candidates: LexicalCandidates::build(
-                        self,
-                        self.expr_id_to_expr_map
-                            .iter()
-                            .filter(|(_, expr)| matches!(expr, Expr::Is(..)))
-                            .map(|(id, _)| *id),
-                    ),
-                });
-                crate::phase_pass_mark("R11: the whole-program sets");
-            }
-            let R11Sets {
-                loaned_captures,
-                value_crossings,
-                binding_candidates,
-                place_candidates,
-                test_candidates,
-            } = sets.as_ref().expect("built above");
             let resources: HashSet<TypeId> = instance.resources.iter().copied().collect();
-            // Delta classification: only the places whose resource-ness is CAUSED
-            // by this instantiation (resource under the parameter set, but not
-            // without it). A place that is a resource regardless — a concrete
-            // resource written into the generic body — is chunk 3's, already
-            // checked with its own in-body span; re-checking it here would
-            // double-report at the instantiation site.
-            let mut memo: HashMap<TypeId, bool> = HashMap::default();
-            let resource_bindings = self.collect_instantiation_bindings(
-                &binding_candidates.within(self, instance.callee),
-                &resources,
-                &mut memo,
-            );
-            let resource_value_places = self.collect_instantiation_value_places(
-                &place_candidates.within(self, instance.callee),
-                &resources,
-                &mut memo,
-            );
-            // Per instantiation: `Option<T>`'s `None` is payload-free at every
-            // instantiation, but a variant carrying `T` is a resource only at
-            // this one, so the refinement is recomputed under the delta set.
-            let is_refinements = self.collect_is_refinements(
-                Some(&test_candidates.within(self, instance.callee)),
-                &resources,
-                &mut memo,
-            );
-            let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
-            // B469: a field move out of an owned aggregate is a destructure when
-            // the aggregate has no `Drop` anywhere inside at THIS instantiation
-            // — so the question is asked with what the instantiation binds.
-            let known_instantiation = self.r11_instantiation_types(&instance);
-            let no_module_level: HashSet<Id> = HashSet::default();
-            let partial_move_roots = self.collect_partial_move_roots(
-                &resource_value_places,
-                &no_module_level,
-                loaned_captures,
-                &known_instantiation,
-            );
-            let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
-            let violations = {
-                // A generic body's bindings are all in-body (parameters / locals);
-                // module-level resources never enter its delta set, so the loan-only
-                // corollary is inert here.
-                let scan = MoveScan {
-                    resource_bindings: &resource_bindings,
-                    resource_value_places: &resource_value_places,
-                    module_level_bindings: &no_module_level,
-                    loaned_captures,
-                    is_refinements: &is_refinements,
-                    value_crossings,
-                    partial_move_roots: &partial_move_roots,
-                    dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
-                };
-                self.scan_instantiated_body(instance.callee, &closures, &scan)
+            let served = match &replay {
+                Some(context) => self.r11_served_record(&instance, context),
+                None => None,
             };
-            self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
-            let body_is_move_clean = violations.is_empty();
-            let reported_before = self.diagnostics.len();
-            match instance.site {
-                R11Site::Call => {
-                    self.emit_r11_violations(instance.callee, instance.call_id, violations)
+            // A live scan answers its edges with the callee and resources
+            // each instantiates, asked once; a record keeps the calls alone
+            // and replay re-asks them (a few memoized type questions each).
+            let (verdict, scanned_live, live_edges, typed_sites) = match served {
+                Some(record) => {
+                    instances_served += 1;
+                    let typed_sites = self.r11_typed_container_sites(&record.container_sites);
+                    (record, false, Vec::new(), typed_sites)
                 }
-                R11Site::Admission => self.emit_inherited_default_violations(&instance, violations),
-            }
-            self.check_own_generic_exactly_once(
-                &instance,
-                &resource_bindings,
-                &resource_value_places,
-                &partial_move_roots,
-                body_is_move_clean,
-            );
-            self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
-            self.check_instantiation_container_resources(&instance, &body_exprs);
-            // B344, LAST and only when this instantiation is otherwise clean.
-            // Every sibling above reports the SAME instantiation, and a body
-            // that already fails R11 fails it for a reason the author can act
-            // on — `Option::unwrap_or` at a resource is "the loaned parameter
-            // `fallback` is moved out", whose steer is `unwrap_or_else`, and
-            // "drop the `lazy`" is not advice a caller of std can take. One
-            // diagnostic per root cause (B5): the lazy rule speaks where
-            // nothing else did, which is the whole of what B344 closed — a
-            // generic whose body never READS the lazy parameter is move-clean,
-            // so R11 has nothing to say and the thunk owns the resource anyway.
-            if self.diagnostics.len() == reported_before {
-                self.check_lazy_parameters_at_instantiation(&instance, &resources, &mut memo);
-            }
+                None => {
+                    instances_scanned += 1;
+                    if sets.is_none() {
+                        let live = self.live_r11_candidate_rows();
+                        let candidates = self.fold_r11_candidates(&live);
+                        if !crate::macros::in_macro_world() {
+                            let walked = live.len() as u64;
+                            crate::incremental::update_census(|census| {
+                                census.r11_rows_live += walked
+                            });
+                        }
+                        self.r11_rows_live = live;
+                        self.r11_rows_filed = true;
+                        sets = Some(R11Sets {
+                            // M149: the move scan's fold when it ran — the same
+                            // whole-program sets, restored and live.
+                            loaned_captures: match &self.move_sets {
+                                Some(sets) => sets.loaned.clone(),
+                                None => self.collect_loaned_pattern_captures(),
+                            },
+                            value_crossings: match &self.move_sets {
+                                Some(sets) => sets.crossings.clone(),
+                                None => self.compute_return_value_crossings(&|_| true),
+                            },
+                            candidates,
+                        });
+                        crate::phase_pass_mark("R11: the whole-program sets");
+                    }
+                    let R11Sets {
+                        loaned_captures,
+                        value_crossings,
+                        candidates,
+                    } = sets.as_ref().expect("built above");
+                    let scan = self.r11_scan_instance(
+                        &instance,
+                        &resources,
+                        loaned_captures,
+                        value_crossings,
+                        candidates,
+                    );
+                    (scan.record, true, scan.edges, scan.typed_sites)
+                }
+            };
+            self.r11_emit_verdict(&instance, &verdict, &typed_sites);
 
             // Propagate: the callee's own calls, now under ITS resource
             // parameters — a call passing `T` on to another generic instantiates
-            // that generic at a resource too (the indirect case).
-            let mut propagate_memo: HashMap<TypeId, bool> = HashMap::default();
-            for call_id in calls {
-                self.r11_discover(
-                    call_id,
-                    &resources,
-                    &mut propagate_memo,
-                    &mut worklist,
-                    &mut enqueued,
-                );
+            // that generic at a resource too (the indirect case). A record
+            // names the calls that did; a live scan asked every body call and
+            // kept those, with their answers.
+            if scanned_live {
+                for (call_id, callee, child_resources) in live_edges {
+                    Self::r11_enqueue(
+                        callee,
+                        child_resources,
+                        call_id,
+                        &mut worklist,
+                        &mut enqueued,
+                    );
+                }
+            } else {
+                let mut propagate_memo: HashMap<TypeId, bool> = HashMap::default();
+                for call_id in &verdict.edges {
+                    if let Some((callee, child_resources)) =
+                        self.r11_edge(*call_id, &resources, &mut propagate_memo)
+                    {
+                        Self::r11_enqueue(
+                            callee,
+                            child_resources,
+                            *call_id,
+                            &mut worklist,
+                            &mut enqueued,
+                        );
+                    }
+                }
             }
+            if scanned_live && let Some(context) = &replay {
+                self.r11_file_record(&instance, context, verdict);
+            }
+        }
+        if !crate::macros::in_macro_world() && instances_served + instances_scanned > 0 {
+            let filed = self.r11_records_derived.len() as u64;
+            crate::incremental::update_census(|census| {
+                census.r11_instances_served += instances_served;
+                census.r11_instances_scanned += instances_scanned;
+                census.r11_records_filed += filed;
+            });
+        }
+    }
+
+    /// One instance's live scan (R11 door B's "derive" half): the delta
+    /// classification over the callee's slices, the affine scan, and the
+    /// sibling verdicts as their emitters split them — everything a record
+    /// of this instance holds, nothing emitted — and beside it what the live
+    /// path keeps in hand and a record re-reads: the edges with their answers
+    /// and the container sites with their types.
+    fn r11_scan_instance(
+        &mut self,
+        instance: &R11Instance,
+        resources: &HashSet<TypeId>,
+        loaned_captures: &HashMap<Id, Id>,
+        value_crossings: &HashSet<Id>,
+        candidates: &r11_candidates::R11Candidates,
+    ) -> R11LiveScan {
+        // Delta classification: only the places whose resource-ness is CAUSED
+        // by this instantiation (resource under the parameter set, but not
+        // without it). A place that is a resource regardless — a concrete
+        // resource written into the generic body — is chunk 3's, already
+        // checked with its own in-body span; re-checking it here would
+        // double-report at the instantiation site.
+        let mut memo: HashMap<TypeId, bool> = HashMap::default();
+        let resource_bindings = self.collect_instantiation_bindings(
+            &r11_candidates::R11Candidates::within(&candidates.bindings, self, instance.callee),
+            resources,
+            &mut memo,
+        );
+        let resource_value_places = self.collect_instantiation_value_places(
+            &r11_candidates::R11Candidates::within(&candidates.places, self, instance.callee),
+            resources,
+            &mut memo,
+        );
+        // Per instantiation: `Option<T>`'s `None` is payload-free at every
+        // instantiation, but a variant carrying `T` is a resource only at
+        // this one, so the refinement is recomputed under the delta set.
+        let is_refinements = self.collect_is_refinements(
+            Some(&r11_candidates::R11Candidates::within(
+                &candidates.tests,
+                self,
+                instance.callee,
+            )),
+            resources,
+            &mut memo,
+        );
+        let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
+        // B469: a field move out of an owned aggregate is a destructure when
+        // the aggregate has no `Drop` anywhere inside at THIS instantiation
+        // — so the question is asked with what the instantiation binds.
+        let known_instantiation = self.r11_instantiation_types(instance);
+        let no_module_level: HashSet<Id> = HashSet::default();
+        let partial_move_roots = self.collect_partial_move_roots(
+            &resource_value_places,
+            &no_module_level,
+            loaned_captures,
+            &known_instantiation,
+        );
+        let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
+        let violations = {
+            // A generic body's bindings are all in-body (parameters / locals);
+            // module-level resources never enter its delta set, so the loan-only
+            // corollary is inert here.
+            let scan = MoveScan {
+                resource_bindings: &resource_bindings,
+                resource_value_places: &resource_value_places,
+                module_level_bindings: &no_module_level,
+                loaned_captures,
+                is_refinements: &is_refinements,
+                value_crossings,
+                partial_move_roots: &partial_move_roots,
+                dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
+            };
+            self.scan_instantiated_body(instance.callee, &closures, &scan)
+        };
+        self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
+        let body_is_move_clean = violations.is_empty();
+        let leaks = self.generic_leaks(
+            instance,
+            &resource_bindings,
+            &resource_value_places,
+            &partial_move_roots,
+            body_is_move_clean,
+        );
+        let drop_forwards = self.generic_drop_forwards(&calls, resources, &mut memo);
+        let typed_sites = self.container_sites(instance.callee, &body_exprs);
+        let container_sites: Vec<Id> = typed_sites.iter().map(|(id, ..)| *id).collect();
+        let lazy_offenses = self.lazy_parameter_offenses(instance, resources, &mut memo);
+        let mut edge_memo: HashMap<TypeId, bool> = HashMap::default();
+        let live_edges: Vec<(Id, Id, Vec<TypeId>)> = calls
+            .into_iter()
+            .filter_map(|call_id| {
+                self.r11_edge(call_id, resources, &mut edge_memo)
+                    .map(|(callee, child_resources)| (call_id, callee, child_resources))
+            })
+            .collect();
+        let edges: Vec<Id> = live_edges.iter().map(|(call_id, ..)| *call_id).collect();
+        let record = r11_records::R11InstanceRecord {
+            drop_digest: 0,
+            violations,
+            leaks,
+            drop_forwards,
+            container_sites,
+            lazy_offenses,
+            edges,
+        };
+        R11LiveScan {
+            record,
+            edges: live_edges,
+            typed_sites,
+        }
+    }
+
+    /// One instance's verdicts spoken at ITS reporting site, in the order the
+    /// pass always spoke them: the affine violations, the exactly-once leaks,
+    /// the `drop` forwards, the container check (asked live of the reporting
+    /// call's bindings over the recorded sites), and B344's lazy rule LAST
+    /// and only when nothing else spoke. Every sibling reports the SAME
+    /// instantiation, and a body that already fails R11 fails it for a
+    /// reason the author can act on — `Option::unwrap_or` at a resource is
+    /// "the loaned parameter `fallback` is moved out", whose steer is
+    /// `unwrap_or_else`, and "drop the `lazy`" is not advice a caller of std
+    /// can take. One diagnostic per root cause (B5): the lazy rule speaks
+    /// where nothing else did, which is the whole of what B344 closed — a
+    /// generic whose body never READS the lazy parameter is move-clean, so
+    /// R11 has nothing to say and the thunk owns the resource anyway.
+    fn r11_emit_verdict(
+        &mut self,
+        instance: &R11Instance,
+        verdict: &r11_records::R11InstanceRecord,
+        typed_sites: &[(Id, TypeId, Span)],
+    ) {
+        let reported_before = self.diagnostics.len();
+        match instance.site {
+            R11Site::Call => self.emit_r11_violations(
+                instance.callee,
+                instance.call_id,
+                verdict.violations.clone(),
+            ),
+            R11Site::Admission => {
+                self.emit_inherited_default_violations(instance, verdict.violations.clone())
+            }
+        }
+        for (note_anchor, binding, leak) in &verdict.leaks {
+            self.emit_generic_leak(instance, *note_anchor, *binding, *leak);
+        }
+        for call_id in &verdict.drop_forwards {
+            self.emit_generic_drop_forward(instance, *call_id);
+        }
+        self.check_instantiation_container_resources(instance, typed_sites);
+        if self.diagnostics.len() == reported_before {
+            self.emit_lazy_offenses(instance, &verdict.lazy_offenses);
         }
     }
 
@@ -19746,20 +19919,26 @@ impl<'src> Analyzer<'src> {
     /// concrete code. The set is per-instantiation because the question is: it
     /// asks the DELTA place set, so a concrete resource overwritten inside a
     /// generic body stays chunk 3's report with its own in-body span.
-    fn check_own_generic_exactly_once(
+    ///
+    /// Answers the leaks — `(note anchor, binding, kind)` in emission order —
+    /// rather than emitting them: R11 door B records them per instance
+    /// (`r11_records.rs`) and `r11_emit_verdict` speaks them at the
+    /// reporting site.
+    fn generic_leaks(
         &mut self,
         instance: &R11Instance,
         resource_bindings: &HashSet<Id>,
         resource_value_places: &HashSet<Id>,
         partial_move_roots: &HashMap<Id, Id>,
         body_is_move_clean: bool,
-    ) {
+    ) -> Vec<(Id, Id, GenericLeak)> {
+        let mut leaks: Vec<(Id, Id, GenericLeak)> = Vec::new();
         if Some(instance.callee) == self.drop_fn_id {
-            return;
+            return leaks;
         }
         let (own_params, statements, tail) = {
             let Some(function) = self.functions.get(&instance.callee) else {
-                return;
+                return leaks;
             };
             let own_params: Vec<Id> = function
                 .parameters
@@ -19816,7 +19995,7 @@ impl<'src> Analyzer<'src> {
         );
         for parameter in &own_params {
             if owned.contains(parameter) {
-                self.emit_generic_leak(instance, *parameter, *parameter, GenericLeak::OwnParameter);
+                leaks.push((*parameter, *parameter, GenericLeak::OwnParameter));
             }
         }
         // B66: the SAME question, asked of every other value the body would have
@@ -19829,7 +20008,7 @@ impl<'src> Analyzer<'src> {
         // clean: the match consumes `o`, so the parameter passes, and the
         // capture leaks.
         if !body_is_move_clean {
-            return;
+            return leaks;
         }
         // Sorted by span (C1: deterministic order; both sets are HashSets).
         let mut leaked: Vec<(Id, Id, GenericLeak)> = plan
@@ -19859,9 +20038,8 @@ impl<'src> Analyzer<'src> {
             let span = **self.span_map.get(note_anchor).unwrap_or(&&EMPTY_SPAN);
             (span.start, span.end)
         });
-        for (note_anchor, binding, leak) in leaked {
-            self.emit_generic_leak(instance, note_anchor, binding, leak);
-        }
+        leaks.extend(leaked);
+        leaks
     }
 
     /// The R11 exactly-once diagnostic: primary at the instantiation site, note at
@@ -19973,10 +20151,16 @@ impl<'src> Analyzer<'src> {
     /// report it once per instantiation site. Deduplicated against the
     /// whole-program report too (`reported_container_structures`), so the caller
     /// that binds its own `List<Guard>` and passes it in is told once.
+    ///
+    /// Asked of the REPORTING call at replay too (R11 door B): the sites are
+    /// the record's ([`Self::container_sites`]), the substitution is the
+    /// current call's, and the dedup set is this analysis's — so a record
+    /// served at a different first-enqueuing call substitutes that call's
+    /// types, as a clean analysis would.
     fn check_instantiation_container_resources(
         &mut self,
         instance: &R11Instance,
-        body_exprs: &HashSet<Id>,
+        sites: &[(Id, TypeId, Span)],
     ) {
         let containers = self.resource_rejecting_containers();
         if containers.is_empty() {
@@ -19985,27 +20169,6 @@ impl<'src> Analyzer<'src> {
         let bindings = self.r11_call_type_bindings(instance.call_id, instance.callee);
         let (constraints, bounds): (Vec<TypeId>, Vec<TypeId>) = bindings.into_iter().unzip();
         let context = Self::instantiation_context(&constraints, &bounds);
-        // The body's own typed sites: the parameters it declares and the
-        // bindings it introduces. Span-sorted so the earliest in-body site is
-        // the one the note points at (C1, determinism).
-        let mut sites: Vec<(Id, TypeId, Span)> = Vec::new();
-        if let Some(function) = self.functions.get(&instance.callee) {
-            for parameter_id in function.parameters.clone() {
-                if let Some(parameter) = self.parameters.get(&parameter_id)
-                    && let Some(span) = self.span_map.get(&parameter_id)
-                {
-                    sites.push((parameter_id, parameter.type_id, **span));
-                }
-            }
-        }
-        for expr_id in body_exprs {
-            if let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(expr_id)
-                && let Some(variable) = self.variables.get(variable_id)
-            {
-                sites.push((variable.id, variable.type_id, variable.name_span));
-            }
-        }
-        sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
         let call_span = self.r11_site_span(instance);
         // The primary is the INSTANTIATION, so it belongs to the caller's file —
         // which is not the entry when the instantiating code was imported (B112).
@@ -20031,7 +20194,7 @@ impl<'src> Analyzer<'src> {
             &mut memo,
         );
         let mut examined: HashSet<TypeId> = HashSet::default();
-        for (_, type_id, body_span) in sites {
+        for &(_, type_id, body_span) in sites {
             if !examined.insert(type_id) {
                 continue;
             }
@@ -20077,6 +20240,51 @@ impl<'src> Analyzer<'src> {
                 Some((callee_name, body_span, instance.callee)),
             );
         }
+    }
+
+    /// The body's own typed sites the container check substitutes into: the
+    /// parameters the callee declares and the bindings its body introduces,
+    /// span-sorted so the earliest in-body site is the one the note points at
+    /// (C1, determinism). Ids alone — an R11 record keeps them, and
+    /// [`Self::check_instantiation_container_resources`] re-reads the types.
+    fn container_sites(&self, callee: Id, body_exprs: &HashSet<Id>) -> Vec<(Id, TypeId, Span)> {
+        let mut sites: Vec<(Id, TypeId, Span)> = Vec::new();
+        if let Some(function) = self.functions.get(&callee) {
+            for parameter_id in &function.parameters {
+                if let Some(parameter) = self.parameters.get(parameter_id)
+                    && let Some(span) = self.span_map.get(parameter_id)
+                {
+                    sites.push((*parameter_id, parameter.type_id, **span));
+                }
+            }
+        }
+        for expr_id in body_exprs {
+            if let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(expr_id)
+                && let Some(variable) = self.variables.get(variable_id)
+            {
+                sites.push((variable.id, variable.type_id, variable.name_span));
+            }
+        }
+        sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
+        sites
+    }
+
+    /// A record's container sites with their types and spans re-read from
+    /// the callee's own tables (R11 door B's replay; a record carries the
+    /// ids alone).
+    fn r11_typed_container_sites(&self, sites: &[Id]) -> Vec<(Id, TypeId, Span)> {
+        sites
+            .iter()
+            .filter_map(|site| {
+                if let Some(parameter) = self.parameters.get(site) {
+                    let span = self.span_map.get(site)?;
+                    Some((*site, parameter.type_id, **span))
+                } else {
+                    let variable = self.variables.get(site)?;
+                    Some((variable.id, variable.type_id, variable.name_span))
+                }
+            })
+            .collect()
     }
 
     /// The callee's own generic parameters that a REFUSED-AND-REPORTED
@@ -20175,17 +20383,19 @@ impl<'src> Analyzer<'src> {
     }
 
     /// the instantiation site, like the other R11 diagnostics.
-    fn check_generic_drop_forwarding(
+    ///
+    /// Answers the offending `drop` calls rather than emitting them: R11 door
+    /// B records them per instance and `r11_emit_verdict` speaks them.
+    fn generic_drop_forwards(
         &mut self,
-        instance: &R11Instance,
         calls: &[Id],
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
-    ) {
-        if self.drop_fn_id.is_none() {
-            return;
-        }
+    ) -> Vec<Id> {
         let mut offending: Vec<Id> = Vec::new();
+        if self.drop_fn_id.is_none() {
+            return offending;
+        }
         for &call_id in calls {
             let Some(argument_id) = self.drop_sink_argument_of(call_id) else {
                 continue;
@@ -20199,9 +20409,7 @@ impl<'src> Analyzer<'src> {
                 offending.push(call_id);
             }
         }
-        for call_id in offending {
-            self.emit_generic_drop_forward(instance, call_id);
-        }
+        offending
     }
 
     /// B344: lazy.md §1's **data only** rule, asked at the INSTANTIATION.
@@ -20223,17 +20431,24 @@ impl<'src> Analyzer<'src> {
     /// siblings': a parameter that is a resource without this instantiation is
     /// the declaration check's, already reported at its own span, so re-reporting
     /// it here would double-report one mistake at two places (B5).
-    fn check_lazy_parameters_at_instantiation(
+    ///
+    /// Split in two for R11 door B: the OFFENSES — the callee's `lazy`
+    /// parameters that are resources under this instantiation's delta — are a
+    /// fact of the body and the resource set, recorded per instance; whether
+    /// the reporting call already spoke for a position
+    /// ([`Self::lazy_position_spoken_for_at`]) is the call's, asked at
+    /// emission ([`Self::emit_lazy_offenses`]).
+    fn lazy_parameter_offenses(
         &mut self,
         instance: &R11Instance,
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
-    ) {
+    ) -> Vec<(usize, Id)> {
         let parameters: Vec<Id> = match self.functions.get(&instance.callee) {
             Some(function) => function.parameters.clone(),
-            None => return,
+            None => return Vec::new(),
         };
-        let lazy_parameters: Vec<(usize, Id, &'src str, TypeId)> = parameters
+        let lazy_parameters: Vec<(usize, Id, TypeId)> = parameters
             .iter()
             .enumerate()
             .filter_map(|(position, parameter_id)| {
@@ -20242,20 +20457,35 @@ impl<'src> Analyzer<'src> {
                     .map(|parameter| (position, parameter))
             })
             .filter(|(_, parameter)| parameter.lazy)
-            .map(|(position, parameter)| {
-                (position, parameter.id, parameter.name, parameter.type_id)
-            })
+            .map(|(position, parameter)| (position, parameter.id, parameter.type_id))
             .collect();
-        for (position, parameter_id, name, type_id) in lazy_parameters {
+        let mut offenses: Vec<(usize, Id)> = Vec::new();
+        for (position, parameter_id, type_id) in lazy_parameters {
             if !self.type_is_resource_with(type_id, resources, memo) {
                 continue;
             }
             if self.type_is_resource(type_id) {
                 continue;
             }
+            offenses.push((position, parameter_id));
+        }
+        offenses
+    }
+
+    /// B344's offenses spoken at the instance's reporting call, each unless
+    /// the value the caller wrote in that position is already refused.
+    fn emit_lazy_offenses(&mut self, instance: &R11Instance, offenses: &[(usize, Id)]) {
+        for &(position, parameter_id) in offenses {
             if self.lazy_position_spoken_for_at(instance.call_id, position) {
                 continue;
             }
+            let Some((name, type_id)) = self
+                .parameters
+                .get(&parameter_id)
+                .map(|parameter| (parameter.name, parameter.type_id))
+            else {
+                continue;
+            };
             self.emit_lazy_parameter_instantiation(instance, parameter_id, name, type_id);
         }
     }
@@ -20557,22 +20787,27 @@ impl<'src> Analyzer<'src> {
         worklist: &mut VecDeque<R11Instance>,
         enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
     ) {
-        if let Some((callee, receiver, self_marker)) = self.r11_inherited_default_call(call_id) {
-            if self.type_is_resource_with(receiver, current_resources, memo)
-                && enqueued.insert((callee, vec![self_marker]))
-            {
-                worklist.push_back(R11Instance {
-                    callee,
-                    resources: vec![self_marker],
-                    call_id,
-                    site: R11Site::Call,
-                });
-            }
-            return;
+        if let Some((callee, resources)) = self.r11_edge(call_id, current_resources, memo) {
+            Self::r11_enqueue(callee, resources, call_id, worklist, enqueued);
         }
-        let Some(callee) = self.r11_direct_callee(call_id) else {
-            return;
-        };
+    }
+
+    /// The instantiation a call makes under `current_resources`, as
+    /// `(callee, sorted resource parameters)` — [`Self::r11_discover`]'s
+    /// question without its enqueue, so a record's propagation EDGES (R11
+    /// door B) can be re-asked of the body calls that answered it.
+    fn r11_edge(
+        &mut self,
+        call_id: Id,
+        current_resources: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> Option<(Id, Vec<TypeId>)> {
+        if let Some((callee, receiver, self_marker)) = self.r11_inherited_default_call(call_id) {
+            return self
+                .type_is_resource_with(receiver, current_resources, memo)
+                .then(|| (callee, vec![self_marker]));
+        }
+        let callee = self.r11_direct_callee(call_id)?;
         let bindings = self.r11_call_type_bindings(call_id, callee);
         let mut resources: Vec<TypeId> = Vec::new();
         for (constraint, bound) in bindings {
@@ -20583,9 +20818,21 @@ impl<'src> Analyzer<'src> {
             }
         }
         if resources.is_empty() {
-            return;
+            return None;
         }
         resources.sort_unstable_by_key(|constraint| constraint.0);
+        Some((callee, resources))
+    }
+
+    /// Enqueues an instantiation unless its key was already enqueued — the
+    /// first call to enqueue an instance is the one that reports it.
+    fn r11_enqueue(
+        callee: Id,
+        resources: Vec<TypeId>,
+        call_id: Id,
+        worklist: &mut VecDeque<R11Instance>,
+        enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
+    ) {
         if enqueued.insert((callee, resources.clone())) {
             worklist.push_back(R11Instance {
                 callee,
@@ -23913,6 +24160,38 @@ impl<'src> Analyzer<'src> {
         selected
     }
 
+    /// B642: `member` called with `generic_list` written after its name, in
+    /// the call's own shape — `{receiver}.{member}{generic_list}()` for a
+    /// METHOD call, the receiver as written (`…` when it is not one short
+    /// line), `()` when it passes nothing else and `(…)` when it does; the
+    /// free form `{member}{generic_list}(…)` otherwise, as before.
+    fn written_call_form(&self, call_id: Id, member: &str, generic_list: &str) -> String {
+        let receiver_id = match self.function_calls.get(&call_id) {
+            Some(call) if self.member_name_spans.contains_key(&call_id) => {
+                call.argument_ids.first().copied().map(|receiver| {
+                    let passes_more = call.argument_ids.len() > 1;
+                    (receiver, passes_more)
+                })
+            }
+            _ => None,
+        };
+        let Some((receiver_id, passes_more)) = receiver_id else {
+            return format!("{member}{generic_list}(…)");
+        };
+        let receiver = self
+            .span_map
+            .get(&receiver_id)
+            .zip(self.source_of_id(receiver_id))
+            .and_then(|(span, source)| {
+                self.source_text(source)
+                    .and_then(|text| text.get(span.into_range()))
+            })
+            .filter(|written| !written.contains('\n') && written.chars().count() <= 40)
+            .unwrap_or("…");
+        let arguments = if passes_more { "(…)" } else { "()" };
+        format!("{receiver}.{member}{generic_list}{arguments}")
+    }
+
     /// B627: whether the value of `call_id`, whose settled type still carries
     /// `generic`, ends where nothing decides it. The value is followed through
     /// what it lands in — the binding it initializes, the call it is an
@@ -23924,8 +24203,28 @@ impl<'src> Analyzer<'src> {
     /// or a landing whose own settled type no longer carries it. A binding
     /// that still carries it, or a carrier only a field read or a statement
     /// consumes, is undetermined.
+    ///
+    /// B640: a value that is the RESULT of a function whose return type is
+    /// inferred — its body's tail, through a block's tail or an `if`'s arms,
+    /// or a `ret`'s value — is typed by nothing there: the function is
+    /// instantiated at each call, so the walk continues at its call sites
+    /// (`fun tail_of() { Holder::build() }` called as `tail_of();` is
+    /// undetermined; `let held: Option<Holder<i32>> = tail_of();` decides it).
     fn undetermined_value_flows_on(&mut self, call_id: Id, generic: TypeId) -> bool {
-        let mut current = call_id;
+        let mut visited_call_sites = HashSet::default();
+        self.undetermined_value_flows_from(call_id, generic, &mut visited_call_sites)
+    }
+
+    /// [`Self::undetermined_value_flows_on`]'s walk from one carrier;
+    /// `visited_call_sites` keeps a recursive function's own call sites from
+    /// being followed twice.
+    fn undetermined_value_flows_from(
+        &mut self,
+        start: Id,
+        generic: TypeId,
+        visited_call_sites: &mut HashSet<Id>,
+    ) -> bool {
+        let mut current = start;
         // Each step moves to an enclosing expression, so the walk is bounded
         // by the nesting depth; the cap only guards a malformed table.
         for _ in 0..64 {
@@ -23958,23 +24257,95 @@ impl<'src> Analyzer<'src> {
             match consumer {
                 Some(consumer_id) if self.settled_type_carries(consumer_id, generic) => {
                     current = consumer_id;
+                    continue;
                 }
                 Some(_) => return false,
-                // A field read off the carrier, or a statement discarding it,
-                // consumes it untyped (`print(Holder::build().unwrap().value)`,
-                // `Holder::build();`): the instance is emitted undetermined.
-                // Any other position (a list element, a tuple, a typed return)
-                // is that position's to type.
-                None => {
-                    return self.expr_id_to_expr_map.values().any(|expr| match expr {
-                        Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..) => {
-                            *subject == current
+                None => {}
+            }
+            // A field read off the carrier, or a statement discarding it,
+            // consumes it untyped (`print(Holder::build().unwrap().value)`,
+            // `Holder::build();`): the instance is emitted undetermined. A
+            // block's tail or an `if`'s arm hands the value to the enclosing
+            // expression (B640). Any other position (a list element, a tuple)
+            // is that position's to type.
+            let mut enclosing = None;
+            for (expr_id, expr) in &self.expr_id_to_expr_map {
+                match expr {
+                    Expr::Field(subject, ..) | Expr::TupleIndex(subject, ..)
+                        if *subject == current =>
+                    {
+                        return true;
+                    }
+                    Expr::Block((statements, tail_id)) => {
+                        if statements.contains(&current) {
+                            return true;
                         }
-                        Expr::Block((statements, _)) => statements.contains(&current),
-                        _ => false,
-                    });
+                        if *tail_id == current {
+                            enclosing = Some(*expr_id);
+                        }
+                    }
+                    Expr::If(branch)
+                        if if_branch_has_final_else(branch)
+                            && if_branch_trails_into(branch, current) =>
+                    {
+                        enclosing = Some(*expr_id);
+                    }
+                    _ => {}
                 }
             }
+            if let Some(enclosing_id) = enclosing {
+                current = enclosing_id;
+                continue;
+            }
+            // A function body's own statement discards the value too (B640:
+            // `result_of();`); the result of a function whose return type is
+            // inferred continues at its call sites.
+            let mut result_of = None;
+            for (function_id, function) in &self.functions {
+                if function.body.0.contains(&current) {
+                    return true;
+                }
+                if function.return_type_id.is_none()
+                    && (function.body.1 == current
+                        || function
+                            .rets
+                            .iter()
+                            .any(|(_, value)| *value == Some(current)))
+                {
+                    result_of = Some(*function_id);
+                }
+            }
+            let Some(function_id) = result_of else {
+                // A CLOSURE's result with no declared return type is one
+                // value for every call (a closure is not instantiated per
+                // call site, so no caller's type reaches back into its body):
+                // `let build = || Holder::build(); build();` is undetermined
+                // whatever its call sites say.
+                return self.closures.values().any(|closure| {
+                    closure.return_type_id.is_none()
+                        && (closure.return_ == current
+                            || closure
+                                .rets
+                                .iter()
+                                .any(|(_, value)| *value == Some(current)))
+                });
+            };
+            let call_sites: Vec<Id> = self
+                .function_calls
+                .iter()
+                .filter(|(_, call)| {
+                    matches!(
+                        self.expr_id_to_expr_map.get(&call.subject_id),
+                        Some(Expr::Local(callee)) if *callee == function_id
+                    )
+                })
+                .map(|(call_id, _)| *call_id)
+                .collect();
+            return call_sites.into_iter().any(|call_site| {
+                visited_call_sites.insert(call_site)
+                    && self.settled_type_carries(call_site, generic)
+                    && self.undetermined_value_flows_from(call_site, generic, visited_call_sites)
+            });
         }
         false
     }
@@ -24068,28 +24439,16 @@ impl<'src> Analyzer<'src> {
         member_id: Id,
         subject_type: &Type,
     ) -> Option<Type> {
-        if !matches!(
-            self.expr_id_to_expr_map.get(&subject_id),
-            Some(Expr::Call(_))
-        ) {
-            return None;
-        }
         let expected = self.expected_types.get(&call_id)?.get_type(self);
         if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
             return None;
         }
-        let mut carried = Vec::new();
-        self.collect_generics(subject_type, 0, &mut carried);
-        let open: Vec<TypeId> = carried
-            .into_iter()
-            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
-            .collect();
-        if open.is_empty() {
-            return None;
-        }
-        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
-        let impl_subject = self.implementations.get(implementation_index)?.subject;
-        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        let (open, answered) = self.receiver_generics_the_answer_carries(
+            call_id,
+            subject_id,
+            member_id,
+            subject_type,
+        )?;
         // The member's own generics are open in its answer too (a `map<U>`
         // returning `Option<U>`), but they are the member's to bind, from
         // its arguments; only the receiver's generics are taken from here.
@@ -24122,6 +24481,72 @@ impl<'src> Analyzer<'src> {
             Type::Unresolved | Type::Unknown => None,
             redirected => Some(redirected),
         }
+    }
+
+    /// B627 / B637: the generics of a receiver CALL that nothing at this site
+    /// holds rigid and that `member_id`'s answer (its impl's binders bound
+    /// from the receiver) still carries — the generics an expectation on the
+    /// method call could decide — with that answer. `None` for a receiver
+    /// that is not a call, or one whose open generics the answer drops
+    /// (`HashMap::new().len()`).
+    fn receiver_generics_the_answer_carries(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> Option<(Vec<TypeId>, Type)> {
+        if !matches!(
+            self.expr_id_to_expr_map.get(&subject_id),
+            Some(Expr::Call(_))
+        ) {
+            return None;
+        }
+        let mut carried = Vec::new();
+        self.collect_generics(subject_type, 0, &mut carried);
+        let open: Vec<TypeId> = carried
+            .into_iter()
+            .filter(|generic| !self.generic_is_enclosing_binder(*generic, call_id))
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let implementation_index = *self.implementation_by_declaration.get(&member_id)?;
+        let impl_subject = self.implementations.get(implementation_index)?.subject;
+        let answered = self.member_return_type_for(member_id, impl_subject, subject_type)?;
+        let mut answered_generics = Vec::new();
+        self.collect_generics(&answered, 0, &mut answered_generics);
+        if !open
+            .iter()
+            .any(|generic| answered_generics.contains(generic))
+        {
+            return None;
+        }
+        Some((open, answered))
+    }
+
+    /// B637: whether a method call should WAIT for its expectation before it
+    /// resolves — B501's rule for an argument call, at the receiver. A call
+    /// standing at another call's parameter (`take(make().unwrap_or(5))`) is
+    /// told that parameter's type only when the outer call is attempted
+    /// (`seed_call_argument_expectations`), which is after the argument —
+    /// the worklist runs the inner call first, so resolving at once settled
+    /// the receiver with `make`'s own `T` open and B627's direction came too
+    /// late. A receiver whose open generics the member's answer carries
+    /// waits while the fixpoint moves; one nothing ever directs resolves at
+    /// the stall, exactly as before.
+    fn method_call_awaits_its_expectation(
+        &mut self,
+        call_id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+    ) -> bool {
+        !self.fixpoint_stalled
+            && !self.expected_types.contains_key(&call_id)
+            && self
+                .receiver_generics_the_answer_carries(call_id, subject_id, member_id, subject_type)
+                .is_some()
     }
 
     /// A candidate member's declared return type, with the declaring impl's own
@@ -27304,6 +27729,7 @@ impl<'src> Analyzer<'src> {
     /// `type_of_expr`'s interned half — the copy passes need the `TypeId` itself
     /// to ask the resource questions (`type_is_resource`,
     /// `resource_triggering_constraints`), which are keyed by id.
+    #[inline]
     fn type_id_of_expr(&self, expr_id: Id) -> Option<TypeId> {
         self.expr_id_to_type_id_map
             .get(&expr_id)
@@ -27499,7 +27925,12 @@ impl<'src> Analyzer<'src> {
             .any(|argument_id| self.stand_down_on_refused_annotation(argument_id))
     }
 
-    /// `place_value_type`'s interned half.
+    /// `place_value_type`'s interned half. Inlined at its callers: R11 door B
+    /// split the instantiation scan out of the worklist's body into
+    /// `r11_scan_instance`, where this and `type_id_of_expr` stopped being
+    /// inlined — 13,000 out-of-line calls on a cold check of `canvas`, the
+    /// whole of its +0.1% — and the hint restores the shape the loop had.
+    #[inline]
     fn place_value_type_id(&self, expr_id: Id) -> Option<TypeId> {
         if let Some(type_id) = self.type_id_of_expr(expr_id) {
             return Some(type_id);
@@ -32541,12 +32972,23 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         for (target_id, assignment_id) in assignment_targets {
             let Some((non_place_id, what)) = self.first_non_place(target_id) else {
-                // F141: a place inside a `Shared::read()` — the read's copy —
-                // is a place nobody keeps.
-                if !shared_reads.is_empty()
-                    && let Some(read_id) = self.spine_rooted_at_a_read(target_id, &shared_reads)
-                {
-                    self.refuse_write_through_read(target_id, assignment_id, read_id);
+                // F141: a place inside a call's result is a place nobody
+                // keeps — a `Shared::read()`'s copy, or (the widening) any
+                // call that returns a value rather than a view.
+                if let Some(call_expr_id) = self.spine_rooted_at_a_call(target_id) {
+                    match self.call_callee_and_receiver(call_expr_id) {
+                        Some((callee_id, _)) if shared_reads.contains(&callee_id) => {
+                            self.refuse_write_through_read(target_id, assignment_id, call_expr_id);
+                        }
+                        _ if !self.call_result_is_a_view(call_expr_id) => {
+                            self.refuse_write_into_temporary(
+                                target_id,
+                                assignment_id,
+                                call_expr_id,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 continue;
             };
@@ -32585,38 +33027,25 @@ impl<'src> Analyzer<'src> {
         // in another, so the rest cost a length test.
         let mut module_level: Option<HashSet<Id>> = None;
         let mut capture_verdicts: HashMap<Id, bool> = HashMap::default();
-        let mut refusals: Vec<(Id, Id, Id, Id, Id)> = Vec::new();
+        let mut refusals: Vec<(LentWrite, Id, Id, Id, Id)> = Vec::new();
         for (call_expr_id, function_call) in self.live_entries(&self.function_calls) {
             let arguments = &function_call.argument_ids;
             if arguments.len() < 2 {
                 continue;
             }
-            let Some(Expr::Local(callee_id)) =
-                self.expr_id_to_expr_map.get(&function_call.subject_id)
-            else {
-                continue;
-            };
-            let parameters: &[Id] = self
-                .method_signature_ref(*callee_id)
-                .map(|(parameters, _)| parameters)
-                .unwrap_or_default();
-            for (position, argument_id) in arguments.iter().enumerate() {
-                let lent_by_parameter = parameters
-                    .get(position)
-                    .and_then(|parameter| self.parameters.get(parameter))
-                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
-                let lent_by_argument = matches!(
-                    self.expr_id_to_expr_map.get(argument_id),
-                    Some(Expr::Reference(_, true))
-                );
-                if !lent_by_parameter && !lent_by_argument {
-                    continue;
-                }
-                let Some(root) = self.place_root_binding(*argument_id) else {
+            for position in self.lent_argument_positions(function_call) {
+                let argument_id = arguments[position];
+                let Some(root) = self.place_root_binding(argument_id) else {
                     continue;
                 };
                 for later in &arguments[position + 1..] {
-                    let Some(rebind) = self.rebind_of_within(*later, root) else {
+                    // B639: a write of the lent place in place — or of a
+                    // place under it, or of one holding it — is the re-bind's
+                    // in-place twin.
+                    let Some(write) = self.rebind_of_within(*later, root).or_else(|| {
+                        self.in_place_write_within(*later, root, argument_id)
+                            .map(LentWrite::InPlace)
+                    }) else {
                         continue;
                     };
                     let module_level =
@@ -32628,16 +33057,146 @@ impl<'src> Analyzer<'src> {
                         .entry(root)
                         .or_insert_with(|| self.binding_is_closure_captured(root));
                     if !captured {
-                        refusals.push((rebind, root, *argument_id, *call_expr_id, *later));
+                        refusals.push((write, root, argument_id, *call_expr_id, *later));
                     }
                 }
             }
         }
         // Source order, so a program with several reports them in reading order.
-        refusals.sort_unstable_by_key(|(rebind, ..)| rebind.0);
-        for (rebind, root, lent, call_expr_id, later) in refusals {
-            self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+        refusals.sort_unstable_by_key(|(write, ..)| write.id().0);
+        for (write, root, lent, call_expr_id, later) in refusals {
+            match write {
+                LentWrite::Rebind(rebind) => {
+                    self.refuse_lent_root_rebind(rebind, root, lent, call_expr_id, later);
+                }
+                LentWrite::InPlace(write) => {
+                    self.refuse_lent_place_write(write, lent, call_expr_id, later);
+                }
+            }
         }
+    }
+
+    /// The argument positions a call lends `&mut` — a `&mut self` receiver or
+    /// `&mut` parameter (`log.items.push(..)`, `log.bump(..)`), or a written
+    /// `&mut` argument (`add(&mut log.items, ..)`). B?2 / B639.
+    fn lent_argument_positions(&self, function_call: &FunctionCall) -> Vec<usize> {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return Vec::new();
+        };
+        let parameters: &[Id] = self
+            .method_signature_ref(*callee_id)
+            .map(|(parameters, _)| parameters)
+            .unwrap_or_default();
+        function_call
+            .argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(position, argument_id)| {
+                let lent_by_parameter = parameters
+                    .get(*position)
+                    .and_then(|parameter| self.parameters.get(parameter))
+                    .is_some_and(|parameter| parameter.convention == Convention::RefMut);
+                lent_by_parameter
+                    || matches!(
+                        self.expr_id_to_expr_map.get(argument_id),
+                        Some(Expr::Reference(_, true))
+                    )
+            })
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    /// B639: an IN-PLACE write inside `expr_id`'s subtree (closures excluded)
+    /// that overlaps the place `lent_id` names under `root` — an assignment
+    /// to it, to a place under it or to one holding it (`log.items[0] = 5`,
+    /// `log.items = []` under a lent `log.items`), or a call lending such a
+    /// place `&mut` (`log.items.push(1)`, `add(&mut log.items, 1)`,
+    /// `log.bump(1)`). Elements are not told apart (`[0]` overlaps `[1]`).
+    /// The writing expression, or `None`.
+    fn in_place_write_within(&self, expr_id: Id, root: Id, lent_id: Id) -> Option<Id> {
+        let lent_place = match self.expr_id_to_expr_map.get(&lent_id) {
+            Some(Expr::Reference(operand, _)) => *operand,
+            _ => lent_id,
+        };
+        let (lent_root, lent_path) = self.place_path(lent_place)?;
+        if lent_root != root {
+            return None;
+        }
+        let overlaps = |analyzer: &Self, place_id: Id| {
+            let place_id = match analyzer.expr_id_to_expr_map.get(&place_id) {
+                Some(Expr::Reference(operand, _)) => *operand,
+                _ => place_id,
+            };
+            analyzer
+                .place_path(place_id)
+                .is_some_and(|(written_root, written_path)| {
+                    written_root == root && paths_nest(&written_path, &lent_path)
+                })
+        };
+        let mut pending = vec![expr_id];
+        let mut children = Vec::new();
+        while let Some(current) = pending.pop() {
+            match self.expr_id_to_expr_map.get(&current) {
+                Some(Expr::Assignment(target, _)) if overlaps(self, *target) => {
+                    return Some(current);
+                }
+                Some(Expr::Call(call_id)) => {
+                    if let Some(function_call) = self.function_calls.get(call_id)
+                        && self
+                            .lent_argument_positions(function_call)
+                            .into_iter()
+                            .any(|position| overlaps(self, function_call.argument_ids[position]))
+                    {
+                        return Some(current);
+                    }
+                }
+                _ => {}
+            }
+            children.clear();
+            self.drop_scan_children(current, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        None
+    }
+
+    /// B639: [`Self::in_place_write_within`]'s refusal, at the write, with
+    /// the re-bind's settle-first steer.
+    fn refuse_lent_place_write(&mut self, write: Id, lent: Id, call_expr_id: Id, later: Id) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let lent_text = text_of(self, lent).unwrap_or("the place");
+        let lent_text = lent_text.strip_prefix("&mut ").unwrap_or(lent_text);
+        let write_text = text_of(self, write)
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("this write");
+        let later_text = text_of(self, later);
+        let settled = text_of(self, call_expr_id)
+            .zip(later_text)
+            .map(|(call_text, argument_text)| call_text.replacen(argument_text, "item", 1))
+            .filter(|rewritten| !rewritten.contains('\n'))
+            .unwrap_or_else(|| format!("{lent_text}.…(item)"));
+        let value = later_text
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("{ … }");
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&write).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{write_text}` writes `{lent_text}` in place while it is lent `&mut` to \
+                     this call, a write under a live `&mut` view; settle the value first: `let \
+                     item = {value}; {settled}`"
+                ),
+            },
+            write,
+        );
     }
 
     /// B?2: the binding a place's spine roots at — `log` for `log.items`,
@@ -32662,14 +33221,14 @@ impl<'src> Analyzer<'src> {
     /// B?2: an assignment re-binding `binding` WHOLE inside `expr_id`'s
     /// subtree, closures excluded (a closure's body runs when it is called,
     /// not where it is written).
-    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<Id> {
+    fn rebind_of_within(&self, expr_id: Id, binding: Id) -> Option<LentWrite> {
         let mut pending = vec![expr_id];
         let mut children = Vec::new();
         while let Some(current) = pending.pop() {
             if let Some(Expr::Assignment(target, _)) = self.expr_id_to_expr_map.get(&current)
                 && matches!(self.expr_id_to_expr_map.get(target), Some(Expr::Local(named)) if *named == binding)
             {
-                return Some(current);
+                return Some(LentWrite::Rebind(current));
             }
             children.clear();
             self.drop_scan_children(current, &mut children);
@@ -32753,23 +33312,67 @@ impl<'src> Analyzer<'src> {
         );
     }
 
-    /// F141: the `Shared::read()` call an assignment target's spine roots at —
-    /// `cell.read().count`, `cell.read().items[0]`, `cell.read().pair.0` —
-    /// walking fields, elements and tuple positions down to the expression
-    /// they are read off. `None` when the root is anything else.
-    fn spine_rooted_at_a_read(&self, target_id: Id, shared_reads: &HashSet<Id>) -> Option<Id> {
+    /// F141: the CALL an assignment target's spine roots at —
+    /// `cell.read().count`, `make().items[0]`, `make().pair.0` — walking
+    /// fields, elements and tuple positions down to the expression they are
+    /// read off. `None` when the root is anything else, or when the target
+    /// is the call itself (B522's question).
+    fn spine_rooted_at_a_call(&self, target_id: Id) -> Option<Id> {
         let mut current = target_id;
         loop {
             match self.expr_id_to_expr_map.get(&current)? {
                 Expr::Field(subject, ..) | Expr::Index(subject, _) => current = *subject,
                 Expr::TupleIndex(root, ..) => current = *root,
-                Expr::Call(_) if current != target_id => {
-                    let (callee_id, _) = self.call_callee_and_receiver(current)?;
-                    return shared_reads.contains(&callee_id).then_some(current);
-                }
+                Expr::Call(_) if current != target_id => return Some(current),
                 _ => return None,
             }
         }
+    }
+
+    /// F141's widening: whether a call's result is a VIEW an assignment can
+    /// write through — a `borrows` callee (`cell.write()`), a wrapped view
+    /// (`Option<&mut T>`), or a callee whose declared return is a view
+    /// (`fun pick(&mut self): &mut T`) — rather than a value.
+    fn call_result_is_a_view(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&call_expr_id) else {
+            return false;
+        };
+        self.call_returns_view(*call_id) || self.call_hands_back_a_view(*call_id)
+    }
+
+    /// F141's widening (ruled R-f at Order 54's GO): an assignment into a
+    /// place inside a call's VALUE — `make().count = 3`, `make().items[0] =
+    /// 7` — writes a temporary nothing keeps, on both backends (each printed
+    /// the old value afterwards, silently). Refused at the target, with the
+    /// result bound first.
+    fn refuse_write_into_temporary(&mut self, target_id: Id, assignment_id: Id, call_id: Id) {
+        let text_of = |analyzer: &Self, id: Id| {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let call_text = text_of(self, call_id)
+            .filter(|text| !text.contains('\n'))
+            .unwrap_or("the call");
+        let rewritten = text_of(self, assignment_id)
+            .and_then(|assignment| assignment.strip_prefix(call_text))
+            .filter(|rest| !rest.contains('\n'))
+            .map(|rest| format!("mut value = {call_text}; value{rest}"))
+            .unwrap_or_else(|| format!("mut value = {call_text}; value.… = …"));
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{call_text}`'s result is a temporary, so this assignment is lost; bind it \
+                     first: `{rewritten}`"
+                ),
+            },
+            target_id,
+        );
     }
 
     /// F141: spec §6.7 — `read()` answers a COPY of the cell's value, so an
@@ -43846,6 +44449,7 @@ impl<'src> Analyzer<'src> {
         path: &[&'src str],
         lookup_scope_id: Id,
         expected_type_id: TypeId,
+        module_segments: &mut Vec<(usize, Id)>,
     ) -> Option<Id> {
         if let [name] = path {
             if let Some(entity) = self.try_get_expr_id_by_name(name, lookup_scope_id) {
@@ -43874,10 +44478,17 @@ impl<'src> Analyzer<'src> {
         let mut segments = path.iter();
         let head = segments.next()?;
         let mut current = self.try_get_expr_id_by_name(head, lookup_scope_id)?;
-        for segment in segments {
+        for (index, segment) in segments.enumerate() {
             let scope_id = match self.expr_id_to_expr_map.get(&current)? {
                 Expr::Enum(enum_id) => self.enums.get(enum_id)?.variants_scope_id,
-                Expr::Module(module_id) => self.modules.get(module_id)?.body.1,
+                Expr::Module(module_id) => {
+                    // E327: a module segment of the written path (`lib` and
+                    // `deep` in `lib::deep::Mode::On`); `index` is the
+                    // segment BEFORE this one, as `segments` has skipped the
+                    // head.
+                    module_segments.push((index, *module_id));
+                    self.modules.get(module_id)?.body.1
+                }
                 _ => return None,
             };
             current = self
@@ -44031,20 +44642,25 @@ impl<'src> Analyzer<'src> {
                 let span = *span;
                 let source_id = *source_id;
                 let name = path.join("::");
-                let entity =
-                    match self.resolve_variant_path(path, lookup_scope_id, expected_type_id) {
-                        Some(entity) => entity,
-                        None => {
-                            let steer = self.scope_miss_steer(path, lookup_scope_id);
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span,
-                                msg: format!("cannot find '{}' in this scope{}", name, steer),
-                            });
-                            return None;
-                        }
-                    };
+                let mut module_segments: Vec<(usize, Id)> = Vec::new();
+                let entity = match self.resolve_variant_path(
+                    path,
+                    lookup_scope_id,
+                    expected_type_id,
+                    &mut module_segments,
+                ) {
+                    Some(entity) => entity,
+                    None => {
+                        let steer = self.scope_miss_steer(path, lookup_scope_id);
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!("cannot find '{}' in this scope{}", name, steer),
+                        });
+                        return None;
+                    }
+                };
                 let (enum_id, variant_index) = match self.expr_id_to_expr_map.get(&entity) {
                     Some(Expr::EnumVariant(enum_id, variant_index)) => (*enum_id, *variant_index),
                     _ => {
@@ -44072,6 +44688,21 @@ impl<'src> Analyzer<'src> {
                             segment_span,
                             Some(entity),
                             enum_type_id,
+                        ));
+                    } else if let Some((_, module_id)) =
+                        module_segments.iter().find(|(at, _)| *at == index)
+                    {
+                        // E327: a MODULE segment (`lib`, `deep` in
+                        // `lib::deep::Mode::On`) takes the row a value
+                        // path's and an annotation's take (E315). One
+                        // directly before the variant is a module too, not
+                        // the enum the arm below would have called it.
+                        let module_type_id = Type::Module(*module_id).get_type_id(self);
+                        self.type_references.push((
+                            source_id,
+                            segment_span,
+                            Some(*module_id),
+                            module_type_id,
                         ));
                     } else if index + 1 == last {
                         self.type_references.push((
@@ -52327,11 +52958,29 @@ impl<'src> Analyzer<'src> {
     /// asked once, after the walk, rather than at each resolution site, because
     /// imports and uses drain in an order neither one controls.
     ///
-    /// A program with no `as` in it does no work here at all.
+    /// A program with no `as` in it does no work here at all, and one with
+    /// aliases reads the text only where an alias COULD be spelled (M154): an
+    /// identifier spells an alias only in the file that declares it, at a use
+    /// of the alias's target ([`Analyzer::alias_binding`]'s two conditions),
+    /// so every other reference of the world is passed over on its target
+    /// alone — kolt's 22 aliases against ~180,000 expressions and ~30,000
+    /// type references, std's and the generated icon module's included, each
+    /// of which used to be spelled out of its file and matched against every
+    /// alias.
     fn collect_import_alias_spans(&mut self) {
         if self.import_aliases.is_empty() {
             return;
         }
+        // Each alias TARGET with the files that alias it.
+        let mut aliased: HashMap<Id, Vec<SourceId>> = HashMap::default();
+        for alias in self.import_aliases.values() {
+            aliased.entry(alias.target).or_default().push(alias.source);
+        }
+        let aliased_in = |target: Id, source: SourceId| {
+            aliased
+                .get(&target)
+                .is_some_and(|sources| sources.contains(&source))
+        };
         let mut found: Vec<((SourceId, Span), Id)> = Vec::new();
         let note = |analyzer: &Self,
                     found: &mut Vec<((SourceId, Span), Id)>,
@@ -52352,7 +53001,9 @@ impl<'src> Analyzer<'src> {
         // Type positions, import/`use` path segments, match-pattern segments,
         // macro names — everything the analyzer records AS a reference.
         for (source, span, definition, _) in &self.type_references {
-            if let Some(target) = definition {
+            if let Some(target) = definition
+                && aliased_in(*target, *source)
+            {
                 note(self, &mut found, *source, *span, *target);
             }
         }
@@ -52362,12 +53013,16 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            if use_id == target {
+            if use_id == target || !aliased.contains_key(target) {
                 continue;
             }
-            let (Some(source), Some(span)) =
-                (self.source_of_id(*use_id), self.span_map.get(use_id))
-            else {
+            let Some(source) = self.source_of_id(*use_id) else {
+                continue;
+            };
+            if !aliased_in(*target, source) {
+                continue;
+            }
+            let Some(span) = self.span_map.get(use_id) else {
                 continue;
             };
             note(self, &mut found, source, **span, *target);
@@ -55383,13 +56038,9 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
     ) {
         for (parameter_id, argument_id) in parameters.iter().zip(argument_ids) {
-            if !matches!(
-                self.expr_id_to_expr_map.get(argument_id),
-                Some(Expr::Call(_))
-            ) || self.expected_types.contains_key(argument_id)
-            {
+            let Some(position) = self.unseeded_argument_call(*argument_id) else {
                 continue;
-            }
+            };
             let Some(parameter_type_id) = self
                 .parameters
                 .get(parameter_id)
@@ -55397,12 +56048,48 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            let parameter_type = parameter_type_id.get_type(self);
-            let decided = self.substitute_type(&parameter_type, substitution_context);
-            let decided_id = decided.get_type_id(self);
-            if self.type_is_ground(decided_id) {
-                self.expected_types.insert(*argument_id, decided_id);
+            // A parameter already ground is its own decision; only an open
+            // one is read through the substitution (and minted).
+            let decided_id = match self.type_is_ground(parameter_type_id) {
+                true => parameter_type_id,
+                false => {
+                    let parameter_type = parameter_type_id.get_type(self);
+                    self.substitute_type(&parameter_type, substitution_context)
+                        .get_type_id(self)
+                }
+            };
+            self.seed_ground_expectation(position, decided_id);
+        }
+    }
+
+    /// The call an argument expectation is told to — `argument_id` itself
+    /// when it is a call nothing nearer has told — or `None`.
+    ///
+    /// B637: a METHOD call still waiting for its expectation
+    /// (`method_call_awaits_its_expectation`) is no `Expr::Call` until it is
+    /// wired, so a member access the walk wrote and nothing has resolved yet
+    /// counts too — `take(make().unwrap_or(5))` under `fun take(value: i32)`
+    /// (a pending FIELD read is told the same; a parameter directs a field
+    /// read as surely as a call). A VIEW of a call at the parameter
+    /// (`peek(&make().unwrap_or(2))`) tells the call: the view's mode is the
+    /// parameter's, its referent the parameter's type.
+    fn unseeded_argument_call(&self, argument_id: Id) -> Option<Id> {
+        let mut position = argument_id;
+        let a_call = loop {
+            match self.expr_id_to_expr_map.get(&position) {
+                Some(Expr::Call(_)) => break true,
+                Some(Expr::Reference(operand, _)) => position = *operand,
+                Some(_) => break false,
+                None => break self.member_name_spans.contains_key(&position),
             }
+        };
+        (a_call && !self.expected_types.contains_key(&position)).then_some(position)
+    }
+
+    /// Records `decided_id` as `position`'s expectation when it is ground.
+    fn seed_ground_expectation(&mut self, position: Id, decided_id: TypeId) {
+        if self.type_is_ground(decided_id) {
+            self.expected_types.insert(position, decided_id);
         }
     }
 
@@ -56436,6 +57123,14 @@ impl<'src> Analyzer<'src> {
                 return Resolution::Failed;
             }
             let substitution_context = HashMap::default();
+            // B637: a closure's declared parameter types direct its argument
+            // calls as a function's do (`f(make().unwrap_or(3))` under
+            // `let f = |x: i32| ..`).
+            for (parameter_type_id, argument_id) in parameter_type_ids.iter().zip(argument_ids) {
+                if let Some(position) = self.unseeded_argument_call(*argument_id) {
+                    self.seed_ground_expectation(position, *parameter_type_id);
+                }
+            }
             for (index, parameter_type_id) in parameter_type_ids.clone().iter().enumerate() {
                 let parameter_type = parameter_type_id.get_type(self);
                 let argument_id = *argument_ids.get(index).unwrap();
@@ -58332,6 +59027,11 @@ impl<'src> Analyzer<'src> {
                     arguments_span,
                 ),
             MethodLookup::Found(member_id) => {
+                if self.method_call_awaits_its_expectation(id, subject_id, member_id, &subject_type)
+                {
+                    self.unwired_method_calls.insert(id, member_id);
+                    return Resolution::Deferred;
+                }
                 // B627 / std-53's A?1: the call's expectation reaches its
                 // RECEIVER before anything reads the receiver's type —
                 // `Holder::build().unwrap()` into a `Holder<i32>` binds the
@@ -65703,15 +66403,24 @@ impl<'src> Analyzer<'src> {
     fn resolve_initializer_head(
         &mut self,
         constraint: &StructInitializerConstraint<'src>,
+        module_segments: &mut Vec<(usize, Id)>,
     ) -> Option<Id> {
         let Some((first, rest)) = constraint.namespace.split_first() else {
             return self.try_get_expr_id_by_name(constraint.struct_name, constraint.scope_id);
         };
         let head = self.try_get_expr_id_by_name(first, constraint.scope_id)?;
         let mut scope_id = self.namespace_body_scope(head)?;
-        for segment in rest {
+        // E327: the namespace segments that are MODULES (an enum in the
+        // middle namespaces its variants and is no module), by position.
+        if let Some(Expr::Module(module_id)) = self.expr_id_to_expr_map.get(&head) {
+            module_segments.push((0, *module_id));
+        }
+        for (index, segment) in rest.iter().enumerate() {
             let member = self.member_in_namespace(segment, scope_id)?;
             scope_id = self.namespace_body_scope(member)?;
+            if let Some(Expr::Module(module_id)) = self.expr_id_to_expr_map.get(&member) {
+                module_segments.push((index + 1, *module_id));
+            }
         }
         self.member_in_namespace(constraint.struct_name, scope_id)
     }
@@ -65746,7 +66455,8 @@ impl<'src> Analyzer<'src> {
         &mut self,
         constraint: &StructInitializerConstraint<'src>,
     ) -> Resolution {
-        let struct_id = match self.resolve_initializer_head(constraint) {
+        let mut module_segments: Vec<(usize, Id)> = Vec::new();
+        let struct_id = match self.resolve_initializer_head(constraint, &mut module_segments) {
             Some(expr_id) => expr_id,
             None => {
                 let span = self
@@ -65799,6 +66509,25 @@ impl<'src> Analyzer<'src> {
         // literal's start would have drawn the label over the module prefix.
         if let Some(source) = self.source_of_id(constraint.initializer_id) {
             self.record_reference(source, constraint.struct_name_span, struct_id);
+            // E327: each MODULE segment of a qualified head records the row
+            // its member records in a value path or an annotation (E315). The
+            // spans are laid back from the name's own, one `::` between
+            // segments.
+            let mut end = constraint.struct_name_span.start;
+            for (index, segment) in constraint.namespace.iter().enumerate().rev() {
+                end = end.saturating_sub("::".len());
+                let start = end.saturating_sub(segment.len());
+                if let Some((_, module_id)) = module_segments.iter().find(|(at, _)| *at == index) {
+                    let module_type_id = Type::Module(*module_id).get_type_id(self);
+                    self.type_references.push((
+                        source,
+                        (start..end).into(),
+                        Some(*module_id),
+                        module_type_id,
+                    ));
+                }
+                end = start;
+            }
         }
         let struct_ = self.structs.get(&struct_id).expect("checked above");
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
@@ -73035,10 +73764,105 @@ impl<'src> Analyzer<'src> {
                     variable_id,
                 );
             }
+            self.refuse_unsettled_literal_bindings();
             self.refuse_expression_holes();
         }
 
         // Clear processed constraints
+    }
+
+    /// B638: B580's refusal for a `let` bound to a generic struct LITERAL no
+    /// field grounds — `let both = Page { items = [], first = None };`. The
+    /// literal settles as the declaration's own `Page<T>` (no hole for B580
+    /// to find, and the residual sweep's declaring-file rule passes a struct
+    /// declared in the same file), and a later typed use reconciles with it
+    /// without reaching back — `let n: Page<i32> = both;` and `take(both)`
+    /// ran on JS, while every native build refused the literal ("does not
+    /// emit a value of an unbound generic type parameter"). The program
+    /// never states the parameter where the value is made, as `let o =
+    /// None; let n: Option<i32> = o;` does not, so it is refused the same
+    /// way, at the initializer. A parameter an enclosing declaration binds
+    /// (the struct's own impl, a generic function's parameter) is that
+    /// scope's; user files only.
+    fn refuse_unsettled_literal_bindings(&mut self) {
+        let mut literals: Vec<(Id, Id)> = self
+            .variables
+            .iter()
+            .filter(|(_, variable)| !variable.annotated)
+            .filter_map(|(variable_id, variable)| {
+                let initial = variable.initial?;
+                matches!(
+                    self.expr_id_to_expr_map.get(&initial),
+                    Some(Expr::StructInitializer(..))
+                )
+                .then_some((*variable_id, initial))
+            })
+            .collect();
+        literals.sort_unstable_by_key(|(variable_id, _)| variable_id.0);
+        for (variable_id, initial) in literals {
+            let Some(source) = self.source_of_id(variable_id) else {
+                continue;
+            };
+            if source == DERIVED_SOURCE
+                || self.std_sources.contains(&source)
+                || self.frozen_sources.contains(&source)
+                || self.dependency_sources.contains(&source)
+            {
+                continue;
+            }
+            let variable_type = self.infer_type(variable_id, &Type::Unknown, &HashMap::default());
+            let Type::Struct(struct_id, _) = &variable_type else {
+                continue;
+            };
+            let Some(own_parameters) = self
+                .structs
+                .get(struct_id)
+                .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            else {
+                continue;
+            };
+            let mut residuals = Vec::new();
+            self.collect_residual_generics(&variable_type, &mut residuals);
+            residuals.retain(|residual| {
+                own_parameters.contains(residual)
+                    && !self.generic_is_enclosing_binder(*residual, variable_id)
+            });
+            if residuals.is_empty() {
+                continue;
+            }
+            let unknown = Type::Unknown.get_type_id(self);
+            let unsettled: SubstitutionContext = residuals
+                .into_iter()
+                .map(|residual| (residual, unknown))
+                .collect();
+            let name = self
+                .variables
+                .get(&variable_id)
+                .map(|variable| variable.name)
+                .unwrap_or("this binding");
+            let written_type = self.substitute_type(&variable_type, &unsettled);
+            let written = self
+                .pretty_print_type(&written_type, &HashMap::default())
+                .replace("unknown", "…");
+            let span = **self
+                .span_map
+                .get(&initial)
+                .or_else(|| self.span_map.get(&variable_id))
+                .unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "cannot infer the type of `{name}`: it is `{written}`, and inference \
+                         cannot settle the `…` from anything the program does with it. Write the \
+                         type on the binding (`{name}: {written}`)"
+                    ),
+                },
+                variable_id,
+            );
+        }
     }
 
     /// B600: B580's refusal for a hole NO binding holds — `Option::None.
@@ -73801,8 +74625,6 @@ pub enum GenericDispatch<'src> {
 /// An `external` std function with a built-in JS lowering.
 #[derive(Debug, Clone, Copy)]
 pub enum Intrinsic {
-    // `scan(): str` — read a line of stdin (runtime helper).
-    Scan,
     // `str.trim()` -> native `.trim()`.
     StrTrim,
     // `str.to_lowercase()` -> native `.toLowerCase()`.
@@ -74893,6 +75715,13 @@ pub struct Program<'src> {
     /// keyed on `parameters` sees plumbing dressed as source. Membership is the
     /// bool: absent means bare.
     pub context_optional_hidden_parameters: HashSet<Id>,
+    /// papers-54's B?2: the context arguments the context pass threads to a
+    /// `for x in subject` loop's implicit `next` call, by the loop's id. The
+    /// call graph records that call as an edge keyed by the loop (no
+    /// `FunctionCall` stands behind it), so the arguments the pass appends to
+    /// a written call's `argument_ids` land here instead; both emitters
+    /// append them after the iterator at every step.
+    pub for_each_context_arguments: HashMap<Id, Vec<Id>>,
     /// B482: the closure TYPES whose `context` clause entry arrives CLEARED
     /// somewhere — a callback position some callee calls under
     /// `context.clear(..)` — as `(closure type, context)`. Every literal that
@@ -75168,7 +75997,11 @@ pub struct Program<'src> {
     pub struct_literal_expectations: HashMap<Id, TypeId>,
     // Named type references in type position: `(file, name span, definition id,
     // label)`. Type names aren't entities, so this drives go-to-definition and
-    // hover on them (e.g. `Option`, `i32`, a trait bound).
+    // hover on them (e.g. `Option`, `i32`, a trait bound). The LABEL is
+    // hover's alone and rendered only where a document can ask for it (M154):
+    // under the reading aids, in a file that banks hover rows; empty
+    // elsewhere — std's references, a derive's template, every reference of
+    // a `vilan check`.
     pub type_references: Vec<(SourceId, Span, Option<Id>, String)>,
     /// Every `as` alias, by its own entity id (E145) — a declaration the
     /// importing file makes, whose target lives elsewhere.
@@ -76408,6 +77241,25 @@ pub fn set_world_table_reuse(enabled: bool) {
 
 pub(crate) fn world_table_reuse_enabled() -> bool {
     WORLD_TABLE_REUSE.load(std::sync::atomic::Ordering::SeqCst) && world_reuse_enabled()
+}
+
+/// R11 door B's own disable switch (`analyzer/r11_records.rs`): the
+/// instance records are neither served nor filed, so every instantiation is
+/// scanned live over the restored candidate rows — the shape the M155 row
+/// pins observe. Separate from the table switch for the reason that one is
+/// separate from `WORLD_REUSE`: a served instance reads no row at all, so a
+/// pin that plants a stale row must take the records out of the way first,
+/// and a switch that only turned the whole table half off could not tell
+/// "the rows were not read" from "nothing was restored".
+static R11_RECORDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_r11_records(enabled: bool) {
+    R11_RECORDS.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn r11_records_enabled() -> bool {
+    R11_RECORDS.load(std::sync::atomic::Ordering::SeqCst) && world_table_reuse_enabled()
 }
 
 /// M19 T1b's PLANT: serve a reused module a stale table.
@@ -79394,8 +80246,27 @@ pub(crate) struct PostRecord {
     /// analysis's fixpoint starts from (`async_infer::infer`). Set once, by
     /// the first analysis that reads the record after filing it; sorted.
     pub async_cold: std::sync::OnceLock<Vec<Id>>,
+    /// M138 (Order 54): the async pass's COLD instance record — the
+    /// adaptation worklist and its decisions over the cold nodes alone, each
+    /// key's reads logged — which a served analysis's worklist restarts from
+    /// (`async_infer::AsyncInstanceRecord`). Set once, beside S3b's cold
+    /// result; its bytes are its own (`AsyncInstanceRecord::bytes`).
+    pub async_instances:
+        std::sync::OnceLock<std::sync::Arc<crate::async_infer::AsyncInstanceRecord>>,
     /// What the record retains, in bytes (M46's currency).
     pub bytes: usize,
+}
+
+impl PostRecord {
+    /// What the record retains now: what it was filed with, and the async
+    /// pass's cold instance record once one is set (M138).
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes
+            + self
+                .async_instances
+                .get()
+                .map_or(0, |instances| instances.bytes)
+    }
 }
 
 impl Program<'_> {
@@ -79413,6 +80284,14 @@ impl Program<'_> {
             .warm_ranges
             .partition_point(|(start, _)| *start <= id.0);
         !(index > 0 && id.0 < seam.warm_ranges[index - 1].1)
+    }
+
+    /// M159: whether a front end SEEDED this analysis's post-pass seam — the
+    /// language server's every analysis, a lone open document's included
+    /// (door (a)) — so the post passes' record was filed and read. `false`
+    /// when no seam was built.
+    pub fn post_seam_seeded(&self) -> bool {
+        self.seam.as_ref().is_some_and(|seam| seam.seeded)
     }
 }
 
@@ -79730,6 +80609,11 @@ struct BaseCacheState {
     /// is written out (`prefix_file_write`).
     prefix_files_tried: HashSet<BaseCacheKey>,
     prefix_files_missed: HashSet<BaseCacheKey>,
+    /// M158: the prefix keys whose world file this process just WROTE, with
+    /// the file's key — the analysis that built the world writes the key's
+    /// checks record beside it once its checks are filed
+    /// (`prefix_checks_write`).
+    prefix_checks_wanted: HashMap<BaseCacheKey, crate::prefix_file::Key>,
     retained_bytes: usize,
     tick: u64,
     /// M44: keys whose world some thread is BUILDING right now, and which
@@ -80460,6 +81344,9 @@ struct ModuleTables {
     /// (`lazy_tables.rs`), filed only by an analysis that ran those passes.
     lazy: lazy_tables::LazyRows,
     hmr: lazy_tables::HmrRows,
+    /// M155: the module's R11 lexical candidates (`r11_candidates.rs`),
+    /// filed only by a seeded analysis that built R11's indexes.
+    r11: r11_candidates::CandidateRows,
     families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
@@ -80591,6 +81478,7 @@ impl ModuleTables {
             + self.moves.bytes()
             + self.lazy.bytes()
             + self.hmr.bytes()
+            + self.r11.bytes()
             + self.hover.bytes()
     }
 }
@@ -80652,6 +81540,8 @@ struct RestoredTables {
     moves: move_tables::MoveRows,
     lazy: lazy_tables::LazyRows,
     hmr: lazy_tables::HmrRows,
+    /// M155: the restored R11 candidate rows.
+    r11: r11_candidates::CandidateRows,
     family_ranges: row_families::FamilyRanges,
     /// M148: the restored hover rows, the entity ranges of the modules and
     /// items whose record carried them, and the restored MODULES as sources
@@ -80693,6 +81583,7 @@ impl Default for RestoredTables {
             moves: move_tables::MoveRows::default(),
             lazy: lazy_tables::LazyRows::default(),
             hmr: lazy_tables::HmrRows::default(),
+            r11: r11_candidates::CandidateRows::default(),
             family_ranges: row_families::FamilyRanges::default(),
             hover: hover_records::RecordedHoverRows::default(),
             hover_ranges: Vec::new(),
@@ -80745,6 +81636,9 @@ impl RestoredTables {
         if tables.families.contains(row_families::RowFamily::Hmr) {
             self.hmr.extend(&tables.hmr);
         }
+        if tables.families.contains(row_families::RowFamily::R11) {
+            self.r11.extend(&tables.r11);
+        }
         if tables.hover_recorded {
             self.hover.extend(&tables.hover);
         }
@@ -80780,6 +81674,10 @@ struct WorldChecks {
     /// it was computed over. One per world key: a session's keystrokes in one
     /// file share a cold set, and a different set files its own.
     post: Option<(u64, std::sync::Arc<PostRecord>)>,
+    /// R11 door B: the world's instance records (`r11_records.rs`), one per
+    /// `(callee, resources)` the world's analyses scanned, each validated at
+    /// replay by its callee's coldness and its `Drop` digest.
+    r11: Option<std::sync::Arc<r11_records::R11Records>>,
     /// M46: what this record costs in BYTES — the input to the budget below,
     /// kept as a running total so enforcing it costs an addition rather than a
     /// walk. M19 T1b counted ROWS here, which priced a one-`Id` last-use row
@@ -80796,7 +81694,11 @@ impl WorldChecks {
     /// table slices.
     fn compute_bytes(&self) -> usize {
         let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
-        let post = self.post.as_ref().map_or(0, |(_, record)| record.bytes);
+        let post = self
+            .post
+            .as_ref()
+            .map_or(0, |(_, record)| record.retained_bytes());
+        let r11 = self.r11.as_ref().map_or(0, |records| records.bytes);
         let items: usize = self.per_item.values().map(|record| record.bytes()).sum();
         let modules: usize = self
             .per_source
@@ -80808,7 +81710,7 @@ impl WorldChecks {
                     + module.tables.as_ref().map_or(0, ModuleTables::bytes)
             })
             .sum();
-        hashes + modules + post + items
+        hashes + modules + post + r11 + items
     }
 }
 
@@ -81042,6 +81944,8 @@ fn checked_cache_store(
         .unwrap_or_default();
     // M110 S3: a post record filed under the same content stays with it.
     let post = existing.and_then(|recorded| recorded.post.clone());
+    // R11 door B: the instance records too.
+    let r11 = existing.and_then(|recorded| recorded.r11.clone());
     // M110 S7: the item records too.
     let per_item = existing
         .map(|recorded| recorded.per_item.clone())
@@ -81064,6 +81968,7 @@ fn checked_cache_store(
         per_source,
         per_item,
         post,
+        r11,
         bytes: 0,
         last_used: tick,
     };
@@ -81186,8 +82091,11 @@ pub(crate) fn checked_cache_store_post(
     {
         return;
     }
-    let was = recorded.post.as_ref().map_or(0, |(_, record)| record.bytes);
-    recorded.bytes = recorded.bytes.saturating_sub(was) + record.bytes;
+    let was = recorded
+        .post
+        .as_ref()
+        .map_or(0, |(_, record)| record.retained_bytes());
+    recorded.bytes = recorded.bytes.saturating_sub(was) + record.retained_bytes();
     recorded.post = Some((cold_fingerprint, record));
     let bytes = recorded.bytes;
     let tick = state.next_tick();
@@ -81198,6 +82106,41 @@ pub(crate) fn checked_cache_store_post(
         .bytes
         .saturating_sub(previous_bytes)
         .saturating_add(bytes);
+    state.evict_to_budget(Some(key));
+}
+
+/// M138: a post record that gained a part after it was filed (the async
+/// pass's cold instance record, set once by the first analysis that reads the
+/// record) has those bytes join its checks record's total, so the budget
+/// (M46) bounds them as it bounds what was filed with it.
+pub(crate) fn checked_cache_grow_post(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    cold_fingerprint: u64,
+    bytes: usize,
+) {
+    let Some(cache) = CHECKED_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tick = state.next_tick();
+    let Some(recorded) = state.records.get_mut(key) else {
+        return;
+    };
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+        || !recorded
+            .post
+            .as_ref()
+            .is_some_and(|(fingerprint, _)| *fingerprint == cold_fingerprint)
+    {
+        return;
+    }
+    recorded.bytes += bytes;
+    recorded.last_used = tick;
+    state.bytes = state.bytes.saturating_add(bytes);
     state.evict_to_budget(Some(key));
 }
 
@@ -81454,8 +82397,11 @@ fn base_cache_admit(
             state.prefix_files_tried.insert(key.clone());
             if let Some(directory) = crate::incremental::world_cache_dir() {
                 match prefix_file_load(&directory, key, std) {
-                    Ok((world, bytes, micros)) => {
+                    Ok((world, bytes, micros, checks_missed)) => {
                         PREFIX_FILE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(file_key) = checks_missed {
+                            state.prefix_checks_wanted.insert(key.clone(), file_key);
+                        }
                         crate::incremental::update_census(|census| {
                             census.prefix_file = Some("loaded");
                             census.prefix_file_bytes = bytes;
@@ -81710,6 +82656,21 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
 static PREFIX_FILE_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PREFIX_FILE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PREFIX_FILE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// M158: the prefix keys' persisted checks records this process loaded and
+/// wrote.
+static PREFIX_CHECKS_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREFIX_CHECKS_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// M158: `(loads, writes)` of the prefix keys' persisted checks records in
+/// this process.
+#[doc(hidden)]
+pub fn prefix_checks_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PREFIX_CHECKS_LOADS.load(Relaxed),
+        PREFIX_CHECKS_WRITES.load(Relaxed),
+    )
+}
 
 /// `(loads, writes, misses)` of the persisted std prefix in this process.
 #[doc(hidden)]
@@ -81733,6 +82694,7 @@ pub fn prefix_files_forget() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.prefix_files_tried.clear();
         state.prefix_files_missed.clear();
+        state.prefix_checks_wanted.clear();
     }
 }
 
@@ -81796,7 +82758,10 @@ fn std_closure_content(std_roots: &[PathBuf], closure: &[String]) -> u64 {
     use std::fmt::Write as _;
     let mut rendered = String::new();
     for root in std_roots {
-        for name in closure {
+        for name in closure
+            .iter()
+            .filter(|name| !closure_names_a_namespace(name))
+        {
             let Some(resolution) = resolve_module_file(root, name) else {
                 continue;
             };
@@ -81845,12 +82810,14 @@ impl World<'static> {
 /// paths re-rooted from the writer's canonical std roots to this process's
 /// std, and its per-source path keys (M110 S6) recomputed over them. `Err`
 /// is the miss and its reason. Returns the world with the file's size and
-/// the load's wall time in microseconds.
+/// the load's wall time in microseconds — and, when the key's checks record
+/// (M158) was a miss, the file's key, so the analysis served the world
+/// writes the record once it has filed it.
 fn prefix_file_load(
     directory: &Path,
     key: &BaseCacheKey,
     std: &PackageSpec,
-) -> Result<(World<'static>, u64, u64), crate::prefix_file::Miss> {
+) -> Result<(World<'static>, u64, u64, Option<crate::prefix_file::Key>), crate::prefix_file::Miss> {
     let file_key = prefix_file_key(key);
     let loaded = crate::prefix_file::read(directory, &file_key)?;
     let current = std_spec_roots(std);
@@ -81873,7 +82840,160 @@ fn prefix_file_load(
             loaded.bytes
         );
     }
-    Ok((world, loaded.bytes as u64, micros))
+    let checks = prefix_checks_load(directory, &file_key, key, &world)
+        .err()
+        .map(|_| file_key);
+    Ok((world, loaded.bytes as u64, micros, checks))
+}
+
+/// M158 (Order 54): the persisted form of a prefix key's checks record — M19's
+/// `WorldChecks` minus what another process cannot read back (the
+/// package-keyed per-item records; the seeded analyses' post-pass and
+/// instance records, which only an editor files) and minus what the reader
+/// recomputes (the sources fingerprint, over its own re-rooted paths).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+struct PersistedChecks {
+    /// `WorldChecks::source_hashes`: the world's content, per source (the
+    /// entry's slot is never compared).
+    source_hashes: Vec<u64>,
+    /// `WorldChecks::per_source`, in source order (the bytes a function of
+    /// the content).
+    per_source: Vec<(u32, ModuleDiagnostics)>,
+}
+
+/// M158: inserts the prefix key's persisted checks record into
+/// [`CHECKED_CACHE`] beside the world just loaded, so the analysis served
+/// from it replays std's Class A checks (and their class D tables) instead
+/// of deriving them. A record that is absent, damaged, foreign or about
+/// other content is a miss of the record alone; one already in memory for
+/// the key is kept.
+fn prefix_checks_load(
+    directory: &Path,
+    file_key: &crate::prefix_file::Key,
+    key: &BaseCacheKey,
+    world: &World<'static>,
+) -> Result<(), &'static str> {
+    let outcome = crate::prefix_file::read_checks(directory, file_key).and_then(|loaded| {
+        crate::prefix_file::codec::decode::<PersistedChecks>(loaded.body, loaded.table)
+            .map_err(|_| crate::prefix_file::Miss::Undecodable)
+    });
+    let missed = |reason: &'static str| {
+        crate::incremental::update_census(|census| census.prefix_checks = Some(reason));
+        Err(reason)
+    };
+    let persisted = match outcome {
+        Ok(persisted) => persisted,
+        Err(miss) => return missed(miss.label()),
+    };
+    // The world's own content, per source: the record describes exactly the
+    // sources the world was built from (the E12 rule at this seam).
+    if persisted.source_hashes.len() != world.source_hashes.len()
+        || persisted.source_hashes.get(1..) != world.source_hashes.get(1..)
+    {
+        return missed("foreign-content");
+    }
+    let cache = CHECKED_CACHE.get_or_init(|| std::sync::Mutex::new(CheckedCacheState::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.records.contains_key(key) {
+        return Ok(());
+    }
+    if state.records.len() >= CHECKED_CACHE_KEYS {
+        state.records.clear();
+        state.bytes = 0;
+    }
+    let tick = state.next_tick();
+    let mut record = WorldChecks {
+        source_hashes: persisted.source_hashes,
+        sources_fingerprint: replay_sources_fingerprint(world.sources.get(1..).unwrap_or(&[])),
+        per_source: persisted.per_source.into_iter().collect(),
+        per_item: HashMap::default(),
+        post: None,
+        r11: None,
+        bytes: 0,
+        last_used: tick,
+    };
+    record.bytes = record.compute_bytes();
+    state.bytes += record.bytes;
+    state.records.insert(key.clone(), record);
+    state.evict_to_budget(Some(key));
+    drop(state);
+    PREFIX_CHECKS_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::incremental::update_census(|census| census.prefix_checks = Some("loaded"));
+    Ok(())
+}
+
+/// M158: writes the prefix key's checks record beside its world, at the end
+/// of the analysis that built (and wrote) the world, or of one served a
+/// loaded world whose record was a miss (absent — the analysis that wrote the
+/// world fell back to another shape before filing — or damaged): once this
+/// process has filed the record (M19's store and the class D tables).
+/// Nothing for a key no such analysis named, and nothing from a cancelled
+/// analysis (a prefix of itself).
+fn prefix_checks_write(key: &BaseCacheKey) {
+    if crate::cancel::cancelled() {
+        return;
+    }
+    let Some(directory) = crate::incremental::world_cache_dir() else {
+        return;
+    };
+    let file_key = {
+        let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.prefix_checks_wanted.remove(key)
+    };
+    let Some(file_key) = file_key else {
+        return;
+    };
+    let persisted = {
+        let Some(cache) = CHECKED_CACHE.get() else {
+            return;
+        };
+        let state = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(recorded) = state.records.get(key) else {
+            return;
+        };
+        let mut per_source: Vec<(u32, ModuleDiagnostics)> = recorded
+            .per_source
+            .iter()
+            .map(|(index, module)| (*index, module.clone()))
+            .collect();
+        per_source.sort_unstable_by_key(|(index, _)| *index);
+        PersistedChecks {
+            source_hashes: recorded.source_hashes.clone(),
+            per_source,
+        }
+    };
+    let outcome = crate::prefix_file::codec::encode(&persisted)
+        .map_err(|error| error.to_string())
+        .and_then(|(body, table)| {
+            crate::prefix_file::write_checks(&directory, &file_key, &key.std_roots, &body, &table)
+        });
+    match outcome {
+        Ok(written) => {
+            PREFIX_CHECKS_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::incremental::update_census(|census| census.prefix_checks_written = true);
+            if crate::phase_timing_enabled() {
+                eprintln!(
+                    "[vilan phase] prefix-checks-written {} bytes={} us={}",
+                    written.path.display(),
+                    written.bytes,
+                    written.took.as_micros()
+                );
+            }
+        }
+        Err(error) => {
+            if crate::phase_timing_enabled() {
+                eprintln!("[vilan phase] prefix-checks-write-failed {error}");
+            }
+        }
+    }
 }
 
 /// Writes the std-only world this analysis just built and stored, when this
@@ -81937,6 +83057,16 @@ fn prefix_file_write(
     match outcome {
         Ok(written) => {
             PREFIX_FILE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // M158: the checks record follows once this analysis files it.
+            {
+                let cache =
+                    BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+                cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .prefix_checks_wanted
+                    .insert(key.clone(), file_key.clone());
+            }
             // P4: the root held to its byte budget, the least recently used
             // worlds first, never the one just written.
             let evicted = crate::world_cache::bound(
@@ -83231,14 +84361,29 @@ fn std_closure<'a>(
                 .map(|(cut, _)| name[..cut].to_string()),
         );
         // A pure namespace has no row (no body under any root): registered
-        // by the drain, nothing of its own to follow.
-        if let Some(requests) = index.requests.get(&name) {
-            pending.extend(requests.iter().cloned());
-            closure.push(interned_display_name(name));
+        // by the drain, nothing of its own to follow. But it IS part of the
+        // world — `namespace_only_modules`, which an import resolving through
+        // it reads — so it rides in the closure as `name/` (a spelling no
+        // module has): a prefix world built for a program that never named
+        // `std::web` holds no `web` namespace, and serving it to one that does
+        // resolved `std::web::dmo` as the moved web prelude instead of a miss
+        // under the namespace (incr-54c's find, P5).
+        match index.requests.get(&name) {
+            Some(requests) => {
+                pending.extend(requests.iter().cloned());
+                closure.push(interned_display_name(name));
+            }
+            None => closure.push(interned_display_name(format!("{name}/"))),
         }
     }
     closure.sort_unstable();
     closure
+}
+
+/// Whether a std closure entry names a pure NAMESPACE (`name/`, see
+/// [`std_closure`]) rather than a module with a body.
+fn closure_names_a_namespace(entry: &str) -> bool {
+    entry.ends_with('/')
 }
 
 /// The canonical module load order (WO-1b), rhyming with WO-1's import sort:
@@ -84951,6 +86096,12 @@ fn analyze_inner<'src>(
                 true,
             ),
         };
+        // M158: a served prefix whose checks record was a miss writes it once
+        // the record is filed (`prefix_checks_write` asks whether one is due).
+        let prefix_checks = checks_key
+            .as_ref()
+            .filter(|key| key.std_prefix && layered.is_none())
+            .cloned();
         return match analyze_over_world(
             world,
             nodes,
@@ -84961,7 +86112,12 @@ fn analyze_inner<'src>(
             checks_key,
             from_base_cache,
         ) {
-            Ok(program) => program,
+            Ok(program) => {
+                if let Some(key) = prefix_checks {
+                    prefix_checks_write(&key);
+                }
+                program
+            }
             Err(reached) => analyze_inner(
                 nodes,
                 entry_source,
@@ -87411,7 +88567,12 @@ fn analyze_inner<'src>(
             .map(|(name, ..)| *name)
             .collect();
         loaded_std.sort_unstable();
-        let differs = !loaded_std.iter().eq(base_cache_key.std_seeds.iter());
+        // The closure's namespaces register without loading a body, so the
+        // drain's loaded modules are compared with its bodied entries.
+        let differs = !loaded_std.iter().eq(base_cache_key
+            .std_seeds
+            .iter()
+            .filter(|entry| !closure_names_a_namespace(entry)));
         if differs && crate::phase_timing_enabled() {
             eprintln!(
                 "[vilan phase] prefix-closure-mismatch loaded {} closure {}",
@@ -87591,6 +88752,9 @@ fn analyze_inner<'src>(
             world.hot.is_some().then(|| refusal_key.clone()),
         ),
     };
+    // M158: the prefix key's own record (P1's forced shape, not a layered
+    // world's key) is written beside the prefix's file once it is filed.
+    let prefix_checks = (layered.is_none() && checks_key.std_prefix).then(|| checks_key.clone());
     let answer = analyze_over_world(
         world,
         nodes,
@@ -87608,7 +88772,12 @@ fn analyze_inner<'src>(
         false,
     );
     match answer {
-        Ok(program) => program,
+        Ok(program) => {
+            if let Some(key) = prefix_checks {
+                prefix_checks_write(&key);
+            }
+            program
+        }
         Err(reached) => analyze_inner(
             nodes,
             entry_source,
@@ -87975,6 +89144,38 @@ fn analyze_over_world<'src>(
             .unwrap_or_default();
         analyzer.decide_item_records(&item_records, &alias_reaching);
     }
+    // R11 door B (`r11_records.rs`): the cold set a served instance record
+    // is validated against — M110 S3's, sealed here because the checks run
+    // before the seam is; whether this analysis FILES the instances it scans
+    // (the item records' rule: a seeded analysis with a key to file under);
+    // and the world's records, served on a hit under the reuse switches the
+    // module records answer to.
+    // The alias closure is asked on a MISS too (M19's reuse never is, so
+    // `alias_reaching` above is empty there): a record filed under one entry
+    // for a module that reaches it through `pkg::` must not be served under
+    // another entry sharing the world's key, where that module is cold.
+    let alias_reaching_for_records: HashSet<SourceId> = if entry_is_open_module && !from_base_cache
+    {
+        analyzer.alias_reaching_sources()
+    } else {
+        alias_reaching.clone()
+    };
+    analyzer.r11_cold_sources = r11_records::cold_sources(
+        &analyzer.entry_dirty_sources,
+        &alias_reaching_for_records,
+        prefix_len,
+    );
+    analyzer.r11_records_filing = analyzer.item_records_enabled() && r11_records_enabled();
+    analyzer.r11_records_served = checks_key
+        .as_ref()
+        .filter(|_| {
+            from_base_cache
+                && !entry_is_module
+                && r11_records_enabled()
+                && !full_scan_checks_forced()
+                && !crate::incremental::clean_requested()
+        })
+        .and_then(|key| r11_records::checked_cache_lookup_r11(key, &source_hashes[..prefix_len]));
     let reuse_candidates: HashSet<SourceId> = if from_base_cache && !entry_is_module {
         (1..recorded_len as u32)
             .map(SourceId)
@@ -88690,9 +89891,6 @@ fn analyze_over_world<'src>(
             .and_then(|scope_id| analyzer.scopes.get(scope_id))
             .and_then(|scope| scope.name_to_id_map.get(name).copied())
     };
-    if let Some(scan_id) = module_member("process", "scan") {
-        intrinsics.insert(scan_id, Intrinsic::Scan);
-    }
     if let Some(hash_id) = module_member("hash", "canonical_hash") {
         intrinsics.insert(hash_id, Intrinsic::CanonicalHash);
     }
@@ -89296,6 +90494,19 @@ fn analyze_over_world<'src>(
                 .move_rows_live
                 .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M155: R11's candidate rows, per source and per item — a seeded
+        // analysis's record only (a cold check never reads one back).
+        let r11_filed = analyzer.r11_rows_filed && seeded;
+        if r11_filed {
+            analyzer
+                .r11_rows_live
+                .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+            if items_enabled {
+                analyzer
+                    .r11_rows_live
+                    .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+            }
+        }
         // M148: the hover rows, per source and per item — the span rows by
         // their place in the file.
         let slice_at = |source: SourceId, _: Span| -> Option<u32> {
@@ -89328,7 +90539,8 @@ fn analyze_over_world<'src>(
         let families = row_families::FamilySet::default()
             .with(row_families::RowFamily::Moves, analyzer.move_rows_filed)
             .with(row_families::RowFamily::Lazy, analyzer.lazy_rows_filed)
-            .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed);
+            .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed)
+            .with(row_families::RowFamily::R11, r11_filed);
         // M110 S7b: the resource slots per SOURCE (an item's window is
         // classified live), by the slot's own source stamp.
         {
@@ -89362,6 +90574,13 @@ fn analyze_over_world<'src>(
             slice.hover_recorded = records_hover;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
+        // R11 door B: the instance records this analysis derived (a seeded
+        // analysis's, cold callees only), filed beside the checks record —
+        // by a complete analysis only, as the items below are.
+        if !crate::cancel::cancelled() {
+            let derived = std::mem::take(&mut analyzer.r11_records_derived);
+            r11_records::checked_cache_store_r11(key, &source_hashes[..prefix_len], derived);
+        }
         // M110 S7: the item records of the re-walked files, with their
         // slices — filed only by a complete analysis (a cancelled phase is
         // a prefix of itself, and a prefix recorded as a whole would replay
@@ -89389,11 +90608,24 @@ fn analyze_over_world<'src>(
 
     // E145: which identifiers spell an `as` alias rather than its target.
     analyzer.collect_import_alias_spans();
-    // Render each type reference's hover label now that all types are resolved.
+    crate::phase_pass_mark("E145's import-alias spans");
+    // Render each type reference's hover label now that all types are
+    // resolved — where a document can ASK for it (M154): the labels are
+    // hover's alone (find-references and go-to-definition read the
+    // `(file, span, definition)` triple), so they are rendered under the
+    // reading aids only, and only for a file that banks hover rows (never
+    // std's, never a derive's template: no document's focus is either). The
+    // rest carry an empty label — on kolt's served keystroke two thirds of
+    // the world's ~30,000 references are std's.
     let type_references = analyzer
         .type_references
         .iter()
         .map(|(source, span, definition, type_id)| {
+            if !workspace.reading_aids
+                || (*source != SourceId(0) && !analyzer.banks_hover_rows(*source))
+            {
+                return (*source, *span, *definition, String::new());
+            }
             // A macro marker's hover label is its rendered signature.
             if let Some(signature) =
                 definition.and_then(|definition| analyzer.macro_signatures.get(&definition))
@@ -89405,6 +90637,7 @@ fn analyze_over_world<'src>(
             (*source, *span, *definition, label)
         })
         .collect::<Vec<_>>();
+    crate::phase_pass_mark("the type-reference labels");
 
     // Resolve the diagnostic attribution marks before `diagnostics` moves into
     // the Program: a diagnostic's source is the last mark at or before its index
@@ -89712,13 +90945,11 @@ fn analyze_over_world<'src>(
                 && !crate::cancel::cancelled()
                 && !crate::incremental::clean_requested() =>
         {
-            let cold_sources: Vec<SourceId> = (1..prefix_len as u32)
-                .map(SourceId)
-                .filter(|source| {
-                    !analyzer.entry_dirty_sources.contains(source)
-                        && !alias_reaching.contains(source)
-                })
-                .collect();
+            let cold_sources: Vec<SourceId> = r11_records::cold_sources(
+                &analyzer.entry_dirty_sources,
+                &alias_reaching,
+                prefix_len,
+            );
             let cold_fingerprint = {
                 let mut rendered = String::new();
                 for source in &cold_sources {
@@ -89892,6 +91123,7 @@ fn analyze_over_world<'src>(
         unwired_method_calls: analyzer.unwired_method_calls,
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
+        for_each_context_arguments: HashMap::default(),
         cleared_clause_contexts: HashSet::default(),
         context_bindings: Vec::new(),
         bool_enum_id: analyzer.bool_enum_id,

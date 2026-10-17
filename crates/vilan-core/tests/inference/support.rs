@@ -121,9 +121,49 @@ fn free_space(path: &Path) -> String {
 }
 
 pub fn std_spec() -> PackageSpec {
+    std_prefix_for_this_binary();
     vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
     )
+}
+
+/// std-prefix P5 (N157, Order 54): this binary's analyses build over the std
+/// prefix, persisted in the suite's world cache (`VILAN_TEST_WORLD_CACHE`,
+/// which `.cargo/config.toml` points at `target/world-cache`) — so a test
+/// process loads std's world and its checks record (M158) from the file an
+/// earlier test process wrote, instead of analyzing std again (nextest gives
+/// every test its own process, so an in-process world dies with its test).
+/// Every program here is one file, the shape in which the prefix and the
+/// canonical path are one layout (`std-prefix.md` §14.2); a program the
+/// prefix refuses (a macro definition, a package prelude) takes the canonical
+/// path as it always did. Outside cargo's environment (no variable), or with
+/// the variable `off`, the binary analyzes as it did before P5.
+fn std_prefix_for_this_binary() {
+    static OPTED_IN: std::sync::Once = std::sync::Once::new();
+    OPTED_IN.call_once(|| {
+        let Some(directory) = std::env::var_os("VILAN_TEST_WORLD_CACHE") else {
+            return;
+        };
+        // `off` (or empty) from the shell keeps the binary canonical — the
+        // measurement's other leg.
+        if directory.is_empty() || directory == "off" || directory == "0" {
+            return;
+        }
+        vilan_core::incremental::set_world_cache(Some(Some(PathBuf::from(directory))));
+        vilan_core::incremental::set_std_prefix(Some(true));
+    });
+}
+
+/// P5's opt-out, for a pin that MEASURES an analysis (a count it leaves
+/// behind, the rows a lookup examined) and so needs the canonical shape it was
+/// written against: a cold analysis after `base_cache_clear` (which a
+/// persisted prefix outlives, being on disk) or a base-cache hit of the same
+/// world. Called first in the test; the binary's opt-in is taken first so it
+/// cannot run after this and undo it.
+pub fn without_the_std_prefix() {
+    std_prefix_for_this_binary();
+    vilan_core::incremental::set_std_prefix(Some(false));
+    vilan_core::incremental::set_world_cache(Some(None));
 }
 
 /// Compile a source through the full pipeline (analyze → context → infer →

@@ -1280,6 +1280,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_read_dir_all",
         "__fs_watch",
         "__fs_watch_stop",
+        "__stdin_line",
+        "__stdout_write",
         "__local_get",
         "__response_header",
         "__session_get",
@@ -1302,28 +1304,17 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__chunk_load",
         "__chunk_preload",
         "__is_null",
+        "__trace_line",
+        "__trace_task",
+        "__trace_run",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
 
-/// The JS source for a runtime helper an intrinsic call needs. `__scan` reads
-/// all of stdin once and hands out one line per call; `__parse_i32` returns the
-/// `Option<i32>` array form (`[0, n]` = `Some`, `[1]` = `None`).
+/// The JS source for a runtime helper an intrinsic call needs. `__parse_i32`
+/// returns the `Option<i32>` array form (`[0, n]` = `Some`, `[1]` = `None`).
 fn helper_source(name: &str) -> &'static str {
     match name {
-        "__scan" => {
-            "let __vilan_stdin = null, __vilan_stdin_index = 0;\n\
-             function __scan() {\n\
-             \tif (__vilan_stdin === null) {\n\
-             \t\ttry {\n\
-             \t\t\t__vilan_stdin = require(\"fs\").readFileSync(0, \"utf-8\").split(\"\\n\");\n\
-             \t\t} catch (error) {\n\
-             \t\t\t__vilan_stdin = [];\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn __vilan_stdin_index < __vilan_stdin.length ? __vilan_stdin[__vilan_stdin_index++] : \"\";\n\
-             }"
-        }
         // STRICT parses: the whole (trimmed) text must be the number — trailing
         // garbage, a fractional part on an integer, or an out-of-range value is
         // `None`, not a truncation (`parseInt`'s liberality said the wrong thing).
@@ -1697,6 +1688,43 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              }"
         }
+        // The reactive trace's three seams (`std::reactive::trace`, E257 S8).
+        // A line goes where `dbg` writes: stderr under a process (and so to
+        // a debugger through the inspector's console events), the console in
+        // the browser. A queued wake's task is made on the waking write's
+        // stack (`console.createTask`), held by token on `globalThis` (the
+        // helpers are declarations; state of their own would need a
+        // declaration order), and the wake runs inside it — the host's async
+        // stack tagging, which a debugger shows as the waking write under
+        // the woken frame. A host without tasks runs the body plainly.
+        "__trace_line" => {
+            "function __trace_line(line) {\n\
+             \tif (typeof process === \"object\") {\n\
+             \t\tconsole.error(line);\n\
+             \t} else {\n\
+             \t\tconsole.log(line);\n\
+             \t}\n\
+             }"
+        }
+        "__trace_task" => {
+            "function __trace_task(token, name) {\n\
+             \tif (typeof console.createTask === \"function\") {\n\
+             \t\t(globalThis.__vilan_trace_tasks ??= new Map()).set(token, console.createTask(name));\n\
+             \t}\n\
+             }"
+        }
+        "__trace_run" => {
+            "function __trace_run(token, body) {\n\
+             \tconst tasks = globalThis.__vilan_trace_tasks;\n\
+             \tconst task = tasks === undefined ? undefined : tasks.get(token);\n\
+             \tif (task === undefined) {\n\
+             \t\tbody();\n\
+             \t\treturn;\n\
+             \t}\n\
+             \ttasks.delete(token);\n\
+             \ttask.run(body);\n\
+             }"
+        }
         // `__guarded` is the one a loop that must FINISH wants — `Owner`'s
         // cleanup group, where a throwing cleanup would otherwise leave every
         // later one in the group undisposed. `None` when `body` returned;
@@ -1987,6 +2015,106 @@ fn helper_source(name: &str) -> &'static str {
         // Q1's exception. Idempotent: a second stop is a no-op, so the
         // destructor stays benign behind any earlier `drop(watcher)`. No
         // public `stop()` surfaces it — the destructor is the only caller.
+        // `std::process::read_line`'s host half (A173 S1): ONE shared stdin
+        // pump, read incrementally — never to EOF first, so an interactive
+        // program answers each line as it is typed. `'data'` appends to the
+        // buffer and `'end'` marks the end; waiters queue and are answered in
+        // order, a line at a time. `\n`, `\r\n` and a lone `\r` each end a line:
+        // a `\r` answers at once and remembers it (`carriage`), so a `\n`
+        // arriving next — in this chunk or the next — is that same ending, and
+        // the split falls identically whatever the chunk boundaries were. At
+        // the end the remainder (if any) is a last line, then `None` (`[1]`)
+        // for every later read.
+        //
+        // The pump lets go of stdin whenever nobody waits: `pause()` stops the
+        // reads and `unref()` stops the handle holding the event loop — without
+        // it a PIPE whose writer stays open keeps the process alive after
+        // `main` ends (3.4 s against 0.47 s in papers-54's probe). `ref()` +
+        // `resume()` again while a waiter is pending: a pending promise is not
+        // a handle, the `ref()` is what holds the loop for the read. (A file
+        // redirect's stream has no `ref`/`unref`; it ends by itself.)
+        //
+        // An abort of the ambient cancel signal removes that waiter and
+        // rejects it with the signal's reason, as `__sleep` does; a line that
+        // arrives later stays buffered for the next reader — cancellation
+        // abandons the WAIT, never a line. The B?1 history: the helper this
+        // replaced called `require("fs")` inside the emitted ES module (`.mjs`
+        // since B86b, v0.33.0), and its own `catch` turned the
+        // `ReferenceError` into "" for every call.
+        "__stdin_line" => {
+            "const __vilan_stdin = { buffer: \"\", ended: false, carriage: false, started: false, waiters: [] };\n\
+             function __stdin_pump() {\n\
+             \tconst state = __vilan_stdin;\n\
+             \twhile (state.waiters.length > 0) {\n\
+             \t\tif (state.carriage && state.buffer.length > 0) {\n\
+             \t\t\tif (state.buffer[0] === \"\\n\") state.buffer = state.buffer.slice(1);\n\
+             \t\t\tstate.carriage = false;\n\
+             \t\t\tcontinue;\n\
+             \t\t}\n\
+             \t\tconst end = state.buffer.search(/[\\r\\n]/);\n\
+             \t\tif (end >= 0) {\n\
+             \t\t\tconst line = state.buffer.slice(0, end);\n\
+             \t\t\tstate.carriage = state.buffer[end] === \"\\r\";\n\
+             \t\t\tstate.buffer = state.buffer.slice(end + 1);\n\
+             \t\t\tstate.waiters.shift().resolve([ 0, line ]);\n\
+             \t\t} else if (state.ended) {\n\
+             \t\t\tconst rest = state.buffer;\n\
+             \t\t\tstate.buffer = \"\";\n\
+             \t\t\tstate.waiters.shift().resolve(rest.length > 0 ? [ 0, rest ] : [ 1 ]);\n\
+             \t\t} else {\n\
+             \t\t\tprocess.stdin.ref?.();\n\
+             \t\t\tprocess.stdin.resume();\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t}\n\
+             \tif (state.started && !state.ended) {\n\
+             \t\tprocess.stdin.pause();\n\
+             \t\tprocess.stdin.unref?.();\n\
+             \t}\n\
+             }\n\
+             function __stdin_line(signal) {\n\
+             \tconst sig = signal && signal[0] === 0 ? signal[1] : undefined;\n\
+             \treturn new Promise((resolve, reject) => {\n\
+             \t\tif (sig && sig.aborted) {\n\
+             \t\t\treject(sig.reason);\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t\tconst state = __vilan_stdin;\n\
+             \t\tif (!state.started) {\n\
+             \t\t\tstate.started = true;\n\
+             \t\t\tprocess.stdin.setEncoding(\"utf8\");\n\
+             \t\t\tprocess.stdin.on(\"data\", (chunk) => {\n\
+             \t\t\t\tstate.buffer += chunk;\n\
+             \t\t\t\t__stdin_pump();\n\
+             \t\t\t});\n\
+             \t\t\tconst ended = () => {\n\
+             \t\t\t\tstate.ended = true;\n\
+             \t\t\t\t__stdin_pump();\n\
+             \t\t\t};\n\
+             \t\t\tprocess.stdin.on(\"end\", ended);\n\
+             \t\t\tprocess.stdin.on(\"error\", ended);\n\
+             \t\t}\n\
+             \t\tconst abort = () => {\n\
+             \t\t\tconst parked = state.waiters.indexOf(waiter);\n\
+             \t\t\tif (parked >= 0) state.waiters.splice(parked, 1);\n\
+             \t\t\treject(sig.reason);\n\
+             \t\t\t__stdin_pump();\n\
+             \t\t};\n\
+             \t\tconst waiter = { resolve: (line) => {\n\
+             \t\t\tif (sig) sig.removeEventListener(\"abort\", abort);\n\
+             \t\t\tresolve(line);\n\
+             \t\t} };\n\
+             \t\tstate.waiters.push(waiter);\n\
+             \t\tif (sig) sig.addEventListener(\"abort\", abort, { once: true });\n\
+             \t\t__stdin_pump();\n\
+             \t});\n\
+             }"
+        }
+        // `std::process::prompt`'s write (A173 S1, E?5): stdout with NO
+        // newline. node writes stdout synchronously to a file and, on Linux, to
+        // a pipe and a TTY, so the text is out before the read that follows
+        // parks — and in order with `console.log`, which writes the same stream.
+        "__stdout_write" => "function __stdout_write(text) {\n\tprocess.stdout.write(text);\n}",
         "__fs_watch_stop" => "function __fs_watch_stop(watcher) {\n\twatcher.stop();\n}",
         // Cryptographically random bytes.
         "__random_bytes" => {
@@ -2881,7 +3009,7 @@ struct Transformer<'src> {
     // decided by the analyzer's verdict on each payload, which an instance
     // never re-decides, so one answer serves every call.
     payload_view_variants_memo: HashMap<Id, Vec<usize>>,
-    // Runtime helper functions (`__scan`, `__parse_i32`, `__random_int`) an
+    // Runtime helper functions (`__parse_i32`, `__env`, `__random_int`) an
     // intrinsic call needs; emitted as a prelude only when used.
     used_helpers: BTreeSet<&'static str>,
     // Host imports an `[extern]` call needs, as module -> imported symbols;
@@ -3533,10 +3661,7 @@ impl<'src> Transformer<'src> {
         // needs no capture: teardown runs and `main` falls through, the tail's side
         // effects preserved.
         let mut t_main_fn_body = if self.scope_needs_drops(&main_fn.body.0) {
-            let tail_is_void = matches!(
-                self.program.entity_map.get(&main_fn.body.1),
-                Some(Expr::Void) | None
-            );
+            let tail_is_void = self.main_tail_is_void(main_fn.body.1);
             if tail_is_void || !self.program.platform.has_process_exit() {
                 let mut body = self.walk_scope_body(
                     &main_fn.body.0,
@@ -3593,6 +3718,16 @@ impl<'src> Transformer<'src> {
             // disposition — exiting or assigning one emits `process.exit(return)`.
             let tail = match tail {
                 Some(value) if value.is_divergent() => {
+                    t_main_fn_body.push(value);
+                    None
+                }
+                // std-54's B?1: a tail whose TYPE is void — a `match` of void
+                // arms, a call written without its `;` — has no exit code to
+                // forward, so it is a plain statement and `main` falls
+                // through: `process.exit` would end the process under a
+                // spawned task still pending, which the native backend waits
+                // for.
+                Some(value) if self.main_tail_is_void(main_fn.body.1) => {
                     t_main_fn_body.push(value);
                     None
                 }
@@ -4001,6 +4136,11 @@ impl<'src> Transformer<'src> {
             });
         }
 
+        // E323/E324: what the sidecar can name only once the walk is over —
+        // the functions a written `Debug` impl prints by, the tables each
+        // trait object can hold (a listed arm: it records, it emits nothing).
+        self.finish_debug_recording();
+
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
         let program = self.program;
         t_functions.sort_by_key(|a| program.canonical_declaration_key(a.0));
@@ -4064,7 +4204,7 @@ impl<'src> Transformer<'src> {
         main_body_start += planted.iter().filter(|at| **at < main_body_start).count();
 
         // Host imports (`import { a, b } from "module";`) from `[extern]` calls,
-        // then runtime helpers (`__scan`, ...) — both a prelude before the body.
+        // then runtime helpers (`__parse_i32`, ...) — both a prelude before the body.
         let imports = self
             .used_imports
             .iter()
@@ -8093,11 +8233,22 @@ impl<'src> Transformer<'src> {
                     let next_dispatch = self.for_each_next_dispatch(id, next_id);
                     let iterator_name = self.ng.next_name();
                     let next_value_name = self.ng.next_name();
-                    let next_call = self.emit_dispatch(
-                        next_dispatch,
-                        vec![js::Node::Local(iterator_name.clone())],
-                        None,
-                    );
+                    // papers-54's B?2: the context arguments the context
+                    // pass threaded to the loop's `next`, after the iterator.
+                    let mut next_arguments = vec![js::Node::Local(iterator_name.clone())];
+                    for argument_id in self
+                        .program
+                        .for_each_context_arguments
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        next_arguments.push(
+                            self.walk_entity(argument_id, block)
+                                .unwrap_or(js::Node::Void),
+                        );
+                    }
+                    let next_call = self.emit_dispatch(next_dispatch, next_arguments, None);
                     block.push(js::Node::ConstVariable(js::Variable {
                         name: iterator_name.clone(),
                         value: Box::new(t_iterable),
@@ -10399,10 +10550,6 @@ impl<'src> Transformer<'src> {
         }
         let mut args = args.into_iter();
         match intrinsic {
-            Intrinsic::Scan => {
-                self.used_helpers.insert("__scan");
-                js::Node::Call(Box::new(js::Node::Local("__scan".to_string())), Vec::new())
-            }
             Intrinsic::StrTrim => native_method(&mut args, "trim"),
             Intrinsic::StrToLowercase => native_method(&mut args, "toLowerCase"),
             Intrinsic::StrToUppercase => native_method(&mut args, "toUpperCase"),
@@ -12101,6 +12248,9 @@ impl<'src> Transformer<'src> {
         if let Some(show) = self.object_show_slot(type_id) {
             entries.push(("$show".to_string(), show));
         }
+        // E324: the sidecar names this table by its functions (a listed arm:
+        // it records, it emits nothing).
+        self.record_vtable(type_id, trait_id, &entries);
         // M89: a table whose every slot names a function is a function of its
         // slot set, so a second pair answering every member with the same
         // functions — a blanket's members over two stage types, say — names
@@ -14537,14 +14687,17 @@ struct SiteWalk<'src> {
 /// What one site reaches in the world — the per-site half of what used to be a
 /// per-site mini-program.
 pub struct SiteReach {
-    /// The concrete functions it reaches, in entity-id order (the order a
-    /// mini-program declared them in).
-    functions: Vec<Id>,
-    /// The `monomorphized` slots it reaches, in emission order.
-    slots: Vec<usize>,
-    /// Every module-level binding its code reads — the prelude's input, and
-    /// what anything not compile-time-known is reported from.
-    globals: HashSet<Id>,
+    /// The union of the site's requirements' closures (M147 (3)): the concrete
+    /// functions it reaches in entity-id order (the order a mini-program
+    /// declared them in), the `monomorphized` slots in emission order, and the
+    /// module-level bindings they read. SHARED with every site whose walk
+    /// required the same set (M161) — kolt's style chain, the same union at
+    /// almost every site — and never copied per site.
+    union: Rc<ReachClosure>,
+    /// The module-level bindings the site's OWN walk read, beside the union's
+    /// — with them, the prelude's input, and what anything not
+    /// compile-time-known is reported from.
+    own_globals: Vec<Id>,
     helpers: Vec<&'static str>,
     imports: Vec<String>,
 }
@@ -14627,19 +14780,25 @@ impl<'src> ConstWorld<'src> {
         // The fixpoint runs against the SITE's reached bindings, in a frame of
         // its own — emitting a binding's initializer can reference more bindings
         // (and, in principle, require more code), and both belong to this site.
+        // M161: the frame starts from the site's OWN rows; the shared union's
+        // bindings join the first round's batch straight from the union, so
+        // neither is copied into a per-site set.
         let frame = transformer.record_enter();
-        transformer.referenced_globals = reach.globals.clone();
+        transformer.referenced_globals = reach.own_globals.iter().copied().collect();
         let mut declared: HashSet<Id> = HashSet::default();
         let mut unresolved: Vec<Id> = Vec::new();
         let mut prelude: Vec<js::Node<'src>> = Vec::new();
+        let mut shared: Option<&HashSet<Id>> = Some(&reach.union.globals);
         loop {
             // `referenced_globals` is a `HashSet`, so sort each round's batch by
             // entity id — the canonical key — or the prelude's declaration order
             // (and any diagnostic order derived from it) would vary run to run
             // (`b33-emission-order.md` §4).
-            let mut pending: Vec<Id> = transformer
-                .referenced_globals
-                .iter()
+            let mut pending: Vec<Id> = shared
+                .take()
+                .into_iter()
+                .flatten()
+                .chain(transformer.referenced_globals.iter())
                 .copied()
                 .filter(|id| is_external(id) && !declared.contains(id))
                 .collect();
@@ -14647,6 +14806,7 @@ impl<'src> ConstWorld<'src> {
                 break;
             }
             pending.sort_by_key(|id| id.0);
+            pending.dedup();
             for binding in pending {
                 declared.insert(binding);
                 // Non-variable references (functions, struct names) emit through
@@ -14705,9 +14865,26 @@ impl<'src> ConstWorld<'src> {
         let closed = transformer.record_leave(frame, None).unwrap_or_default();
         // Whatever the prelude's own walks added belongs to this site too.
         if closed.requires.is_empty() {
-            reach.globals = closed.globals;
+            reach.own_globals = closed.globals.into_iter().collect();
         } else {
-            reach = self.reach_from(&closed);
+            // B?2 (incr-54a's find): the prelude's requirements JOIN the site's
+            // own. The frame opened empty, so `closed` alone is the prelude's
+            // reach — a G24 snapshot written into it (`const let add = |n|
+            // helper(n)`) requires `helper` — and taken alone it dropped every
+            // function the site's expression reached: `const twice(add(1))`
+            // failed with "unknown host call `twice`".
+            let mut seed = self
+                .sites
+                .get(&expr_id)
+                .map(|site| site.record.clone())
+                .unwrap_or_default();
+            seed.requires.extend(closed.requires);
+            seed.globals.extend(closed.globals);
+            seed.helpers.extend(closed.helpers);
+            for (module, symbols) in closed.imports {
+                seed.imports.entry(module).or_default().extend(symbols);
+            }
+            reach = self.reach_from(&seed);
         }
         (reach, prelude, unresolved)
     }
@@ -14739,13 +14916,13 @@ impl<'src> ConstWorld<'src> {
         prelude: Vec<js::Node<'src>>,
     ) -> ConstSite<'world> {
         let mut world: Vec<&'world js::Node<'world>> =
-            Vec::with_capacity(reach.functions.len() + reach.slots.len());
-        for function_id in &reach.functions {
+            Vec::with_capacity(reach.union.functions.len() + reach.union.slots.len());
+        for function_id in &reach.union.functions {
             if let Some(node) = self.transformer.required_functions.get(function_id) {
                 world.push(node);
             }
         }
-        for slot in &reach.slots {
+        for slot in &reach.union.slots {
             if let Some(node) = self.transformer.monomorphized.get(*slot) {
                 world.push(node);
             }
@@ -14879,10 +15056,14 @@ impl<'src> ConstWorld<'src> {
             Some(recorder) => self.union_of(&seed.requires, recorder),
             None => Rc::new(ReachClosure::default()),
         };
-        // The shared union is the large half: copied whole (a table copy, not a
-        // re-hash of every row), the site's own few rows added to the copy.
-        let mut globals = union.globals.clone();
-        globals.extend(seed.globals.iter().copied());
+        // The shared union is the large half: held behind its `Rc` (M161),
+        // the site's own few rows beside it.
+        let own_globals: Vec<Id> = seed
+            .globals
+            .iter()
+            .copied()
+            .filter(|global| !union.globals.contains(global))
+            .collect();
         let mut helpers = union.helpers.clone();
         helpers.extend(seed.helpers.iter().copied());
         let mut imports = union.imports.clone();
@@ -14892,11 +15073,9 @@ impl<'src> ConstWorld<'src> {
                 .or_default()
                 .extend(symbols.iter().cloned());
         }
-        let (functions, slots) = (union.functions.clone(), union.slots.clone());
         SiteReach {
-            functions,
-            slots,
-            globals,
+            union,
+            own_globals,
             helpers: helpers.into_iter().collect(),
             imports: imports
                 .iter()
@@ -15322,7 +15501,10 @@ const RESERVED_NAMES: &[&str] = &[
     "__dbg_map",
     "__dbg_set",
     "__dbg_stack",
-    "__scan",
+    "__vilan_stdin",
+    "__stdin_pump",
+    "__stdin_line",
+    "__stdout_write",
     "__parse_i32",
     "__parse_f64",
     "__random_int",
@@ -16192,6 +16374,51 @@ fn bodyless_refusal_frame(requester: Option<(&str, Option<&str>)>) -> String {
         }
         Some((frame, None)) => format!(". It was first reached while emitting `{frame}`"),
         None => String::new(),
+    }
+}
+
+impl<'src> Transformer<'src> {
+    /// Whether `main`'s tail answers no exit code: none written (a block whose
+    /// last statement carried its `;`), or an expression whose TYPE is void
+    /// (std-54's B?1: decided by the type, not by the tail's syntax).
+    fn main_tail_is_void(&self, tail: Id) -> bool {
+        let is_void = |type_id: TypeId| {
+            self.program
+                .type_id_to_type_map
+                .get(&self.resolve_type_id(type_id))
+                .is_some_and(|type_| matches!(type_, Type::Void))
+        };
+        match self.program.entity_map.get(&tail) {
+            Some(Expr::Void) | None => true,
+            // A call records no type of its own: its callee's return answers
+            // — declared, inferred, or an external's.
+            Some(Expr::Call(call_id)) => self
+                .program
+                .function_calls
+                .get(call_id)
+                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => Some(*target),
+                    _ => None,
+                })
+                .and_then(|target| {
+                    self.program
+                        .functions
+                        .get(&target)
+                        .and_then(|function| {
+                            function.return_type_id.or_else(|| {
+                                self.program.inferred_return_types.get(&target).copied()
+                            })
+                        })
+                        .or_else(|| {
+                            self.program
+                                .external_functions
+                                .get(&target)
+                                .map(|external| external.return_type_id)
+                        })
+                })
+                .is_some_and(is_void),
+            Some(_) => self.expr_type_id(tail).is_some_and(is_void),
+        }
     }
 }
 

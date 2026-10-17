@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use vilan_core::incremental::{
     Census, clean_analysis, clean_analysis_keeping_hot_shape, render_observation,
 };
-use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
+use vilan_core::{
+    BuildOptions, EntryMode, PackageSpec, Platform, Workspace, analyze_source, transform,
+};
 
 use super::std_spec;
 
@@ -230,6 +232,69 @@ pub fn observe(package: &Package, seeds: Vec<PathBuf>, leg: Leg) -> Observation 
                 Leg::Incremental => analyze(),
                 Leg::Clean => clean_analysis(analyze),
                 Leg::CleanSameShape => clean_analysis_keeping_hot_shape(analyze),
+            };
+            let census = vilan_core::incremental::census();
+            let rendering = program
+                .as_ref()
+                .map(|program| render_observation(program, &errors))
+                .unwrap_or_else(|| format!("no program: {errors:?}"));
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            Observation {
+                rendering,
+                javascript,
+                census,
+            }
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// M159: one analysis of `file` as a LONE open document — the language
+/// server's M104 hybrid, the editor's common row: the module is the entry
+/// (file mode, the package's `main` named as its declared program, as a
+/// manifest would name it), and the incremental leg is SEEDED with the
+/// document's own path (door (a)), so the post passes' record is filed and
+/// read as on the world-mode path. A seed that is the entry names no hot
+/// module: there is no hot-set shape, so the clean leg is the canonical one
+/// for both comparisons.
+pub fn observe_lone(package: &Package, file: &str, leg: Leg) -> Observation {
+    let entry_text = package.text(file).to_string();
+    let pkg_root = package.directory.clone();
+    let entry = package.path(file);
+    let platform = package.platform;
+    let seeds = match leg {
+        Leg::Incremental => vec![entry.clone()],
+        Leg::Clean | Leg::CleanSameShape => Vec::new(),
+    };
+    let workspace = Workspace {
+        entry_mode: EntryMode::OpenFile {
+            declared_entries: vec!["main".to_string()],
+        },
+        ..package.workspace(seeds)
+    };
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(entry_text.into_boxed_str());
+            let analyze = || {
+                analyze_source(
+                    leaked,
+                    &std_spec(),
+                    &pkg_root,
+                    &entry,
+                    Some(platform),
+                    &workspace,
+                )
+            };
+            let (program, errors) = match leg {
+                Leg::Incremental => analyze(),
+                Leg::Clean | Leg::CleanSameShape => clean_analysis(analyze),
             };
             let census = vilan_core::incremental::census();
             let rendering = program
@@ -1297,6 +1362,294 @@ pub const EFFECT_FIXTURES: &[Fixture] = &[
         dependencies: &[],
     },
 ];
+
+// --- M138: the async worklist restarted from the world's cold instance record --
+//
+// A cold module whose instance verdicts the HOT set decides through each of
+// the reads M138's record logs: `relay` hands `twice` a closure that calls a
+// trait dispatch (`via`), and a hot impl of the trait turning async makes the
+// closure async — so `relay` discovers `twice`'s adapted instance and awaits
+// it; `twice_hook` hands `twice` a cold binding a hot module assigns, and an
+// async closure assigned there does the same; `slow_twice` instantiates
+// `twice` at an always-async closure, so the record holds `(twice, [f])` and
+// `(apply, [f])` and the hot caller whose closure turns async is SERVED them.
+// The world's record is filed over the base text; each edit moves one read.
+
+pub const ASYNC_RECORD_MAIN: &str =
+    "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
+
+pub const ASYNC_RECORD_LIB: &str = "import std::time;\n\nexport trait Fetch {\n\tfun fetch(self): i32;\n}\n\nexport struct Plain {\n\tn: i32,\n}\n\nimpl Plain with Fetch {\n\tfun fetch(self): i32 {\n\t\tself.n\n\t}\n}\n\nexport fun via<T: Fetch>(source: T): i32 {\n\tsource.fetch()\n}\n\nexport fun apply(f: || i32): i32 {\n\tf()\n}\n\nexport fun twice(f: || i32): i32 {\n\tapply(f) + apply(f)\n}\n\nexport fun relay(): i32 {\n\tlet source = Plain { n = 1 };\n\ttwice(|| via(source))\n}\n\nexport mut hook = || 1;\n\nexport fun twice_hook(): i32 {\n\ttwice(hook)\n}\n\nexport fun slow_twice(): i32 {\n\ttwice(|| {\n\t\ttime::sleep(1);\n\t\t1\n\t})\n}\n";
+
+pub const ASYNC_RECORD_VIEWS: &str = "import std::time;\nimport pkg::lib::{ Fetch, hook, relay, slow_twice, twice, twice_hook };\n\nstruct Quick {\n\tn: i32,\n}\n\nimpl Quick with Fetch {\n\tfun fetch(self): i32 {\n\t\tself.n\n\t}\n}\n\nexport fun render(): i32 {\n\trelay() + twice_hook() + slow_twice() + twice(|| 3)\n}\n";
+
+pub const ASYNC_RECORD_FIXTURES: &[Fixture] = &[Fixture {
+    name: "async_record",
+    platform: NODE,
+    files: &[
+        ("main.vl", ASYNC_RECORD_MAIN),
+        ("lib.vl", ASYNC_RECORD_LIB),
+        ("views.vl", ASYNC_RECORD_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a hot impl turns async under a cold generic's dispatch: the cold closure's caller must adapt (M138)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[("\t\tself.n\n", "\t\ttime::sleep(1);\n\t\tself.n\n")],
+        },
+        Edit {
+            label: "a hot assignment hands a cold binding an async closure: the cold caller must adapt (M138)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "export fun render(): i32 {\n",
+                "export fun render(): i32 {\n\thook = || {\n\t\ttime::sleep(1);\n\t\t2\n\t};\n",
+            )],
+        },
+        Edit {
+            label: "a hot call's closure turns async: the cold callee's recorded instance is served (M138)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "twice(|| 3)",
+                "twice(|| {\n\t\ttime::sleep(1);\n\t\t3\n\t})",
+            )],
+        },
+    ],
+    dependencies: &[],
+}];
+
+// --- M138's find: S3b's cold result over a value a HOT module holds ----------
+//
+// A cold binding a hot module assigns an `async || T` FIELD READ into: S3b's
+// cold result (the base fixpoint over the cold nodes) asked the binding's held
+// values without asking where they came from, so `call_hook` entered the cold
+// set through the hot assignment, and the keystroke that removes it was served
+// a seed it could not shrink from.
+
+pub const S3B_HELD_LIB: &str =
+    "export mut hook = || 1;\n\nexport fun call_hook(): i32 {\n\thook()\n}\n";
+
+pub const S3B_HELD_VIEWS: &str = "import std::time;\nimport pkg::lib::{ call_hook, hook };\n\nstruct Holder {\n\trun: async || i32,\n}\n\nexport fun render(): i32 {\n\tlet holder = Holder { run = || {\n\t\ttime::sleep(1);\n\t\t2\n\t} };\n\thook = holder.run;\n\tcall_hook()\n}\n";
+
+pub const S3B_HELD_FIXTURES: &[Fixture] = &[Fixture {
+    name: "s3b_held",
+    platform: NODE,
+    files: &[
+        ("main.vl", ASYNC_RECORD_MAIN),
+        ("lib.vl", S3B_HELD_LIB),
+        ("views.vl", S3B_HELD_VIEWS),
+    ],
+    edits: &[Edit {
+        label: "a hot assignment of an async field read into a cold binding removed: the cold caller must turn sync (S3b)",
+        file: "views.vl",
+        seed: None,
+        replacements: &[("\thook = holder.run;\n", "")],
+    }],
+    dependencies: &[],
+}];
+
+// --- B635: the cold rewrite's mints, a function of the cold rows alone --------
+//
+// A cold covered-to-safe boundary — `read_mood`'s strict read calls `peek`,
+// whose safe read takes `Option<i32>`, so the threaded argument is a minted
+// `Some(..)` wrap CALL — beside a hot leaf whose keystroke makes a hot function
+// need the context (a hidden parameter minted, and a threaded argument at its
+// caller). The cold log is the same on every keystroke, so the recorded
+// post-rewrite cold graph is replayed; until B635 the hot parameter minted
+// before the cold threaded arguments and every cold wrap's id moved under the
+// replay.
+
+pub const B635_CTX: &str = "import std::context::Context;\nimport std::option::Option::{ Some, None };\n\nexport let mood = Context<i32>::new();\n\nfun peek(): i32 {\n\tmatch mood.get_safe() {\n\t\tSome(let value) => value,\n\t\tNone => 0,\n\t}\n}\n\nexport fun read_mood(): i32 {\n\tmood.get() + peek()\n}\n";
+
+pub const B635_VIEWS: &str = "import std::option::Option::{ Some, None };\nimport pkg::ctx::{ mood, read_mood };\n\nexport fun render(): i32 {\n\tmood.run(5, || read_mood())\n}\n\nexport fun extra(): i32 {\n\t1\n}\n";
+
+pub const B635_MAIN: &str = "import pkg::views::{ extra, render };\n\nfun main() {\n\tprint(render());\n\tprint(extra());\n}\n";
+
+pub const B635_FIXTURES: &[Fixture] = &[Fixture {
+    name: "b635_wraps",
+    platform: NODE,
+    files: &[
+        ("main.vl", B635_MAIN),
+        ("ctx.vl", B635_CTX),
+        ("views.vl", B635_VIEWS),
+    ],
+    edits: &[Edit {
+        label: "a hot function gains a safe context read beside a cold covered-to-safe wrap (B635)",
+        file: "views.vl",
+        seed: None,
+        replacements: &[(
+            "\t1\n",
+            "\tmatch mood.get_safe() {\n\t\tSome(let value) => value,\n\t\tNone => 1,\n\t}\n",
+        )],
+    }],
+    dependencies: &[],
+}];
+
+// --- M159: the LONE open document's own class --------------------------------
+//
+// A module opened ALONE (the language server's M104 hybrid: file mode, seeded
+// with its own path) whose keystroke removes an effect the post passes decide
+// over the whole world: a `sleep` that made a function async, whose module
+// binding's initializer is refused while it is. A file-mode program emits no
+// JS, so the S3b seed's staleness has to show as a diagnostic here — the
+// refusal a clean analysis drops once the sleep goes.
+
+pub const LONE_MAIN: &str = "import pkg::lone::{ paused, pause_once };\nimport pkg::views::render;\n\nfun main() {\n\tprint(paused);\n\tprint(pause_once());\n\tprint(render());\n}\n";
+
+pub const LONE_LONE: &str = "import std::time;\nimport pkg::ctx::read_mood;\n\nexport fun pause_once(): i32 {\n\ttime::sleep(1);\n\tread_mood()\n}\n\nexport let paused = pause_once();\n";
+
+pub const LONE_FIXTURES: &[Fixture] = &[Fixture {
+    name: "lone",
+    platform: NODE,
+    files: &[
+        ("main.vl", LONE_MAIN),
+        ("ctx.vl", EFFECT_CTX),
+        ("lone.vl", LONE_LONE),
+        ("views.vl", POST_PASS_VIEWS),
+    ],
+    edits: &[Edit {
+        label: "a sleep removed from the lone document: the initializer's refusal must go (M159)",
+        file: "lone.vl",
+        seed: None,
+        replacements: &[("\ttime::sleep(1);\n", "")],
+    }],
+    dependencies: &[],
+}];
+
+// --- M155: R11's instantiations over restored and served candidate rows -------
+//
+// A leaf whose first function instantiates two of the leaf's OWN generics at
+// a resource — one not move-clean (R11 refuses the instantiation), one clean
+// — so a keystroke typed into that function re-walks the file and SERVES the
+// generics' items: their R11 candidate rows (`analyzer/r11_candidates.rs`)
+// come back re-based with their text, and the instantiation's slice must
+// still find them. The other edits make the clean generic dirty and the dirty
+// one clean.
+
+pub const R11_MAIN: &str = "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
+
+pub const R11_DB: &str = "[resource]\nexport struct Db {\n\thandle: i32,\n}\n\nexport fun sink(own d: Db) {\n\tprint(\"{d.handle}\");\n}\n";
+
+pub const R11_VIEWS: &str = "import pkg::db::{ Db, sink };\n\nexport fun render(): i32 {\n\tlet db = Db { handle = 1 };\n\tlet out = use_twice(db);\n\tsink(out);\n\tsink(pass_once(Db { handle = 2 }));\n\t1\n}\n\nfun use_twice<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}\n\nfun pass_once<T>(own x: T): T {\n\tx\n}\n";
+
+pub const R11_FIXTURES: &[Fixture] = &[Fixture {
+    name: "r11_rows",
+    platform: NODE,
+    files: &[
+        ("main.vl", R11_MAIN),
+        ("db.vl", R11_DB),
+        ("views.vl", R11_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a statement typed above the leaf's instantiated generics: their served rows re-based (M155)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\t1\n}\n\nfun use_twice",
+                "\tlet extra = \"a statement longer than the generic it pushes down, so a served row left at its old offset falls outside the callee\";\n\textra.len() as i32\n}\n\nfun use_twice",
+            )],
+        },
+        Edit {
+            label: "the clean generic made dirty: R11 must refuse its instantiation (M155)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "fun pass_once<T>(own x: T): T {\n\tx\n}",
+                "fun pass_once<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}",
+            )],
+        },
+        Edit {
+            label: "the dirty generic made clean: its refusal must go (M155)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\tlet keep = x;\n\tx\n}\n\nfun pass_once",
+                "\tx\n}\n\nfun pass_once",
+            )],
+        },
+    ],
+    dependencies: &[],
+}];
+
+// --- R11 door B: instance records served, validated and refused (incr-54b, Order 54) -------
+//
+// A COLD module `shapes.vl` holds the generics the hot leaf instantiates at
+// its resource `Conn`: `split<T>` moves a field out of an owned `Pair<T>` (a
+// destructure exactly while `T` holds no `Drop` inside — the B469 question
+// the record's digest reads), `use_twice<T>` is not move-clean, `pass_once<T>`
+// is, and `outer<T>` passes its `T` on to `inner<T>` in `helpers.vl` (a
+// PROPAGATED instance, reported at the inner call inside `outer`'s body).
+// The first seeded analysis files one record per instance; every later
+// keystroke in the leaf serves them. The four edits are the record's four
+// validators: (a) a `Drop` impl for `Conn` typed into the leaf — the digest
+// moves, `split`'s field move is no destructure, and the instantiation must
+// be refused (the plant `R11RecordUnguarded` serves the stale record past
+// it); (b) `use_twice`'s argument replaced by a number — the instance is no
+// longer seeded, so its recorded refusal must not be spoken; (c) the clean
+// generic in the cold module made dirty with the seed on the leaf — its
+// module is hot, so it is scanned live; (d) the propagated child made dirty
+// in ITS module — `outer`'s record leads to `inner`, whose module is hot.
+
+pub const R11_RECORD_MAIN: &str =
+    "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
+
+pub const R11_RECORD_SHAPES: &str = "import pkg::helpers::inner;\n\nexport struct Pair<T> {\n\tfirst: T,\n\tsecond: i32,\n}\n\nexport fun split<T>(own pair: Pair<T>): T {\n\tpair.first\n}\n\nexport fun use_twice<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}\n\nexport fun pass_once<T>(own x: T): T {\n\tx\n}\n\nexport fun outer<T>(own x: T): T {\n\tinner(x)\n}\n";
+
+pub const R11_RECORD_HELPERS: &str = "export fun inner<T>(own x: T): T {\n\tx\n}\n";
+
+pub const R11_RECORD_VIEWS: &str = "import pkg::shapes::{ Pair, outer, pass_once, split, use_twice };\nimport std::drop::Drop;\n\n[resource]\nstruct Conn {\n\tid: i32,\n}\n\nfun close(own c: Conn) {\n\tprint(\"{c.id}\");\n}\n\nexport fun render(): i32 {\n\tclose(split(Pair { first = Conn { id = 1 }, second = 2 }));\n\tclose(use_twice(Conn { id = 3 }));\n\tclose(pass_once(Conn { id = 4 }));\n\tclose(outer(Conn { id = 5 }));\n\t1\n}\n";
+
+pub const R11_RECORD_FIXTURES: &[Fixture] = &[Fixture {
+    name: "r11_records",
+    platform: NODE,
+    files: &[
+        ("main.vl", R11_RECORD_MAIN),
+        ("shapes.vl", R11_RECORD_SHAPES),
+        ("helpers.vl", R11_RECORD_HELPERS),
+        ("views.vl", R11_RECORD_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a Drop impl for the leaf's resource typed in: the cold generic's field move is no destructure now (door B's digest)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\tid: i32,\n}\n\n",
+                "\tid: i32,\n}\n\nimpl Conn with Drop {\n\tfun drop(&mut self) {\n\t\tprint(\"closed\");\n\t}\n}\n\n",
+            )],
+        },
+        Edit {
+            label: "the refused instantiation's resource argument replaced by a number: its recorded refusal must not be spoken (door B's seeding)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\tclose(use_twice(Conn { id = 3 }));\n",
+                "\tprint(use_twice(3));\n",
+            )],
+        },
+        Edit {
+            label: "the cold module's clean generic made dirty with the seed on the leaf: its module is hot, scanned live (door B's cold validator)",
+            file: "shapes.vl",
+            seed: Some("views.vl"),
+            replacements: &[(
+                "export fun pass_once<T>(own x: T): T {\n\tx\n}",
+                "export fun pass_once<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}",
+            )],
+        },
+        Edit {
+            label: "the propagated child made dirty in its own module: outer's recorded edge leads to a live scan of inner (door B's edges)",
+            file: "helpers.vl",
+            seed: Some("views.vl"),
+            replacements: &[(
+                "export fun inner<T>(own x: T): T {\n\tx\n}",
+                "export fun inner<T>(own x: T): T {\n\tlet keep = x;\n\tx\n}",
+            )],
+        },
+    ],
+    dependencies: &[],
+}];
 
 // --- M110 S6: the id-window classes (incr-50, Order 50; spike-49's two predicted reds) ---
 //

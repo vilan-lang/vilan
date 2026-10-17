@@ -1,0 +1,22 @@
+// E257 S8's gate (`src/test/session.test.ts`): the reactive trace under the
+// debugger. A write inside a `batch` queues the effect's wake, which runs when
+// the batch ends, on another stack: the debugger shows the write under the
+// effect's frame, below a label naming the cause, and the trace's line is in
+// the debug console. A `// break:` comment names a line the session stops on,
+// a `// write:` comment the write.
+import std::io::print;
+import std::reactive::trace::trace;
+import std::reactive::{ Flow, SignalCell, batch };
+
+fun bump(count: SignalCell<i32>) {
+	count.set(2); // write: bump
+}
+
+fun main() {
+	trace(true);
+	let count = SignalCell::new(1);
+	let _watch = count.sub(|value| {
+		print(i"count is {value}"); // break: effect
+	});
+	batch(|| bump(count));
+}

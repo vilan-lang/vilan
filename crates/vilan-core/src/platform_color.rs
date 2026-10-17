@@ -347,6 +347,11 @@ pub fn paint_reachable_nodes(program: &Program) -> Option<HashSet<Id>> {
 /// A per-call type binding: the analyzer's constraint id → bound type id.
 type SubstitutionContext = HashMap<TypeId, TypeId>;
 
+/// M160: a frame's `Self` — the concrete receiver a trait DEFAULT body is
+/// walked for, and the trait whose default it is (whose `Self` marker,
+/// `Type::Trait(trait, ..)`, the receiver stands for in that body).
+type FrameSelf = (TypeId, Id);
+
 /// How the walk arrived at a frame: the call site's span, the file that span
 /// indexes into, and whether the site is user code (only user-code sites are
 /// eligible anchors).
@@ -392,9 +397,10 @@ struct Traversal<'a, 'src> {
     graph: &'a CallGraph,
     platform: Option<Platform>,
     /// Nodes visited PER instantiation — keyed like `emit_instance`, by the
-    /// resolved bindings — so the same generic function re-walks under a
-    /// different `T` but recursion still terminates.
-    visited: HashSet<(Id, Vec<(u32, u32)>)>,
+    /// resolved bindings and the frame's `Self` (M160) — so the same generic
+    /// function re-walks under a different `T`, and a trait default under a
+    /// different receiver, but recursion still terminates.
+    visited: HashSet<(Id, Vec<(u32, u32)>, Option<u32>)>,
     /// The walk stack: each frame's node with how it was ARRIVED at — the call
     /// site's span, the file that span indexes into, and whether it is user
     /// code. The file rides along with the span so a violation renders where it
@@ -421,6 +427,11 @@ struct Traversal<'a, 'src> {
     /// Each impl-declared member's impl SUBJECT, built on the first dispatch
     /// that needs it (M133's [`Traversal::bind_candidate_impl`]).
     impl_subjects: Option<HashMap<Id, TypeId>>,
+    /// M160: every member a TRAIT declares (its defaults among them) with
+    /// its trait, built on the first dispatch that needs it — a candidate in
+    /// this map reached on a concrete receiver is walked with that receiver
+    /// as its `Self`.
+    trait_members: Option<HashMap<Id, Id>>,
 }
 
 impl<'a, 'src> Traversal<'a, 'src> {
@@ -439,6 +450,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
             follow_const_initializers: false,
             origin: Origin::Entry,
             impl_subjects: None,
+            trait_members: None,
         }
     }
 
@@ -491,12 +503,30 @@ impl<'a, 'src> Traversal<'a, 'src> {
         substitution: &SubstitutionContext,
         arrived_by: Option<ArrivalSite>,
     ) {
+        self.walk_as(node, substitution, None, arrived_by);
+    }
+
+    /// [`Traversal::walk`] with the frame's `Self` (M160): the concrete
+    /// receiver a trait DEFAULT body is walked for, which a `self` call inside
+    /// it (`GenericDispatch::OnType(None, member)`) dispatches on — as
+    /// emission specializes the default per receiver. `None` everywhere else:
+    /// a function or an impl's member names its own receiver's type.
+    fn walk_as(
+        &mut self,
+        node: Id,
+        substitution: &SubstitutionContext,
+        self_type: Option<FrameSelf>,
+        arrived_by: Option<ArrivalSite>,
+    ) {
         let mut key: Vec<(u32, u32)> = substitution
             .iter()
             .map(|(constraint, bound)| (constraint.0, self.resolve_type_id(*bound, substitution).0))
             .collect();
         key.sort_unstable();
-        if !self.visited.insert((node, key)) {
+        if !self
+            .visited
+            .insert((node, key, self_type.map(|(receiver, _)| receiver.0)))
+        {
             return;
         }
         self.trail.push((node, arrived_by));
@@ -563,11 +593,16 @@ impl<'a, 'src> Traversal<'a, 'src> {
         {
             let arrived = self.arrival(call.call_id);
             match call.target {
-                CallTarget::Function(callee)
-                | CallTarget::Closure(callee)
-                | CallTarget::External(callee) => {
-                    let next = self.callee_substitution(call.call_id, callee, substitution);
+                CallTarget::Function(callee) | CallTarget::External(callee) => {
+                    let mut next = self.callee_substitution(call.call_id, callee, substitution);
+                    self.ground_self(&mut next, self_type);
                     self.walk(callee, &next, arrived);
+                }
+                // A closure is its creator's code: its `self` is the frame's.
+                CallTarget::Closure(callee) => {
+                    let mut next = self.callee_substitution(call.call_id, callee, substitution);
+                    self.ground_self(&mut next, self_type);
+                    self.walk_as(callee, &next, self_type, arrived);
                 }
                 CallTarget::Variant(_) => {}
                 CallTarget::Indirect(IndirectReason::Value) => {
@@ -578,7 +613,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
                 CallTarget::Indirect(_) => {
                     // THE refinement: a resolved receiver selects one impl's
                     // member; an unresolved one keeps every candidate.
-                    let receiver = self.dispatch_receiver(call.call_id, substitution);
+                    let receiver = self.dispatch_receiver(call.call_id, substitution, self_type);
                     let candidates = crate::async_infer::dispatch_candidates_for(
                         self.program,
                         call.call_id,
@@ -587,10 +622,24 @@ impl<'a, 'src> Traversal<'a, 'src> {
                     for candidate in candidates {
                         let mut next =
                             self.callee_substitution(call.call_id, candidate, substitution);
-                        if let Some(receiver) = receiver {
-                            self.bind_candidate_impl(candidate, receiver, substitution, &mut next);
-                        }
-                        self.walk(candidate, &next, arrived);
+                        self.ground_self(&mut next, self_type);
+                        // M160: a trait's own member (a default) selected for
+                        // a concrete receiver runs with that receiver as its
+                        // `Self`.
+                        let candidate_self = match receiver {
+                            Some(receiver) => {
+                                self.bind_candidate_impl(
+                                    candidate,
+                                    receiver,
+                                    substitution,
+                                    &mut next,
+                                );
+                                self.trait_of_member(candidate)
+                                    .map(|trait_id| (receiver, trait_id))
+                            }
+                            None => None,
+                        };
+                        self.walk_as(candidate, &next, candidate_self, arrived);
                     }
                 }
             }
@@ -635,7 +684,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
         #[allow(clippy::unnecessary_to_owned, reason = "ends the graph borrow")]
         if let Some(children) = self.graph.closure_children_of(node) {
             for closure in children.to_vec() {
-                self.walk(closure, &substitution.clone(), None);
+                self.walk_as(closure, &substitution.clone(), self_type, None);
             }
         }
         for closure in self.graph.initializer_closures_of(node).to_vec() {
@@ -683,7 +732,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
     /// shares the caller's constraints inherits them (a nested call inside
     /// a generic body).
     fn callee_substitution(
-        &self,
+        &mut self,
         call_id: Id,
         callee: Id,
         incoming: &SubstitutionContext,
@@ -709,8 +758,35 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
         // No record: pass the caller's bindings through — a call inside a
         // generic body resolves the shared constraints; unrelated keys are
-        // inert (nothing looks them up).
+        // inert (nothing looks them up). M160: inert, but not free — the
+        // visited key is the whole substitution, so a FREE function (no impl,
+        // no trait) re-walked under every caller's unrelated bindings walked
+        // its whole subtree again each time (kolt's `fresh_id`, `enqueue`,
+        // `drain`: 300-400 walks apiece once trait defaults are walked per
+        // receiver). A free function names no constraint but its own, so its
+        // own are all it is handed.
+        if self.is_free_function(callee) {
+            let own: &[TypeId] = self
+                .program
+                .functions
+                .get(&callee)
+                .map(|function| function.generic_parameter_constraint_ids.as_slice())
+                .unwrap_or_default();
+            return incoming
+                .iter()
+                .filter(|(constraint, _)| own.contains(constraint))
+                .map(|(constraint, bound)| (*constraint, *bound))
+                .collect();
+        }
         incoming.clone()
+    }
+
+    /// M160: whether `callee` is a FREE function — neither an impl's member
+    /// nor a trait's — so its body names no type parameter but its own.
+    fn is_free_function(&mut self, callee: Id) -> bool {
+        self.program.functions.contains_key(&callee)
+            && self.trait_of_member(callee).is_none()
+            && !self.impl_subjects().contains_key(&callee)
     }
 
     /// M133: a dispatch candidate that an IMPL declares, reached on a concrete
@@ -730,16 +806,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
         incoming: &SubstitutionContext,
         next: &mut SubstitutionContext,
     ) {
-        let subjects = self.impl_subjects.get_or_insert_with(|| {
-            let mut subjects: HashMap<Id, TypeId> = HashMap::default();
-            for implementation in &self.program.implementations {
-                for member in implementation.declarations.values() {
-                    subjects.insert(*member, implementation.subject);
-                }
-            }
-            subjects
-        });
-        let Some(subject) = subjects.get(&candidate).copied() else {
+        let Some(subject) = self.impl_subjects().get(&candidate).copied() else {
             return;
         };
         let mut bindings: SubstitutionContext = HashMap::default();
@@ -747,6 +814,65 @@ impl<'a, 'src> Traversal<'a, 'src> {
         for (constraint, bound) in bindings {
             let resolved = self.resolve_type_id(bound, incoming);
             next.entry(constraint).or_insert(resolved);
+        }
+    }
+
+    /// Each impl-declared member's impl SUBJECT (M133), built once.
+    fn impl_subjects(&mut self) -> &HashMap<Id, TypeId> {
+        let program = self.program;
+        self.impl_subjects.get_or_insert_with(|| {
+            let mut subjects: HashMap<Id, TypeId> = HashMap::default();
+            for implementation in &program.implementations {
+                for member in implementation.declarations.values() {
+                    subjects.insert(*member, implementation.subject);
+                }
+            }
+            subjects
+        })
+    }
+
+    /// M160: the TRAIT that declares `member` (a default, or a signature a
+    /// default body may call), if one does.
+    fn trait_of_member(&mut self, member: Id) -> Option<Id> {
+        self.trait_members
+            .get_or_insert_with(|| {
+                self.program
+                    .traits
+                    .values()
+                    .flat_map(|trait_| {
+                        trait_
+                            .declarations
+                            .values()
+                            .map(|declared| (*declared, trait_.id))
+                    })
+                    .collect()
+            })
+            .get(&member)
+            .copied()
+    }
+
+    /// M160: `type_id` grounded through the frame's `Self` — the receiver,
+    /// where the type is the frame's trait's `Self` marker (a default body
+    /// handing `self` on: `observe_flow(self, ..)` binds `F` to the marker,
+    /// which names no impl, and every `Flow::start` was walked for it).
+    fn self_grounded(&self, type_id: TypeId, self_type: Option<FrameSelf>) -> TypeId {
+        match (self_type, self.program.type_id_to_type_map.get(&type_id)) {
+            (Some((receiver, frame_trait)), Some(Type::Trait(trait_id, _)))
+                if *trait_id == frame_trait =>
+            {
+                receiver
+            }
+            _ => type_id,
+        }
+    }
+
+    /// M160: a callee's bindings with the frame's `Self` marker grounded.
+    fn ground_self(&self, next: &mut SubstitutionContext, self_type: Option<FrameSelf>) {
+        if self_type.is_none() {
+            return;
+        }
+        for bound in next.values_mut() {
+            *bound = self.self_grounded(*bound, self_type);
         }
     }
 
@@ -767,14 +893,25 @@ impl<'a, 'src> Traversal<'a, 'src> {
     }
 
     /// The concrete receiver a dispatch resolves to under the bindings, if
-    /// the record + the substitution pin one down.
-    fn dispatch_receiver(&self, call_id: Id, substitution: &SubstitutionContext) -> Option<TypeId> {
+    /// the record + the substitution pin one down — and, for a `self` call
+    /// inside a trait default (`OnType(None, ..)`), the frame's `Self`
+    /// (M160).
+    fn dispatch_receiver(
+        &self,
+        call_id: Id,
+        substitution: &SubstitutionContext,
+        self_type: Option<FrameSelf>,
+    ) -> Option<TypeId> {
         let resolved = match crate::async_infer::dispatch_at(self.program, call_id)? {
             GenericDispatch::OnConstraint(constraint_id, _) => {
                 self.resolve_type_id(*substitution.get(&constraint_id)?, substitution)
             }
-            GenericDispatch::OnType(receiver, _) => self.resolve_type_id(receiver?, substitution),
+            GenericDispatch::OnType(receiver, _) => self.resolve_type_id(
+                receiver.or(self_type.map(|(receiver, _)| receiver))?,
+                substitution,
+            ),
         };
+        let resolved = self.self_grounded(resolved, self_type);
         match self.program.type_id_to_type_map.get(&resolved) {
             Some(Type::Struct(_, _) | Type::Enum(_, _)) => Some(resolved),
             _ => None,

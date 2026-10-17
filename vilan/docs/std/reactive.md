@@ -49,6 +49,7 @@ import std::reactive::{
 | `on_cleanup` | fn | run a cleanup when the ambient owner is released |
 | `run_with_owner`, `comp`, `get_owner`, `owner_scope` | fns/context | establish/read the ambient owner |
 | `turn`, `batch`, `flush`, `at_settle`, `FlushPolicy`, `turn_scope` | fns/context | write batching |
+| `trace::trace` | fn | the reactive trace (`std::reactive::trace`): a line per wake, naming what woke it (debugging) |
 | `optimistic` | fn | paint → commit → confirm-or-rollback (one shot) |
 | `Optimistic<T>`, `WriteState` | struct/enum | the same lifecycle, observable and overlap-safe |
 | `draft`, `Draft<T>`, `DraftState` | fn/struct/enum | local-first editing cell |
@@ -1091,6 +1092,47 @@ leave the scheduler broken: the draining flags are restored on the way out, so
 the next write settles normally, this turn included. (Before this, one throwing
 observer left its turn draining forever, and every later write in the program
 queued into it and was never flushed.)
+
+## trace — who woke what
+
+```vilan,fragment
+// std::reactive::trace
+fun trace(on: bool)
+```
+
+`trace(true)` (`import std::reactive::trace::trace;`) writes a line to stderr
+(the browser's console) for every **wake** a write causes — each subscriber the
+write reached, as it runs — naming what woke it:
+
+```text
+[reactive] effect #4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
+[reactive] derivation #2 woken by cell #1, set at src/main.vl:9:7
+[reactive] effect #5 woken by cell #3, set by derivation #2
+[reactive] effect #6 woken by derivation #2
+```
+
+A subscriber is an `effect` (it acts on a value) or a `derivation` (a pipe's
+stage, a `.memo()`, a relay), numbered by its id; a cell by its identity,
+which is the same number on every line. The places are `[track_caller]`
+locations: where the cell was made by `SignalCell::new`, and the `set` or
+`update` that wrote it — each named only when it is your code's, never std's.
+A write std makes inside a traced wake (a `.memo()` publishing its value)
+says `set by` that wake instead, and a relay's wake (`distinct`, `switch`)
+names the relay. A cell made by `Signal::new`, and a write through a
+`S: Signal<T>` bound or a `dyn Signal`, carry no place: a trait member cannot
+track its caller.
+
+The lines are the same bytes on both backends. Turn the trace on before the
+cells you want named are made (a cell remembers where it was made only while
+the trace is on), and off with `trace(false)`. The scheduler reaches the trace
+through hooks `trace(true)` installs, so a program that never imports it
+carries none of it.
+
+Under the `vilan` debugger (VS Code) the lines also appear in the Debug
+Console, and a wake that waited in a turn's queue — run when the turn settles,
+on a stack without the write — shows the write's stack under the woken frame,
+below a label naming the cause (node's async stack tagging,
+`console.createTask`; the native backend has no host task to tag).
 
 ## optimistic
 

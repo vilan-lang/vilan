@@ -54,6 +54,8 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../../vilan-core/tests/stdin_fixture/mod.rs"]
+mod stdin_fixture;
 #[path = "../../vilan-core/tests/test_pool/mod.rs"]
 mod test_pool;
 
@@ -1171,6 +1173,10 @@ const PLATFORM_BOUND_REQUIRED: &[&str] = &[
     "asset_bundle.vl",
     "element-syntax.vl",
     "estate.vl",
+    // A173 S1 + F?4: `std::process` natively — `args`/`env`, and the stdin
+    // reader over the program's `.stdin` fixture.
+    "process-env.vl",
+    "stdin-lines.vl",
 ];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
@@ -1475,7 +1481,13 @@ fn compare(staged: &Path, program: &str) -> Verdict {
 
 /// [`compare`] building into `target` ([`legs_in_parallel`]).
 fn compare_in(staged: &Path, program: &str, target: &Path) -> Verdict {
-    let vilan = |staged: &Path| vilan_in(staged, target);
+    // Each leg reads the program's stdin fixture when it has one (A173 S1),
+    // opened afresh per leg: both backends must read the same lines.
+    let vilan = |staged: &Path| {
+        let mut command = vilan_in(staged, target);
+        command.stdin(stdin_fixture::stdin_for(&staged.join(program)));
+        command
+    };
     let native = vilan(staged)
         .args(["run", "--backend", "rust", program])
         .output()
@@ -10153,6 +10165,48 @@ fn a_deref_of_a_blocks_view_reads_the_value_on_both_backends() {
     );
 }
 
+/// A173 S1 / B?1: both backends read `stdin-lines.vl`'s fixture line for line
+/// — `\n`, `\r\n` and a lone `\r` each end one line, a blank line is a line,
+/// a non-ASCII line survives whole, a last line with no ending is still one,
+/// and past the end `read_line()` stays `None` and `scan()` stays `""`.
+///
+/// The expected bytes are WRITTEN OUT rather than only compared across the
+/// legs: a harness that dropped the fixture would hand both backends an empty
+/// stdin, and two programs reading nothing agree perfectly. Under its own
+/// program name, as every native test builds (N158).
+#[test]
+fn a173_both_backends_read_the_corpus_stdin_fixture_line_for_line() {
+    let staged = stage();
+    for extension in ["vl", "stdin"] {
+        std::fs::copy(
+            staged.join(format!("stdin-lines.{extension}")),
+            staged.join(format!("native_probe_stdin_lines.{extension}")),
+        )
+        .expect("stage the stdin program under its own name");
+    }
+    let expected = concat!(
+        "scan: [the first line]\n",
+        "1: [ends with lf] 12\n",
+        "2: [ends with crlf] 14\n",
+        "3: [ends with a lone cr] 19\n",
+        "4: [between two lone crs] 20\n",
+        "5: [] 0\n",
+        "6: [blank above] 11\n",
+        "7: [] 0\n",
+        "8: [wide \u{e9} \u{2713}] 8\n",
+        "9: [  padded  ] 10\n",
+        "10: [no ending] 9\n",
+        "lines after scan: 10\n",
+        "read_line past the end is None: true\n",
+        "scan past the end: []\n",
+    );
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "native_probe_stdin_lines.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
@@ -11839,6 +11893,7 @@ fn run_on_in(staged: &Path, backend: Option<&str>, program: &str, target: &Path)
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
     }
+    command.stdin(stdin_fixture::stdin_for(&staged.join(program)));
     let output = command.arg(program).output().expect("run vilan");
     Run {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -12015,6 +12070,139 @@ fn s0_caller_and_a_caught_panic_read_the_same_on_both_backends() {
         site("print(here())", "here"),
     );
     assert_eq!(native.stdout, expected);
+}
+
+// ---------------------------------------------------------------------------
+// E257 S8 (debugging.md §6.2): the reactive trace.
+// ---------------------------------------------------------------------------
+
+const REACTIVE_TRACE: &str = include_str!("native/reactive_trace.vl");
+const REACTIVE_TRACE_FILE: &str = "native_probe_reactive_trace.vl";
+
+/// E257 S8: `std::reactive::trace(true)` writes one line per wake to stderr —
+/// the woken subscriber, the cell that woke it with where it was made, and the
+/// write's place (a `[track_caller]` location, S0) — the same bytes on both
+/// backends, one pin per wake path: a write with no turn (inline), a write
+/// queued in an ambient turn (`batch`), a derivation's write joining the
+/// DRAINING turn (`set by`), a write after its turn settled (one microtask
+/// drains it), a relay's wake (`distinct`), `update`, a cell made by
+/// `Signal::new` and written through a bound (no place: a `[track_caller]`
+/// trait member is refused), and the trace off. Native has no host task to
+/// tag a queued wake with (`console.createTask` is the JS backend's): the
+/// lines are the same, only a debugger's async stack differs.
+#[test]
+fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
+    let staged = stage();
+    let made = |file: &str| {
+        site_of(
+            file,
+            REACTIVE_TRACE,
+            "let count = SignalCell::new(1)",
+            "new",
+        )
+    };
+    let site = |file: &str, line: &str, column: &str| site_of(file, REACTIVE_TRACE, line, column);
+    type Expected =
+        fn(&str, &dyn Fn(&str) -> String, &dyn Fn(&str, &str, &str) -> String) -> (String, String);
+    let cases: Vec<(&str, Expected)> = vec![
+        ("inline", |file, made, site| {
+            (
+                "inline 1\ninline 2\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "count.set(2)", "set")
+                ),
+            )
+        }),
+        ("turn", |file, made, site| {
+            (
+                "turn 1\nqueued\nturn 3\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "count.set(3)", "set")
+                ),
+            )
+        }),
+        ("draining", |file, made, site| {
+            (
+                "draining 2\ndraining 8\n".to_string(),
+                format!(
+                    "[reactive] derivation #0 woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] effect #1 woken by cell #3, set by derivation #0\n",
+                    made(file),
+                    site(file, "batch(|| count.set(4))", "set")
+                ),
+            )
+        }),
+        ("late", |file, made, site| {
+            (
+                "late 1\nbefore the microtask\nlate 5\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "later = Some(|| count.set(5))", "set")
+                ),
+            )
+        }),
+        ("relay", |file, made, site| {
+            (
+                "relay 1\nrelay 6\n".to_string(),
+                format!(
+                    "[reactive] derivation #1 woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] effect #0 woken by derivation #1\n",
+                    made(file),
+                    site(file, "count.set(6)", "set")
+                ),
+            )
+        }),
+        ("update", |file, made, site| {
+            (
+                "update 1\nupdate 2\n".to_string(),
+                format!(
+                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    made(file),
+                    site(file, "count.update(", "update")
+                ),
+            )
+        }),
+        ("unplaced", |_, _, _| {
+            (
+                "unplaced 10\nunplaced 11\n".to_string(),
+                "[reactive] effect #0 woken by cell #2\n".to_string(),
+            )
+        }),
+        ("off", |_, _, _| {
+            ("off 1\noff 7\n".to_string(), String::new())
+        }),
+    ];
+    // One program per path, each under its OWN file name (N158), so a place
+    // names that file.
+    let legs = legs_in_parallel("trace", cases, |(path, expected), target| {
+        let file = REACTIVE_TRACE_FILE.replace(".vl", &format!("_{path}.vl"));
+        std::fs::write(
+            staged.join(&file),
+            REACTIVE_TRACE.replace("\"PATH\"", &format!("{path:?}")),
+        )
+        .expect("write the probe program");
+        let (stdout, stderr) = expected(&file, &made, &site);
+        let mut wrong = Vec::new();
+        for (backend, run) in [
+            ("native", run_on_in(&staged, Some("rust"), &file, target)),
+            ("node", run_on_in(&staged, None, &file, target)),
+        ] {
+            if run.code != Some(0) || run.stdout != stdout || run.stderr != stderr {
+                wrong.push(format!(
+                    "{path} on {backend}: exited {:?}\nstdout {:?}\nexpected {stdout:?}\nstderr {:?}\nexpected {stderr:?}",
+                    run.code, run.stdout, run.stderr
+                ));
+            }
+        }
+        wrong
+    });
+    let wrong: Vec<String> = legs.into_iter().flatten().collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -13345,6 +13533,117 @@ fn f123_a_std_lookup_over_a_shared_views_field_reads_in_place_on_both_backends()
     );
 }
 
+/// papers-54's F?3: a `for x in subject` over a type whose INHERENT
+/// `next(self): Option<T>` awaits — the shape `fs::Watcher` and `BodyReader`
+/// pull by hand with a bare loop — was emitted `while let Some(x) =
+/// next(&mut iterator)` with no `.await`, which cargo refused (E0308,
+/// "expected future, found `Option`"); the JS lowering awaited it. The step
+/// is awaited natively now, and both print the same.
+#[test]
+fn an_awaiting_inherent_next_drives_a_for_loop_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_async_inherent_for_in.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/async_inherent_for_in.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "tick 2\ntick 1\ntick 0\ndone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// native-54's F?1: `Option::take` / `Option::replace` over a receiver that
+/// lives in a CELL natively — a module-level binding (`module_maybe.take()`),
+/// a field of one, a captured binding, a `Shared` view's field
+/// (`cell.write().maybe.take()`) — rendered the receiver through the reading
+/// arm, a copy out of the cell, so the take answered the value and left the
+/// binding holding it (`Some(1)` where JS prints `None`). The receiver is a
+/// place now, as a `List`'s `pop` receiver is; a plain local, its field and a
+/// `&mut self` field are the controls (they were places already).
+#[test]
+fn an_option_take_through_a_cell_writes_the_cell_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_option_take_through_a_cell.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/option_take_through_a_cell.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "Some(1)\nNone\nSome(1)\nNone\nSome(2)\nNone\nNone\nSome(4)\nSome(4)\nNone\n\
+                    Some(1)\nNone\nSome(1)\nSome(6)\nSome(1)\nNone\nSome(1)\nNone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// native-54's N?3: a by-value read of a module-level binding at a consuming
+/// position — `has(module_items, 9)` beside a later read, a field and a tuple
+/// slot of one — is `cell.get()` natively, a whole-value copy already, and
+/// rule 1's consumed-place copy cloned it again (`(MODULE.with(|cell|
+/// cell.get())).clone()`). The emission pin: no module read is cloned twice.
+#[test]
+fn a_module_binding_read_by_value_is_copied_once_natively() {
+    let staged = stage();
+    let file = "native_probe_module_read_copied_once.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/module_read_copied_once.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "false\ntrue\ntrue\ntrue\nfalse\n4\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let main = emitted_main(&staged, file);
+    assert!(
+        !main.contains("cell.get())).clone()") && !main.contains("cell.get()).items).clone()"),
+        "a module binding's read is copied once:\n{main}"
+    );
+}
+
+/// std-54's B?1: a void `main` whose TAIL is a void-typed expression — a
+/// `match` of void arms, a std call written without its `;`, a user call the
+/// same — beside a spawned task still pending. The JS lowering decided the
+/// tail's disposition by its syntax and forwarded it to `process.exit`,
+/// which dropped the task's output (`the spawned task finished` printed
+/// natively only); the `;`-less call's native `main` did not build (the
+/// tail ran into the appended `run_pending()`). The disposition is the
+/// tail's TYPE now, and both backends print both lines.
+#[test]
+fn a_void_main_tail_waits_for_pending_work_on_both_backends() {
+    let staged = stage();
+    for (file, source, tail) in [
+        (
+            "native_probe_main_match_tail.vl",
+            include_str!("native/main_match_tail.vl"),
+            "the tail is a match",
+        ),
+        (
+            "native_probe_main_call_tail.vl",
+            include_str!("native/main_call_tail.vl"),
+            "the tail is a call with no semicolon",
+        ),
+        (
+            "native_probe_main_user_tail.vl",
+            include_str!("native/main_user_tail.vl"),
+            "the tail is a user call",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let expected = format!("{tail}\nthe spawned task finished\n");
+        assert_eq!(
+            both_stdouts(&staged, file),
+            (expected.clone(), expected),
+            "{file}"
+        );
+    }
+}
+
 /// The stdout of `file` on the JS and on the native backend.
 fn both_stdouts(staged: &Path, file: &str) -> (String, String) {
     let run = |arguments: &[&str]| {
@@ -13484,6 +13783,19 @@ fn f138_a_later_argument_that_rebinds_a_viewed_captured_binding_answers_the_same
 /// an `&Option` beside a closure that writes it (`None` — a copy taken in
 /// order), while the same `&Option` beside a block that writes it is a view
 /// taken last (`Some(2)`).
+///
+/// F143: the same order for a MODULE-LEVEL `mut` binding, which any call a
+/// later argument makes can reach — by value (an in-place write and a
+/// re-bind), a `&`, a `&self` receiver direct and through a generic callee,
+/// a `push` and a user `&mut self` receiver beside a re-bind, a field spine,
+/// a reading intrinsic's receiver, a scalar `&` and an `&Option` (a module
+/// binding's `&` waits whatever its type). The base answered differently on
+/// the two backends at six of the fourteen and read the binding where it
+/// stood on both at seven more; the scalar by value (`9`) is the control.
+/// A `&mut` argument over a module binding beside a `&` one that runs code
+/// (`both(&mut module_items, &refill())`, `refill` re-binding it) settles the
+/// `&` one first natively, where it had been evaluated under the cell's
+/// borrow and stopped with the reentrancy sentence (JS: `2`).
 #[test]
 fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_arguments_on_both_backends()
  {
@@ -13494,7 +13806,8 @@ fn f138_an_argument_rooted_at_a_captured_binding_is_read_after_the_later_argumen
         include_str!("native/captured_binding_argument_rebound.vl"),
     )
     .expect("write the probe program");
-    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n";
+    let expected = "3\n3\n2\n3\n3\ntrue\ntrue\ntrue\ntrue\ntrue\nSome(9)\nfirst\nsecond\n1\n1\n9\n9\nNone\nSome(2)\n\
+                    true\ntrue\ntrue\ntrue\n2\n3\n3\ntrue\ntrue\ntrue\n9\n5\nSome(3)\n9\n2\n";
     assert_eq!(
         both_stdouts(&staged, file),
         (expected.to_string(), expected.to_string()),
@@ -13996,6 +14309,64 @@ fn b627_an_expected_type_through_a_receiver_answers_on_both_backends() {
         compare(&staged, file),
         Verdict::Identical,
         "an expectation through a receiver must bind the same natively"
+    );
+}
+
+/// B637: an argument at a non-generic parameter — a function's, a method's, a
+/// closure's, through a view — directs its receiver call's generic, the same
+/// on both backends.
+#[test]
+fn b637_an_argument_expectation_through_a_receiver_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_argument_expectation_through_a_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/argument_expectation_through_a_receiver.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "an argument's expectation through a receiver must bind the same natively"
+    );
+}
+
+/// B639's boundary: a later argument writing a disjoint place of the lent
+/// place's root, another binding, or a captured root compiles and answers the
+/// same on both backends (the overlapping writes are refused by the checker).
+#[test]
+fn b639_a_disjoint_write_beside_a_lent_place_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_lent_place_disjoint_write.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/lent_place_disjoint_write.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a disjoint write beside a lent place must answer the same natively"
+    );
+}
+
+/// papers-54's B?2: a `for` loop whose `next` reads a context — the ambient
+/// nursery in a sync `Iterator` (outside a nursery and inside one), a sleep in
+/// an awaiting inherent `next` — is handed the threaded context argument at
+/// every step on both backends (JS threw a `TypeError`, cargo refused E0061).
+#[test]
+fn a_for_loops_next_reading_a_context_answers_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_for_in_context_next.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/for_in_context_next.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a for loop's context-reading `next` must answer the same natively"
     );
 }
 

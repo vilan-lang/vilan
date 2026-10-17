@@ -23,6 +23,11 @@
 //! value is one JS hands on by reference (a struct, a list, a map, a fixed
 //! array, a trait object; at a `&`, a scalar JS views as a `(base, key)`
 //! pair) and the native copy is deferred.
+//!
+//! F143: a MODULE-LEVEL `mut` binding is held to the same rule — any call a
+//! later argument makes can reach it — except that natively it is never a
+//! view (a callee could meet the borrow): its copy out of the `thread_local!`
+//! cell is deferred instead, at a `&` whatever its type.
 
 use super::Transformer;
 use crate::analyzer::{Expr, FunctionCall};
@@ -185,10 +190,14 @@ impl<'src> Transformer<'src> {
             return false;
         }
         let by_value = convention == Receiving::ByValue;
-        let read_late_on_js = self.expr_type_id(place).is_some_and(|type_id| {
-            self.aliases_on_the_js_backend(type_id)
-                || (!by_value && self.resolves_to_scalar_view_pointee(type_id))
-        });
+        // F143: a `&` of a module-level binding waits whatever its type — the
+        // native copy out of the binding's cell is deferred there as a
+        // captured binding's view is taken last.
+        let read_late_on_js = (!by_value && self.is_a_module_place(place))
+            || self.expr_type_id(place).is_some_and(|type_id| {
+                self.aliases_on_the_js_backend(type_id)
+                    || (!by_value && self.resolves_to_scalar_view_pointee(type_id))
+            });
         if !read_late_on_js
             || (by_value && self.copy_applies(self.program.clone_sites.get(&argument)))
         {
@@ -276,25 +285,19 @@ impl<'src> Transformer<'src> {
     /// Whether some closure captures `binding` (a `mut` one). A local is
     /// captured only by a closure written inside the function that declares
     /// it, so for one of the emitted function's own bindings the question is
-    /// asked of the closures inside that function alone; a module-level
-    /// binding (or code at module level) asks the whole program's table.
+    /// asked of the closures inside that function alone; code at module level
+    /// asks the whole program's table.
+    ///
+    /// F143: a MODULE-LEVEL `mut` binding answers true outright. It is a place
+    /// every function shares, so any call a later argument makes can reach it
+    /// — the same reason a captured binding's argument waits — and natively it
+    /// lives in a `thread_local!` cell whose copy `vilan-rust`'s
+    /// `defers_its_cell_copy` takes after the later arguments.
     fn is_captured(&self, binding: Id) -> bool {
-        let module_level = self
-            .module_bindings
-            .get_or_init(|| {
-                self.program
-                    .modules
-                    .values()
-                    .flat_map(|module| module.body.0.iter())
-                    .filter_map(|statement| match self.program.entity_map.get(statement) {
-                        Some(Expr::Variable(binding)) => Some(*binding),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .contains(&binding);
-        if !module_level
-            && let Some(function_id) = self.emitting_stack.last().copied()
+        if self.is_a_module_binding(binding) {
+            return true;
+        }
+        if let Some(function_id) = self.emitting_stack.last().copied()
             && let Some(captured) = self.function_capture_table(function_id)
         {
             return captured.contains(&binding);
@@ -302,6 +305,24 @@ impl<'src> Transformer<'src> {
         self.captured_mut_bindings
             .get_or_init(|| crate::captures::captured_mut_bindings(self.program))
             .contains(&binding)
+    }
+
+    /// Whether `binding` is declared at a module's top level (F143).
+    fn is_a_module_binding(&self, binding: Id) -> bool {
+        // The entry file's top-level bindings are in no `modules` body, so
+        // the table is the program's own list (the native backend's
+        // `thread_local!` set).
+        self.module_bindings
+            .get_or_init(|| self.program.module_level_bindings().into_iter().collect())
+            .contains(&binding)
+    }
+
+    /// Whether `place` is a spine over a module-level binding (F143): natively
+    /// a copy out of its `thread_local!` cell, never a view of it — any callee
+    /// can reach the binding, and would meet the view's borrow.
+    fn is_a_module_place(&self, place: Id) -> bool {
+        self.spine_binding(place)
+            .is_some_and(|binding| self.is_a_module_binding(binding))
     }
 
     /// The `mut` bindings the closures inside one function capture, computed
@@ -467,6 +488,9 @@ impl<'src> Transformer<'src> {
         let Some((binding, _)) = self.captured_spine_root(place) else {
             return false;
         };
+        if self.is_a_module_binding(binding) {
+            return false;
+        }
         let natively_copy = self
             .expr_type_id(place)
             .is_some_and(|type_id| self.is_natively_copy(type_id));

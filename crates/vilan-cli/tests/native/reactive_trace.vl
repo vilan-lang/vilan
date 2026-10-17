@@ -1,0 +1,68 @@
+// E257 S8: the reactive trace (`std::reactive::trace::trace`) names each wake and its
+// cause identically on both backends. `PATH` picks the wake path: the test
+// writes one copy per path (the native backend has no `args()`), and the
+// substitution keeps every line in place.
+import std::io::print;
+import std::reactive::trace::trace;
+import std::reactive::{ Flow, FlushPolicy, Pipe, Signal, SignalCell, Source, batch, turn };
+
+/// A write through the trait: a bound names no place.
+fun write_through<S: Signal<i32>>(cell: S, value: i32) {
+	cell.set(value);
+}
+
+fun main() {
+	let path = "PATH";
+	trace(path != "off");
+	let count = SignalCell::new(1);
+	let plain: SignalCell<i32> = Signal::new(10);
+	if path == "inline" {
+		// No turn: the write wakes the effect at once, depth-first.
+		let _watch = count.sub(|value| print(i"inline {value}"));
+		count.set(2);
+	} else if path == "turn" {
+		// An ambient turn: the wake waits in its queue until the batch ends.
+		let _watch = count.sub(|value| print(i"turn {value}"));
+		batch(|| {
+			count.set(3);
+			print("queued");
+		});
+	} else if path == "draining" {
+		// A derivation's write inside a drain joins the DRAINING turn.
+		let doubled = count.derive(|value| value * 2).memo();
+		let _watch = doubled.sub(|value| print(i"draining {value}"));
+		batch(|| count.set(4));
+	} else if path == "late" {
+		// A write from a closure made inside a turn, run after it settled:
+		// one microtask drains it.
+		let _watch = count.sub(|value| print(i"late {value}"));
+		mut later: Option<|| void> = None;
+		turn(FlushPolicy::AtEnd, || {
+			later = Some(|| count.set(5));
+		});
+		match later {
+			Some(let write) => write(),
+			None => {},
+		}
+		print("before the microtask");
+	} else if path == "relay" {
+		// `distinct` keeps a registration of its own and wakes the observer
+		// below it: the relay is the cause.
+		let _watch = count.distinct().sub(|value| print(i"relay {value}"));
+		count.set(6);
+	} else if path == "update" {
+		let _watch = count.sub(|value| print(i"update {value}"));
+		count.update(|&mut value| {
+			value = *value + 1;
+		});
+	} else if path == "unplaced" {
+		// Made by `Signal::new` and written through a bound: the trace has
+		// no place for either (a `[track_caller]` trait member is refused).
+		let _watch = plain.sub(|value| print(i"unplaced {value}"));
+		write_through(plain, 11);
+	} else {
+		// Off: the same write, no line.
+		let _watch = count.sub(|value| print(i"off {value}"));
+		count.set(7);
+	}
+}
