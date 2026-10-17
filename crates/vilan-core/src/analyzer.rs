@@ -30,6 +30,7 @@ mod live_ranges;
 mod liveness;
 mod move_tables;
 mod r11_candidates;
+mod r11_records;
 mod row_families;
 mod written_types;
 
@@ -1972,6 +1973,7 @@ struct PlanArm {
 /// Which value a generic body would have to destroy and cannot (R11,
 /// destruction.md §6). One rule — "a generic body cannot destroy a `T`" — read
 /// at every place the drop planner can schedule a destruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum GenericLeak {
     /// An `own T` parameter still owned at the body's fall-through end: never
     /// moved out, so the caller's value has no destroyer.
@@ -2032,7 +2034,10 @@ impl MoveFlow {
 }
 
 /// One affine-rule violation (destruction.md §4), collected by the `&self` scan
-/// and rendered to a diagnostic by the `&mut self` driver.
+/// and rendered to a diagnostic by the `&mut self` driver. Recorded per R11
+/// instance (`r11_records.rs`): every field is an id or a span of the scanned
+/// body.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum ResourceMoveViolation {
     /// R1/R3/R4/R6: a resource binding used after it was moved. Primary at the
     /// use, note ("moved here") at the move site.
@@ -2209,6 +2214,17 @@ impl LexicalCandidates {
         inside.sort_unstable_by_key(|(position, _)| *position);
         inside.into_iter().map(|(_, id)| id).collect()
     }
+}
+
+/// What one instance's live scan answers (R11 door B): the record of its
+/// verdicts, and what the live path keeps in hand where a replay re-reads it
+/// from the record's ids — the propagation edges with the callee and
+/// resources each instantiates, and the container check's sites with their
+/// types and spans.
+struct R11LiveScan {
+    record: r11_records::R11InstanceRecord,
+    edges: Vec<(Id, Id, Vec<TypeId>)>,
+    typed_sites: Vec<(Id, TypeId, Span)>,
 }
 
 /// How an [`R11Instance`] was reached (B463).
@@ -4360,6 +4376,19 @@ pub struct Analyzer<'src> {
     /// derived them (it met an instantiation).
     r11_rows_live: r11_candidates::CandidateRows,
     r11_rows_filed: bool,
+    /// R11 door B (`r11_records.rs`): the world's instance records served to
+    /// this analysis (a hit's), whether it FILES the instances it scans (a
+    /// seeded analysis with a key), the records it derived, and the sources
+    /// cold for it — M110 S3's cold set, sealed before the checks so the
+    /// pass can ask it of a callee.
+    #[serde(skip)]
+    r11_records_served: Option<std::sync::Arc<r11_records::R11Records>>,
+    #[serde(skip)]
+    r11_records_filing: bool,
+    #[serde(skip)]
+    r11_records_derived: Vec<(r11_records::R11InstanceKey, r11_records::R11InstanceRecord)>,
+    #[serde(skip)]
+    r11_cold_sources: Vec<SourceId>,
     move_sets: Option<move_tables::MoveSets>,
     /// M150: the live lane's lazy-argument and HMR-site contributions
     /// (`lazy_tables.rs`), and whether each pass derived them.
@@ -8011,6 +8040,10 @@ impl<'src> Analyzer<'src> {
             move_rows_filed: false,
             r11_rows_live: r11_candidates::CandidateRows::default(),
             r11_rows_filed: false,
+            r11_records_served: None,
+            r11_records_filing: false,
+            r11_records_derived: Vec::new(),
+            r11_cold_sources: Vec::new(),
             move_sets: None,
             lazy_rows_live: lazy_tables::LazyRows::default(),
             lazy_rows_filed: false,
@@ -19586,140 +19619,271 @@ impl<'src> Analyzer<'src> {
         }
         let mut sets: Option<R11Sets> = None;
 
+        // R11 door B (`r11_records.rs`): the world's instance records, served
+        // and filed. An instance whose callee is COLD and whose key has a
+        // record with the current `Drop` digest is EMITTED from the record at
+        // this reporting site and its edges re-discovered — scanning nothing,
+        // building no set; every other instance is scanned live, as before,
+        // and filed when its callee is cold. The worklist above and below is
+        // unchanged, so WHO reports stays what a clean analysis reports.
+        let replay = self.r11_replay_context();
+        let mut instances_served: u64 = 0;
+        let mut instances_scanned: u64 = 0;
+
         while let Some(instance) = worklist.pop_front() {
-            if sets.is_none() {
-                let live = self.live_r11_candidate_rows();
-                let candidates = self.fold_r11_candidates(&live);
-                if !crate::macros::in_macro_world() {
-                    let walked = live.len() as u64;
-                    crate::incremental::update_census(|census| census.r11_rows_live += walked);
-                }
-                self.r11_rows_live = live;
-                self.r11_rows_filed = true;
-                sets = Some(R11Sets {
-                    // M149: the move scan's fold when it ran — the same
-                    // whole-program sets, restored and live.
-                    loaned_captures: match &self.move_sets {
-                        Some(sets) => sets.loaned.clone(),
-                        None => self.collect_loaned_pattern_captures(),
-                    },
-                    value_crossings: match &self.move_sets {
-                        Some(sets) => sets.crossings.clone(),
-                        None => self.compute_return_value_crossings(&|_| true),
-                    },
-                    candidates,
-                });
-                crate::phase_pass_mark("R11: the whole-program sets");
-            }
-            let R11Sets {
-                loaned_captures,
-                value_crossings,
-                candidates,
-            } = sets.as_ref().expect("built above");
             let resources: HashSet<TypeId> = instance.resources.iter().copied().collect();
-            // Delta classification: only the places whose resource-ness is CAUSED
-            // by this instantiation (resource under the parameter set, but not
-            // without it). A place that is a resource regardless — a concrete
-            // resource written into the generic body — is chunk 3's, already
-            // checked with its own in-body span; re-checking it here would
-            // double-report at the instantiation site.
-            let mut memo: HashMap<TypeId, bool> = HashMap::default();
-            let resource_bindings = self.collect_instantiation_bindings(
-                &r11_candidates::R11Candidates::within(&candidates.bindings, self, instance.callee),
-                &resources,
-                &mut memo,
-            );
-            let resource_value_places = self.collect_instantiation_value_places(
-                &r11_candidates::R11Candidates::within(&candidates.places, self, instance.callee),
-                &resources,
-                &mut memo,
-            );
-            // Per instantiation: `Option<T>`'s `None` is payload-free at every
-            // instantiation, but a variant carrying `T` is a resource only at
-            // this one, so the refinement is recomputed under the delta set.
-            let is_refinements = self.collect_is_refinements(
-                Some(&r11_candidates::R11Candidates::within(
-                    &candidates.tests,
-                    self,
-                    instance.callee,
-                )),
-                &resources,
-                &mut memo,
-            );
-            let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
-            // B469: a field move out of an owned aggregate is a destructure when
-            // the aggregate has no `Drop` anywhere inside at THIS instantiation
-            // — so the question is asked with what the instantiation binds.
-            let known_instantiation = self.r11_instantiation_types(&instance);
-            let no_module_level: HashSet<Id> = HashSet::default();
-            let partial_move_roots = self.collect_partial_move_roots(
-                &resource_value_places,
-                &no_module_level,
-                loaned_captures,
-                &known_instantiation,
-            );
-            let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
-            let violations = {
-                // A generic body's bindings are all in-body (parameters / locals);
-                // module-level resources never enter its delta set, so the loan-only
-                // corollary is inert here.
-                let scan = MoveScan {
-                    resource_bindings: &resource_bindings,
-                    resource_value_places: &resource_value_places,
-                    module_level_bindings: &no_module_level,
-                    loaned_captures,
-                    is_refinements: &is_refinements,
-                    value_crossings,
-                    partial_move_roots: &partial_move_roots,
-                    dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
-                };
-                self.scan_instantiated_body(instance.callee, &closures, &scan)
+            let served = match &replay {
+                Some(context) => self.r11_served_record(&instance, context),
+                None => None,
             };
-            self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
-            let body_is_move_clean = violations.is_empty();
-            let reported_before = self.diagnostics.len();
-            match instance.site {
-                R11Site::Call => {
-                    self.emit_r11_violations(instance.callee, instance.call_id, violations)
+            // A live scan answers its edges with the callee and resources
+            // each instantiates, asked once; a record keeps the calls alone
+            // and replay re-asks them (a few memoized type questions each).
+            let (verdict, scanned_live, live_edges, typed_sites) = match served {
+                Some(record) => {
+                    instances_served += 1;
+                    let typed_sites = self.r11_typed_container_sites(&record.container_sites);
+                    (record, false, Vec::new(), typed_sites)
                 }
-                R11Site::Admission => self.emit_inherited_default_violations(&instance, violations),
-            }
-            self.check_own_generic_exactly_once(
-                &instance,
-                &resource_bindings,
-                &resource_value_places,
-                &partial_move_roots,
-                body_is_move_clean,
-            );
-            self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
-            self.check_instantiation_container_resources(&instance, &body_exprs);
-            // B344, LAST and only when this instantiation is otherwise clean.
-            // Every sibling above reports the SAME instantiation, and a body
-            // that already fails R11 fails it for a reason the author can act
-            // on — `Option::unwrap_or` at a resource is "the loaned parameter
-            // `fallback` is moved out", whose steer is `unwrap_or_else`, and
-            // "drop the `lazy`" is not advice a caller of std can take. One
-            // diagnostic per root cause (B5): the lazy rule speaks where
-            // nothing else did, which is the whole of what B344 closed — a
-            // generic whose body never READS the lazy parameter is move-clean,
-            // so R11 has nothing to say and the thunk owns the resource anyway.
-            if self.diagnostics.len() == reported_before {
-                self.check_lazy_parameters_at_instantiation(&instance, &resources, &mut memo);
-            }
+                None => {
+                    instances_scanned += 1;
+                    if sets.is_none() {
+                        let live = self.live_r11_candidate_rows();
+                        let candidates = self.fold_r11_candidates(&live);
+                        if !crate::macros::in_macro_world() {
+                            let walked = live.len() as u64;
+                            crate::incremental::update_census(|census| {
+                                census.r11_rows_live += walked
+                            });
+                        }
+                        self.r11_rows_live = live;
+                        self.r11_rows_filed = true;
+                        sets = Some(R11Sets {
+                            // M149: the move scan's fold when it ran — the same
+                            // whole-program sets, restored and live.
+                            loaned_captures: match &self.move_sets {
+                                Some(sets) => sets.loaned.clone(),
+                                None => self.collect_loaned_pattern_captures(),
+                            },
+                            value_crossings: match &self.move_sets {
+                                Some(sets) => sets.crossings.clone(),
+                                None => self.compute_return_value_crossings(&|_| true),
+                            },
+                            candidates,
+                        });
+                        crate::phase_pass_mark("R11: the whole-program sets");
+                    }
+                    let R11Sets {
+                        loaned_captures,
+                        value_crossings,
+                        candidates,
+                    } = sets.as_ref().expect("built above");
+                    let scan = self.r11_scan_instance(
+                        &instance,
+                        &resources,
+                        loaned_captures,
+                        value_crossings,
+                        candidates,
+                    );
+                    (scan.record, true, scan.edges, scan.typed_sites)
+                }
+            };
+            self.r11_emit_verdict(&instance, &verdict, &typed_sites);
 
             // Propagate: the callee's own calls, now under ITS resource
             // parameters — a call passing `T` on to another generic instantiates
-            // that generic at a resource too (the indirect case).
-            let mut propagate_memo: HashMap<TypeId, bool> = HashMap::default();
-            for call_id in calls {
-                self.r11_discover(
-                    call_id,
-                    &resources,
-                    &mut propagate_memo,
-                    &mut worklist,
-                    &mut enqueued,
-                );
+            // that generic at a resource too (the indirect case). A record
+            // names the calls that did; a live scan asked every body call and
+            // kept those, with their answers.
+            if scanned_live {
+                for (call_id, callee, child_resources) in live_edges {
+                    Self::r11_enqueue(
+                        callee,
+                        child_resources,
+                        call_id,
+                        &mut worklist,
+                        &mut enqueued,
+                    );
+                }
+            } else {
+                let mut propagate_memo: HashMap<TypeId, bool> = HashMap::default();
+                for call_id in &verdict.edges {
+                    if let Some((callee, child_resources)) =
+                        self.r11_edge(*call_id, &resources, &mut propagate_memo)
+                    {
+                        Self::r11_enqueue(
+                            callee,
+                            child_resources,
+                            *call_id,
+                            &mut worklist,
+                            &mut enqueued,
+                        );
+                    }
+                }
             }
+            if scanned_live && let Some(context) = &replay {
+                self.r11_file_record(&instance, context, verdict);
+            }
+        }
+        if !crate::macros::in_macro_world() && instances_served + instances_scanned > 0 {
+            let filed = self.r11_records_derived.len() as u64;
+            crate::incremental::update_census(|census| {
+                census.r11_instances_served += instances_served;
+                census.r11_instances_scanned += instances_scanned;
+                census.r11_records_filed += filed;
+            });
+        }
+    }
+
+    /// One instance's live scan (R11 door B's "derive" half): the delta
+    /// classification over the callee's slices, the affine scan, and the
+    /// sibling verdicts as their emitters split them — everything a record
+    /// of this instance holds, nothing emitted — and beside it what the live
+    /// path keeps in hand and a record re-reads: the edges with their answers
+    /// and the container sites with their types.
+    fn r11_scan_instance(
+        &mut self,
+        instance: &R11Instance,
+        resources: &HashSet<TypeId>,
+        loaned_captures: &HashMap<Id, Id>,
+        value_crossings: &HashSet<Id>,
+        candidates: &r11_candidates::R11Candidates,
+    ) -> R11LiveScan {
+        // Delta classification: only the places whose resource-ness is CAUSED
+        // by this instantiation (resource under the parameter set, but not
+        // without it). A place that is a resource regardless — a concrete
+        // resource written into the generic body — is chunk 3's, already
+        // checked with its own in-body span; re-checking it here would
+        // double-report at the instantiation site.
+        let mut memo: HashMap<TypeId, bool> = HashMap::default();
+        let resource_bindings = self.collect_instantiation_bindings(
+            &r11_candidates::R11Candidates::within(&candidates.bindings, self, instance.callee),
+            resources,
+            &mut memo,
+        );
+        let resource_value_places = self.collect_instantiation_value_places(
+            &r11_candidates::R11Candidates::within(&candidates.places, self, instance.callee),
+            resources,
+            &mut memo,
+        );
+        // Per instantiation: `Option<T>`'s `None` is payload-free at every
+        // instantiation, but a variant carrying `T` is a resource only at
+        // this one, so the refinement is recomputed under the delta set.
+        let is_refinements = self.collect_is_refinements(
+            Some(&r11_candidates::R11Candidates::within(
+                &candidates.tests,
+                self,
+                instance.callee,
+            )),
+            resources,
+            &mut memo,
+        );
+        let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
+        // B469: a field move out of an owned aggregate is a destructure when
+        // the aggregate has no `Drop` anywhere inside at THIS instantiation
+        // — so the question is asked with what the instantiation binds.
+        let known_instantiation = self.r11_instantiation_types(instance);
+        let no_module_level: HashSet<Id> = HashSet::default();
+        let partial_move_roots = self.collect_partial_move_roots(
+            &resource_value_places,
+            &no_module_level,
+            loaned_captures,
+            &known_instantiation,
+        );
+        let dbg_stack_sink = std::cell::RefCell::new(DbgStackMoveRecords::new());
+        let violations = {
+            // A generic body's bindings are all in-body (parameters / locals);
+            // module-level resources never enter its delta set, so the loan-only
+            // corollary is inert here.
+            let scan = MoveScan {
+                resource_bindings: &resource_bindings,
+                resource_value_places: &resource_value_places,
+                module_level_bindings: &no_module_level,
+                loaned_captures,
+                is_refinements: &is_refinements,
+                value_crossings,
+                partial_move_roots: &partial_move_roots,
+                dbg_stack_sink: (!self.dbg_stack_calls.is_empty()).then_some(&dbg_stack_sink),
+            };
+            self.scan_instantiated_body(instance.callee, &closures, &scan)
+        };
+        self.record_dbg_stack_moves(dbg_stack_sink.into_inner());
+        let body_is_move_clean = violations.is_empty();
+        let leaks = self.generic_leaks(
+            instance,
+            &resource_bindings,
+            &resource_value_places,
+            &partial_move_roots,
+            body_is_move_clean,
+        );
+        let drop_forwards = self.generic_drop_forwards(&calls, resources, &mut memo);
+        let typed_sites = self.container_sites(instance.callee, &body_exprs);
+        let container_sites: Vec<Id> = typed_sites.iter().map(|(id, ..)| *id).collect();
+        let lazy_offenses = self.lazy_parameter_offenses(instance, resources, &mut memo);
+        let mut edge_memo: HashMap<TypeId, bool> = HashMap::default();
+        let live_edges: Vec<(Id, Id, Vec<TypeId>)> = calls
+            .into_iter()
+            .filter_map(|call_id| {
+                self.r11_edge(call_id, resources, &mut edge_memo)
+                    .map(|(callee, child_resources)| (call_id, callee, child_resources))
+            })
+            .collect();
+        let edges: Vec<Id> = live_edges.iter().map(|(call_id, ..)| *call_id).collect();
+        let record = r11_records::R11InstanceRecord {
+            drop_digest: 0,
+            violations,
+            leaks,
+            drop_forwards,
+            container_sites,
+            lazy_offenses,
+            edges,
+        };
+        R11LiveScan {
+            record,
+            edges: live_edges,
+            typed_sites,
+        }
+    }
+
+    /// One instance's verdicts spoken at ITS reporting site, in the order the
+    /// pass always spoke them: the affine violations, the exactly-once leaks,
+    /// the `drop` forwards, the container check (asked live of the reporting
+    /// call's bindings over the recorded sites), and B344's lazy rule LAST
+    /// and only when nothing else spoke. Every sibling reports the SAME
+    /// instantiation, and a body that already fails R11 fails it for a
+    /// reason the author can act on — `Option::unwrap_or` at a resource is
+    /// "the loaned parameter `fallback` is moved out", whose steer is
+    /// `unwrap_or_else`, and "drop the `lazy`" is not advice a caller of std
+    /// can take. One diagnostic per root cause (B5): the lazy rule speaks
+    /// where nothing else did, which is the whole of what B344 closed — a
+    /// generic whose body never READS the lazy parameter is move-clean, so
+    /// R11 has nothing to say and the thunk owns the resource anyway.
+    fn r11_emit_verdict(
+        &mut self,
+        instance: &R11Instance,
+        verdict: &r11_records::R11InstanceRecord,
+        typed_sites: &[(Id, TypeId, Span)],
+    ) {
+        let reported_before = self.diagnostics.len();
+        match instance.site {
+            R11Site::Call => self.emit_r11_violations(
+                instance.callee,
+                instance.call_id,
+                verdict.violations.clone(),
+            ),
+            R11Site::Admission => {
+                self.emit_inherited_default_violations(instance, verdict.violations.clone())
+            }
+        }
+        for (note_anchor, binding, leak) in &verdict.leaks {
+            self.emit_generic_leak(instance, *note_anchor, *binding, *leak);
+        }
+        for call_id in &verdict.drop_forwards {
+            self.emit_generic_drop_forward(instance, *call_id);
+        }
+        self.check_instantiation_container_resources(instance, typed_sites);
+        if self.diagnostics.len() == reported_before {
+            self.emit_lazy_offenses(instance, &verdict.lazy_offenses);
         }
     }
 
@@ -19755,20 +19919,26 @@ impl<'src> Analyzer<'src> {
     /// concrete code. The set is per-instantiation because the question is: it
     /// asks the DELTA place set, so a concrete resource overwritten inside a
     /// generic body stays chunk 3's report with its own in-body span.
-    fn check_own_generic_exactly_once(
+    ///
+    /// Answers the leaks — `(note anchor, binding, kind)` in emission order —
+    /// rather than emitting them: R11 door B records them per instance
+    /// (`r11_records.rs`) and `r11_emit_verdict` speaks them at the
+    /// reporting site.
+    fn generic_leaks(
         &mut self,
         instance: &R11Instance,
         resource_bindings: &HashSet<Id>,
         resource_value_places: &HashSet<Id>,
         partial_move_roots: &HashMap<Id, Id>,
         body_is_move_clean: bool,
-    ) {
+    ) -> Vec<(Id, Id, GenericLeak)> {
+        let mut leaks: Vec<(Id, Id, GenericLeak)> = Vec::new();
         if Some(instance.callee) == self.drop_fn_id {
-            return;
+            return leaks;
         }
         let (own_params, statements, tail) = {
             let Some(function) = self.functions.get(&instance.callee) else {
-                return;
+                return leaks;
             };
             let own_params: Vec<Id> = function
                 .parameters
@@ -19825,7 +19995,7 @@ impl<'src> Analyzer<'src> {
         );
         for parameter in &own_params {
             if owned.contains(parameter) {
-                self.emit_generic_leak(instance, *parameter, *parameter, GenericLeak::OwnParameter);
+                leaks.push((*parameter, *parameter, GenericLeak::OwnParameter));
             }
         }
         // B66: the SAME question, asked of every other value the body would have
@@ -19838,7 +20008,7 @@ impl<'src> Analyzer<'src> {
         // clean: the match consumes `o`, so the parameter passes, and the
         // capture leaks.
         if !body_is_move_clean {
-            return;
+            return leaks;
         }
         // Sorted by span (C1: deterministic order; both sets are HashSets).
         let mut leaked: Vec<(Id, Id, GenericLeak)> = plan
@@ -19868,9 +20038,8 @@ impl<'src> Analyzer<'src> {
             let span = **self.span_map.get(note_anchor).unwrap_or(&&EMPTY_SPAN);
             (span.start, span.end)
         });
-        for (note_anchor, binding, leak) in leaked {
-            self.emit_generic_leak(instance, note_anchor, binding, leak);
-        }
+        leaks.extend(leaked);
+        leaks
     }
 
     /// The R11 exactly-once diagnostic: primary at the instantiation site, note at
@@ -19982,10 +20151,16 @@ impl<'src> Analyzer<'src> {
     /// report it once per instantiation site. Deduplicated against the
     /// whole-program report too (`reported_container_structures`), so the caller
     /// that binds its own `List<Guard>` and passes it in is told once.
+    ///
+    /// Asked of the REPORTING call at replay too (R11 door B): the sites are
+    /// the record's ([`Self::container_sites`]), the substitution is the
+    /// current call's, and the dedup set is this analysis's — so a record
+    /// served at a different first-enqueuing call substitutes that call's
+    /// types, as a clean analysis would.
     fn check_instantiation_container_resources(
         &mut self,
         instance: &R11Instance,
-        body_exprs: &HashSet<Id>,
+        sites: &[(Id, TypeId, Span)],
     ) {
         let containers = self.resource_rejecting_containers();
         if containers.is_empty() {
@@ -19994,27 +20169,6 @@ impl<'src> Analyzer<'src> {
         let bindings = self.r11_call_type_bindings(instance.call_id, instance.callee);
         let (constraints, bounds): (Vec<TypeId>, Vec<TypeId>) = bindings.into_iter().unzip();
         let context = Self::instantiation_context(&constraints, &bounds);
-        // The body's own typed sites: the parameters it declares and the
-        // bindings it introduces. Span-sorted so the earliest in-body site is
-        // the one the note points at (C1, determinism).
-        let mut sites: Vec<(Id, TypeId, Span)> = Vec::new();
-        if let Some(function) = self.functions.get(&instance.callee) {
-            for parameter_id in function.parameters.clone() {
-                if let Some(parameter) = self.parameters.get(&parameter_id)
-                    && let Some(span) = self.span_map.get(&parameter_id)
-                {
-                    sites.push((parameter_id, parameter.type_id, **span));
-                }
-            }
-        }
-        for expr_id in body_exprs {
-            if let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(expr_id)
-                && let Some(variable) = self.variables.get(variable_id)
-            {
-                sites.push((variable.id, variable.type_id, variable.name_span));
-            }
-        }
-        sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
         let call_span = self.r11_site_span(instance);
         // The primary is the INSTANTIATION, so it belongs to the caller's file —
         // which is not the entry when the instantiating code was imported (B112).
@@ -20040,7 +20194,7 @@ impl<'src> Analyzer<'src> {
             &mut memo,
         );
         let mut examined: HashSet<TypeId> = HashSet::default();
-        for (_, type_id, body_span) in sites {
+        for &(_, type_id, body_span) in sites {
             if !examined.insert(type_id) {
                 continue;
             }
@@ -20086,6 +20240,51 @@ impl<'src> Analyzer<'src> {
                 Some((callee_name, body_span, instance.callee)),
             );
         }
+    }
+
+    /// The body's own typed sites the container check substitutes into: the
+    /// parameters the callee declares and the bindings its body introduces,
+    /// span-sorted so the earliest in-body site is the one the note points at
+    /// (C1, determinism). Ids alone — an R11 record keeps them, and
+    /// [`Self::check_instantiation_container_resources`] re-reads the types.
+    fn container_sites(&self, callee: Id, body_exprs: &HashSet<Id>) -> Vec<(Id, TypeId, Span)> {
+        let mut sites: Vec<(Id, TypeId, Span)> = Vec::new();
+        if let Some(function) = self.functions.get(&callee) {
+            for parameter_id in &function.parameters {
+                if let Some(parameter) = self.parameters.get(parameter_id)
+                    && let Some(span) = self.span_map.get(parameter_id)
+                {
+                    sites.push((*parameter_id, parameter.type_id, **span));
+                }
+            }
+        }
+        for expr_id in body_exprs {
+            if let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(expr_id)
+                && let Some(variable) = self.variables.get(variable_id)
+            {
+                sites.push((variable.id, variable.type_id, variable.name_span));
+            }
+        }
+        sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
+        sites
+    }
+
+    /// A record's container sites with their types and spans re-read from
+    /// the callee's own tables (R11 door B's replay; a record carries the
+    /// ids alone).
+    fn r11_typed_container_sites(&self, sites: &[Id]) -> Vec<(Id, TypeId, Span)> {
+        sites
+            .iter()
+            .filter_map(|site| {
+                if let Some(parameter) = self.parameters.get(site) {
+                    let span = self.span_map.get(site)?;
+                    Some((*site, parameter.type_id, **span))
+                } else {
+                    let variable = self.variables.get(site)?;
+                    Some((variable.id, variable.type_id, variable.name_span))
+                }
+            })
+            .collect()
     }
 
     /// The callee's own generic parameters that a REFUSED-AND-REPORTED
@@ -20184,17 +20383,19 @@ impl<'src> Analyzer<'src> {
     }
 
     /// the instantiation site, like the other R11 diagnostics.
-    fn check_generic_drop_forwarding(
+    ///
+    /// Answers the offending `drop` calls rather than emitting them: R11 door
+    /// B records them per instance and `r11_emit_verdict` speaks them.
+    fn generic_drop_forwards(
         &mut self,
-        instance: &R11Instance,
         calls: &[Id],
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
-    ) {
-        if self.drop_fn_id.is_none() {
-            return;
-        }
+    ) -> Vec<Id> {
         let mut offending: Vec<Id> = Vec::new();
+        if self.drop_fn_id.is_none() {
+            return offending;
+        }
         for &call_id in calls {
             let Some(argument_id) = self.drop_sink_argument_of(call_id) else {
                 continue;
@@ -20208,9 +20409,7 @@ impl<'src> Analyzer<'src> {
                 offending.push(call_id);
             }
         }
-        for call_id in offending {
-            self.emit_generic_drop_forward(instance, call_id);
-        }
+        offending
     }
 
     /// B344: lazy.md §1's **data only** rule, asked at the INSTANTIATION.
@@ -20232,17 +20431,24 @@ impl<'src> Analyzer<'src> {
     /// siblings': a parameter that is a resource without this instantiation is
     /// the declaration check's, already reported at its own span, so re-reporting
     /// it here would double-report one mistake at two places (B5).
-    fn check_lazy_parameters_at_instantiation(
+    ///
+    /// Split in two for R11 door B: the OFFENSES — the callee's `lazy`
+    /// parameters that are resources under this instantiation's delta — are a
+    /// fact of the body and the resource set, recorded per instance; whether
+    /// the reporting call already spoke for a position
+    /// ([`Self::lazy_position_spoken_for_at`]) is the call's, asked at
+    /// emission ([`Self::emit_lazy_offenses`]).
+    fn lazy_parameter_offenses(
         &mut self,
         instance: &R11Instance,
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
-    ) {
+    ) -> Vec<(usize, Id)> {
         let parameters: Vec<Id> = match self.functions.get(&instance.callee) {
             Some(function) => function.parameters.clone(),
-            None => return,
+            None => return Vec::new(),
         };
-        let lazy_parameters: Vec<(usize, Id, &'src str, TypeId)> = parameters
+        let lazy_parameters: Vec<(usize, Id, TypeId)> = parameters
             .iter()
             .enumerate()
             .filter_map(|(position, parameter_id)| {
@@ -20251,20 +20457,35 @@ impl<'src> Analyzer<'src> {
                     .map(|parameter| (position, parameter))
             })
             .filter(|(_, parameter)| parameter.lazy)
-            .map(|(position, parameter)| {
-                (position, parameter.id, parameter.name, parameter.type_id)
-            })
+            .map(|(position, parameter)| (position, parameter.id, parameter.type_id))
             .collect();
-        for (position, parameter_id, name, type_id) in lazy_parameters {
+        let mut offenses: Vec<(usize, Id)> = Vec::new();
+        for (position, parameter_id, type_id) in lazy_parameters {
             if !self.type_is_resource_with(type_id, resources, memo) {
                 continue;
             }
             if self.type_is_resource(type_id) {
                 continue;
             }
+            offenses.push((position, parameter_id));
+        }
+        offenses
+    }
+
+    /// B344's offenses spoken at the instance's reporting call, each unless
+    /// the value the caller wrote in that position is already refused.
+    fn emit_lazy_offenses(&mut self, instance: &R11Instance, offenses: &[(usize, Id)]) {
+        for &(position, parameter_id) in offenses {
             if self.lazy_position_spoken_for_at(instance.call_id, position) {
                 continue;
             }
+            let Some((name, type_id)) = self
+                .parameters
+                .get(&parameter_id)
+                .map(|parameter| (parameter.name, parameter.type_id))
+            else {
+                continue;
+            };
             self.emit_lazy_parameter_instantiation(instance, parameter_id, name, type_id);
         }
     }
@@ -20566,22 +20787,27 @@ impl<'src> Analyzer<'src> {
         worklist: &mut VecDeque<R11Instance>,
         enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
     ) {
-        if let Some((callee, receiver, self_marker)) = self.r11_inherited_default_call(call_id) {
-            if self.type_is_resource_with(receiver, current_resources, memo)
-                && enqueued.insert((callee, vec![self_marker]))
-            {
-                worklist.push_back(R11Instance {
-                    callee,
-                    resources: vec![self_marker],
-                    call_id,
-                    site: R11Site::Call,
-                });
-            }
-            return;
+        if let Some((callee, resources)) = self.r11_edge(call_id, current_resources, memo) {
+            Self::r11_enqueue(callee, resources, call_id, worklist, enqueued);
         }
-        let Some(callee) = self.r11_direct_callee(call_id) else {
-            return;
-        };
+    }
+
+    /// The instantiation a call makes under `current_resources`, as
+    /// `(callee, sorted resource parameters)` — [`Self::r11_discover`]'s
+    /// question without its enqueue, so a record's propagation EDGES (R11
+    /// door B) can be re-asked of the body calls that answered it.
+    fn r11_edge(
+        &mut self,
+        call_id: Id,
+        current_resources: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> Option<(Id, Vec<TypeId>)> {
+        if let Some((callee, receiver, self_marker)) = self.r11_inherited_default_call(call_id) {
+            return self
+                .type_is_resource_with(receiver, current_resources, memo)
+                .then(|| (callee, vec![self_marker]));
+        }
+        let callee = self.r11_direct_callee(call_id)?;
         let bindings = self.r11_call_type_bindings(call_id, callee);
         let mut resources: Vec<TypeId> = Vec::new();
         for (constraint, bound) in bindings {
@@ -20592,9 +20818,21 @@ impl<'src> Analyzer<'src> {
             }
         }
         if resources.is_empty() {
-            return;
+            return None;
         }
         resources.sort_unstable_by_key(|constraint| constraint.0);
+        Some((callee, resources))
+    }
+
+    /// Enqueues an instantiation unless its key was already enqueued — the
+    /// first call to enqueue an instance is the one that reports it.
+    fn r11_enqueue(
+        callee: Id,
+        resources: Vec<TypeId>,
+        call_id: Id,
+        worklist: &mut VecDeque<R11Instance>,
+        enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
+    ) {
         if enqueued.insert((callee, resources.clone())) {
             worklist.push_back(R11Instance {
                 callee,
@@ -27491,6 +27729,7 @@ impl<'src> Analyzer<'src> {
     /// `type_of_expr`'s interned half — the copy passes need the `TypeId` itself
     /// to ask the resource questions (`type_is_resource`,
     /// `resource_triggering_constraints`), which are keyed by id.
+    #[inline]
     fn type_id_of_expr(&self, expr_id: Id) -> Option<TypeId> {
         self.expr_id_to_type_id_map
             .get(&expr_id)
@@ -27686,7 +27925,12 @@ impl<'src> Analyzer<'src> {
             .any(|argument_id| self.stand_down_on_refused_annotation(argument_id))
     }
 
-    /// `place_value_type`'s interned half.
+    /// `place_value_type`'s interned half. Inlined at its callers: R11 door B
+    /// split the instantiation scan out of the worklist's body into
+    /// `r11_scan_instance`, where this and `type_id_of_expr` stopped being
+    /// inlined — 13,000 out-of-line calls on a cold check of `canvas`, the
+    /// whole of its +0.1% — and the hint restores the shape the loop had.
+    #[inline]
     fn place_value_type_id(&self, expr_id: Id) -> Option<TypeId> {
         if let Some(type_id) = self.type_id_of_expr(expr_id) {
             return Some(type_id);
@@ -76999,6 +77243,25 @@ pub(crate) fn world_table_reuse_enabled() -> bool {
     WORLD_TABLE_REUSE.load(std::sync::atomic::Ordering::SeqCst) && world_reuse_enabled()
 }
 
+/// R11 door B's own disable switch (`analyzer/r11_records.rs`): the
+/// instance records are neither served nor filed, so every instantiation is
+/// scanned live over the restored candidate rows — the shape the M155 row
+/// pins observe. Separate from the table switch for the reason that one is
+/// separate from `WORLD_REUSE`: a served instance reads no row at all, so a
+/// pin that plants a stale row must take the records out of the way first,
+/// and a switch that only turned the whole table half off could not tell
+/// "the rows were not read" from "nothing was restored".
+static R11_RECORDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_r11_records(enabled: bool) {
+    R11_RECORDS.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn r11_records_enabled() -> bool {
+    R11_RECORDS.load(std::sync::atomic::Ordering::SeqCst) && world_table_reuse_enabled()
+}
+
 /// M19 T1b's PLANT: serve a reused module a stale table.
 ///
 /// The differential proves that restoring equals recomputing. It cannot, on
@@ -81387,6 +81650,10 @@ struct WorldChecks {
     /// it was computed over. One per world key: a session's keystrokes in one
     /// file share a cold set, and a different set files its own.
     post: Option<(u64, std::sync::Arc<PostRecord>)>,
+    /// R11 door B: the world's instance records (`r11_records.rs`), one per
+    /// `(callee, resources)` the world's analyses scanned, each validated at
+    /// replay by its callee's coldness and its `Drop` digest.
+    r11: Option<std::sync::Arc<r11_records::R11Records>>,
     /// M46: what this record costs in BYTES — the input to the budget below,
     /// kept as a running total so enforcing it costs an addition rather than a
     /// walk. M19 T1b counted ROWS here, which priced a one-`Id` last-use row
@@ -81404,6 +81671,7 @@ impl WorldChecks {
     fn compute_bytes(&self) -> usize {
         let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
         let post = self.post.as_ref().map_or(0, |(_, record)| record.bytes);
+        let r11 = self.r11.as_ref().map_or(0, |records| records.bytes);
         let items: usize = self.per_item.values().map(|record| record.bytes()).sum();
         let modules: usize = self
             .per_source
@@ -81415,7 +81683,7 @@ impl WorldChecks {
                     + module.tables.as_ref().map_or(0, ModuleTables::bytes)
             })
             .sum();
-        hashes + modules + post + items
+        hashes + modules + post + r11 + items
     }
 }
 
@@ -81649,6 +81917,8 @@ fn checked_cache_store(
         .unwrap_or_default();
     // M110 S3: a post record filed under the same content stays with it.
     let post = existing.and_then(|recorded| recorded.post.clone());
+    // R11 door B: the instance records too.
+    let r11 = existing.and_then(|recorded| recorded.r11.clone());
     // M110 S7: the item records too.
     let per_item = existing
         .map(|recorded| recorded.per_item.clone())
@@ -81671,6 +81941,7 @@ fn checked_cache_store(
         per_source,
         per_item,
         post,
+        r11,
         bytes: 0,
         last_used: tick,
     };
@@ -88582,6 +88853,38 @@ fn analyze_over_world<'src>(
             .unwrap_or_default();
         analyzer.decide_item_records(&item_records, &alias_reaching);
     }
+    // R11 door B (`r11_records.rs`): the cold set a served instance record
+    // is validated against — M110 S3's, sealed here because the checks run
+    // before the seam is; whether this analysis FILES the instances it scans
+    // (the item records' rule: a seeded analysis with a key to file under);
+    // and the world's records, served on a hit under the reuse switches the
+    // module records answer to.
+    // The alias closure is asked on a MISS too (M19's reuse never is, so
+    // `alias_reaching` above is empty there): a record filed under one entry
+    // for a module that reaches it through `pkg::` must not be served under
+    // another entry sharing the world's key, where that module is cold.
+    let alias_reaching_for_records: HashSet<SourceId> = if entry_is_open_module && !from_base_cache
+    {
+        analyzer.alias_reaching_sources()
+    } else {
+        alias_reaching.clone()
+    };
+    analyzer.r11_cold_sources = r11_records::cold_sources(
+        &analyzer.entry_dirty_sources,
+        &alias_reaching_for_records,
+        prefix_len,
+    );
+    analyzer.r11_records_filing = analyzer.item_records_enabled() && r11_records_enabled();
+    analyzer.r11_records_served = checks_key
+        .as_ref()
+        .filter(|_| {
+            from_base_cache
+                && !entry_is_module
+                && r11_records_enabled()
+                && !full_scan_checks_forced()
+                && !crate::incremental::clean_requested()
+        })
+        .and_then(|key| r11_records::checked_cache_lookup_r11(key, &source_hashes[..prefix_len]));
     let reuse_candidates: HashSet<SourceId> = if from_base_cache && !entry_is_module {
         (1..recorded_len as u32)
             .map(SourceId)
@@ -89980,6 +90283,13 @@ fn analyze_over_world<'src>(
             slice.hover_recorded = records_hover;
         }
         checked_cache_store_tables(key, &source_hashes[..prefix_len], tables);
+        // R11 door B: the instance records this analysis derived (a seeded
+        // analysis's, cold callees only), filed beside the checks record —
+        // by a complete analysis only, as the items below are.
+        if !crate::cancel::cancelled() {
+            let derived = std::mem::take(&mut analyzer.r11_records_derived);
+            r11_records::checked_cache_store_r11(key, &source_hashes[..prefix_len], derived);
+        }
         // M110 S7: the item records of the re-walked files, with their
         // slices — filed only by a complete analysis (a cancelled phase is
         // a prefix of itself, and a prefix recorded as a whole would replay
@@ -90344,13 +90654,11 @@ fn analyze_over_world<'src>(
                 && !crate::cancel::cancelled()
                 && !crate::incremental::clean_requested() =>
         {
-            let cold_sources: Vec<SourceId> = (1..prefix_len as u32)
-                .map(SourceId)
-                .filter(|source| {
-                    !analyzer.entry_dirty_sources.contains(source)
-                        && !alias_reaching.contains(source)
-                })
-                .collect();
+            let cold_sources: Vec<SourceId> = r11_records::cold_sources(
+                &analyzer.entry_dirty_sources,
+                &alias_reaching,
+                prefix_len,
+            );
             let cold_fingerprint = {
                 let mut rendered = String::new();
                 for source in &cold_sources {
