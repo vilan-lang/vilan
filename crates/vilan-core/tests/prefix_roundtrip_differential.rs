@@ -456,6 +456,62 @@ fn m158_a_damaged_or_foreign_checks_record_is_a_miss_of_the_record_alone() {
     let _ = std::fs::remove_dir_all(&cache);
 }
 
+/// **incr-54c's find (P5)**: a std namespace a program's import names
+/// (`std::web`, a directory with no body) is part of the prefix world —
+/// `namespace_only_modules` — so it is part of the prefix's KEY. Before the
+/// fix the closure skipped it, so a prefix built for a program that never
+/// named `std::web` was served to one that does, which then resolved
+/// `std::web::dmo` as the moved web prelude ("`std::web` moved to
+/// `std::web::prelude`") instead of a miss under the namespace — over the
+/// persisted file and over the in-process prefix alike.
+#[test]
+fn a_std_namespace_the_import_names_is_part_of_the_prefix_key() {
+    let cache = cache_directory("namespace");
+    let empty: Vec<(String, String)> = vec![("main.vl".to_string(), "fun main() {}\n".to_string())];
+    let dmo: Vec<(String, String)> = vec![(
+        "main.vl".to_string(),
+        "import std::web::dmo;\n\nfun main() {}\n".to_string(),
+    )];
+    let first = write_package("prefix_namespace_empty", Platform::default(), &empty, &[]);
+    let second = write_package("prefix_namespace_dmo", Platform::default(), &dmo, &[]);
+    let clean = observe_fresh(&second, None, Leg::Clean);
+    assert!(
+        clean
+            .rendering
+            .contains("cannot find 'dmo' in the imported path"),
+        "the canonical analysis misses `dmo` under the namespace: {}",
+        clean.rendering
+    );
+    // Over the persisted file the empty program wrote.
+    let written = observe_fresh(&first, Some(cache.clone()), Leg::Incremental);
+    assert_eq!(written.census.prefix_file, Some("written"));
+    let over_file = observe_fresh(&second, Some(cache.clone()), Leg::Incremental);
+    assert_eq!(
+        over_file.rendering, clean.rendering,
+        "over the empty program's file"
+    );
+    // Over the in-process prefix the empty program stored.
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::prefix_files_forget();
+    set_world_cache(Some(None));
+    set_std_prefix(Some(true));
+    let _ = observe(&first, Vec::new(), Leg::Incremental);
+    let in_process = observe(&second, Vec::new(), Leg::Incremental);
+    set_std_prefix(None);
+    set_world_cache(None);
+    assert!(
+        in_process.census.prefix_world,
+        "the program builds over the prefix"
+    );
+    assert_eq!(
+        in_process.rendering, clean.rendering,
+        "over the empty program's in-process prefix"
+    );
+    first.remove();
+    second.remove();
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
 fn walk(directory: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(directory) else {

@@ -82758,7 +82758,10 @@ fn std_closure_content(std_roots: &[PathBuf], closure: &[String]) -> u64 {
     use std::fmt::Write as _;
     let mut rendered = String::new();
     for root in std_roots {
-        for name in closure {
+        for name in closure
+            .iter()
+            .filter(|name| !closure_names_a_namespace(name))
+        {
             let Some(resolution) = resolve_module_file(root, name) else {
                 continue;
             };
@@ -84358,14 +84361,29 @@ fn std_closure<'a>(
                 .map(|(cut, _)| name[..cut].to_string()),
         );
         // A pure namespace has no row (no body under any root): registered
-        // by the drain, nothing of its own to follow.
-        if let Some(requests) = index.requests.get(&name) {
-            pending.extend(requests.iter().cloned());
-            closure.push(interned_display_name(name));
+        // by the drain, nothing of its own to follow. But it IS part of the
+        // world — `namespace_only_modules`, which an import resolving through
+        // it reads — so it rides in the closure as `name/` (a spelling no
+        // module has): a prefix world built for a program that never named
+        // `std::web` holds no `web` namespace, and serving it to one that does
+        // resolved `std::web::dmo` as the moved web prelude instead of a miss
+        // under the namespace (incr-54c's find, P5).
+        match index.requests.get(&name) {
+            Some(requests) => {
+                pending.extend(requests.iter().cloned());
+                closure.push(interned_display_name(name));
+            }
+            None => closure.push(interned_display_name(format!("{name}/"))),
         }
     }
     closure.sort_unstable();
     closure
+}
+
+/// Whether a std closure entry names a pure NAMESPACE (`name/`, see
+/// [`std_closure`]) rather than a module with a body.
+fn closure_names_a_namespace(entry: &str) -> bool {
+    entry.ends_with('/')
 }
 
 /// The canonical module load order (WO-1b), rhyming with WO-1's import sort:
@@ -88549,7 +88567,12 @@ fn analyze_inner<'src>(
             .map(|(name, ..)| *name)
             .collect();
         loaded_std.sort_unstable();
-        let differs = !loaded_std.iter().eq(base_cache_key.std_seeds.iter());
+        // The closure's namespaces register without loading a body, so the
+        // drain's loaded modules are compared with its bodied entries.
+        let differs = !loaded_std.iter().eq(base_cache_key
+            .std_seeds
+            .iter()
+            .filter(|entry| !closure_names_a_namespace(entry)));
         if differs && crate::phase_timing_enabled() {
             eprintln!(
                 "[vilan phase] prefix-closure-mismatch loaded {} closure {}",
