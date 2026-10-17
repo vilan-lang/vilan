@@ -80246,8 +80246,27 @@ pub(crate) struct PostRecord {
     /// analysis's fixpoint starts from (`async_infer::infer`). Set once, by
     /// the first analysis that reads the record after filing it; sorted.
     pub async_cold: std::sync::OnceLock<Vec<Id>>,
+    /// M138 (Order 54): the async pass's COLD instance record — the
+    /// adaptation worklist and its decisions over the cold nodes alone, each
+    /// key's reads logged — which a served analysis's worklist restarts from
+    /// (`async_infer::AsyncInstanceRecord`). Set once, beside S3b's cold
+    /// result; its bytes are its own (`AsyncInstanceRecord::bytes`).
+    pub async_instances:
+        std::sync::OnceLock<std::sync::Arc<crate::async_infer::AsyncInstanceRecord>>,
     /// What the record retains, in bytes (M46's currency).
     pub bytes: usize,
+}
+
+impl PostRecord {
+    /// What the record retains now: what it was filed with, and the async
+    /// pass's cold instance record once one is set (M138).
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes
+            + self
+                .async_instances
+                .get()
+                .map_or(0, |instances| instances.bytes)
+    }
 }
 
 impl Program<'_> {
@@ -80590,6 +80609,11 @@ struct BaseCacheState {
     /// is written out (`prefix_file_write`).
     prefix_files_tried: HashSet<BaseCacheKey>,
     prefix_files_missed: HashSet<BaseCacheKey>,
+    /// M158: the prefix keys whose world file this process just WROTE, with
+    /// the file's key — the analysis that built the world writes the key's
+    /// checks record beside it once its checks are filed
+    /// (`prefix_checks_write`).
+    prefix_checks_wanted: HashMap<BaseCacheKey, crate::prefix_file::Key>,
     retained_bytes: usize,
     tick: u64,
     /// M44: keys whose world some thread is BUILDING right now, and which
@@ -81670,7 +81694,10 @@ impl WorldChecks {
     /// table slices.
     fn compute_bytes(&self) -> usize {
         let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
-        let post = self.post.as_ref().map_or(0, |(_, record)| record.bytes);
+        let post = self
+            .post
+            .as_ref()
+            .map_or(0, |(_, record)| record.retained_bytes());
         let r11 = self.r11.as_ref().map_or(0, |records| records.bytes);
         let items: usize = self.per_item.values().map(|record| record.bytes()).sum();
         let modules: usize = self
@@ -82064,8 +82091,11 @@ pub(crate) fn checked_cache_store_post(
     {
         return;
     }
-    let was = recorded.post.as_ref().map_or(0, |(_, record)| record.bytes);
-    recorded.bytes = recorded.bytes.saturating_sub(was) + record.bytes;
+    let was = recorded
+        .post
+        .as_ref()
+        .map_or(0, |(_, record)| record.retained_bytes());
+    recorded.bytes = recorded.bytes.saturating_sub(was) + record.retained_bytes();
     recorded.post = Some((cold_fingerprint, record));
     let bytes = recorded.bytes;
     let tick = state.next_tick();
@@ -82076,6 +82106,41 @@ pub(crate) fn checked_cache_store_post(
         .bytes
         .saturating_sub(previous_bytes)
         .saturating_add(bytes);
+    state.evict_to_budget(Some(key));
+}
+
+/// M138: a post record that gained a part after it was filed (the async
+/// pass's cold instance record, set once by the first analysis that reads the
+/// record) has those bytes join its checks record's total, so the budget
+/// (M46) bounds them as it bounds what was filed with it.
+pub(crate) fn checked_cache_grow_post(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    cold_fingerprint: u64,
+    bytes: usize,
+) {
+    let Some(cache) = CHECKED_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tick = state.next_tick();
+    let Some(recorded) = state.records.get_mut(key) else {
+        return;
+    };
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+        || !recorded
+            .post
+            .as_ref()
+            .is_some_and(|(fingerprint, _)| *fingerprint == cold_fingerprint)
+    {
+        return;
+    }
+    recorded.bytes += bytes;
+    recorded.last_used = tick;
+    state.bytes = state.bytes.saturating_add(bytes);
     state.evict_to_budget(Some(key));
 }
 
@@ -82332,8 +82397,11 @@ fn base_cache_admit(
             state.prefix_files_tried.insert(key.clone());
             if let Some(directory) = crate::incremental::world_cache_dir() {
                 match prefix_file_load(&directory, key, std) {
-                    Ok((world, bytes, micros)) => {
+                    Ok((world, bytes, micros, checks_missed)) => {
                         PREFIX_FILE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(file_key) = checks_missed {
+                            state.prefix_checks_wanted.insert(key.clone(), file_key);
+                        }
                         crate::incremental::update_census(|census| {
                             census.prefix_file = Some("loaded");
                             census.prefix_file_bytes = bytes;
@@ -82588,6 +82656,21 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
 static PREFIX_FILE_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PREFIX_FILE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PREFIX_FILE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// M158: the prefix keys' persisted checks records this process loaded and
+/// wrote.
+static PREFIX_CHECKS_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREFIX_CHECKS_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// M158: `(loads, writes)` of the prefix keys' persisted checks records in
+/// this process.
+#[doc(hidden)]
+pub fn prefix_checks_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PREFIX_CHECKS_LOADS.load(Relaxed),
+        PREFIX_CHECKS_WRITES.load(Relaxed),
+    )
+}
 
 /// `(loads, writes, misses)` of the persisted std prefix in this process.
 #[doc(hidden)]
@@ -82611,6 +82694,7 @@ pub fn prefix_files_forget() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.prefix_files_tried.clear();
         state.prefix_files_missed.clear();
+        state.prefix_checks_wanted.clear();
     }
 }
 
@@ -82674,7 +82758,10 @@ fn std_closure_content(std_roots: &[PathBuf], closure: &[String]) -> u64 {
     use std::fmt::Write as _;
     let mut rendered = String::new();
     for root in std_roots {
-        for name in closure {
+        for name in closure
+            .iter()
+            .filter(|name| !closure_names_a_namespace(name))
+        {
             let Some(resolution) = resolve_module_file(root, name) else {
                 continue;
             };
@@ -82723,12 +82810,14 @@ impl World<'static> {
 /// paths re-rooted from the writer's canonical std roots to this process's
 /// std, and its per-source path keys (M110 S6) recomputed over them. `Err`
 /// is the miss and its reason. Returns the world with the file's size and
-/// the load's wall time in microseconds.
+/// the load's wall time in microseconds — and, when the key's checks record
+/// (M158) was a miss, the file's key, so the analysis served the world
+/// writes the record once it has filed it.
 fn prefix_file_load(
     directory: &Path,
     key: &BaseCacheKey,
     std: &PackageSpec,
-) -> Result<(World<'static>, u64, u64), crate::prefix_file::Miss> {
+) -> Result<(World<'static>, u64, u64, Option<crate::prefix_file::Key>), crate::prefix_file::Miss> {
     let file_key = prefix_file_key(key);
     let loaded = crate::prefix_file::read(directory, &file_key)?;
     let current = std_spec_roots(std);
@@ -82751,7 +82840,160 @@ fn prefix_file_load(
             loaded.bytes
         );
     }
-    Ok((world, loaded.bytes as u64, micros))
+    let checks = prefix_checks_load(directory, &file_key, key, &world)
+        .err()
+        .map(|_| file_key);
+    Ok((world, loaded.bytes as u64, micros, checks))
+}
+
+/// M158 (Order 54): the persisted form of a prefix key's checks record — M19's
+/// `WorldChecks` minus what another process cannot read back (the
+/// package-keyed per-item records; the seeded analyses' post-pass and
+/// instance records, which only an editor files) and minus what the reader
+/// recomputes (the sources fingerprint, over its own re-rooted paths).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+struct PersistedChecks {
+    /// `WorldChecks::source_hashes`: the world's content, per source (the
+    /// entry's slot is never compared).
+    source_hashes: Vec<u64>,
+    /// `WorldChecks::per_source`, in source order (the bytes a function of
+    /// the content).
+    per_source: Vec<(u32, ModuleDiagnostics)>,
+}
+
+/// M158: inserts the prefix key's persisted checks record into
+/// [`CHECKED_CACHE`] beside the world just loaded, so the analysis served
+/// from it replays std's Class A checks (and their class D tables) instead
+/// of deriving them. A record that is absent, damaged, foreign or about
+/// other content is a miss of the record alone; one already in memory for
+/// the key is kept.
+fn prefix_checks_load(
+    directory: &Path,
+    file_key: &crate::prefix_file::Key,
+    key: &BaseCacheKey,
+    world: &World<'static>,
+) -> Result<(), &'static str> {
+    let outcome = crate::prefix_file::read_checks(directory, file_key).and_then(|loaded| {
+        crate::prefix_file::codec::decode::<PersistedChecks>(loaded.body, loaded.table)
+            .map_err(|_| crate::prefix_file::Miss::Undecodable)
+    });
+    let missed = |reason: &'static str| {
+        crate::incremental::update_census(|census| census.prefix_checks = Some(reason));
+        Err(reason)
+    };
+    let persisted = match outcome {
+        Ok(persisted) => persisted,
+        Err(miss) => return missed(miss.label()),
+    };
+    // The world's own content, per source: the record describes exactly the
+    // sources the world was built from (the E12 rule at this seam).
+    if persisted.source_hashes.len() != world.source_hashes.len()
+        || persisted.source_hashes.get(1..) != world.source_hashes.get(1..)
+    {
+        return missed("foreign-content");
+    }
+    let cache = CHECKED_CACHE.get_or_init(|| std::sync::Mutex::new(CheckedCacheState::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.records.contains_key(key) {
+        return Ok(());
+    }
+    if state.records.len() >= CHECKED_CACHE_KEYS {
+        state.records.clear();
+        state.bytes = 0;
+    }
+    let tick = state.next_tick();
+    let mut record = WorldChecks {
+        source_hashes: persisted.source_hashes,
+        sources_fingerprint: replay_sources_fingerprint(world.sources.get(1..).unwrap_or(&[])),
+        per_source: persisted.per_source.into_iter().collect(),
+        per_item: HashMap::default(),
+        post: None,
+        r11: None,
+        bytes: 0,
+        last_used: tick,
+    };
+    record.bytes = record.compute_bytes();
+    state.bytes += record.bytes;
+    state.records.insert(key.clone(), record);
+    state.evict_to_budget(Some(key));
+    drop(state);
+    PREFIX_CHECKS_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::incremental::update_census(|census| census.prefix_checks = Some("loaded"));
+    Ok(())
+}
+
+/// M158: writes the prefix key's checks record beside its world, at the end
+/// of the analysis that built (and wrote) the world, or of one served a
+/// loaded world whose record was a miss (absent — the analysis that wrote the
+/// world fell back to another shape before filing — or damaged): once this
+/// process has filed the record (M19's store and the class D tables).
+/// Nothing for a key no such analysis named, and nothing from a cancelled
+/// analysis (a prefix of itself).
+fn prefix_checks_write(key: &BaseCacheKey) {
+    if crate::cancel::cancelled() {
+        return;
+    }
+    let Some(directory) = crate::incremental::world_cache_dir() else {
+        return;
+    };
+    let file_key = {
+        let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.prefix_checks_wanted.remove(key)
+    };
+    let Some(file_key) = file_key else {
+        return;
+    };
+    let persisted = {
+        let Some(cache) = CHECKED_CACHE.get() else {
+            return;
+        };
+        let state = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(recorded) = state.records.get(key) else {
+            return;
+        };
+        let mut per_source: Vec<(u32, ModuleDiagnostics)> = recorded
+            .per_source
+            .iter()
+            .map(|(index, module)| (*index, module.clone()))
+            .collect();
+        per_source.sort_unstable_by_key(|(index, _)| *index);
+        PersistedChecks {
+            source_hashes: recorded.source_hashes.clone(),
+            per_source,
+        }
+    };
+    let outcome = crate::prefix_file::codec::encode(&persisted)
+        .map_err(|error| error.to_string())
+        .and_then(|(body, table)| {
+            crate::prefix_file::write_checks(&directory, &file_key, &key.std_roots, &body, &table)
+        });
+    match outcome {
+        Ok(written) => {
+            PREFIX_CHECKS_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::incremental::update_census(|census| census.prefix_checks_written = true);
+            if crate::phase_timing_enabled() {
+                eprintln!(
+                    "[vilan phase] prefix-checks-written {} bytes={} us={}",
+                    written.path.display(),
+                    written.bytes,
+                    written.took.as_micros()
+                );
+            }
+        }
+        Err(error) => {
+            if crate::phase_timing_enabled() {
+                eprintln!("[vilan phase] prefix-checks-write-failed {error}");
+            }
+        }
+    }
 }
 
 /// Writes the std-only world this analysis just built and stored, when this
@@ -82815,6 +83057,16 @@ fn prefix_file_write(
     match outcome {
         Ok(written) => {
             PREFIX_FILE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // M158: the checks record follows once this analysis files it.
+            {
+                let cache =
+                    BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+                cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .prefix_checks_wanted
+                    .insert(key.clone(), file_key.clone());
+            }
             // P4: the root held to its byte budget, the least recently used
             // worlds first, never the one just written.
             let evicted = crate::world_cache::bound(
@@ -84109,14 +84361,29 @@ fn std_closure<'a>(
                 .map(|(cut, _)| name[..cut].to_string()),
         );
         // A pure namespace has no row (no body under any root): registered
-        // by the drain, nothing of its own to follow.
-        if let Some(requests) = index.requests.get(&name) {
-            pending.extend(requests.iter().cloned());
-            closure.push(interned_display_name(name));
+        // by the drain, nothing of its own to follow. But it IS part of the
+        // world — `namespace_only_modules`, which an import resolving through
+        // it reads — so it rides in the closure as `name/` (a spelling no
+        // module has): a prefix world built for a program that never named
+        // `std::web` holds no `web` namespace, and serving it to one that does
+        // resolved `std::web::dmo` as the moved web prelude instead of a miss
+        // under the namespace (incr-54c's find, P5).
+        match index.requests.get(&name) {
+            Some(requests) => {
+                pending.extend(requests.iter().cloned());
+                closure.push(interned_display_name(name));
+            }
+            None => closure.push(interned_display_name(format!("{name}/"))),
         }
     }
     closure.sort_unstable();
     closure
+}
+
+/// Whether a std closure entry names a pure NAMESPACE (`name/`, see
+/// [`std_closure`]) rather than a module with a body.
+fn closure_names_a_namespace(entry: &str) -> bool {
+    entry.ends_with('/')
 }
 
 /// The canonical module load order (WO-1b), rhyming with WO-1's import sort:
@@ -85829,6 +86096,12 @@ fn analyze_inner<'src>(
                 true,
             ),
         };
+        // M158: a served prefix whose checks record was a miss writes it once
+        // the record is filed (`prefix_checks_write` asks whether one is due).
+        let prefix_checks = checks_key
+            .as_ref()
+            .filter(|key| key.std_prefix && layered.is_none())
+            .cloned();
         return match analyze_over_world(
             world,
             nodes,
@@ -85839,7 +86112,12 @@ fn analyze_inner<'src>(
             checks_key,
             from_base_cache,
         ) {
-            Ok(program) => program,
+            Ok(program) => {
+                if let Some(key) = prefix_checks {
+                    prefix_checks_write(&key);
+                }
+                program
+            }
             Err(reached) => analyze_inner(
                 nodes,
                 entry_source,
@@ -88289,7 +88567,12 @@ fn analyze_inner<'src>(
             .map(|(name, ..)| *name)
             .collect();
         loaded_std.sort_unstable();
-        let differs = !loaded_std.iter().eq(base_cache_key.std_seeds.iter());
+        // The closure's namespaces register without loading a body, so the
+        // drain's loaded modules are compared with its bodied entries.
+        let differs = !loaded_std.iter().eq(base_cache_key
+            .std_seeds
+            .iter()
+            .filter(|entry| !closure_names_a_namespace(entry)));
         if differs && crate::phase_timing_enabled() {
             eprintln!(
                 "[vilan phase] prefix-closure-mismatch loaded {} closure {}",
@@ -88469,6 +88752,9 @@ fn analyze_inner<'src>(
             world.hot.is_some().then(|| refusal_key.clone()),
         ),
     };
+    // M158: the prefix key's own record (P1's forced shape, not a layered
+    // world's key) is written beside the prefix's file once it is filed.
+    let prefix_checks = (layered.is_none() && checks_key.std_prefix).then(|| checks_key.clone());
     let answer = analyze_over_world(
         world,
         nodes,
@@ -88486,7 +88772,12 @@ fn analyze_inner<'src>(
         false,
     );
     match answer {
-        Ok(program) => program,
+        Ok(program) => {
+            if let Some(key) = prefix_checks {
+                prefix_checks_write(&key);
+            }
+            program
+        }
         Err(reached) => analyze_inner(
             nodes,
             entry_source,

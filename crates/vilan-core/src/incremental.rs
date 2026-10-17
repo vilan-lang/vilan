@@ -323,6 +323,26 @@ pub(crate) fn clean_keeps_hot_shape() -> bool {
     CLEAN.with(Cell::get) == Clean::KeepingHotShape
 }
 
+// --- B635: the replayed graph, verified ------------------------------------
+
+static VERIFY_GRAPH_REPLAYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// B635's test surface: while on, an analysis that REPLAYS the world's
+/// recorded post-rewrite cold graph also builds the graph whole over the same
+/// rewritten tree and counts the cold calls the two name differently
+/// ([`Census::graph_replay_mismatches`]). A replayed graph is meant to be
+/// exact, and the call ids the cold rewrite mints are the part a uniform
+/// renumbering could get wrong.
+#[doc(hidden)]
+pub fn set_verify_graph_replays(on: bool) {
+    VERIFY_GRAPH_REPLAYS.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn verify_graph_replays() -> bool {
+    VERIFY_GRAPH_REPLAYS.load(Ordering::Relaxed)
+}
+
 // --- the planted bugs (Q3's non-vacuity) ------------------------------------
 
 /// A bug a slice plants so its differential can be watched going red
@@ -396,6 +416,12 @@ pub enum Plant {
     /// field move admitted as a destructure, and the instantiation's R5
     /// refusal is never spoken.
     R11RecordUnguarded,
+    /// M138 (Order 54): the async pass's cold instance record is served
+    /// without validating what its keys READ — a hot edit that makes an id a
+    /// cold key read async (a dispatch candidate, a closure a cold call
+    /// passes, a value a hot module assigns into a cold binding) then leaves
+    /// the key's recorded verdict, its discoveries and its decision in place.
+    AsyncRecordUnguarded,
 }
 
 impl Plant {
@@ -416,6 +442,7 @@ impl Plant {
             Plant::ItemRecordUnguarded => 14,
             Plant::LiveRangeWalksServed => 15,
             Plant::R11RecordUnguarded => 16,
+            Plant::AsyncRecordUnguarded => 17,
         }
     }
 }
@@ -537,6 +564,20 @@ pub struct Census {
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
+    /// B635's instrument ([`set_verify_graph_replays`]): the cold calls a
+    /// REPLAYED post-rewrite graph names differently from the graph built
+    /// whole over the same tree — 0 by construction, counted only while the
+    /// switch is on.
+    pub graph_replay_mismatches: u64,
+    /// M138 (Order 54): the recorded cold instance keys this analysis's async
+    /// worklist answered from the world's cold instance record, the ones it
+    /// RE-WALKED (something a key read moved, or a callee it read flipped),
+    /// and the records it filed.
+    pub async_keys_served: u64,
+    pub async_keys_rewalked: u64,
+    pub async_records_filed: u64,
+    /// What the record this analysis filed retains, in bytes.
+    pub async_record_bytes: u64,
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
@@ -557,6 +598,14 @@ pub struct Census {
     /// `foreign-key`, `unreadable`, `undecodable`); `None` when no prefix
     /// key was looked up or the world cache is off.
     pub prefix_file: Option<&'static str>,
+    /// M158 (Order 54): what loading the prefix key's persisted CHECKS record
+    /// did for this analysis — `loaded` (inserted beside the loaded world, so
+    /// std's Class A checks replay) or the reason the record was a miss;
+    /// `None` when no prefix file was loaded.
+    pub prefix_checks: Option<&'static str>,
+    /// M158: whether this analysis WROTE the record — the one that built the
+    /// prefix's world, or one served a world whose record was a miss.
+    pub prefix_checks_written: bool,
     /// The file's size and the load's or the write's wall time, for the row
     /// the report asks for (not a clock the gate reads).
     pub prefix_file_bytes: u64,
@@ -642,12 +691,19 @@ thread_local! {
             r11_instances_scanned: 0,
             r11_records_filed: 0,
             hover_rows_restored: 0,
+            graph_replay_mismatches: 0,
+            async_keys_served: 0,
+            async_keys_rewalked: 0,
+            async_records_filed: 0,
+            async_record_bytes: 0,
             prefix_world: false,
             prefix_layered: false,
             prefix_hits: 0,
             prefix_refusals: 0,
             prefix_refusal: None,
             prefix_file: None,
+            prefix_checks: None,
+            prefix_checks_written: false,
             prefix_file_bytes: 0,
             prefix_file_micros: 0,
             post_seam: None,
@@ -1013,9 +1069,11 @@ pub fn report(program: &Program) {
              windows-overflowed={} window-writes-other={} window-outside-anchor={} \
              records-served={} records-stale={} records-filed={} live-ranges={} \
              live-entities={} move-rows-live={} r11-rows-live={} instances-served={} \
-             instances-scanned={} instance-records-filed={} hover-rows-restored={} \
+             instances-scanned={} instance-records-filed={} async-seeded={}/{} \
+             async-records-filed={} async-record-bytes={} hover-rows-restored={} \
              prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
+             prefix-checks={} prefix-checks-written={} \
              post-seam={}",
             census.base_hits,
             census.base_misses,
@@ -1048,6 +1106,10 @@ pub fn report(program: &Program) {
             census.r11_instances_served,
             census.r11_instances_scanned,
             census.r11_records_filed,
+            census.async_keys_served,
+            census.async_keys_rewalked,
+            census.async_records_filed,
+            census.async_record_bytes,
             census.hover_rows_restored,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
@@ -1056,6 +1118,8 @@ pub fn report(program: &Program) {
             census.prefix_file.unwrap_or("-"),
             census.prefix_file_bytes,
             census.prefix_file_micros,
+            census.prefix_checks.unwrap_or("-"),
+            u8::from(census.prefix_checks_written),
             census
                 .post_seam
                 .map_or_else(|| "-".to_string(), |seam| seam.render()),

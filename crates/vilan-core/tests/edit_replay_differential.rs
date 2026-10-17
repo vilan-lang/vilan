@@ -211,24 +211,22 @@ fn replay_the_classes() -> Replayed {
         }
         package.remove();
     }
+    // B635's cold wraps and M138's cold instance record start from a served
+    // analysis of the BASE text too: the world's records are filed over it,
+    // and each keystroke replays them. Before the effect classes, which the
+    // gate expects last.
+    for fixture in B635_FIXTURES
+        .iter()
+        .chain(ASYNC_RECORD_FIXTURES)
+        .chain(S3B_HELD_FIXTURES)
+    {
+        replay_from_the_base_text(fixture, "views.vl", &mut divergences, &mut censuses);
+    }
     // M110 S3: the effect classes start from a served analysis of the BASE
     // text — the world's record is filed with every effect present, and each
     // edit then removes one (a seed that cannot shrink is the planted bug).
     for fixture in EFFECT_FIXTURES {
-        let mut package = fixture.write();
-        let first = observe(&package, vec![package.path("effects.vl")], Leg::Incremental);
-        let clean = observe(&package, Vec::new(), Leg::Clean);
-        if first.rendering != clean.rendering {
-            divergences.push(format!(
-                "{}: the first analysis differs from the clean one at {}",
-                fixture.name,
-                first_difference(&first.rendering, &clean.rendering)
-            ));
-        }
-        for edit in fixture.edits {
-            censuses.extend(replay(&mut package, edit, &mut divergences));
-        }
-        package.remove();
+        replay_from_the_base_text(fixture, "effects.vl", &mut divergences, &mut censuses);
     }
     vilan_core::analyzer::base_cache_clear();
     Replayed {
@@ -237,6 +235,31 @@ fn replay_the_classes() -> Replayed {
         served,
         entry_impl,
     }
+}
+
+/// Writes `fixture`, analyzes its base text seeded at `seed` (the world's
+/// records are filed over it) and compares it with a clean analysis, then
+/// replays every edit and its undo.
+fn replay_from_the_base_text(
+    fixture: &Fixture,
+    seed: &str,
+    divergences: &mut Vec<String>,
+    censuses: &mut Vec<Census>,
+) {
+    let mut package = fixture.write();
+    let first = observe(&package, vec![package.path(seed)], Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    if first.rendering != clean.rendering {
+        divergences.push(format!(
+            "{}: the first analysis differs from the clean one at {}",
+            fixture.name,
+            first_difference(&first.rendering, &clean.rendering)
+        ));
+    }
+    for edit in fixture.edits {
+        censuses.extend(replay(&mut package, edit, divergences));
+    }
+    package.remove();
 }
 
 /// **std-prefix P1's gate** (`std-prefix.md` §13): every §6 edit class and
@@ -1089,6 +1112,9 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
         .chain(R11_FIXTURES)
         .chain(R11_RECORD_FIXTURES)
         .chain(EFFECT_FIXTURES)
+        .chain(B635_FIXTURES)
+        .chain(ASYNC_RECORD_FIXTURES)
+        .chain(S3B_HELD_FIXTURES)
         .chain(POST_PASS_FIXTURES)
         .chain(BOUND_FIXTURES)
         .chain(WINDOW_FIXTURES)
@@ -1207,6 +1233,174 @@ fn m159_the_lone_leg_sees_a_fixpoint_seeded_from_the_settled_set() {
             .any(|divergence| divergence.contains("the initializer's refusal must go")),
         "the settled-seed plant must turn the lone sleep removal red; it found: \
          {divergences:#?}"
+    );
+}
+
+/// M138's fixture leg, on a cleared base cache: the base text's analysis
+/// files the world's records, then every edit and its undo is compared with a
+/// clean analysis. Answers the divergences and each step's census, labelled.
+fn replay_the_async_record() -> (Vec<String>, Vec<(String, Census)>) {
+    vilan_core::analyzer::base_cache_clear();
+    let mut divergences = Vec::new();
+    let mut steps: Vec<(String, Census)> = Vec::new();
+    for fixture in ASYNC_RECORD_FIXTURES {
+        let mut package = fixture.write();
+        let first = observe(&package, vec![package.path("views.vl")], Leg::Incremental);
+        let clean = observe(&package, Vec::new(), Leg::Clean);
+        if first.rendering != clean.rendering {
+            divergences.push(format!(
+                "{}: the first analysis differs from the clean one at {}",
+                fixture.name,
+                first_difference(&first.rendering, &clean.rendering)
+            ));
+        }
+        steps.push(("the base text".to_string(), first.census));
+        for edit in fixture.edits {
+            let censuses = replay(&mut package, edit, &mut divergences);
+            steps.push((format!("{} (edit)", edit.label), censuses[0]));
+            steps.push((format!("{} (undo)", edit.label), censuses[1]));
+        }
+        package.remove();
+    }
+    vilan_core::analyzer::base_cache_clear();
+    (divergences, steps)
+}
+
+/// **M138's seeded form** (Order 54, R-c): the async worklist restarts from
+/// the world's COLD instance record — the adaptation over the cold nodes
+/// alone, each key's reads logged — and re-walks a recorded key only when
+/// something it read moved. Every keystroke of the fixture and its undo
+/// answers what a clean analysis answers; non-vacuous on every count: the
+/// base text's analysis FILES the record, every keystroke is served recorded
+/// keys, and the two edits that move a read (a dispatch candidate turned
+/// async, an async closure assigned into a cold binding) re-walk keys. (The
+/// classes leg replays the fixture too, behind every other.)
+#[test]
+fn m138_the_async_worklist_restarts_from_the_cold_instance_record() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    let (divergences, steps) = replay_the_async_record();
+    assert!(
+        divergences.is_empty(),
+        "the M138 fixture observes the incremental analysis:\n{}",
+        divergences.join("\n")
+    );
+    for (step, census) in &steps {
+        eprintln!(
+            "M138: {step}: async-seeded={}/{} filed={} bytes={}",
+            census.async_keys_served,
+            census.async_keys_rewalked,
+            census.async_records_filed,
+            census.async_record_bytes
+        );
+    }
+    assert!(
+        steps[0].1.async_records_filed == 1,
+        "the base text's analysis files the cold instance record: {:#?}",
+        steps[0].1
+    );
+    assert!(
+        steps[1..]
+            .iter()
+            .all(|(_, census)| census.async_keys_served > 0),
+        "every keystroke is served recorded keys"
+    );
+    let rewalked = |step: &str| -> u64 {
+        steps
+            .iter()
+            .find(|(label, _)| label.contains(step) && label.ends_with("(edit)"))
+            .map_or(0, |(_, census)| census.async_keys_rewalked)
+    };
+    let quiet = rewalked("recorded instance is served");
+    for moved in ["dispatch", "assignment"] {
+        assert!(
+            rewalked(moved) > quiet,
+            "the {moved} edit moves a read a recorded key made, which re-walks it \
+             ({} against the quiet edit's {quiet})",
+            rewalked(moved)
+        );
+    }
+}
+
+/// M138's plant: the cold instance record served without validating what its
+/// keys READ — a hot impl turned async under a cold generic's dispatch, or an
+/// async closure assigned into a cold binding, then leaves `relay`'s or
+/// `twice_hook`'s recorded verdict (no adapted callee, nothing awaited) in
+/// place, and the emitted JS keeps a sync caller a clean analysis awaits.
+#[test]
+fn the_differential_sees_an_async_record_served_past_a_moved_read() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(Some(Plant::AsyncRecordUnguarded));
+    let replayed = std::panic::catch_unwind(replay_the_async_record);
+    set_plant(None);
+    let (divergences, _) = replayed.expect("the M138 leg panicked under a plant");
+    for edit in ["dispatch", "assignment"] {
+        assert!(
+            divergences
+                .iter()
+                .any(|divergence| divergence.contains(edit) && divergence.contains("(M138)")),
+            "the unguarded async record must turn the {edit} edit red; it found: \
+             {divergences:#?}"
+        );
+    }
+}
+
+/// **B635**: the context rewrite mints every section's COLD rows before any
+/// section's hot rows, so the recorded post-rewrite cold graph — replayed
+/// whenever the cold rewrite log matches, renumbered by a uniform base shift —
+/// names exactly the cold calls a graph built whole over the rewritten tree
+/// names, whatever the hot rows mint. The fixture's keystroke makes a hot
+/// function need the context beside a cold covered-to-safe wrap (a minted
+/// `Some(..)` call); until B635 the hot hidden parameter minted before the cold
+/// threaded arguments and moved the wrap's id under the replay. Non-vacuous:
+/// the keystroke and its undo replay the recorded graph.
+#[test]
+fn b635_a_replayed_cold_graph_names_the_calls_a_rebuilt_one_names() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_verify_graph_replays(true);
+    let mut divergences = Vec::new();
+    let mut censuses = Vec::new();
+    for fixture in B635_FIXTURES {
+        let mut package = fixture.write();
+        let first = observe(&package, vec![package.path("views.vl")], Leg::Incremental);
+        censuses.push(first.census);
+        for edit in fixture.edits {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+    }
+    vilan_core::incremental::set_verify_graph_replays(false);
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        divergences.is_empty(),
+        "the B635 fixture observes the incremental analysis:\n{}",
+        divergences.join("\n")
+    );
+    let replayed: u64 = censuses
+        .iter()
+        .map(|census| census.context_log_replayed)
+        .sum();
+    let mismatches: u64 = censuses
+        .iter()
+        .map(|census| census.graph_replay_mismatches)
+        .sum();
+    assert!(
+        replayed >= 2,
+        "the keystroke and its undo replay the recorded post-rewrite graph ({replayed}): \
+         {censuses:#?}"
+    );
+    assert_eq!(
+        mismatches, 0,
+        "a replayed cold graph names cold calls a graph built whole does not ({replayed} \
+         replays): the cold rewrite's mints moved with the hot rows"
     );
 }
 

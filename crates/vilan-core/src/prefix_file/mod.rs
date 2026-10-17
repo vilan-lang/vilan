@@ -55,6 +55,16 @@ pub(crate) const DEPENDENCIES_TIER: &str = "dependencies";
 pub(crate) const STD_TIER_FILE: &str = "std.world";
 pub(crate) const DEPENDENCIES_TIER_FILE: &str = "dependencies.world";
 
+/// M158 (Order 54): the prefix key's CHECKS record (M19's `WorldChecks`
+/// minus its package-keyed per-item records), beside the world it describes
+/// in the key's directory — written at the end of the analysis that built the
+/// world, so the world itself is written before any record exists and a
+/// process that loads only the world (an older writer, a failed write) still
+/// loads it. The same framing as the world (magic, header with the key in
+/// clear, checksum): a damaged or foreign file is a miss of the record only.
+pub(crate) const STD_CHECKS_FILE: &str = "std.checks";
+pub(crate) const DEPENDENCIES_CHECKS_FILE: &str = "dependencies.checks";
+
 /// What a prefix world is a function of (`std-prefix.md` §6), in clear.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Key {
@@ -184,6 +194,16 @@ pub(crate) fn tier_path(directory: &Path, key: &Key) -> PathBuf {
     directory.join(key.directory_name()).join(file)
 }
 
+/// M158: where this key's checks record lives under `directory` — beside
+/// its world, named by the same last tier.
+pub(crate) fn checks_path(directory: &Path, key: &Key) -> PathBuf {
+    let file = match key.tiers.last().map(String::as_str) {
+        Some(DEPENDENCIES_TIER) => DEPENDENCIES_CHECKS_FILE,
+        _ => STD_CHECKS_FILE,
+    };
+    directory.join(key.directory_name()).join(file)
+}
+
 /// Whether a file exists under this key's name (not whether it would load).
 #[cfg(test)]
 pub(crate) fn exists(directory: &Path, key: &Key) -> bool {
@@ -208,8 +228,29 @@ pub(crate) fn write(
     body: &[u8],
     table: &[u8],
 ) -> Result<Written, String> {
+    write_file(tier_path(directory, key), key, std_roots, body, table)
+}
+
+/// M158: writes the checks record for `key` beside its world, framed as the
+/// world is.
+pub(crate) fn write_checks(
+    directory: &Path,
+    key: &Key,
+    std_roots: &[PathBuf],
+    body: &[u8],
+    table: &[u8],
+) -> Result<Written, String> {
+    write_file(checks_path(directory, key), key, std_roots, body, table)
+}
+
+fn write_file(
+    path: PathBuf,
+    key: &Key,
+    std_roots: &[PathBuf],
+    body: &[u8],
+    table: &[u8],
+) -> Result<Written, String> {
     let started = now();
-    let path = tier_path(directory, key);
     let parent = path
         .parent()
         .expect("the tier file sits in the key's directory");
@@ -276,8 +317,17 @@ pub(crate) fn directory_key(directory: &Path) -> Option<Key> {
 
 /// Reads and validates the std tier for `key`. Every failure is a [`Miss`].
 pub(crate) fn read(directory: &Path, key: &Key) -> Result<Loaded, Miss> {
+    read_file(tier_path(directory, key), key)
+}
+
+/// M158: reads and validates the checks record for `key`. Every failure is a
+/// [`Miss`] of the record alone.
+pub(crate) fn read_checks(directory: &Path, key: &Key) -> Result<Loaded, Miss> {
+    read_file(checks_path(directory, key), key)
+}
+
+fn read_file(path: PathBuf, key: &Key) -> Result<Loaded, Miss> {
     let started = now();
-    let path = tier_path(directory, key);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(Miss::Absent),
