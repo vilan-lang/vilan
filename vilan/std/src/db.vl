@@ -268,7 +268,9 @@ export impl Database {
 		match exec_guarded(self, "COMMIT") {
 			Some(let message) => {
 				self.rollback_migration();
-				panic(i"std::db migrate: migration '{step.name}' could not be committed: {message}");
+				panic(
+					i"std::db migrate: migration '{step.name}' could not be committed: {message}",
+				);
 			},
 			None => {},
 		}

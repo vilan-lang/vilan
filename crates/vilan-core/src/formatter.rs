@@ -4124,6 +4124,12 @@ struct Printer<'src> {
     /// the first refusal, which is what keeps every layout the formatter had
     /// before argument lists could break.
     arguments_blocked: bool,
+    /// E329: while a TERMINATED statement is reprinted with the split armed,
+    /// the source offset where its expression ends - the expression the `;`
+    /// glues to. A call that ends exactly there counts the `;` in its own
+    /// width measure, so a call statement splits at the width the statement
+    /// hook armed it at, as a chain does.
+    terminator_end: Option<usize>,
     /// E314: how many element-body holes (`{ … }`) enclose the expression being
     /// printed. A call's arguments break one per line only inside one — outside
     /// markup a call keeps its last-argument layout (the estate would move by
@@ -4178,6 +4184,7 @@ impl<'src> Printer<'src> {
             options,
             head_start: None,
             arguments_blocked: false,
+            terminator_end: None,
             hole_depth: 0,
             tuple_forced: false,
             width_element_splits: 0,
@@ -4389,6 +4396,13 @@ impl<'src> Printer<'src> {
     /// same-line comment of whatever ends at `after` (`import x; // note`), so a
     /// caller reordering the items it belongs to can re-emit it in the new
     /// place. Returns `None` (consuming nothing) otherwise.
+    ///
+    /// E325: a comment with a brace between `after` and itself trails the
+    /// CONSTRUCT that brace belongs to, not the node ending at `after` - in
+    /// `if c { 1 } else { 2 } // note` the `1` is a block's tail whose `}` and
+    /// the `else` branch both come before the comment, so it stays pending for
+    /// the construct's own end (after the closing `}`) instead of moving onto
+    /// the first arm.
     fn take_trailing_comment(&mut self, after: usize) -> Option<&'src str> {
         if let Some((span, text)) = self.comments.get(self.cursor).copied() {
             let start = span.into_range().start;
@@ -4396,7 +4410,7 @@ impl<'src> Printer<'src> {
                 && self
                     .source
                     .get(after..start)
-                    .is_some_and(|gap| !gap.contains('\n'))
+                    .is_some_and(|gap| !gap.contains(['\n', '{', '}']))
             {
                 self.cursor += 1;
                 return Some(text);
@@ -4505,7 +4519,10 @@ impl<'src> Printer<'src> {
                 self.out.push(';');
             }
             if self.begin_split_reprint(statement_start, comment_cursor) {
+                let enclosing_terminator =
+                    std::mem::replace(&mut self.terminator_end, terminated.then_some(range.end));
                 self.print_item(item);
+                self.terminator_end = enclosing_terminator;
                 self.split = Split::Off;
                 if terminated {
                     self.out.push(';');
@@ -6668,6 +6685,13 @@ impl<'src> Printer<'src> {
         display_width(&self.out[line_start..]) > LINE_BUDGET
     }
 
+    /// E329: the columns the statement's `;` adds to the line `expr` ends - one
+    /// when `expr` is the very expression the terminated statement being
+    /// reprinted ends with (the printer pushes the `;` after it), else none.
+    fn terminator_after(&self, expr: &Spanned<Node<'src>>) -> usize {
+        usize::from(self.terminator_end == Some(expr.1.into_range().end))
+    }
+
     /// Whether the FIRST line of a rendering that starts at output offset
     /// `start` overflows the budget — where `start` may be anywhere on its line,
     /// not just past the indentation.
@@ -6679,12 +6703,19 @@ impl<'src> Printer<'src> {
     /// lines needs both halves: the text's own indentation, and the first line,
     /// which is the line the decision is about.
     fn first_line_over_budget(&self, start: usize) -> bool {
+        self.first_line_over_budget_by(start, 0)
+    }
+
+    /// [`Self::first_line_over_budget`] with `extra` columns still to come on
+    /// that line - the statement's `;`, which the printer pushes after the
+    /// expression it terminates (E329).
+    fn first_line_over_budget_by(&self, start: usize, extra: usize) -> bool {
         let line_start = self.out[..start]
             .rfind('\n')
             .map_or(0, |newline| newline + 1);
         let rendered = &self.out[line_start..];
         let first_line = rendered.split('\n').next().unwrap_or(rendered);
-        display_width(first_line) > LINE_BUDGET
+        display_width(first_line) + extra > LINE_BUDGET
     }
 
     /// Ends an ATTRIBUTE line (`[derive(..)]`, `[deprecated(..)]`, a fence…)
@@ -8730,7 +8761,8 @@ impl<'src> Printer<'src> {
                 if split != Split::Off
                     && !blocked
                     && !arguments.0.is_empty()
-                    && (cut.is_some() || self.first_line_over_budget(call_start))
+                    && (cut.is_some()
+                        || self.first_line_over_budget_by(call_start, self.terminator_after(expr)))
                 {
                     let crossing = self.budget_crossing(call_start);
                     let cause = cut.or_else(|| starts.iter().rposition(|start| *start <= crossing));
@@ -19003,6 +19035,255 @@ mod argument_layout {
 	let short = add(1, 2);
 }
 "####,
+        );
+    }
+}
+
+#[cfg(test)]
+mod call_statement_terminator {
+    //! E329: a call statement is measured WITH its `;`. The statement hook arms
+    //! the split at 101 columns (the whole statement), but the Call arm's own
+    //! measure saw the call alone - 100 columns - and kept the arguments inline,
+    //! leaving a 101-column line that a chain statement of the same width
+    //! splits. The call that ends exactly where the terminated statement's
+    //! expression ends counts the `;` as one more column. Every case runs
+    //! through `assert_construct`: token round trip, idempotence, the canonical
+    //! form's own round trip.
+    use super::bailing_constructs::assert_construct;
+
+    const CALLEE: &str = "plain_function_call_with_no_chain_at_all";
+
+    /// A one-tab statement `{lead}CALLEE(argument_one, argument_two, aaa..)`
+    /// whose line is `columns` wide before any terminator (a tab is four
+    /// columns): `(inline form, split form)`, both ending in `terminator`.
+    fn statement(lead: &str, columns: usize, terminator: &str) -> (String, String) {
+        let fixed = 4 + lead.len() + CALLEE.len() + "(argument_one, argument_two, )".len();
+        let last = "a".repeat(columns - fixed);
+        (
+            format!(
+                "fun demo() {{\n\t{lead}{CALLEE}(argument_one, argument_two, {last}){terminator}\n}}\n"
+            ),
+            format!(
+                "fun demo() {{\n\t{lead}{CALLEE}(\n\t\targument_one,\n\t\targument_two,\n\t\t{last},\n\t){terminator}\n}}\n"
+            ),
+        )
+    }
+
+    /// The repro: 100 columns before the `;` is 101 with it.
+    #[test]
+    fn a_call_statement_at_the_budget_before_its_semicolon_splits() {
+        let (inline, split) = statement("let value = ", 100, ";");
+        assert_construct(&inline, &split);
+    }
+
+    #[test]
+    fn a_call_statement_one_column_under_the_budget_with_its_semicolon_stays_inline() {
+        let (inline, _) = statement("let value = ", 99, ";");
+        assert_construct(&inline, &inline);
+    }
+
+    /// Without a `;` (a block's tail) the 100-column line fits as it did.
+    #[test]
+    fn the_same_call_without_a_semicolon_stays_inline_at_the_budget() {
+        let (inline, _) = statement("let value = ", 100, "");
+        assert_construct(&inline, &inline);
+    }
+
+    #[test]
+    fn the_same_call_without_a_semicolon_splits_one_column_past_the_budget() {
+        let (inline, split) = statement("let value = ", 101, "");
+        assert_construct(&inline, &split);
+    }
+
+    /// The other terminated shapes the hook arms: a bare call statement, an
+    /// assignment, a prefix operator in front of the call.
+    #[test]
+    fn the_other_terminated_statement_shapes_split_at_the_same_width() {
+        for lead in ["", "value = ", "let value = !", "let value = &"] {
+            let (inline, split) = statement(lead, 100, ";");
+            assert_construct(&inline, &split);
+            let (inline, _) = statement(lead, 99, ";");
+            assert_construct(&inline, &inline);
+        }
+    }
+
+    /// A call inside an element hole is unchanged: the hole's `}` is not a
+    /// statement terminator, and no statement hook arms there.
+    #[test]
+    fn a_call_in_an_element_hole_is_unchanged() {
+        let hole = |columns: usize| {
+            let fixed = 8 + 1 + "plain_call_with_no_chain(argument_one, argument_two, )".len() + 1;
+            let last = "a".repeat(columns - fixed);
+            (
+                format!(
+                    "fun demo(): View {{\n\t<div>\n\t\t{{plain_call_with_no_chain(argument_one, argument_two, {last})}}\n\t</div>\n}}\n"
+                ),
+                format!(
+                    "fun demo(): View {{\n\t<div>\n\t\t{{plain_call_with_no_chain(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{last},\n\t\t)}}\n\t</div>\n}}\n"
+                ),
+            )
+        };
+        let (at_the_budget, _) = hole(100);
+        assert_construct(&at_the_budget, &at_the_budget);
+        let (past, split) = hole(102);
+        assert_construct(&past, &split);
+    }
+}
+
+#[cfg(test)]
+mod trailing_comment_anchor {
+    //! E325: a trailing comment written after a one-line `if c { 1 } else { 2 }`
+    //! annotated the whole construct, but the formatter, breaking the `if` over
+    //! lines, handed it to the first arm's tail (`1 // note`): the tail's
+    //! trailing-comment flush took any same-line comment, whatever code stood
+    //! between the tail and the comment. A comment with a brace between itself
+    //! and the node stays pending for the construct's own end - after the
+    //! closing `}`. Every case runs through `assert_construct`.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_comment_after_a_one_line_if_statement_lands_after_the_closing_brace() {
+        assert_construct(
+            r####"fun demo(c: bool) {
+	if c { foo() } else { bar() } // the tail
+}
+"####,
+            r####"fun demo(c: bool) {
+	if c {
+		foo()
+	} else {
+		bar()
+	} // the tail
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_comment_after_a_block_tail_if_lands_after_the_closing_brace() {
+        assert_construct(
+            r####"fun pick(c: bool): i32 {
+	if c { 1 } else { 2 } // the tail
+}
+"####,
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1
+	} else {
+		2
+	} // the tail
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_comment_after_an_else_if_chain_lands_after_the_closing_brace() {
+        assert_construct(
+            r####"fun demo(c: bool, d: bool) {
+	if c { foo() } else if d { bar() } else { baz() } // chain
+}
+"####,
+            r####"fun demo(c: bool, d: bool) {
+	if c {
+		foo()
+	} else if d {
+		bar()
+	} else {
+		baz()
+	} // chain
+}
+"####,
+        );
+    }
+
+    /// A comment that already sits on the then-branch stays there, and a second
+    /// one after the construct stays after it.
+    #[test]
+    fn a_comment_already_on_the_then_branch_stays() {
+        assert_construct(
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1 // then
+	} else {
+		2
+	} // after
+}
+"####,
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1 // then
+	} else {
+		2
+	} // after
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_comment_in_the_else_branch_stays_on_its_tail() {
+        assert_construct(
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1
+	} else {
+		2 // else
+	}
+}
+"####,
+            r####"fun pick(c: bool): i32 {
+	if c {
+		1
+	} else {
+		2 // else
+	}
+}
+"####,
+        );
+    }
+
+    /// An `if` that fits inline on a `let` keeps the comment after the `;`.
+    #[test]
+    fn an_inline_if_keeps_its_comment_after_the_semicolon() {
+        assert_construct(
+            r####"fun demo(c: bool) {
+	let v = if c { 1 } else { 2 }; // the tail
+}
+"####,
+            r####"fun demo(c: bool) {
+	let v = if c { 1 } else { 2 }; // the tail
+}
+"####,
+        );
+    }
+
+    #[test]
+    fn a_match_arm_comment_is_unchanged() {
+        assert_construct(
+            r####"fun demo(c: bool) {
+	let y = match c {
+		true => 1, // arm
+		false => 2
+	};
+}
+"####,
+            r####"fun demo(c: bool) {
+	let y = match c {
+		true => 1, // arm
+		false => 2
+	};
+}
+"####,
+        );
+    }
+
+    /// The same anchor on a function body written on one line.
+    #[test]
+    fn a_comment_after_a_one_line_function_lands_after_its_closing_brace() {
+        assert_construct(
+            "fun one(): i32 { 7 } // one-line fn\n",
+            "fun one(): i32 {\n\t7\n} // one-line fn\n",
         );
     }
 }
