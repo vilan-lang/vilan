@@ -173,7 +173,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Many tests shell out to `node` (the macro/native equivalence gate, every
       # e2e suite). Pinned to the same version release.yml's gate job uses.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       # The TextMate grammar's SCOPE pins (tracker E163). They tokenise with
@@ -198,7 +198,7 @@ jobs:
       # fail-fast is off via the committed .config/nextest.toml — this
       # workflow is the instrument that produces the COMPLETE failure list
       # per push (the exit code still gates).
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest
       # The registry, the git checkouts and `target/`, carried between runs.
@@ -286,7 +286,7 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
       # The leg ends by RUNNING the artifact under node (N134): v0.41.0's
       # compiler built and bound here and trapped on every compile.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       # The build, the bindings and the smoke, from the script. The same 16 MiB stack the
@@ -408,7 +408,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The same installer the suite legs use for nextest, same pin.
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-audit
       - name: No advisory against the dependency tree
@@ -456,7 +456,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: The instruction budgets hold
         run: scripts/ci-local.sh perf
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: perf-measured
