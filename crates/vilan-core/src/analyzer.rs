@@ -47486,7 +47486,9 @@ impl<'src> Analyzer<'src> {
         self.note_callable_coercion(expr_id, constraint, &inferred);
         self.note_variant_coercion(expr_id, &inferred);
         self.note_dyn_coercion(expr_id, constraint, &inferred, substitution_context);
-        self.note_any_option_coercion(expr_id, constraint, &inferred, substitution_context);
+        if matches!(constraint, Type::Any | Type::Generic(_)) {
+            self.note_any_option_coercion(expr_id, constraint, &inferred, substitution_context);
+        }
         inferred
     }
 
@@ -48137,12 +48139,9 @@ impl<'src> Analyzer<'src> {
     ) {
         let landing = match constraint {
             Type::Any => true,
-            Type::Generic(constraint_id) => matches!(
-                substitution_context
-                    .get(constraint_id)
-                    .map(|bound| bound.get_type(self)),
-                Some(Type::Any)
-            ),
+            Type::Generic(constraint_id) => substitution_context
+                .get(constraint_id)
+                .is_some_and(|bound| matches!(bound.borrow_type(self), Type::Any)),
             _ => false,
         };
         if !landing {
@@ -48201,15 +48200,17 @@ impl<'src> Analyzer<'src> {
             }
             _ => return Vec::new(),
         };
+        // Borrowed, not cloned: this runs on every resolved method call, and a
+        // receiver with an `any` argument is a vanishing minority of them.
         impl_arguments
             .iter()
             .zip(subject_arguments)
             .filter_map(|(impl_argument, subject_argument)| {
                 match (
-                    impl_argument.get_type(self),
-                    subject_argument.get_type(self),
+                    impl_argument.borrow_type(self),
+                    subject_argument.borrow_type(self),
                 ) {
-                    (Type::Generic(binder), Type::Any) => Some(binder),
+                    (Type::Generic(binder), Type::Any) => Some(*binder),
                     _ => None,
                 }
             })
@@ -59921,13 +59922,18 @@ impl<'src> Analyzer<'src> {
                 return Resolution::Deferred;
             }
             // M165: a parameter the receiver binds to `any` (`push` on a
-            // `List<any>`) — see `any_bound_receiver_binders`.
-            if let Some(Type::Generic(binder)) = declared_id.map(|declared| declared.get_type(self))
-                && self
-                    .any_bound_receiver_binders
+            // `List<any>`) — see `any_bound_receiver_binders`. The call's own
+            // entry is asked first: almost no call has one.
+            let lands_at_any =
+                self.any_bound_receiver_binders
                     .get(&call_id)
-                    .is_some_and(|binders| binders.contains(&binder))
-            {
+                    .is_some_and(|binders| {
+                        matches!(
+                            declared_id.map(|declared| declared.borrow_type(self)),
+                            Some(Type::Generic(binder)) if binders.contains(binder)
+                        )
+                    });
+            if lands_at_any {
                 self.record_any_option_landing(*argument_id, &argument_type);
             }
             // B353 — an UNANNOTATED closure parameter whose one-shot slot has
