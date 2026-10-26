@@ -353,6 +353,21 @@ impl<T> Future for Catch<T> {
     }
 }
 
+/// `__guarded_async` — run `body` to its end, answering `Err(message)` if it
+/// panicked: `guarded`'s async twin, the shape `std::rpc`'s `guarded_async`
+/// names (M165: an `[rpc]` body that throws answers its call with the error).
+/// The JS helper is a `try`/`await`/`catch` returning `[0, value]` or
+/// `[1, message]`; natively [`Catch`] catches at every poll, as a task's own
+/// failure latch does. A cancellation is not the body's failure and keeps
+/// travelling.
+pub async fn guarded_async<T>(body: Boxed<T>) -> Result<T, Str> {
+    match Catch::new(body).await {
+        Ok(value) => Ok(value),
+        Err(Failure::Cancelled) => raise(Failure::Cancelled),
+        Err(Failure::Panic(message, _location)) => Err(message),
+    }
+}
+
 // ------------------------------------------------------------ nurseries ---
 
 /// A nursery's body — `__Nursery`'s fields, plus the two the JS version gets

@@ -1551,12 +1551,34 @@ export impl RpcProtocol {
 			.under_owner(self.owner);
 		let outcome = match (request.deserializer.failed)() {
 			Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),
-			None => (self.dispatch)(request),
+			// M165: a handler that THROWS — a host binding's `TypeError`, a `panic`
+			// — answers its call with the error, as a `Remote` failure naming the
+			// method and the message, so the client's awaited call is rejected
+			// rather than parked forever (the handler's task used to die with
+			// `unhandled task error (spawned in accept_socket)` and the client
+			// heard nothing). The server log keeps a line: the throw is still the
+			// handler's defect, answered rather than lost.
+			None => match guarded_async(|| (self.dispatch)(request)) {
+				Ok(let answered) => answered,
+				Err(let thrown) => {
+					let method = request.method;
+					log_line(
+						i"rpc `{method}` threw, and the call was answered with the error: {thrown}",
+					);
+					RpcOutcome::Failure(RpcError::Remote(i"`{method}` threw: {thrown}"))
+				},
+			},
 		};
 		let status = status_of_outcome(outcome);
 		(encode_reply(self.codec, outcome), status)
 	}
 }
+
+/// One line on stderr (the console's error stream where there is one) — the
+/// reactive trace's seam (`std::reactive::trace`), reached here for the server's
+/// log of a handler that threw (M165).
+[extern("__trace_line")]
+external fun log_line(line: str);
 
 /// `unknown method: ` — the one `Remote` failure that is the CALLER's fault rather
 /// than the handler's, and the only thing telling the leg's 404 from its 500. It is

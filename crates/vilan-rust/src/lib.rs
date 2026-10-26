@@ -10453,6 +10453,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // closure it invokes: `await body()` there is `body.await` here, and
             // a `Pin<Box<dyn Future>>` is what lets the join hold it across the
             // drain without the emitted source ever naming `Pin`.
+            // M165: `std::rpc`'s `guarded_async` — the body as a future, as the
+            // join takes it; `Catch` at every poll is the native `try`/`catch`.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__guarded_async",
+            } => format!(
+                "vilan_rt::executor::guarded_async({})",
+                self.pinned_body_argument(argument_ids, 0, depth, span)?
+            ),
             ExternBinding::Function {
                 module: None,
                 symbol: "__nursery_run",

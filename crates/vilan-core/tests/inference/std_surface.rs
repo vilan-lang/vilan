@@ -8191,3 +8191,63 @@ fn m165_print_and_an_externals_any_parameter_take_the_option_as_it_is() {
         "Some(4)\n[0,4]\nfalse\n",
     );
 }
+
+/// M165's rpc half: an `[rpc]` body that THROWS answers its call with a `Remote`
+/// error naming the method and the message — the client's awaited call is
+/// rejected, never parked forever — the service answers the next call as
+/// before, and the server's log keeps a line about the throw (on stderr, as the
+/// task's own failure line was). On the base the handler's task died with
+/// `unhandled task error (spawned in …)` and the client heard nothing.
+#[test]
+fn m165_an_rpc_body_that_throws_answers_its_call_and_the_log_keeps_a_line() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+import std::io::{ panic, print };
+import std::json::json_codec;
+import std::result::Result::{ Err, Ok };
+import std::rpc::{ DuplexTransport, local_rpc };
+
+[service(CounterClient)]
+struct Counter {}
+
+impl Counter {
+    [rpc]
+    fun add(self, a: i32, b: i32): i32 {
+        a + b
+    }
+
+    [rpc]
+    fun explode(self, why: str): i32 {
+        panic(why);
+        0
+    }
+}
+
+fun main() {
+    let transport = local_rpc(Counter {}.dispatcher().into_protocol(json_codec()));
+    let client = CounterClient { transport, codec = json_codec() };
+    print(i"add: {client.add(2, 3).debug()}");
+    print(i"explode: {client.explode("boom").debug()}");
+    print(i"add again: {client.add(4, 5).debug()}");
+}
+main();
+"#,
+    );
+    assert_eq!(
+        code, 0,
+        "the program runs to its end:\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "add: Ok(5)\nexplode: Err(RpcError::Remote(\"`explode` threw: boom\"))\nadd again: Ok(9)\n",
+        "the thrown call is answered and the next one served:\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("rpc `explode` threw, and the call was answered with the error: boom"),
+        "the server log keeps a line about the throw:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unhandled task error"),
+        "the handler's task no longer dies:\n{stderr}"
+    );
+}

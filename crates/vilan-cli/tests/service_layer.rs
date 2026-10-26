@@ -160,7 +160,25 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 
 /// Runs `vilan run <dir>` under a liveness bound and returns its stdout — the
 /// same pattern (and the same E40 rationale for the bound) as `rpc_http.rs`.
+/// Anything on stderr fails the run; a program EXPECTED to log goes through
+/// [`vilan_run_with_liveness_bound_capturing`].
 fn vilan_run_with_liveness_bound(dir: &Path) -> String {
+    let (stdout, stderr) = vilan_run_with_liveness_bound_capturing(dir);
+    let unexpected: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_node_windows_teardown_noise(line))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "vilan run wrote to stderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+    stdout
+}
+
+/// [`vilan_run_with_liveness_bound`]'s run, with stderr handed back beside
+/// stdout for a pin whose claim is about a line the server LOGS (M165).
+fn vilan_run_with_liveness_bound_capturing(dir: &Path) -> (String, String) {
     let liveness = support::run_liveness();
     let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", dir.to_str().unwrap()])
@@ -198,16 +216,7 @@ fn vilan_run_with_liveness_bound(dir: &Path) -> String {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    let unexpected: Vec<&str> = stderr
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !is_node_windows_teardown_noise(line))
-        .collect();
-    assert!(
-        unexpected.is_empty(),
-        "vilan run wrote to stderr:\n{stderr}\nstdout:\n{stdout}"
-    );
-    stdout
+    (stdout, stderr)
 }
 
 /// Windows only: node's own shutdown race, not output from the program —
@@ -1431,6 +1440,91 @@ fun run(port: i32) {
         stdout.contains("who:ada"),
         "the credential offered on the handshake must reach the factory as the connection's \
          identity:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M165: a `[service]` whose `explode` throws, reached over a real socket.
+const THROWING_SERVER: &str = r#"import std::io::{ panic, print };
+import std::process::exit;
+import std::result::Result::{ Err, Ok };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::server::{ Connection, Service };
+
+[service(CounterClient)]
+struct Counter {}
+
+impl Counter {
+	[rpc]
+	fun add(self, a: i32, b: i32): i32 {
+		a + b
+	}
+
+	[rpc]
+	fun explode(self, why: str): i32 {
+		panic(why);
+		0
+	}
+}
+
+fun run(port: i32) {
+	match CounterClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			print(i"explode: {client.explode("boom").debug()}");
+			print(i"add: {client.add(2, 3).debug()}");
+			print(i"explode again: {client.explode("twice").debug()}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Counter {}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+"#;
+
+#[test]
+fn m165_an_rpc_body_that_throws_answers_its_call_over_a_socket_and_the_log_keeps_a_line() {
+    // The socket leg's task (`accept_socket`'s `async { … respond … }`) used
+    // to die with `unhandled task error (spawned in accept_socket): boom`, and
+    // the client's awaited call hung with no error to show (kolt: a form that
+    // did nothing). The call is answered with a `Remote` error naming the
+    // method and the message, the connection answers the next call, and the
+    // server's log keeps a line about the throw — on stderr, where the task's
+    // failure line was — while the task itself no longer dies.
+    let dir = temp_project("throwing");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", THROWING_SERVER);
+    let (stdout, stderr) = vilan_run_with_liveness_bound_capturing(&dir);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "explode: Err(RpcError::Remote(\"`explode` threw: boom\"))",
+            "add: Ok(5)",
+            "explode again: Err(RpcError::Remote(\"`explode` threw: twice\"))",
+        ],
+        "the thrown calls are answered and the connection stays usable:\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("rpc `explode` threw, and the call was answered with the error: boom"),
+        "the server log keeps a line about the throw:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unhandled task error"),
+        "the handler's task no longer dies:\n{stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
