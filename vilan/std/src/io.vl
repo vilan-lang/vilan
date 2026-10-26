@@ -1,6 +1,11 @@
 // `std::io` — the universal (core) I/O surface: `print` (the host console) and
-// `panic`/`assert`, available on every target. Process-level and stdin I/O (`scan`,
-// `args`, `env`, `exit`) live in the Node platform layer `std::process`.
+// `panic`/`assert`, available on every target; and `write`, standard output with no
+// newline, on the process platforms only. Process-level and stdin I/O (`scan`,
+// `args`, `env`, `exit`, `keys`) live in the platform layer `std::process`.
+
+/// `write(text)`: standard output with no newline, flushed (E332) — declared in
+/// `std::io::stdout`, the `@process` half of this module.
+export import pkg::io::stdout::write;
 
 export *;
 

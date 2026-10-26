@@ -3,6 +3,7 @@
 
 [platform("@process")] mod self;
 
+import pkg::io::stdout;
 import pkg::option::Option::{ self, None, Some };
 import pkg::task::{ CancelSignal, ambient_signal };
 
@@ -42,7 +43,7 @@ fun scan(): str {
 /// cursor after it). `None` once stdin has ended, so a loop that asks again on
 /// a bad answer still stops at the end of its input.
 fun prompt(text: str): Option<str> {
-	stdout_write(text);
+	stdout::write(text);
 	read_line()
 }
 
@@ -52,12 +53,6 @@ fun prompt(text: str): Option<str> {
 /// `vilan_rt::process::stdin_line` natively).
 [extern("__stdin_line")]
 export(in mod) async external fun stdin_line(signal: Option<CancelSignal>): Option<str>;
-
-/// Writes `text` to stdout unterminated and flushed — `prompt`'s half. Not
-/// public: the general no-newline `io` write is A173 S2's, where redraws need it
-/// beside cursor control.
-[extern("__stdout_write")]
-export(in mod) external fun stdout_write(text: str): void;
 
 /// The arguments the program was invoked with, excluding the runtime and script
 /// path — e.g. `vilan run prog.vl a b` yields `["a", "b"]`.

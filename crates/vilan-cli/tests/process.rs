@@ -501,3 +501,59 @@ fun main() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// E332: `io::write` — stdout with no newline, flushed, on both backends.
+// ---------------------------------------------------------------------------
+
+/// `io::write(text)` (E332): the bytes reach stdout exactly as written — no
+/// newline added, a `\r` kept, in order with `print` — and FLUSHED by the
+/// write itself. The proof of the flush is the sequencing: the write happens
+/// while a read is ALREADY parked (so the read's own flush ran before it),
+/// and the test types nothing until the written text has arrived; natively a
+/// write left in Rust's line-buffered stdout would never arrive, and the
+/// session would hang. The program's last write ends the output with no
+/// newline after it.
+#[test]
+fn e332_write_puts_unterminated_text_on_stdout_flushed() {
+    for backend in BACKENDS {
+        let dir = temp_project(&format!("write_{}", backend.unwrap_or("js")));
+        write(
+            &dir,
+            "write.vl",
+            r#"import std::io::{ print, write };
+import std::option::Option::{ self, None, Some };
+import std::process::read_line;
+import std::task;
+import std::time;
+
+fun main() {
+	task::nursery(|n| {
+		async {
+			match read_line() {
+				Some(let line) => print(i"[{line}]"),
+				None => print("the end"),
+			}
+			n.cancel();
+		};
+		async {
+			time::sleep(10);
+			write("par");
+			write("tial\r");
+			time::sleep(1000000);
+		};
+	});
+	write("tail");
+}
+"#,
+        );
+        let mut conversation = Conversation::start(&dir, "write.vl", backend);
+        conversation.wait_for("partial\r");
+        assert_eq!(conversation.stdout, "partial\r", "{backend:?}");
+        conversation.write("ok\n");
+        let (code, stdout) = conversation.finish();
+        assert_eq!(code, Some(0), "{backend:?}");
+        assert_eq!(stdout, "partial\r[ok]\ntail", "{backend:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -449,3 +449,115 @@ class = "ci"
 ratio = 1.003
 reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0015"
 item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:watch"
+class = "reference"
+ratio = 1.006
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0037 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.006
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0037 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:browser"
+class = "reference"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0016 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0016 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:router"
+class = "reference"
+ratio = 1.005
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0022 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.005
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0022 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0014 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0014 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0015 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0015 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:canvas"
+class = "reference"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0014 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0014 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:rpc"
+class = "reference"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0010 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0010 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0019 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.004
+reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0019 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "E332"

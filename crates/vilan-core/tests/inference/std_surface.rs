@@ -8158,3 +8158,38 @@ fn m165_print_and_an_externals_any_parameter_take_the_option_as_it_is() {
         "Some(4)\n[0,4]\nfalse\n",
     );
 }
+
+#[test]
+fn e332_io_write_runs_on_a_process_platform_with_no_newline() {
+    // `io::write` (E332): standard output with NO newline — the line ends only
+    // where a `print` (or a `\n` in the text) ends it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::{ print, write };
+        fun main() {
+            write("a");
+            write("b");
+            print("c");
+        }
+        "#,
+        "abc\n",
+    );
+}
+
+#[test]
+fn e332_io_write_is_refused_on_the_browser_leg_naming_the_chain() {
+    // A browser has no standard output: `io::write` is declared in the
+    // `@process` module `std::io::stdout` (and re-exported), so the coloring
+    // refuses it as it refuses `process::args()` — while `print`, beside it in
+    // `std::io`, stays universal.
+    assert_fails_browser_with(
+        r#"
+        import std::io::{ print, write };
+        fun main() {
+            print("universal");
+            write("process only");
+        }
+        "#,
+        "main → write (std::io::stdout)",
+    );
+}
