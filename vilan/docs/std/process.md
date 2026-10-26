@@ -82,6 +82,7 @@ channel, is in [Persistence](../guide/persistence.md#migrations-carrying-a-schem
 impl Server { fun builder(): ServerBuilder }
 impl ServerBuilder {
 	fun port(own self, port: i32): ServerBuilder
+	fun host(own self, address: str): ServerBuilder   // bind one address; default: every interface
 	fun on_request(own self, handler: async |Request| Response): ServerBuilder
 	fun on_upgrade(own self, handler: |NodeRequest, NodeSocket, Bytes| void): ServerBuilder
 	fun on_start(own self, callback: |Server| void): ServerBuilder
@@ -133,6 +134,12 @@ impl CachePolicy {
 	fun cache_control(own self, value: str): CachePolicy       // the field value, verbatim
 }
 ```
+
+**Binding one address.** With no `host`, a server listens on every
+interface, so anything on the network can reach it (and Windows asks the
+user about the firewall). A server meant for this machine only (a desktop
+app's own, a dev tool, a test) binds the loopback: `.host("127.0.0.1")`, or
+`"::1"` for IPv6. `url()` then names that address.
 
 `Request::header` reads one header off the request, and the conditional
 request built on it ships whole. `etag_of` mints a **strong validator** for
@@ -763,8 +770,14 @@ fun build_of(leg: str): Result<LegBuild, BuildError>   // async
 fun require_build(leg: str): LegBuild                  // async; stops if it can't
 ```
 
-`build_of` reads `dist/<leg>.chunks.json`, which every build of a browser
-leg writes. A leg that was never built is `Err(BuildError::NotBuilt)` and
+`build_of` reads `<leg>.chunks.json`, which every build of a browser leg
+writes into `dist/`. It looks **beside the running server** first: a build
+writes `dist/server.mjs` next to every leg's manifest, so a server started
+from any folder (a desktop app's data folder, a service manager's working
+folder) finds its own build. `dist/` under the working folder is the
+fallback, and a missing manifest's error names both places it looked.
+Natively the binary is not written into `dist/`, so a native server looks in
+the working folder's `dist/` only. A leg that was never built is `Err(BuildError::NotBuilt)` and
 not an empty build — the manifest's presence is the difference, which is
 why it is written even when the leg does not split. `require_build` is the
 boot idiom: a server that cannot describe its own build has nothing to

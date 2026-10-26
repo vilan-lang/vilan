@@ -893,11 +893,22 @@ impl Server {
     /// request: the socket is bound here, but a connection is only ACCEPTED in
     /// the loop's I/O poll, and the microtask queue drains before every one.
     pub fn listen(&self, port: i32, on_ready: Rc<dyn Fn()>) {
+        self.listen_at("0.0.0.0", port, on_ready);
+    }
+
+    /// `server.listen(port, host, on_ready)` — bound to `host` alone
+    /// (`ServerBuilder::host`, M168): `127.0.0.1` is reachable from this
+    /// machine only, where [`Self::listen`] takes every interface.
+    pub fn listen_on(&self, port: i32, host: &str, on_ready: Rc<dyn Fn()>) {
+        self.listen_at(host, port, on_ready);
+    }
+
+    fn listen_at(&self, host: &str, port: i32, on_ready: Rc<dyn Fn()>) {
         let requested = port.clamp(0, 65535) as u16;
-        let listener = match TcpListener::bind(("0.0.0.0", requested)) {
+        let listener = match TcpListener::bind((host, requested)) {
             Ok(listener) => listener,
             Err(error) => crate::panic_with(&format!(
-                "the server could not bind port {requested}: {error}"
+                "the server could not bind {host} port {requested}: {error}"
             )),
         };
         if let Err(error) = listener.set_nonblocking(true) {

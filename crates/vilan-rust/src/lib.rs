@@ -10690,6 +10690,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.value_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?
             ),
+            // M168: `listen(port, host, cb)` — `ServerBuilder::host`'s bind.
+            ("NodeServer", "listen_on") => format!(
+                "({}).listen_on({}, &{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
+            ),
             ("NodeServer", "address") => {
                 format!(
                     "({}).address()",
@@ -11693,6 +11701,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // boot. The three `RawStat` getters are receiver-keyed in
             // [`Emitter::http_host_binding`].
             (None, "__fs_stat", "raw_stat") => one(self, "fs::stat"),
+            // M168: `std::build`'s "beside the running module" probe. A native
+            // binary is not written into the build's output folder (it lives
+            // under `dist/native/<name>/target/`), so nothing is beside it to
+            // find: the empty answer sends `build_of` to the working folder,
+            // which is where a native server always looked.
+            (None, "__module_dir", "module_dir") => Ok(Some("vilan_rt::str_new(\"\")".to_string())),
             (None, "Date.now", "now_millis") => {
                 Ok(Some("vilan_rt::time::now_millis()".to_string()))
             }

@@ -23,8 +23,15 @@ import pkg::io::{ panic, print };
 import pkg::json::{ JsonValue, coerce_bool, coerce_str };
 import pkg::option::Option::{ self, None, Some };
 import pkg::path;
+import pkg::process::cwd;
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::watch::is_watching;
+
+/// The directory holding the running module (`import.meta.dirname`), `""` where
+/// there is none to ask — a native binary, which the build does not write into its
+/// output folder. A built server is `dist/server.mjs`: this is that `dist`.
+[extern("__module_dir")]
+external fun module_dir(): str;
 
 /// What one browser leg's build emitted, as the build itself knows it.
 export struct LegBuild {
@@ -101,9 +108,10 @@ export impl LegBuild {
 /// about a leg it never built has made a recoverable mistake, and the message says
 /// which one.
 export enum BuildError {
-	/// No build manifest where one was expected — the payload is the path. The leg
-	/// was never built, or the process is running from a directory that is not the
-	/// project root.
+	/// No build manifest where one was expected — the payload is the place, or the
+	/// two places (beside the server, then under the working folder), looked at.
+	/// The leg was never built, or the server is running from somewhere that is
+	/// neither beside its build nor the project root.
 	NotBuilt(str),
 	/// A manifest is there but does not read as one this toolchain wrote — the
 	/// payload is the path.
@@ -127,15 +135,37 @@ export impl BuildError {
 /// build: since the manifest is written on EVERY build of a browser leg, its
 /// absence means one thing and `"chunks": []` means another, which is exactly
 /// the difference §5.9 argued the always-written manifest buys.
+///
+/// The manifest is looked for BESIDE THE RUNNING MODULE first (M168): a build
+/// writes every leg into one folder, the server's own `server.mjs` among them, so
+/// the folder the server was loaded from holds the manifest wherever the process
+/// was started — a desktop app's data folder, a service manager's working folder.
+/// The working folder's `dist/` is the fallback (a server run some other way). Run
+/// from the project root, the two are the same folder and the build is described as
+/// `dist`, exactly as before.
 export fun build_of(leg: str): Result<LegBuild, BuildError> {
-	// `dist/` is where every multi-entry build puts a leg, and a server runs from
-	// the project root — the two facts the hand-written `"dist/client.js"` already
-	// assumed, now assumed in exactly one place.
-	let dist = "dist";
-	let manifest_path = path::join(dist, i"{leg}.chunks.json");
-	if fs::stat(manifest_path).is_none() {
-		ret Err(BuildError::NotBuilt(manifest_path));
+	let name = i"{leg}.chunks.json";
+	// `dist/` under the working folder: where every multi-entry build puts a leg,
+	// and where a server run from the project root finds it.
+	let fallback = "dist";
+	let fallback_manifest = path::join(fallback, name);
+	let beside = module_dir();
+	mut tried = fallback_manifest;
+	if beside != "" && path::normalize(beside) != path::resolve(cwd(), fallback) {
+		let beside_manifest = path::join(beside, name);
+		if fs::stat(beside_manifest).is_some() {
+			ret read_build(beside, beside_manifest);
+		}
+		tried = i"{beside_manifest} (beside the server) or {fallback_manifest}";
 	}
+	if fs::stat(fallback_manifest).is_none() {
+		ret Err(BuildError::NotBuilt(tried));
+	}
+	read_build(fallback, fallback_manifest)
+}
+
+/// The manifest at `manifest_path`, read and parsed as `dist`'s description.
+fun read_build(dist: str, manifest_path: str): Result<LegBuild, BuildError> {
 	match fs::read_file_to_str(manifest_path).try_parse_json() {
 		None => Err(BuildError::Unreadable(manifest_path)),
 		Some(let manifest) => read_manifest(dist, manifest_path, manifest),

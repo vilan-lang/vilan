@@ -1304,6 +1304,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__router_path",
         "__router_url",
         "__router_state",
+        "__module_dir",
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1593,6 +1594,14 @@ fn helper_source(name: &str) -> &'static str {
         // Router glue (std::web::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
+        // M168: the directory the running module was loaded from — `dist/` for
+        // a built server (`dist/server.mjs`), where `std::build` looks for a
+        // leg's manifest first. `import.meta.dirname` is node's (20.11+), Deno's
+        // and Bun's; a host without it answers `""`, and the working folder is
+        // the fallback.
+        "__module_dir" => {
+            "function __module_dir() {\n\treturn typeof import.meta.dirname === \"string\" ? import.meta.dirname : \"\";\n}"
+        }
         // M167: the current entry's state, when it is TEXT — the only kind
         // `std::web::router` writes. The first entry (state `null`) and one
         // another script pushed with an object both read as `""`.
