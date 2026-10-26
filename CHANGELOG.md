@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**E335: `vilan run` forwards `SIGTERM`, `SIGHUP` and `SIGINT` to the program it started and waits for it — a supervisor, an editor task or a harness that stops `vilan run` no longer leaves node (or the native binary) running, orphaned, holding its port or parked on stdin — and a program killed by a signal is reported as 128 + the signal (143 for `SIGTERM`), as a shell does, where it was exit 1.** `vilan run` waited with `Command::status()` and answered no signal but `Ctrl-C`'s, which the terminal delivers to the whole foreground group. On unix the three signals now come through one pipeline (`job.rs`: the handler writes the signal's number to a pipe, a thread reads it) in place of `ctrlc`, which hands its closure no number to forward: a plain run (`--backend js` under node, `--backend rust` the built binary, and a workspace's node member) registers its child and the thread `kill`s it with the signal received, then the run reports the child's own end; a terminal's `Ctrl-C` is not delivered a second time (the kernel raised it for the group, the child included). A signal that finds no child to forward to (a compile, a `--watch` session, whose restart rounds keep their own path untouched) is answered by the interrupt hook as before — temp script removed, exit 130. On Windows the Job object a spawned child is assigned to already takes the program when `vilan run` dies, and the native run is now assigned to one too. The old `an_interrupted_run_removes_its_script_map_and_sidecar` expectation (`SIGTERM`/`SIGHUP` to `vilan` alone leave the program running and the run exits 130) is now 143 and 129 with the program gone. Pins: `run_signals::a_signal_sent_to_vilan_run_reaches_the_program_and_is_its_exit_status` (a program parked on `read_line`, each of the three signals, both backends: the program is gone, the status is 128 + n; red on the base with the program left running). Tracker E335.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->

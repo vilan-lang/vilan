@@ -107,12 +107,13 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
 /// `vilan-run-<pid>.mjs`, its map and its sidecar in the temp directory.
 ///
 /// `SIGTERM` and `SIGHUP` go to `vilan` ALONE, as a debugger ending a session
-/// sends them: the program keeps running, so only the hook can answer — it
-/// removes the three files and exits 130. `SIGINT` goes to the run's process
-/// GROUP, as a terminal's `Ctrl-C` does: the program stops with it, so the
-/// hook and the run's own end race to the same removal, and the run exits
-/// with a code either way. Without the hook, every signal killed `vilan`
-/// outright: no code, and every file stayed.
+/// sends them: since E335 the run forwards them to the program and waits, so
+/// the program stops, the run removes the three files on its way out, and it
+/// exits with the program's own end (128 + the signal: 143 and 129; the
+/// forwarding itself is pinned in `run_signals.rs`). `SIGINT` goes to the
+/// run's process GROUP, as a terminal's `Ctrl-C` does: the program stops with
+/// it and the run exits with a code either way. Without the hook, every
+/// signal killed `vilan` outright: no code, and every file stayed.
 #[test]
 fn an_interrupted_run_removes_its_script_map_and_sidecar() {
     use std::os::unix::process::CommandExt;
@@ -169,7 +170,12 @@ fn an_interrupted_run_removes_its_script_map_and_sidecar() {
                 "SIG{signal}: the run exits, not killed: {status:?}"
             );
         } else {
-            assert_eq!(status.code(), Some(130), "SIG{signal}: the hook exits 130");
+            let number = if signal == "TERM" { 15 } else { 1 };
+            assert_eq!(
+                status.code(),
+                Some(128 + number),
+                "SIG{signal}: the run reports the program's death by the signal"
+            );
         }
         for file in &files {
             assert!(
