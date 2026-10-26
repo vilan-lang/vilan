@@ -4236,6 +4236,11 @@ struct Printer<'src> {
     /// width measure, so a call statement splits at the width the statement
     /// hook armed it at, as a chain does.
     terminator_end: Option<usize>,
+    /// E337/E338: the columns that follow the expression ending at
+    /// [`Self::terminator_end`] on its line - the statement's `;` (one), plus
+    /// what a postfix applied after it prints (`!`, `?`, `.field`).
+    /// Meaningful only while `terminator_end` is set.
+    terminator_columns: usize,
     /// E314: how many element-body holes (`{ … }`) enclose the expression being
     /// printed. A call's arguments break one per line only inside one — outside
     /// markup a call keeps its last-argument layout (the estate would move by
@@ -4291,6 +4296,7 @@ impl<'src> Printer<'src> {
             head_start: None,
             arguments_blocked: false,
             terminator_end: None,
+            terminator_columns: 0,
             hole_depth: 0,
             tuple_forced: false,
             width_element_splits: 0,
@@ -4630,10 +4636,17 @@ impl<'src> Printer<'src> {
                 self.out.push(';');
             }
             if self.begin_split_reprint(statement_start, comment_cursor) {
+                // E337: an UNTERMINATED statement (a block's tail written as a
+                // `let`) still ends where its value ends, with no `;` after it
+                // (zero columns) - a `!` / `?` / `.field` that ends it is
+                // followed by columns of its own all the same.
                 let enclosing_terminator =
-                    std::mem::replace(&mut self.terminator_end, terminated.then_some(range.end));
+                    std::mem::replace(&mut self.terminator_end, Some(range.end));
+                let enclosing_columns =
+                    std::mem::replace(&mut self.terminator_columns, usize::from(terminated));
                 self.print_item(item);
                 self.terminator_end = enclosing_terminator;
+                self.terminator_columns = enclosing_columns;
                 self.split = Split::Off;
                 if terminated {
                     self.out.push(';');
@@ -6623,7 +6636,13 @@ impl<'src> Printer<'src> {
             let enclosing_head = self.head_start.take();
             self.print_expr(tail);
             if self.begin_split_reprint(statement_start, comment_cursor) {
+                // E337: the tail has no terminator, but a postfix that ends it
+                // is followed by columns the call under it must count.
+                let enclosing = (self.terminator_end, self.terminator_columns);
+                self.terminator_end = Some(tail_range.end);
+                self.terminator_columns = 0;
                 self.print_expr(tail);
+                (self.terminator_end, self.terminator_columns) = enclosing;
                 self.split = Split::Off;
             }
             self.head_start = enclosing_head;
@@ -6817,11 +6836,63 @@ impl<'src> Printer<'src> {
         display_width(&self.out[line_start..]) > LINE_BUDGET
     }
 
-    /// E329: the columns the statement's `;` adds to the line `expr` ends - one
-    /// when `expr` is the very expression the terminated statement being
-    /// reprinted ends with (the printer pushes the `;` after it), else none.
+    /// E329: the columns that still follow `expr` on the line it ends - the
+    /// statement's `;` (one) when `expr` is the very expression the terminated
+    /// statement being reprinted ends with (the printer pushes the `;` after
+    /// it), plus the postfix an enclosing `!` / `?` / `.field` prints after it
+    /// (E337); else none.
     fn terminator_after(&self, expr: &Spanned<Node<'src>>) -> usize {
-        usize::from(self.terminator_end == Some(expr.1.into_range().end))
+        if self.terminator_end == Some(expr.1.into_range().end) {
+            self.terminator_columns
+        } else {
+            0
+        }
+    }
+
+    /// E337: enters the subject of a postfix (`!`, `?`, `.field`) that ends the
+    /// expression the `;` (or a hole's `}`) follows. A call subject gets the
+    /// split permission the postfix was handed - the postfix is the value, and
+    /// the call is as much of the line as it is in `let v = f(a, b, c);` - and
+    /// the call's own measure counts the `suffix` columns the postfix prints
+    /// after it, along with the terminator. Returns what to put back with
+    /// [`Self::leave_postfix_subject`]; `None` when nothing was entered.
+    fn enter_postfix_subject(
+        &mut self,
+        postfix: &Spanned<Node<'src>>,
+        subject: &Spanned<Node<'src>>,
+        split: Split,
+        suffix: usize,
+    ) -> Option<(Option<usize>, usize)> {
+        let ends_the_value = self.terminator_end == Some(postfix.1.into_range().end);
+        if split == Split::Off || !ends_the_value || !Self::postfixes_over_a_call(subject) {
+            return None;
+        }
+        let saved = (self.terminator_end, self.terminator_columns);
+        self.terminator_end = Some(subject.1.into_range().end);
+        self.terminator_columns += suffix;
+        self.split = split;
+        Some(saved)
+    }
+
+    /// Whether `node` is a call, or `!` / `?` / `.field` applied to something
+    /// that is (`f(..)!.field`): the shapes the width rule's permission is
+    /// handed down through (E337).
+    fn postfixes_over_a_call(node: &Spanned<Node<'src>>) -> bool {
+        match &node.0 {
+            Node::Call(..) => true,
+            Node::TryAssert(inner) | Node::Lifted(inner) => Self::postfixes_over_a_call(inner),
+            Node::MemberAccessor(inner, member) => {
+                matches!(member.0, Node::Accessor(_)) && Self::postfixes_over_a_call(inner)
+            }
+            _ => false,
+        }
+    }
+
+    fn leave_postfix_subject(&mut self, saved: Option<(Option<usize>, usize)>) {
+        if let Some((end, columns)) = saved {
+            self.terminator_end = end;
+            self.terminator_columns = columns;
+        }
     }
 
     /// Whether the FIRST line of a rendering that starts at output offset
@@ -8811,7 +8882,16 @@ impl<'src> Printer<'src> {
                 self.out.push('>');
             }
             Node::MemberAccessor(subject, member) => {
+                // E337: `f(a, b, c).field;` - the field is the postfix, one
+                // dot and its name after the call.
+                let entered = match &member.0 {
+                    Node::Accessor(name) => {
+                        self.enter_postfix_subject(expr, subject, split, 1 + display_width(name))
+                    }
+                    _ => None,
+                };
                 self.print_postfix_subject(subject);
+                self.leave_postfix_subject(entered);
                 self.out.push('.');
                 // The callee of `list.push(…)` IS the member, so a permission
                 // dropped here never reaches the call's arguments — which made
@@ -8991,7 +9071,9 @@ impl<'src> Printer<'src> {
                 self.print_prefix_operand(operand, split);
             }
             Node::TryAssert(subject) => {
+                let entered = self.enter_postfix_subject(expr, subject, split, 1);
                 self.print_operand(subject, 100);
+                self.leave_postfix_subject(entered);
                 self.out.push('!');
             }
             // `value as T` (B571): a chain-tier postfix. A block-like value
@@ -9018,7 +9100,9 @@ impl<'src> Printer<'src> {
             // trees (the region rewrite runs only at the analyzer's entry),
             // so the mark prints back exactly as written.
             Node::Lifted(subject) => {
+                let entered = self.enter_postfix_subject(expr, subject, split, 1);
                 self.print_operand(subject, 100);
+                self.leave_postfix_subject(entered);
                 self.out.push('?');
             }
             // A recorded paren group — the parentheses were written, so they
@@ -19228,6 +19312,10 @@ mod call_statement_terminator {
     //! expression ends counts the `;` as one more column. Every case runs
     //! through `assert_construct`: token round trip, idempotence, the canonical
     //! form's own round trip.
+    //!
+    //! E337 carries the count through a `!` / `?` / `.field` that ends the
+    //! statement (`let v = f(a, b, c)!;`: the postfix and the `;` both follow
+    //! the call).
     use super::bailing_constructs::assert_construct;
 
     const CALLEE: &str = "plain_function_call_with_no_chain_at_all";
@@ -19306,6 +19394,82 @@ mod call_statement_terminator {
         assert_construct(&at_the_budget, &at_the_budget);
         let (past, split) = hole(102);
         assert_construct(&past, &split);
+    }
+
+    /// E337: the call is the subject of a `!` / `?` / `.field` that ends the
+    /// terminated statement. The postfix and the `;` are both columns after
+    /// the call, so the statement splits at the width `let v = f(..);` does:
+    /// the line, `!;` included, is 100 columns at the budget and 101 over it.
+    fn postfixed(terminator: &str, line: usize) -> (String, String) {
+        statement("let value = ", line - terminator.len(), terminator)
+    }
+
+    #[test]
+    fn a_call_with_a_postfix_at_the_budget_stays_inline() {
+        for terminator in ["!;", "?;", ".field;"] {
+            let (inline, _) = postfixed(terminator, 100);
+            assert_construct(&inline, &inline);
+        }
+    }
+
+    #[test]
+    fn a_call_with_a_postfix_one_column_over_splits_its_arguments() {
+        for terminator in ["!;", "?;", ".field;"] {
+            let (inline, split) = postfixed(terminator, 101);
+            assert_construct(&inline, &split);
+        }
+    }
+
+    #[test]
+    fn the_postfix_without_a_semicolon_counts_only_itself() {
+        // A block's tail: no `;`, so the line is 100 with the `!` at the budget.
+        let (inline, _) = statement("let value = ", 99, "!");
+        assert_construct(&inline, &inline);
+        let (inline, split) = statement("let value = ", 100, "!");
+        assert_construct(&inline, &split);
+    }
+
+    #[test]
+    fn the_other_terminated_shapes_follow_the_same_width() {
+        for lead in ["", "value = "] {
+            let (inline, split) = statement(lead, 99, "!;");
+            assert_construct(&inline, &split);
+            let (inline, _) = statement(lead, 98, "!;");
+            assert_construct(&inline, &inline);
+        }
+    }
+
+    #[test]
+    fn stacked_postfixes_count_all_of_them() {
+        // `f(..)!.field;` - the `!` and `.field;` both follow the call.
+        let (inline, split) = statement("let value = ", 101 - "!.field;".len(), "!.field;");
+        assert_construct(&inline, &split);
+        let (inline, _) = statement("let value = ", 100 - "!.field;".len(), "!.field;");
+        assert_construct(&inline, &inline);
+    }
+
+    /// E339 stays as ruled: a binary's right operand keeps "the `;` is the
+    /// statement's" (`binary_operand_layout::a_right_operand_at_the_budget_...`).
+    /// The `!` is the operand's own, so it counts - `1 + f(..)!;` splits at the
+    /// width `1 + f(..)` does once the `!` is added, and the `;` still is not.
+    #[test]
+    fn a_right_operand_with_a_postfix_counts_the_postfix_but_not_the_semicolon() {
+        let (at_101, _) = statement("let value = 1 + ", 101 - 2, "!;");
+        assert_construct(&at_101, &at_101);
+        let (over, split) = statement("let value = 1 + ", 102 - 2, "!;");
+        assert_construct(&over, &split);
+        // The bare call is the reference: 101 columns with its `;` stays.
+        let (bare, _) = statement("let value = 1 + ", 100, ";");
+        assert_construct(&bare, &bare);
+    }
+
+    #[test]
+    fn a_postfix_whose_subject_is_not_a_call_is_unchanged() {
+        let source = format!(
+            "fun demo() {{\n\tlet value = {}.field!;\n}}\n",
+            "a".repeat(100)
+        );
+        assert_construct(&source, &source);
     }
 }
 
