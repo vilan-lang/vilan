@@ -1,0 +1,38 @@
+// M165 on both backends: an `[rpc]` body that THROWS (a `panic`; node:sqlite's
+// bind `TypeError` is the exhibit) answers its call with a `Remote` error
+// naming the method and the message — the client's awaited call is rejected,
+// never parked — and the service answers the next call as before. The
+// server's log line rides stderr, outside the differential's stdout.
+
+import std::io::{ panic, print };
+import std::json::json_codec;
+import std::result::Result::{ Err, Ok };
+import std::rpc::{ DuplexTransport, local_rpc };
+
+[service(CounterClient)]
+struct Counter {}
+
+impl Counter {
+	[rpc]
+	fun add(self, a: i32, b: i32): i32 {
+		a + b
+	}
+
+	[rpc]
+	fun explode(self, why: str): i32 {
+		panic(why);
+		0
+	}
+}
+
+fun main() {
+	let transport = local_rpc(Counter {}.dispatcher().into_protocol(json_codec()));
+	let client = CounterClient { transport, codec = json_codec() };
+	print(i"add: {client.add(2, 3).debug()}");
+	print(i"explode: {client.explode("boom").debug()}");
+	print(i"add again: {client.add(4, 5).debug()}");
+	match client.explode("twice") {
+		Err(let error) => print(i"again: {error.debug()}"),
+		Ok(let value) => print(i"answered {value}"),
+	}
+}

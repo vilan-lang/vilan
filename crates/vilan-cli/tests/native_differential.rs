@@ -14472,6 +14472,22 @@ fn a_for_loops_next_reading_a_context_answers_on_both_backends() {
     );
 }
 
+/// M165: an `[rpc]` body that throws answers its call with a `Remote` error
+/// naming the method and the message on both backends — the client's awaited
+/// call is rejected, never parked — and the service answers the next call.
+#[test]
+fn m165_an_rpc_body_that_throws_answers_its_call_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_rpc_body_throws.vl";
+    std::fs::write(staged.join(file), include_str!("native/rpc_body_throws.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a thrown rpc body must answer its call the same natively"
+    );
+}
+
 /// B626: a module scalar read only through a view — a `const let`, a `let`, a
 /// `mut` written through `&mut`, a read inside a closure — answers the same on
 /// both backends (JS shook the binding out and threw `ReferenceError`).

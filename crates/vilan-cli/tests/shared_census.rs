@@ -138,7 +138,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive/store_core.vl",
-        4,
+        5,
         "E: a store's cells, all minted by the store and reached through every \
          copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
          (`Store::new`), each node of its slot tree, and a slot's subscription \
@@ -146,9 +146,11 @@ const CENSUS: &[(&str, usize, &str)] = &[
          `store.vl` at A149 S3 (so `std::web::ui` stops loading the collection \
          layer); +1 there: a keyed node's table of children (a map's keys, a \
          set's members, a keyed list's keys), made by the first subscription \
-         under a key and read by every write's diff. A collection flow's feed \
-         keeps its state in `mut` bindings its closures capture, so `store.vl` \
-         itself mints none",
+         under a key and read by every write's diff; +1 at M172 (Order 55): the \
+         root's identity table (`ids`), a cell as `keyed` is, because binding \
+         the map copied every identity minted once per boundary a mirror named. \
+         A collection flow's feed keeps its state in `mut` bindings its \
+         closures capture, so `store.vl` itself mints none",
     ),
     (
         "reactive/trace.vl",
@@ -190,8 +192,15 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc/mirror.vl",
-        31,
-        "R + E: the open mirror channels, the client's views and the failed \
+        37,
+        "R + E (+6 at M172, Order 55: the tables keyed by what they are looked \
+         up by — on the server the base of each grant by its path's identity \
+         (`bases`), the slots under each grant (`under`) and the opening-order \
+         stamp source; on the client the slot of each boundary by identity \
+         (`named`), how many named slots stand below each place (`covered`) \
+         and the naming-order stamp source; and per store mirror the hold \
+         count per boundary (`holding`) — every one reached through every copy \
+         of its record): the open mirror channels, the client's views and the failed \
          mints' last errors (three module bindings), and the cells every copy of \
          a record reaches — on the server per channel the grants, the slots, the \
          turn's dirty and seeding lists, its pending flush, the next base \
@@ -206,8 +215,9 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc/server.vl",
-        6,
-        "R + O: the registry, the server's stats",
+        7,
+        "R + O: the registry, the server's stats; +1 at A174 (Order 55): the \
+         closers by connection id (`Connection::close`), a module binding",
     ),
     (
         "shared.vl",
@@ -333,7 +343,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 240,
+        total, 248,
         "the total number of `Shared` construction sites in std changed"
     );
 

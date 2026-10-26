@@ -290,6 +290,21 @@ async argument is refused here", and a parameter is the only position
 that could otherwise accept one — a plain closure type already refuses
 an async store everywhere else.
 
+**A closure parameter without the clause keeps the context it was made
+with.** `fun while_on(provide: || void)` cannot hand `provide` to
+`run_with_owner(owner, provide)` — the refusal names the fix, "type it
+`(sync || void) context owner_scope`" — and the wrap `|| provide()` is
+accepted but is the trap: the literal is injected, `provide` is not, so
+what `provide` registers belongs to the owner `while_on`'s caller was
+made with, and disposing `owner` takes nothing back. The checker warns
+when such a parameter — one whose type carries no `owner_scope`, answering
+a `View` or nothing — is called inside a body that establishes an owner
+(`swap`, `when`, `each`, `run_with_owner`, an overlay's `attach`, a
+clause-typed field): "`probes` is a closure parameter called inside
+`swap`'s body, which establishes an owner … type it
+`(sync |…| View) context owner_scope` so it takes the owner at the call".
+The clause on the parameter is the fix in every case.
+
 ## 8.6 Declared requirements: the `context` clause on a `fun`
 
 A function's requirement is **inferred** from its body by default (§8.3):
