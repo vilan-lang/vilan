@@ -633,6 +633,55 @@ fn p6a_a_package_impl_a_std_question_reaches_is_decided_by_the_rule() {
     );
 }
 
+/// **N179: a program the std prefix is not ATTEMPTED for says why.** The
+/// reuse gate in front of the attempt is syntactic — an entry whose text says
+/// `macro` may define one, which would register into the world's registry —
+/// so a program that only MENTIONS the word (the corpus's `crypto`, `db`,
+/// `file`, `watch` say it in a comment) takes the canonical path. The census
+/// read `prefix-world 0 prefix-refusal -` for it, neither served nor why; it
+/// names the gate now (`macro-text`), without counting a refusal of the
+/// prefix, and the analysis answers what the clean one does. A program the
+/// gate passes is served, with no reason.
+#[test]
+fn n179_a_program_the_prefix_is_not_attempted_for_names_the_gate() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let mentions = Package::write(
+        "prefix_macro_text",
+        NODE,
+        &[(
+            "main.vl",
+            "// No macro is defined here; the word is enough for the gate.\n\
+             fun main() {\n\tprint(\"ok\");\n}\n",
+        )],
+    );
+    let plain = Package::write(
+        "prefix_plain_text",
+        NODE,
+        &[("main.vl", "fun main() {\n\tprint(\"ok\");\n}\n")],
+    );
+    let not_taken = observe_over_the_prefix(&mentions);
+    let taken = observe_over_the_prefix(&plain);
+    mentions.remove();
+    plain.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        !not_taken.census.prefix_world
+            && not_taken.census.prefix_refusal == Some("macro-text")
+            && not_taken.census.prefix_refusals == 0,
+        "the gate in front of the prefix is named, and is not a refusal of it: {:?}",
+        not_taken.census
+    );
+    assert!(
+        taken.census.prefix_world && taken.census.prefix_refusal.is_none(),
+        "a program the gate passes is served with no reason: {:?}",
+        taken.census
+    );
+}
+
 /// kolt's `src/lib/scale_step.vl`: a package struct made callable (B340).
 /// std asks whether its closure types are `Callable`, and the call operator's
 /// coercion admitted this impl for them (M145's second refusal on kolt).

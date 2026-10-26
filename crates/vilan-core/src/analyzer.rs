@@ -83989,6 +83989,19 @@ fn note_hot_refusal(reason: &'static str, key: &BaseCacheKey) {
     });
 }
 
+/// N179: the std-prefix world (P1) asked for and not attempted — a gate in
+/// front of the attempt said no. Named in the census's `prefix-refusal`
+/// column; not a refusal OF the prefix (`prefix-refusals` counts those), and
+/// the analysis the census describes is not over it, whatever an abandoned
+/// earlier attempt of the same analysis was.
+fn note_prefix_not_taken(reason: &'static str) {
+    crate::incremental::update_census(|census| {
+        census.prefix_world = false;
+        census.prefix_layered = false;
+        census.prefix_refusal = Some(reason);
+    });
+}
+
 /// The std-prefix world (P1) refused before its build began.
 fn note_prefix_refusal(reason: &'static str) {
     crate::incremental::update_census(|census| {
@@ -86012,6 +86025,36 @@ fn analyze_inner<'src>(
         && shape.hot
         && hot_shape_allowed
         && !crate::macros::in_macro_world();
+    // N179: a program the prefix is asked for and NOT attempted says why, so
+    // the census reads every program by name (`prefix-world 0 prefix-refusal
+    // macro-text`) rather than `-`. A refusal of an attempt (the hot shapes'
+    // guards, `refused-before`) has already said so; these are the gates in
+    // front of the attempt — the reuse gate's own reasons, and the shapes a
+    // rebuild narrows to.
+    if crate::incremental::std_prefix() && !std_prefix_wanted && !crate::macros::in_macro_world() {
+        let reason = if !shape.cache {
+            // A rebuild without the cache: generated code demanded a module
+            // the served world never loaded (`expand_entry_over_world`).
+            Some("uncached")
+        } else if shape.defer_resolve {
+            // B553: an entry impl answered a pre-entry question.
+            Some("resolve-deferred")
+        } else if !shape.std_prefix || !shape.hot {
+            // A narrowed retry: the refusal that narrowed it was noted.
+            None
+        } else if entry_is_inside_std {
+            Some("inside-std")
+        } else if !base_cacheable {
+            // The entry's text says `macro` (the reuse gate is syntactic: a
+            // macro-DEFINING entry registers into the world's registry).
+            Some("macro-text")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            note_prefix_not_taken(reason);
+        }
+    }
     let hot_world = match std_prefix_wanted
         .then(|| std_prefix_set(&entry_pkg_seeds, entry_path, pkg_root, workspace))
     {
