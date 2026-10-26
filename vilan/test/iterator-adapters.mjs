@@ -172,7 +172,7 @@ function take(self, count3) {
 function next3(self) {
 	let $a = null;
 	if (self[1] < self[0].length) {
-		const value = __clone(__at(self[0], self[1], "std/src/iterator.vl:168:16"));
+		const value = __clone(__at(self[0], self[1], "std/src/iterator.vl:184:16"));
 		self[1] = self[1] + 1;
 		$a = [ 0, value ];
 	} else {
