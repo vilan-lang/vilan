@@ -3328,6 +3328,108 @@ fn initializer_field_count_mismatch_is_unaffected_by_the_closest_name_scan() {
     );
 }
 
+// --- B653: a struct literal sets each field once ------------------------------
+//
+// `Pair { left = 1, left = 2 }` checked clean and the last value won; a slip
+// that meant another field dropped that field's value whenever the literal
+// still supplied every field. Refused at the second name, the first noted.
+
+const SET_TWICE: &str = "`left` is set twice in this `Pair` literal";
+
+#[test]
+fn b653_a_field_set_twice_is_refused_at_the_second_name() {
+    let source = r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let pair = Pair { left = 1, left = 2 };
+        }
+        "#;
+    assert_fails_spanning_nth(source, "left", 2, SET_TWICE);
+    // The note sits on the FIRST occurrence's name, in this file.
+    let first = source.find("left = 1").expect("the first occurrence");
+    let diagnostics = failure_diagnostics_with_notes(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _, note)| message.contains(SET_TWICE)
+                && note.as_ref().is_some_and(|(text, range, elsewhere)| text
+                    == "`left` is already set here"
+                    && *range == (first..first + "left".len())
+                    && !elsewhere)),
+        "{diagnostics:#?}"
+    );
+    assert_fails_once_with(source, "set twice");
+}
+
+#[test]
+fn b653_the_shorthand_form_is_refused_the_same() {
+    let source = r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let left = 5;
+        	let pair = Pair { left, left };
+        }
+        "#;
+    assert_fails_spanning_nth(source, "left", 3, SET_TWICE);
+    assert_fails_once_with(source, "set twice");
+}
+
+#[test]
+fn b653_a_repeat_beside_a_surplus_is_named_before_the_count() {
+    // The count message cannot name a field when the surplus IS a repeat
+    // (every name is a real field); the repeat is the cause and is reported
+    // alone.
+    let source = r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let pair = Pair { left = 1, right = 2, left = 3 };
+        }
+        "#;
+    assert_fails_once_with(source, SET_TWICE);
+    assert_fails_without(source, "expects 2 fields");
+}
+
+#[test]
+fn b653_a_qualified_or_generic_literal_and_two_distinct_fields_are_checked_alike() {
+    assert_fails_with(
+        r#"
+        struct Pair<T> {
+        	left: T,
+        	right: T,
+        }
+
+        fun main() {
+        	let pair = Pair<i32> { right = 1, right = 2 };
+        }
+        "#,
+        "`right` is set twice in this `Pair` literal",
+    );
+    assert_compiles(
+        r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let pair = Pair { right = 2, left = 1 };
+        }
+        "#,
+    );
+}
+
 // A missing import segment points at that segment, not the whole statement.
 #[test]
 fn import_segment_error_spans_the_segment() {

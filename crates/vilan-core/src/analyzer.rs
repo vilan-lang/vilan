@@ -66171,6 +66171,42 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
+    /// B653: a struct literal names each field once. `Pair { left = 1, left =
+    /// 2 }` checked clean and the LAST value won — a copy-paste slip meant for
+    /// another field dropped that field's value silently whenever the literal
+    /// still happened to supply every field (`Pair { left, left }`, the
+    /// shorthand, the same). Refused at the SECOND occurrence's name, the first
+    /// as the note, and before the count check, whose message cannot name a
+    /// field when the surplus is a repeat. Reports every repeat of the literal,
+    /// each against the occurrence it repeats.
+    fn refuse_repeated_field(&mut self, constraint: &StructInitializerConstraint<'src>) -> bool {
+        let mut refused = false;
+        for (index, (name, _, _, name_span)) in constraint.fields.iter().enumerate() {
+            let Some((_, _, _, first_span)) = constraint.fields[..index]
+                .iter()
+                .find(|(earlier, ..)| earlier == name)
+            else {
+                continue;
+            };
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: Some(crate::error::Note::here(
+                    *first_span,
+                    format!("`{name}` is already set here"),
+                )),
+                span: *name_span,
+                msg: format!(
+                    "`{name}` is set twice in this `{}` literal: a literal sets each field once, \
+                     and the second value would replace the first; remove one, or name the field \
+                     it was meant for",
+                    constraint.struct_name
+                ),
+            });
+            refused = true;
+        }
+        refused
+    }
+
     /// S4 (editing-dx.md §7.1): the struct-initializer field-count message,
     /// naming the struct and — per direction — the field responsible.
     /// Missing: the struct's declared fields the literal never supplied,
@@ -66534,6 +66570,9 @@ impl<'src> Analyzer<'src> {
         let struct_fields = struct_.fields.clone();
         let struct_name_span = struct_.name_span;
         if self.refuse_internal_field_write(constraint, struct_id, &struct_fields) {
+            return Resolution::Failed;
+        }
+        if self.refuse_repeated_field(constraint) {
             return Resolution::Failed;
         }
         if constraint.fields.len() != struct_fields.len() {
