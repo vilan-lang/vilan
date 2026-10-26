@@ -35,6 +35,13 @@ impl Row {
 Parameters are `?` placeholders. Synchronous by design (fits the rpc
 dispatch path). `desc` and other SQL keywords fail as column names.
 
+A bind list holds numbers, `str`s, `bool`s and `Option`s of them. A `bool`
+binds as the integer 0 or 1, and an `Option` as its value or NULL, so a
+nullable column takes the `Option` directly: `.run([title, status_id])`
+with `status_id: Option<u53>`. Anything else (a struct, a list, a tuple,
+another enum) is refused when the statement runs, naming its index in the
+list: `std::db: cannot bind the parameter at index 2 of 3: …`.
+
 `Database` is a **`resource`**: it has a single owner and *moves* rather than
 copies, and it closes its `node:sqlite` handle at its owner's last use. A
 `let db = Database::open(..)` local closes after the last statement that uses

@@ -5761,6 +5761,14 @@ pub struct Analyzer<'src> {
     /// the repeated inference passes over one site report once.
     dyn_refusals_reported: HashSet<Id>,
     callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// M165: every expression an `Option` value lands at an `any` position at,
+    /// with how many `Option` layers it is. See [`Program::any_option_coercions`].
+    any_option_coercions: HashMap<Id, usize>,
+    /// M165: a method call's impl binders the RECEIVER binds to `any`
+    /// (`List<any>`'s `T`), by call — an argument at a parameter typed by one
+    /// lands at the `any` (`params.push(maybe)`), though the call's own
+    /// substitution binds the binder to the argument's type.
+    any_bound_receiver_binders: HashMap<Id, Vec<TypeId>>,
     /// A124 R3: every expression a concrete value is erased into a trait object
     /// at — the expression's own id, and the value's own type, which is what the
     /// emitter builds the vtable from. Recorded by
@@ -8308,6 +8316,8 @@ impl<'src> Analyzer<'src> {
             supertrait_self_at_call: HashMap::default(),
             expected_types: HashMap::default(),
             callable_coercions: HashMap::default(),
+            any_option_coercions: HashMap::default(),
+            any_bound_receiver_binders: HashMap::default(),
             dyn_coercions: HashMap::default(),
             dyn_tuple_coercions: HashMap::default(),
             parameter_erasures: Vec::new(),
@@ -47476,6 +47486,7 @@ impl<'src> Analyzer<'src> {
         self.note_callable_coercion(expr_id, constraint, &inferred);
         self.note_variant_coercion(expr_id, &inferred);
         self.note_dyn_coercion(expr_id, constraint, &inferred, substitution_context);
+        self.note_any_option_coercion(expr_id, constraint, &inferred, substitution_context);
         inferred
     }
 
@@ -48101,6 +48112,124 @@ impl<'src> Analyzer<'src> {
         })
     }
 
+    /// M165: an `Option` value landing at an `any` position — an element of a
+    /// `List<any>` bind list, `params.push(maybe)` on one, an `any` parameter —
+    /// is its payload or nothing there, as the native backend's `Any::from`
+    /// makes it: `Some(1)` is `1` and `None` is `null`, so `std::db` binds the
+    /// value or NULL instead of handing `node:sqlite` the variant's array (read
+    /// as named parameters: "Unknown named parameter '0'"). Recorded with the
+    /// value's `Option` depth, which the JS emitter unwraps (`walk_entity`).
+    ///
+    /// The shape test comes first, as [`Self::note_dyn_coercion`]'s does: an
+    /// `any` expectation is a vanishing minority of inference entries. The
+    /// forms are the callable coercion's allow-list, for its reason — an
+    /// expectation forwarded through a block or an `if` reaches the leaf the
+    /// emitter walks in the landing position, and only the leaf converts — plus
+    /// the bare `None` (a `Some(1)` built in place is a call). The direct `any`
+    /// parameters of `print` and of an external function take the value as it
+    /// is; the call path drops those ([`Self::keep_any_option_coercion`]).
+    fn note_any_option_coercion(
+        &mut self,
+        expr_id: Id,
+        constraint: &Type,
+        inferred: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        let landing = match constraint {
+            Type::Any => true,
+            Type::Generic(constraint_id) => matches!(
+                substitution_context
+                    .get(constraint_id)
+                    .map(|bound| bound.get_type(self)),
+                Some(Type::Any)
+            ),
+            _ => false,
+        };
+        if !landing {
+            return;
+        }
+        if !matches!(
+            self.expr_id_to_expr_map.get(&expr_id),
+            Some(
+                Expr::Local(_)
+                    | Expr::Field(..)
+                    | Expr::Index(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Call(_)
+                    | Expr::EnumVariant(..)
+                    | Expr::Dereference(_)
+                    | Expr::Ascribe(_)
+            )
+        ) {
+            return;
+        }
+        self.record_any_option_landing(expr_id, inferred);
+    }
+
+    /// M165: `value_id`, of type `value`, lands at an `any` position as it
+    /// stands — recorded when it is an `Option`, with its depth
+    /// (`Option<Option<i32>>` is two layers).
+    fn record_any_option_landing(&mut self, value_id: Id, value: &Type) {
+        let mut depth = 0;
+        let mut layer = value.clone();
+        while let Type::Enum(enum_id, arguments) = &layer
+            && Some(*enum_id) == self.option_enum_id
+            && arguments.len() == 1
+        {
+            depth += 1;
+            layer = arguments[0].get_type(self);
+        }
+        if depth > 0 {
+            self.any_option_coercions.insert(value_id, depth);
+        }
+    }
+
+    /// M165: the impl's binders the receiver fills with `any`, read position
+    /// by position (`List<T>` against `List<any>` is `T`). Reconciling the two
+    /// binds nothing for them — `any` absorbs — so the call's substitution
+    /// later binds each to its argument's type instead.
+    fn receiver_binders_at_any(&self, impl_subject: &Type, subject: &Type) -> Vec<TypeId> {
+        let (impl_arguments, subject_arguments) = match (impl_subject, subject) {
+            (
+                Type::Struct(impl_id, impl_arguments),
+                Type::Struct(subject_id, subject_arguments),
+            )
+            | (Type::Enum(impl_id, impl_arguments), Type::Enum(subject_id, subject_arguments))
+                if impl_id == subject_id && impl_arguments.len() == subject_arguments.len() =>
+            {
+                (impl_arguments, subject_arguments)
+            }
+            _ => return Vec::new(),
+        };
+        impl_arguments
+            .iter()
+            .zip(subject_arguments)
+            .filter_map(|(impl_argument, subject_argument)| {
+                match (
+                    impl_argument.get_type(self),
+                    subject_argument.get_type(self),
+                ) {
+                    (Type::Generic(binder), Type::Any) => Some(binder),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// M165: an argument at a DIRECT `any` parameter of `print` or of an
+    /// external function is handed over as it is — `print(maybe)` prints
+    /// `Some(1)`, and `canonical_hash(Some(1))` keys the variant, not `1` — so
+    /// the conversion [`Self::note_any_option_coercion`] recorded there is
+    /// dropped. A generic parameter bound to `any` (`List<any>::push`) keeps it.
+    fn keep_any_option_coercion(&mut self, callee_id: Id, parameter_type: &Type, argument_id: Id) {
+        if matches!(parameter_type, Type::Any)
+            && (Some(callee_id) == self.print_fn_id
+                || self.external_functions.contains_key(&callee_id))
+        {
+            self.any_option_coercions.remove(&argument_id);
+        }
+    }
+
     /// B340 Q1: record an expression at which a `Callable` value coerces to a
     /// closure. This is the ONE place a value's own type and the type its
     /// position wants are both in hand for every landing the language has — an
@@ -48696,6 +48825,15 @@ impl<'src> Analyzer<'src> {
                             .unwrap_or(Type::Function(function_id)),
                         other => other,
                     };
+                    // M165: an element of a literal handed to a `List<any>`
+                    // (`statement.run([maybe, name])`) lands at the `any`
+                    // itself. The expectation is not seeded into the element
+                    // (the note above), so the element was typed undirected and
+                    // nothing inside it recorded the landing; the element is
+                    // the one place to convert, whatever its form.
+                    if matches!(expected_element, Some(Type::Any)) {
+                        self.record_any_option_landing(*item_id, &item_type);
+                    }
                     element_type = match self.reconcile_type(
                         &element_type,
                         &item_type,
@@ -57617,6 +57755,7 @@ impl<'src> Analyzer<'src> {
                         // language's own conversion on JS, which needs to
                         // know it is one. Anything else keeps its type for
                         // S3: an aggregate prints through the printer.
+                        self.keep_any_option_coercion(function_id, &parameter_type, argument_id);
                         if Some(function_id) == self.print_fn_id {
                             if self.is_a_number_type(&argument_type) {
                                 self.number_print_arguments.insert(argument_id);
@@ -58485,6 +58624,11 @@ impl<'src> Analyzer<'src> {
                             &mut bindings,
                         );
                         self.bind_open_context_slot(&impl_subject, &subject_type, &mut bindings);
+                        let any_binders =
+                            self.receiver_binders_at_any(&impl_subject, &subject_type);
+                        if !any_binders.is_empty() {
+                            self.any_bound_receiver_binders.insert(id, any_binders);
+                        }
                         if !bindings.is_empty() {
                             self.method_call_substitution.insert(id, bindings);
                         }
@@ -59562,6 +59706,12 @@ impl<'src> Analyzer<'src> {
             return Resolution::Deferred;
         }
         let slot_type = slot.get_type(self);
+        // M165: `params.push(maybe)` on a `List<any>` lands the value at the
+        // `any` — the slot's own channel, so the call's argument check never
+        // types it against the `any` itself.
+        if matches!(slot_type, Type::Any) {
+            self.record_any_option_landing(argument_id, &argument_type);
+        }
         if !matches!(slot_type, Type::Unknown) {
             if self
                 .reconcile_type(&argument_type, &slot_type, &HashMap::default())
@@ -59769,6 +59919,16 @@ impl<'src> Analyzer<'src> {
             let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
                 return Resolution::Deferred;
+            }
+            // M165: a parameter the receiver binds to `any` (`push` on a
+            // `List<any>`) — see `any_bound_receiver_binders`.
+            if let Some(Type::Generic(binder)) = declared_id.map(|declared| declared.get_type(self))
+                && self
+                    .any_bound_receiver_binders
+                    .get(&call_id)
+                    .is_some_and(|binders| binders.contains(&binder))
+            {
+                self.record_any_option_landing(*argument_id, &argument_type);
             }
             // B353 — an UNANNOTATED closure parameter whose one-shot slot has
             // not been filled yet is `Unknown`, and `Unknown` reconciles with
@@ -76139,6 +76299,12 @@ pub struct Program<'src> {
     /// in the program — the vtable's slot set (§6.2's reachability).
     pub dyn_dispatched_members: HashSet<(Id, &'src str)>,
     pub callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// M165: the expressions an `Option` value lands at an `any` position at,
+    /// with its `Option` depth. The JS emitter unwraps each to its payload or
+    /// `null` (`walk_entity`), which is what the native backend's `Any::from`
+    /// does at the same positions — so a `List<any>` bind list holds the value
+    /// or NULL on both.
+    pub any_option_coercions: HashMap<Id, usize>,
     /// B462: references to a tuple variant standing for a closure, as
     /// `(enum, variant, arity, the closure type)` — eta-expanded at the site.
     pub variant_coercions: HashMap<Id, (Id, usize, usize, TypeId)>,
@@ -91218,6 +91384,7 @@ fn analyze_over_world<'src>(
         tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
+        any_option_coercions: std::mem::take(&mut analyzer.any_option_coercions),
         variant_coercions: std::mem::take(&mut analyzer.variant_coercions),
         dyn_coercions: std::mem::take(&mut analyzer.dyn_coercions),
         dyn_tuple_coercions: std::mem::take(&mut analyzer.dyn_tuple_coercions),

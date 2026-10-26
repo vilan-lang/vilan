@@ -14425,3 +14425,44 @@ fn m166_a_derived_decoder_reads_an_absent_option_field_as_none_on_both_backends(
         );
     }
 }
+
+/// M165: a `List<any>` bind list holds an `Option`'s payload or NULL and a
+/// `bool` as 0 or 1 on both backends — the native backend's `Any::from` and
+/// binder already did; JS handed `node:sqlite` the variant's array ("Unknown
+/// named parameter '0'") and a JS boolean ("cannot be bound"). Every way a
+/// bind list is filled converts: a literal element, a value built in place,
+/// an `if` element, a nested `Option`, `push` onto a `List<any>`. `print` and
+/// `canonical_hash` still take the `Option` as it is, and a vilan function's
+/// `any` parameter receives the payload, as natively.
+#[test]
+fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_bind_conversions.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/db_bind_conversions.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "literal 1 1\n",
+                "none NULL 0\n",
+                "deep NULL 1\n",
+                "built 4 0\n",
+                "branch 1 1\n",
+                "pushed 1 1\n",
+                "first literal\n",
+                "2\n",
+                "Some(1)\n",
+                "1\n",
+                "null\n",
+                "false\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
