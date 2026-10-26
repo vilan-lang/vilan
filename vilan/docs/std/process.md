@@ -83,6 +83,8 @@ impl Server { fun builder(): ServerBuilder }
 impl ServerBuilder {
 	fun port(own self, port: i32): ServerBuilder
 	fun host(own self, address: str): ServerBuilder   // bind one address; default: every interface
+	fun max_body_bytes(own self, limit: usize): ServerBuilder   // the body cap; default 1 MiB
+	fun max_body_bytes_under(own self, mount: str, limit: usize): ServerBuilder   // a mount's cap
 	fun on_request(own self, handler: async |Request| Response): ServerBuilder
 	fun on_upgrade(own self, handler: |NodeRequest, NodeSocket, Bytes| void): ServerBuilder
 	fun on_start(own self, callback: |Server| void): ServerBuilder
@@ -101,8 +103,9 @@ impl Server {
 impl Request {
 	fun path(self): str
 	fun method(self): str
-	fun body(self): str      // the body as text
+	fun body(self): str      // the body as text, read on the first call
 	fun bytes(self): Bytes   // the same body raw (binary POSTs)
+	fun max_body_bytes(own self, limit: usize): Request   // this request's cap (a route's)
 	fun header(self, name: str): Option<str>   // a request header, case-insensitive
 }
 impl Response {
@@ -140,6 +143,71 @@ interface, so anything on the network can reach it (and Windows asks the
 user about the firewall). A server meant for this machine only (a desktop
 app's own, a dev tool, a test) binds the loopback: `.host("127.0.0.1")`, or
 `"::1"` for IPv6. `url()` then names that address.
+
+**Request bodies: capped, and read when the handler asks.** A handler runs
+on the request's head. The body stays on the wire until the handler calls
+`bytes()` or `body()`; the first call reads it whole, and a later one
+answers the same bytes. So a handler that can answer from the head alone —
+a `401` for a request that is not signed in, a refusal off a declared
+`Content-Length`, a quota — never receives an upload it is about to turn
+away.
+
+Every read is capped: **1 MiB** unless the app says otherwise. A body over
+the cap is answered `413 Content Too Large` and its connection closed
+without the rest being read — a declared `Content-Length` over the cap
+before a byte of the body arrives, a chunked body (no declared length) at
+the chunk that crosses it, counted as it arrives. The handler ends at the
+read, the way a cancelled task ends: the request is over, so the code after
+the read does not run and its response is never asked for. A client that
+hangs up halfway through a body ends the handler the same way.
+
+Three places choose the cap, the most specific winning:
+
+- `ServerBuilder::max_body_bytes(n)` — the server's own, for every request;
+- `ServerBuilder::max_body_bytes_under(mount, n)` — every path at or under
+  `mount`, by whole segments (`/api/files` covers `/api/files/upload`, not
+  `/api/filesystem`), the longest mount winning;
+- `Request::max_body_bytes(n)` — one route's, chosen in the handler before
+  it reads (a role or a quota can choose it too).
+
+```vilan,norun
+import std::http::{ Request, Response, Server };
+
+fun upload(request: Request): Response {
+	// Answered from the head: the 20 MB a stranger sends is never read.
+	request.header("Authorization") is Some(let _token)
+		else ret Response::builder().code(401).body("sign in first").build();
+	let file = request.max_body_bytes(25 * 1024 * 1024).bytes();
+	Response::builder().body(i"stored {file.len()} bytes").build()
+}
+
+fun main() {
+	Server::builder()
+		.port(3000)
+		.max_body_bytes_under("/api/import/", 8 * 1024 * 1024)
+		.on_request(|request| {
+			match request.path() {
+				"/api/upload" => upload(request),
+				_ => Response::builder().code(404).body("not found").build(),
+			}
+		})
+		.build()
+		.start();
+}
+```
+
+A mounted rpc service's POST leg reads its frame through the same
+`Request::bytes`, so it is under the cap too — a service mounted at
+`/rpc/` takes a cap of its own with `.max_body_bytes_under("/rpc/", n)`.
+
+A body the handler never read is not left in the way of the connection:
+one within the cap is drained (node discards it and keeps the connection
+alive for the client's next request; the native server, which closes every
+connection, discards it before the close so the client reads its response
+rather than a reset), and one over the cap, or chunked, is not — the
+response says `Connection: close` and the connection is closed. The body is
+read whole into memory when it is read; streaming it as it arrives is not
+here yet.
 
 `Request::header` reads one header off the request, and the conditional
 request built on it ships whole. `etag_of` mints a **strong validator** for
