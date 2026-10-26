@@ -1,0 +1,39 @@
+# The terminal MODE behind `std::process::keys()` on the native backend
+# (tracker A173 S2; proposal/terminal.md §4.2, Q3 RULED 2026-10-16).
+#
+# SEPARATE from `vilan-rt`, for the reason `vilan-rt-sqlite`, `vilan-rt-crypto`
+# and `vilan-rt-signal` are: `vilan-rt` takes no crates.io dependencies and
+# forbids `unsafe` (Order 37's R8), and a terminal's raw mode is reached only
+# through FFI — `tcgetattr`/`tcsetattr` on unix, `GetConsoleMode`/
+# `SetConsoleMode` on Windows — which Rust's std does not expose. So the
+# dependency lives here, and the cargo project `vilan build --backend rust`
+# writes names this crate ONLY when the program reaches `process::keys()`. A
+# program that reads no keys pays nothing.
+#
+# `libc` (unix) and `windows-sys` (Windows), both already in the compiler's own
+# lockfile and so in the third-party notices — for the mode switch alone. NOT
+# crossterm: it brings an event loop and a key decoder this design does not
+# use, and its decoder would be the second decoder terminal.md §4.1 removes
+# (the decoder is std's own vilan, `KeyDecoder`, the same on both backends).
+# This crate's `unsafe` is the FFI calls and the signal handler's static state,
+# each block with its reason.
+[package]
+name = "vilan-rt-term"
+version = "0.52.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The terminal-mode half of the runtime for key-reading programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+vilan-rt = { path = "../vilan-rt" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

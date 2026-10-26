@@ -4,37 +4,71 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-const __vilan_stdin = { buffer: "", ended: false, carriage: false, started: false, waiters: [] };
+function __stdin_line(signal) {
+	return __stdin_wait(signal, false, -1);
+}
+const __vilan_stdin = { buffer: Buffer.alloc(0), ended: false, carriage: false, started: false, waiters: [] };
+function __stdin_start() {
+	const state = __vilan_stdin;
+	if (state.started) return;
+	state.started = true;
+	process.stdin.on("data", (chunk) => {
+		state.buffer = state.buffer.length === 0 ? chunk : Buffer.concat([ state.buffer, chunk ]);
+		__stdin_pump();
+	});
+	const ended = () => {
+		state.ended = true;
+		__stdin_pump();
+	};
+	process.stdin.on("end", ended);
+	process.stdin.on("error", ended);
+}
 function __stdin_pump() {
 	const state = __vilan_stdin;
 	while (state.waiters.length > 0) {
 		if (state.carriage && state.buffer.length > 0) {
-			if (state.buffer[0] === "\n") state.buffer = state.buffer.slice(1);
+			if (state.buffer[0] === 10) state.buffer = state.buffer.subarray(1);
 			state.carriage = false;
 			continue;
 		}
-		const end = state.buffer.search(/[\r\n]/);
-		if (end >= 0) {
-			const line = state.buffer.slice(0, end);
-			state.carriage = state.buffer[end] === "\r";
-			state.buffer = state.buffer.slice(end + 1);
-			state.waiters.shift().resolve([ 0, line ]);
-		} else if (state.ended) {
-			const rest = state.buffer;
-			state.buffer = "";
-			state.waiters.shift().resolve(rest.length > 0 ? [ 0, rest ] : [ 1 ]);
+		const waiter = state.waiters[0];
+		if (waiter.bytes) {
+			if (state.buffer.length > 0) {
+				const chunk = new Uint8Array(state.buffer);
+				state.buffer = Buffer.alloc(0);
+				state.waiters.shift().resolve([ 0, chunk ]);
+				continue;
+			}
+			if (state.ended) {
+				state.waiters.shift().resolve([ 1 ]);
+				continue;
+			}
 		} else {
-			process.stdin.ref?.();
-			process.stdin.resume();
-			return;
+			const end = state.buffer.findIndex((byte) => byte === 10 || byte === 13);
+			if (end >= 0) {
+				const line = state.buffer.toString("utf8", 0, end);
+				state.carriage = state.buffer[end] === 13;
+				state.buffer = state.buffer.subarray(end + 1);
+				state.waiters.shift().resolve([ 0, line ]);
+				continue;
+			}
+			if (state.ended) {
+				const rest = state.buffer;
+				state.buffer = Buffer.alloc(0);
+				state.waiters.shift().resolve(rest.length > 0 ? [ 0, rest.toString("utf8") ] : [ 1 ]);
+				continue;
+			}
 		}
+		process.stdin.ref?.();
+		process.stdin.resume();
+		return;
 	}
 	if (state.started && !state.ended) {
 		process.stdin.pause();
 		process.stdin.unref?.();
 	}
 }
-function __stdin_line(signal) {
+function __stdin_wait(signal, bytes, wait) {
 	const sig = signal && signal[0] === 0 ? signal[1] : undefined;
 	return new Promise((resolve, reject) => {
 		if (sig && sig.aborted) {
@@ -42,32 +76,30 @@ function __stdin_line(signal) {
 			return;
 		}
 		const state = __vilan_stdin;
-		if (!state.started) {
-			state.started = true;
-			process.stdin.setEncoding("utf8");
-			process.stdin.on("data", (chunk) => {
-				state.buffer += chunk;
-				__stdin_pump();
-			});
-			const ended = () => {
-				state.ended = true;
-				__stdin_pump();
-			};
-			process.stdin.on("end", ended);
-			process.stdin.on("error", ended);
-		}
-		const abort = () => {
+		__stdin_start();
+		let timer;
+		const withdraw = () => {
 			const parked = state.waiters.indexOf(waiter);
 			if (parked >= 0) state.waiters.splice(parked, 1);
+			if (sig) sig.removeEventListener("abort", abort);
+			if (timer !== undefined) clearTimeout(timer);
+		};
+		const abort = () => {
+			withdraw();
 			reject(sig.reason);
 			__stdin_pump();
 		};
-		const waiter = { resolve: (line) => {
-			if (sig) sig.removeEventListener("abort", abort);
-			resolve(line);
+		const waiter = { bytes, resolve: (value) => {
+			withdraw();
+			resolve(value);
 		} };
 		state.waiters.push(waiter);
 		if (sig) sig.addEventListener("abort", abort, { once: true });
+		if (wait >= 0) timer = setTimeout(() => {
+			withdraw();
+			resolve([ 0, new Uint8Array(0) ]);
+			__stdin_pump();
+		}, wait);
 		__stdin_pump();
 	});
 }

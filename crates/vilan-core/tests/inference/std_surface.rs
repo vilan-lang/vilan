@@ -8193,3 +8193,125 @@ fn e332_io_write_is_refused_on_the_browser_leg_naming_the_chain() {
         "main → write (std::io::stdout)",
     );
 }
+
+// --- A173 S2: `process::keys()`, `Key`, `Press`, the std `KeyDecoder` -------
+
+#[test]
+fn a173_s2_keys_over_an_empty_stdin_end_at_once() {
+    // No input at all is the end of the stream: `next` and `next_press` are
+    // `None` from the first call, and stay `None`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process::keys;
+        fun main() {
+            let keys = keys();
+            print(keys.next().is_none());
+            print(keys.next_press().is_none());
+            print(keys.next().is_none());
+        }
+        "#,
+        "true\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn a173_s2_the_flat_key_and_the_press_are_two_views_of_one_decode() {
+    // `next_press` normalizes (`Char("c")` + ctrl, `Right` + ctrl, `Tab` +
+    // shift); `Press::key` flattens it the way `Keys::next` does (`Ctrl("c")`,
+    // `Right`, `BackTab`). The flat enum matches with or-patterns (a leg's
+    // comma-separated patterns) over literal payloads — the shape a key loop
+    // is written in.
+    assert_compiles_and_runs(
+        r#"
+        import std::bytes::Bytes;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::process::{ Key, KeyDecoder };
+        fun verdict(key: Key): str {
+            match key {
+                Key::Char("q"), Key::Ctrl("c") => "quit",
+                Key::Right, Key::Left => "move",
+                Key::BackTab => "back",
+                Key::F(let number) => i"f{number}",
+                _ => "other",
+            }
+        }
+        fun main() {
+            let codes = [3, 27, 91, 49, 59, 53, 67, 27, 91, 90, 27, 79, 81, 120];
+            let bytes = Bytes::alloc(codes.len());
+            mut index = 0;
+            for code in codes {
+                bytes.set(index, code);
+                index += 1;
+            }
+            mut decoder = KeyDecoder::new();
+            decoder.feed(bytes);
+            decoder.finish();
+            for {
+                match decoder.next() {
+                    Some(let press) => print(i"{verdict(press.key())} ctrl={press.ctrl} shift={press.shift}"),
+                    None => jump break,
+                }
+            }
+        }
+        "#,
+        "quit ctrl=true shift=false\nmove ctrl=true shift=false\nback ctrl=false shift=true\nf2 ctrl=false shift=false\nother ctrl=false shift=false\n",
+    );
+}
+
+#[test]
+fn a173_s2_a_lone_escape_waits_on_a_pipe_and_resolves_at_the_end() {
+    // The pipe rule (terminal.md §4.3): no timeout, so a lone ESC is not yet
+    // a key — `next` is `None` with the byte pending — until the byte after
+    // it decides (`x`: Alt-x) or the end does (`Escape`). An EMPTY chunk is
+    // a terminal's silence (the timeout's verdict) and resolves it at once.
+    assert_compiles_and_runs(
+        r#"
+        import std::bytes::Bytes;
+        import std::debug::Debug;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::process::KeyDecoder;
+        fun byte(code: i32): Bytes {
+            let one = Bytes::alloc(1);
+            one.set(0, code);
+            one
+        }
+        fun main() {
+            mut decoder = KeyDecoder::new();
+            decoder.feed(byte(27));
+            print(decoder.next().is_none());
+            decoder.feed(byte(120));
+            print(decoder.next().unwrap().key().debug());
+            decoder.feed(byte(27));
+            print(decoder.next().is_none());
+            decoder.feed(Bytes::alloc(0));
+            print(decoder.next().unwrap().key().debug());
+            decoder.feed(byte(27));
+            decoder.finish();
+            print(decoder.next().unwrap().key().debug());
+            print(decoder.next().is_none());
+        }
+        "#,
+        "true\nKey::Alt(\"x\")\ntrue\nKey::Escape\nKey::Escape\ntrue\n",
+    );
+}
+
+#[test]
+fn a173_s2_the_keys_handle_is_a_resource() {
+    // `Keys` owns terminal state: like every resource it moves rather than
+    // copies, and a closure cannot capture one (destruction.md R9) — a key
+    // handler is the pull loop, never a callback holding the handle.
+    assert_fails_with(
+        r#"
+        import std::process::keys;
+        fun main() {
+            let keys = keys();
+            let read = || keys.next();
+            read();
+        }
+        "#,
+        "a closure cannot capture the resource `keys`",
+    );
+}

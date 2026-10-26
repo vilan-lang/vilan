@@ -25,9 +25,10 @@
 //! `Serialize`/`Deserialize` take `&mut self` and `Wire::describe`/`rebuild`
 //! take `&mut S`/`&mut D`, so the visitors' state lives in plain fields.
 //!
-//! The ONE F residue left is recorded in `FRAME_SCOPED_BLOCKED` with its
-//! reason. It is not an oversight: it is the language telling the code what
-//! shape it may have.
+//! The F residues left are recorded in `FRAME_SCOPED_BLOCKED` with their
+//! reason — one reason, twice: an awaiting `next` on a resource (`fs::Reader`,
+//! and since A173 S2 `process::Keys`). It is not an oversight: it is the
+//! language telling the code what shape it may have.
 
 use std::path::{Path, PathBuf};
 
@@ -57,6 +58,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "memo.vl",
         1,
         "E: the memo cache outlives every maker's scope",
+    ),
+    (
+        "process.vl",
+        1,
+        "F (blocked: `Keys::next` awaits, so no `&mut self` — A173 S2's \
+         decoder state, `Reader`'s cursor's shape)",
     ),
     (
         "process/web/ui.vl",
@@ -259,15 +266,25 @@ const VISITOR_STATE_UNBOXED: &[(&str, &str)] = &[
 ///
 /// It is ONE file now. `json.vl`'s six and `binary.vl`'s four left with A108;
 /// this one cannot follow them, and the reason is not the receiver.
-const FRAME_SCOPED_BLOCKED: &[(&str, usize, &str)] = &[(
-    "fs.vl",
-    1,
-    "`Reader.cursor` is FORCED rather than chosen, and the type's own \
-     doc-comment says so: `Reader::next` awaits the read, and a `&mut` view \
-     may not be held across a suspension (spec §6.3), so a plain field behind \
-     `&mut self` is not a shape this method may have — which is exactly why \
-     A108's receiver change reached the other ten and not this one.",
-)];
+const FRAME_SCOPED_BLOCKED: &[(&str, usize, &str)] = &[
+    (
+        "fs.vl",
+        1,
+        "`Reader.cursor` is FORCED rather than chosen, and the type's own \
+         doc-comment says so: `Reader::next` awaits the read, and a `&mut` view \
+         may not be held across a suspension (spec §6.3), so a plain field behind \
+         `&mut self` is not a shape this method may have — which is exactly why \
+         A108's receiver change reached the other ten and not this one.",
+    ),
+    (
+        "process.vl",
+        1,
+        "`Keys.decoder` (A173 S2) is `Reader.cursor` again: `Keys::next` awaits \
+         the next bytes, so the decoder's state cannot be a plain field behind \
+         `&mut self` (spec §6.3) — and the decoder itself, `KeyDecoder`, takes \
+         `&mut self` everywhere, so the cell is the ONE place the shape is forced.",
+    ),
+];
 
 fn std_source_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src")
@@ -332,7 +349,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 239,
+        total, 240,
         "the total number of `Shared` construction sites in std changed"
     );
 

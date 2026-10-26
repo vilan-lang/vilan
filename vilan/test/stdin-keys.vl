@@ -1,0 +1,33 @@
+// `std::process::keys()` over a PIPE (A173 S2; proposal/terminal.md §4.3,
+// §4.4 step 2): every run of this program reads `stdin-keys.stdin`, so the JS
+// and native builds decode the SAME bytes, and the native differential holds
+// them to the same keys, byte for byte. On a pipe no terminal mode is touched
+// and the grammar decodes with no timeout: a lone ESC is `Escape` when the
+// next byte cannot continue a sequence, or at the end; `None` ends the loop.
+// The fixture: letters, crlf, the arrows (CSI and SS3), ctrl+Right, Home and
+// End in their spellings, F1, F5, F12, Alt-x, Ctrl-C, both Backspaces, Tab,
+// Shift+Tab, UTF-8 of three widths, a bracketed paste holding an ESC and a
+// newline, an unknown sequence (dropped), `?`, lf, ESC ESC `q` (an Escape,
+// then Alt-q: the second ESC prefixes the `q`), and a lone ESC at the end.
+
+import std::debug::Debug;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::{ Key, keys };
+
+fun main() {
+	let keys = keys();
+	mut count = 0;
+	for {
+		match keys.next_press() {
+			Some(let press) => {
+				count += 1;
+				print(i"{count}: {press.key().debug()} | {press.debug()}");
+			}
+			None => jump break,
+		}
+	}
+	print(i"keys: {count}");
+	// Past the end the stream stays ended.
+	print(i"next past the end is None: {keys.next().is_none()}");
+}

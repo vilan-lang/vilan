@@ -1,0 +1,123 @@
+// `std::process`'s key decoder (A173 S2; proposal/terminal.md §4.1, §4.4 step
+// 1): bytes fed to `KeyDecoder` directly, row by row — the escape table (the
+// arrows, Home/End in both spellings, the `~` keys, F1–F12, the xterm modifier
+// parameter, Alt, the C0 controls, UTF-8 of every width), the paste brackets,
+// the malformed and cut-short sequences that are DROPPED rather than typed,
+// and the chunk splits the pipe rule decides by the bytes alone. Both backends
+// run this one decoder; the native differential holds them to these bytes.
+
+import std::bytes::Bytes;
+import std::debug::Debug;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::process::{ KeyDecoder, Press };
+
+/// The byte string spelled by `codes`, decimal byte values separated by spaces
+/// (`"27 91 65"` is ESC [ A; `""` is the empty chunk, a terminal's silence).
+fun bytes(codes: str): Bytes {
+	if codes.is_empty() {
+		ret Bytes::alloc(0);
+	}
+	let values = codes.split(" ");
+	let out = Bytes::alloc(values.len());
+	mut index = 0;
+	for value in values {
+		out.set(index, value.parse_i32().unwrap());
+		index += 1;
+	}
+	out
+}
+
+/// One key as the table prints it: the flat key `next` answers, then the
+/// modifier set `next_press` carries.
+fun describe(press: Press): str {
+	mut text = press.key().debug();
+	if press.ctrl {
+		text = text + " +ctrl";
+	}
+	if press.alt {
+		text = text + " +alt";
+	}
+	if press.shift {
+		text = text + " +shift";
+	}
+	text
+}
+
+/// Prints every key the decoder has complete, tagged with the chunk it
+/// completed in.
+fun drain(decoder: &mut KeyDecoder, chunk: str) {
+	for {
+		match decoder.next() {
+			Some(let press) => print(i"  {chunk}: {describe(press)}"),
+			None => jump break,
+		}
+	}
+}
+
+/// Feeds `chunks` one at a time, draining after each, then finishes.
+fun decode(label: str, chunks: List<str>) {
+	print(label);
+	mut decoder = KeyDecoder::new();
+	mut index = 0;
+	for chunk in chunks {
+		index += 1;
+		decoder.feed(bytes(chunk));
+		drain(&mut decoder, i"chunk {index}");
+	}
+	decoder.finish();
+	drain(&mut decoder, "end");
+}
+
+fun main() {
+	decode("arrows CSI", ["27 91 65 27 91 66 27 91 67 27 91 68"]);
+	decode("arrows SS3", ["27 79 65 27 79 66 27 79 67 27 79 68"]);
+	decode("home: CSI H, SS3 H, 1~, 7~", ["27 91 72 27 79 72 27 91 49 126 27 91 55 126"]);
+	decode("end: CSI F, SS3 F, 4~, 8~", ["27 91 70 27 79 70 27 91 52 126 27 91 56 126"]);
+	decode("insert delete pageup pagedown", [
+		"27 91 50 126 27 91 51 126 27 91 53 126 27 91 54 126",
+	]);
+	decode("F1-F4 SS3", ["27 79 80 27 79 81 27 79 82 27 79 83"]);
+	decode("F1-F5 CSI ~", [
+		"27 91 49 49 126 27 91 49 50 126 27 91 49 51 126 27 91 49 52 126 27 91 49 53 126",
+	]);
+	decode("F6-F12 CSI ~", [
+		"27 91 49 55 126 27 91 49 56 126 27 91 49 57 126 27 91 50 48 126 27 91 50 49 126 27 91 50 51 126 27 91 50 52 126",
+	]);
+	decode("modified: ctrl+Right shift+Up alt+Left ctrl+Delete shift+F1", [
+		"27 91 49 59 53 67 27 91 49 59 50 65 27 91 49 59 51 68 27 91 51 59 53 126 27 91 49 59 50 80",
+	]);
+	decode("Enter: cr", ["13"]);
+	decode("Enter: lf", ["10"]);
+	decode("Enter: crlf is one", ["13 10"]);
+	decode("Enter: cr cr is two", ["13 13"]);
+	decode("Enter: lf cr is two", ["10 13"]);
+	decode("Enter: lf lf is two", ["10 10"]);
+	decode("Backspace 0x7f and 0x08, Tab, BackTab", ["127 8 9 27 91 90"]);
+	decode("Ctrl: c d z, NUL, 0x1c", ["3 4 26 0 28"]);
+	decode("Alt: x, X, Backspace, Ctrl-c, e-acute", ["27 120 27 88 27 127 27 3 27 195 169"]);
+	decode("UTF-8: 2, 3 and 4 bytes", ["195 169 226 156 147 240 159 152 128"]);
+	decode("printable ASCII", ["32 126 48 57 65 122"]);
+	decode("lone ESC at the end", ["27"]);
+	decode("ESC ESC", ["27 27"]);
+	decode("ESC [ at the end is Alt-[", ["27 91"]);
+	decode("ESC O at the end is Alt-O", ["27 79"]);
+	decode("paste with ESC and line endings inside", [
+		"27 91 50 48 48 126 97 27 91 66 98 13 10 99 27 91 50 48 49 126 122",
+	]);
+	decode("paste never closed", ["27 91 50 48 48 126 97 98 99"]);
+	decode("dropped: unknown final, private marker, unknown SS3, stray paste end", [
+		"27 91 49 59 57 88 27 91 63 50 53 104 27 79 120 27 91 50 48 49 126 107",
+	]);
+	decode("dropped: CSI cut by a control byte", ["27 91 49 7"]);
+	decode("dropped: CSI cut by the end", ["27 91 49 50"]);
+	decode("dropped: stray continuation, cut scalar, 0xff", ["128 195 40 255 106"]);
+	decode("dropped: scalar cut by the end", ["226 156"]);
+	decode("ESC | [ | A: one Up, nothing early (no timeout on a pipe)", ["27", "91", "65"]);
+	decode("ESC | x: Alt-x, the bytes decide", ["27", "120"]);
+	decode("cr | lf: one Enter, at the cr", ["13", "10"]);
+	decode("4-byte scalar one byte at a time", ["240", "159", "152", "128"]);
+	decode("paste with its end split", ["27 91 50 48 48 126 97 98", "27 91 50 48", "49 126"]);
+	decode("ESC, then silence, then [A: the timeout resolves Escape", ["27", "", "91 65"]);
+	decode("ESC [ 1 ; 5 split mid-parameters", ["27 91 49", "59 53", "67"]);
+}

@@ -561,3 +561,59 @@ class = "ci"
 ratio = 1.004
 reason = "std-55b: `std::io` re-exports `write` from the new `@process` module `std::io::stdout`, one more module every program that loads `std::io` loads; measured x1.0019 (callgrind, VILAN_STD at the commit's std over the base's)"
 item = "E332"
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.016
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0133 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.016
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0133 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.016
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0138 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.016
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0138 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.014
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0112 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.014
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0112 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.011
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0085 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.011
+reason = "std-55b: `std::process` gains the key stream (`Keys`, `Key`, `Press`, the std `KeyDecoder`), analyzed by every program that loads `std::process`; measured x1.0085 (callgrind, VILAN_STD at the commit's std over the base's)"
+item = "A173"

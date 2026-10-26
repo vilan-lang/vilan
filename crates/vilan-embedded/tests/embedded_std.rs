@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use vilan_embedded::{
     CONTENT_HASH, FILES, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES, RT_MANIFEST,
-    RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, materialize_into,
+    RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, RT_TERM_MANIFEST, materialize_into,
 };
 
 mod scratch;
@@ -180,6 +180,8 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
         ("vilan-rt-sqlite", RT_SQLITE_MANIFEST, "rusqlite"),
         ("vilan-rt-crypto", RT_CRYPTO_MANIFEST, "getrandom"),
         ("vilan-rt-signal", RT_SIGNAL_MANIFEST, "ctrlc"),
+        // A173 S2: a PLATFORM dependency block is kept like the plain one.
+        ("vilan-rt-term", RT_TERM_MANIFEST, "libc"),
     ];
     for (directory, manifest, dependency) in optional {
         let mut on_disk = Vec::new();
@@ -201,6 +203,14 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
         assert!(manifest.contains(dependency), "{manifest}");
         assert!(!manifest.contains("workspace = true"), "{manifest}");
         assert!(manifest.contains("[workspace]"), "{manifest}");
+    }
+    // A173 S2: both of `vilan-rt-term`'s platform blocks survive, each under
+    // its own `cfg` — a dropped one is a crate that builds on one OS only.
+    for block in [
+        "[target.'cfg(unix)'.dependencies]\nlibc",
+        "[target.'cfg(windows)'.dependencies]\nwindows-sys",
+    ] {
+        assert!(RT_TERM_MANIFEST.contains(block), "{RT_TERM_MANIFEST}");
     }
 
     let cache_root = scratch::root().join(format!(
