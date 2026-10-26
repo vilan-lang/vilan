@@ -40,6 +40,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**E334: the E126 view exhibit's generator wrote a method std no longer has — `combine((self.title, self.count)).map(..)` on a `Combine<(str, i32)>` — so the exhibit the diagnostics gates measure did not type-check (the gate `the_view_exhibit_tracks_the_recorded_application_shape` asserted that it must analyze clean, and was `#[ignore]`d red); it now spells the stage as std does, `.derive(..).cell()`, and analyzes clean.** The shape gate stays `#[ignore]`d, its reason stamped E334: with the exhibit analyzing, its census (257,606 entities, 27,870 method-call substitutions, 575 implementations) sits at 2.59x the 2026-09-04 recording's entities (99,522; 18,745; 433), outside the 2x band, and today's kolt reads 634,908 / 35,988 / 1,224 — so re-recording moves the band the other way, and the subject's size is the owner's call. Tracker E334.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->
