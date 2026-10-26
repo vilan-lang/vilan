@@ -704,34 +704,46 @@ impl<'src> Analyzer<'src> {
         // the WHOLE variant line (E328), `Option<i32>::Some(i32)` - the
         // instantiation, the variant, and the declared payload under the
         // instantiation's arguments, as a pattern's label spells it.
+        let label_from = |enum_id: Id,
+                          arguments: &[TypeId],
+                          variant_index: usize,
+                          ground: bool|
+         -> Option<String> {
+            if arguments.is_empty() {
+                return None;
+            }
+            if ground
+                && !arguments
+                    .iter()
+                    .all(|argument| self.type_is_ground(*argument))
+            {
+                return None;
+            }
+            let enum_ = self.enums.get(&enum_id)?;
+            let variant = enum_.variants.get(variant_index)?;
+            let head = self.pretty_print_type(&Type::Enum(enum_id, arguments.to_vec()), &empty);
+            let mut label = format!("{head}::{}", variant.name);
+            if !variant.data_type_ids.is_empty() {
+                let substitution =
+                    applied_substitution(&enum_.generic_parameter_constraint_ids, arguments);
+                let payload: Vec<String> = variant
+                    .data_type_ids
+                    .iter()
+                    .map(|payload| self.pretty_print_type(payload.borrow_type(self), &substitution))
+                    .collect();
+                label.push_str(&format!("({})", payload.join(", ")));
+            }
+            (!label.contains("Unknown") && !label.contains('?')).then_some(label)
+        };
         let label_of =
             |type_id: TypeId, enum_id: Id, variant_index: usize, ground: bool| -> Option<String> {
                 let Type::Enum(found, arguments) = type_id.borrow_type(self) else {
                     return None;
                 };
-                if *found != enum_id || arguments.is_empty() {
+                if *found != enum_id {
                     return None;
                 }
-                if ground && !self.type_is_ground(type_id) {
-                    return None;
-                }
-                let enum_ = self.enums.get(&enum_id)?;
-                let variant = enum_.variants.get(variant_index)?;
-                let head = self.pretty_print_type(type_id.borrow_type(self), &empty);
-                let mut label = format!("{head}::{}", variant.name);
-                if !variant.data_type_ids.is_empty() {
-                    let substitution =
-                        applied_substitution(&enum_.generic_parameter_constraint_ids, arguments);
-                    let payload: Vec<String> = variant
-                        .data_type_ids
-                        .iter()
-                        .map(|payload| {
-                            self.pretty_print_type(payload.borrow_type(self), &substitution)
-                        })
-                        .collect();
-                    label.push_str(&format!("({})", payload.join(", ")));
-                }
-                (!label.contains("Unknown") && !label.contains('?')).then_some(label)
+                label_from(enum_id, arguments, variant_index, ground)
             };
         // What a bare variant reference or a variant constructor CALL stands
         // for: the id the label is keyed by (the reference) and the id the
@@ -748,6 +760,8 @@ impl<'src> Analyzer<'src> {
             }
         }
         let mut by_parameter: HashMap<Id, TypeId> = HashMap::default();
+        // E333: the enum instantiation a method call's receiver stands for.
+        let mut by_receiver: HashMap<Id, (Id, Vec<TypeId>)> = HashMap::default();
         // The variant constructor calls: (callee, its enum, the call).
         let mut variant_calls: Vec<(Id, (Id, usize), Id)> = Vec::new();
         // The cheap, cache-hot test first: most of the world is std's.
@@ -771,10 +785,87 @@ impl<'src> Analyzer<'src> {
             if function.parameters.len() != call.argument_ids.len() {
                 continue;
             }
+            // E333: a RECEIVER (`Some(4).unwrap_or(0)`) is the call's first
+            // argument against a `self` parameter that is an instantiation
+            // of an enum under the call's substitution - the receiver's own
+            // instantiation, which no other fact of its position holds.
+            if let (Some(receiver), Some(self_parameter)) = (
+                call.argument_ids.first(),
+                function
+                    .parameters
+                    .first()
+                    .and_then(|parameter_id| self.parameters.get(parameter_id)),
+            ) && self_parameter.name == "self"
+                && let Type::Enum(enum_id, arguments) = self_parameter.type_id.borrow_type(self)
+            {
+                let substitution = self.method_call_substitution.get(&call.id);
+                let resolved: Vec<TypeId> = arguments
+                    .iter()
+                    .map(|argument| match argument.borrow_type(self) {
+                        Type::Generic(constraint_id) => substitution
+                            .and_then(|substitution| substitution.get(constraint_id))
+                            .copied()
+                            .unwrap_or(*argument),
+                        _ => *argument,
+                    })
+                    .collect();
+                by_receiver.insert(*receiver, (*enum_id, resolved));
+            }
             for (argument_id, parameter_id) in call.argument_ids.iter().zip(&function.parameters) {
                 if let Some(parameter) = self.parameters.get(parameter_id) {
                     by_parameter.insert(*argument_id, parameter.type_id);
                 }
+            }
+        }
+        // E333: each element of a list or tuple literal, with the type its
+        // container's type gives it. The container is typed by whatever fact
+        // its own position holds (its recorded type, the type it is expected
+        // at, the binding it initializes, the parameter it is passed to), and
+        // a container inside a container by the outer one's element.
+        let mut by_container: HashMap<Id, TypeId> = HashMap::default();
+        let mut containers: Vec<(Id, &Vec<Id>)> = Vec::new();
+        for (container_id, expr) in
+            super::live_ranges::LiveEntries::over(&self.expr_id_to_expr_map, live)
+        {
+            if let Expr::List(elements) | Expr::Tuple(elements) = expr
+                && in_scope(*container_id)
+            {
+                containers.push((*container_id, elements));
+            }
+        }
+        for _ in 0..3 {
+            let before = by_container.len();
+            for (container_id, elements) in &containers {
+                let Some(container) = self
+                    .type_id_of_expr(*container_id)
+                    .or_else(|| self.expected_types.get(container_id).copied())
+                    .or_else(|| by_binding.get(container_id).copied())
+                    .or_else(|| by_parameter.get(container_id).copied())
+                    .or_else(|| by_container.get(container_id).copied())
+                else {
+                    continue;
+                };
+                match container.borrow_type(self) {
+                    Type::Struct(_, arguments) if arguments.len() == 1 => {
+                        for element in *elements {
+                            by_container.insert(*element, arguments[0]);
+                        }
+                    }
+                    Type::Array(element_type, _) => {
+                        for element in *elements {
+                            by_container.insert(*element, *element_type);
+                        }
+                    }
+                    Type::Tuple(items, _) if items.len() == elements.len() => {
+                        for (element, item) in elements.iter().zip(items) {
+                            by_container.insert(*element, *item);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if by_container.len() == before {
+                break;
             }
         }
         let mut labels: HashMap<Id, String> = HashMap::default();
@@ -795,6 +886,24 @@ impl<'src> Analyzer<'src> {
                     by_parameter
                         .get(&position)
                         .and_then(|declared| label_of(*declared, enum_id, variant_index, true))
+                })
+                .or_else(|| {
+                    // E333: a list's or tuple's element reads the element
+                    // type of its container's type...
+                    by_container
+                        .get(&position)
+                        .and_then(|element| label_of(*element, enum_id, variant_index, true))
+                })
+                .or_else(|| {
+                    // ...and a method call's receiver the instantiation of
+                    // the `self` parameter it meets under the call's
+                    // substitution.
+                    by_receiver
+                        .get(&position)
+                        .filter(|(receiver_enum, _)| *receiver_enum == enum_id)
+                        .and_then(|(_, arguments)| {
+                            label_from(enum_id, arguments, variant_index, true)
+                        })
                 });
             if let Some(label) = label {
                 labels.insert(reference, label);
@@ -812,7 +921,12 @@ impl<'src> Analyzer<'src> {
                 consider(*id, variant, *id);
             }
         }
-        for id in by_binding.keys().chain(by_parameter.keys()) {
+        for id in by_binding
+            .keys()
+            .chain(by_parameter.keys())
+            .chain(by_container.keys())
+            .chain(by_receiver.keys())
+        {
             if let Some(variant) = variant_enum(*id) {
                 consider(*id, variant, *id);
             }

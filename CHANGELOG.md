@@ -35,6 +35,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**E333: a generic enum's variant as a LIST or TUPLE element, or as a method call's receiver, hovers with its instantiation and payload — `Some` in `[Some(1), None]`, `Ok` in `(Ok(3.5), None)` annotated `(Result<f64, bool>, Option<i32>)`, `Some(4)` in `Some(4).unwrap_or(0)` read `Option::Some`, bare, where the same variant in a return, a binding or an argument has read `Option<i32>::Some(i32)` since E317/E328.** `variant_use_labels` settled a variant's instantiation from the return slot, an annotation, the initialized binding and a plain call's declared parameter, and an element of a container or a receiver has none of those facts at its own position. It now reads an element's type from its container's (the list's or tuple's own recorded type, else the type its position expects, else the binding it initializes or the parameter it is passed to, a container inside a container by the outer one's element), and a receiver's from the member call's `self` parameter under the call's substitution (`Some(4).unwrap_or(0)`, `None.unwrap_or(7)`, `Ok(5).unwrap_or_else(|text: str| 0)`). A receiver whose method leaves one of the enum's parameters unbound (`Ok(5).map_err(..)` binds `F` and `E`, not `T`) and a list of un-annotated `Ok`/`Err` (whose element type the analysis records as a bare `Result`) still say nothing, as a label with a hole always has: that is the analysis's, not the hover's. Editor-only: empty without the reading aids. Pin: `e333_a_variant_in_a_container_or_as_a_receiver_hovers_with_its_instantiation` (`Some`, `None`, `Ok`, `Err` in a list, a tuple and as a receiver; red before). Tracker E333.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->
