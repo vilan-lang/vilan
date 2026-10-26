@@ -105,6 +105,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B659: an unsuffixed integer literal at a generic that only a closure argument's RESULT fixes waits for that closure — `opt.map_or(|it| it.depth, 0)` with `depth: usize` infers `U = usize` (it reported "Expected i32, but got usize … convert with `.as_i32()`" inside the closure, advice that pointed away from the fix), on the method path and the free one (`pick(0, || held.depth)`, the literal standing first); and a closure (or unannotated function) whose `ret` returns a `usize` and whose tail is a bare literal returns `usize` ("this `ret` returns usize, but the closure's body yields i32" before).** The literal took `i32` while the call's other arguments were still unread: `bind_callee_own_generics` skips such a literal in its first phase and reads it LAST in its second (`literals_awaiting_a_closure_result`: a generic in the closure parameter's result and not in its parameters — `fold`'s accumulator stays the literal's to fix, B589), and the free call's positional loop orders it the same way; the return-evidence fold (`unify_return_evidence`) reads the first non-literal numeric `ret` as the literal tail's expectation. A `ret` of another kind still disagrees at the `ret`. Cost: both checks are skipped by a call with fewer than two arguments or no closure argument; on kolt's warm package check the two paths measured ~0.08 % of 29.9 G instructions (callgrind, function by function against the B646 commit). Pins: `generics::b659_a_literal_waits_for_the_closures_result`, `b659_a_literal_tail_takes_the_rets_numeric_type`, and `native_differential::solver55_inference_shapes_answer_the_same_on_both_backends`. Tracker B659.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->

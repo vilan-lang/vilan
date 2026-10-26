@@ -10958,3 +10958,71 @@ fn b552_a_block_closures_local_built_from_its_parameter_types_the_callers_generi
         "5\n",
     );
 }
+
+// --- B659: an unsuffixed literal waits for a closure's result ----------------
+
+/// B659: `opt.map_or(|it| it.depth, 0)` with `depth: usize` infers `U = usize`
+/// — the literal defaulted to `i32` first and pinned `U`, and the closure was
+/// refused ("Expected i32, but got usize … convert with `.as_i32()`", which
+/// pointed away from the fix). The literal is a number until something says
+/// which: here, the closure's result. One pin per shape: the item's, a `Some`
+/// receiver, and the literal standing BEFORE the closure (a free generic
+/// function).
+#[test]
+fn b659_a_literal_waits_for_the_closures_result() {
+    assert_compiles_and_runs(
+        concat!(
+            "struct Item { depth: usize }\n",
+            "fun pick<U>(fallback: U, read: || U): U { read() }\n",
+            "fun main() {\n",
+            "\tlet item: Option<Item> = None;\n",
+            "\tlet depth = item.map_or(|it| it.depth, 0);\n",
+            "\tlet other: usize = depth;\n",
+            "\tlet some: Option<Item> = Some(Item { depth = 4 });\n",
+            "\tlet four = some.map_or(|it| it.depth, 0);\n",
+            "\tlet four_usize: usize = four;\n",
+            "\tlet held = Item { depth = 7 };\n",
+            "\tlet seven = pick(0, || held.depth);\n",
+            "\tlet seven_usize: usize = seven;\n",
+            "\tprint(i\"{other} {four_usize} {seven_usize}\");\n",
+            "}\n",
+        ),
+        "0 4 7\n",
+    );
+}
+
+/// B659's second shape: a closure whose `ret` returns a `usize` and whose
+/// tail is a bare literal — the tail is read first and took `i32` before the
+/// `ret` was unified ("this `ret` returns usize, but the closure's body
+/// yields i32"). An unannotated FUNCTION reads its evidence the same way.
+#[test]
+fn b659_a_literal_tail_takes_the_rets_numeric_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun first_even(values: List<usize>) {\n",
+            "\tfor value in values {\n",
+            "\t\tif value % 2 == 0 { ret value; }\n",
+            "\t}\n",
+            "\t0\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet values: List<usize> = [3, 8, 5];\n",
+            "\tlet find = || {\n",
+            "\t\tfor value in values {\n",
+            "\t\t\tif value > 4 { ret value; }\n",
+            "\t\t}\n",
+            "\t\t0\n",
+            "\t};\n",
+            "\tlet found: usize = find();\n",
+            "\tlet even: usize = first_even(values);\n",
+            "\tprint(i\"{found} {even}\");\n",
+            "}\n",
+        ),
+        "8 8\n",
+    );
+    // A `ret` of another kind still disagrees with the literal, at the `ret`.
+    assert_fails_with(
+        "fun main() {\n\tlet pick = |flag: bool| {\n\t\tif flag { ret \"yes\"; }\n\t\t0\n\t};\n\tprint(pick(true));\n}\n",
+        "this `ret` returns str, but the closure's body yields i32",
+    );
+}

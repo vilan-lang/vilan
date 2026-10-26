@@ -46712,21 +46712,50 @@ impl<'src> Analyzer<'src> {
         // for it; every other call walks its arguments in place, allocating
         // nothing.
         let mut order: Vec<usize> = Vec::new();
-        let mut first_literal = argument_ids.len();
         if literal_last {
             order.extend(0..argument_ids.len());
             order.sort_by_key(|index| self.is_unsuffixed_numeric(argument_ids[*index]));
-            first_literal = order
-                .iter()
-                .position(|index| self.is_unsuffixed_numeric(argument_ids[*index]))
-                .unwrap_or(order.len());
         }
         let mut closures_read = !literal_last;
-        let schedule = (0..argument_ids.len()).map(|step| match literal_last {
-            true => order[step],
-            false => step,
-        });
-        for (step, index) in schedule.enumerate() {
+        // B659: an unsuffixed literal at a generic only a closure argument's
+        // RESULT fixes (`map_or(|it| it.depth, 0)`, `U` from the closure)
+        // waits for that closure — typed first it took `i32` and bound `U`,
+        // and the closure was refused against `|Item| i32`. Skipped in the
+        // first phase, read LAST in the second, and not at all while a closure
+        // has not typed (the call then defers with the generic open).
+        let deferred_literals = self.literals_awaiting_a_closure_result(
+            &parameter_ids,
+            argument_ids,
+            self_parameter_offset,
+            &bindable,
+            substitution,
+        );
+        let deferred_tail: &[usize] = match skip_closures {
+            true => &[],
+            false => &deferred_literals,
+        };
+        // An iterator, not a collected list: this runs once per call per
+        // attempt (M30 counted 856,908 on kolt), and almost every call has
+        // nothing deferred.
+        let schedule = || {
+            (0..argument_ids.len())
+                .map(|step| match literal_last {
+                    true => order[step],
+                    false => step,
+                })
+                .filter(|index| !deferred_literals.contains(index))
+                .chain(deferred_tail.iter().copied())
+        };
+        let first_literal = match literal_last {
+            true => schedule()
+                .position(|index| self.is_unsuffixed_numeric(argument_ids[index]))
+                .unwrap_or(argument_ids.len()),
+            false => argument_ids.len(),
+        };
+        for (step, index) in schedule().enumerate() {
+            if deferred_literals.contains(&index) && unresolved_closure_argument {
+                break;
+            }
             if !closures_read && step == first_literal {
                 closures_read = true;
                 self.derive_generics_from_bounds(&bindable, &bindable, substitution);
@@ -46843,6 +46872,87 @@ impl<'src> Analyzer<'src> {
         // substitution keys on.
         self.derive_generics_from_bounds(&bindable, &bindable, substitution);
         unresolved_closure_argument
+    }
+
+    /// B659: the argument positions holding an unsuffixed numeric literal whose
+    /// parameter mentions a generic that a CLOSURE argument fixes through its
+    /// result alone — `map_or<U>(self, f: |T| U, default: U)`'s `default`. A
+    /// generic the closure's PARAMETERS also carry (`fold`'s accumulator) is
+    /// the literal's to fix, since the closure cannot type without it (B589).
+    fn literals_awaiting_a_closure_result(
+        &self,
+        parameter_ids: &[Id],
+        argument_ids: &[Id],
+        self_parameter_offset: usize,
+        bindable: &[TypeId],
+        substitution: &SubstitutionContext,
+    ) -> Vec<usize> {
+        // The common call has no closure argument, or no literal one: answer
+        // without reading a parameter type. (A closure and a literal are two
+        // arguments.)
+        if argument_ids.len() < 2 {
+            return Vec::new();
+        }
+        let has_closure = argument_ids.iter().any(|argument_id| {
+            matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            )
+        });
+        if !has_closure
+            || !argument_ids
+                .iter()
+                .any(|argument_id| self.is_unsuffixed_numeric(*argument_id))
+        {
+            return Vec::new();
+        }
+        let parameter_type = |index: usize| {
+            parameter_ids
+                .get(index + self_parameter_offset)
+                .and_then(|parameter_id| self.parameters.get(parameter_id))
+                .map(|parameter| parameter.type_id.get_type(self))
+        };
+        let mut result_generics: Vec<TypeId> = Vec::new();
+        for (index, argument_id) in argument_ids.iter().enumerate() {
+            if !matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            ) {
+                continue;
+            }
+            let Some(Type::Closure(parameters, returned, _, _)) = parameter_type(index) else {
+                continue;
+            };
+            let mut in_parameters = Vec::new();
+            for parameter in &parameters {
+                self.collect_generics(&parameter.get_type(self), 0, &mut in_parameters);
+            }
+            let mut in_result = Vec::new();
+            self.collect_generics(&returned.get_type(self), 0, &mut in_result);
+            result_generics.extend(in_result.into_iter().filter(|generic| {
+                bindable.contains(generic)
+                    && !in_parameters.contains(generic)
+                    && !substitution.contains_key(generic)
+            }));
+        }
+        if result_generics.is_empty() {
+            return Vec::new();
+        }
+        argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(index, argument_id)| {
+                self.is_unsuffixed_numeric(**argument_id)
+                    && parameter_type(*index).is_some_and(|parameter_type| {
+                        let mut mentioned = Vec::new();
+                        self.collect_generics(&parameter_type, 0, &mut mentioned);
+                        mentioned
+                            .iter()
+                            .any(|generic| result_generics.contains(generic))
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Every constraint a call to `member_id` may bind: the callee's OWN
@@ -51688,6 +51798,40 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnInference {
+        // B659's second shape: the tail is read first, so an unsuffixed
+        // literal tail took `i32` before a `ret` naming the width was read —
+        // `{ for .. { found then ret at; } 0 }` with `at: usize` refused the
+        // `ret` against the literal's default. The literal is a NUMBER, not
+        // an `i32`: the first value-carrying item that is not one (and whose
+        // type is numeric) directs it, as an annotation would.
+        let literal_hint = match initial_expectation {
+            Type::Unknown
+                if evidence
+                    .first()
+                    .and_then(|(_, value_id)| *value_id)
+                    .is_some_and(|value_id| self.is_unsuffixed_numeric(value_id)) =>
+            {
+                let others: Vec<Id> = evidence
+                    .iter()
+                    .skip(1)
+                    .filter_map(|(_, value_id)| *value_id)
+                    .filter(|value_id| !self.is_unsuffixed_numeric(*value_id))
+                    .collect();
+                others.into_iter().find_map(|value_id| {
+                    let value_type = self.infer_type_inner(
+                        value_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    );
+                    self.numeric_primitive_name(&value_type)
+                        .is_some()
+                        .then_some(value_type)
+                })
+            }
+            _ => None,
+        };
+        let initial_expectation = literal_hint.as_ref().unwrap_or(initial_expectation);
         let mut running: Option<(Type, ReturnOrigin)> = None;
         let mut last_resort: Option<Type> = None;
         let mut disagreements = Vec::new();
@@ -58184,7 +58328,33 @@ impl<'src> Analyzer<'src> {
                     // B600: the other arguments, for a callee generic the call
                     // leaves open that an argument was typed in.
                     let mut typed_arguments: Vec<Id> = Vec::new();
-                    for (index, parameter_id) in parameters.iter().enumerate() {
+                    // B659: a literal at a generic only a closure argument's
+                    // result fixes is read after that closure (`pick(0, ||
+                    // held.depth)`), as on the method path.
+                    let deferred_literals = match argument_ids.len() >= 2
+                        && argument_ids.iter().any(|argument_id| {
+                            matches!(
+                                self.expr_id_to_expr_map.get(argument_id),
+                                Some(Expr::Closure(_))
+                            )
+                        }) {
+                        true => {
+                            let bindable = self.callee_bindable_generics(function_id);
+                            self.literals_awaiting_a_closure_result(
+                                &parameters,
+                                argument_ids,
+                                0,
+                                &bindable,
+                                &substitution_context,
+                            )
+                        }
+                        false => Vec::new(),
+                    };
+                    let order = (0..parameters.len())
+                        .filter(|index| !deferred_literals.contains(index))
+                        .chain(deferred_literals.iter().copied());
+                    for index in order {
+                        let parameter_id = &parameters[index];
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
