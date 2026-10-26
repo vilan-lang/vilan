@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, eleven crates, plus the language's own tree:
+Rust workspace, twelve crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -74,6 +74,13 @@ Rust workspace, eleven crates, plus the language's own tree:
   CLI's) lives here and routes the signals to `vilan_rt::http::request_termination`; the
   crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
   when the program starts an HTTP server.
+- `crates/vilan-rt-term` — the terminal MODE behind `std::process::keys()` for emitted Rust
+  (A173 S2, terminal.md Q3): raw mode is FFI (`tcsetattr` on unix, `SetConsoleMode` on
+  Windows), so `libc`/`windows-sys` live here, with a signal handler that restores the
+  terminal and re-raises; a generated cargo project names it only when the program reaches
+  `keys()`. The KEYS are not here — std's `KeyDecoder` (vilan) decodes the bytes
+  `vilan-rt`'s stdin pump reads, the same on both backends. Unlike its three siblings it
+  cannot be `forbid(unsafe_code)`: every `unsafe` block carries its reason.
 
 ## Definition of done (the gates)
 
