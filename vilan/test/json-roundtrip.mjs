@@ -20,13 +20,13 @@ function has_field(self, name) {
 	return Object.hasOwn(self, name);
 }
 function from_json_value(value) {
-	let $x = null;
+	let $w = null;
 	if (__json_kind(value) === "string") {
-		$x = [ 0, String(value) ];
+		$w = [ 0, String(value) ];
 	} else {
-		$x = [ 1, "expected a string" ];
+		$w = [ 1, "expected a string" ];
 	}
-	return $x;
+	return $w;
 }
 function from_json_value2(value) {
 	let $d = null;
@@ -75,24 +75,25 @@ function from_json_value3(value) {
 		return [ 1, "missing field members" ];
 	}
 	$v;
-	let $w = null;
-	if (!(has_field(value, "captain"))) {
-		return [ 1, "missing field captain" ];
+	const $x = from_json_value(value["name"]);
+	if ($x[0] === 1) {
+		return $x;
 	}
-	$w;
-	const $y = from_json_value(value["name"]);
-	if ($y[0] === 1) {
-		return $y;
+	const $B = from_json_value6(value["members"]);
+	if ($B[0] === 1) {
+		return $B;
 	}
-	const $C = from_json_value6(value["members"]);
-	if ($C[0] === 1) {
-		return $C;
+	let $F = null;
+	if (has_field(value, "captain")) {
+		const $E = from_json_value7(value["captain"]);
+		if ($E[0] === 1) {
+			return $E;
+		}
+		$F = $E[1];
+	} else {
+		$F = [ 1 ];
 	}
-	const $F = from_json_value7(value["captain"]);
-	if ($F[0] === 1) {
-		return $F;
-	}
-	return [ 0, [ $y[1], $C[1], $F[1] ] ];
+	return [ 0, [ $x[1], $B[1], $F ] ];
 }
 function from_json_value4(value) {
 	let $c = null;
@@ -181,34 +182,34 @@ function ok_or(self, err) {
 	return $s;
 }
 function from_json_value6(value) {
-	let $z = null;
+	let $y = null;
 	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
-	$z;
+	$y;
 	let result = [  ];
 	for (const element of value) {
-		const $B = result;
-		const $A = from_json_value(element);
-		if ($A[0] === 1) {
-			return $A;
+		const $A = result;
+		const $z = from_json_value(element);
+		if ($z[0] === 1) {
+			return $z;
 		}
-		$B.push($A[1]);
+		$A.push($z[1]);
 	}
 	return [ 0, result ];
 }
 function from_json_value7(value) {
-	let $D = null;
+	let $C = null;
 	if (value === null) {
-		$D = [ 0, [ 1 ] ];
+		$C = [ 0, [ 1 ] ];
 	} else {
-		const $E = from_json_value(value);
-		if ($E[0] === 1) {
-			return $E;
+		const $D = from_json_value(value);
+		if ($D[0] === 1) {
+			return $D;
 		}
-		$D = [ 0, [ 0, $E[1] ] ];
+		$C = [ 0, [ 0, $D[1] ] ];
 	}
-	return $D;
+	return $C;
 }
 function from_json_value8(value) {
 	let $L = null;

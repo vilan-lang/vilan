@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**M166: a `[derive(Json)]` struct decodes an `Option` field its object leaves out as `None`, as it decodes `null` — `Node::from_json("{\"id\": 1}")` for `struct Node { id: u32, note: Option<str> }` answered `Err("missing field note")`, so adding an `Option` field to a struct kept as JSON (a preference in `localStorage`, a saved layout, a JSON column) made every value stored before it fail to decode.** The derived `from_json_value` skips the presence check for a field WRITTEN as `Option<T>` and reads an absent one as `Option::None` (the output imports `std::option::Option` only when some field is one); a present field still decodes through the field's own decoder, so `null` is `None` and `5` at an `Option<str>` is still "expected a string". A missing non-`Option` field is refused by name as before, a nested `Option<Option<T>>` reads absent and `null` alike as the outer `None`, an `Option<T>` field of a generic struct is covered, and `to_json` still writes `null`. The test is syntactic, as every derive input is: an alias for an `Option`, or a type parameter instantiated at one, must be present (std/encoding.md says so). A default for a non-`Option` field (`[default(false)] locked: bool`) is filed as the follow-up. The corpus golden `json-roundtrip.mjs` moved (its `captain: Option<str>` field's check), its printed output byte-identical. Pin: `native_differential::m166_a_derived_decoder_reads_an_absent_option_field_as_none_on_both_backends` (`native/json_absent_option.vl`). Tracker M166.
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->

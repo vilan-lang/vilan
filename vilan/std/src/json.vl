@@ -921,6 +921,14 @@ macro fun decoded(type_: TypeExpr, value: str): str {
 	}
 }
 
+// Whether a field is WRITTEN as `Option<T>`: the derived decoder reads its absence
+// as `None` (M166). The test is syntactic, as every derive input is
+// (`macro_std::meta`): a type alias for an `Option`, or a generic parameter
+// instantiated at one, is decoded as any other field and must be present.
+macro fun is_option(type_: TypeExpr): bool {
+	type_.name == "Option" && type_.arguments.len() == 1
+}
+
 export macro fun struct_json_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of, init_of, quote, join };
 
@@ -941,7 +949,9 @@ export macro fun struct_json_impls(target: StructItem): str {
 	let to_json = fun_of("to_json").parameter("self").returns("str").expr(join(parts, " + "));
 	// Decoding is fallible (I3): `from_json` parses the text without crashing,
 	// `from_json_value` checks each field is present (naming a missing one) and
-	// threads a leaf failure with `!`.
+	// threads a leaf failure with `!`. An `Option` field is the exception: an
+	// object that leaves it out decodes it as `None`, as `null` does, so a struct
+	// that gains an `Option` field still reads JSON written before it (M166).
 	//
 	// The subject is spelled as an APPLICATION of its own parameters (`Handle<T>`)
 	// in every type role, and the impl binds them with the derived trait (B194's
@@ -960,15 +970,23 @@ export macro fun struct_json_impls(target: StructItem): str {
 	// depend on the deriving file importing the variants (`Result` the type is
 	// reachable wherever the derive is; its variants may not be in scope).
 	for field in target.fields {
-		let label = quote(field.name);
-		from_json_value = from_json_value.line(
-			i"if !value.has_field({label}) \{ ret Result::Err(\"missing field {field.name}\") \}",
-		);
+		if !is_option(field.type_) {
+			let label = quote(field.name);
+			from_json_value = from_json_value.line(i"if !value.has_field({label}) \{ ret Result::Err(\"missing field {field.name}\") \}");
+		}
 	}
 	mut literal = init_of(target.name);
 	for field in target.fields {
 		let label = quote(field.name);
-		literal = literal.field(field.name, decoded(field.type_, i"value.field({label})") + "!");
+		let present = decoded(field.type_, i"value.field({label})") + "!";
+		if is_option(field.type_) {
+			literal = literal.field(
+				field.name,
+				i"if value.has_field({label}) \{ {present} \} else \{ Option::None \}",
+			);
+		} else {
+			literal = literal.field(field.name, present);
+		}
 	}
 	from_json_value = from_json_value.expr(i"Result::Ok({literal.render()})");
 	impl_of(target.name)
@@ -1317,6 +1335,7 @@ export macro fun Json(item: Item): Source {
 		}
 		ret source(i"import std::json::\{ Json, FromJson, JsonValue{decoder_imports(types)} \};\n"
 			+ "import std::result::Result;\n"
+			+ option_import(types)
 			+ struct_json_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
@@ -1340,6 +1359,17 @@ macro fun decoder_imports(types: List<TypeExpr>): str {
 	for type_ in types {
 		if !type_.is_path_head() {
 			ret ", from_json_value_of";
+		}
+	}
+	""
+}
+
+// `Option::None`, which a decoder spells for an absent `Option` field (M166),
+// imported only where some field is one so every other derive is unchanged.
+macro fun option_import(types: List<TypeExpr>): str {
+	for type_ in types {
+		if is_option(type_) {
+			ret "import std::option::Option;\n";
 		}
 	}
 	""

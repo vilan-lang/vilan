@@ -14388,3 +14388,40 @@ fn b626_a_module_scalar_read_only_through_a_view_answers_on_both_backends() {
         "a module scalar read through a view must be declared on JS"
     );
 }
+
+/// M166: a derived `FromJson` reads an `Option` field its object leaves out as
+/// `None` — the same answer as `null` — so a struct that gains an `Option`
+/// field still decodes JSON stored before it. A missing non-`Option` field is
+/// still refused by name, a nested `Option<Option<..>>` reads absent and `null`
+/// alike as the outer `None`, and `to_json` still writes `null`.
+#[test]
+fn m166_a_derived_decoder_reads_an_absent_option_field_as_none_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_json_absent_option.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/json_absent_option.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "ok 1 <none>\n",
+                "ok 2 hi\n",
+                "ok 3 <none>\n",
+                "err missing field id\n",
+                "err expected a string\n",
+                "{\"id\":1,\"note\":null}\n",
+                "{\"id\":1,\"note\":\"x\"}\n",
+                "ok none false {\"depth\":null,\"pair\":null}\n",
+                "ok none false {\"depth\":null,\"pair\":null}\n",
+                "ok some(some) true {\"depth\":7,\"pair\":[1,2]}\n",
+                "true {\"inner\":null}\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
