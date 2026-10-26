@@ -4229,7 +4229,7 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
     let source = String::from_utf8_lossy(&output.stdout);
     for needle in [
         "vilan_rt::http::create_server",
-        "vilan_rt::http::read_request_bytes",
+        "vilan_rt::http::read_body",
         ").listen(",
         ").address()",
         ").port()",
@@ -4262,7 +4262,7 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
 /// reaches the same server.
 const HTTP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -4276,6 +4276,7 @@ const HTTP_PROBE: &str = concat!(
     "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -4503,7 +4504,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "import std::bytes::encode_utf8;\n",
     "import std::crypto::sha256;\n",
     "import std::db::Database;\n",
-    "import std::http::{ Request, Response, Server };\n",
+    "import std::http::{ BodyLimits, Request, Response, Server };\n",
     "import std::io::print;\n",
     "import std::json::{ FromJson, Json };\n",
     "import std::option::Option::None;\n",
@@ -4555,6 +4556,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -5867,7 +5869,7 @@ fn a_stopped_server_ends_the_program_the_same_on_both_backends() {
 
 const STOP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -5881,6 +5883,7 @@ const STOP_PROBE: &str = concat!(
     "\t\t},\n",
     "\t\ton_stop = |stopped| print(\"stopped\"),\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -6099,7 +6102,7 @@ fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
 #[cfg(unix)]
 const OPEN_STREAM_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -6112,6 +6115,7 @@ const OPEN_STREAM_PROBE: &str = concat!(
     "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",

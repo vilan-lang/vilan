@@ -25,19 +25,28 @@
 //!
 //! Every socket is non-blocking and every socket is an
 //! [`crate::executor::IoSource`], polled once per executor turn. The listener
-//! accepts; a connection reads until it has a whole request; the request
+//! accepts; a connection reads until it has a whole request HEAD; the request
 //! handler is SPAWNED, exactly as node treats the promise its callback returns
 //! (floating — an unhandled rejection reports and the server keeps serving); the
 //! response's bytes go into an outbox the same poll flushes. Nothing blocks the
 //! loop, so a program can serve requests and run timers at once.
 //!
+//! # The body is read when the handler asks (M164)
+//!
+//! A handler runs on the head. Its body stays in the kernel — the connection does
+//! not read it, so a client that sends more than the socket buffers holds stalls
+//! — until `std::http`'s `Request::bytes` asks ([`read_body`]), under the cap
+//! the server resolved for the request: a declared `Content-Length` over it is
+//! refused before a byte is read, and a chunked body (decoded here, RFC 9112
+//! §7.1) is counted as it arrives and refused at the chunk size that crosses it.
+//! A refusal answers `413` and closes; the read ends its task as a cancellation.
+//!
 //! # Not in v1, by name
 //!
-//! Keep-alive (every response says `Connection: close`), `Transfer-Encoding:
-//! chunked` on the way IN (a request that sends one is refused with `411`),
-//! HTTP/2, TLS, and the WebSocket handshake itself — the upgrade HANDOVER is
-//! here, so a `std::ws` written in vilan has a socket to write its handshake to,
-//! but nothing here computes an RFC 6455 accept key.
+//! Keep-alive (every response says `Connection: close`), HTTP/2, TLS, and the
+//! WebSocket handshake itself — the upgrade HANDOVER is here, so a `std::ws`
+//! written in vilan has a socket to write its handshake to, but nothing here
+//! computes an RFC 6455 accept key.
 
 use std::cell::{Cell, RefCell};
 use std::io::{ErrorKind, Read, Write};
@@ -46,8 +55,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use crate::bytes::Bytes;
-use crate::executor::{Boxed, IoSource, register_io, spawn};
+use crate::executor::{Boxed, IoSource, Parked, raise_cancelled, register_io, spawn};
 use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
 
@@ -60,8 +73,23 @@ const READ_CHUNK: usize = 8 * 1024;
 /// allocation driven by a stranger.
 const MAX_HEAD: usize = 64 * 1024;
 
-/// The largest body this accepts before answering `413`, for the same reason.
-const MAX_BODY: usize = 16 * 1024 * 1024;
+/// How long a connection closing with body bytes possibly still on the wire — a
+/// refused body — waits, write half shut and reading nothing, before it closes
+/// (M164). Closing a socket with
+/// unread bytes in it sends a RESET rather than a FIN, and a reset can reach
+/// the client before it has read the answer it was sent — the `413` lost on the
+/// way. The wait is Go's `rstAvoidanceDelay` (500 ms): the client has the answer
+/// and the end of it, and the server holds nothing but the socket for it.
+const LINGER: Duration = Duration::from_millis(500);
+
+/// How much of a body one turn reads before decoding it (M164): what a body over
+/// its cap can have in memory when it is refused, beyond the cap itself.
+const BODY_SLICE: usize = 64 * 1024;
+
+/// The longest chunk-size line (or trailer line) a chunked body may carry before
+/// it is refused as malformed: a size is a few hex digits, and an unbounded line
+/// is an unbounded allocation driven by a stranger, as an unbounded head is.
+const MAX_CHUNK_LINE: usize = 4 * 1024;
 
 // ---------------------------------------------------------------- parsing ---
 
@@ -172,33 +200,180 @@ fn parse_head(buffer: &[u8]) -> Result<Head, HeadError> {
     })
 }
 
-/// The declared body length, or a refusal.
+/// How a request's body is delimited on the wire (RFC 9112 §6.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// Neither field: no body.
+    Empty,
+    /// `Content-Length: n`.
+    Length(usize),
+    /// `Transfer-Encoding: chunked`, decoded by [`ChunkDecoder`].
+    Chunked,
+}
+
+/// The body's framing, or a refusal.
 ///
-/// A `Transfer-Encoding` is refused rather than half-handled: this server does
-/// not decode chunked requests in v1, and reading a chunked body as if it were
-/// length-delimited would hand the handler framing bytes as content.
-fn body_length(head: &Head) -> Result<usize, HeadError> {
-    if head
-        .fields
-        .iter()
-        .any(|(name, _)| name == "transfer-encoding")
-    {
-        return Err(HeadError::Refused(411, "Length Required"));
-    }
-    let Some((_, value)) = head
-        .fields
-        .iter()
-        .find(|(name, _)| name == "content-length")
-    else {
-        return Ok(0);
+/// No size is refused here: the cap is the APPLICATION's (`std::http`'s
+/// `max_body_bytes`, resolved per request), so it is applied when the body is
+/// read ([`read_body`]), against the declared length first. A transfer coding
+/// other than `chunked` is `501` (RFC 9112 §6.1: a coding the server does not
+/// understand), and a request carrying both fields is `400` — the two framings
+/// disagreeing about where the message ends is how requests are smuggled, and
+/// node's parser refuses it too.
+fn body_framing(head: &Head) -> Result<Framing, HeadError> {
+    let field = |wanted: &str| {
+        head.fields
+            .iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, value)| value.trim().to_ascii_lowercase())
     };
-    let Ok(length) = value.trim().parse::<usize>() else {
-        return Err(HeadError::Refused(400, "Bad Request"));
-    };
-    if length > MAX_BODY {
-        return Err(HeadError::Refused(413, "Content Too Large"));
+    let length = field("content-length");
+    if let Some(coding) = field("transfer-encoding") {
+        if length.is_some() {
+            return Err(HeadError::Refused(400, "Bad Request"));
+        }
+        let codings: Vec<&str> = coding.split(',').map(str::trim).collect();
+        if codings != ["chunked"] {
+            return Err(HeadError::Refused(501, "Not Implemented"));
+        }
+        return Ok(Framing::Chunked);
     }
-    Ok(length)
+    let Some(value) = length else {
+        return Ok(Framing::Empty);
+    };
+    match value.parse::<usize>() {
+        Ok(0) => Ok(Framing::Empty),
+        Ok(length) => Ok(Framing::Length(length)),
+        Err(_) => Err(HeadError::Refused(400, "Bad Request")),
+    }
+}
+
+/// Where a chunked body's decoder is (RFC 9112 §7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkStage {
+    /// Reading a chunk-size line (`1a;ext=1`).
+    Size,
+    /// Inside a chunk's data, with this many bytes of it left.
+    Data(usize),
+    /// After a chunk's data: its line terminator.
+    DataEnd,
+    /// After the last (zero-size) chunk: trailer lines, up to an empty one.
+    Trailers,
+    /// The body has ended.
+    Done,
+}
+
+/// What one [`ChunkDecoder::feed`] came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Decoded {
+    /// Everything available was taken; the body has not ended.
+    More,
+    /// The body ended.
+    Done,
+    /// A chunk size would take the body past the cap. Refused at the SIZE
+    /// line, before any of that chunk's data is read.
+    OverLimit,
+    /// Not a chunked body.
+    Malformed,
+}
+
+/// A chunked body, decoded incrementally out of the connection's inbox.
+#[derive(Debug)]
+struct ChunkDecoder {
+    stage: ChunkStage,
+    /// Trailer bytes taken so far, bounded by [`MAX_HEAD`].
+    trailer_bytes: usize,
+}
+
+impl ChunkDecoder {
+    fn new() -> ChunkDecoder {
+        ChunkDecoder {
+            stage: ChunkStage::Size,
+            trailer_bytes: 0,
+        }
+    }
+
+    /// Takes what it can out of `input` (draining what it consumed), appending
+    /// the decoded data to `output`, and refuses a chunk whose size would take
+    /// `output` past `limit` bytes.
+    fn feed(&mut self, input: &mut Vec<u8>, output: &mut Vec<u8>, limit: usize) -> Decoded {
+        let mut consumed = 0;
+        let outcome = loop {
+            let available = &input[consumed..];
+            match self.stage {
+                ChunkStage::Done => break Decoded::Done,
+                ChunkStage::Size | ChunkStage::DataEnd | ChunkStage::Trailers => {
+                    let Some(end) = available.iter().position(|byte| *byte == b'\n') else {
+                        if available.len() > MAX_CHUNK_LINE {
+                            break Decoded::Malformed;
+                        }
+                        break Decoded::More;
+                    };
+                    let line = &available[..end];
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    consumed += end + 1;
+                    match self.stage {
+                        ChunkStage::Size => {
+                            let Some(size) = chunk_size(line) else {
+                                break Decoded::Malformed;
+                            };
+                            if size == 0 {
+                                self.stage = ChunkStage::Trailers;
+                                continue;
+                            }
+                            match output.len().checked_add(size) {
+                                Some(total) if total <= limit => {}
+                                _ => break Decoded::OverLimit,
+                            }
+                            self.stage = ChunkStage::Data(size);
+                        }
+                        ChunkStage::DataEnd => {
+                            if !line.is_empty() {
+                                break Decoded::Malformed;
+                            }
+                            self.stage = ChunkStage::Size;
+                        }
+                        _ => {
+                            self.trailer_bytes += end + 1;
+                            if self.trailer_bytes > MAX_HEAD {
+                                break Decoded::Malformed;
+                            }
+                            if line.is_empty() {
+                                self.stage = ChunkStage::Done;
+                            }
+                        }
+                    }
+                }
+                ChunkStage::Data(remaining) => {
+                    if available.is_empty() {
+                        break Decoded::More;
+                    }
+                    let taken = remaining.min(available.len());
+                    output.extend_from_slice(&available[..taken]);
+                    consumed += taken;
+                    self.stage = if taken == remaining {
+                        ChunkStage::DataEnd
+                    } else {
+                        ChunkStage::Data(remaining - taken)
+                    };
+                }
+            }
+        };
+        input.drain(..consumed);
+        outcome
+    }
+}
+
+/// A chunk-size line's size: hex digits, then optional `;` extensions (which
+/// carry nothing this server reads). `None` for anything else, an empty size or
+/// one too large for a `usize` among it.
+fn chunk_size(line: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(line).ok()?;
+    let digits = text.split(';').next()?.trim();
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    usize::from_str_radix(digits, 16).ok()
 }
 
 /// Whether the head asks for a protocol upgrade (`node:http`'s `upgrade` event,
@@ -273,6 +448,53 @@ enum Stage {
     Closed,
 }
 
+/// Where a request's body stands (M164).
+enum BodyState {
+    /// Nobody has asked for it: it stays on the wire (in the kernel, or the part
+    /// that arrived with the head in the inbox).
+    Unread,
+    /// A handler asked: it is being taken off the wire, up to `limit` bytes.
+    Reading { limit: usize },
+    /// Read whole.
+    Read(Bytes),
+    /// Over the cap or malformed: answered, and the connection is closing.
+    Refused,
+    /// The client went away before it arrived, or the request was answered
+    /// before it was asked for.
+    Gone,
+}
+
+/// One request's body: its framing, where it stands, what has been decoded and
+/// who waits for it.
+struct Body {
+    framing: Framing,
+    state: BodyState,
+    decoded: Vec<u8>,
+    chunks: ChunkDecoder,
+    waiters: Vec<Parked>,
+}
+
+impl Body {
+    fn new(framing: Framing) -> Body {
+        Body {
+            framing,
+            state: BodyState::Unread,
+            decoded: Vec::new(),
+            chunks: ChunkDecoder::new(),
+            waiters: Vec::new(),
+        }
+    }
+
+    /// Settles the body and wakes everyone waiting for it.
+    fn settle(&mut self, state: BodyState) {
+        self.state = state;
+        self.decoded = Vec::new();
+        for waiter in self.waiters.drain(..) {
+            waiter.wake();
+        }
+    }
+}
+
 /// One accepted connection: the socket, what has been read, what is waiting to
 /// be written, and the stage.
 struct Connection {
@@ -296,6 +518,18 @@ struct Connection {
     /// even though the socket is closed one poll later once the outbox has been
     /// flushed — see [`Connection::destroy`].
     destroyed: Cell<bool>,
+    /// The request's body (M164) — one request per connection, since every
+    /// response here closes it.
+    body: RefCell<Body>,
+    /// Whether a response head has gone out on this connection — the
+    /// application's, or a refusal's. One answer per connection: a response
+    /// that finds the connection already answered writes nothing.
+    answered: Cell<bool>,
+    /// Whether the write half has been shut for a linger.
+    write_shut: Cell<bool>,
+    /// When a closing connection that may still have body bytes coming stops
+    /// waiting for its client to read the answer (see [`LINGER`]).
+    linger_until: Cell<Option<Instant>>,
 }
 
 impl Connection {
@@ -313,7 +547,102 @@ impl Connection {
             last_activity: Cell::new(Instant::now()),
             timed_out: Cell::new(false),
             destroyed: Cell::new(false),
+            body: RefCell::new(Body::new(Framing::Empty)),
+            answered: Cell::new(false),
+            write_shut: Cell::new(false),
+            linger_until: Cell::new(None),
         }
+    }
+
+    /// Whether the connection should take bytes off the socket this turn: while
+    /// it reads a head, while it is upgraded, and while a body is being read —
+    /// never for a body nobody asked for, which stays in the kernel.
+    fn wants_bytes(&self) -> bool {
+        match self.stage.get() {
+            Stage::Reading | Stage::Upgraded => true,
+            Stage::Dispatched | Stage::Closing => {
+                matches!(self.body.borrow().state, BodyState::Reading { .. })
+            }
+            Stage::Closed => false,
+        }
+    }
+
+    /// Moves a body being read forward with what the inbox holds. `true` if
+    /// anything changed.
+    fn advance_body(&self, hung_up: bool) -> bool {
+        let mut body = self.body.borrow_mut();
+        let BodyState::Reading { limit } = body.state else {
+            return false;
+        };
+        let mut inbox = self.inbox.borrow_mut();
+        let before = inbox.len();
+        let outcome = match body.framing {
+            Framing::Empty => Decoded::Done,
+            Framing::Length(length) => {
+                let taken = (length - body.decoded.len()).min(inbox.len());
+                body.decoded.extend(inbox.drain(..taken));
+                if body.decoded.len() == length {
+                    Decoded::Done
+                } else {
+                    Decoded::More
+                }
+            }
+            Framing::Chunked => {
+                let Body {
+                    chunks, decoded, ..
+                } = &mut *body;
+                chunks.feed(&mut inbox, decoded, limit)
+            }
+        };
+        let progressed = inbox.len() != before;
+        drop(inbox);
+        match outcome {
+            Decoded::Done => {
+                let bytes = Bytes::from_vec(std::mem::take(&mut body.decoded));
+                body.settle(BodyState::Read(bytes));
+                true
+            }
+            Decoded::More if hung_up => {
+                body.settle(BodyState::Gone);
+                true
+            }
+            Decoded::More => progressed,
+            Decoded::OverLimit => {
+                body.settle(BodyState::Refused);
+                drop(body);
+                self.refuse_body(limit);
+                true
+            }
+            Decoded::Malformed => {
+                body.settle(BodyState::Refused);
+                drop(body);
+                if !self.answered.replace(true) {
+                    refuse(self, 400, "Bad Request");
+                } else {
+                    self.stage.set(Stage::Closing);
+                }
+                true
+            }
+        }
+    }
+
+    /// The over-the-cap answer (M164): `413` with the sentence node's twin
+    /// sends, and the connection closing without the rest of the body read. A
+    /// response already under way cannot become a `413`, so it is cut instead.
+    fn refuse_body(&self, limit: usize) {
+        if self.answered.replace(true) {
+            self.stage.set(Stage::Closing);
+            return;
+        }
+        let message = format!("the request body is larger than {limit} bytes");
+        let head = format!(
+            "HTTP/1.1 413 Content Too Large\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            message.len()
+        );
+        self.enqueue(head.as_bytes());
+        self.enqueue(message.as_bytes());
+        self.stage.set(Stage::Closing);
     }
 
     fn touch(&self) {
@@ -321,16 +650,24 @@ impl Connection {
         self.timed_out.set(false);
     }
 
-    /// Reads whatever has arrived. Answers `(progressed, the peer hung up)`.
-    fn read_available(&self) -> (bool, bool) {
+    /// Reads whatever has arrived, or `budget` bytes of it — a body is read a
+    /// bounded slice per turn and decoded in between, so a body over its cap is
+    /// refused with at most a slice of it in memory. Answers `(progressed, the
+    /// peer hung up)`.
+    fn read_available(&self, budget: usize) -> (bool, bool) {
         let mut progressed = false;
         let mut chunk = [0u8; READ_CHUNK];
+        let mut taken = 0;
         loop {
+            if taken >= budget {
+                return (progressed, false);
+            }
             let read = self.stream.borrow_mut().read(&mut chunk);
             match read {
                 Ok(0) => return (progressed, true),
                 Ok(count) => {
                     self.inbox.borrow_mut().extend_from_slice(&chunk[..count]);
+                    taken += count;
                     progressed = true;
                     self.touch();
                 }
@@ -405,6 +742,13 @@ impl Connection {
             return;
         }
         self.stage.set(Stage::Closed);
+        {
+            // A read still waiting ends: the body will never arrive now.
+            let mut body = self.body.borrow_mut();
+            if matches!(body.state, BodyState::Unread | BodyState::Reading { .. }) {
+                body.settle(BodyState::Gone);
+            }
+        }
         let _ = self.stream.borrow().shutdown(Shutdown::Both);
         for listener in self.on_close.borrow().iter() {
             listener();
@@ -512,13 +856,8 @@ impl Js for Socket {
 
 // ---------------------------------------------------------------- request ---
 
-/// `NodeRequest` — one inbound request, head and body both already read.
-///
-/// The body is COLLECTED before the handler is called, which is what
-/// `std::http`'s `Server::start` does on the JS backend too (it awaits
-/// `node:stream/consumers`' `buffer` before constructing its `Request`). So
-/// [`read_request_bytes`] hands back what is already here rather than driving a
-/// stream.
+/// `NodeRequest` — one inbound request: its head, and the connection its body
+/// is still on (M164: [`read_body`] takes it when the handler asks).
 #[derive(Clone)]
 pub struct Request(Rc<RequestBody>);
 
@@ -526,7 +865,7 @@ struct RequestBody {
     method: String,
     target: String,
     fields: Vec<(String, String)>,
-    body: Bytes,
+    connection: Rc<Connection>,
 }
 
 impl Request {
@@ -552,11 +891,6 @@ impl Request {
             .iter()
             .find(|(known, _)| *known == wanted)
             .map(|(_, value)| str_new(value))
-    }
-
-    /// The whole body as bytes.
-    pub fn bytes(&self) -> Bytes {
-        self.0.body.clone()
     }
 
     /// `request.headers` — the whole field set as the opaque host object
@@ -594,9 +928,76 @@ impl Js for Request {
     }
 }
 
-/// `node:stream/consumers`' `buffer` — the body, which is already read.
-pub async fn read_request_bytes(request: Request) -> Bytes {
-    request.bytes()
+/// `__http_read_body(request, response, limit)` — the request's body, read on
+/// the FIRST call and answered from there after (M164; `std::http`'s
+/// `Request::bytes`). See the module comment for the cap; the response handle is
+/// the JS twin's (node's `413` goes out on it), and here the connection answers
+/// for itself.
+pub fn read_body(request: Request, _response: Response, limit: usize) -> BodyRead {
+    BodyRead {
+        connection: Rc::clone(&request.0.connection),
+        limit,
+    }
+}
+
+/// The future [`read_body`] returns. Public because emitted code's TYPE
+/// inference names it, never its text.
+pub struct BodyRead {
+    connection: Rc<Connection>,
+    limit: usize,
+}
+
+impl Future for BodyRead {
+    type Output = Bytes;
+
+    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Bytes> {
+        let connection = &self.connection;
+        let starts = {
+            let body = connection.body.borrow();
+            match &body.state {
+                BodyState::Read(bytes) => return Poll::Ready(bytes.clone()),
+                BodyState::Unread => true,
+                BodyState::Reading { .. } => false,
+                BodyState::Refused | BodyState::Gone => {
+                    drop(body);
+                    raise_cancelled()
+                }
+            }
+        };
+        if starts {
+            let mut body = connection.body.borrow_mut();
+            if connection.answered.get() {
+                // Read after the response went out: the connection is closing.
+                body.settle(BodyState::Gone);
+                drop(body);
+                raise_cancelled();
+            }
+            if let Framing::Length(length) = body.framing
+                && length > self.limit
+            {
+                // Over the cap by its own declaration: refused before a byte of
+                // it is read.
+                body.settle(BodyState::Refused);
+                drop(body);
+                connection.refuse_body(self.limit);
+                raise_cancelled();
+            }
+            body.state = BodyState::Reading { limit: self.limit };
+            drop(body);
+            // Whatever arrived with the head is taken now; the poll takes the
+            // rest as it comes.
+            connection.advance_body(false);
+            match &connection.body.borrow().state {
+                BodyState::Read(bytes) => return Poll::Ready(bytes.clone()),
+                BodyState::Reading { .. } => {}
+                _ => raise_cancelled(),
+            }
+        }
+        if let Some(parked) = Parked::current() {
+            connection.body.borrow_mut().waiters.push(parked);
+        }
+        Poll::Pending
+    }
 }
 
 // --------------------------------------------------------------- response ---
@@ -652,6 +1053,12 @@ impl Response {
         if self.0.head_sent.replace(true) {
             return;
         }
+        // One answer per connection: a body refused under this response has
+        // already answered `413`, and this one is dropped (M164).
+        if self.0.connection.answered.replace(true) {
+            self.0.ended.set(true);
+            return;
+        }
         let status = self.0.status.get();
         let phrase = reason(status);
         let mut head = if phrase.is_empty() {
@@ -681,6 +1088,9 @@ impl Response {
             return;
         }
         self.send_head(None);
+        if self.0.ended.get() {
+            return;
+        }
         if status_carries_a_body(self.0.status.get()) {
             self.0.connection.enqueue(chunk.as_bytes());
         }
@@ -693,7 +1103,7 @@ impl Response {
 
     /// `response.end(bytes)`.
     pub fn end_bytes(&self, body: &Bytes) {
-        if self.0.ended.replace(true) {
+        if self.0.ended.get() {
             return;
         }
         // A `204`, a `304` and every `1xx` carry NO body (RFC 9110 §6.4.1), and
@@ -703,6 +1113,7 @@ impl Response {
         // `Content-Length: 0` on it would claim the representation is empty.
         if !status_carries_a_body(self.0.status.get()) {
             self.send_head(None);
+            self.0.ended.set(true);
             self.0.connection.stage.set(Stage::Closing);
             return;
         }
@@ -714,6 +1125,11 @@ impl Response {
             Some(body.len())
         };
         self.send_head(length);
+        if self.0.ended.replace(true) {
+            // The connection was already answered (a refused body): nothing of
+            // this response goes out.
+            return;
+        }
         self.0.connection.enqueue(&body.as_slice());
         self.0.connection.stage.set(Stage::Closing);
     }
@@ -753,9 +1169,10 @@ impl Js for Response {
 /// refusal in [`parse_head`] and [`body_length`] takes. It writes the head by
 /// hand rather than through [`Response`], because a refused request never
 /// reaches the application and never gets a `Response` at all.
-fn refuse(connection: &Rc<Connection>, status: u16, phrase: &str) {
+fn refuse(connection: &Connection, status: u16, phrase: &str) {
     let head =
         format!("HTTP/1.1 {status} {phrase}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    connection.answered.set(true);
     connection.enqueue(head.as_bytes());
     connection.stage.set(Stage::Closing);
 }
@@ -967,7 +1384,13 @@ impl Server {
         *self.0.listener.borrow_mut() = None;
         let connections: Vec<Rc<Connection>> = self.0.connections.borrow().clone();
         for connection in connections {
-            if matches!(connection.stage.get(), Stage::Reading | Stage::Upgraded) {
+            // A handler still waiting for a body is waiting on the client, not
+            // answering: it ends with the connection (its read is cancelled).
+            let waits_on_the_client =
+                matches!(connection.body.borrow().state, BodyState::Reading { .. });
+            if matches!(connection.stage.get(), Stage::Reading | Stage::Upgraded)
+                || waits_on_the_client
+            {
                 connection.close();
             }
         }
@@ -1012,7 +1435,17 @@ impl Server {
     /// progressed.
     fn service(&self, connection: &Rc<Connection>) -> bool {
         let mut progressed = false;
-        let (read, hung_up) = connection.read_available();
+        // A body nobody asked for is not read (M164): it waits in the kernel,
+        // and a client sending more than the socket buffers holds stalls.
+        let (read, hung_up) = if connection.wants_bytes() {
+            let budget = match connection.stage.get() {
+                Stage::Dispatched | Stage::Closing => BODY_SLICE,
+                _ => usize::MAX,
+            };
+            connection.read_available(budget)
+        } else {
+            (false, false)
+        };
         progressed |= read;
         match connection.stage.get() {
             Stage::Reading => {
@@ -1021,6 +1454,11 @@ impl Server {
                 } else if hung_up {
                     // The peer went away mid-head: nothing to answer.
                     connection.close();
+                    progressed = true;
+                }
+            }
+            Stage::Dispatched => {
+                if connection.advance_body(hung_up) {
                     progressed = true;
                 }
             }
@@ -1043,8 +1481,12 @@ impl Server {
             return true;
         }
         if connection.stage.get() == Stage::Closing && connection.outbox.borrow().is_empty() {
-            connection.close();
-            progressed = true;
+            if self.lingers(connection) {
+                progressed |= read;
+            } else {
+                connection.close();
+                progressed = true;
+            }
         }
         if hung_up
             && connection.outbox.borrow().is_empty()
@@ -1057,6 +1499,28 @@ impl Server {
             progressed = true;
         }
         progressed
+    }
+
+    /// What a connection that has answered does before it closes (M164).
+    /// `true` while it is still at it.
+    ///
+    /// A connection whose body was refused may still have body bytes on the way:
+    /// it LINGERS — the write half is shut and nothing more is read for
+    /// [`LINGER`], so the client reads its answer before the close that follows
+    /// resets the rest.
+    fn lingers(&self, connection: &Rc<Connection>) -> bool {
+        if !matches!(connection.body.borrow().state, BodyState::Refused) {
+            return false;
+        }
+        if !connection.write_shut.replace(true) {
+            let _ = connection.stream.borrow().shutdown(Shutdown::Write);
+        }
+        let deadline = connection
+            .linger_until
+            .get()
+            .unwrap_or_else(|| Instant::now() + LINGER);
+        connection.linger_until.set(Some(deadline));
+        Instant::now() < deadline
     }
 
     /// `socket.setTimeout`'s event, checked once per turn.
@@ -1089,33 +1553,26 @@ impl Server {
                 return true;
             }
         };
-        let length = match body_length(&head) {
-            Ok(length) => length,
+        let framing = match body_framing(&head) {
+            Ok(framing) => framing,
             Err(HeadError::Refused(status, phrase)) => {
                 refuse(connection, status, phrase);
                 return true;
             }
-            // `body_length` never asks for more bytes.
+            // `body_framing` never asks for more bytes.
             Err(HeadError::Incomplete) => return false,
         };
         let upgrade = asks_to_upgrade(&head);
-        if !upgrade && buffered.len() < head.length + length {
-            return false;
-        }
-        let body = if upgrade {
-            // The upgrade's "head" is whatever arrived after the request head —
-            // node's third argument, and for a WebSocket handshake it is almost
-            // always empty.
-            buffered[head.length..].to_vec()
-        } else {
-            buffered[head.length..head.length + length].to_vec()
-        };
+        // The handler runs on the HEAD (M164): what arrived after it stays in
+        // the inbox as the body's first bytes, and the rest stays on the wire
+        // until the handler asks for it.
+        let after_head = connection.inbox.borrow_mut().split_off(head.length);
         connection.inbox.borrow_mut().clear();
         let request = Request(Rc::new(RequestBody {
             method: head.method,
             target: head.target,
             fields: head.fields,
-            body: Bytes::from_vec(body.clone()),
+            connection: Rc::clone(connection),
         }));
         if upgrade {
             let handler = self.0.upgrade.borrow().clone();
@@ -1123,7 +1580,10 @@ impl Server {
                 Some(handler) => {
                     connection.stage.set(Stage::Upgraded);
                     let socket = Socket(Rc::clone(connection));
-                    handler(request, socket, Bytes::from_vec(body));
+                    // The upgrade's "head" is whatever arrived after the request
+                    // head — node's third argument, and for a WebSocket handshake
+                    // it is almost always empty.
+                    handler(request, socket, Bytes::from_vec(after_head));
                 }
                 // Node destroys an unclaimed upgrade socket, and so does
                 // `std::http`'s own documentation of this path.
@@ -1131,6 +1591,8 @@ impl Server {
             }
             return true;
         }
+        *connection.inbox.borrow_mut() = after_head;
+        *connection.body.borrow_mut() = Body::new(framing);
         connection.stage.set(Stage::Dispatched);
         let response = Response(Rc::new(ResponseBody {
             connection: Rc::clone(connection),
@@ -1297,31 +1759,131 @@ mod tests {
     }
 
     #[test]
-    fn a_body_length_is_read_and_a_chunked_request_is_refused() {
-        let with = head_of("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n").expect("parses");
-        assert_eq!(body_length(&with), Ok(5));
-        let without = head_of("GET / HTTP/1.1\r\n\r\n").expect("parses");
-        assert_eq!(body_length(&without), Ok(0));
-        let chunked =
-            head_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").expect("parses");
+    fn the_body_framing_is_read_from_the_head() {
+        let framing = |text: &str| body_framing(&head_of(text).expect("parses"));
         assert_eq!(
-            body_length(&chunked),
-            Err(HeadError::Refused(411, "Length Required"))
+            framing("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n"),
+            Ok(Framing::Length(5))
         );
-        let nonsense = head_of("POST / HTTP/1.1\r\nContent-Length: ten\r\n\r\n").expect("parses");
+        assert_eq!(framing("GET / HTTP/1.1\r\n\r\n"), Ok(Framing::Empty));
         assert_eq!(
-            body_length(&nonsense),
+            framing("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n"),
+            Ok(Framing::Empty)
+        );
+        // M164: chunked is DECODED now, where it was refused with `411`.
+        assert_eq!(
+            framing("POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n"),
+            Ok(Framing::Chunked)
+        );
+        // A coding this server cannot undo (RFC 9112 §6.1).
+        assert_eq!(
+            framing("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"),
+            Err(HeadError::Refused(501, "Not Implemented"))
+        );
+        // Both framings at once: how a request is smuggled past a proxy.
+        assert_eq!(
+            framing("POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Err(HeadError::Refused(400, "Bad Request"))
         );
-        let huge = head_of(&format!(
-            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-            MAX_BODY + 1
-        ))
-        .expect("parses");
         assert_eq!(
-            body_length(&huge),
-            Err(HeadError::Refused(413, "Content Too Large"))
+            framing("POST / HTTP/1.1\r\nContent-Length: ten\r\n\r\n"),
+            Err(HeadError::Refused(400, "Bad Request"))
         );
+        // No size is refused at the head any more: the cap is the
+        // application's, applied when the body is read.
+        assert_eq!(
+            framing("POST / HTTP/1.1\r\nContent-Length: 1000000000\r\n\r\n"),
+            Ok(Framing::Length(1_000_000_000))
+        );
+    }
+
+    // -- the chunked decoder, per rule (RFC 9112 §7.1) --
+
+    /// Feeds `wire` to a fresh decoder `step` bytes at a time, as a socket
+    /// could deliver it, and answers the last outcome and what was decoded.
+    fn decode(wire: &[u8], step: usize, limit: usize) -> (Decoded, Vec<u8>) {
+        let mut decoder = ChunkDecoder::new();
+        let mut inbox = Vec::new();
+        let mut output = Vec::new();
+        let mut outcome = Decoded::More;
+        for piece in wire.chunks(step) {
+            inbox.extend_from_slice(piece);
+            outcome = decoder.feed(&mut inbox, &mut output, limit);
+            if outcome != Decoded::More {
+                break;
+            }
+        }
+        (outcome, output)
+    }
+
+    #[test]
+    fn a_chunked_body_decodes_however_the_wire_splits_it() {
+        let wire = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        for step in [1, 2, 3, 7, wire.len()] {
+            assert_eq!(
+                decode(wire, step, 1024),
+                (Decoded::Done, b"hello world".to_vec()),
+                "split every {step} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_extensions_trailers_and_bare_line_feeds_are_accepted() {
+        let wire = b"A;name=value\r\n0123456789\r\n0\r\nX-Checksum: 1\r\n\r\n";
+        assert_eq!(
+            decode(wire, 4, 1024),
+            (Decoded::Done, b"0123456789".to_vec())
+        );
+        assert_eq!(
+            decode(b"3\nabc\n0\n\n", 1, 1024),
+            (Decoded::Done, b"abc".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_chunk_that_would_cross_the_cap_is_refused_at_its_size_line() {
+        // The second chunk's size takes the body to 12 of a 10-byte cap: refused
+        // with its data still unsent — the bytes after the size line never
+        // arrive here, and the outcome does not wait for them.
+        let (outcome, decoded) = decode(b"5\r\nhello\r\n7\r\n", 1, 10);
+        assert_eq!(outcome, Decoded::OverLimit);
+        assert_eq!(decoded, b"hello".to_vec());
+        // Exactly the cap is within it.
+        assert_eq!(
+            decode(b"5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n", 5, 10),
+            (Decoded::Done, b"helloworld".to_vec())
+        );
+        // A size too large for any count is refused, never wrapped.
+        assert_eq!(
+            decode(b"ffffffffffffffffffff\r\n", 64, usize::MAX).0,
+            Decoded::Malformed
+        );
+        assert_eq!(
+            decode(b"ffffffffffffffff\r\n", 64, 10).0,
+            Decoded::OverLimit
+        );
+    }
+
+    #[test]
+    fn malformed_chunk_framing_is_refused() {
+        for wire in [
+            &b"zz\r\nhello\r\n"[..],
+            &b"\r\n"[..],
+            &b"5\r\nhelloXX0\r\n\r\n"[..],
+            &b"-5\r\nhello\r\n"[..],
+        ] {
+            assert_eq!(
+                decode(wire, 1, 1024).0,
+                Decoded::Malformed,
+                "{:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
+        // An unbounded size line is an unbounded allocation: refused once it
+        // outgrows any size a chunk could need.
+        let long = vec![b'1'; MAX_CHUNK_LINE + 2];
+        assert_eq!(decode(&long, 512, usize::MAX).0, Decoded::Malformed);
     }
 
     #[test]
@@ -1461,7 +2023,7 @@ mod tests {
         let answered = block_on(async move {
             let handler: Handler = Rc::new(move |request: Request, response: Response| {
                 crate::executor::pin_future(async move {
-                    let body = request.bytes();
+                    let body = read_body(request.clone(), response.clone(), 1024).await;
                     let text = String::from_utf8_lossy(&body.as_slice()).into_owned();
                     let host = request
                         .header("HOST")
@@ -1495,12 +2057,15 @@ mod tests {
         assert_eq!(body, "hello world|h");
     }
 
+    /// M164: a chunked request is decoded — it was refused with `411` — and
+    /// the handler reads the content, never the framing.
     #[test]
-    fn a_chunked_request_is_refused_over_the_wire_rather_than_misread() {
+    fn a_chunked_request_is_decoded_over_the_wire() {
         let answered = block_on(async move {
-            let handler: Handler = Rc::new(move |_request: Request, response: Response| {
+            let handler: Handler = Rc::new(move |request: Request, response: Response| {
                 crate::executor::pin_future(async move {
-                    response.end("the handler must not be reached");
+                    let body = read_body(request.clone(), response.clone(), 1024).await;
+                    response.end(&String::from_utf8_lossy(&body.as_slice()));
                 })
             });
             let server = create_server(handler);
@@ -1508,15 +2073,87 @@ mod tests {
             let port = server.port() as u16;
             let client = fetch(
                 port,
-                "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n\
+                 6\r\n world\r\n0\r\n\r\n",
             );
             crate::executor::sleep(200, None).await;
             server.close(Rc::new(|| {}));
             client.join().expect("the client thread")
         });
         let (status, _, body) = split(&answered);
-        assert_eq!(status, "HTTP/1.1 411 Length Required");
-        assert_eq!(body, "");
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "hello world");
+    }
+
+    /// M164: a body declared over the cap the read is given is answered `413`
+    /// before a byte of it is read — the client here never SENDS one, so a
+    /// server that waited for it would answer nothing — and the read ends its
+    /// task as a cancellation: the handler's code after it does not run, and
+    /// the cancellation is not reported.
+    #[test]
+    fn a_body_declared_over_the_cap_is_refused_before_it_is_read() {
+        let after_the_read = Rc::new(Cell::new(false));
+        let reached = Rc::clone(&after_the_read);
+        let answered = block_on(async move {
+            let handler: Handler = Rc::new(move |request: Request, response: Response| {
+                let reached = Rc::clone(&reached);
+                crate::executor::pin_future(async move {
+                    let _body = read_body(request.clone(), response.clone(), 10).await;
+                    reached.set(true);
+                    response.end("the handler must not go on");
+                })
+            });
+            let server = create_server(handler);
+            server.listen(0, Rc::new(|| {}));
+            let port = server.port() as u16;
+            let client = fetch(
+                port,
+                "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 11\r\n\r\n",
+            );
+            crate::executor::sleep(200, None).await;
+            server.close(Rc::new(|| {}));
+            client.join().expect("the client thread")
+        });
+        let (status, headers, body) = split(&answered);
+        assert_eq!(status, "HTTP/1.1 413 Content Too Large");
+        assert!(
+            headers.iter().any(|line| line == "Connection: close"),
+            "{headers:?}"
+        );
+        assert_eq!(body, "the request body is larger than 10 bytes");
+        assert!(
+            !after_the_read.get(),
+            "the handler ends at the refused read"
+        );
+    }
+
+    /// M164: a chunked body is counted as it arrives and refused at the chunk
+    /// that crosses the cap — the client here never ends the body, so a server
+    /// that read to the end before counting would answer nothing.
+    #[test]
+    fn a_chunked_body_over_the_cap_is_refused_as_it_arrives() {
+        let answered = block_on(async move {
+            let handler: Handler = Rc::new(move |request: Request, response: Response| {
+                crate::executor::pin_future(async move {
+                    let _body = read_body(request.clone(), response.clone(), 8).await;
+                    response.end("the handler must not go on");
+                })
+            });
+            let server = create_server(handler);
+            server.listen(0, Rc::new(|| {}));
+            let port = server.port() as u16;
+            let client = fetch(
+                port,
+                "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n\
+                 5\r\nworld\r\n",
+            );
+            crate::executor::sleep(200, None).await;
+            server.close(Rc::new(|| {}));
+            client.join().expect("the client thread")
+        });
+        let (status, _, body) = split(&answered);
+        assert_eq!(status, "HTTP/1.1 413 Content Too Large");
+        assert_eq!(body, "the request body is larger than 8 bytes");
     }
 
     #[test]
