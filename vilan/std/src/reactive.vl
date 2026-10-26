@@ -683,6 +683,8 @@ export struct TraceHooks {
 	relay: |Subscriber, Option<Turn>| bool,
 	/// A scrub took this subscriber id out of this turn's queue.
 	forget: |Turn, i32| void,
+	/// An `effect`/`sub`/`on_change` made the subscriber with this id, here (B646).
+	placed: |i32, Location| void,
 }
 
 [internal("the reactive trace's hooks (E257 S8)")]
@@ -695,6 +697,7 @@ export let trace_hooks: Shared<TraceHooks> = Shared::new(TraceHooks {
 	run = |_subscriber: Subscriber, _cause: str| {},
 	relay = |_subscriber: Subscriber, _draining: Option<Turn>| false,
 	forget = |_turn: Turn, _id: i32| {},
+	placed = |_id: i32, _site: Location| {},
 });
 
 /// The cause the wakes being QUEUED now were made by — set for the length of the
@@ -2126,7 +2129,11 @@ export trait Flow<T> {
 	/// direct attach). Until Order 46 it was required and every stage carried the
 	/// same copy, because the native backend refused a default calling a hook it
 	/// reached through a blanket.
+	///
+	/// `[track_caller]` (B646), as every `Flow` subscriber is: under the reactive
+	/// trace (`trace`) the subscriber's wakes name where it was made.
 	[must_use]
+	[track_caller]
 	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
 		observe_flow(self, |value| tracking.clear(|| observer(value)), false)
 	}
@@ -2136,6 +2143,7 @@ export trait Flow<T> {
 	/// owner-tied spelling. A callback, cleared as `on_change`'s is; a default over
 	/// `start`, as `on_change` is.
 	[must_use]
+	[track_caller]
 	fun sub(own self, observer: (|T| void) context tracking): Subscription {
 		observe_flow(self, |value| tracking.clear(|| observer(value)), true)
 	}
@@ -2146,6 +2154,7 @@ export trait Flow<T> {
 	/// A CALLBACK, not a tracking body (A142 §7.3, B482): it runs under
 	/// `tracking.clear(..)`, so a `track()` in it is refused at compile time and a
 	/// `tracking.get_safe()` reads `None`. Its dependency is its input.
+	[track_caller]
 	fun effect_on_change(
 		own self,
 		body: (|T| void) context (owner_scope, tracking, ambient_nursery),
@@ -2176,6 +2185,10 @@ export trait Flow<T> {
 	/// values: the input's observer (minted first) runs the body, and the re-run —
 	/// woken in the derivation phase, run in the effect phase after it — finds it
 	/// clean and does nothing.
+	///
+	/// `[track_caller]` (B646): under the reactive trace (`trace`) the effect's
+	/// wakes name where it was made.
+	[track_caller]
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery)) {
 		let runs = Owner::new();
 		let tracker = new_tracker();
@@ -2201,6 +2214,9 @@ export trait Flow<T> {
 				}
 			}
 		}, false);
+		if tracing.read() {
+			(trace_hooks.read().placed)(rerun.id, caller());
+		}
 		attach_tracker(tracker, rerun);
 		match latest {
 			Some(let value) => run_tracked(runs, tracker, || body(value)),
@@ -2276,20 +2292,41 @@ export impl type S: Source<type T> with Flow<T> {
 
 	[must_use]
 	fun on_change(own self, observer: (|T| void) context tracking): Subscription {
-		self.attach_observer(|value| tracking.clear(|| observer(value)), false)
+		place_subscription(
+			self.attach_observer(|value| tracking.clear(|| observer(value)), false),
+			caller(),
+		)
 	}
 
 	[must_use]
 	fun sub(own self, observer: (|T| void) context tracking): Subscription {
-		self.attach_observer(|value| tracking.clear(|| observer(value)), true)
+		place_subscription(
+			self.attach_observer(|value| tracking.clear(|| observer(value)), true),
+			caller(),
+		)
 	}
+}
+
+/// Under the reactive trace (`trace`), remember that the subscriber behind
+/// `subscription` was made at `site` — a `[track_caller]` `Flow` member's caller
+/// (B646) — and hand the subscription back.
+fun place_subscription(own subscription: Subscription, site: Location): Subscription {
+	if tracing.read() {
+		(trace_hooks.read().placed)(subscription.id, site);
+	}
+	subscription
 }
 
 /// A stage's `on_change` (`immediately` false) and `sub` (true), written once:
 /// start the flow, attach one pulling subscriber, and chain the instance's release
 /// onto the handle. The subscriber is MINTED, so it spends the derivation mark
 /// (`as_derivation`) like every observer does.
+///
+/// `[track_caller]` (B646): under the reactive trace (`trace`) the minted
+/// subscriber is placed at the caller — the program's `sub`/`on_change`, forwarded
+/// through the tracking `Flow` member that called this.
 [internal("a stage author's `on_change`/`sub`, written once")]
+[track_caller]
 export fun observe_flow<T, F: Flow<T>>(
 	own flow: F,
 	observer: |T| void,
@@ -2304,7 +2341,11 @@ export fun observe_flow<T, F: Flow<T>>(
 		// the value is discarded; the OBSERVER still runs only on a change.
 		let _primed = pull();
 	}
-	let subscription = (instance.attach)(mint_subscriber(|| observer(pull())));
+	let subscriber = mint_subscriber(|| observer(pull()));
+	if tracing.read() {
+		(trace_hooks.read().placed)(subscriber.id, caller());
+	}
+	let subscription = (instance.attach)(subscriber);
 	also_releasing(subscription, instance.release);
 	if immediately {
 		observer(pull());
@@ -2444,10 +2485,20 @@ export trait Signal<T> with Source<T> {
 	/// The canonical cell, concretely — deliberately not `Self`: a bare
 	/// `Signal::new(1)` has no receiver and no bound in scope to resolve a `Self`
 	/// against.
+	///
+	/// `[track_caller]` (B646): under the reactive trace (`trace`) the cell
+	/// remembers where it was made — `SignalCell::new`, which this calls, takes
+	/// this call's caller.
+	[track_caller]
 	fun new(own value: T): SignalCell<T> {
 		SignalCell::new(value)
 	}
 
+	/// Write `value` and notify. `[track_caller]` (B646): every implementation
+	/// takes its caller's location — through a bound and a `dyn Signal` too — so
+	/// under the reactive trace (`trace`) a write names its place however it was
+	/// reached.
+	[track_caller]
 	fun set(self, value: T);
 
 	/// Publish the current value without changing it.
@@ -2593,11 +2644,9 @@ fun attach<T>(signal: SignalCell<T>, subscriber: Subscriber): Subscription {
 /// The canonical write side. `set_with` is the trait's default, unchanged — the
 /// body std used to carry here is the body the trait carries now.
 export impl SignalCell<type T> with Signal<T> {
-	/// Reached through the trait — a `S: Signal<T>` bound, a `dyn Signal` — where
-	/// no call site names a location (a `[track_caller]` trait member is refused):
-	/// the inherent `set` below is what a concrete cell's `cell.set(v)` calls, and
-	/// this is that write, made from here (std's place, which the trace leaves
-	/// out).
+	/// Reached through the trait — a `S: Signal<T>` bound, a `dyn Signal` — and
+	/// tracking as the trait declares it (B646): the inherent `set` below is what a
+	/// concrete cell's `cell.set(v)` calls, and this hands it this call's caller.
 	fun set(self, value: T) {
 		self.set(value);
 	}
@@ -2655,9 +2704,9 @@ export impl SignalCell<type T> {
 	/// The cell STORES `value`, so it takes it `own` (R-c): a caller's last use
 	/// moves it in, any other use hands over a copy — never the caller's own value.
 	///
-	/// `[track_caller]`, and inherent rather than the `Signal` impl's (a tracking
-	/// trait member is refused): under the reactive trace (`trace`) the cell
-	/// remembers where it was made, and its wakes name the place.
+	/// `[track_caller]`: under the reactive trace (`trace`) the cell remembers where
+	/// it was made, and its wakes name the place. `Signal::new` tracks too (B646),
+	/// and hands this its caller.
 	[track_caller]
 	fun new(own value: T): SignalCell<T> {
 		mut subscribers: List<Subscriber> = [];
@@ -2674,8 +2723,8 @@ export impl SignalCell<type T> {
 	/// Write `value` and notify — `Signal::set`, for a concrete cell. An inherent
 	/// method is found before the trait's, so `cell.set(v)` lands here, and under
 	/// the reactive trace (`trace`) every wake it causes names this call's place.
-	/// Through the trait (a bound, a `dyn Signal`) the write is the same and names
-	/// no place.
+	/// Through the trait (a bound, a `dyn Signal`) the write is the same, and names
+	/// its place too: the trait's `set` tracks (B646) and hands this its caller.
 	[track_caller]
 	fun set(self, value: T) {
 		if tracing.read() {

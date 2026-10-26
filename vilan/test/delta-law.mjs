@@ -211,6 +211,12 @@ function queue_wakes(turn, subscribers, traced, cause) {
 		enqueue(turn, subscribers);
 	}
 }
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
+}
 function next_random(bound) {
 	const state = seed.v * 16807 % 2147483647;
 	seed.v = state;
@@ -314,14 +320,14 @@ function new3(value2, caller) {
 	}
 	return cell;
 }
-function new4(value2) {
-	return new3(value2, "std/src/reactive.vl:2448:15");
+function new4(value2, caller) {
+	return new3(value2, caller);
 }
 function with_limit(limit) {
 	return [ __shared_new([  ]), __shared_new(0), __shared_new(0), __shared_new([  ]), limit ];
 }
 function bounded(initial, limit) {
-	return [ new4(__clone(initial)), with_limit(limit) ];
+	return [ new4(__clone(initial), "delta-law.vl:66:33"), with_limit(limit) ];
 }
 function cursor(self) {
 	const minted = [ fresh_id(), __shared_new(self[1].v) ];
@@ -341,7 +347,7 @@ function new5() {
 	return [ __shared_new([  ]), __shared_new(0), __shared_new(0), __shared_new([  ]), delta_log_limit ];
 }
 function new6(initial) {
-	return [ new4(__clone(initial)), new5() ];
+	return [ new4(__clone(initial), "delta-law.vl:62:33"), new5() ];
 }
 function since(self, cursor3) {
 	const at2 = cursor3[1].v;
@@ -562,12 +568,12 @@ function attach_observer(self, observer, immediately) {
 function attach_observer2(self, observer, immediately) {
 	return attach_observer(self[0], observer, immediately);
 }
-function on_change(self, observer) {
-	return attach_observer2(self, (value2) => {
+function on_change(self, observer, caller) {
+	return place_subscription(attach_observer2(self, (value2) => {
 		return (() => {
 			return observer(value2, [ 1 ]);
 		})();
-	}, false);
+	}, false), caller);
 }
 function map_each(source2, $a) {
 	const cursor3 = cursor2(source2);
@@ -621,7 +627,7 @@ function map_each(source2, $a) {
 			$i;
 		}
 		return;
-	});
+	}, "delta-law.vl:244:22");
 	return out;
 }
 function size(self) {
@@ -718,6 +724,8 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 }, (_subscriber, _draining) => {
 	return false;
 }, (_turn, _id) => {
+	return;
+}, (_id, _site) => {
 	return;
 } ]);
 const waking = __shared_new([ 1 ]);

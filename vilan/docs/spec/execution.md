@@ -105,9 +105,14 @@ its own site, or, from inside another tracking function's own body, that
 function's location, so a chain of tracking functions reports the outermost
 caller. A closure is a boundary: a closure written inside a tracking
 function reports its own sites. `std::debug::caller()` reads the location.
-The attribute is refused on a trait method (a call through a trait is
-dispatched, so no call site knows to pass a location), and a tracking
-function cannot be taken as a value. std's `panic`, `assert`, `unwrap`,
+A tracking function cannot be taken as a value, and a `for .. in` loop
+cannot call a tracking `next` (the iterator protocol has no site to pass).
+On a trait member the attribute is part of the trait's contract: declared on
+the trait's member, every implementation of it takes the hidden parameter
+whether or not it writes the attribute, and every call naming the member
+passes a location — a static call, a call through a generic bound and a call
+through a `dyn` object's table alike. An implementation that marks a member
+its trait does not declare tracking is refused. std's `panic`, `assert`, `unwrap`,
 `unwrap_err`, `expect`, `expect_err` and `List::remove`/`insert` are
 tracking, and so is every subscript: `xs[i]` out of bounds reports the
 subscript's own site.

@@ -192,6 +192,12 @@ function queue_wakes(turn2, subscribers, traced, cause) {
 		enqueue(turn2, subscribers);
 	}
 }
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
+}
 async function tick() {
 
 }
@@ -203,8 +209,8 @@ function new3(value, caller) {
 	}
 	return cell;
 }
-function new4(value) {
-	return new3(value, "std/src/reactive.vl:2448:15");
+function new4(value, caller) {
+	return new3(value, caller);
 }
 function attach(signal, subscriber) {
 	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
@@ -235,12 +241,12 @@ function attach_observer(self, observer, immediately) {
 	}
 	return subscription;
 }
-function sub(self, observer) {
-	return attach_observer(self, (value) => {
+function sub(self, observer, caller) {
+	return place_subscription(attach_observer(self, (value) => {
 		return (() => {
 			return observer(value, [ 1 ]);
 		})();
-	}, true);
+	}, true), caller);
 }
 function is_empty(self) {
 	return self.length === 0;
@@ -342,16 +348,18 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
-const a = new4(0);
-const b = new4(0);
+const a = new4(0, "reactive-turns.vl:13:18");
+const b = new4(0, "reactive-turns.vl:14:18");
 sub(__clone(a), (value, $a) => {
 	return console.log("a -> " + value);
-});
+}, "reactive-turns.vl:15:19");
 sub(__clone(b), (value, $d) => {
 	return console.log("b -> " + value);
-});
+}, "reactive-turns.vl:16:19");
 const turn_a = new2();
 const turn_b = new2();
 (($e) => {

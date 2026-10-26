@@ -158,11 +158,11 @@ function new3(value, caller) {
 	}
 	return cell;
 }
-function new4(value) {
-	return new3(value, "std/src/reactive.vl:2448:15");
+function new4(value, caller) {
+	return new3(value, caller);
 }
-function new5(value) {
-	return new3(value, "std/src/reactive.vl:2448:15");
+function new5(value, caller) {
+	return new3(value, caller);
 }
 function get(self) {
 	return __clone(self[0].v);
@@ -354,17 +354,19 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const no_cleanups = __shared_new([  ]);
-const title = new4("Tasks <live>");
-const todos = new5([ "alpha", "beta & gamma" ]);
-const page = new5([ 1 ]);
+const title = new4("Tasks <live>", "ssr-render.vl:27:22");
+const todos = new5([ "alpha", "beta & gamma" ], "ssr-render.vl:28:45");
+const page = new5([ 1 ], "ssr-render.vl:29:21");
 console.log(render(app(title, todos, page)));
 console.log(render(text(view("p"), "<script>alert(\"&\")</script>")));
 console.log(render(attr(attr(view("img"), "src", "/logo.png"), "alt", "a & b")));
 console.log(render(child3(attr(view("svg"), "viewBox", "0 0 24 24"), attr(view("path"), "d", "M5 12h14"))));
-const name = new4("world & <you>");
-const mixed = child5(child4(child3(child4(attr2(view("p"), "data-live", new4("a \"quoted\" & value")), "Take "), text(view("code"), "vilan upgrade")), " & enjoy. "), name);
+const name = new4("world & <you>", "ssr-render.vl:48:21");
+const mixed = child5(child4(child3(child4(attr2(view("p"), "data-live", new4("a \"quoted\" & value", "ssr-render.vl:50:30")), "Take "), text(view("code"), "vilan upgrade")), " & enjoy. "), name);
 console.log(render(mixed));
 const pair = [ text(view("i"), "a"), text(view("b"), "b") ];
 console.log(render(child6(view("p"), pair)));

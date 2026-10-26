@@ -255,6 +255,12 @@ function defer(self, cleanup) {
 	}
 	return $J;
 }
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
+}
 function new5(value, caller) {
 	let subscribers = [  ];
 	const cell = [ __shared_new(value), __shared_new(subscribers) ];
@@ -263,8 +269,8 @@ function new5(value, caller) {
 	}
 	return cell;
 }
-function new6(value) {
-	return new5(value, "std/src/reactive.vl:2448:15");
+function new6(value, caller) {
+	return new5(value, caller);
 }
 function is_empty(self) {
 	return self.length === 0;
@@ -327,8 +333,8 @@ function update(self, mutate, $a, caller) {
 function get(self) {
 	return __clone(self[0].v);
 }
-function new7(value) {
-	return new5(value, "std/src/reactive.vl:2448:15");
+function new7(value, caller) {
+	return new5(value, caller);
 }
 function insert(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
@@ -415,12 +421,12 @@ function attach_observer(self, observer, immediately) {
 	}
 	return subscription;
 }
-function sub(self, observer) {
-	return attach_observer(self, (value) => {
+function sub(self, observer, caller) {
+	return place_subscription(attach_observer(self, (value) => {
 		return (() => {
 			return observer(value, [ 1 ]);
 		})();
-	}, true);
+	}, true), caller);
 }
 function take(self, item, $z) {
 	defer(self, () => {
@@ -451,11 +457,11 @@ function set(self, value, $Q, caller) {
 	self[0].v = __clone(value);
 	notify2(self, $Q);
 }
-function set2(self, value, $P) {
-	set(self, value, $P, "std/src/reactive.vl:2602:8");
+function set2(self, value, $P, caller) {
+	set(self, value, $P, caller);
 }
 function set_with(self, transform, $O) {
-	set2(self, transform(get(self)), $O);
+	set2(self, transform(get(self)), $O, "std/src/reactive.vl:2510:8");
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -478,34 +484,36 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
 const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
 const owner = new4();
-const todos = new6([ 1, 2 ]);
+const todos = new6([ 1, 2 ], "signal-update.vl:14:22");
 update(todos, (list) => {
 	list.push(5);
 	return;
 }, [ 1 ], "signal-update.vl:15:8");
 console.log(String(get(todos).length));
-const scores = new7(new2());
+const scores = new7(new2(), "signal-update.vl:21:54");
 update2(scores, (entries) => {
 	insert(entries, "a", 1);
 	insert(entries, "b", 2);
 	return;
 }, [ 1 ], "signal-update.vl:22:9");
 console.log(String(len(get(scores))));
-const count = new7(1);
+const count = new7(1, "signal-update.vl:29:22");
 update3(count, (value) => {
 	value[0][value[1]] = value[0][value[1]] + 10;
 	return;
 }, [ 1 ], "signal-update.vl:30:8");
 console.log(String(get(count)));
-const watched = new6([ 0 ]);
+const watched = new6([ 0 ], "signal-update.vl:36:24");
 take(owner, sub(__clone(watched), (list, $w) => {
 	return console.log("len " + list.length);
-}), [ 1 ]);
+}, "signal-update.vl:37:21"), [ 1 ]);
 update(watched, (list) => {
 	list.push(1);
 	list.push(2);

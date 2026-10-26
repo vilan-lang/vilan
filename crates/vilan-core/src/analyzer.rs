@@ -43004,22 +43004,14 @@ impl<'src> Analyzer<'src> {
         if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
             self.record_type_context_clause(return_type_id, names, body_scope_id, None);
         }
-        // debugging.md S0: `[track_caller]`'s location travels as a hidden
-        // trailing parameter, threaded at every STATIC call. A trait member is
-        // reached by dispatch — a `dyn` table, a generic bound — where no one
-        // call site knows it is calling a tracking function, so the attribute
-        // is refused there rather than silently reporting nothing.
-        if function.track_caller && (self.walking_trait_body || self.walking_trait_impl_body) {
-            self.diagnostics.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span: function.name.1,
-                msg: "`[track_caller]` is not supported on a trait method: a call through \
-                      a trait is dispatched, so no call site knows to pass its location. \
-                      Mark a free function or an inherent method instead"
-                    .to_string(),
-            });
-        }
+        // debugging.md S0, B646: `[track_caller]`'s location travels as a
+        // hidden trailing parameter. On a trait member it is part of the
+        // trait's CONTRACT: declared on the trait, every implementation takes
+        // the hidden location and every call through the trait passes it (a
+        // static call, a bound's call, a `dyn` table's slot). Whether an
+        // implementation's own mark agrees with its trait is decided after
+        // analysis, where the implementation's trait is known
+        // (`track_caller::imply_trait_tracking`).
         if function.external {
             // An `external` function is an intrinsic: no Vilan body, a
             // declared (or void) return type, registered as an external

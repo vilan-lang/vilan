@@ -152,11 +152,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive/trace.vl",
-        5,
+        6,
         "R (E257 S8): the reactive trace's module-level state, program \
          lifetime — the write site a traced `set` leaves for its `notify`, the \
-         traced wake running now, each cell's birthplace by identity, the \
-         queued wakes' causes and tasks, and the task-token counter",
+         traced wake running now, each cell's birthplace by identity, each \
+         subscriber's birthplace by id (B646), the queued wakes' causes and \
+         tasks, and the task-token counter",
     ),
     (
         "reactive/transient.vl",
@@ -332,7 +333,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 239,
+        total, 240,
         "the total number of `Shared` construction sites in std changed"
     );
 

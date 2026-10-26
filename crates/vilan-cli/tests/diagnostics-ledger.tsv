@@ -683,7 +683,6 @@ row	flagship	key
 659	-	cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view, and write `pair.0`
 660	-	`{member_name}` is an `[internal]` field of std's `{struct_name}`, and an internal std field is not a member outside std: {reason}
 661	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed
-662	-	`[track_caller]` is not supported on a trait method: a call through a trait is dispatched, so no call site knows to pass its location
 663	-	`{name}` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one
 664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
 665	-	`dbg` takes no type arguments: it prints each argument at the type it already has
@@ -779,3 +778,5 @@ row	flagship	key
 756	-	a tuple takes no trailing comma; remove the `,` before `)`
 757	-	wrap a closure type that is a parameter in parentheses: `({written})` — bare, its `|` closes the outer parameter list
 758	-	a struct literal can't be a `match` subject here: the `{{` after a name opens the legs; wrap the literal in parentheses or bind it with `let` first
+NEW	-	`[track_caller]` on `{name}`, which `{trait_name}` does not declare tracking: a call through `{trait_name}` (a bound, a `dyn`) would pass no location. Declare it on the trait's member (`[track_caller]` above `{trait_name}`'s `fun {name}`), where every implementation takes it
+NEW	-	`{name}` is `[track_caller]`, and a `for .. in` loop calls it through the iterator protocol, which cannot pass its caller's location. Call `{name}` yourself inside the loop, or drop `[track_caller]` from it
