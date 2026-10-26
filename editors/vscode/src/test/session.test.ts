@@ -519,6 +519,17 @@ test('a traced wake shows the waking write below its cause, and its line in the 
         assert.ok(label > 0, `a label naming the cause: ${JSON.stringify(frames)}`);
         const fixture = path.basename(program);
         assert.match(frames[label].name, new RegExp(`^cell #\\d+ \\(made at ${fixture}:\\d+:\\d+\\), set at ${fixture}:${writes.get('bump')}:\\d+$`));
+        // E336: std's frames are named by their vilan functions, not by V8's
+        // inference - the closure `run_traced` hands `with_finally` read
+        // `running_wake.v` (the property its sibling closure assigns), and the
+        // closures std passes around `(anonymous)`.
+        const names = frames.map((frame) => frame.name);
+        assert.ok(names.includes('a closure in run_traced'), JSON.stringify(names));
+        assert.ok(names.includes('run_traced'), JSON.stringify(names));
+        assert.ok(
+            !names.some((name) => name === '(anonymous)' || name === 'running_wake.v'),
+            `a std frame named by V8's guess: ${JSON.stringify(names)}`,
+        );
         // Below it, the write: std's frames subtle, then `bump` at its `set`.
         const below = frames.slice(label + 1).filter((frame) => frame.presentationHint === 'normal');
         assert.deepEqual([below[0]?.name, below[0]?.line], ['bump', writes.get('bump')], JSON.stringify(frames));

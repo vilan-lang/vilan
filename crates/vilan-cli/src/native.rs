@@ -548,7 +548,15 @@ pub fn run(unit: &Unit, platform: Platform, args: &[String]) -> ExitCode {
         Ok(binary) => binary,
         Err(code) => return code,
     };
-    crate::exit_code_of(Command::new(&binary).args(args).status())
+    // E335: the binary is waited on through the same forwarding wait as the
+    // node program, so a signal sent to `vilan run` reaches it.
+    crate::install_interrupt_hook();
+    crate::exit_code_of(crate::job::run_to_end(|| {
+        Command::new(&binary)
+            .args(args)
+            .spawn()
+            .map(crate::job::ManagedChild::adopt)
+    }))
 }
 
 #[cfg(test)]

@@ -198,9 +198,9 @@ impl Conversation {
         self.stdin = None;
     }
 
-    /// A red step's teardown: the input closes FIRST, because killing `vilan
-    /// run` does not reach the program it started (node, or the native
-    /// binary), and a program parked on stdin ends at its end of input.
+    /// A red step's teardown: the input closes FIRST, because a SIGKILL of `vilan
+    /// run` cannot be forwarded to the program it started (node, or the native
+    /// binary; E335 forwards the catchable signals), and a program parked on stdin ends at its end of input.
     fn abandon(&mut self) {
         self.close();
         let _ = self.child.kill();

@@ -1467,20 +1467,23 @@ fn install_watch_interrupt_hook() {
     install_interrupt_hook();
 }
 
-/// The exit hook for `Ctrl-C` (and, `ctrlc`'s `termination` feature, `SIGTERM`
-/// and `SIGHUP` — a debugger ending a session, a closed terminal): remove the
-/// temp script this process has on disk, with its map and sidecar, and exit
-/// 130. Installed once per process.
+/// The exit hook for `Ctrl-C` (and `SIGTERM` and `SIGHUP` — a debugger ending a
+/// session, a closed terminal): remove the temp script this process has on
+/// disk, with its map and sidecar, and exit 130. Installed once per process.
+/// On unix the signals come through [`job`]'s forwarding pipeline (E335): a
+/// plain `vilan run` that is waiting on its program hands the signal to the
+/// program instead and reports the program's own end; this hook answers a
+/// signal that finds no program to forward to (a compile, a watch session).
 ///
 /// The hook is deliberately tiny, and silent — the process is on its way out
 /// and a warning would race the child's own shutdown. It does not touch the
 /// child, and must not: on unix the terminal delivers `SIGINT` to the whole
 /// process group, so the `node` child is already stopping on its own; on
 /// Windows the child's kill-on-close Job object (see [`job`]) reaps its tree
-/// the moment this process exits. `ctrlc` runs the closure on its own thread
-/// rather than inside the signal handler, which is what makes filesystem work
-/// legal here at all — a raw `SIGINT` handler may not allocate the path or run
-/// `atexit`.
+/// the moment this process exits. The hook runs on its own thread rather than
+/// inside the signal handler (`ctrlc` on Windows, the signal pipe on unix),
+/// which is what makes filesystem work legal here at all — a raw `SIGINT`
+/// handler may not allocate the path or run `atexit`.
 ///
 /// Before the temp-script lock, a plain `vilan run` had no hook at all (an
 /// interrupt left `vilan-run-<pid>.mjs`, its map and its sidecar behind), and
@@ -1494,11 +1497,17 @@ fn install_interrupt_hook() {
     INSTALLED.call_once(|| {
         // Best effort: a run is not worth failing over a handler the OS
         // refused.
-        let _ = ctrlc::set_handler(|| {
-            let _held = clear_temp_script();
-            std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
-        });
+        #[cfg(unix)]
+        job::install_signal_forwarding(|_signal| exit_after_clearing_temp_script());
+        #[cfg(not(unix))]
+        let _ = ctrlc::set_handler(exit_after_clearing_temp_script);
     });
+}
+
+/// The interrupt hook's end: remove the temp script, exit 130.
+fn exit_after_clearing_temp_script() {
+    let _held = clear_temp_script();
+    std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
 }
 
 /// The temp script this process has on disk — `vilan-run-<pid>.mjs`,
@@ -6300,8 +6309,8 @@ fn run_workspace(
     let script = artifact_path(Path::new("dist"), &server.name, NODE_LEG);
     // The build just wrote the server's map beside it, or removed a stale one.
     let mapped = source_map_path(&root.join(&script)).is_file();
-    let status = spawn_node(&script, &node_flags(mapped, inspect), args, Some(root))
-        .and_then(|mut child| child.wait());
+    let status =
+        job::run_to_end(|| spawn_node(&script, &node_flags(mapped, inspect), args, Some(root)));
     exit_code_of(status)
 }
 
@@ -8316,8 +8325,7 @@ fn run_node_script(
             return ExitCode::FAILURE;
         }
     };
-    let status = spawn_node(&script, &node_flags(mapped, inspect), args, None)
-        .and_then(|mut child| child.wait());
+    let status = job::run_to_end(|| spawn_node(&script, &node_flags(mapped, inspect), args, None));
     remove_temp_script(&script);
     exit_code_of(status)
 }
@@ -8449,7 +8457,10 @@ fn exit_code_of(status: std::io::Result<std::process::ExitStatus>) -> ExitCode {
     match status {
         Ok(status) => match status.code() {
             Some(code) => ExitCode::from(code as u8),
-            None => ExitCode::FAILURE, // terminated by a signal
+            // Terminated by a signal: 128 + its number, as a shell reports it
+            // (E335); no number to read off unix.
+            None => job::signal_exit_code(&status)
+                .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)),
         },
         Err(error) => {
             eprintln!(

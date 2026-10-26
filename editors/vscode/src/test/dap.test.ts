@@ -73,6 +73,28 @@ test('a generated position maps to the last segment at or before it', () => {
     assert.equal(map.original({ line: 9, column: 0 }), undefined);
 });
 
+// E336: a frame the sidecar does not describe (std's) is named by the map.
+test('a function head is a segment that starts exactly there and carries the name; a place is held by the last head before it', () => {
+    const map = new SourceMap(
+        {
+            version: 3,
+            sources: ['list.vl'],
+            names: ['first', 'second'],
+            // Line 0: `first`'s head at column 9; line 1: a closure's head (no
+            // name) and a statement in it; line 3: `second`'s head at column 0.
+            mappings: encode([[[9, 0, 4, 4, 0]], [[2, 0, 5, 8], [10, 0, 5, 20]], [], [[0, 0, 12, 4, 1]]]),
+        },
+        path.join(DIST, 'main.mjs.map'),
+    );
+    assert.equal(map.names[map.segmentAt({ line: 0, column: 9 })?.name ?? -1], 'first');
+    assert.equal(map.segmentAt({ line: 0, column: 10 }), undefined, 'a head is where it starts, not after');
+    assert.equal(map.segmentAt({ line: 1, column: 2 })?.name, undefined, 'a closure head carries no name');
+    assert.equal(map.enclosingFunctionName({ line: 1, column: 2 }), 'first');
+    assert.equal(map.enclosingFunctionName({ line: 0, column: 3 }), undefined, 'nothing before the first head');
+    assert.equal(map.enclosingFunctionName({ line: 3, column: 5 }), 'second');
+    assert.equal(map.enclosingFunctionName({ line: 2, column: 0 }), 'first');
+});
+
 test('a breakpoint binds at the line\'s statement start in every emitted copy, sliding to the next mapped line', () => {
     const map = exampleMap();
     const source = map.sourceIndex(path.join(DIST, 'main.vl'));
@@ -382,17 +404,22 @@ test('a JavaScript value prints as the JavaScript debugger would', () => {
     assert.equal(describe(undefined), 'undefined');
 });
 
-/// `[[column, source, line, column], ..]` per line, encoded as `mappings`.
+/// `[[column, source, line, column, name?], ..]` per line, encoded as `mappings`.
 function encode(lines: number[][][]): string {
     let source = 0;
     let line = 0;
     let column = 0;
+    let name = 0;
     return lines
         .map((segments) => {
             let generated = 0;
             return segments
                 .map((segment) => {
                     const fields = [segment[0] - generated, segment[1] - source, segment[2] - line, segment[3] - column];
+                    if (segment[4] !== undefined) {
+                        fields.push(segment[4] - name);
+                        name = segment[4];
+                    }
                     generated = segment[0];
                     source = segment[1];
                     line = segment[2];

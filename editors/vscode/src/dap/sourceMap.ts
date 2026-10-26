@@ -96,6 +96,33 @@ export class SourceMap {
         };
     }
 
+    /// The segment that STARTS exactly at `position`, if one does (a function
+    /// head is marked at the column V8 reports it at).
+    segmentAt(position: GeneratedPosition): Segment | undefined {
+        return this.lines[position.line]?.find((segment) => segment.column === position.column && segment.source >= 0);
+    }
+
+    /// The function a generated position stands in, by the nearest NAMED
+    /// segment before it - a function head is the one mark that carries a
+    /// `names` entry, and the emitted functions are flat at the module's top
+    /// level, so the last head before a place is the function holding it (a
+    /// function declared inside another is the one blind spot).
+    enclosingFunctionName(position: GeneratedPosition): string | undefined {
+        for (let line = Math.min(position.line, this.lines.length - 1); line >= 0; line--) {
+            const segments = this.lines[line];
+            for (let index = segments.length - 1; index >= 0; index--) {
+                const segment = segments[index];
+                if (line === position.line && segment.column > position.column) {
+                    continue;
+                }
+                if (segment.name !== undefined) {
+                    return this.names[segment.name];
+                }
+            }
+        }
+        return undefined;
+    }
+
     /// Where a breakpoint on `line` of `source` binds: the line's statement
     /// starts — every segment at the line's smallest original column, one per
     /// emitted copy (each instance of a generic, a closure's re-emission). A
