@@ -18,7 +18,6 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 mod support;
 
@@ -190,24 +189,10 @@ fn exchange(port: u16, head: &str, body: &[u8]) -> Result<String, String> {
     read_response(&mut stream)
 }
 
-/// What a client that streams its body while it reads saw: how much of the
-/// body the server let it write, whether the write failed, and the response.
-struct Streamed {
-    sent: usize,
-    failed: bool,
-    response: String,
-}
-
 /// Sends `head`, then `total` body bytes from a second thread — in chunks
-/// when `chunked`, and with no terminating chunk unless `terminate` — while
-/// this thread reads the response.
-fn streamed(
-    port: u16,
-    head: &str,
-    total: usize,
-    chunked: bool,
-    terminate: bool,
-) -> Result<Streamed, String> {
+/// when `chunked`, with no terminating chunk — while this thread reads the
+/// response.
+fn streamed(port: u16, head: &str, total: usize, chunked: bool) -> Result<String, String> {
     let mut stream = connect(port)?;
     stream
         .write_all(head.as_bytes())
@@ -229,25 +214,17 @@ fn streamed(
                 writer.write_all(&piece[..count])
             };
             if written.is_err() {
-                return (sent, true);
+                return;
             }
             sent += count;
         }
-        if chunked && terminate && writer.write_all(b"0\r\n\r\n").is_err() {
-            return (sent, true);
-        }
-        (sent, false)
     });
     let response = read_response(&mut stream).unwrap_or_else(|failure| failure);
     // The sender ends either way: the server closed the socket under it, or it
     // wrote everything.
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    let (sent, failed) = sender.join().expect("the sending thread");
-    Ok(Streamed {
-        sent,
-        failed,
-        response,
-    })
+    sender.join().expect("the sending thread");
+    Ok(response)
 }
 
 fn status_of(response: &str) -> &str {
@@ -434,9 +411,9 @@ fn the_writer_of_a_refused_body_stalls(port: u16, _backend: Backend) -> Result<(
 /// refused connection half-closes and lingers before the close, so the reset
 /// that closing over unread bytes sends cannot overtake the answer.
 fn a_streaming_client_reads_the_refusal(port: u16, _backend: Backend) -> Result<(), String> {
-    let outcome = streamed(port, &post_head("/echo", 2 * MIB), 2 * MIB, false, false)?;
-    expect_status(&outcome.response, "HTTP/1.1 413 Content Too Large")?;
-    expect_body(&outcome.response, DEFAULT_REFUSAL)
+    let outcome = streamed(port, &post_head("/echo", 2 * MIB), 2 * MIB, false)?;
+    expect_status(&outcome, "HTTP/1.1 413 Content Too Large")?;
+    expect_body(&outcome, DEFAULT_REFUSAL)
 }
 
 /// A chunked body over the default, counted as it arrives: 1.5 MiB in 64 KiB
@@ -445,9 +422,9 @@ fn chunked_over_the_default_is_refused_as_it_arrives(
     port: u16,
     _backend: Backend,
 ) -> Result<(), String> {
-    let outcome = streamed(port, &chunked_head("/echo"), 3 * MIB / 2, true, false)?;
-    expect_status(&outcome.response, "HTTP/1.1 413 Content Too Large")?;
-    expect_body(&outcome.response, DEFAULT_REFUSAL)
+    let outcome = streamed(port, &chunked_head("/echo"), 3 * MIB / 2, true)?;
+    expect_status(&outcome, "HTTP/1.1 413 Content Too Large")?;
+    expect_body(&outcome, DEFAULT_REFUSAL)
 }
 
 /// A chunked body within the cap is decoded — the native server refused every
@@ -464,15 +441,9 @@ fn chunked_within_the_cap_is_decoded(port: u16, _backend: Backend) -> Result<(),
 
 /// A body within the cap is read whole, streamed in pieces.
 fn a_body_within_the_cap_is_read_whole(port: u16, _backend: Backend) -> Result<(), String> {
-    let outcome = streamed(
-        port,
-        &post_head("/echo", 900 * 1024),
-        900 * 1024,
-        false,
-        false,
-    )?;
-    expect_status(&outcome.response, "HTTP/1.1 200 OK")?;
-    expect_body(&outcome.response, "len=921600")
+    let outcome = streamed(port, &post_head("/echo", 900 * 1024), 900 * 1024, false)?;
+    expect_status(&outcome, "HTTP/1.1 200 OK")?;
+    expect_body(&outcome, "len=921600")
 }
 
 /// A client that hangs up halfway through a body ends that request and
@@ -726,9 +697,9 @@ fn the_server_cap_is_the_builders(port: u16, _backend: Backend) -> Result<(), St
 /// The PER-ROUTE override: the handler raises its request's cap before the
 /// read — a 3 MiB body is read whole, a 5 MiB one refused at its declaration.
 fn a_route_raises_its_own_cap(port: u16, _backend: Backend) -> Result<(), String> {
-    let within = streamed(port, &post_head("/route", 3 * MIB), 3 * MIB, false, false)?;
-    expect_status(&within.response, "HTTP/1.1 200 OK")?;
-    expect_body(&within.response, "len=3145728")?;
+    let within = streamed(port, &post_head("/route", 3 * MIB), 3 * MIB, false)?;
+    expect_status(&within, "HTTP/1.1 200 OK")?;
+    expect_body(&within, "len=3145728")?;
     let over = exchange(port, &post_head("/route", 5 * MIB), b"")?;
     expect_status(&over, "HTTP/1.1 413 Content Too Large")?;
     expect_body(&over, "the request body is larger than 4194304 bytes")
@@ -738,23 +709,11 @@ fn a_route_raises_its_own_cap(port: u16, _backend: Backend) -> Result<(), String
 /// by whole segments, so `/mountain` keeps the server's 512 — and the longer
 /// mount under it (`/mount/narrow/`) wins with its 1 KiB.
 fn a_mount_sets_the_cap_under_it(port: u16, _backend: Backend) -> Result<(), String> {
-    let under = streamed(
-        port,
-        &post_head("/mount/files", 2 * MIB),
-        2 * MIB,
-        false,
-        false,
-    )?;
-    expect_status(&under.response, "HTTP/1.1 200 OK")?;
-    expect_body(&under.response, "len=2097152")?;
-    let itself = streamed(
-        port,
-        &post_head("/mount?x=1", 2 * MIB),
-        2 * MIB,
-        false,
-        false,
-    )?;
-    expect_status(&itself.response, "HTTP/1.1 200 OK")?;
+    let under = streamed(port, &post_head("/mount/files", 2 * MIB), 2 * MIB, false)?;
+    expect_status(&under, "HTTP/1.1 200 OK")?;
+    expect_body(&under, "len=2097152")?;
+    let itself = streamed(port, &post_head("/mount?x=1", 2 * MIB), 2 * MIB, false)?;
+    expect_status(&itself, "HTTP/1.1 200 OK")?;
     let beside = exchange(port, &post_head("/mountain", 2 * MIB), b"")?;
     expect_body(&beside, "the request body is larger than 512 bytes")?;
     let narrower = exchange(port, &post_head("/mount/narrow/x", 2000), b"")?;
@@ -774,14 +733,10 @@ fn a_service_mount_takes_its_mounts_cap(port: u16, _backend: Backend) -> Result<
         ),
         2 * MIB,
         false,
-        false,
     )?;
-    expect_status(&outcome.response, "HTTP/1.1 400 Bad Request")?;
-    if !body_of(&outcome.response).contains("Decode") {
-        return Err(format!(
-            "the frame must reach the codec: {}",
-            outcome.response
-        ));
+    expect_status(&outcome, "HTTP/1.1 400 Bad Request")?;
+    if !body_of(&outcome).contains("Decode") {
+        return Err(format!("the frame must reach the codec: {}", outcome));
     }
     Ok(())
 }
@@ -805,9 +760,9 @@ fn the_upload_route_shape(port: u16, _backend: Backend) -> Result<(), String> {
     let too_big = exchange(port, &signed_in(30_000_000), b"")?;
     expect_code(&too_big, 413)?;
     expect_body(&too_big, "Files can be up to 25 MB.")?;
-    let stored = streamed(port, &signed_in(5 * MIB), 5 * MIB, false, false)?;
-    expect_status(&stored.response, "HTTP/1.1 200 OK")?;
-    expect_body(&stored.response, "stored=5242880")
+    let stored = streamed(port, &signed_in(5 * MIB), 5 * MIB, false)?;
+    expect_status(&stored, "HTTP/1.1 200 OK")?;
+    expect_body(&stored, "stored=5242880")
 }
 
 #[test]
