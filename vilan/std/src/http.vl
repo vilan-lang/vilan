@@ -195,7 +195,9 @@ export struct Request {
 	/// The response this request is answered on — where a refused body's `413`
 	/// goes.
 	reply: NodeResponse,
-	/// The most body bytes `bytes`/`body` will read: the server's `max_body_bytes`.
+	/// The most body bytes `bytes`/`body` will read: the server's `max_body_bytes`,
+	/// or the cap of the mount the path is under (`max_body_bytes_under`), or this
+	/// request's own (`Request::max_body_bytes`).
 	limit: usize,
 }
 
@@ -224,15 +226,28 @@ export impl Request {
 	/// declared `Content-Length`, a quota — never receives the body at all. A later
 	/// call answers the same bytes without reading again.
 	///
-	/// At most the server's cap (`max_body_bytes`, 1 MiB unless the server said
-	/// otherwise) is read. A body over it — a declared `Content-Length` before a
-	/// byte of the body is read, a chunked one at the chunk that crosses it — is
-	/// answered `413 Content Too Large`, the connection is closed without reading
-	/// the rest, and the handler ENDS here, as a cancelled task ends: the request
-	/// is over, so the code after the read does not run and its response is never
-	/// asked for. A client that hangs up mid-body ends the handler the same way.
+	/// At most the request's cap (`max_body_bytes`, 1 MiB unless the server or the
+	/// handler said otherwise) is read. A body over it — a declared
+	/// `Content-Length` before a byte of the body is read, a chunked one at the
+	/// chunk that crosses it — is answered `413 Content Too Large`, the connection
+	/// is closed without reading the rest, and the handler ENDS here, as a
+	/// cancelled task ends: the request is over, so the code after the read does
+	/// not run and its response is never asked for. A client that hangs up mid-body
+	/// ends the handler the same way.
 	fun bytes(self): Bytes {
 		read_body(self.node, self.reply, self.limit)
+	}
+
+	/// This request's body cap, in place of the server's — the PER-ROUTE override
+	/// (M164). Call it before the first read, in the arm that matched the route:
+	///
+	///	ApiRoute::Upload => upload(request.max_body_bytes(25 * 1024 * 1024)),
+	///
+	/// It can lower the cap as well as raise it, and it is the handler's own
+	/// decision per request — a quota or a role can choose it.
+	fun max_body_bytes(own self, limit: usize): Request {
+		self.limit = limit;
+		self
 	}
 
 	/// The value of a named request header, or `None` when the request did not
@@ -549,7 +564,7 @@ export struct Server {
 	/// waits on this handler — the socket stays open until something writes to it —
 	/// so a handler that settles later still owns the socket when it does.
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
-	/// The request-body cap (M164).
+	/// The request-body caps (M164): the server's, and each mount's.
 	body_limits: BodyLimits,
 	/// The live listener, once bound — what `stop()` closes. `start()` populates it
 	/// on the copy of `Server` it hands to `on_start`, so stopping a `Server` value
@@ -586,22 +601,50 @@ export struct ServerBuilder {
 	/// headers (kolt.local 025b — §5.10's fence is about defaults, and this is the
 	/// hook, not a default).
 	asset_cache: Option<|str| CachePolicy>,
-	/// The request-body cap `max_body_bytes` set.
+	/// The request-body caps `max_body_bytes` and `max_body_bytes_under` set.
 	body_limits: BodyLimits,
 }
 
-/// How many body bytes a request may send (M164).
+/// How many body bytes a request may send (M164): one cap for the whole server and
+/// one per mount, a path prefix — the longest mount a request's path is under wins.
+/// A handler can still choose per request (`Request::max_body_bytes`).
 export struct BodyLimits {
 	server: usize,
+	mounts: List<(str, usize)>,
 }
 
 export impl BodyLimits {
-	/// The cap a server has when the app sets none: 1 MiB for every request (M164,
+	/// The caps a server has when the app sets none: 1 MiB for every request (M164,
 	/// R-g) — big enough for every form, JSON call and rpc frame an app sends; an
-	/// upload route raises its own.
+	/// upload route raises its own — and no mounts.
 	fun new(): BodyLimits {
-		BodyLimits { server = 1048576 }
+		BodyLimits { server = 1048576, mounts = [] }
 	}
+
+	/// The cap for a request at `target` (path + query): its longest mount's, or
+	/// the server's.
+	fun for_target(self, target: str): usize {
+		let path = target.split("?")[0];
+		mut chosen = self.server;
+		mut chosen_length = 0usize;
+		for mount in self.mounts {
+			let (prefix, limit) = mount;
+			if is_under(path, prefix) && (chosen_length == 0 || prefix.len() >= chosen_length) {
+				chosen = limit;
+				chosen_length = prefix.len();
+			}
+		}
+		chosen
+	}
+}
+
+/// Whether `path` is at or under the mount `prefix`, by whole segments: `/api` and
+/// `/api/` both cover `/api/upload`, and neither covers `/apiary`.
+fun is_under(path: str, prefix: str): bool {
+	if prefix.ends_with("/") {
+		ret path.starts_with(prefix) || path == prefix.substring(0, prefix.len() - 1);
+	}
+	path == prefix || path.starts_with(prefix + "/")
 }
 
 export impl Server {
@@ -656,9 +699,9 @@ export impl Server {
 		let body_limits = self.body_limits;
 		let node_server = node_create_server(|node_request, node_response| {
 			// The handler runs on the HEAD: the body stays on the wire until it
-			// asks (`Request::bytes`, M164), under the server's cap. `respond` is
-			// what keeps a refused body's cancellation from ending the process on
-			// node.
+			// asks (`Request::bytes`, M164), under the cap its path resolves to.
+			// `respond` is what keeps a refused body's cancellation from ending the
+			// process on node.
 			//
 			// This callback suspends — `request_handler` is `async` and awaited —
 			// which is the proof that nothing downstream of it is synchronous. Said
@@ -711,7 +754,7 @@ fun answer(
 	node_request: NodeRequest,
 	node_response: NodeResponse,
 ) {
-	let limit = body_limits.server;
+	let limit = body_limits.for_target(node_request.url());
 	let response = request_handler(Request { node = node_request, reply = node_response, limit });
 	node_response.set_status_code(response.status);
 	if response.headers.len() == 0 {
@@ -767,6 +810,16 @@ export impl ServerBuilder {
 	/// so a mounted service is under it too.
 	fun max_body_bytes(own self, limit: usize): ServerBuilder {
 		self.body_limits.server = limit;
+		self
+	}
+
+	/// The body cap for every request at or under `mount` — a path prefix, by whole
+	/// segments (`/api/files` covers `/api/files/upload`, not `/api/filesystem`) —
+	/// in place of the server's: the PER-MOUNT override (M164). The longest mount a
+	/// path is under wins; repeatable. A handler that matched one route can still
+	/// choose its own (`Request::max_body_bytes`).
+	fun max_body_bytes_under(own self, mount: str, limit: usize): ServerBuilder {
+		self.body_limits.mounts.push((mount, limit));
 		self
 	}
 

@@ -639,3 +639,197 @@ fn m164_a_handler_reads_the_body_only_when_it_asks_on_both_backends() {
         ),
     ]);
 }
+
+// ------------------------------------------------------- the overrides ---
+
+/// The overrides' program: the server's own cap LOWERED to 512 bytes, two
+/// mounts above it (the longer one narrower), a mounted rpc service under a
+/// mount of its own, a route that raises its cap in the handler, and the shape
+/// of kolt's `/api/upload` — an auth check and a declared-length check off the
+/// head, then the read under the route's own 25 MB.
+const OVERRIDES_SERVER: &str = r#"import std::io::print;
+import std::http::{ Request, Response, Server };
+import std::json::json_codec;
+import std::rpc::server::Service;
+import std::shared::Shared;
+
+[service(CounterClient)]
+struct Counter {
+	count: Shared<i32>,
+}
+
+impl Counter {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.write() = self.count.read() + by;
+		self.count.read()
+	}
+}
+
+let max_upload_bytes = 26214400;
+
+fun echo(request: Request): Response {
+	let body = request.bytes();
+	Response::builder().body(i"len={body.len()}").build()
+}
+
+fun plain(code: i32, text: str): Response {
+	Response::builder().code(code).body(text).build()
+}
+
+fun upload(request: Request): Response {
+	request.header("X-Signed-In") is Some(let _user) else ret plain(401, "Sign in to upload.");
+	let declared = request
+		.header("Content-Length")
+		.and_then(|length| length.parse_f64())
+		.unwrap_or(0);
+	declared <= max_upload_bytes.as_f64() else ret plain(413, "Files can be up to 25 MB.");
+	let bytes = request.max_body_bytes(max_upload_bytes.as_usize()).bytes();
+	Response::builder().body(i"stored={bytes.len()}").build()
+}
+
+fun main() {
+	let counter = Counter { count = Shared::new(0) };
+	Server::builder()
+		.port(0)
+		.max_body_bytes(512)
+		.max_body_bytes_under("/mount", 3145728)
+		.max_body_bytes_under("/mount/narrow/", 1024)
+		.max_body_bytes_under("/svc/", 3145728)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).at("/svc/"))
+		.on_request(|request| {
+			let path = request.path();
+			if path == "/api/upload" {
+				ret upload(request);
+			}
+			if path == "/route" {
+				ret echo(request.max_body_bytes(4194304));
+			}
+			echo(request)
+		})
+		.on_start(|server| ANNOUNCE)
+		.build()
+		.start();
+}
+"#;
+
+/// `max_body_bytes(512)` moves the server's own cap — down, here.
+fn the_server_cap_is_the_builders(port: u16, _backend: Backend) -> Result<(), String> {
+    let within = exchange(port, &post_head("/echo", 500), &[b'a'; 500])?;
+    expect_status(&within, "HTTP/1.1 200 OK")?;
+    expect_body(&within, "len=500")?;
+    let over = exchange(port, &post_head("/echo", 600), b"")?;
+    expect_status(&over, "HTTP/1.1 413 Content Too Large")?;
+    expect_body(&over, "the request body is larger than 512 bytes")
+}
+
+/// The PER-ROUTE override: the handler raises its request's cap before the
+/// read — a 3 MiB body is read whole, a 5 MiB one refused at its declaration.
+fn a_route_raises_its_own_cap(port: u16, _backend: Backend) -> Result<(), String> {
+    let within = streamed(port, &post_head("/route", 3 * MIB), 3 * MIB, false, false)?;
+    expect_status(&within.response, "HTTP/1.1 200 OK")?;
+    expect_body(&within.response, "len=3145728")?;
+    let over = exchange(port, &post_head("/route", 5 * MIB), b"")?;
+    expect_status(&over, "HTTP/1.1 413 Content Too Large")?;
+    expect_body(&over, "the request body is larger than 4194304 bytes")
+}
+
+/// The PER-MOUNT override: every path at or under `/mount` takes its 3 MiB —
+/// by whole segments, so `/mountain` keeps the server's 512 — and the longer
+/// mount under it (`/mount/narrow/`) wins with its 1 KiB.
+fn a_mount_sets_the_cap_under_it(port: u16, _backend: Backend) -> Result<(), String> {
+    let under = streamed(
+        port,
+        &post_head("/mount/files", 2 * MIB),
+        2 * MIB,
+        false,
+        false,
+    )?;
+    expect_status(&under.response, "HTTP/1.1 200 OK")?;
+    expect_body(&under.response, "len=2097152")?;
+    let itself = streamed(
+        port,
+        &post_head("/mount?x=1", 2 * MIB),
+        2 * MIB,
+        false,
+        false,
+    )?;
+    expect_status(&itself.response, "HTTP/1.1 200 OK")?;
+    let beside = exchange(port, &post_head("/mountain", 2 * MIB), b"")?;
+    expect_body(&beside, "the request body is larger than 512 bytes")?;
+    let narrower = exchange(port, &post_head("/mount/narrow/x", 2000), b"")?;
+    expect_body(&narrower, "the request body is larger than 1024 bytes")
+}
+
+/// A mounted rpc service under a mount of its own: the POST leg reads a 2 MiB
+/// frame (the codec refuses it as JSON — the cap did not), where the server's
+/// 512 would have refused it.
+fn a_service_mount_takes_its_mounts_cap(port: u16, _backend: Backend) -> Result<(), String> {
+    let outcome = streamed(
+        port,
+        &format!(
+            "POST /svc/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            2 * MIB
+        ),
+        2 * MIB,
+        false,
+        false,
+    )?;
+    expect_status(&outcome.response, "HTTP/1.1 400 Bad Request")?;
+    if !body_of(&outcome.response).contains("Decode") {
+        return Err(format!(
+            "the frame must reach the codec: {}",
+            outcome.response
+        ));
+    }
+    Ok(())
+}
+
+/// kolt's `/api/upload`, as the exhibit: refused from the HEAD when the client
+/// is not signed in (a 20 MB body never sent), its own `413` for a declared
+/// size over 25 MB, and an upload over the server's 512 bytes stored under the
+/// route's own 25 MB.
+fn the_upload_route_shape(port: u16, _backend: Backend) -> Result<(), String> {
+    let anonymous = exchange(port, &post_head("/api/upload", 20_000_000), b"")?;
+    expect_status(&anonymous, "HTTP/1.1 401 Unauthorized")?;
+    expect_body(&anonymous, "Sign in to upload.")?;
+    let signed_in = |length: usize| {
+        format!(
+            "POST /api/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Signed-In: ada\r\n\
+             Content-Length: {length}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // The app's own 413: node names it `Payload Too Large`, the native server
+    // RFC 9110's `Content Too Large`, so only the code is compared here.
+    let too_big = exchange(port, &signed_in(30_000_000), b"")?;
+    expect_code(&too_big, 413)?;
+    expect_body(&too_big, "Files can be up to 25 MB.")?;
+    let stored = streamed(port, &signed_in(5 * MIB), 5 * MIB, false, false)?;
+    expect_status(&stored.response, "HTTP/1.1 200 OK")?;
+    expect_body(&stored.response, "stored=5242880")
+}
+
+#[test]
+fn m164_the_server_a_mount_and_a_route_each_set_the_cap_on_both_backends() {
+    let built = Built::new(
+        "request_body_overrides",
+        &OVERRIDES_SERVER.replace("ANNOUNCE", ANNOUNCE_PORT),
+    );
+    built.check(&[
+        (
+            "the server's cap is the builder's",
+            the_server_cap_is_the_builders,
+        ),
+        ("a route raises its own cap", a_route_raises_its_own_cap),
+        (
+            "a mount sets the cap under it",
+            a_mount_sets_the_cap_under_it,
+        ),
+        (
+            "a service mount takes its mount's cap",
+            a_service_mount_takes_its_mounts_cap,
+        ),
+        ("the upload route's shape", the_upload_route_shape),
+    ]);
+}
