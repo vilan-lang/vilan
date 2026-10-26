@@ -1,0 +1,52 @@
+// B647: a module-level `mut` binding lent to a callee that does not write it,
+// a local lent to one that writes a module binding, the copy the refusal
+// names, and the by-value twin (a module binding handed by value to a callee
+// that writes it is a copy, rule 1) - the same answers on both backends.
+import std::io::print;
+
+struct Log {
+	items: List<i32>,
+}
+
+impl Log {
+	fun grown(self): usize {
+		module_log.items.push(1);
+		self.items.len()
+	}
+}
+
+mut module_items: List<i32> = [1];
+mut module_other: List<i32> = [];
+mut module_log: Log = Log { items = [] };
+
+fun reads(items: &List<i32>): usize {
+	module_items.len() + items.len()
+}
+
+fun grows_other(items: &List<i32>): usize {
+	module_other.push(1);
+	items.len()
+}
+
+fun lent_and_grow(items: &List<i32>): usize {
+	module_items.push(2);
+	items.len()
+}
+
+fun by_value(items: List<i32>): usize {
+	module_items.push(3);
+	items.len()
+}
+
+fun main() {
+	print(reads(&module_items));
+	print(grows_other(&module_items));
+	mut local = [5];
+	print(lent_and_grow(&local));
+	let items = module_items;
+	print(lent_and_grow(&items));
+	print(by_value(module_items));
+	print(module_items.len());
+	print(module_log.grown());
+	print(module_log.items.len());
+}

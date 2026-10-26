@@ -304,7 +304,7 @@ function advance(self, carried) {
 			if ($ae[0] === 0) {
 				const message2 = $ae[1];
 				$af = (() => {
-					throw __panic(message2, "std/src/reactive.vl:1291:27");
+					throw __panic(message2, "std/src/reactive.vl:1294:27");
 				})();
 			} else {
 				$af = undefined;
@@ -337,6 +337,12 @@ function defer_to_owner(cleanup, $M) {
 	}
 	return $O;
 }
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
+}
 function new4(value, caller) {
 	let subscribers = [  ];
 	const cell = [ __shared_new(value), __shared_new(subscribers) ];
@@ -345,8 +351,8 @@ function new4(value, caller) {
 	}
 	return cell;
 }
-function new5(value) {
-	return new4(value, "std/src/reactive.vl:2448:15");
+function new5(value, caller) {
+	return new4(value, caller);
 }
 function get(self) {
 	return __clone(self[0].v);
@@ -435,12 +441,12 @@ function attach_observer(self, observer, immediately) {
 	}
 	return subscription;
 }
-function on_change(self, observer) {
-	return attach_observer(self, (value) => {
+function on_change(self, observer, caller) {
+	return place_subscription(attach_observer(self, (value) => {
 		return (() => {
 			return observer(value, [ 1 ]);
 		})();
-	}, false);
+	}, false), caller);
 }
 function take(self, item, $x) {
 	defer(self, () => {
@@ -460,7 +466,7 @@ function selector(source, $a, $b) {
 		let $e = null;
 		if ($d[0] === 0) {
 			const leaving = $d[1];
-			$e = set(leaving, false, $a, "std/src/reactive.vl:2967:33");
+			$e = set(leaving, false, $a, "std/src/reactive.vl:3016:33");
 		} else {
 			$e = undefined;
 		}
@@ -469,12 +475,12 @@ function selector(source, $a, $b) {
 		let $q = null;
 		if ($p[0] === 0) {
 			const arriving = $p[1];
-			$q = set(arriving, true, $a, "std/src/reactive.vl:2971:35");
+			$q = set(arriving, true, $a, "std/src/reactive.vl:3020:35");
 		} else {
 			$q = undefined;
 		}
 		return $q;
-	}), $a, $b);
+	}, "std/src/reactive.vl:3009:42"), $a, $b);
 	return [ cells, current2 ];
 }
 function of(self, key, $J) {
@@ -485,7 +491,7 @@ function of(self, key, $J) {
 		const existing = $K[1];
 		$L = existing;
 	} else {
-		const cell = new4(key === self[1].v, "std/src/reactive.vl:2991:46");
+		const cell = new4(key === self[1].v, "std/src/reactive.vl:3040:46");
 		self[0].v.set(hash2, cell);
 		defer_to_owner(() => {
 			self[0].v.delete(hash2);
@@ -584,11 +590,13 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
 const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
-const current = new5(1);
+const current = new5(1, "reactive-selector.vl:20:41");
 const selected = selector(current, [ 1 ], [ 1 ]);
 const rows = new3();
 const one = run_with_owner(rows, ($I) => {
@@ -612,12 +620,12 @@ set2(current, 2, [ 1 ], "reactive-selector.vl:43:10");
 console.log("same cell=" + get(again) + " entries=" + selected[0].v.size);
 dispose2(rows);
 console.log("after dispose=" + selected[0].v.size);
-const counted = new5(0);
+const counted = new5(0, "reactive-selector.vl:56:41");
 let hits = 0;
 const watch = on_change(__clone(counted), (_, $ai) => {
 	hits = hits + 1;
 	return;
-});
+}, "reactive-selector.vl:58:22");
 batch(($aj) => {
 	set2(counted, 1, [ 0, $aj ], "reactive-selector.vl:62:11");
 	set2(counted, 2, [ 0, $aj ], "reactive-selector.vl:63:11");

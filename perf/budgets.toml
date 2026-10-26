@@ -533,3 +533,324 @@ class = "reference"
 ratio = 1.002
 reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.143 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
 item = "M157"
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00111 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00111 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00100 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:watch"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00100 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00257 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:browser"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00257 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00308 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00308 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00102 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:router"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00102 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00179 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00179 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00170 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00170 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00192 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:canvas"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00192 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00224 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:rpc"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00224 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00221 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00221 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00172 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.005
+reason = "B646's [track_caller] on trait members: std marks Signal::new/set and Flow's effect/effect_on_change/sub/on_change (and observe_flow), every implementation gains the hidden Location parameter and every call through the trait its argument, and the trace's `placed` hook: x1.00172 instructions:u of `vilan check` on the lane's box (reference machine, loaded) against the installed v0.52.0 (d18f50d8)."
+item = "B646"
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00204 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00204 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00191 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:watch"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00191 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00200 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:browser"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00200 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00280 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00280 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00256 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:router"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00256 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00513 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00513 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00212 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00212 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00165 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:canvas"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00165 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00247 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:rpc"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00247 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00342 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00342 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00363 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00363 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00392 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"
+
+[[bump]]
+subject = "genapp:46"
+class = "reference"
+ratio = 1.004
+reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00392 instructions:u (B646's share is under its own 1.005 rows)."
+item = "B659"

@@ -126,8 +126,8 @@ function new2(value, caller) {
 	}
 	return cell;
 }
-function new3(value) {
-	return new2(value, "std/src/reactive.vl:2448:15");
+function new3(value, caller) {
+	return new2(value, caller);
 }
 function get(self) {
 	return __clone(self[0].v);
@@ -204,8 +204,10 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
-const name = new3("world & <you>");
+const name = new3("world & <you>", "element-syntax.vl:17:21");
 console.log(render(child3(child(child2(child(attr2(attr(view("p"), "data-live", __clone(name)), "title", "hi"), "Take "), child(view("code"), "vilan upgrade")), " & enjoy. "), name)));
 console.log(render(attr2(attr2(attr2(view("input"), "type", "checkbox"), "aria-label", "Done"), "disabled", "")));
 console.log(render(child2(child2(view("ul"), row("alpha")), row("beta"))));

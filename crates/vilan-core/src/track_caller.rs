@@ -20,6 +20,17 @@
 //!      cannot know to pass a location, and silently passing nothing would be
 //!      a wrong answer.
 //!
+//! **A trait member (B646).** `[track_caller]` declared on a trait's member is
+//! part of the trait's contract: every implementation of the member takes the
+//! hidden location whether or not it writes the attribute
+//! ([`imply_trait_tracking`]), the trait's declaration takes it too (so a
+//! `dyn` table's slot is typed with it on both backends), and every call that
+//! names the member passes one — a static call, a call through a bound (the
+//! analyzer resolved it to the trait's declaration, and emission re-dispatches
+//! it to the implementation with the argument list as threaded here) and a
+//! call through a `dyn` table. An implementation that marks a member its trait
+//! does not is refused: a call through the trait would pass nothing.
+//!
 //! A closure is a boundary, as in Rust: a closure written inside a tracking
 //! function is not itself tracking, so a panic inside it reports the closure's
 //! own site.
@@ -36,13 +47,14 @@
 
 use std::path::{Component, Path};
 
-use crate::analyzer::{Expr, ExprIfBranch, Parameter, Program, SourceId};
-use crate::call_graph::{Call, CallGraph, CallTarget};
+use crate::analyzer::{Expr, ExprIfBranch, Implementation, Parameter, Program, SourceId};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::node::Convention;
 use crate::span::Span;
+use crate::type_::Type;
 
 /// The hidden parameter's name. Neither backend can collide on it: both
 /// suffix a binding's emitted name with its id.
@@ -59,6 +71,7 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
         // no `Location` type to give the parameter, and nothing tracks.
         return;
     };
+    imply_trait_tracking(program);
     let tracking: HashSet<Id> = program
         .functions
         .iter()
@@ -83,14 +96,16 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
     };
 
     // 1. The hidden parameters, in the program's own function order so the
-    //    minted ids are deterministic.
-    let bodied: Vec<Id> = program
+    //    minted ids are deterministic. A trait's signature-only member takes
+    //    one too (B646): it has no body to read it, but its parameter list is
+    //    what a `dyn` table's slot is typed and sized by.
+    let tracking_functions: Vec<(Id, bool)> = program
         .functions
         .iter()
-        .filter(|(_, function)| function.track_caller && function.has_body)
-        .map(|(id, _)| *id)
+        .filter(|(_, function)| function.track_caller)
+        .map(|(id, function)| (*id, function.has_body))
         .collect();
-    for function_id in bodied {
+    for (function_id, has_body) in tracking_functions {
         let parameter = fresh();
         program.parameters.insert(
             parameter,
@@ -112,37 +127,72 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
         if let Some(function) = program.functions.get_mut(&function_id) {
             function.parameters.push(parameter);
         }
-        program
-            .track_caller_parameters
-            .insert(function_id, parameter);
+        if has_body {
+            program
+                .track_caller_parameters
+                .insert(function_id, parameter);
+        }
     }
 
-    // 2. The location argument at every static call. A node's own hidden
-    //    parameter forwards; anything else names the site.
+    // 2. The location argument at every call that names a tracking function:
+    //    a static call, and (B646) a call through a bound or a `dyn` table,
+    //    which the analyzer resolved to the trait's declaration — emission
+    //    re-dispatches it with the argument list threaded here. A node's own
+    //    hidden parameter forwards; anything else names the site. A call with
+    //    no argument list — a `for` loop's `next` — cannot carry one.
     let mut threaded: Vec<(Id, Option<Id>)> = Vec::new();
-    let collect = |calls: &[Call], forward: Option<Id>, into: &mut Vec<(Id, Option<Id>)>| {
+    let mut argumentless: Vec<(Id, Id)> = Vec::new();
+    let collect = |calls: &[Call],
+                   forward: Option<Id>,
+                   into: &mut Vec<(Id, Option<Id>)>,
+                   argumentless: &mut Vec<(Id, Id)>| {
         for call in calls {
-            let (CallTarget::Function(target) | CallTarget::External(target)) = call.target else {
-                continue;
+            let target = match call.target {
+                CallTarget::Function(target) | CallTarget::External(target) => target,
+                CallTarget::Indirect(
+                    IndirectReason::GenericMember | IndirectReason::TraitDispatch,
+                ) => match dispatched_declaration(program, call.call_id) {
+                    Some(target) => target,
+                    None => continue,
+                },
+                CallTarget::Closure(_)
+                | CallTarget::Variant(_)
+                | CallTarget::Indirect(IndirectReason::Value) => continue,
             };
-            if tracking.contains(&target) {
+            if !tracking.contains(&target) {
+                continue;
+            }
+            if program.function_calls.contains_key(&call.call_id) {
                 into.push((call.call_id, forward));
+            } else {
+                argumentless.push((call.call_id, target));
             }
         }
     };
     for node in graph.nodes() {
         let forward = program.track_caller_parameters.get(&node.id()).copied();
-        collect(graph.calls_of(node.id()), forward, &mut threaded);
+        collect(
+            graph.calls_of(node.id()),
+            forward,
+            &mut threaded,
+            &mut argumentless,
+        );
     }
     let bindings = program.module_level_bindings();
     for &binding in &bindings {
-        collect(graph.initializer_calls_of(binding), None, &mut threaded);
+        collect(
+            graph.initializer_calls_of(binding),
+            None,
+            &mut threaded,
+            &mut argumentless,
+        );
         // A `const` initializer runs in the compile-time interpreter, which
         // calls the same functions with the same arity.
         collect(
             graph.const_initializer_calls_of(binding),
             None,
             &mut threaded,
+            &mut argumentless,
         );
     }
     for &region in graph.const_regions() {
@@ -150,6 +200,7 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
             graph.const_initializer_calls_of(region),
             None,
             &mut threaded,
+            &mut argumentless,
         );
     }
     let mut seen: HashSet<Id> = HashSet::default();
@@ -231,6 +282,19 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
                     .map(|external| external.name)
             })
             .unwrap_or("this function");
+        // A member with a receiver (B646: a trait's tracking method taken as
+        // a value) is called on the closure's argument.
+        let receives = program
+            .functions
+            .get(&function)
+            .and_then(|function| function.parameters.first())
+            .and_then(|parameter| program.parameters.get(parameter))
+            .is_some_and(|parameter| parameter.name == "self");
+        let steer = if receives {
+            format!("`|value| value.{name}(..)`")
+        } else {
+            format!("`|value| {name}(value)`")
+        };
         let span = program
             .span_map
             .get(&reference)
@@ -245,7 +309,41 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
                 msg: format!(
                     "`{name}` is `[track_caller]`: it takes its caller's location as a hidden \
                      argument, and a call through a value cannot pass one. Call it inside a \
-                     closure instead: `|value| {name}(value)`"
+                     closure instead: {steer}"
+                ),
+            },
+            source,
+        );
+    }
+
+    // A `for` loop calls its iterator's `next` through the protocol, with no
+    // argument list to append a location to.
+    for (loop_id, target) in argumentless {
+        let name = program
+            .functions
+            .get(&target)
+            .map(|function| function.name)
+            .unwrap_or("next");
+        // At the iterable: the loop's protocol call is made on it.
+        let anchor = match program.entity_map.get(&loop_id) {
+            Some(Expr::ForEach(iterable, _, _)) => *iterable,
+            _ => loop_id,
+        };
+        let span = program
+            .span_map
+            .get(&anchor)
+            .map(|span| **span)
+            .unwrap_or(Span { start: 0, end: 0 });
+        let source = program.source_of(loop_id).unwrap_or(SourceId(0));
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`{name}` is `[track_caller]`, and a `for .. in` loop calls it through the \
+                     iterator protocol, which cannot pass its caller's location. Call `{name}` \
+                     yourself inside the loop, or drop `[track_caller]` from it"
                 ),
             },
             source,
@@ -253,6 +351,118 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
     }
 
     program.next_entity_id = next_id;
+}
+
+/// B646: `[track_caller]` declared on a trait's member makes tracking part of
+/// the trait's contract, so every implementation of that member tracks —
+/// marked or not — and the flag is set on it here, where each
+/// implementation's trait is known. An implementation that marks a member its
+/// trait does NOT declare tracking is refused: a call through the trait (a
+/// bound, a `dyn` table) passes no location, so the mark would promise a site
+/// it cannot report.
+pub fn imply_trait_tracking(program: &mut Program) {
+    let mut implied: Vec<Id> = Vec::new();
+    let mut refused: Vec<(Id, &str, Id)> = Vec::new();
+    for implementation in &program.implementations {
+        if implementation.trait_ids.is_empty() {
+            continue;
+        }
+        for &(name, member) in &implementation.declared_members {
+            let Some(function) = program.functions.get(&member) else {
+                continue;
+            };
+            let Some(declaration) = home_declaration(program, implementation, name) else {
+                continue;
+            };
+            let declared = program
+                .functions
+                .get(&declaration)
+                .is_some_and(|declaration| declaration.track_caller);
+            if declared {
+                if !function.track_caller {
+                    implied.push(member);
+                }
+            } else if function.track_caller {
+                refused.push((member, name, declaration));
+            }
+        }
+    }
+    for member in implied {
+        if let Some(function) = program.functions.get_mut(&member) {
+            function.track_caller = true;
+        }
+    }
+    for (member, name, declaration) in refused {
+        let trait_name = program
+            .traits
+            .values()
+            .find(|trait_| trait_.declarations.get(name) == Some(&declaration))
+            .map(|trait_| trait_.name)
+            .unwrap_or("its trait");
+        let span = program
+            .functions
+            .get(&member)
+            .map(|function| function.name_span)
+            .unwrap_or(Span { start: 0, end: 0 });
+        let source = program.source_of(member).unwrap_or(SourceId(0));
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`[track_caller]` on `{name}`, which `{trait_name}` does not declare \
+                     tracking: a call through `{trait_name}` (a bound, a `dyn`) would pass no \
+                     location. Declare it on the trait's member (`[track_caller]` above \
+                     `{trait_name}`'s `fun {name}`), where every implementation takes it"
+                ),
+            },
+            source,
+        );
+    }
+}
+
+/// The trait member `name` implements in `implementation`: the declaration in
+/// the first of its traits — or their supertraits, nearest first — that
+/// declares the name.
+fn home_declaration(program: &Program, implementation: &Implementation, name: &str) -> Option<Id> {
+    let mut queue: Vec<Id> = implementation.trait_ids.clone();
+    let mut seen: HashSet<Id> = HashSet::default();
+    let mut next = 0;
+    while let Some(&trait_id) = queue.get(next) {
+        next += 1;
+        if !seen.insert(trait_id) {
+            continue;
+        }
+        let Some(trait_) = program.traits.get(&trait_id) else {
+            continue;
+        };
+        if let Some(&member) = trait_.declarations.get(name) {
+            return Some(member);
+        }
+        for supertrait in &trait_.supertraits {
+            if let Some(Type::Trait(supertrait_id, _)) = program.type_id_to_type_map.get(supertrait)
+            {
+                queue.push(*supertrait_id);
+            }
+        }
+    }
+    None
+}
+
+/// The trait member a dispatched call names (B646): the analyzer resolved a
+/// call through a bound or a `dyn` table to the member's DECLARATION, which
+/// stays the call's subject while emission picks the implementation.
+fn dispatched_declaration(program: &Program, call_id: Id) -> Option<Id> {
+    let subject = match program.function_calls.get(&call_id) {
+        Some(call) => call.subject_id,
+        // A `for` loop's protocol call: the loop is the call.
+        None => return program.for_each_next.get(&call_id).copied(),
+    };
+    match program.entity_map.get(&subject) {
+        Some(Expr::Local(member)) if program.functions.contains_key(member) => Some(*member),
+        _ => None,
+    }
 }
 
 /// debugging.md §3.3 (Q4): every `dbg(..)` in a build whose policy is

@@ -4520,6 +4520,11 @@ pub struct Analyzer<'src> {
     /// `never` and marks every frame nested inside the re-entered one inexact
     /// — built on an unfinished neighbour — so only exact answers are recorded.
     return_inference_stack: Vec<(Id, bool)>,
+    /// B667: each walked `match`'s leg bodies, by the match's id — what a
+    /// match still waiting on its constraint is made of, for the return-
+    /// position walk (`self_returning_function`), which runs while the
+    /// constraint queue is drained.
+    match_leg_bodies: HashMap<Id, Vec<Id>>,
     /// `inferred_return_type`'s record: the last exact answer per unannotated
     /// function, for the read-only coercion path (`compare_type`) that cannot
     /// infer on the spot.
@@ -8052,6 +8057,7 @@ impl<'src> Analyzer<'src> {
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
+            match_leg_bodies: HashMap::default(),
             return_depth_refused: false,
             inferred_return_types: HashMap::default(),
             closure_held_targets: HashMap::default(),
@@ -33057,6 +33063,278 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B647 (spec §6.4, rule 4): a call that LENDS a module-level `mut`
+    /// binding — a written `&`/`&mut` of it or of a place under it, or a
+    /// `&self`/`&mut self` receiver over one — to a callee whose write summary
+    /// reaches that binding is refused at the argument: the callee's body is
+    /// a second path to the place the loan holds, and the two backends
+    /// answered differently (`lent_and_grow(&module_items)` with the callee
+    /// pushing into `module_items` printed `1` on JS, where the `&` is the
+    /// binding's object, and `0` natively, a copy out of its `thread_local!`
+    /// cell; `touch(&mut module_items)` printed `2` on JS and stopped natively
+    /// with the runtime's reentrancy sentence). Asked of the whole program on
+    /// every analysis (the callee may sit in another module), and nothing at
+    /// all for a program with no module-level `mut` binding — the estate.
+    fn check_module_binding_loans(&mut self) {
+        let module_mut = self.module_mut_bindings();
+        if module_mut.is_empty() {
+            return;
+        }
+        let mut loans: Vec<(Id, Id, Id, Convention)> = Vec::new();
+        for (call_expr_id, function_call) in &self.function_calls {
+            let parameters: &[Id] = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                Some(Expr::Local(callee_id)) => self
+                    .method_signature_ref(*callee_id)
+                    .map(|(parameters, _)| parameters)
+                    .unwrap_or_default(),
+                _ => &[],
+            };
+            for (position, argument_id) in function_call.argument_ids.iter().enumerate() {
+                let (place, lent) = match self.expr_id_to_expr_map.get(argument_id) {
+                    Some(Expr::Reference(operand, true)) => (*operand, Convention::RefMut),
+                    Some(Expr::Reference(operand, false)) => (*operand, Convention::Ref),
+                    _ => match parameters
+                        .get(position)
+                        .and_then(|parameter| self.parameters.get(parameter))
+                    {
+                        // A view receiver lends implicitly (`items.len()` over a
+                        // `&self`); a view parameter refuses a bare place
+                        // already (no implicit borrow).
+                        Some(parameter)
+                            if parameter.name == "self"
+                                && matches!(
+                                    parameter.convention,
+                                    Convention::Ref | Convention::RefMut
+                                ) =>
+                        {
+                            (*argument_id, parameter.convention)
+                        }
+                        _ => continue,
+                    },
+                };
+                if let Some(root) = self.place_root_binding(place)
+                    && module_mut.contains(&root)
+                {
+                    loans.push((*call_expr_id, *argument_id, root, lent));
+                }
+            }
+        }
+        if loans.is_empty() {
+            return;
+        }
+        let calls = std::cell::OnceCell::new();
+        let writes = self.module_writes(&module_mut, self.calls_index(&calls));
+        let mut summaries: HashMap<Id, HashMap<Id, bool>> = HashMap::default();
+        let mut refusals: Vec<(Id, Id, Id, Convention)> = Vec::new();
+        for (call_expr_id, argument_id, root, lent) in loans {
+            let subject = WriteSubject::Module(root, &writes);
+            if self.call_reaches_a_write(
+                call_expr_id,
+                &subject,
+                self.calls_index(&calls),
+                summaries.entry(root).or_default(),
+            ) {
+                refusals.push((call_expr_id, argument_id, root, lent));
+            }
+        }
+        refusals.sort_unstable_by_key(|(_, argument_id, ..)| argument_id.0);
+        for (call_expr_id, argument_id, root, lent) in refusals {
+            self.refuse_module_binding_loan(call_expr_id, argument_id, root, lent);
+        }
+    }
+
+    /// B647: the module-level bindings declared `mut` — a top-level `mut` of
+    /// the entry file or of a loaded module.
+    fn module_mut_bindings(&self) -> HashSet<Id> {
+        // `module_level_binding_ids`' scope test, asked of the `mut` bindings
+        // alone and without a pass over every scope: a module body's scope,
+        // or a root scope (the entry file's).
+        let module_scopes: HashSet<Id> =
+            self.modules.values().map(|module| module.body.1).collect();
+        self.variables
+            .values()
+            .filter(|variable| variable.mutable)
+            .map(|variable| variable.id)
+            .filter(|variable_id| {
+                self.expr_id_to_scope_id_map
+                    .get(variable_id)
+                    .is_some_and(|scope_id| {
+                        let home =
+                            expansion_home_scope(&self.generated_expansion_scopes, *scope_id);
+                        module_scopes.contains(&home)
+                            || self
+                                .scopes
+                                .get(&home)
+                                .is_some_and(|scope| scope.parent_id.is_none())
+                    })
+            })
+            .collect()
+    }
+
+    /// B647: every write of a module-level `mut` binding — an assignment whose
+    /// target's spine roots at it, or a call lending such a place `&mut` —
+    /// and the bindings a call through a closure VALUE may reach: written
+    /// (through any call) by a closure literal's body or by a function taken
+    /// as a value.
+    fn module_writes(&self, module_mut: &HashSet<Id>, calls: &LexicalCandidates) -> ModuleWrites {
+        let mut writes = ModuleWrites::default();
+        for (expr_id, expr) in &self.expr_id_to_expr_map {
+            let root = match expr {
+                Expr::Assignment(target, _) => self.place_root_binding(*target),
+                Expr::Call(call_id) => self.function_calls.get(call_id).and_then(|function_call| {
+                    self.lent_argument_positions(function_call)
+                        .into_iter()
+                        .find_map(|position| {
+                            self.place_root_binding(function_call.argument_ids[position])
+                                .filter(|root| module_mut.contains(root))
+                        })
+                }),
+                _ => None,
+            };
+            if let Some(root) = root
+                && module_mut.contains(&root)
+            {
+                writes.sites.push((*expr_id, root));
+            }
+        }
+        let written: HashSet<Id> = writes.sites.iter().map(|(_, binding)| *binding).collect();
+        if written.is_empty() {
+            return writes;
+        }
+        // The bodies a call through a value can run: every closure literal's,
+        // and every function named other than as a call's callee.
+        let subjects: HashSet<Id> = self
+            .function_calls
+            .values()
+            .map(|function_call| function_call.subject_id)
+            .collect();
+        let mut bodies: Vec<Id> = self
+            .closures
+            .values()
+            .map(|closure| closure.return_)
+            .collect();
+        bodies.extend(
+            self.expr_id_to_expr_map
+                .iter()
+                .filter_map(|(expr_id, expr)| match expr {
+                    Expr::Local(function_id)
+                        if !subjects.contains(expr_id)
+                            && self.functions.contains_key(function_id) =>
+                    {
+                        Some(*function_id)
+                    }
+                    _ => None,
+                }),
+        );
+        bodies.sort_unstable_by_key(|id| id.0);
+        bodies.dedup();
+        let mut through_values = HashSet::default();
+        for binding in written {
+            let subject = WriteSubject::Module(binding, &writes);
+            let mut summaries = HashMap::default();
+            if bodies
+                .iter()
+                .any(|body| self.function_reaches_a_write(*body, &subject, calls, &mut summaries))
+            {
+                through_values.insert(binding);
+            }
+        }
+        writes.through_values = through_values;
+        writes
+    }
+
+    /// B647: a write of the module-level `binding` inside `expr_id`'s span.
+    fn spans_a_module_write(&self, expr_id: Id, binding: Id, writes: &ModuleWrites) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        writes.sites.iter().any(|(write_id, written)| {
+            *written == binding
+                && self.source_of_id(*write_id) == Some(source)
+                && self.one_span_space(expr_id, *write_id)
+                && self.span_map.get(write_id).is_some_and(|write_span| {
+                    write_span.start >= span.start && write_span.end <= span.end
+                })
+        })
+    }
+
+    /// B647's refusal, at the lent argument, with the copy-first steer.
+    fn refuse_module_binding_loan(
+        &mut self,
+        call_expr_id: Id,
+        argument_id: Id,
+        root: Id,
+        lent: Convention,
+    ) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let name = self
+            .variables
+            .get(&root)
+            .map(|variable| variable.name)
+            .unwrap_or("the binding");
+        let function_call = self.function_calls.get(&call_expr_id);
+        let (callee, parameter_name) = match function_call
+            .and_then(|function_call| self.expr_id_to_expr_map.get(&function_call.subject_id))
+        {
+            Some(Expr::Local(callee_id)) => {
+                let callee = self
+                    .functions
+                    .get(callee_id)
+                    .map(|function| function.name)
+                    .unwrap_or("the callee");
+                let position = function_call
+                    .and_then(|function_call| {
+                        function_call
+                            .argument_ids
+                            .iter()
+                            .position(|argument| *argument == argument_id)
+                    })
+                    .unwrap_or(0);
+                let parameter_name = self
+                    .method_signature_ref(*callee_id)
+                    .and_then(|(parameters, _)| parameters.get(position).copied())
+                    .and_then(|parameter| self.parameters.get(&parameter))
+                    .map(|parameter| parameter.name);
+                (callee, parameter_name)
+            }
+            _ => ("the callee", None),
+        };
+        let copy = match parameter_name {
+            Some(parameter) if parameter != "self" && parameter != name => parameter.to_string(),
+            _ => format!("{name}_copy"),
+        };
+        let argument_text = text_of(self, argument_id).unwrap_or(name);
+        let settled_argument = argument_text.replacen(name, &copy, 1);
+        let call_text = text_of(self, call_expr_id)
+            .filter(|text| !text.contains('\n'))
+            .map(|text| text.replacen(argument_text, &settled_argument, 1))
+            .unwrap_or_else(|| format!("{callee}({settled_argument})"));
+        let binder = match lent {
+            Convention::RefMut => "mut",
+            _ => "let",
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{callee}` writes `{name}` while `{name}` is lent to this call, so the loan \
+                     and the write are two paths to one place (a write under a live view); copy \
+                     it first: `{binder} {copy} = {name}; {call_text}`"
+                ),
+            },
+            argument_id,
+        );
+    }
+
     /// The argument positions a call lends `&mut` — a `&mut self` receiver or
     /// `&mut` parameter (`log.items.push(..)`, `log.bump(..)`), or a written
     /// `&mut` argument (`add(&mut log.items, ..)`). B?2 / B639.
@@ -34485,16 +34763,76 @@ impl<'src> Analyzer<'src> {
             let Some(parameter_ids) = parameter_ids else {
                 continue;
             };
+            let callee_name = self
+                .functions
+                .get(&callee_id)
+                .map(|function| function.name)
+                .or_else(|| {
+                    self.external_functions
+                        .get(&callee_id)
+                        .map(|external| external.name)
+                })
+                .unwrap_or("the function");
             for (parameter_id, argument_id) in parameter_ids.iter().zip(argument_ids.iter()) {
                 // The required call-site spelling for this parameter — `&`/`&mut`
-                // for a view convention; the implicit `self` receiver and all
-                // by-value conventions need nothing.
+                // for a view convention; the implicit `self` receiver needs
+                // nothing.
                 let kind = match self.parameters.get(parameter_id) {
                     Some(parameter) if parameter.name == "self" => continue,
                     Some(parameter) => match parameter.convention {
                         Convention::RefMut => "&mut",
                         Convention::Ref => "&",
-                        Convention::Bare | Convention::Own => continue,
+                        Convention::Bare | Convention::Own => {
+                            // B649: a written `&`/`&mut` at a BY-VALUE
+                            // parameter lends a view the callee cannot take —
+                            // the JS build handed the scalar view's
+                            // `[cell, key]` pair over AS the value (`==`
+                            // compared an array with a number) where native
+                            // passed the value. A view a by-value callee
+                            // cannot keep is noise: refused, with the fix.
+                            // A generic parameter over a receiver that HOLDS
+                            // views (`shelf.count(0).unwrap_or(&0)` on an
+                            // `Option<&i32>`, B577) takes a view: its `T` is one.
+                            let written_view = match self.expr_id_to_expr_map.get(argument_id) {
+                                Some(Expr::Reference(_, mutable)) => Some(*mutable),
+                                _ => None,
+                            };
+                            let over_a_view_holder = || {
+                                let mut mentioned = Vec::new();
+                                self.collect_generics(
+                                    &parameter.type_id.get_type(self),
+                                    0,
+                                    &mut mentioned,
+                                );
+                                !mentioned.is_empty()
+                                    && argument_ids.first().is_some_and(|receiver| {
+                                        self.receiver_holds_a_view(*receiver)
+                                    })
+                            };
+                            if let Some(mutable) = written_view
+                                && !over_a_view_holder()
+                            {
+                                let written = if mutable { "&mut" } else { "&" };
+                                let parameter_name = parameter.name;
+                                self.push_anchored(
+                                    Error {
+                                        trace: Vec::new(),
+                                        note: None,
+                                        span: **self
+                                            .span_map
+                                            .get(argument_id)
+                                            .unwrap_or(&&EMPTY_SPAN),
+                                        msg: format!(
+                                            "drop the `{written}`: `{callee_name}` takes \
+                                             `{parameter_name}` by value, so it cannot take a \
+                                             view of it"
+                                        ),
+                                    },
+                                    *argument_id,
+                                );
+                            }
+                            continue;
+                        }
                     },
                     None => continue,
                 };
@@ -34507,6 +34845,18 @@ impl<'src> Analyzer<'src> {
                     }, *argument_id);
                 }
             }
+        }
+    }
+
+    /// B649: whether a receiver is a value holding VIEWS — a call returning a
+    /// wrapped view (`Option<&T>`), directly or as an inline transient.
+    fn receiver_holds_a_view(&self, receiver: Id) -> bool {
+        match self.expr_id_to_expr_map.get(&receiver) {
+            Some(Expr::Call(call_id)) => {
+                self.call_returns_wrapped_view(*call_id).is_some()
+                    || self.inline_subject_wrapped_view_shape(receiver).is_some()
+            }
+            _ => self.inline_subject_wrapped_view_shape(receiver).is_some(),
         }
     }
 
@@ -35309,6 +35659,10 @@ impl<'src> Analyzer<'src> {
         // M110 S7b: built at the first ask — a served keystroke whose live
         // positions never reach B457's call-through test pays nothing for it.
         let calls_index = |analyzer: &Self| -> &LexicalCandidates { analyzer.calls_index(calls) };
+        // B647's by-value twin: the module-level `mut` bindings, and (at the
+        // first argument over one) every write of them.
+        let module_mut = self.module_mut_bindings();
+        let module_writes: std::cell::OnceCell<ModuleWrites> = std::cell::OnceCell::new();
         // M19 T1b: a reused module's decisions are restored below. Every
         // position this loop `consider`s is a sub-expression of the entry it
         // is standing on, so skipping the expression skips exactly the rows
@@ -35500,9 +35854,38 @@ impl<'src> Analyzer<'src> {
                                         &mut HashMap::default(),
                                     )
                                 });
+                        // B647's by-value twin: a module-level `mut` binding (or
+                        // a place under one) handed BY VALUE — a bare
+                        // parameter or a bare `self` — to a callee that writes
+                        // it: JS handed over the binding's own object, so the
+                        // callee's parameter saw the callee's write, where
+                        // natively it is a copy out of the binding's cell. The
+                        // argument is a copy (rule 1).
+                        let module_binding_the_callee_writes = parameter.convention
+                            == Convention::Bare
+                            && !module_mut.is_empty()
+                            && !matches!(
+                                self.expr_id_to_expr_map.get(argument_id),
+                                Some(Expr::Reference(..))
+                            )
+                            && self
+                                .place_root_binding(*argument_id)
+                                .filter(|root| module_mut.contains(root))
+                                .is_some_and(|root| {
+                                    let writes = module_writes.get_or_init(|| {
+                                        self.module_writes(&module_mut, calls_index(self))
+                                    });
+                                    self.function_reaches_a_write(
+                                        callee_id,
+                                        &WriteSubject::Module(root, writes),
+                                        calls_index(self),
+                                        &mut HashMap::default(),
+                                    )
+                                });
                         if parameter.convention == Convention::Own
                             || is_shared_read_receiver
                             || read_the_callee_writes
+                            || module_binding_the_callee_writes
                         {
                             consider(self, *argument_id, None);
                         }
@@ -36653,18 +37036,7 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B457: whether one call can reach an in-place write of `cell` — the
-    /// callee's WRITE SUMMARY. A function with a body answers for its own span
-    /// and every call in it (memoized per function, and a function already
-    /// being asked answers no, so recursion terminates; its own writes are
-    /// counted where it is first asked). An external writes no vilan cell
-    /// (`Shared::write` IS the write, counted by the span test), and a variant
-    /// builds a value. A dispatched member answers for every body of its name.
-    /// A call through a closure LITERAL — applied where it is written, or
-    /// named by an immutable `let` whose initializer is one (B634) — answers
-    /// for the literal's body, as a function answers for its own. Any other
-    /// call through a closure VALUE (a subscriber, a parameter, a `mut`
-    /// binding, a field) is unknown statically, and answers whether ANY write
-    /// mutates the cell in place.
+    /// callee's WRITE SUMMARY ([`Self::call_reaches_a_write`] for a cell).
     fn call_reaches_an_in_place_write(
         &self,
         call_id: Id,
@@ -36672,9 +37044,30 @@ impl<'src> Analyzer<'src> {
         calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
-        if self.shared_cells.reads.contains_key(&call_id)
-            || self.shared_cells.writes.contains_key(&call_id)
-        {
+        self.call_reaches_a_write(call_id, &WriteSubject::Cell(cell), calls, summaries)
+    }
+
+    /// B457 / B647: whether one call can reach a write of `subject` — the
+    /// callee's WRITE SUMMARY. A function with a body answers for its own
+    /// span and every call in it (memoized per function, and a function
+    /// already being asked answers no, so recursion terminates; its own
+    /// writes are counted where it is first asked). An external writes no
+    /// vilan place (`Shared::write` IS the write, counted by the span test),
+    /// and a variant builds a value. A dispatched member answers for every
+    /// body of its name. A call through a closure LITERAL — applied where it
+    /// is written, or named by an immutable `let` whose initializer is one
+    /// (B634) — answers for the literal's body, as a function answers for its
+    /// own. Any other call through a closure VALUE (a subscriber, a
+    /// parameter, a `mut` binding, a field) is unknown statically, and
+    /// answers the subject's own worst case ([`WriteSubject::unknown`]).
+    fn call_reaches_a_write(
+        &self,
+        call_id: Id,
+        subject: &WriteSubject<'_>,
+        calls: &LexicalCandidates,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        if subject.is_the_access(self, call_id) {
             return false;
         }
         let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -36707,12 +37100,12 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|function| function.has_body)
                 })
                 .collect();
-            return candidates.into_iter().any(|member| {
-                self.function_reaches_an_in_place_write(member, cell, calls, summaries)
-            });
+            return candidates
+                .into_iter()
+                .any(|member| self.function_reaches_a_write(member, subject, calls, summaries));
         }
         if let Some(body) = self.closure_literal_body(function_call.subject_id) {
-            return self.function_reaches_an_in_place_write(body, cell, calls, summaries);
+            return self.function_reaches_a_write(body, subject, calls, summaries);
         }
         match self.expr_id_to_expr_map.get(&function_call.subject_id) {
             Some(Expr::Local(callee)) => {
@@ -36729,12 +37122,11 @@ impl<'src> Analyzer<'src> {
                     .get(callee)
                     .is_some_and(|function| function.has_body)
                 {
-                    return self
-                        .function_reaches_an_in_place_write(*callee, cell, calls, summaries);
+                    return self.function_reaches_a_write(*callee, subject, calls, summaries);
                 }
-                self.shared_cells.mutated.contains(&cell)
+                subject.unknown(self)
             }
-            _ => self.shared_cells.mutated.contains(&cell),
+            _ => subject.unknown(self),
         }
     }
 
@@ -36767,16 +37159,29 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B457: a function's write summary for `cell` — an in-place write inside
-    /// its span, or a call inside it that reaches one. B634: a closure
-    /// literal's BODY answers here too (`function_id` is then the body's
-    /// expression, whose span is the body's). The calls come from
-    /// `calls`' span index (M96): filtering the whole expression map per
-    /// function asked made the summary O(functions × expressions) — 48
-    /// summaries, ~95M instructions each, on kolt's client.
+    /// its span, or a call inside it that reaches one
+    /// ([`Self::function_reaches_a_write`] for a cell).
     fn function_reaches_an_in_place_write(
         &self,
         function_id: Id,
         cell: CellSlot,
+        calls: &LexicalCandidates,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        self.function_reaches_a_write(function_id, &WriteSubject::Cell(cell), calls, summaries)
+    }
+
+    /// B457 / B647: a function's write summary for `subject` — a write inside
+    /// its span, or a call inside it that reaches one. B634: a closure
+    /// literal's BODY answers here too (`function_id` is then the body's
+    /// expression, whose span is the body's). The calls come from `calls`'
+    /// span index (M96): filtering the whole expression map per function
+    /// asked made the summary O(functions × expressions) — 48 summaries, ~95M
+    /// instructions each, on kolt's client. `summaries` is one subject's.
+    fn function_reaches_a_write(
+        &self,
+        function_id: Id,
+        subject: &WriteSubject<'_>,
         calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
@@ -36786,7 +37191,7 @@ impl<'src> Analyzer<'src> {
         // In progress: no until proven otherwise (a recursive call adds no
         // write the function's own span does not already hold).
         summaries.insert(function_id, false);
-        let answer = self.spans_an_in_place_write(function_id, cell) || {
+        let answer = subject.spans_a_write(self, function_id) || {
             let (Some(source), Some(span)) = (
                 self.source_of_id(function_id),
                 self.span_map.get(&function_id),
@@ -36797,7 +37202,7 @@ impl<'src> Analyzer<'src> {
                 .inside(source, span.start, span.end)
                 .into_iter()
                 .filter(|call_id| self.one_span_space(function_id, *call_id))
-                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, calls, summaries))
+                .any(|call_id| self.call_reaches_a_write(call_id, subject, calls, summaries))
         };
         summaries.insert(function_id, answer);
         answer
@@ -42140,6 +42545,8 @@ impl<'src> Analyzer<'src> {
                 body: body_id,
             });
         }
+        self.match_leg_bodies
+            .insert(id, walked_legs.iter().map(|leg| leg.body).collect());
         self.constraints.push(Constraint::Match(PreppedMatch {
             id,
             subject_id,
@@ -43004,22 +43411,14 @@ impl<'src> Analyzer<'src> {
         if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
             self.record_type_context_clause(return_type_id, names, body_scope_id, None);
         }
-        // debugging.md S0: `[track_caller]`'s location travels as a hidden
-        // trailing parameter, threaded at every STATIC call. A trait member is
-        // reached by dispatch — a `dyn` table, a generic bound — where no one
-        // call site knows it is calling a tracking function, so the attribute
-        // is refused there rather than silently reporting nothing.
-        if function.track_caller && (self.walking_trait_body || self.walking_trait_impl_body) {
-            self.diagnostics.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span: function.name.1,
-                msg: "`[track_caller]` is not supported on a trait method: a call through \
-                      a trait is dispatched, so no call site knows to pass its location. \
-                      Mark a free function or an inherent method instead"
-                    .to_string(),
-            });
-        }
+        // debugging.md S0, B646: `[track_caller]`'s location travels as a
+        // hidden trailing parameter. On a trait member it is part of the
+        // trait's CONTRACT: declared on the trait, every implementation takes
+        // the hidden location and every call through the trait passes it (a
+        // static call, a bound's call, a `dyn` table's slot). Whether an
+        // implementation's own mark agrees with its trait is decided after
+        // analysis, where the implementation's trait is known
+        // (`track_caller::imply_trait_tracking`).
         if function.external {
             // An `external` function is an intrinsic: no Vilan body, a
             // declared (or void) return type, registered as an external
@@ -46321,21 +46720,50 @@ impl<'src> Analyzer<'src> {
         // for it; every other call walks its arguments in place, allocating
         // nothing.
         let mut order: Vec<usize> = Vec::new();
-        let mut first_literal = argument_ids.len();
         if literal_last {
             order.extend(0..argument_ids.len());
             order.sort_by_key(|index| self.is_unsuffixed_numeric(argument_ids[*index]));
-            first_literal = order
-                .iter()
-                .position(|index| self.is_unsuffixed_numeric(argument_ids[*index]))
-                .unwrap_or(order.len());
         }
         let mut closures_read = !literal_last;
-        let schedule = (0..argument_ids.len()).map(|step| match literal_last {
-            true => order[step],
-            false => step,
-        });
-        for (step, index) in schedule.enumerate() {
+        // B659: an unsuffixed literal at a generic only a closure argument's
+        // RESULT fixes (`map_or(|it| it.depth, 0)`, `U` from the closure)
+        // waits for that closure — typed first it took `i32` and bound `U`,
+        // and the closure was refused against `|Item| i32`. Skipped in the
+        // first phase, read LAST in the second, and not at all while a closure
+        // has not typed (the call then defers with the generic open).
+        let deferred_literals = self.literals_awaiting_a_closure_result(
+            &parameter_ids,
+            argument_ids,
+            self_parameter_offset,
+            &bindable,
+            substitution,
+        );
+        let deferred_tail: &[usize] = match skip_closures {
+            true => &[],
+            false => &deferred_literals,
+        };
+        // An iterator, not a collected list: this runs once per call per
+        // attempt (M30 counted 856,908 on kolt), and almost every call has
+        // nothing deferred.
+        let schedule = || {
+            (0..argument_ids.len())
+                .map(|step| match literal_last {
+                    true => order[step],
+                    false => step,
+                })
+                .filter(|index| !deferred_literals.contains(index))
+                .chain(deferred_tail.iter().copied())
+        };
+        let first_literal = match literal_last {
+            true => schedule()
+                .position(|index| self.is_unsuffixed_numeric(argument_ids[index]))
+                .unwrap_or(argument_ids.len()),
+            false => argument_ids.len(),
+        };
+        for (step, index) in schedule().enumerate() {
+            if deferred_literals.contains(&index) && unresolved_closure_argument {
+                break;
+            }
             if !closures_read && step == first_literal {
                 closures_read = true;
                 self.derive_generics_from_bounds(&bindable, &bindable, substitution);
@@ -46452,6 +46880,87 @@ impl<'src> Analyzer<'src> {
         // substitution keys on.
         self.derive_generics_from_bounds(&bindable, &bindable, substitution);
         unresolved_closure_argument
+    }
+
+    /// B659: the argument positions holding an unsuffixed numeric literal whose
+    /// parameter mentions a generic that a CLOSURE argument fixes through its
+    /// result alone — `map_or<U>(self, f: |T| U, default: U)`'s `default`. A
+    /// generic the closure's PARAMETERS also carry (`fold`'s accumulator) is
+    /// the literal's to fix, since the closure cannot type without it (B589).
+    fn literals_awaiting_a_closure_result(
+        &self,
+        parameter_ids: &[Id],
+        argument_ids: &[Id],
+        self_parameter_offset: usize,
+        bindable: &[TypeId],
+        substitution: &SubstitutionContext,
+    ) -> Vec<usize> {
+        // The common call has no closure argument, or no literal one: answer
+        // without reading a parameter type. (A closure and a literal are two
+        // arguments.)
+        if argument_ids.len() < 2 {
+            return Vec::new();
+        }
+        let has_closure = argument_ids.iter().any(|argument_id| {
+            matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            )
+        });
+        if !has_closure
+            || !argument_ids
+                .iter()
+                .any(|argument_id| self.is_unsuffixed_numeric(*argument_id))
+        {
+            return Vec::new();
+        }
+        let parameter_type = |index: usize| {
+            parameter_ids
+                .get(index + self_parameter_offset)
+                .and_then(|parameter_id| self.parameters.get(parameter_id))
+                .map(|parameter| parameter.type_id.get_type(self))
+        };
+        let mut result_generics: Vec<TypeId> = Vec::new();
+        for (index, argument_id) in argument_ids.iter().enumerate() {
+            if !matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            ) {
+                continue;
+            }
+            let Some(Type::Closure(parameters, returned, _, _)) = parameter_type(index) else {
+                continue;
+            };
+            let mut in_parameters = Vec::new();
+            for parameter in &parameters {
+                self.collect_generics(&parameter.get_type(self), 0, &mut in_parameters);
+            }
+            let mut in_result = Vec::new();
+            self.collect_generics(&returned.get_type(self), 0, &mut in_result);
+            result_generics.extend(in_result.into_iter().filter(|generic| {
+                bindable.contains(generic)
+                    && !in_parameters.contains(generic)
+                    && !substitution.contains_key(generic)
+            }));
+        }
+        if result_generics.is_empty() {
+            return Vec::new();
+        }
+        argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(index, argument_id)| {
+                self.is_unsuffixed_numeric(**argument_id)
+                    && parameter_type(*index).is_some_and(|parameter_type| {
+                        let mut mentioned = Vec::new();
+                        self.collect_generics(&parameter_type, 0, &mut mentioned);
+                        mentioned
+                            .iter()
+                            .any(|generic| result_generics.contains(generic))
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Every constraint a call to `member_id` may bind: the callee's OWN
@@ -51297,6 +51806,40 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnInference {
+        // B659's second shape: the tail is read first, so an unsuffixed
+        // literal tail took `i32` before a `ret` naming the width was read —
+        // `{ for .. { found then ret at; } 0 }` with `at: usize` refused the
+        // `ret` against the literal's default. The literal is a NUMBER, not
+        // an `i32`: the first value-carrying item that is not one (and whose
+        // type is numeric) directs it, as an annotation would.
+        let literal_hint = match initial_expectation {
+            Type::Unknown
+                if evidence
+                    .first()
+                    .and_then(|(_, value_id)| *value_id)
+                    .is_some_and(|value_id| self.is_unsuffixed_numeric(value_id)) =>
+            {
+                let others: Vec<Id> = evidence
+                    .iter()
+                    .skip(1)
+                    .filter_map(|(_, value_id)| *value_id)
+                    .filter(|value_id| !self.is_unsuffixed_numeric(*value_id))
+                    .collect();
+                others.into_iter().find_map(|value_id| {
+                    let value_type = self.infer_type_inner(
+                        value_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    );
+                    self.numeric_primitive_name(&value_type)
+                        .is_some()
+                        .then_some(value_type)
+                })
+            }
+            _ => None,
+        };
+        let initial_expectation = literal_hint.as_ref().unwrap_or(initial_expectation);
         let mut running: Option<(Type, ReturnOrigin)> = None;
         let mut last_resort: Option<Type> = None;
         let mut disagreements = Vec::new();
@@ -57793,7 +58336,33 @@ impl<'src> Analyzer<'src> {
                     // B600: the other arguments, for a callee generic the call
                     // leaves open that an argument was typed in.
                     let mut typed_arguments: Vec<Id> = Vec::new();
-                    for (index, parameter_id) in parameters.iter().enumerate() {
+                    // B659: a literal at a generic only a closure argument's
+                    // result fixes is read after that closure (`pick(0, ||
+                    // held.depth)`), as on the method path.
+                    let deferred_literals = match argument_ids.len() >= 2
+                        && argument_ids.iter().any(|argument_id| {
+                            matches!(
+                                self.expr_id_to_expr_map.get(argument_id),
+                                Some(Expr::Closure(_))
+                            )
+                        }) {
+                        true => {
+                            let bindable = self.callee_bindable_generics(function_id);
+                            self.literals_awaiting_a_closure_result(
+                                &parameters,
+                                argument_ids,
+                                0,
+                                &bindable,
+                                &substitution_context,
+                            )
+                        }
+                        false => Vec::new(),
+                    };
+                    let order = (0..parameters.len())
+                        .filter(|index| !deferred_literals.contains(index))
+                        .chain(deferred_literals.iter().copied());
+                    for index in order {
+                        let parameter_id = &parameters[index];
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
@@ -59213,7 +59782,19 @@ impl<'src> Analyzer<'src> {
             Type::Unresolved => MethodLookup::Defer,
             // An unannotated closure parameter awaiting bidirectional inference
             // defers rather than erroring; once its type lands the call resolves.
-            Type::Unknown if self.is_unknown_closure_parameter(subject_id) => MethodLookup::Defer,
+            // B670: and so does a receiver BUILT from one — `(value *
+            // 100.0).round()` under `scale.derive(|value| ..)` asked for the
+            // product's type before `value` was filled, and refused "cannot
+            // call method 'round' on unknown" where `value.round()` waited.
+            Type::Unknown
+                if self.is_unknown_closure_parameter(subject_id)
+                    || (!matches!(
+                        self.expr_id_to_expr_map.get(&subject_id),
+                        Some(Expr::Local(_) | Expr::Parameter(_))
+                    ) && self.value_awaits_a_closure_parameter(subject_id)) =>
+            {
+                MethodLookup::Defer
+            }
             // A comprehension binder whose element type isn't set yet defers, too.
             Type::Unknown if self.is_untyped_comprehension_binder(subject_id) => {
                 MethodLookup::Defer
@@ -66388,11 +66969,37 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|(_, _, body_id)| (Vec::new(), *body_id))
             .collect();
-        let Some(match_type) =
-            self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs")
-        else {
-            return Resolution::Deferred;
-        };
+        let match_type =
+            match self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs") {
+                Some(match_type) => match_type,
+                None => {
+                    // B667: a leg that calls the function this match is the
+                    // RETURN of — `fun open(how: str) { match how { "right" =>
+                    // open("split"), _ => print("here") } }`, no written return
+                    // type — asks for that function's return, which is this
+                    // match's type: the cycle never resolved. The legs are read as
+                    // the function's own return inference reads them, with the
+                    // function on the inference stack, so the self-call answers
+                    // `never` (it constrains nothing: its value IS the answer under
+                    // construction) and the other legs decide; an `if` in the same
+                    // place always typed this way. Only for a match in the
+                    // function's return position, where its type and the
+                    // function's are one type.
+                    let Some(function_id) =
+                        self.self_returning_function(prepped.id, prepped.scope_id)
+                    else {
+                        return Resolution::Deferred;
+                    };
+                    self.return_inference_stack.push((function_id, false));
+                    let unified =
+                        self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs");
+                    self.return_inference_stack.pop();
+                    match unified {
+                        Some(match_type) => match_type,
+                        None => return Resolution::Deferred,
+                    }
+                }
+            };
         let match_type_id = match_type.get_type_id(self);
         self.resolved_types.insert(prepped.id, match_type_id);
         // Expand each or-pattern leg into one leg per alternative, all sharing the
@@ -66446,6 +67053,85 @@ impl<'src> Analyzer<'src> {
             refused = true;
         }
         refused
+    }
+
+    /// B667: the name of a function with no written return type that `body`
+    /// calls in its tail (through blocks), for the unresolved match's steer.
+    fn unannotated_callee_in_tail(&self, body: Id) -> Option<&'src str> {
+        let mut current = body;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Block((_, tail)) => current = *tail,
+                Expr::Call(call_id) => {
+                    let function_call = self.function_calls.get(call_id)?;
+                    let Some(Expr::Local(callee)) =
+                        self.expr_id_to_expr_map.get(&function_call.subject_id)
+                    else {
+                        return None;
+                    };
+                    return self
+                        .functions
+                        .get(callee)
+                        .filter(|function| function.has_body && function.return_type_id.is_none())
+                        .map(|function| function.name);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// B667: the function with no written return type whose RETURN this
+    /// match is — the function whose body the match's scope sits in, when the
+    /// match is reached from that body's tail through blocks' tails, an `if`'s
+    /// branch tails and a resolved or still-pending `match`'s leg bodies.
+    /// There the match's type and the function's are one type, so a call to
+    /// the function inside a leg (free or a method, resolved or not) is the
+    /// answer under construction. `None` for every other match.
+    fn self_returning_function(&mut self, match_id: Id, scope_id: Id) -> Option<Id> {
+        if self.function_scopes_indexed != self.functions.len() {
+            self.function_by_body_scope = self
+                .functions
+                .iter()
+                .map(|(function_id, function)| (function.body.2, *function_id))
+                .collect();
+            self.function_scopes_indexed = self.functions.len();
+        }
+        let mut scope = scope_id;
+        let mut owner = None;
+        for _ in 0..4096 {
+            if let Some(function_id) = self.function_by_body_scope.get(&scope) {
+                owner = Some(*function_id);
+                break;
+            }
+            scope = self.scopes.get(&scope)?.parent_id?;
+        }
+        let function_id = owner?;
+        let function = self.functions.get(&function_id)?;
+        if !function.has_body || function.return_type_id.is_some() {
+            return None;
+        }
+        let mut pending = vec![function.body.1];
+        while let Some(current) = pending.pop() {
+            if current == match_id {
+                return Some(function_id);
+            }
+            match self.expr_id_to_expr_map.get(&current) {
+                Some(Expr::Block((_, tail))) => pending.push(*tail),
+                Some(Expr::If(branch)) => {
+                    let mut branch_bodies = Vec::new();
+                    if_branch_bodies(branch, &mut branch_bodies);
+                    pending.extend(branch_bodies.into_iter().map(|(_, tail)| tail));
+                }
+                Some(Expr::Match(_, legs)) => pending.extend(legs.iter().map(|leg| leg.body)),
+                None => {
+                    if let Some(bodies) = self.match_leg_bodies.get(&current) {
+                        pending.extend(bodies.iter().copied());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// S4 (editing-dx.md §7.1): the struct-initializer field-count message,
@@ -70401,13 +71087,20 @@ impl<'src> Analyzer<'src> {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
                 Some(trait_id) => trait_id,
                 None => {
+                    // B664: in the impl's OWN file. Pushed bare, the error
+                    // took whichever file the walk had last been reading — in
+                    // a package, none the span fit (no location at all) or an
+                    // unrelated one (kolt's `views.vl:25`, an import).
                     let steer = self.import_steer(check.trait_name).unwrap_or_default();
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: check.span,
-                        msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
-                    });
+                    self.push_in_source(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: check.span,
+                            msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
+                        },
+                        check.source_id,
+                    );
                     continue;
                 }
             };
@@ -70415,12 +71108,15 @@ impl<'src> Analyzer<'src> {
             // member with a default body is inherited, so an impl need not
             // provide it.
             if !self.traits.contains_key(&trait_id) {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: check.span,
-                    msg: format!("'{}' is not a trait", check.trait_name),
-                });
+                self.push_in_source(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: check.span,
+                        msg: format!("'{}' is not a trait", check.trait_name),
+                    },
+                    check.source_id,
+                );
                 continue;
             }
             // B273: the impl's `with` clause writes a trait APPLICATION, and
@@ -70867,12 +71563,15 @@ impl<'src> Analyzer<'src> {
                         subject_name, trait_label, member_name, expected_signature
                     )
                 };
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note,
-                    span: check.span,
-                    msg,
-                });
+                self.push_in_source(
+                    Error {
+                        trace: Vec::new(),
+                        note,
+                        span: check.span,
+                        msg,
+                    },
+                    check.source_id,
+                );
             }
         }
 
@@ -73831,28 +74530,54 @@ impl<'src> Analyzer<'src> {
                 );
             }
         }
-        let unresolved_matches: Vec<(Id, Span)> = if residuals_are_cascade {
+        let unresolved_matches: Vec<(Id, Span, Vec<Id>)> = if residuals_are_cascade {
             Vec::new()
         } else {
             self.constraints
                 .iter()
                 .filter_map(|constraint| match constraint {
-                    Constraint::Match(prepped) => Some((prepped.subject_id, prepped.span)),
+                    Constraint::Match(prepped) => Some((
+                        prepped.subject_id,
+                        prepped.span,
+                        prepped.legs.iter().map(|leg| leg.body).collect(),
+                    )),
                     _ => None,
                 })
                 .collect()
         };
-        for (subject_id, span) in unresolved_matches {
+        for (subject_id, span, leg_bodies) in unresolved_matches {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
+            // B667: name the leg whose type never settled, and — when that leg
+            // calls a function with no written return type — the fix.
+            let unsettled_leg = leg_bodies.iter().copied().find(|body| {
+                matches!(
+                    self.infer_type(*body, &Type::Unknown, &HashMap::default()),
+                    Type::Unresolved
+                )
+            });
+            let steer = unsettled_leg
+                .and_then(|body| self.unannotated_callee_in_tail(body))
+                .map(|name| {
+                    format!(
+                        "; this leg calls `{name}`, whose return type is inferred from its body — \
+                         write it (`fun {name}(…): <type>`)"
+                    )
+                })
+                .unwrap_or_default();
+            let note = unsettled_leg.map(|body| {
+                Note::here(
+                    **self.span_map.get(&body).unwrap_or(&&EMPTY_SPAN),
+                    "this leg's type is never determined".to_string(),
+                )
+            });
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
-                    note: None,
+                    note,
                     span,
                     msg: format!(
-                        "type of match expression could not be resolved (subject: {})",
-                        subject_str
+                        "type of match expression could not be resolved (subject: {subject_str}){steer}"
                     ),
                 },
                 subject_id,
@@ -75408,6 +76133,62 @@ enum CellSlot {
     Field(Id, usize),
     /// Every handle with no slot the compiler can name.
     Unknown,
+}
+
+/// What a WRITE SUMMARY is asked about (B457, B647): whether a function — its
+/// own span and every call it makes — can write it.
+enum WriteSubject<'a> {
+    /// A `Shared` cell, written IN PLACE (B457: a rebind installs a fresh
+    /// value and leaves the storage a read handed out alone).
+    Cell(CellSlot),
+    /// A module-level `mut` binding, written at all — an assignment to it or
+    /// to a place under it, or a call lending such a place `&mut` (B647).
+    Module(Id, &'a ModuleWrites),
+}
+
+/// B647: every write of a module-level `mut` binding in the program, and the
+/// bindings a call through an unknown closure value may write.
+#[derive(Default)]
+struct ModuleWrites {
+    /// `(writing expression, binding)`: an assignment whose target's spine
+    /// roots at the binding, or a call lending such a place `&mut`.
+    sites: Vec<(Id, Id)>,
+    /// The bindings written inside some closure literal's body or by a
+    /// function taken as a value — what a call through a closure VALUE may
+    /// reach.
+    through_values: HashSet<Id>,
+}
+
+impl WriteSubject<'_> {
+    /// A write of the subject inside `expr_id`'s source span.
+    fn spans_a_write(&self, analyzer: &Analyzer<'_>, expr_id: Id) -> bool {
+        match self {
+            WriteSubject::Cell(cell) => analyzer.spans_an_in_place_write(expr_id, *cell),
+            WriteSubject::Module(binding, writes) => {
+                analyzer.spans_a_module_write(expr_id, *binding, writes)
+            }
+        }
+    }
+
+    /// Whether `call_id` IS the subject's own access rather than a call that
+    /// runs code: a cell's `read()`/`write()`.
+    fn is_the_access(&self, analyzer: &Analyzer<'_>, call_id: Id) -> bool {
+        match self {
+            WriteSubject::Cell(_) => {
+                analyzer.shared_cells.reads.contains_key(&call_id)
+                    || analyzer.shared_cells.writes.contains_key(&call_id)
+            }
+            WriteSubject::Module(..) => false,
+        }
+    }
+
+    /// The answer for a call nothing here can see into — a closure value.
+    fn unknown(&self, analyzer: &Analyzer<'_>) -> bool {
+        match self {
+            WriteSubject::Cell(cell) => analyzer.shared_cells.mutated.contains(cell),
+            WriteSubject::Module(binding, writes) => writes.through_values.contains(binding),
+        }
+    }
 }
 
 /// B267: the program's `Shared` cells — which slots can hold the same one, and
@@ -89804,6 +90585,10 @@ fn analyze_over_world<'src>(
         analyzer.check_reseat_escape();
     }
     unless_cancelled! {
+        // B647: a loan of a module-level `mut` binding against the callee's
+        // write summary — whole-program (the callee may sit in another
+        // module), so outside the Class A window.
+        analyzer.check_module_binding_loans();
         analyzer.check_wire_boundary();
         analyzer.check_json_boundary();
         analyzer.check_hashable_boundary();

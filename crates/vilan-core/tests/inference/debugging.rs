@@ -8,18 +8,142 @@ use super::support::*;
 
 // --- S0: `[track_caller]` -------------------------------------------------
 
-/// A trait member is reached by dispatch, where no call site knows it is
-/// calling a tracking function, so the attribute is refused there — on the
-/// trait's declaration and on an implementation's member alike.
+/// B646: `[track_caller]` DECLARED on a trait member is part of the trait's
+/// contract. Every implementation takes the hidden location (marked or not),
+/// and every call passes it: a static call its own site, a call through a
+/// bound its own site at each instantiation, a `dyn` table's slot its own
+/// site, a default reached through the type, a `T::member()` static, a
+/// `Trait::member(receiver)` path call; a tracking caller forwards its own.
+/// (The native backend's answers are `native_differential`'s
+/// `b646_*`.)
 #[test]
-fn s0_track_caller_is_refused_on_a_trait_method() {
-    assert_fails_with(
-        "trait Probe {\n\t[track_caller]\n\tfun probe(self): i32;\n}\nfun main() {}\n",
-        "`[track_caller]` is not supported on a trait method",
+fn b646_a_trait_member_declared_tracking_names_every_call_site() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::caller;\n",
+            "trait Probe {\n",
+            "\t[track_caller]\n",
+            "\tfun probe(self, label: str): str;\n",
+            "\t[track_caller]\n",
+            "\tfun fallback(self): str {\n",
+            "\t\t\"default \" + caller().text()\n",
+            "\t}\n",
+            "}\n",
+            "trait Make {\n",
+            "\t[track_caller]\n",
+            "\tfun make(): str;\n",
+            "}\n",
+            "struct P {}\n",
+            "impl P with Probe {\n",
+            "\tfun probe(self, label: str): str { label + \" \" + caller().text() }\n",
+            "}\n",
+            "impl P with Make {\n",
+            "\tfun make(): str { \"make \" + caller().text() }\n",
+            "}\n",
+            "struct Q {}\n",
+            "impl Q with Probe {\n",
+            "\t[track_caller]\n",
+            "\tfun probe(self, label: str): str { label + \" q \" + caller().text() }\n",
+            "\tfun fallback(self): str { \"q \" + caller().text() }\n",
+            "}\n",
+            "fun bound<T: Probe>(value: T): str { value.probe(\"bound\") }\n",
+            "fun object(value: dyn Probe): str { value.probe(\"dyn\") }\n",
+            "fun object_default(value: dyn Probe): str { value.fallback() }\n",
+            "fun build<T: Make>(): str { T::make() }\n",
+            "[track_caller]\n",
+            "fun forwarding<T: Probe>(value: T): str { value.probe(\"forwarded\") }\n",
+            "fun main() {\n",
+            "\tprint(P {}.probe(\"static\"));\n",
+            "\tprint(Q {}.probe(\"static\"));\n",
+            "\tprint(bound(P {}));\n",
+            "\tprint(bound(Q {}));\n",
+            "\tprint(object(P {}));\n",
+            "\tprint(object(Q {}));\n",
+            "\tprint(P {}.fallback());\n",
+            "\tprint(object_default(P {}));\n",
+            "\tprint(object_default(Q {}));\n",
+            "\tprint(build<P>());\n",
+            "\tprint(P::make());\n",
+            "\tprint(forwarding(Q {}));\n",
+            "\tprint(Probe::probe(P {}, \"path\"));\n",
+            "}\n",
+        ),
+        concat!(
+            "static test.vl:34:13\n",
+            "static q test.vl:35:13\n",
+            "bound test.vl:27:44\n",
+            "bound q test.vl:27:44\n",
+            "dyn test.vl:28:43\n",
+            "dyn q test.vl:28:43\n",
+            "default test.vl:40:13\n",
+            "default test.vl:29:51\n",
+            "q test.vl:29:51\n",
+            "make test.vl:30:32\n",
+            "make test.vl:44:11\n",
+            "forwarded q test.vl:45:8\n",
+            "path test.vl:46:15\n",
+        ),
     );
+}
+
+/// B646: a call inside a trait's NON-tracking default that names a tracking
+/// member passes the default's own site — a default is a body like any
+/// other, and the location stops at a body that does not track.
+#[test]
+fn b646_a_non_tracking_default_passes_its_own_site() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::debug::caller;\n",
+            "trait Probe {\n",
+            "\tfun twice(self): str { self.inner() + \" / \" + self.inner() }\n",
+            "\t[track_caller]\n",
+            "\tfun inner(self): str;\n",
+            "}\n",
+            "struct P {}\n",
+            "impl P with Probe {\n",
+            "\tfun inner(self): str { caller().text() }\n",
+            "}\n",
+            "fun main() { print(P {}.twice()); }\n",
+        ),
+        "test.vl:3:30 / test.vl:3:53\n",
+    );
+}
+
+/// B646: an implementation that marks a member its trait does NOT declare
+/// tracking is refused — a call through the trait would pass no location —
+/// with the steer to declare it on the trait. An inherent method is still
+/// free to track.
+#[test]
+fn b646_an_implementation_cannot_track_what_its_trait_does_not() {
     assert_fails_with(
         "trait Probe {\n\tfun probe(self): i32;\n}\nstruct P {}\nimpl P with Probe {\n\t[track_caller]\n\tfun probe(self): i32 { 1 }\n}\nfun main() { print(P {}.probe()); }\n",
-        "`[track_caller]` is not supported on a trait method",
+        "`[track_caller]` on `probe`, which `Probe` does not declare tracking",
+    );
+    // A supertrait's member is the trait the implementation answers to.
+    assert_fails_with(
+        "trait Base {\n\tfun probe(self): i32;\n}\ntrait Sub with Base {}\nstruct P {}\nimpl P with Sub {\n\t[track_caller]\n\tfun probe(self): i32 { 1 }\n}\nfun main() { print(P {}.probe()); }\n",
+        "`[track_caller]` on `probe`, which `Base` does not declare tracking",
+    );
+}
+
+/// B646: a tracking trait member taken as a VALUE is refused as a free
+/// function is, with a method-shaped steer.
+#[test]
+fn b646_a_tracking_trait_member_taken_as_a_value_is_refused() {
+    assert_fails_with(
+        "trait Probe {\n\t[track_caller]\n\tfun probe(self): i32;\n}\nstruct P {}\nimpl P with Probe {\n\tfun probe(self): i32 { 1 }\n}\nfun main() {\n\tlet f = Probe::probe;\n}\n",
+        "`probe` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one. Call it inside a closure instead: `|value| value.probe(..)`",
+    );
+}
+
+/// B646 (met on the way): a `for .. in` loop calls `next` through the
+/// iterator protocol with no argument list, so a tracking `next` was handed no
+/// location (`undefined` on JS) — refused at the iterable now.
+#[test]
+fn b646_a_for_loop_over_a_tracking_next_is_refused() {
+    assert_fails_with(
+        "import std::debug::caller;\nstruct Count { at: i32 }\nimpl Count {\n\t[track_caller]\n\tfun next(&mut self): Option<i32> {\n\t\tprint(caller().text());\n\t\tif self.at < 2 { self.at += 1; Some(self.at) } else { None }\n\t}\n}\nfun main() {\n\tmut count = Count { at = 0 };\n\tfor item in count {\n\t\tprint(item);\n\t}\n}\n",
+        "`next` is `[track_caller]`, and a `for .. in` loop calls it through the iterator protocol",
     );
 }
 

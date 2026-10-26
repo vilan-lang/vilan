@@ -183,11 +183,11 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 | `[client_service]` | · | · | · | · | · |
 | `[extern("f")]` | ✓ | ✓ | ✓ | · | · |
 | `[must_use]` | ✓ | ✓ | ✓ | · | · |
-| `[track_caller]` | ✓ | a23 | a23 | · | · |
+| `[track_caller]` | ✓ | ✓ | ✓ | · | · |
 | `[rpc]` | ✓ | ✓ | ✓ | · | · |
 | `[trait_only]` | ✓ | ✓ | ✓ | · | · |
 | `[doc(hidden)]` | s6 | s6 | s6 | · | · |
-| `[expose]` | · | · | · | a24 | · |
+| `[expose]` | · | · | · | a23 | · |
 | `[platform("browser")]` | ✓ | ✓ | ✓ | · | · |
 | `[deprecated("use g")]` | ✓ | ✓ | ✓ | · | · |
 | `[internal("why")]` | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -211,19 +211,19 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 
 | marker | B1 | B2 | B3 | B4 | B5 | B6 | B7 | B8 | B9 | B10 |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `async` | · | · | s1 | s1 | s1 | · | ✓ | · | a25 | ✓ |
-| `const` | · | · | · | ✓ | a26 | · | · | a27 | ✓ | ✓ |
-| `export` | · | · | · | a16 | s28 | · | · | s28 | · | s28 |
+| `async` | · | · | s1 | s1 | s1 | · | ✓ | · | a24 | ✓ |
+| `const` | · | · | · | ✓ | a25 | · | · | a26 | ✓ | ✓ |
+| `export` | · | · | · | a16 | s27 | · | · | s27 | · | s27 |
 | `external` | · | · | · | · | · | · | · | · | · | · |
-| `macro` | · | · | · | · | · | · | · | · | a29 | a29 |
+| `macro` | · | · | · | · | · | · | · | · | a28 | a28 |
 | `mut` | ✓ | ✓ | ✓ | · | ✓ | · | · | · | · | · |
 | `as` | · | · | · | · | · | · | · | · | · | · |
-| `auto` | · | · | · | · | · | a30 | a30 | · | · | · |
+| `auto` | · | · | · | · | · | a29 | a29 | · | · | · |
 | `borrows` | · | · | · | · | · | · | · | · | · | · |
 | `context` | · | · | · | · | · | · | · | · | · | · |
 | `dyn` | s20 | s20 | s20 | · | s20 | ✓ | · | · | s20 | s20 |
 | `jump` | · | · | · | · | · | · | · | · | · | · |
-| `lazy` | ✓ | ✓ | s31 | a32 | s33 | s21 | · | · | · | · |
+| `lazy` | ✓ | ✓ | s30 | a31 | s32 | s21 | · | · | · | · |
 | `only` | · | · | · | · | · | · | · | · | · | · |
 | `own` | ✓ | ✓ | ✓ | · | s22 | s22 | · | · | s22 | s22 |
 | `self` | · | · | · | · | · | · | · | · | · | · |
@@ -242,9 +242,9 @@ Rows: every MARKER (the five classes) and every contextual keyword. Cells: `✓`
 | `[trait_only]` | · | · | · | · | · | · | · | · | · | · |
 | `[doc(hidden)]` | · | · | · | · | · | · | · | · | · | · |
 | `[expose]` | · | · | · | · | · | · | · | · | · | · |
-| `[platform("browser")]` | · | · | · | a34 | · | · | · | · | · | · |
-| `[deprecated("use g")]` | · | · | · | a35 | · | · | · | · | · | · |
-| `[internal("why")]` | · | · | · | a36 | · | · | · | · | · | · |
+| `[platform("browser")]` | · | · | · | a33 | · | · | · | · | · | · |
+| `[deprecated("use g")]` | · | · | · | a34 | · | · | · | · | · | · |
+| `[internal("why")]` | · | · | · | a35 | · | · | · | · | · | · |
 | `[resource]` | · | · | · | s10 | s10 | · | · | · | s10 | s10 |
 | `[hint(Show)]` | · | · | · | a14 | · | · | · | · | · | · |
 | `[reactive(coarse)]` | · | · | · | · | · | · | · | · | · | · |
@@ -390,31 +390,31 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 | `async` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `await` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `const` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `css` | s37 | s37 | · | · | ✓ | ✓ | ✓ | · |
+| `css` | s36 | s36 | · | · | ✓ | ✓ | ✓ | · |
 | `else` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `enum` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `export` | · | · | · | s28 | ✓ | ✓ | ✓ | s28 |
+| `export` | · | · | · | s27 | ✓ | ✓ | ✓ | s27 |
 | `external` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `false` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `for` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `fun` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `if` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `impl` | · | · | s38 | · | ✓ | ✓ | ✓ | · |
-| `import` | s39 | s39 | s39 | · | ✓ | ✓ | ✓ | · |
+| `impl` | · | · | s37 | · | ✓ | ✓ | ✓ | · |
+| `import` | s38 | s38 | s38 | · | ✓ | ✓ | ✓ | · |
 | `in` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `is` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `let` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `macro` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `match` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `mod` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `mut` | s40 | · | · | · | ✓ | ✓ | ✓ | · |
+| `mut` | s39 | · | · | · | ✓ | ✓ | ✓ | · |
 | `null` | · | · | · | ✓ | ✓ | ✓ | ✓ | · |
 | `ret` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `struct` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `trait` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `type` | · | · | · | · | ✓ | ✓ | ✓ | · |
 | `true` | · | · | · | · | ✓ | ✓ | ✓ | · |
-| `use` | s39 | s39 | s39 | · | ✓ | ✓ | ✓ | · |
+| `use` | s38 | s38 | s38 | · | ✓ | ✓ | ✓ | · |
 | `as` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `auto` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `borrows` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -424,11 +424,11 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 | `lazy` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `only` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `own` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | s41 |
+| `self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | s40 |
 | `Self` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `sync` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `then` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `void` | s42 | s42 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `void` | s41 | s41 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `with` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `derive` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `service` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -471,23 +471,22 @@ Whether the word may NAME something (parser only): a reserved keyword never can 
 - **s20** `dyn` marks a trait object in TYPE position — `let shape: dyn Shape = circle;` — and has no reading in an expression: a value becomes a trait object where it meets that type
 - **s21** `lazy` is written where the deferral is DECLARED — `lazy let name: T = …;` at module level, or `lazy name: T` on a parameter — and a call passes the argument plainly
 - **s22** `own` is a PARAMETER convention — `fun take(own list: List<T>)` — and has no reading here: a `let` already owns its value, and a type is written without it
-- **a23** `[track_caller]` is not supported on a trait method: a call through a trait is dispatched, so no call site knows to pass its location. Mark a free function or an inherent method instead
-- **a24** field `x` of struct `S` is `[expose]`d, but its type `i32` does not implement `std::Source`: only observable state can be exposed, because the client mirrors it by subscribing. Write a `SignalCell<T>` with a Wire `T`, or…
-- **a25** Expected i32, but got Task<i32> instead.
-- **a26** `const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`
-- **a27** const evaluation failed: a `const` result must be plain data; this evaluates to a closure. A compile-time CLOSURE is spelled as a declaration: write `const let g = ..;` — a `const let` admits a closure over plain data (`…
-- **s28** `export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` sco…
-- **a29** no macro named `g` is in scope
-- **a30** `auto` writes a type the toolchain infers and keeps current, so it stands only where a type is inferred: a function's return, a `let` or `mut` binding, or an ascription (`as auto T`) — nothing is inferred here, so write …
-- **s31** a closure cannot take a `lazy` parameter: a closure TYPE (`sync \|A\| B`) has no lazy form, so the thunking would be invisible to every position the closure is annotated, stored or passed in. Take a closure parameter (`\|ma…
-- **a32** `x` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's. A local would need a runtime was-it-initialized flag to know whether to destroy it at the end of its scope — d…
-- **s33** a lazy binding is `lazy let name: T = <initializer>;` — `lazy` defers a BINDING's initializer to its first use, and a parameter's argument to the callee's first read
-- **a34** `x` is a local binding, and `[platform(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
-- **a35** `x` is a local binding, and `[deprecated(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
-- **a36** `x` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
-- **s37** `css` is a keyword: it begins a `css { … }` block. The style values that used to spell it were renamed out of its way — `Length::css(…)` is now `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.t…
-- **s38** the unit type is spelled `void`: `()` is the empty tuple, which no expression can produce
-- **s39** an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
-- **s40** a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and writing both is neither
-- **s41** `self` is reserved for the file's own module — `mod self;`, with no body, as the file's first statement — so a nested module cannot take the name: give it another
-- **s42** `void` is the unit value's own spelling, so a binding cannot take it: every later `void` still reads as the unit, not as this binding — name it something else
+- **a23** field `x` of struct `S` is `[expose]`d, but its type `i32` does not implement `std::Source`: only observable state can be exposed, because the client mirrors it by subscribing. Write a `SignalCell<T>` with a Wire `T`, or…
+- **a24** Expected i32, but got Task<i32> instead.
+- **a25** `const x = …` is not a declaration: a compile-time binding is `const let x = …`, and a runtime one seeded from a build-time value is `let x = const …`
+- **a26** const evaluation failed: a `const` result must be plain data; this evaluates to a closure. A compile-time CLOSURE is spelled as a declaration: write `const let g = ..;` — a `const let` admits a closure over plain data (`…
+- **s27** `export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` sco…
+- **a28** no macro named `g` is in scope
+- **a29** `auto` writes a type the toolchain infers and keeps current, so it stands only where a type is inferred: a function's return, a `let` or `mut` binding, or an ascription (`as auto T`) — nothing is inferred here, so write …
+- **s30** a closure cannot take a `lazy` parameter: a closure TYPE (`sync \|A\| B`) has no lazy form, so the thunking would be invisible to every position the closure is annotated, stored or passed in. Take a closure parameter (`\|ma…
+- **a31** `x` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's. A local would need a runtime was-it-initialized flag to know whether to destroy it at the end of its scope — d…
+- **s32** a lazy binding is `lazy let name: T = <initializer>;` — `lazy` defers a BINDING's initializer to its first use, and a parameter's argument to the callee's first read
+- **a33** `x` is a local binding, and `[platform(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+- **a34** `x` is a local binding, and `[deprecated(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+- **a35** `x` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+- **s36** `css` is a keyword: it begins a `css { … }` block. The style values that used to spell it were renamed out of its way — `Length::css(…)` is now `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.t…
+- **s37** the unit type is spelled `void`: `()` is the empty tuple, which no expression can produce
+- **s38** an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
+- **s39** a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and writing both is neither
+- **s40** `self` is reserved for the file's own module — `mod self;`, with no body, as the file's first statement — so a nested module cannot take the name: give it another
+- **s41** `void` is the unit value's own spelling, so a binding cannot take it: every later `void` still reads as the unit, not as this binding — name it something else

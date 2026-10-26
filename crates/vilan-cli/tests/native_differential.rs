@@ -12101,15 +12101,17 @@ const REACTIVE_TRACE: &str = include_str!("native/reactive_trace.vl");
 const REACTIVE_TRACE_FILE: &str = "native_probe_reactive_trace.vl";
 
 /// E257 S8: `std::reactive::trace(true)` writes one line per wake to stderr —
-/// the woken subscriber, the cell that woke it with where it was made, and the
-/// write's place (a `[track_caller]` location, S0) — the same bytes on both
-/// backends, one pin per wake path: a write with no turn (inline), a write
-/// queued in an ambient turn (`batch`), a derivation's write joining the
-/// DRAINING turn (`set by`), a write after its turn settled (one microtask
-/// drains it), a relay's wake (`distinct`), `update`, a cell made by
-/// `Signal::new` and written through a bound (no place: a `[track_caller]`
-/// trait member is refused), and the trace off. Native has no host task to
-/// tag a queued wake with (`console.createTask` is the JS backend's): the
+/// the woken subscriber with where it was made, the cell that woke it with
+/// where it was made, and the write's place (a `[track_caller]` location, S0)
+/// — the same bytes on both backends, one pin per wake path: a write with no
+/// turn (inline), a write queued in an ambient turn (`batch`), a derivation's
+/// write joining the DRAINING turn (`set by`), a write after its turn settled
+/// (one microtask drains it), a relay's wake (`distinct`), `update`, a cell
+/// made by `Signal::new` and written through a bound, a write through a `dyn
+/// Signal` with a subscriber made through a `dyn Source` (B646: the `Signal`
+/// and `Flow` members are `[track_caller]` on the trait, so every one of these
+/// names its place), an `effect`, and the trace off. Native has no host task
+/// to tag a queued wake with (`console.createTask` is the JS backend's): the
 /// lines are the same, only a debugger's async stack differs.
 #[test]
 fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
@@ -12130,7 +12132,8 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "inline 1\ninline 2\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"inline {value}\")", "sub"),
                     made(file),
                     site(file, "count.set(2)", "set")
                 ),
@@ -12140,7 +12143,8 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "turn 1\nqueued\nturn 3\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"turn {value}\")", "sub"),
                     made(file),
                     site(file, "count.set(3)", "set")
                 ),
@@ -12151,9 +12155,10 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 "draining 2\ndraining 8\n".to_string(),
                 format!(
                     "[reactive] derivation #0 woken by cell #1 (made at {}), set at {}\n\
-                     [reactive] effect #1 woken by cell #3, set by derivation #0\n",
+                     [reactive] effect #1 at {} woken by cell #3, set by derivation #0\n",
                     made(file),
-                    site(file, "batch(|| count.set(4))", "set")
+                    site(file, "batch(|| count.set(4))", "set"),
+                    site(file, "print(i\"draining {value}\")", "sub"),
                 ),
             )
         }),
@@ -12161,7 +12166,8 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "late 1\nbefore the microtask\nlate 5\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"late {value}\")", "sub"),
                     made(file),
                     site(file, "later = Some(|| count.set(5))", "set")
                 ),
@@ -12172,9 +12178,10 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 "relay 1\nrelay 6\n".to_string(),
                 format!(
                     "[reactive] derivation #1 woken by cell #1 (made at {}), set at {}\n\
-                     [reactive] effect #0 woken by derivation #1\n",
+                     [reactive] effect #0 at {} woken by derivation #1\n",
                     made(file),
-                    site(file, "count.set(6)", "set")
+                    site(file, "count.set(6)", "set"),
+                    site(file, "print(i\"relay {value}\")", "sub"),
                 ),
             )
         }),
@@ -12182,16 +12189,44 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "update 1\nupdate 2\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"update {value}\")", "sub"),
                     made(file),
                     site(file, "count.update(", "update")
                 ),
             )
         }),
-        ("unplaced", |_, _, _| {
+        ("trait", |file, _, site| {
             (
-                "unplaced 10\nunplaced 11\n".to_string(),
-                "[reactive] effect #0 woken by cell #2\n".to_string(),
+                "trait 10\ntrait 11\n".to_string(),
+                format!(
+                    "[reactive] effect #0 at {} woken by cell #2 (made at {}), set at {}\n",
+                    site(file, "print(i\"trait {value}\")", "sub"),
+                    site(file, "Signal::new(10)", "new"),
+                    site(file, "\tcell.set(value);", "set"),
+                ),
+            )
+        }),
+        ("object", |file, made, site| {
+            (
+                "object 12\n".to_string(),
+                format!(
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"object {value}\")", "on_change"),
+                    made(file),
+                    site(file, "erased.set(12)", "set"),
+                ),
+            )
+        }),
+        ("effect", |file, made, site| {
+            (
+                "effect 1\neffect 13\n".to_string(),
+                format!(
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"effect {value}\")", "effect"),
+                    made(file),
+                    site(file, "count.set(13)", "set"),
+                ),
             )
         }),
         ("off", |_, _, _| {
@@ -12224,6 +12259,52 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
     });
     let wrong: Vec<String> = legs.into_iter().flatten().collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+/// B646: `[track_caller]` declared on a trait member names every call site
+/// the same way on both backends — a static call, a call through a bound
+/// after monomorphization, a call through a `dyn` table's slot (the native
+/// object trait's method takes the `Location` parameter), a default reached
+/// through the type and through the table, a `T::member()` static, a path
+/// call, and a tracking caller forwarding its own location.
+#[test]
+fn b646_a_tracking_trait_member_names_its_call_site_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_b646_trait_track_caller.vl",
+        include_str!("native/b646_trait_track_caller.vl"),
+        include_str!("native/b646_trait_track_caller.stdout"),
+        "",
+    );
+}
+
+/// B647: a module-level `mut` binding lent where no write reaches it, a local
+/// lent to a writer, the copy the refusal names, and the by-value twin — a
+/// module binding handed by value to a callee that writes it is a copy, which
+/// JS now takes too (it printed the callee's own push through the parameter)
+/// — the same bytes on both backends (`native/b647_module_binding_copies.*`).
+#[test]
+fn b647_module_binding_loans_and_copies_answer_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_b647_module_binding_copies.vl",
+        include_str!("native/b647_module_binding_copies.vl"),
+        include_str!("native/b647_module_binding_copies.stdout"),
+        "",
+    );
+}
+
+/// B659, B667, B670: a literal waiting for a closure's result (method and
+/// free path), a literal tail taking a `ret`'s width, a self-call in a
+/// `match` leg of an unannotated function, a method on an operator's result
+/// over a closure parameter — typed, and answering the same on both backends
+/// (`native/solver55_inference.*`).
+#[test]
+fn solver55_inference_shapes_answer_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_solver55_inference.vl",
+        include_str!("native/solver55_inference.vl"),
+        include_str!("native/solver55_inference.stdout"),
+        "",
+    );
 }
 
 // ---------------------------------------------------------------------------

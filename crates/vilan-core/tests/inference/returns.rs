@@ -6043,3 +6043,57 @@ fn b537_a_statement_over_an_unbound_return_carries_the_steer_alone() {
         "this body ends without producing a value",
     );
 }
+
+// --- B667: a self-call in a `match` leg of an unannotated function ----------
+
+/// B667: a function with no written return type that calls itself in a
+/// `match` leg resolves — the self-call's value IS the function's return, so
+/// the other legs decide it (`void` here), as an `if` always did. Pinned: the
+/// item's shape, a numeric return through a recursive leg, a nested `match`
+/// (kolt's `Panels::open`), and a method.
+#[test]
+fn b667_a_self_call_in_a_match_leg_resolves_from_the_other_legs() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun open(how: str) {\n",
+            "\tmatch how {\n",
+            "\t\t\"right\" => open(\"split\"),\n",
+            "\t\t_ => print(i\"open {how}\"),\n",
+            "\t}\n",
+            "}\n",
+            "fun count(n: i32) {\n",
+            "\tmatch n {\n",
+            "\t\t0 => 0,\n",
+            "\t\t_ => 1 + count(n - 1),\n",
+            "\t}\n",
+            "}\n",
+            "fun down(n: i32) {\n",
+            "\tmatch n {\n",
+            "\t\t0 => 100,\n",
+            "\t\t_ => down(n - 1),\n",
+            "\t}\n",
+            "}\n",
+            "struct Panels { side: Option<str> }\n",
+            "impl Panels {\n",
+            "\tfun open(self, how: str) {\n",
+            "\t\tmatch how {\n",
+            "\t\t\t\"right\" => match self.side {\n",
+            "\t\t\t\tSome(let at) => print(i\"beside {at}\"),\n",
+            "\t\t\t\tNone => self.open(\"split\"),\n",
+            "\t\t\t},\n",
+            "\t\t\t_ => print(i\"panel {how}\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\topen(\"right\");\n",
+            "\tlet three: i32 = count(3);\n",
+            "\tlet hundred: i32 = down(4);\n",
+            "\tprint(i\"{three} {hundred}\");\n",
+            "\tPanels { side = None }.open(\"right\");\n",
+            "\tPanels { side = Some(\"left\") }.open(\"right\");\n",
+            "}\n",
+        ),
+        "open split\n3 100\npanel split\nbeside left\n",
+    );
+}
