@@ -1200,6 +1200,28 @@ trait's own parameter. Match a value of the enum's own type, or move the
 match to where the parameter is concrete. A bound does not change this:
 a trait bound cannot make a parameter be one particular enum.
 
+### Which impls a library's own code sees
+
+The standard library's declarations, and each dependency package's, are
+resolved **before the entry package's declarations exist**. An impl that the
+program's own package declares — in the entry file or in any of its
+modules — never answers a question that std's or a dependency's own
+resolution asks: the methods std's bodies call, the traits std's bodies ask
+of their own values, are decided by std and the dependencies alone. Your impl
+answers the questions your package asks, and the questions asked where your
+types are used.
+
+Nothing about dispatch at a USE is affected. A std generic instantiated with
+one of your types (`list.sort()` over your `Ord` impl), your `Display` printed
+through std's `print`, your `Wire` impl serialized by a std channel — each of
+those is a question your code asks at its call site, after std has resolved,
+and your impl answers it. What the rule settles is that adding an impl to
+your package cannot change how std's own code was typed — an inherent
+`impl type T { fun len(self): i32 }` in a package module is a member of every
+type for that package's calls, and std's `xs.len()` inside its own list code
+still means std's `len`. A program builds the same, to the byte, whether or
+not the toolchain reuses a std it resolved for another program.
+
 ## 5.8 Conversions and coercions
 
 There are **no implicit conversions** between numeric types; use the

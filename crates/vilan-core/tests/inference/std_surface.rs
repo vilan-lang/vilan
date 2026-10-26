@@ -5344,10 +5344,20 @@ fn m107_impls_of_one_trait_over_distinct_types_are_never_compared() {
 /// counter at two sizes in one process; the generated plain package of
 /// `performance-gates.md` §6.2 (24k -> 49k lines) went from x2.80 to x1.94 in
 /// instructions with this and the other M107 indices.
+///
+/// N182: the binary's analyses build over the persisted std prefix (P5), and
+/// the pin counts them as it counts the canonical world's base-cache hits — a
+/// world loaded from the prefix FILE examines the same rows as one the base
+/// cache stored (pinned below). What the first analysis of a process pays on
+/// top is not the world's: its `[derive(PartialEq, Debug)]` expands through
+/// the derive macros' own WORLDS, nested analyses on this thread whose lookups
+/// the thread's counter sees too (962 rows on the 30-type program, once per
+/// process — every later expansion is served). The canonical world's first
+/// analysis was a base-cache MISS, which `served` discards, so it absorbed
+/// them; over a loaded prefix the first analysis is already served, so the
+/// pin warms the expansion first, with one analysis it does not count.
 #[test]
 fn m107_impl_lookups_examine_rows_linear_in_the_package() {
-    // Base-cache hits of one canonical world, counted (see `served` below).
-    without_the_std_prefix();
     fn rows(types: usize) -> (usize, bool) {
         // `performance-gates.md` §6.2's plain module, one per type, in one
         // file: derived `PartialEq` and `Debug`, a list built and walked, an
@@ -5407,6 +5417,29 @@ fn m107_impl_lookups_examine_rows_linear_in_the_package() {
             .map(|(count, _)| count)
             .expect("the base cache serves a repeated analysis of the same world")
     };
+    // N182: the derive expansion's macro worlds, once per process, uncounted.
+    rows(30);
+    // N182: a world LOADED from the persisted prefix examines the rows a
+    // STORED one does — the first analysis after the in-memory cache is
+    // cleared is served the file again (when the binary builds over one), the
+    // next the base cache's copy of it.
+    let loads_before = vilan_core::analyzer::prefix_file_counts().0;
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::prefix_files_forget();
+    let (reloaded, reloaded_served) = rows(30);
+    let loaded_from_the_file = vilan_core::analyzer::prefix_file_counts().0 > loads_before;
+    let stored = served(30);
+    if loaded_from_the_file {
+        assert!(
+            reloaded_served,
+            "a world loaded from the prefix file is served"
+        );
+        assert_eq!(
+            reloaded, stored,
+            "an analysis served a world loaded from the prefix file examined {reloaded} impl \
+             rows where one served the stored world examined {stored} (N182)"
+        );
+    }
     // The MARGINAL rows of each doubling, so std's own share (every lookup
     // reads std's impls of the member too) cancels: linear growth doubles the
     // margin per doubling, quadratic growth quadruples it.

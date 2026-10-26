@@ -330,54 +330,17 @@ struct ImplReachLog {
     /// two-phase order has always resolved std before the entry walked, and
     /// what std's lookups answer is std's to decide (the deferred order would
     /// otherwise put a user's blanket in reach of std's own calls). It still
-    /// counts against a HOT impl, which a canonical analysis would have walked
-    /// before std resolved.
+    /// counts against a HOT impl: since P6a the tiers resolve before ANY
+    /// package node exists, so this log never sees their first resolve — a
+    /// std question here is one the package half asked again (a constraint
+    /// std's own resolve left open), and the canonical package half asks it
+    /// with the hot modules walked.
     asked_by_std: bool,
     /// How many impls the world held when its recorded resolve ended — every
     /// impl from this index on joined after it. `None` for a world that never
     /// resolved before its entry (the deferred order), whose impls were all
     /// there to be asked.
     floor: Option<usize>,
-}
-
-impl ImplReachLog {
-    /// std-prefix P2: the questions of this (std's, filter `everything`) log
-    /// that `filter` would have recorded — a member question about one of its
-    /// names, or anything when it records everything.
-    fn kept_by(&self, filter: &ReachFilter) -> ImplReachLog {
-        let members = self
-            .members
-            .iter()
-            .filter(|(name, _)| filter.everything || filter.members.contains(&***name))
-            .map(|(name, receivers)| (name.clone(), receivers.clone()))
-            .collect();
-        let traits = match filter.everything {
-            true => self.traits.clone(),
-            false => HashMap::default(),
-        };
-        ImplReachLog {
-            members,
-            traits,
-            ..ImplReachLog::default()
-        }
-    }
-
-    /// Adds `other`'s questions to this log's (a receiver asked by a package
-    /// source on either side stays asked by one).
-    fn absorb(&mut self, other: ImplReachLog) {
-        for (name, receivers) in other.members {
-            let into = self.members.entry(name).or_default();
-            for (receiver, asked) in receivers {
-                note_receiver(into, &receiver, asked);
-            }
-        }
-        for (trait_id, receivers) in other.traits {
-            let into = self.traits.entry(trait_id).or_default();
-            for (receiver, asked) in receivers {
-                note_receiver(into, &receiver, asked);
-            }
-        }
-    }
 }
 
 /// Which questions an [`ImplReachLog`] keeps, read off the LATE files' syntax
@@ -5439,6 +5402,13 @@ pub struct Analyzer<'src> {
     // the lookups that hold `&mut self`; the log is written only while
     // `recording`, and never read until the resolve that wrote it has ended.
     impl_reach: std::cell::RefCell<ImplReachLog>,
+    /// std-prefix P6a: the tier rule's ORACLE, while it is pending — every
+    /// question the tiers' resolve asked of the impl table (filter
+    /// `everything`; its `floor` is the first package impl), recorded only
+    /// when the oracle is on ([`crate::incremental::tier_oracle`]), and tested
+    /// against the package's impls once they have resolved
+    /// ([`Analyzer::check_tier_oracle`]).
+    tier_oracle: Option<ImplReachLog>,
     #[serde(skip)]
     macro_expression_expansions: HashMap<usize, &'static Spanned<Node<'static>>>,
     // Expression sites whose expansion failed — already diagnosed; they walk
@@ -8256,6 +8226,7 @@ impl<'src> Analyzer<'src> {
             macro_signatures: HashMap::default(),
             pending_macro_references: Vec::new(),
             impl_reach: std::cell::RefCell::default(),
+            tier_oracle: None,
             macro_expression_expansions: HashMap::default(),
             macro_failed_sites: HashSet::default(),
             module_scope_ids: HashSet::default(),
@@ -54426,6 +54397,100 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// std-prefix P6a (`std-prefix.md` §14.3, the rule): the TIERS' resolve —
+    /// std's, and the dependency tier's — run after their walk and BEFORE the
+    /// entry package's first node mints, in every shape: the canonical drain
+    /// at M144's boundary, and the std-only prefix world, whose resolve this
+    /// is. The package resolves after its own walk, over the tiers' settled
+    /// answers; an impl it declares never answers a question asked here.
+    ///
+    /// Nothing is recorded for that rule to be checked against: the entry
+    /// package cannot answer these questions, so there is nothing to refuse.
+    /// The ORACLE ([`crate::incremental::tier_oracle`], a test) records every
+    /// question all the same, for [`Self::check_tier_oracle`] to test the
+    /// package's impls against once they have resolved. The record touches no
+    /// reach floor and no census row the production log reads.
+    fn resolve_tiers(&mut self) {
+        let oracle = crate::incremental::tier_oracle() && !crate::macros::in_macro_world();
+        if oracle {
+            let pending = std::mem::replace(
+                self.impl_reach.get_mut(),
+                ImplReachLog {
+                    recording: true,
+                    filter: ReachFilter {
+                        everything: true,
+                        members: Default::default(),
+                    },
+                    ..ImplReachLog::default()
+                },
+            );
+            self.resolve_world();
+            let mut log = std::mem::replace(self.impl_reach.get_mut(), pending);
+            log.recording = false;
+            log.floor = Some(self.implementations.len());
+            self.tier_oracle = Some(log);
+        } else {
+            self.resolve_world();
+        }
+    }
+
+    /// std-prefix P6a: the PACKAGE half of the pre-entry resolve, after the
+    /// package has walked over the tiers' settled answers — the canonical
+    /// drain's and the prefix world's alike. What it asks of the impl table is
+    /// recorded under `filter` (M121 / B553: the late files' impls, the
+    /// entry's and a hot set's, are tested against it once they resolve).
+    ///
+    /// A package that added nothing since the tiers resolved — a single-file
+    /// program, whose pre-entry world IS the tiers' — has nothing for the
+    /// fixpoint to settle: the tiers' resolve already ran it to a stall over
+    /// exactly these constraints. So it runs no second pass over them (that
+    /// pass was the whole cost of the split, ~0.5 % of a small program's
+    /// check), and the reach log still draws its floor, which M110 S2a reads.
+    /// `walked_from` is the entity counter where the tiers' world ended.
+    fn resolve_package_half(&mut self, filter: Option<ReachFilter>, walked_from: Option<u32>) {
+        let added = walked_from != Some(self.entity_id);
+        match filter {
+            Some(filter) => {
+                self.begin_impl_reach_log(filter);
+                if added {
+                    self.resolve_world();
+                }
+                self.end_impl_reach_log();
+            }
+            None if added => self.resolve_world(),
+            None => {}
+        }
+    }
+
+    /// std-prefix P6a: the tier rule's oracle, as the entry is about to walk —
+    /// once the package half has resolved its impls' subjects (the pre-entry
+    /// resolve, or `resolve_package_over_prefix`) and before `build()`, which
+    /// is where the old guard asked and where an impl's own binder still reads
+    /// as the hole it is. A package impl that could have answered a question
+    /// the tiers' resolve asked — a program whose meaning the rule decided —
+    /// is counted and named; nothing is refused (both shapes apply the rule
+    /// alike). The entry's impls are not walked yet (M121 never let them
+    /// answer a tier's question), and a world that defers its package half to
+    /// `build()` (B553, B239/M70's open module) has no resolved package impl
+    /// here to test: the oracle covers the two-phase order, where every
+    /// program the estate builds takes it.
+    fn check_tier_oracle(&mut self) {
+        let Some(log) = self.tier_oracle.take() else {
+            return;
+        };
+        // Every package impl counts against every tier question (`hot`).
+        let Some(reached) = self.reach_verdict(&log, 0..u32::MAX) else {
+            return;
+        };
+        crate::incremental::count_tier_oracle_hit();
+        if !crate::macros::in_macro_world() {
+            crate::incremental::update_census(|census| census.tier_oracle_hits += 1);
+            if crate::phase_timing_enabled() || crate::counters::counters_enabled() {
+                eprintln!("[vilan phase] tier-oracle {}", reached.first);
+            }
+        }
+    }
+
     /// M121 / B553: start recording what this resolve asks of the impl table
     /// ([`ImplReachLog`]). Called around the PRE-STORE resolve only — the one
     /// whose answers the impls walked after it (the entry's, a hot set's) must
@@ -54513,6 +54578,16 @@ impl<'src> Analyzer<'src> {
         // M110 S2a reads the floor after the verdict took the log.
         self.prefix_impl_count = self.impl_reach.get_mut().floor;
         let log = std::mem::take(self.impl_reach.get_mut());
+        self.reach_verdict(&log, hot_sources)
+    }
+
+    /// [`Self::impl_reach`]'s test over a given `log`: every impl from its
+    /// floor on, against the questions it recorded.
+    fn reach_verdict(
+        &mut self,
+        log: &ImplReachLog,
+        hot_sources: std::ops::Range<u32>,
+    ) -> Option<ImplReached> {
         let floor = log.floor?;
         if floor >= self.implementations.len() || (log.members.is_empty() && log.traits.is_empty())
         {
@@ -80597,6 +80672,11 @@ pub(crate) struct BaseCacheKey {
     /// Empty for every key but a prefix built for a program with dependencies,
     /// so every key minted before this field existed is unchanged.
     dependency_tier: Vec<String>,
+    /// std-prefix P6a: the world carries the tier rule's ORACLE record
+    /// ([`crate::incremental::tier_oracle`], a test): the tiers' resolve
+    /// recorded every question it asked, which a world built without the
+    /// oracle does not hold — so the two are two worlds (and two files).
+    tier_oracle: bool,
 }
 
 /// One retained base world and the claims that keep its borrows alive (M23).
@@ -82910,6 +82990,9 @@ fn prefix_file_key(key: &BaseCacheKey) -> crate::prefix_file::Key {
             .iter()
             .chain(&key.dependency_tier)
             .cloned()
+            // P6a: the tier oracle's record rides the world; its file is
+            // another file.
+            .chain(key.tier_oracle.then(|| "tier-oracle".to_string()))
             .collect(),
         tiers: if key.dependency_tier.is_empty() {
             vec![crate::prefix_file::STD_TIER.to_string()]
@@ -83915,15 +83998,16 @@ fn hot_set_imports_a_use_inferred_binding(
 /// std-prefix P1 (`std-prefix.md` §4.2): the package half of the canonical
 /// two-phase resolve, over a std-only prefix whose own resolve was std's alone.
 ///
-/// The package's constraints resolve first, recorded under the ENTRY's filter
-/// as the canonical pre-entry resolve records them (B553's question, asked of
-/// the entry's impls after its walk). Then §4.2's guard, once the package's
-/// impls have resolved their subjects: the prefix recorded every question
-/// std's resolve asked ([`ImplReachLog`], filter `everything`), and a package
-/// impl — every impl between the prefix's floor and the package's is one —
-/// that could have answered one means std's answers are not the canonical
-/// analysis's; the caller builds canonically ([`shape_after_impl_reach`]:
-/// `by_hot`).
+/// The package's constraints resolve over the tiers' settled answers,
+/// recorded under the ENTRY's filter as the canonical pre-entry resolve
+/// records them (B553's question, asked of the entry's impls after its walk).
+///
+/// P6a (§14.3): this is the canonical order too — the canonical drain resolves
+/// the tiers before the package's first node mints, as the prefix world does —
+/// so §4.2's guard is the RULE: a package impl never answers a question std's
+/// (or a dependency's) resolution asked, in either shape, and there is nothing
+/// to refuse. The guard survives as a test oracle
+/// ([`Analyzer::check_tier_oracle`]).
 ///
 /// M110 S1's third guard (a use-inferred binding a hot module imports) has no
 /// work here: the package walks in the canonical order among itself, after
@@ -83931,58 +84015,29 @@ fn hot_set_imports_a_use_inferred_binding(
 ///
 /// std-prefix P2: a LAYERED world records what its own key's filter asks
 /// (`ReachFilter` of the entry and S1's hot set — the late files of the world
-/// it becomes), and keeps std's questions that filter would have kept beside
-/// the package's: the world is stored as S1's or the canonical miss stores
-/// it, and that world's resolve asked both at once.
+/// it becomes): the world is stored as S1's or the canonical miss stores it,
+/// and that miss's package half asked those questions.
 fn resolve_package_over_prefix(
     world: &mut World<'_>,
     nodes: &Spanned<NodeList<'_>>,
     layered: Option<&Layered>,
-) -> Result<(), ImplReached> {
+) {
     let resolve_started = crate::prefix_file::now();
-    let package_sources = world.prefix_len as u32..world.sources.len() as u32;
     let analyzer = &mut world.analyzer;
-    let std_log = std::mem::take(analyzer.impl_reach.get_mut());
     analyzer.source_paths = world.sources.clone();
     let filter = match layered {
         Some(layered) => layered.world_key.reach.clone(),
         None => ReachFilter::of(std::iter::once(&nodes.0)),
     };
-    let kept_std = match (layered, &filter) {
-        (Some(_), Some(filter)) => Some(std_log.kept_by(filter)),
-        _ => None,
-    };
-    match filter {
-        Some(filter) => {
-            analyzer.begin_impl_reach_log(filter);
-            analyzer.resolve_world();
-            analyzer.end_impl_reach_log();
-        }
-        None => analyzer.resolve_world(),
-    }
-    let mut package_log = std::mem::replace(analyzer.impl_reach.get_mut(), std_log);
-    let verdict = analyzer.impl_reach(package_sources);
-    if let Some(kept_std) = kept_std {
-        package_log.absorb(kept_std);
-        analyzer.prefix_impl_count = package_log.floor;
-    }
-    *analyzer.impl_reach.get_mut() = package_log;
+    // The stored world ended where the package began walking over it.
+    let walked_from = analyzer.prefix_entity_end;
+    analyzer.resolve_package_half(filter, walked_from);
     if crate::phase_timing_enabled() {
         eprintln!(
             "[vilan phase] prefix-package-resolve us={}",
             crate::prefix_file::micros_since(resolve_started)
         );
     }
-    if let Some(mut reached) = verdict {
-        // The impl guard's plant (M110 S1) lets a package impl through too.
-        if crate::incremental::planted(crate::incremental::Plant::ImplGuardOff) {
-            reached.by_hot = false;
-        }
-        if reached.by_hot || reached.by_entry {
-            return Err(reached);
-        }
-    }
-    Ok(())
 }
 
 /// The resolved pre-entry world — everything `analyze` builds before the
@@ -83998,9 +84053,11 @@ struct World<'src> {
     source_hashes: Vec<u64>,
     entry_is_module: bool,
     /// B239: this world's entry is a MODULE its siblings import (file mode,
-    /// and something in the load referenced `pkg::<entry>`), so the pre-entry
-    /// `resolve_world` was DEFERRED — nothing here has resolved yet, and the
-    /// post-entry `build()` is the one pass that resolves it all.
+    /// and something in the load referenced `pkg::<entry>`), so the PACKAGE
+    /// half of the pre-entry resolve was DEFERRED — the tiers (std, the
+    /// dependencies) resolved before the package's nodes minted (P6a: they
+    /// never reach `pkg::<entry>`), and the post-entry `build()` resolves the
+    /// package and the entry together.
     ///
     /// M70: such a world IS stored, keyed by the module it excludes
     /// ([`BaseCacheKey::entry_open_module`]), and this flag travels with it —
@@ -84009,10 +84066,12 @@ struct World<'src> {
     /// exactly when the analysis that stored it did, and the entry tail reads
     /// the order off the world rather than off its own load.
     entry_is_open_module: bool,
-    /// Whether the pre-entry `resolve_world` was skipped: the open module's
-    /// order above, or B553's deferred order ([`AnalysisShape::defer_resolve`]).
-    /// The post-entry `build()` is then the one resolve, and the entry tail
-    /// waits for it with everything the pre-entry resolve would have bound.
+    /// Whether the PACKAGE half of the pre-entry resolve was skipped: the open
+    /// module's order above, or B553's deferred order
+    /// ([`AnalysisShape::defer_resolve`]). The tiers resolved alone in every
+    /// order (P6a); the post-entry `build()` then resolves the package with the
+    /// entry, and the entry tail waits for it with everything the pre-entry
+    /// resolve would have bound.
     resolve_deferred: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
@@ -84103,6 +84162,19 @@ fn note_hot_refusal(reason: &'static str, key: &BaseCacheKey) {
             census.prefix_refusals += 1;
             census.prefix_refusal = Some(reason);
         }
+    });
+}
+
+/// N179: the std-prefix world (P1) asked for and not attempted — a gate in
+/// front of the attempt said no. Named in the census's `prefix-refusal`
+/// column; not a refusal OF the prefix (`prefix-refusals` counts those), and
+/// the analysis the census describes is not over it, whatever an abandoned
+/// earlier attempt of the same analysis was.
+fn note_prefix_not_taken(reason: &'static str) {
+    crate::incremental::update_census(|census| {
+        census.prefix_world = false;
+        census.prefix_layered = false;
+        census.prefix_refusal = Some(reason);
     });
 }
 
@@ -84782,6 +84854,117 @@ enum DeferredMint<'src> {
     },
 }
 
+/// The namespace scopes a deferred mint registers under: std's, the entry
+/// package's (`pkg`), and the global scope every module scope is a child of.
+#[derive(Clone, Copy)]
+struct OriginScopes {
+    std: Id,
+    pkg: Id,
+    global: Id,
+}
+
+/// M144: mints one tier's deferred non-std nodes ([`DeferredMint`]) — its pure
+/// namespaces first, then its modules and the entry's alias, each set in
+/// discovery order, as `load_hot_modules` mints a package over a stored prefix.
+/// Returns each body's row in the drain's `loaded` list with the module scope
+/// its node now has. Called once for the dependency tier (M152) and once for
+/// the entry package, after the tiers resolve (P6a).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drain's node tables, threaded through as the drain holds them"
+)]
+fn mint_deferred_nodes<'src>(
+    analyzer: &mut Analyzer<'src>,
+    mints: Vec<DeferredMint<'src>>,
+    module_nodes: &mut HashMap<(Origin, &'src str), Id>,
+    deferred_requests: &mut Vec<(Origin, &'src str)>,
+    module_scopes: &mut HashMap<&'src str, Id>,
+    pkg_module_names: &mut HashSet<&'src str>,
+    scopes: OriginScopes,
+) -> Vec<(usize, Id)> {
+    let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = mints
+        .into_iter()
+        .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
+    let mut minted: Vec<(usize, Id)> = Vec::new();
+    for mint in namespaces.into_iter().chain(bodies) {
+        let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
+            Origin::Std => scopes.std,
+            Origin::Pkg => scopes.pkg,
+            Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
+        };
+        match mint {
+            DeferredMint::Namespace {
+                origin,
+                name,
+                children,
+            } => {
+                let origin_scope_id = origin_scope_of(analyzer, origin);
+                let module_id = ensure_module_node(
+                    analyzer,
+                    module_nodes,
+                    deferred_requests,
+                    origin,
+                    name,
+                    origin_scope_id,
+                    scopes.global,
+                );
+                analyzer.namespace_only_modules.insert(module_id, children);
+                if origin == Origin::Pkg {
+                    pkg_module_names.insert(name);
+                }
+            }
+            DeferredMint::EntryAlias { name } => {
+                let module_id = analyzer.new_entity_id();
+                analyzer.modules.insert(
+                    module_id,
+                    Module {
+                        id: module_id,
+                        name,
+                        body: (Vec::new(), scopes.global),
+                    },
+                );
+                analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+                analyzer.source_ranges.push(SourceRange {
+                    start: module_id.0,
+                    end: module_id.0 + 1,
+                    source: SourceId(0),
+                });
+                analyzer
+                    .expr_id_to_expr_map
+                    .insert(module_id, Expr::Module(module_id));
+                analyzer
+                    .mut_scope_for_scope_id(scopes.pkg)
+                    .name_to_id_map
+                    .insert(name, module_id);
+            }
+            DeferredMint::Body {
+                origin,
+                name,
+                module_source_id,
+                directory_holds_a_lib_body,
+                loaded_index,
+            } => {
+                let origin_scope_id = origin_scope_of(analyzer, origin);
+                let module_scope_id = mint_module_node(
+                    analyzer,
+                    module_nodes,
+                    deferred_requests,
+                    module_scopes,
+                    pkg_module_names,
+                    origin,
+                    name,
+                    origin_scope_id,
+                    scopes.global,
+                    module_source_id,
+                    directory_holds_a_lib_body,
+                );
+                minted.push((loaded_index, module_scope_id));
+            }
+        }
+    }
+    minted
+}
+
 /// A65: the entity a module PATH denotes, created if this analysis has not
 /// met it yet — the parent chain first, so `lib::ui` exists before
 /// `lib::ui::widget` registers under it.
@@ -85413,12 +85596,11 @@ fn std_prefix_keys(
         entry_pkg: None,
         entry_open_module: None,
         hot: None,
-        // Every question std's resolve asks is recorded: the impls that may
-        // answer one are whichever package builds over the prefix.
-        reach: Some(ReachFilter {
-            everything: true,
-            members: Default::default(),
-        }),
+        // P6a: std's resolve records nothing — no package impl answers a
+        // question the tiers' resolution asks (`std-prefix.md` §14.3), so
+        // there is nothing for one to be tested against. (The tier oracle,
+        // a test, records them in `Analyzer::tier_oracle`, keyed apart.)
+        reach: None,
         std_prefix: true,
         dependency_tier: tier.map(|tier| tier.rows).unwrap_or_default(),
         ..base_cache_key.clone()
@@ -85656,9 +85838,11 @@ struct AnalysisShape {
     cache: bool,
     /// A hot-set world (M110 S1) may be built.
     hot: bool,
-    /// B553: the loaded modules do NOT resolve before the entry walks — the
-    /// whole world resolves once, in the post-entry `build()`, with every
-    /// impl in it (the monolithic order, the one B239's open module takes).
+    /// B553: the package's modules do NOT resolve before the entry walks —
+    /// they resolve once, in the post-entry `build()`, with every package and
+    /// entry impl in it (the order B239's open module takes). The tiers still
+    /// resolve first and alone (P6a: an entry impl never answers their
+    /// questions, so the deferral has nothing to protect there).
     /// Taken when an impl the entry walks answers a question the pre-entry
     /// resolve asked ([`ImplReachLog`]); such a world is neither read from nor
     /// written to the base cache, since what it is keyed by is not what it
@@ -85911,6 +86095,7 @@ fn analyze_inner<'src>(
         reach: None,
         std_prefix: false,
         dependency_tier: Vec::new(),
+        tier_oracle: crate::incremental::tier_oracle() && !crate::macros::in_macro_world(),
     };
     let base_cacheable = shape.cache
         && !entry_is_inside_std
@@ -86018,6 +86203,36 @@ fn analyze_inner<'src>(
         && shape.hot
         && hot_shape_allowed
         && !crate::macros::in_macro_world();
+    // N179: a program the prefix is asked for and NOT attempted says why, so
+    // the census reads every program by name (`prefix-world 0 prefix-refusal
+    // macro-text`) rather than `-`. A refusal of an attempt (the hot shapes'
+    // guards, `refused-before`) has already said so; these are the gates in
+    // front of the attempt — the reuse gate's own reasons, and the shapes a
+    // rebuild narrows to.
+    if crate::incremental::std_prefix() && !std_prefix_wanted && !crate::macros::in_macro_world() {
+        let reason = if !shape.cache {
+            // A rebuild without the cache: generated code demanded a module
+            // the served world never loaded (`expand_entry_over_world`).
+            Some("uncached")
+        } else if shape.defer_resolve {
+            // B553: an entry impl answered a pre-entry question.
+            Some("resolve-deferred")
+        } else if !shape.std_prefix || !shape.hot {
+            // A narrowed retry: the refusal that narrowed it was noted.
+            None
+        } else if entry_is_inside_std {
+            Some("inside-std")
+        } else if !base_cacheable {
+            // The entry's text says `macro` (the reuse gate is syntactic: a
+            // macro-DEFINING entry registers into the world's registry).
+            Some("macro-text")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            note_prefix_not_taken(reason);
+        }
+    }
     let hot_world = match std_prefix_wanted
         .then(|| std_prefix_set(&entry_pkg_seeds, entry_path, pkg_root, workspace))
     {
@@ -86188,23 +86403,11 @@ fn analyze_inner<'src>(
                 shape_after_hot_load(refusal, &refusal_key, shape),
             );
         }
-        // std-prefix P1: the package resolves over std's settled answers, before
-        // the entry walks — the canonical two-phase order with std's half done
-        // alone (§4.2) — unless a package impl answers a question std asked.
-        if base_cache_key.std_prefix
-            && let Err(reached) = resolve_package_over_prefix(&mut world, nodes, layered.as_ref())
-        {
-            let shape = shape_after_impl_reach(shape, &reached, Some(&refusal_key));
-            return analyze_inner(
-                nodes,
-                entry_source,
-                std,
-                pkg_root,
-                entry_path,
-                platform,
-                workspace,
-                shape,
-            );
+        // std-prefix P1: the package resolves over the tiers' settled
+        // answers, before the entry walks — the canonical two-phase order with
+        // the tiers' half done alone, which is the canonical order (P6a).
+        if base_cache_key.std_prefix {
+            resolve_package_over_prefix(&mut world, nodes, layered.as_ref());
         }
         // std-prefix P2: the layered world is stored under its own key, and
         // its hot set (S1's) walks over it.
@@ -88029,6 +88232,14 @@ fn analyze_inner<'src>(
     // tier walks in the prefix, the package after it as the hot set), so a
     // dependency's ids — and the emitted order of its declarations against
     // the package's — are one answer in both shapes.
+    //
+    // P6a (`std-prefix.md` §14.3): and the TIERS RESOLVE before the first
+    // package node mints — std and the dependency tier, together — exactly
+    // as the std-only prefix world resolves before the package walks over it.
+    // So the two shapes are one id layout (M157: the entities std's resolve
+    // mints come before the package's nodes in both), and an impl the entry
+    // package declares never answers a question the tiers' resolution asks —
+    // the entry's rule since M121, extended to its package.
     let (dependency_mints, package_mints): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) =
         deferred_mints.into_iter().partition(|mint| {
             matches!(
@@ -88043,204 +88254,29 @@ fn analyze_inner<'src>(
             )
         });
     let mut deferred_requests: Vec<(Origin, &str)> = Vec::new();
-    for (phase, phase_mints) in [dependency_mints, package_mints].into_iter().enumerate() {
-        let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = phase_mints
-            .into_iter()
-            .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
-        for mint in namespaces.into_iter().chain(bodies) {
-            let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
-                Origin::Std => std_scope_id,
-                Origin::Pkg => pkg_scope_id,
-                Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
-            };
-            match mint {
-                DeferredMint::Namespace {
-                    origin,
-                    name,
-                    children,
-                } => {
-                    let origin_scope_id = origin_scope_of(&analyzer, origin);
-                    let module_id = ensure_module_node(
-                        &mut analyzer,
-                        &mut module_nodes,
-                        &mut deferred_requests,
-                        origin,
-                        name,
-                        origin_scope_id,
-                        global_scope_id,
-                    );
-                    analyzer.namespace_only_modules.insert(module_id, children);
-                    if origin == Origin::Pkg {
-                        pkg_module_names.insert(name);
-                    }
-                }
-                DeferredMint::EntryAlias { name } => {
-                    let module_id = analyzer.new_entity_id();
-                    analyzer.modules.insert(
-                        module_id,
-                        Module {
-                            id: module_id,
-                            name,
-                            body: (Vec::new(), global_scope_id),
-                        },
-                    );
-                    analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                    analyzer.source_ranges.push(SourceRange {
-                        start: module_id.0,
-                        end: module_id.0 + 1,
-                        source: SourceId(0),
-                    });
-                    analyzer
-                        .expr_id_to_expr_map
-                        .insert(module_id, Expr::Module(module_id));
-                    analyzer
-                        .mut_scope_for_scope_id(pkg_scope_id)
-                        .name_to_id_map
-                        .insert(name, module_id);
-                }
-                DeferredMint::Body {
-                    origin,
-                    name,
-                    module_source_id,
-                    directory_holds_a_lib_body,
-                    loaded_index,
-                } => {
-                    let origin_scope_id = origin_scope_of(&analyzer, origin);
-                    let module_scope_id = mint_module_node(
-                        &mut analyzer,
-                        &mut module_nodes,
-                        &mut deferred_requests,
-                        &mut module_scopes,
-                        &mut pkg_module_names,
-                        origin,
-                        name,
-                        origin_scope_id,
-                        global_scope_id,
-                        module_source_id,
-                        directory_holds_a_lib_body,
-                    );
-                    loaded[loaded_index].3 = Some(module_scope_id);
-                }
-            }
-        }
-        if phase == 0 {
-            // M152: the dependencies' modules, then each dependency's `lib.vl`
-            // into its own namespace (its public surface), mirroring the `std` lib
-            // walk above.
-            for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
-                if !matches!(origin, Origin::Dep(_)) {
-                    continue;
-                }
-                let module_scope_id =
-                    module_scope_id.expect("M144: a dependency's node is minted above");
-                walk_module(
-                    &mut analyzer,
-                    ast,
-                    text,
-                    module_scope_id,
-                    *source_id,
-                    *origin,
-                );
-            }
-            for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in
-                &dependency_lib_walks
-            {
-                let root_start = analyzer.entity_id;
-                analyzer.set_current_source(*source_id);
-                analyzer.module_scope_ids.insert(*namespace_scope_id);
-                let start = analyzer.entity_id;
-                analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
-                analyzer.source_ranges.push(SourceRange {
-                    start,
-                    end: analyzer.entity_id,
-                    source: *source_id,
-                });
-                // Macro-generated items (derives included) walk into the lib's
-                // namespace — or into the inline `mod` that declared the deriving
-                // item (B201).
-                for generated in generated_by_source.get(source_id).into_iter().flatten() {
-                    let scope_id = analyzer
-                        .declaring_module_scope(*namespace_scope_id, &generated.module_path);
-                    analyzer.walk_generated_expansion(
-                        generated.nodes,
-                        scope_id,
-                        generated.origin,
-                        *source_id,
-                    );
-                }
-                analyzer
-                    .dependency_root_ranges
-                    .push((root_start, analyzer.entity_id));
-            }
-        }
+    let origin_scopes = OriginScopes {
+        std: std_scope_id,
+        pkg: pkg_scope_id,
+        global: global_scope_id,
+    };
+    for (loaded_index, module_scope_id) in mint_deferred_nodes(
+        &mut analyzer,
+        dependency_mints,
+        &mut module_nodes,
+        &mut deferred_requests,
+        &mut module_scopes,
+        &mut pkg_module_names,
+        origin_scopes,
+    ) {
+        loaded[loaded_index].3 = Some(module_scope_id);
     }
-    debug_assert!(
-        deferred_requests
-            .iter()
-            .all(|(origin, name)| module_nodes.contains_key(&(*origin, name))),
-        "M144: a deferred mint asked for a module the discovery never reached"
-    );
-    // Every loaded module's importable names, read syntactically before its
-    // walk. A prelude module publishes exactly these (prelude.md §8), and
-    // reading them here is what lets `seed_preludes` answer "what does
-    // `std::web::prelude` make ambient" without re-parsing anything. (After
-    // std's walk since M144, which reads none of them: `seed_preludes` runs
-    // in the resolve, once everything has walked.)
-    for (_name, ast, _text, module_scope_id, _source_id, _origin) in &loaded {
-        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
-        let mut importables = Vec::new();
-        collect_importables(&ast.0, &mut importables);
-        analyzer.prelude_exports.insert(
-            module_scope_id,
-            importables
-                .into_iter()
-                .map(|importable| importable.name)
-                .collect(),
-        );
-    }
-    // A dependency's `lib.vl` walks into the dependency's NAMESPACE scope, not
-    // into a module scope in `loaded` — so its ambient set is queued here, from
-    // the same package's own prelude. (std's `lib.vl` is the twin case and
-    // needs nothing: std declares `prelude = false`.)
-    for (source_id, namespace_scope_id, lib_ast, package_index, _lib_text) in &dependency_lib_walks
-    {
-        let mut importables = Vec::new();
-        collect_importables(&lib_ast.0, &mut importables);
-        analyzer.prelude_exports.insert(
-            *namespace_scope_id,
-            importables
-                .into_iter()
-                .map(|importable| importable.name)
-                .collect(),
-        );
-        if let Some(path) = workspace.packages[*package_index].prelude.module_path() {
-            analyzer
-                .prelude_seeds
-                .push((*namespace_scope_id, path.to_string(), *source_id));
-        }
-    }
-    // Queue each module's ambient set, from the prelude ITS OWN package
-    // declares (prelude.md §7 — never the consumer's, never inherited).
-    for (_name, _ast, _text, module_scope_id, source_id, origin) in &loaded {
-        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
-        let prelude = match origin {
-            Origin::Std => &std.prelude,
-            Origin::Pkg => &workspace.entry_prelude,
-            Origin::Dep(index) => &workspace.packages[*index].prelude,
-        };
-        if let Some(path) = prelude.module_path() {
-            analyzer
-                .prelude_seeds
-                .push((module_scope_id, path.to_string(), *source_id));
-        }
-    }
-    // M144: the package's modules walk after their nodes (a dependency's
-    // walked with its own, M152).
+    // M152: the dependencies' modules, then each dependency's `lib.vl` into its
+    // own namespace (its public surface), mirroring the `std` lib walk above.
     for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
-        if *origin != Origin::Pkg {
+        if !matches!(origin, Origin::Dep(_)) {
             continue;
         }
-        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        let module_scope_id = module_scope_id.expect("M144: a dependency's node is minted above");
         walk_module(
             &mut analyzer,
             ast,
@@ -88249,6 +88285,99 @@ fn analyze_inner<'src>(
             *source_id,
             *origin,
         );
+    }
+    for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in &dependency_lib_walks
+    {
+        let root_start = analyzer.entity_id;
+        analyzer.set_current_source(*source_id);
+        analyzer.module_scope_ids.insert(*namespace_scope_id);
+        let start = analyzer.entity_id;
+        analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
+        analyzer.source_ranges.push(SourceRange {
+            start,
+            end: analyzer.entity_id,
+            source: *source_id,
+        });
+        // Macro-generated items (derives included) walk into the lib's
+        // namespace — or into the inline `mod` that declared the deriving
+        // item (B201).
+        for generated in generated_by_source.get(source_id).into_iter().flatten() {
+            let scope_id =
+                analyzer.declaring_module_scope(*namespace_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                *source_id,
+            );
+        }
+        analyzer
+            .dependency_root_ranges
+            .push((root_start, analyzer.entity_id));
+    }
+    // Every loaded module's importable names, read syntactically before its
+    // walk. A prelude module publishes exactly these (prelude.md §8), and
+    // reading them here is what lets `seed_preludes` answer "what does
+    // `std::web::prelude` make ambient" without re-parsing anything. (After
+    // std's walk since M144, which reads none of them: `seed_preludes` runs
+    // in the resolve, once everything has walked.) The tiers' modules here,
+    // before the tiers resolve (P6a); the package's once its nodes mint.
+    let publish_importables =
+        |analyzer: &mut Analyzer<'src>, ast: &Spanned<NodeList<'src>>, scope_id: Id| {
+            let mut importables = Vec::new();
+            collect_importables(&ast.0, &mut importables);
+            analyzer.prelude_exports.insert(
+                scope_id,
+                importables
+                    .into_iter()
+                    .map(|importable| importable.name)
+                    .collect(),
+            );
+        };
+    for (_name, ast, _text, module_scope_id, _source_id, origin) in &loaded {
+        if *origin == Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every tier's module node is minted");
+        publish_importables(&mut analyzer, ast, module_scope_id);
+    }
+    // A dependency's `lib.vl` walks into the dependency's NAMESPACE scope, not
+    // into a module scope in `loaded` — so its ambient set is queued here, from
+    // the same package's own prelude. (std's `lib.vl` is the twin case and
+    // needs nothing: std declares `prelude = false`.)
+    for (source_id, namespace_scope_id, lib_ast, package_index, _lib_text) in &dependency_lib_walks
+    {
+        publish_importables(&mut analyzer, lib_ast, *namespace_scope_id);
+        if let Some(path) = workspace.packages[*package_index].prelude.module_path() {
+            analyzer
+                .prelude_seeds
+                .push((*namespace_scope_id, path.to_string(), *source_id));
+        }
+    }
+    // Queue each module's ambient set, from the prelude ITS OWN package
+    // declares (prelude.md §7 — never the consumer's, never inherited). The
+    // tiers' modules here; the package's below, after the tiers resolve.
+    let queue_prelude = |analyzer: &mut Analyzer<'src>,
+                         module_scope_id: Id,
+                         source_id: SourceId,
+                         origin: Origin| {
+        let prelude = match origin {
+            Origin::Std => &std.prelude,
+            Origin::Pkg => &workspace.entry_prelude,
+            Origin::Dep(index) => &workspace.packages[index].prelude,
+        };
+        if let Some(path) = prelude.module_path() {
+            analyzer
+                .prelude_seeds
+                .push((module_scope_id, path.to_string(), source_id));
+        }
+    };
+    for (_name, _ast, _text, module_scope_id, source_id, origin) in &loaded {
+        if *origin == Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every tier's module node is minted");
+        queue_prelude(&mut analyzer, module_scope_id, *source_id, *origin);
     }
     // Remember `panic` so its calls can be typed as never and lowered to a throw.
     if let Some(io_scope_id) = module_scopes.get("io") {
@@ -88634,6 +88763,64 @@ fn analyze_inner<'src>(
             .insert("Task", task_struct_id);
     }
 
+    // P6a (`std-prefix.md` §14.3): the TIERS resolve here, alone — after
+    // std's and the dependencies' walk and the lang items above, before the
+    // first package node mints — in every order the pre-entry resolve takes:
+    // the two-phase one, and B553's and B239/M70's deferred ones, which defer
+    // only the PACKAGE half to the entry's `build()` (the entry cannot answer
+    // a tier's question, so nothing a deferral protects waits here). A world
+    // whose entry IS a module (a std or dependency file opened directly)
+    // keeps the monolithic order: its tiers hold the entry.
+    let phase_base_start = crate::PhaseClock::now();
+    if !entry_is_module {
+        analyzer.source_paths = sources.clone();
+        analyzer.resolve_tiers();
+    }
+    let tiers_entity_end = (!entry_is_module).then_some(analyzer.entity_id);
+    let phase_tiers = phase_base_start.elapsed();
+    // M144: the package's nodes, after the tiers' resolve (P6a).
+    for (loaded_index, module_scope_id) in mint_deferred_nodes(
+        &mut analyzer,
+        package_mints,
+        &mut module_nodes,
+        &mut deferred_requests,
+        &mut module_scopes,
+        &mut pkg_module_names,
+        origin_scopes,
+    ) {
+        loaded[loaded_index].3 = Some(module_scope_id);
+    }
+    debug_assert!(
+        deferred_requests
+            .iter()
+            .all(|(origin, name)| module_nodes.contains_key(&(*origin, name))),
+        "M144: a deferred mint asked for a module the discovery never reached"
+    );
+    for (_name, ast, _text, module_scope_id, source_id, origin) in &loaded {
+        if *origin != Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        publish_importables(&mut analyzer, ast, module_scope_id);
+        queue_prelude(&mut analyzer, module_scope_id, *source_id, *origin);
+    }
+    // M144: the package's modules walk after their nodes (a dependency's
+    // walked with its own, M152).
+    for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
+        if *origin != Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        walk_module(
+            &mut analyzer,
+            ast,
+            text,
+            module_scope_id,
+            *source_id,
+            *origin,
+        );
+    }
+
     // A normal entry is walked here in the global scope. When the entry is a std
     // module it was already walked (as its module) in the loop above, so skip
     // this to avoid analyzing it twice.
@@ -88664,31 +88851,31 @@ fn analyze_inner<'src>(
     // 0 cache hits in a 3-keystroke walk with an unbounded cache) because
     // nothing else ever minted their key. `BaseCacheKey::entry_open_module`
     // carries the excluded module, so the world is offered back to the file it
-    // was built for and to nothing else; it is stored UNRESOLVED, and the hit
-    // path reproduces this very order from the flag the world carries.
+    // was built for and to nothing else; it is stored with its PACKAGE half
+    // unresolved, and the hit path reproduces this very order from the flag
+    // the world carries. (P6a: its tiers resolved before the package minted,
+    // so the stored world carries std resolved and a hit's `build()` resolves
+    // the package and the entry only — kolt's `styles.vl` css keystroke reads
+    // 8.06 -> 6.61 G instructions for it.)
     //
     // It can also still hit a world stored for a DIFFERENT entry that never
     // loaded this file — `base_cache_lookup`'s `entry_is_a_loaded_module`
     // refuses every world that did.
     let entry_is_open_module =
         entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
-    let phase_base_start = crate::PhaseClock::now();
+    //
+    // P6a: this is the PACKAGE half of the pre-entry resolve; the tiers'
+    // resolved before the package's nodes minted (above), in every order.
+    let phase_package_start = crate::PhaseClock::now();
     let resolve_deferred = entry_is_open_module || shape.defer_resolve;
     if !entry_is_module && !resolve_deferred {
         analyzer.source_paths = sources.clone();
         // M121 / B553: what this resolve asks of the impl table is recorded,
         // so the impls walked after it — the entry's, a hot set's — can be
         // tested against it once they have resolved (`impl_reach`).
-        match &base_cache_key.reach {
-            Some(filter) => {
-                analyzer.begin_impl_reach_log(filter.clone());
-                analyzer.resolve_world();
-                analyzer.end_impl_reach_log();
-            }
-            None => analyzer.resolve_world(),
-        }
+        analyzer.resolve_package_half(base_cache_key.reach.clone(), tiers_entity_end);
     }
-    let phase_base = phase_base_start.elapsed();
+    let phase_base = phase_tiers + phase_package_start.elapsed();
     let prefix_len = sources.len();
     // M110 S1's third guard, decided while the prefix's resolution is fresh
     // and BEFORE the store, so a refused hot world is never stored: a prefix
@@ -88853,23 +89040,10 @@ fn analyze_inner<'src>(
             shape_after_hot_load(refusal, &refusal_key, shape),
         );
     }
-    // std-prefix P1: the package resolves over std's settled answers, before
-    // the entry walks — the canonical two-phase order with std's half done
-    // alone (§4.2) — unless a package impl answers a question std asked.
-    if base_cache_key.std_prefix
-        && let Err(reached) = resolve_package_over_prefix(&mut world, nodes, layered.as_ref())
-    {
-        let shape = shape_after_impl_reach(shape, &reached, Some(&refusal_key));
-        return analyze_inner(
-            nodes,
-            entry_source,
-            std,
-            pkg_root,
-            entry_path,
-            platform,
-            workspace,
-            shape,
-        );
+    // std-prefix P1: the package resolves over the tiers' settled answers,
+    // before the entry walks — the canonical order since P6a.
+    if base_cache_key.std_prefix {
+        resolve_package_over_prefix(&mut world, nodes, layered.as_ref());
     }
     // std-prefix P2: the layered world, stored under its own key where the
     // prefix it was built over could be (the closure check above), and its
@@ -89161,6 +89335,9 @@ fn analyze_over_world<'src>(
         {
             analyzer.select_platform_twins(&nodes.0, entry_text);
         }
+        // P6a: the tier rule's oracle (a test), before the entry's impls
+        // exist and while the package's binders still read as holes.
+        analyzer.check_tier_oracle();
         let entry_walk_start = analyzer.entity_id;
         analyzer.entry_walk_start = Some(entry_walk_start);
         analyzer.walk_module_items(&nodes.0, global_scope_id);
