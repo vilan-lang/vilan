@@ -220,10 +220,17 @@ named-binder = MEMBER "=" binder ;
 
 extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] [ "," ] ")" "]" ;
 extern-args = STRING [ "," STRING ]              (* global, or module and symbol *)
+            | MULTILINE_STRING                   (* a host expression over lines *)
             | "method" [ "," STRING ]            (* method on the receiver *)
             | ( "get" | "set" ) "," STRING       (* property read / write *)
             | "new" "," STRING [ "," STRING ] ;  (* construction *)
 ```
+
+A triple-quoted string is the first arm's host expression when it does not
+fit on a line: `[extern("""…""")]`, raw and laid out by the multiline rule
+(lexical.md §2), stands alone and is called parenthesized, `(…)(args)`. Every
+other string argument of every attribute is a one-line `STRING`; a
+triple-quoted one there is refused at the literal.
 
 The four arms are the four host bindings. `"method"` is the only form
 word that stands alone: `[extern(method)]` binds the receiver method of
@@ -466,7 +473,7 @@ none of them is a type to abbreviate.
 
 ```text
 impl  = [ internal-label ] [ platform-attr ] "impl" type [ "with" type { "+" type } ]
-        "{" { statement } "}" ;
+        "{" { function | import ";" | use ";" } "}" ;
 trait = [ deprecated-label ] [ internal-label ] [ platform-attr ]
         [ "[" "resource" "]" ] "trait" IDENT
         [ generic-params ]
@@ -494,7 +501,11 @@ at a `const` parameter's argument position (`impl Ring<type T, const N>`)
 the binder is `const N` or `_`. A literal length outranks a length binder by
 the specificity order (`impl [i32; 3]` over `impl [type T; _]`).
 `with` lists the implemented trait(s). An impl without `with` provides
-inherent members. A trait's `with` lists supertraits.
+inherent members. A trait's `with` lists supertraits. An impl body declares
+methods (and may import names for them): a `struct`, `enum`, `trait`,
+`impl`, `mod`, a binding or a statement written there is refused at its
+keyword (the declaration belongs at the module's top level, a statement in a
+`fun`).
 
 ### Generic parameters and arguments
 

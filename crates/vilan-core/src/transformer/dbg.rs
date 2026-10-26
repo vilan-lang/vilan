@@ -550,7 +550,7 @@ impl<'src> Transformer<'src> {
                                 js::Node::Number(value.to_string(), None)
                             }
                             crate::analyzer::BackingValue::Str(raw) => js::Node::String(
-                                Cow::Owned(super::unescape_string(raw).into_owned()),
+                                Cow::Owned(crate::lexing::unescape_string(raw).into_owned()),
                             ),
                         };
                         (literal, text(variant.as_str()))

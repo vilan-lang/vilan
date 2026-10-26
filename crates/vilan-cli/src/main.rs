@@ -7624,6 +7624,22 @@ fn compile_to_js(
     // shared by the plain path, the note path and the warnings.
     let mut diagnostic_files: HashMap<SourceId, (String, String)> = HashMap::new();
     diagnostic_files.insert(SourceId(0), (filename.clone(), source_ref.to_string()));
+    // The entry's PARSE errors render first (B656): analysis runs on the
+    // recovered tree, so whatever it reports downstream of a syntax error is at
+    // best that error's echo, and the first diagnostic a reader meets should
+    // be the cause. They used to follow every analyzer error — `css` is a
+    // keyword printed after the "this body ends without producing a value" it
+    // caused, a refused `struct` inside an `impl` after "unknown struct" at
+    // its use. `analyze_source` (the editor and the playground) already puts
+    // them first.
+    for error in &parse_errors {
+        report_plain(
+            &diagnostic_files,
+            SourceId(0),
+            error.span.into_range(),
+            &vilan_core::parsing::render(error),
+        );
+    }
 
     if let Some(root) = root {
         if emit_debug {
@@ -8070,7 +8086,7 @@ fn compile_to_js(
     // The entry's parse errors belong to the entry; the analyzer's carry their
     // own source.
     let unrendered = analyzer_errors.split_off(rendered_errors);
-    report(&diagnostic_files, unrendered, parse_errors);
+    report(&diagnostic_files, unrendered);
     if cascade > 1 {
         eprintln!(
             "{} {cascade} macro definitions failed to compile; this compile \
@@ -8891,27 +8907,16 @@ fn diagnostic_line(text: &str) {
     let _ = std::io::Write::write_all(&mut DiagnosticStream, b"\n");
 }
 
-/// Renders parser diagnostics (via the handwritten frontend's `render`) and
-/// analyzer/codegen diagnostics with ariadne. Analyzer diagnostics arrive
-/// pre-rendered as `(source, span, message)` — each renders against the file
-/// its span indexes into, and is labeled with that file (backlog E16); parse
-/// errors are the entry's own and carry the structured
-/// found/expected/context/hint the renderer assembles.
+/// Renders the analyzer/codegen diagnostics the analysis loop did not render
+/// in place, with ariadne. They arrive pre-rendered as `(source, span,
+/// message)` — each renders against the file its span indexes into, and is
+/// labeled with that file (backlog E16). The entry's parse errors render
+/// before analysis (B656), so they lead.
 fn report(
     files: &HashMap<SourceId, (String, String)>,
     analyzer_errors: Vec<(SourceId, std::ops::Range<usize>, String)>,
-    parse_errors: Vec<vilan_core::parsing::ParseError>,
 ) {
-    let diagnostics = analyzer_errors
-        .into_iter()
-        .chain(parse_errors.into_iter().map(|error| {
-            (
-                SourceId(0),
-                error.span.into_range(),
-                vilan_core::parsing::render(&error),
-            )
-        }));
-    for (source, span, message) in diagnostics {
+    for (source, span, message) in analyzer_errors {
         report_plain(files, source, span, &message);
     }
 }

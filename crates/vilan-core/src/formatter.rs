@@ -6301,6 +6301,13 @@ impl<'src> Printer<'src> {
                 self.out.push_str(symbol);
                 self.out.push('"');
             }
+            // B654's host expression: reprinted VERBATIM, as a triple-quoted
+            // literal always is (its whitespace is the layout rule's).
+            ExternBinding::Code { text } => {
+                self.out.push_str("\"\"\"");
+                self.out.push_str(text);
+                self.out.push_str("\"\"\"");
+            }
             ExternBinding::Method { symbol: None } => self.out.push_str("method"),
             ExternBinding::Method {
                 symbol: Some(symbol),

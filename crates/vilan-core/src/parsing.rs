@@ -222,6 +222,30 @@ pub enum ParseErrorReason {
     /// went on as if it had been written tight, and `vilan fmt` writes it so.
     /// `written` is the name, `tight` the name with its list respelled.
     SpacedGenerics { written: String, tight: String },
+    /// B652: a backslash sequence in a string body that is not an escape —
+    /// `written` is the sequence as the source spells it (`\q`, `\x4`,
+    /// `\u{110000}`), the span it covers.
+    Escape {
+        kind: lexing::EscapeErrorKind,
+        written: String,
+    },
+    /// B654: a triple-quoted attribute argument that breaks the multiline
+    /// rule — the rule's own sentence (`util::multiline_layout`'s).
+    MalformedMultiline(String),
+    /// B654: a triple-quoted string where an attribute takes a one-line one
+    /// (every argument but `[extern(..)]`'s host expression).
+    MultilineAttributeArgument,
+    /// B658: a guard's `else` after a `let`'s value. `suggestion` is the
+    /// statement respelled as the let-else form, with the binding's name, when
+    /// the `is` test binds exactly one capture.
+    LetElse {
+        suggestion: Option<(String, String)>,
+    },
+    /// B661: a closure type written bare as a closure type's parameter;
+    /// `written` is its text, which the steer wraps.
+    BareClosureTypeParameter { written: String },
+    /// B655: a statement in an `impl` body that is not a member.
+    NonMemberInImpl(NonMember),
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1772,6 +1796,179 @@ fn matching_close(open: char) -> char {
     }
 }
 
+/// B654: a triple-quoted string where an attribute argument is a one-line
+/// string. Curated (diagnostics-standard.md B6): the rule and the one place
+/// the multi-line form IS an attribute argument.
+const MULTILINE_ATTRIBUTE_ARGUMENT: &str = "an attribute argument here is a one-line string; a \
+     triple-quoted string is an attribute argument only as `[extern(\"\"\"…\"\"\")]`'s host \
+     expression, alone";
+
+/// B660: a `,` before a tuple's closing `)`. Curated (diagnostics-standard.md
+/// B6): the rule and the one-action fix.
+const A_TUPLE_TAKES_NO_TRAILING_COMMA: &str = "a tuple takes no trailing comma; remove the \
+     `,` before `)`";
+
+/// B663: a struct literal heading a `match` subject. Curated (B6): the rule
+/// and its two ways out.
+const A_STRUCT_LITERAL_IS_NO_MATCH_SUBJECT: &str = "a struct literal can't be a `match` subject \
+     here: the `{` after a name opens the legs; wrap the literal in parentheses or bind it with \
+     `let` first";
+
+/// B658: the one capture an `is` pattern binds, when it binds exactly one —
+/// the name, the mutability flag and the name's span, mutably, so the
+/// let-else recovery can rename it.
+fn single_capture<'pattern, 'src>(
+    pattern: &'pattern mut Pattern<'src>,
+) -> Option<(&'pattern mut &'src str, bool, Span)> {
+    fn collect<'pattern, 'src>(
+        pattern: &'pattern mut Pattern<'src>,
+        found: &mut Vec<(&'pattern mut &'src str, bool, Span)>,
+    ) {
+        match pattern {
+            Pattern::Binding(name, mutable, span) => found.push((name, *mutable, *span)),
+            Pattern::Variant(_, Some(payload)) => {
+                for (inner, _) in payload {
+                    collect(inner, found);
+                }
+            }
+            Pattern::Tuple(items) | Pattern::Array(items) => {
+                for (inner, _) in items {
+                    collect(inner, found);
+                }
+            }
+            Pattern::Labelled(_, inner) => collect(&mut inner.0, found),
+            Pattern::Wildcard | Pattern::Variant(_, None) | Pattern::Literal(_) => {}
+        }
+    }
+    let mut found = Vec::new();
+    collect(pattern, &mut found);
+    if found.len() == 1 { found.pop() } else { None }
+}
+
+/// What B655 refuses in an `impl` body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonMember {
+    /// A declaration: `struct`, `enum`, `trait`, `impl`, `mod`, or a binding
+    /// (`let`/`mut`). `keyword` is the word it is refused at.
+    Item { keyword: ItemKeyword },
+    /// Anything else: an expression or a block, which would never run there.
+    Statement,
+}
+
+/// The keyword a refused `impl`-body item is spanned on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKeyword {
+    Struct,
+    Enum,
+    Trait,
+    Impl,
+    Mod,
+    /// `let`, `mut`, `lazy let`: the binder word written.
+    Binding,
+}
+
+impl ItemKeyword {
+    fn matches(self, token: &Token<'_>) -> bool {
+        match self {
+            ItemKeyword::Struct => *token == Token::Struct,
+            ItemKeyword::Enum => *token == Token::Enum,
+            ItemKeyword::Trait => *token == Token::Trait,
+            ItemKeyword::Impl => *token == Token::Impl,
+            ItemKeyword::Mod => *token == Token::Mod,
+            ItemKeyword::Binding => matches!(token, Token::Let | Token::Mut),
+        }
+    }
+
+    /// The declaration, as the message names it.
+    fn described(self) -> &'static str {
+        match self {
+            ItemKeyword::Struct => "a `struct`",
+            ItemKeyword::Enum => "an `enum`",
+            ItemKeyword::Trait => "a `trait`",
+            ItemKeyword::Impl => "an `impl`",
+            ItemKeyword::Mod => "a `mod`",
+            ItemKeyword::Binding => "a `let`/`mut` binding",
+        }
+    }
+}
+
+/// Whether a statement of an `impl` body is a member, and what it is when
+/// not. A member is a `fun` — under any attribute run, `export` or user macro
+/// attribute it carries. An `import`/`use` is admitted too: it serves every
+/// method (pinned, `macros::an_import_inside_an_impl_body_serves_its_methods`).
+/// A `macro fun` (refused by its own rule), a macro invocation or block (its
+/// expansion decides) and an `Error` (already reported) are left alone.
+fn non_member_kind(node: &Node<'_>) -> Option<NonMember> {
+    let item = |keyword| Some(NonMember::Item { keyword });
+    match node {
+        Node::Func(_)
+        | Node::Import(..)
+        | Node::Use(..)
+        | Node::MacroFun(_)
+        | Node::MacroInvocation(..)
+        | Node::MacroBlock(_)
+        | Node::Error => None,
+        // G24's `const fun` is a member as a plain `fun` is (`const` marks
+        // when it runs); `const (expr)` is a statement, one level down.
+        Node::Export(_, inner, _)
+        | Node::Derive(_, inner)
+        | Node::Service(_, inner)
+        | Node::Const(inner)
+        | Node::MacroAttribute(_, _, _, inner) => non_member_kind(&inner.0),
+        Node::Struct(..) => item(ItemKeyword::Struct),
+        Node::Enum(..) => item(ItemKeyword::Enum),
+        Node::Trait(..) => item(ItemKeyword::Trait),
+        Node::Impl(..) => item(ItemKeyword::Impl),
+        Node::Module(..) => item(ItemKeyword::Mod),
+        Node::Let(..) | Node::LetDestructure(..) => item(ItemKeyword::Binding),
+        _ => Some(NonMember::Statement),
+    }
+}
+
+/// B655's message: the rule and the move.
+fn non_member_rule(kind: NonMember) -> String {
+    match kind {
+        NonMember::Item { keyword } => format!(
+            "{} cannot be declared inside an `impl` — an `impl` declares methods; move it to \
+             the module's top level",
+            keyword.described()
+        ),
+        NonMember::Statement => "a statement cannot stand inside an `impl` — an `impl` \
+             declares methods, and this would never run; move it into a `fun`"
+            .to_string(),
+    }
+}
+
+/// B652's refusal of a string escape that is not one: the sequence as
+/// written, why, and the escapes that exist (diagnostics-standard.md B6 — the
+/// prohibition explains itself and names the sanctioned spelling). An unknown
+/// escape leads with the literal backslash, the likeliest intent (a regex's
+/// `\d`, a Windows path), before the list.
+fn escape_rule(kind: lexing::EscapeErrorKind, written: &str) -> String {
+    use lexing::EscapeErrorKind;
+    match kind {
+        EscapeErrorKind::Unknown => format!(
+            "unknown escape `{written}` in a string: a backslash itself is written `\\\\`, and the \
+             escapes are {}",
+            lexing::STRING_ESCAPES
+        ),
+        EscapeErrorKind::Hex => format!(
+            "the escape `{written}` is cut short: `\\x` takes exactly two hex digits, `\\x41`"
+        ),
+        EscapeErrorKind::Unicode => format!(
+            "the escape `{written}` is cut short: `\\u` takes four hex digits, `\\u0301`, or a \
+             code point in braces, `\\u{{1F600}}`"
+        ),
+        EscapeErrorKind::PastLastCodePoint => {
+            format!("the escape `{written}` is past the last code point, `\\u{{10FFFF}}`")
+        }
+        EscapeErrorKind::LoneSurrogate => format!(
+            "the escape `{written}` is half of a UTF-16 surrogate pair, not a character: write \
+             the code point it pairs into, `\\u{{1F600}}`, or the pair `\\uD83D\\uDE00`"
+        ),
+    }
+}
+
 /// Render one parse error as user-facing text, following the diagnostics standard
 /// (`proposal/diagnostics-standard.md`): "found X expected Y in <context> — <hint>"
 /// for the structured case, the curated rule verbatim, and an unclosed-delimiter
@@ -1810,6 +2007,23 @@ pub fn render(error: &ParseError) -> String {
             "`as {written}` then `<`: a generic list after `as` touches its type, `{tight}` — \
              spaced, the `<` after an ascribed type is a comparison"
         ),
+        ParseErrorReason::Escape { kind, written } => escape_rule(*kind, written),
+        ParseErrorReason::NonMemberInImpl(kind) => non_member_rule(*kind),
+        ParseErrorReason::LetElse { suggestion } => match suggestion {
+            Some((respelled, name)) => format!(
+                "a `let` takes no guard: the let-else form is the `is` test alone, \
+                 `{respelled}`, with no `let {name} =`"
+            ),
+            None => "a `let` takes no guard: the let-else form is the `is` test alone, \
+                 `opt is Some(let x) else ret;`, with no `let x =`"
+                .to_string(),
+        },
+        ParseErrorReason::BareClosureTypeParameter { written } => format!(
+            "wrap a closure type that is a parameter in parentheses: `({written})` — bare, its \
+             `|` closes the outer parameter list"
+        ),
+        ParseErrorReason::MalformedMultiline(message) => message.clone(),
+        ParseErrorReason::MultilineAttributeArgument => MULTILINE_ATTRIBUTE_ARGUMENT.to_string(),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -1941,19 +2155,31 @@ fn parse_with(source: &str, preserve_paren_groups: bool) -> ParsedWithWarnings<'
     // expressed by the ERROR LIST (empty ⇒ clean), not by a missing tree.
     let mut errors: Vec<ParseError> = lex_errors
         .iter()
-        .map(|error| ParseError {
-            span: (error.position..error.position + error.character.len_utf8()).into(),
+        .map(|error| {
+            let mut end = error.position + error.character.len_utf8();
             // A lexer error that knows WHICH rule the character broke states it;
             // the rest render as the generic "found X expected a token".
-            reason: match error.rule {
-                Some(rule) => ParseErrorReason::Rule(rule),
+            let reason = match error.rule {
+                Some(lexing::LexRule::Statement(rule)) => ParseErrorReason::Rule(rule),
+                // B652: the refused escape, spanned and quoted whole.
+                Some(lexing::LexRule::Escape { kind, length }) => {
+                    end = error.position + length;
+                    ParseErrorReason::Escape {
+                        kind,
+                        written: source[error.position..end].to_string(),
+                    }
+                }
                 None => ParseErrorReason::Expected {
                     found: Found::Character(error.character),
                     expected: vec!["a token".to_string()],
                 },
-            },
-            context: Vec::new(),
-            hint: None,
+            };
+            ParseError {
+                span: (error.position..end).into(),
+                reason,
+                context: Vec::new(),
+                hint: None,
+            }
         })
         .collect();
     errors.append(&mut parser.errors);
@@ -2080,6 +2306,9 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
+    /// B656: a binder named `css` was refused and read as the name, so a bare
+    /// `css` after it is that binding's use, not a second refusal.
+    css_binder_refused: bool,
     /// Whether the statement about to be read is the FILE's first (B415): the
     /// one position `mod self;` — the host of the file's platform — may stand
     /// in. Set by
@@ -2274,6 +2503,9 @@ fn apply_binding_mutability(pattern: Pattern<'_>, mutable: bool) -> Pattern<'_> 
 enum ExternArg<'src> {
     Word(&'src str),
     Text(&'src str),
+    /// A triple-quoted literal's raw inner text and the token's span (B654):
+    /// legal as the attribute's ONE argument, the host expression.
+    Code(&'src str, Span),
 }
 
 /// Interprets a `[extern(..)]` attribute's arguments into a host binding. A
@@ -2282,6 +2514,7 @@ enum ExternArg<'src> {
 fn extern_binding_from_args<'src>(args: &[ExternArg<'src>]) -> ExternBinding<'src> {
     use ExternArg::{Text, Word};
     match args {
+        [ExternArg::Code(text, _)] => ExternBinding::Code { text },
         [Text(symbol)] => ExternBinding::Function {
             module: None,
             symbol,
@@ -2888,6 +3121,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             context_stack: Vec::new(),
             preserve_paren_groups,
             in_member_body: false,
+            css_binder_refused: false,
             file_head: false,
             nesting_depth: 0,
             nesting_refusal: None,
@@ -3294,11 +3528,32 @@ impl<'a, 'src> Parser<'a, 'src> {
             None => true,
         };
         if advance {
-            self.farthest_failure = Some(Failure {
-                position,
-                expected: vec![expected.to_string()],
-                context: self.context_stack.clone(),
-            });
+            // The record a failure replaces lends it its buffers: a clean parse
+            // notes at every alternative it backs out of, so a fresh record per
+            // advance was an allocation per note (three, with the context and
+            // the expectation's text) on the keystroke path.
+            match &mut self.farthest_failure {
+                Some(failure) => {
+                    failure.position = position;
+                    failure.expected.truncate(1);
+                    match failure.expected.first_mut() {
+                        Some(first) => {
+                            first.clear();
+                            first.push_str(expected);
+                        }
+                        None => failure.expected.push(expected.to_string()),
+                    }
+                    failure.context.clear();
+                    failure.context.extend_from_slice(&self.context_stack);
+                }
+                None => {
+                    self.farthest_failure = Some(Failure {
+                        position,
+                        expected: vec![expected.to_string()],
+                        context: self.context_stack.clone(),
+                    });
+                }
+            }
         } else if let Some(failure) = &mut self.farthest_failure
             && position == failure.position
             && !failure.expected.iter().any(|e| e == expected)
@@ -6119,6 +6374,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return Some(initializer);
             }
         }
+        // B656: once a binder named `css` has been refused (and read as that
+        // name), a bare `css` is its USE — read as the name too, silently: the
+        // binding's refusal is the one diagnostic for the one cause.
+        if self.css_binder_refused && self.peek_is(&Token::Css) {
+            let start = self.position;
+            self.bump();
+            return Some((Node::Accessor("css"), self.span_from(start)));
+        }
         self.parse_atom()
     }
 
@@ -6406,14 +6669,32 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             if parser.peek_is_ctrl(',') {
                 // A tuple is `expr (',' expr)*` (≥2 elements) with NO trailing comma
-                // — unlike a list literal, the chumsky `tuple` atom has no
-                // `allow_trailing`, so `(a, b,)` declines (a group can't hold a comma
-                // either). Every `,` here must be followed by an expression.
+                // — unlike a list literal, `(a, b,)` is no tuple (a group can't
+                // hold a comma either). B660: the trailing comma is still the
+                // natural slip — a call's arguments, a list, a struct literal and
+                // a signature all take one, and the formatter writes it on every
+                // multi-line one — so it is REFUSED at the comma and read as if
+                // absent, rather than declining the whole atom (which read as
+                // "expected an expression" at the `)`, or as an unclosed `(` once
+                // the tuple was a call's argument).
                 let mut items = vec![first];
                 while parser.eat_ctrl(',') {
+                    if parser.peek_is_ctrl(')') {
+                        parser.errors.push(ParseError {
+                            span: parser.token_span(parser.position - 1),
+                            reason: ParseErrorReason::Rule(A_TUPLE_TAKES_NO_TRAILING_COMMA),
+                            context: Vec::new(),
+                            hint: None,
+                        });
+                        break;
+                    }
                     items.push(parser.parse_tuple_entry()?);
                 }
                 parser.expect_ctrl(')')?;
+                // `(a,)`: the one-entry slip is a group with a stray comma.
+                if items.len() == 1 && !matches!(items[0].0, Node::Labelled(..)) {
+                    return items.pop();
+                }
                 parser.check_tuple_labels(&items);
                 Some((Node::Tuple(items), parser.span_from(start)))
             } else {
@@ -7353,10 +7634,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             // No statement starts here. The block's trailing expression is the
             // other legitimate reading (it is the one thing in a block that needs
             // no `;`), and it must close the block to be one.
-            if let Some(expression) = self.attempt(|parser| {
+            //
+            // B663: the statement attempt that just failed parsed this same
+            // text and failed for the `;` a tail does not take, at the block's
+            // `}` — the FARTHEST failure on record, and a stale one for the
+            // re-parse below. A block inside the tail (a closure's body, an
+            // element's handler) asked the farthest failure what its own
+            // broken statement wanted and was handed that `;`, so `let z = 5
+            // 6;` in an `on:submit` handler was reported as a missing `;` at
+            // the element's closing tag (kolt: sixteen lines below). The tail
+            // attempt runs without it; the farther of the two is kept after.
+            let statement_failure = self.farthest_failure.take();
+            let parsed = self.attempt(|parser| {
                 let expression = parser.parse_discarded(Self::parse_expression)?;
                 parser.peek_is_ctrl('}').then_some(expression)
-            }) {
+            });
+            self.farthest_failure = match (statement_failure, self.farthest_failure.take()) {
+                (Some(statement), Some(tail)) if tail.position > statement.position => Some(tail),
+                (Some(statement), _) => Some(statement),
+                (None, tail) => tail,
+            };
+            if let Some(expression) = parsed {
                 tail = Some(expression);
                 break;
             }
@@ -7545,7 +7843,30 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_match(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Match)?;
-        let subject = self.parse_condition()?;
+        let subject_start = self.position;
+        let mut subject = self.parse_condition()?;
+        // B663: `match Point { x = 2 }.doubled() {` — the subject is a
+        // condition, where a `{` after a bare path opens the legs (a struct
+        // literal would swallow them), so the literal's `x = 2` read as a leg
+        // and failed on its `=`. A leg never begins `name =`, so that shape
+        // after a path subject IS the literal: refused there with the two
+        // spellings that work, and parsed as one so the legs below still read
+        // (inside element syntax the failure used to surface as a missing `;`
+        // at the element's closing tag, sixteen lines down in kolt).
+        if self.struct_literal_heads_the_legs(&subject)
+            && let Some(literal_end) =
+                self.scan_balanced(self.position, '{', '}', &[('(', ')'), ('[', ']')])
+        {
+            self.errors.push(ParseError {
+                span: (self.token_span(subject_start).start..self.token_span(literal_end - 1).end)
+                    .into(),
+                reason: ParseErrorReason::Rule(A_STRUCT_LITERAL_IS_NO_MATCH_SUBJECT),
+                context: Vec::new(),
+                hint: None,
+            });
+            self.position = subject_start;
+            subject = self.parse_expression()?;
+        }
         let legs_start = self.position;
         self.expect_ctrl('{')?;
         let mut legs = Vec::new();
@@ -7560,6 +7881,20 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.expect_ctrl('}')?;
         let legs = (legs, self.span_from(legs_start));
         Some((Node::Match(Box::new(subject), legs), self.span_from(start)))
+    }
+
+    /// B663: whether the `{` at the cursor, after a match `subject` that is a
+    /// bare path, opens a struct LITERAL rather than the legs — `name =` (or
+    /// `name,`/`name }`'s shorthand is a leg too, so only the `=` decides).
+    fn struct_literal_heads_the_legs(&self, subject: &Spanned<Node<'src>>) -> bool {
+        matches!(
+            subject.0,
+            Node::Accessor(_) | Node::AccessorWithGenerics(..) | Node::StaticAccessor(..)
+        ) && self.peek_is_ctrl('{')
+            && self
+                .peek_at(1)
+                .is_some_and(|token| matches!(token, Token::Ident(_)) || is_reserved_word(token))
+            && matches!(self.peek_at(2), Some(Token::Op("=")))
     }
 
     /// One leg: `pattern (, pattern)* (if guard)? => body`.
@@ -7608,6 +7943,112 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((Node::FuncReturn(value.map(Box::new)), self.span_from(start)))
     }
 
+    /// B658: a `let` whose value is followed by a guard's `else`. The guard
+    /// `c else S;` is a STATEMENT read only at a statement's head, so after a
+    /// binding's `=` the `else` belonged to nothing: at the top of a body it
+    /// was a missing `;`, and inside a block the parse ran on into the
+    /// enclosing `if`'s own `else` and failed in an unrelated call below,
+    /// never naming this line. Refused at `let … =` with the let-else form,
+    /// and parsed as the guard the author meant: when the binding is one name
+    /// and the `is` test binds exactly one, that capture takes the binding's
+    /// name — `let target = target is Some(let t) else ret;` reads as `target
+    /// is Some(let target) else ret;` — so the uses below see the unwrapped
+    /// value instead of failing as a cascade.
+    fn let_else_as_guard(
+        &mut self,
+        start: usize,
+        binder: Spanned<Pattern<'src>>,
+        value: Spanned<Node<'src>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        let equals = (start..self.position)
+            .find(|&position| matches!(self.tokens[position].0, Token::Op("=")))
+            .unwrap_or(start);
+        let head: Span = (self.token_span(start).start..self.token_span(equals).end).into();
+        let else_word = self.here_span();
+        self.bump(); // `else`
+        let otherwise = self.parse_then_branch(false, false)?;
+        let mut condition = value;
+        let suggestion = match (&binder.0, &mut condition.0) {
+            (Pattern::Binding(name, _, _), Node::Is(subject, pattern)) => {
+                let written_subject = self.source[subject.1.into_range()].to_string();
+                let block_reads = |parser: &Self, word: &str| parser.block_reads_name(word);
+                match single_capture(&mut pattern.0) {
+                    // The capture keeps its own name when the code below reads
+                    // IT (the author then meant `let t` and wrote `let x =`
+                    // by habit); otherwise it takes the binding's.
+                    Some(capture) if block_reads(self, capture.0) => {
+                        let written = self.source[pattern.1.into_range()].to_string();
+                        Some((format!("{written_subject} is {written}"), name.to_string()))
+                    }
+                    Some(capture) => {
+                        let pattern_text = self.source[pattern.1.into_range()].to_string();
+                        let capture_text = self.source[capture.2.into_range()].to_string();
+                        let offset = capture.2.start - pattern.1.start;
+                        let renamed = format!(
+                            "{}{}{}",
+                            &pattern_text[..offset],
+                            name,
+                            &pattern_text[offset + capture_text.len()..]
+                        );
+                        *capture.0 = *name;
+                        Some((format!("{written_subject} is {renamed}"), name.to_string()))
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let otherwise_text = self.source[otherwise.1.into_range()].to_string();
+        self.errors.push(ParseError {
+            span: head,
+            reason: ParseErrorReason::LetElse {
+                suggestion: suggestion
+                    .map(|(test, name)| (format!("{test} else {otherwise_text};"), name)),
+            },
+            context: Vec::new(),
+            hint: None,
+        });
+        let span = self.span_from(start);
+        let otherwise_span = otherwise.1;
+        let at = else_word.start;
+        Some(read_as_statement((
+            Node::If(NodeIfBranch::If(Box::new(If {
+                condition: Box::new(condition),
+                then: (
+                    (Vec::new(), Box::new((Node::Void, Span::from(at..at)))),
+                    Span::from(at..at),
+                ),
+                else_: Some((
+                    NodeIfBranch::Else(((Vec::new(), Box::new(otherwise)), otherwise_span)),
+                    otherwise_span,
+                )),
+                spelling: IfSpelling::Then {
+                    then_word: None,
+                    else_word: Some(else_word),
+                    statement: false,
+                },
+            }))),
+            span,
+        )))
+    }
+
+    /// Whether `name` is read as a NAME between the cursor and the end of the
+    /// enclosing block — a token scan to the `}` that closes it (B658's
+    /// rename test; parse-time, so a shadowing re-binding counts as a read).
+    fn block_reads_name(&self, name: &str) -> bool {
+        let mut depth = 0usize;
+        for (token, _) in &self.tokens[self.position..] {
+            match token {
+                Token::Ctrl('{') => depth += 1,
+                Token::Ctrl('}') if depth == 0 => return false,
+                Token::Ctrl('}') => depth -= 1,
+                Token::Ident(word) if *word == name => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// `let`/`mut` binding: `(let|mut) binder (: type)? (= value)?`, lowering a bare
     /// name to `Let` and a destructuring binder to `LetDestructure`.
     fn parse_let(&mut self) -> Option<Spanned<Node<'src>>> {
@@ -7652,11 +8093,21 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
-        let value = if self.eat_op("=") {
+        let mut value = if self.eat_op("=") {
             Some(Box::new(self.parse_expression()?))
         } else {
             None
         };
+        // B658: `let target = target is Some(let t) else ret;` — a guard's
+        // `else` after a binding's value that is an `is` test: the let-else
+        // shape another language spells this way. (Any other value before an
+        // `else` — `let x = ready else 1;` — keeps B459's missing `;`.)
+        if !lazy
+            && self.peek_is(&Token::Else)
+            && let Some(value) = value.take_if(|value| matches!(value.0, Node::Is(..)))
+        {
+            return self.let_else_as_guard(start, (pattern, pattern_span), *value);
+        }
         if lazy {
             // `lazy mut` — the binding is initialized ONCE, at first use, and
             // memoized; a `mut` module global is a different contract (a slot
@@ -8088,6 +8539,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         // parameter, the `,` its argument list could have taken at its `>` —
         // and `fun f(a: List<i32>, 5)` reported "found '>' expected ','" one
         // parameter early. A `let` and a `for` binder read the same production.
+        // B656: `css` is a keyword, and a binder is a parse-time fact — so the
+        // refusal is made HERE, wherever the binder stands (a `let` in a
+        // closure in an element hole included), and the binder is read as the
+        // name it was meant to be. Before, the parse broke at the word and
+        // the keyword diagnostic fired only when the farthest failure happened
+        // to land on it; in a closure inside an element hole it never did, and
+        // a `List<void>` hole error and two "expected `;`" stood in for it.
+        if self.peek_is(&Token::Css) {
+            let span = self.here_span();
+            self.bump();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+            self.css_binder_refused = true;
+            return Some((Pattern::Binding("css", false, span), span));
+        }
         let Some(name) = self.eat_ident() else {
             self.note_expected("a name");
             return None;
@@ -8513,9 +8983,22 @@ impl<'a, 'src> Parser<'a, 'src> {
         let parameters = if self.eat_op("||") {
             Vec::new()
         } else if self.eat_op("|") {
-            let parameters = self.comma_list(Self::parse_closure_type_parameter, |parser| {
+            let mut parameters = self.comma_list(Self::parse_closure_type_parameter, |parser| {
                 parser.peek_is_op("|")
             })?;
+            // B661: `|str, |bool| void| void` read its inner `|` as the list's
+            // close after a trailing comma, and the parse broke one token later
+            // with nothing said about the parentheses the inner type needs.
+            while let Some(nested) = self.bare_closure_type_parameter() {
+                parameters.push((None, Box::new(nested)));
+                if self.eat_ctrl(',') {
+                    parameters.extend(
+                        self.comma_list(Self::parse_closure_type_parameter, |parser| {
+                            parser.peek_is_op("|")
+                        })?,
+                    );
+                }
+            }
             self.expect_op("|")?;
             parameters
         } else {
@@ -8529,6 +9012,39 @@ impl<'a, 'src> Parser<'a, 'src> {
             Node::ClosureType(parameters, return_type),
             self.span_from(start),
         ))
+    }
+
+    /// B661: a closure type written BARE as a closure type's parameter —
+    /// `|str, |bool| void| void` — refused with the parenthesized spelling and
+    /// read as that parameter, so the parse (and a struct's other fields) goes
+    /// on. Called where the parameter list just ended in a comma: the `|` there
+    /// is either the list's close after a trailing comma or the opener of a
+    /// bare closure type, and it is the opener when the comma and the `|` share
+    /// a line (the formatter breaks before a trailing comma's close) and a
+    /// whole closure type parses from it, followed by the next `,` or the
+    /// list's own `|`. A trailing comma never meets that: what follows its
+    /// close is the return type, then the surrounding production.
+    fn bare_closure_type_parameter(&mut self) -> Option<Spanned<Node<'src>>> {
+        let comma = self.position.checked_sub(1)?;
+        if !matches!(self.tokens.get(comma), Some((Token::Ctrl(','), _)))
+            || !self.peek_is_op("|")
+            || self.source[self.token_span(comma).end..self.token_span(self.position).start]
+                .contains('\n')
+        {
+            return None;
+        }
+        let nested = self.attempt(|parser| {
+            let nested = parser.parse_closure_type()?;
+            (parser.peek_is_ctrl(',') || parser.peek_is_op("|")).then_some(nested)
+        })?;
+        let written = self.source[nested.1.into_range()].to_string();
+        self.errors.push(ParseError {
+            span: nested.1,
+            reason: ParseErrorReason::BareClosureTypeParameter { written },
+            context: Vec::new(),
+            hint: None,
+        });
+        Some(nested)
     }
 
     /// One closure-type parameter: `(name :)? type`.
@@ -8797,6 +9313,68 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.expect_ctrl('}')?;
         Some((statements, self.span_from(start)))
+    }
+
+    /// An `impl` body: [`Parser::parse_item_body`]'s `{ statement* }`, with
+    /// every statement that is not a MEMBER refused where it stands (B655).
+    fn parse_impl_body(&mut self) -> Option<Spanned<NodeList<'src>>> {
+        if let Some(clean) = self.attempt(Self::parse_impl_body_clean) {
+            return Some(clean);
+        }
+        self.recover_delimited("implementation body", '{', '}', &[('(', ')'), ('[', ']')])
+            .map(|span| (Vec::new(), span))
+    }
+
+    /// The clean `impl` body. The grammar's body is `{ statement }` — the
+    /// statement parser reads it — but an `impl` DECLARES METHODS, and nothing
+    /// else in it was ever anything: before B655 a `struct` between two methods
+    /// was walked into the impl's member scope and then existed nowhere (a use
+    /// read "unknown struct", in another module "cannot find 'Hidden' in the
+    /// imported path"), a `let` checked clean and was a `ReferenceError` on JS
+    /// and a rustc refusal natively, and a statement never ran. Each is refused
+    /// at its keyword (a statement at itself) and kept in the tree, so the parse
+    /// goes on as it did.
+    fn parse_impl_body_clean(&mut self) -> Option<Spanned<NodeList<'src>>> {
+        let start = self.position;
+        self.expect_ctrl('{')?;
+        let mut statements = Vec::new();
+        loop {
+            if self.peek_is_ctrl('}') || self.at_end() {
+                break;
+            }
+            let statement_start = self.position;
+            match self.parse_statement() {
+                Some(statement) => {
+                    self.refuse_non_member(&statement, statement_start);
+                    statements.push(statement);
+                }
+                None => break,
+            }
+        }
+        self.expect_ctrl('}')?;
+        Some((statements, self.span_from(start)))
+    }
+
+    /// B655's refusal of one `impl`-body statement that is not a member, or
+    /// nothing for a member. The tokens from `statement_start` to the cursor
+    /// are the statement's own, so an item's keyword is found among them past
+    /// any attribute run.
+    fn refuse_non_member(&mut self, statement: &Spanned<Node<'src>>, statement_start: usize) {
+        let Some(kind) = non_member_kind(&statement.0) else {
+            return;
+        };
+        let keyword_span = match kind {
+            NonMember::Item { keyword, .. } => (statement_start..self.position)
+                .find(|&position| keyword.matches(&self.tokens[position].0))
+                .map(|position| self.token_span(position)),
+            NonMember::Statement => None,
+        };
+        self.errors.push(ParseError {
+            span: keyword_span.unwrap_or(statement.1),
+            reason: ParseErrorReason::NonMemberInImpl(kind),
+            context: Vec::new(),
+            hint: None,
+        });
     }
 
     /// `{ function* }` — a trait body: a list of function declarations ONLY (not
@@ -9509,11 +10087,18 @@ impl<'a, 'src> Parser<'a, 'src> {
                 Some((fields, parser.span_from(fields_start)))
             }) {
                 Some(clean) => clean,
-                None => {
-                    let span =
-                        self.recover_delimited("struct body", '{', '}', &[('(', ')'), ('[', ']')])?;
-                    (Vec::new(), span)
-                }
+                None => match self.recover_struct_fields() {
+                    Some(recovered) => recovered,
+                    None => {
+                        let span = self.recover_delimited(
+                            "struct body",
+                            '{',
+                            '}',
+                            &[('(', ')'), ('[', ']')],
+                        )?;
+                        (Vec::new(), span)
+                    }
+                },
             };
             Some(fields)
         } else if self.eat_ctrl(';') {
@@ -9531,6 +10116,141 @@ impl<'a, 'src> Parser<'a, 'src> {
                 labels,
             ),
             self.span_from(start),
+        ))
+    }
+
+    /// B661/B673: a struct body whose clean parse failed, read FIELD BY FIELD.
+    /// The body used to recover to NO fields, so one broken field type took
+    /// the struct's every field with it: each use of another field read
+    /// "struct 'Message' has no field 'next_id'", and each literal "`Provider`
+    /// expects 0 fields" — listed before the parse error, four times over. Now
+    /// a field that parses is kept, a broken one is reported where it broke
+    /// and kept by NAME with an unresolved type (the parse-recovery hole the
+    /// type walk reads silently), so a struct literal and a field read still
+    /// find it. `None` when the body does not balance; the caller's
+    /// whole-body recovery takes that case.
+    fn recover_struct_fields(&mut self) -> Option<Spanned<Vec<Spanned<StructField<'src>>>>> {
+        self.attempt(Self::recover_struct_fields_inner)
+    }
+
+    /// [`Parser::recover_struct_fields`]'s body. `None` — rolled back, for the
+    /// whole-body recovery to take — when a broken field has no `name :` to
+    /// keep it by: a body that garbled from its first token (`struct S { 1 2
+    /// 3 }`) is the "unclosed `{` in struct body" case, not a field's.
+    fn recover_struct_fields_inner(&mut self) -> Option<Spanned<Vec<Spanned<StructField<'src>>>>> {
+        let open = self.position;
+        if !self.peek_is_ctrl('{') {
+            return None;
+        }
+        let end = self.scan_balanced(open, '{', '}', &[('(', ')'), ('[', ']')])?;
+        let close = end - 1;
+        let mut fields = Vec::new();
+        let mut position = open + 1;
+        while position < close {
+            self.position = position;
+            let parsed = self.attempt(|parser| {
+                let field = parser.parse_struct_field()?;
+                Some((field, parser.position))
+            });
+            let resume = match parsed {
+                Some((field, stopped))
+                    if stopped == close
+                        || matches!(self.tokens.get(stopped), Some((Token::Ctrl(','), _))) =>
+                {
+                    fields.push(field);
+                    stopped
+                }
+                parsed => {
+                    let next = self.next_field_boundary(position, close);
+                    let salvaged = self.salvaged_field(position, next)?;
+                    match parsed {
+                        // The field read, and something it cannot take follows.
+                        Some((_, stopped)) => self.emit_failure(
+                            stopped,
+                            vec!["','".to_string(), "'}'".to_string()],
+                            Vec::new(),
+                        ),
+                        None => {
+                            match self.take_failure_within(position.saturating_sub(1), next + 1) {
+                                Some(failure) => self.emit_failure(
+                                    failure.position,
+                                    failure.expected,
+                                    failure.context,
+                                ),
+                                // Nothing inside said what it wanted: the
+                                // type after the name is not one.
+                                None => self.emit_failure(
+                                    (position + 2).min(next),
+                                    vec!["a type".to_string()],
+                                    Vec::new(),
+                                ),
+                            }
+                        }
+                    }
+                    fields.push(salvaged);
+                    next
+                }
+            };
+            position = if resume < close { resume + 1 } else { close };
+        }
+        self.position = end;
+        Some((fields, self.span_from(open)))
+    }
+
+    /// Where the broken field starting at `position` ends: the next `,` at
+    /// bracket depth zero that a line break follows (fields are written one
+    /// to a line, and a `,` inside a closure type's parameters is not one), or
+    /// the body's `close`.
+    fn next_field_boundary(&self, position: usize, close: usize) -> usize {
+        let mut depth = 0usize;
+        for index in position..close {
+            match &self.tokens[index].0 {
+                Token::Ctrl('(' | '[' | '{' | '<') => depth += 1,
+                Token::Ctrl(')' | ']' | '}' | '>') => depth = depth.saturating_sub(1),
+                Token::Ctrl(',')
+                    if depth == 0
+                        && self.source
+                            [self.token_span(index).end..self.token_span(index + 1).start]
+                            .contains('\n') =>
+                {
+                    return index;
+                }
+                _ => {}
+            }
+        }
+        close
+    }
+
+    /// A broken field kept by its name: `[attributes]* name :` at `position`,
+    /// with a recovery hole for its type. `None` when no name reads there.
+    fn salvaged_field(&self, position: usize, end: usize) -> Option<Spanned<StructField<'src>>> {
+        let mut at = position;
+        while matches!(self.tokens.get(at), Some((Token::Ctrl('['), _))) {
+            at = self.scan_balanced(at, '[', ']', &[('(', ')'), ('{', '}')])?;
+        }
+        let (token, name_span) = self.tokens.get(at)?;
+        let name = match token {
+            Token::Ident(name) => *name,
+            token if is_reserved_word(token) => self.source.get(name_span.into_range())?,
+            _ => return None,
+        };
+        if !matches!(self.tokens.get(at + 1), Some((Token::Op(":"), _))) || at + 2 > end {
+            return None;
+        }
+        let type_span: Span = (self.token_span(at + 2).start
+            ..self.token_span(end.saturating_sub(1).max(at + 2)).end)
+            .into();
+        let field_span: Span =
+            (self.token_span(position).start..type_span.end.max(name_span.end)).into();
+        Some((
+            (
+                (name, *name_span),
+                Some((Node::Error, type_span)),
+                Exposure::default(),
+                None,
+                Reactivity::default(),
+            ),
+            field_span,
         ))
     }
 
@@ -9806,8 +10526,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             Vec::new()
         };
-        let body =
-            self.within_member_body(|parser| parser.parse_item_body("implementation body"))?;
+        let body = self.within_member_body(Self::parse_impl_body)?;
         Some((
             Node::Impl(Box::new(subject), traits, body, labels),
             self.span_from(start),
@@ -10844,6 +11563,21 @@ impl<'a, 'src> Parser<'a, 'src> {
             if retains {
                 binding.pop();
             }
+            // B654: the host expression stands alone. Beside a form word or a
+            // module it would lower to the empty global symbol, silently, as a
+            // malformed attribute does — so it is refused at the literal.
+            if binding.len() > 1 {
+                for argument in &binding {
+                    if let ExternArg::Code(_, span) = argument {
+                        parser.errors.push(ParseError {
+                            span: *span,
+                            reason: ParseErrorReason::MultilineAttributeArgument,
+                            context: Vec::new(),
+                            hint: None,
+                        });
+                    }
+                }
+            }
             Some((extern_binding_from_args(&binding), retains))
         })
     }
@@ -10863,7 +11597,61 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.bump();
                 Some(ExternArg::Text(text))
             }
+            // B654: the triple-quoted form, raw and multi-line — where a long
+            // host expression lives. Its shape is the multiline rule's, refused
+            // here at the literal as it would be anywhere else (no expression
+            // walk ever sees an attribute argument).
+            Some(Token::MultilineString(text)) => {
+                let text = *text;
+                let span = self.token_span(self.position);
+                self.bump();
+                self.refuse_malformed_multiline(text, span);
+                Some(ExternArg::Code(text, span))
+            }
             _ => None,
+        }
+    }
+
+    /// A STRING attribute argument that is not `[extern(..)]`'s host
+    /// expression — a steer, a reason, a platform pattern: one line. A
+    /// triple-quoted string there is refused AT the literal and read as its
+    /// raw text, so the attribute (and the item under it) still parses; before
+    /// B654 the attribute failed whole and re-read as a list expression, which
+    /// reported "cannot find 'deprecated' in this scope".
+    fn eat_attribute_string(&mut self) -> Option<&'src str> {
+        match self.peek() {
+            Some(Token::String(text)) => {
+                let text = *text;
+                self.bump();
+                Some(text)
+            }
+            Some(Token::MultilineString(text)) => {
+                let text = *text;
+                self.errors.push(ParseError {
+                    span: self.token_span(self.position),
+                    reason: ParseErrorReason::MultilineAttributeArgument,
+                    context: Vec::new(),
+                    hint: None,
+                });
+                self.bump();
+                Some(text)
+            }
+            _ => None,
+        }
+    }
+
+    /// The multiline rule (`util::multiline_layout`) over a triple-quoted
+    /// literal's raw text, refused at the offending text inside it. `span` is
+    /// the whole token's, delimiters included.
+    fn refuse_malformed_multiline(&mut self, text: &'src str, span: Span) {
+        if let Err((message, range)) = crate::util::multiline_layout(text) {
+            let content_start = span.start + "\"\"\"".len();
+            self.errors.push(ParseError {
+                span: (content_start + range.start..content_start + range.end).into(),
+                reason: ParseErrorReason::MalformedMultiline(message),
+                context: Vec::new(),
+                hint: None,
+            });
         }
     }
 
@@ -10934,11 +11722,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             parser.bump();
             parser.expect_ctrl('(')?;
-            let Some(Token::String(steer)) = parser.peek() else {
-                return None;
-            };
-            let steer = *steer;
-            parser.bump();
+            let steer = parser.eat_attribute_string()?;
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(steer)
@@ -10962,11 +11746,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             parser.bump();
             parser.expect_ctrl('(')?;
-            let Some(Token::String(reason)) = parser.peek() else {
-                return None;
-            };
-            let reason = *reason;
-            parser.bump();
+            let reason = parser.eat_attribute_string()?;
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(reason)
@@ -11071,13 +11851,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// One platform pattern: a quoted string with its span.
     fn parse_platform_pattern(&mut self) -> Option<Spanned<&'src str>> {
         let start = self.position;
-        if let Some(Token::String(text)) = self.peek() {
-            let text = *text;
-            self.bump();
-            Some((text, self.span_from(start)))
-        } else {
-            None
-        }
+        let text = self.eat_attribute_string()?;
+        Some((text, self.span_from(start)))
     }
 
     // --- Macro forms ---------------------------------------------------------

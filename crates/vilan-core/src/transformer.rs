@@ -1170,48 +1170,6 @@ fn collect_reference_if(branch: &js::IfBranch, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Interprets a string literal's backslash escapes into the characters they
-/// denote (`\n` -> newline, `\t`, `\r`, `\"`, `\\`, `\0`), so the value is the
-/// real text — the JS formatter then re-escapes it for output. Borrows the slice
-/// unchanged when it has no escapes. An unknown escape keeps both characters.
-///
-/// This is where a string literal's VALUE is built from source text — for a
-/// plain `"…"` and for each literal fragment of an `i"…"` alike (the lexer
-/// desugars an i-string into `String` tokens) — so it is where the
-/// `\r\n`-is-one-line-terminator rule lands (`windows-support.md` §2,
-/// specification §2.1): a multi-line literal's value carries `\n` per source
-/// line break whatever the file's on-disk encoding, exactly as a triple-quoted
-/// literal already does. An ESCAPED `\r` is unaffected — it is written, not read
-/// from the line ending — and a lone `\r` in the text is preserved.
-pub fn unescape_string(raw: &str) -> Cow<'_, str> {
-    let raw = crate::util::normalize_newlines(raw);
-    if !raw.contains('\\') {
-        return raw;
-    }
-    let mut result = String::with_capacity(raw.len());
-    let mut characters = raw.chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            result.push(character);
-            continue;
-        }
-        match characters.next() {
-            Some('n') => result.push('\n'),
-            Some('t') => result.push('\t'),
-            Some('r') => result.push('\r'),
-            Some('"') => result.push('"'),
-            Some('\\') => result.push('\\'),
-            Some('0') => result.push('\0'),
-            Some(other) => {
-                result.push('\\');
-                result.push(other);
-            }
-            None => result.push('\\'),
-        }
-    }
-    Cow::Owned(result)
-}
-
 /// The helpers a helper's own body calls, added to a sorted helper list so a
 /// program that reaches the caller also emits the callee.
 ///
@@ -6535,7 +6493,7 @@ impl<'src> Transformer<'src> {
                 };
                 js::Node::Number(whole, fraction.map(|x| x.to_string()))
             }
-            Expr::String(x) => js::Node::String(unescape_string(x)),
+            Expr::String(x) => js::Node::String(crate::lexing::unescape_string(x)),
             // debugging.md S0: a `[track_caller]` call's location argument —
             // `std::debug::Location` is its text on this backend.
             Expr::CallerLocation(anchor) => {
@@ -9075,7 +9033,7 @@ impl<'src> Transformer<'src> {
             // The declaration carries the RAW literal text, so it unescapes at
             // emission exactly like any other string literal.
             BackingValue::Str(text) => Some(js::Node::String(Cow::Owned(
-                unescape_string(text).into_owned(),
+                crate::lexing::unescape_string(text).into_owned(),
             ))),
         }
     }
@@ -10587,6 +10545,15 @@ impl<'src> Transformer<'src> {
                         .insert(symbol.to_string());
                 }
                 js::Node::Call(Box::new(js::Node::Local(format!("new {symbol}"))), args)
+            }
+            // B654: a triple-quoted host expression, its text laid out by the
+            // multiline rule (the parser refused a malformed one) and called
+            // PARENTHESIZED — a multi-line arrow or `function` written bare
+            // would take the argument list into its own body.
+            ExternBinding::Code { text } => {
+                let code =
+                    crate::util::trim_multiline_string(text).unwrap_or_else(|_| text.to_string());
+                js::Node::Call(Box::new(js::Node::Local(format!("({code})"))), args)
             }
         }
     }
@@ -16505,7 +16472,6 @@ mod tests {
     use super::{
         Formatter, HashMap, HashSet, NameGenerator, NameSeed, NameStyle, bodyless_refusal_frame,
         canonical_instance_body, js, readable_name_probes, reset_readable_name_probes,
-        unescape_string,
     };
     use crate::id::Id;
 
@@ -16713,49 +16679,5 @@ mod tests {
         assert_eq!(padded.between("-", "-(2)"), " ");
         assert_eq!(padded.between("7", "-"), " ");
         assert_eq!(padded.between("", ""), " ");
-    }
-
-    /// A string literal's value is built from the NORMALIZED source text
-    /// (windows-support.md §2, spec §2): a `\r\n` in the file is one line
-    /// terminator, so a multi-line literal carries `\n` however the file was
-    /// saved. Plain `"…"` and the literal fragments of an `i"…"` both arrive
-    /// here, so both are covered.
-    #[test]
-    fn a_crlf_line_break_in_a_literal_becomes_one_newline() {
-        assert_eq!(unescape_string("alpha\r\nbeta"), "alpha\nbeta");
-        assert_eq!(unescape_string("a\r\nb\r\nc"), "a\nb\nc");
-    }
-
-    #[test]
-    fn a_lone_carriage_return_in_a_literal_is_preserved() {
-        // Classic-Mac endings are deliberately NOT blessed: a `\r` with no
-        // following `\n` is an ordinary character of the value.
-        assert_eq!(unescape_string("a\rb"), "a\rb");
-    }
-
-    #[test]
-    fn an_escaped_carriage_return_survives_normalization() {
-        // `\r` WRITTEN in the literal is a value the author asked for — only a
-        // line ending read off the file normalizes. `\r\n` typed as escapes
-        // stays a two-character CRLF.
-        assert_eq!(unescape_string(r"a\r\nb"), "a\r\nb");
-        assert_eq!(unescape_string(r"a\rb"), "a\rb");
-    }
-
-    #[test]
-    fn a_literal_needing_neither_pass_is_borrowed() {
-        let raw = "plain text";
-        match unescape_string(raw) {
-            std::borrow::Cow::Borrowed(borrowed) => assert!(std::ptr::eq(borrowed, raw)),
-            std::borrow::Cow::Owned(_) => {
-                panic!("an escape-free, CR-free literal must not allocate")
-            }
-        }
-    }
-
-    #[test]
-    fn escapes_and_a_crlf_line_break_compose() {
-        // Both passes on one literal: the CRLF folds, the escapes interpret.
-        assert_eq!(unescape_string("a\\t\r\nb\\\"c"), "a\t\nb\"c");
     }
 }

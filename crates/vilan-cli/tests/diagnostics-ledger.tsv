@@ -765,3 +765,17 @@ row	flagship	key
 742	-	this call's result `{settled_label}` is never fully determined: nothing it is passed binds '{generic_label}' and nothing its result lands in names it. Write the type on the binding the result lands in (`let value: … = …`){path_door}
 743	-	`{write_text}` writes `{lent_text}` in place while it is lent `&mut` to this call, a write under a live `&mut` view; settle the value first: `let item = {value}; {settled}`
 744	-	`{call_text}`'s result is a temporary, so this assignment is lost; bind it first: `{rewritten}`
+745	-	unknown escape `{written}` in a string: a backslash itself is written `\\\\`, and the escapes are {escapes}
+746	-	the escape `{written}` is cut short: `\\x` takes exactly two hex digits, `\\x41`
+747	-	the escape `{written}` is cut short: `\\u` takes four hex digits, `\\u0301`, or a code point in braces, `\\u{{1F600}}`
+748	-	the escape `{written}` is past the last code point, `\\u{{10FFFF}}`
+749	-	the escape `{written}` is half of a UTF-16 surrogate pair, not a character: write the code point it pairs into, `\\u{{1F600}}`, or the pair `\\uD83D\\uDE00`
+750	-	`{name}` is set twice in this `{}` literal: a literal sets each field once, and the second value would replace the first; remove one, or name the field it was meant for
+751	-	an attribute argument here is a one-line string; a triple-quoted string is an attribute argument only as `[extern(\"\"\"…\"\"\")]`'s host expression, alone
+752	-	{} cannot be declared inside an `impl` — an `impl` declares methods; move it to the module's top level
+753	-	a statement cannot stand inside an `impl` — an `impl` declares methods, and this would never run; move it into a `fun`
+754	-	a `let` takes no guard: the let-else form is the `is` test alone, `{respelled}`, with no `let {name} =`
+755	-	a `let` takes no guard: the let-else form is the `is` test alone, `opt is Some(let x) else ret;`, with no `let x =`
+756	-	a tuple takes no trailing comma; remove the `,` before `)`
+757	-	wrap a closure type that is a parameter in parentheses: `({written})` — bare, its `|` closes the outer parameter list
+758	-	a struct literal can't be a `match` subject here: the `{{` after a name opens the legs; wrap the literal in parentheses or bind it with `let` first

@@ -16443,12 +16443,10 @@ fn sanitize(name: &str) -> String {
 /// backend's two lines — and no program in the accepted corpus carried an
 /// escape, so the differential never saw it.
 ///
-/// The escape set is `unescape_string`'s, exactly: `\n`, `\t`, `\r`, `\"`,
-/// `\\`, `\0`, an unknown escape keeping BOTH characters (which is what makes
-/// the lexer's `RAW_BACKSLASH` doubling round-trip), and a CRLF folded to one
-/// `\n` (`windows-support.md` §2). It is reproduced rather than called because
-/// the function is private to `transformer.rs`; the lane's report asks for it to
-/// be shared.
+/// The escape set is `lexing::unescape_string`'s, exactly — the one decoder
+/// both backends call (B652: `\x41`, `\u{1F600}` and every other escape the
+/// lexer admits decode to one value; the rest are refused before code
+/// generation) — and a CRLF folded to one `\n` (`windows-support.md` §2).
 fn rust_string(text: &str) -> String {
     rust_literal(&unescape_string_value(text))
 }
@@ -16477,13 +16475,13 @@ fn rust_literal(value: &str) -> String {
 
 /// The VALUE of a vilan string literal's body.
 ///
-/// F26: `transformer::unescape_string` IS this function and is now `pub`, so
+/// F26: `lexing::unescape_string` IS this function and is `pub`, so
 /// the backend calls it rather than carrying a copy that drifts — a literal's
 /// value must be the same value on both backends, and two implementations of
 /// "what does `\\n` mean" is exactly the shape the differential can only catch
 /// after it has shipped.
 fn unescape_string_value(raw: &str) -> String {
-    vilan_core::transformer::unescape_string(raw).into_owned()
+    vilan_core::lexing::unescape_string(raw).into_owned()
 }
 
 fn describe(resolved: &Type) -> String {

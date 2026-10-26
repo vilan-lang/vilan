@@ -183,9 +183,26 @@ string_char      = "\" any_char_except_line_terminator
 MULTILINE_STRING = '"""' , raw_text , '"""' ;
 ```
 
-In a plain string a backslash escapes the next character; escape sequences
-are preserved in the token and interpreted at code generation with
-JavaScript string-escape semantics (`\n`, `\"`, `\\`, …). A multiline
+In a plain string a backslash begins an escape, and each escape denotes one
+character of the value, with JavaScript's string-escape semantics:
+
+| Escape | Value |
+|---|---|
+| `\n` `\r` `\t` | line feed, carriage return, tab |
+| `\b` `\f` `\v` `\0` | backspace, form feed, vertical tab, NUL |
+| `\"` `\'` `\\` | the quote, the apostrophe, the backslash |
+| `\{` `\}` | a literal brace (the `i"…"` escapes, written alike here) |
+| `\xHH` | the code point of exactly two hex digits: `\x41` is `A` |
+| `\uHHHH` | the code point of exactly four hex digits: `\u0301`; a high surrogate followed at once by a low one, `\uD83D\uDE00`, is their one character |
+| `\u{H…}` | the code point in braces, up to `\u{10FFFF}`: `\u{1F600}` |
+
+Any other backslash sequence is an error at the lexer, spanned on the
+sequence — `\q`, `\d`, the octal `\1`, a `\x` or `\u` short of its
+digits, a code point past `\u{10FFFF}`, and a surrogate that is not the
+high half of a written pair — because keeping it verbatim is the one
+reading nobody writing it can mean; a backslash itself is `\\`. The token
+keeps the literal's source text (what the formatter prints); its value is
+the decoded text, the same value on every backend. A multiline
 string is **raw** (a backslash is a backslash) and runs to the first
 `"""`; the whitespace prefix of the line containing the closing delimiter
 is stripped from every line of the content.
@@ -213,9 +230,9 @@ istring_char     = "\" any_char_except_line_terminator
 ```
 
 `i"…"` is an interpolated string: `{expr}` holes embed expressions; `\{`
-and `\}` are literal braces. Every other escape is carried through as the
-plain twin carries it — `\` and the character it precedes, interpreted at
-code generation — and an unescaped `}` outside a hole is an error. The
+and `\}` are literal braces. Every other escape is the plain twin's, with
+the plain twin's value and the same refusal of a sequence that is not one,
+and an unescaped `}` outside a hole is an error. The
 construct is defined by desugaring. An interpolated string is exactly
 equivalent to a parenthesized concatenation:
 

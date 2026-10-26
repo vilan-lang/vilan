@@ -11161,3 +11161,95 @@ fn b536_an_attribute_order_refusal_rides_the_analysis() {
         "a declaration's attributes are written in one order",
     );
 }
+
+// --- B654: a triple-quoted string is `[extern(..)]`'s host expression ---------
+//
+// A host binding longer than a line had no spelling: the attribute's
+// arguments took the one-line string forms only, and `[extern("""…""")]`
+// failed the whole attribute, which then re-read as a list expression —
+// "cannot find 'extern' in this scope" at the name, "expected `;`" at `)]`.
+// The raw multi-line form is now the host EXPRESSION (laid out by the
+// multiline rule, called parenthesized); any other attribute string refuses
+// it at the literal.
+
+#[test]
+fn b654_the_items_multiline_extern_runs() {
+    assert_compiles_and_runs(
+        "import std::io::print;\n\n[extern(\n\t\"\"\"\n\t(() => 1)\n\t\"\"\"\n)]\nexternal fun one(): i32;\n\n\
+         fun main() {\n\tprint(one());\n}\n",
+        "1\n",
+    );
+}
+
+#[test]
+fn b654_a_long_host_helper_keeps_its_lines_its_escapes_and_its_layout() {
+    // Raw: `\d` is a regex escape and `\n` two characters, as the host reads
+    // them. A multi-line arrow written bare would take `(args)` into its body;
+    // the parentheses keep the call on the expression.
+    assert_compiles_and_runs(
+        "import std::io::print;\n\n[extern(\n\t\"\"\"\n\t(text) => {\n\t\tconst digits = text.match(/\\d+/g) ?? [];\n\
+         \t\treturn digits.length + `\\n`.length;\n\t}\n\t\"\"\"\n)]\nexternal fun count_numbers(text: str): i32;\n\n\
+         fun main() {\n\tprint(count_numbers(\"a1 b22 c\"));\n}\n",
+        "3\n",
+    );
+}
+
+#[test]
+fn b654_the_items_second_spelling_is_refused_at_the_literal_alone() {
+    // Text after the opening delimiter breaks the multiline rule; that is the
+    // one diagnostic, spanned on the text — no "cannot find 'extern'", no
+    // "expected `;`", and the function under it is still the extern.
+    let source = "[extern(\"\"\"(() => 1)\n\t\"\"\")]\nexternal fun one(): i32;\n\nfun main() {\n\tlet _one = one();\n}\n";
+    assert_fails_spanning(
+        source,
+        "(() => 1)",
+        "nothing may follow the opening \"\"\" on its line",
+    );
+    assert_eq!(
+        failure_diagnostics(source).len(),
+        1,
+        "{:#?}",
+        failure_diagnostics(source)
+    );
+}
+
+#[test]
+fn b654_a_multiline_string_elsewhere_in_an_attribute_is_refused_at_the_literal() {
+    const ONE_LINE: &str = "an attribute argument here is a one-line string";
+    for (source, literal) in [
+        (
+            "[extern(method, \"\"\"\n\ttoString\n\t\"\"\")]\nexternal fun text(value: i32): str;\n\nfun main() {}\n",
+            "\"\"\"\n\ttoString\n\t\"\"\"",
+        ),
+        (
+            "[deprecated(\"\"\"\n\tuse two()\n\t\"\"\")]\nfun one(): i32 { 1 }\n\nfun main() {}\n",
+            "\"\"\"\n\tuse two()\n\t\"\"\"",
+        ),
+        (
+            "[internal(\"\"\"\n\tunsafe\n\t\"\"\")]\nfun one(): i32 { 1 }\n\nfun main() {}\n",
+            "\"\"\"\n\tunsafe\n\t\"\"\"",
+        ),
+    ] {
+        assert_fails_spanning(source, literal, ONE_LINE);
+        assert_eq!(
+            failure_diagnostics(source).len(),
+            1,
+            "{source}: {:#?}",
+            failure_diagnostics(source)
+        );
+    }
+}
+
+#[test]
+fn b654_the_formatter_reprints_a_multiline_extern_as_written() {
+    let source = "[extern(\n\t\"\"\"\n\t(() => 1)\n\t\"\"\"\n)]\nexternal fun one(): i32;\n";
+    let reprinted = vilan_core::formatter::reprint(source).expect("formats");
+    assert!(
+        reprinted.contains("[extern(\"\"\"\n\t(() => 1)\n\t\"\"\")]"),
+        "{reprinted}"
+    );
+    assert_eq!(
+        vilan_core::formatter::reprint(&reprinted).expect("formats"),
+        reprinted
+    );
+}
