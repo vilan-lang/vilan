@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**The lockfile moves `tokio` 1.52.3 → 1.54.1 (RUSTSEC-2026-0386, `AsyncFd::new` unsound, published 2026-10-13).** CI's audit leg (`cargo audit --deny unsound`) went red on next after the advisory landed, with no code change on our side; `cargo update -p tokio` alone clears it. Found by std-55b (Order 55).
+
 <!-- family: fix -->
 **D16: the tour and the gotchas page state the `match`-operand rule as built — a `match` is an ordinary operand (`flag && match slot { .. }`, `1 + match slot { .. }`), and only a `match` that BEGINS a statement ends at its closing brace, so an operator after it there starts a new statement and is refused with the message that says to parenthesize it.** Both pages had said a `match` cannot be an operator operand at all (B231 made it one, Order 21), and the gotcha named the working parenthesized form as the broken one. The tour's paragraph now carries a runnable example the docs gate compiles — `flag && match ..` as a tail, `1 + match ..` in a `let`, and the parenthesized statement form — so a regression in either half reds there. Tracker D16.
 
