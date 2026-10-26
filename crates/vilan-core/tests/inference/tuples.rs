@@ -8865,3 +8865,59 @@ fn b581_a_direct_spread_call_collects_and_a_built_tuple_spreads() {
         "Expected (f64, f64)",
     );
 }
+
+// --- B660: a tuple's trailing comma is named, and read as absent --------------
+
+const NO_TRAILING_COMMA: &str = "a tuple takes no trailing comma; remove the `,` before `)`";
+
+#[test]
+fn b660_a_multi_line_tuples_trailing_comma_is_refused_at_the_comma() {
+    let source = "fun main() {\n\tlet pair = (\n\t\t1,\n\t\t2,\n\t);\n}\n";
+    let comma = source.find("2,").expect("the comma") + 1;
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(NO_TRAILING_COMMA.to_string(), comma..comma + 1)],
+    );
+}
+
+#[test]
+fn b660_the_call_argument_case_never_reads_as_an_unclosed_paren() {
+    let source = r#"
+        struct Pair { left: i32 }
+        impl Pair { fun derive(self, f: |i32| i32): i32 { f(self.left) } }
+        fun combine(pair: (i32, i32)): Pair { Pair { left = pair.0 } }
+        fun main() {
+            let a = 1;
+            let b = 2;
+            let lit = combine((
+                a,
+                b,
+            )).derive(|x| x + 1);
+        }
+        "#;
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].0, NO_TRAILING_COMMA);
+}
+
+#[test]
+fn b660_lists_calls_and_labelled_tuples_keep_their_trailing_commas() {
+    assert_compiles(
+        r#"
+        fun take(a: i32, b: i32): i32 { a + b }
+        fun main() {
+            let list = [
+                1,
+                2,
+            ];
+            let sum = take(
+                1,
+                2,
+            );
+            let pair = (1, 2);
+        }
+        "#,
+    );
+    // A one-entry slip is a group with a stray comma: the comma alone.
+    assert_fails_once_with("fun main() {\n\tlet one = (1,);\n}\n", NO_TRAILING_COMMA);
+}

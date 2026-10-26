@@ -776,3 +776,4 @@ NEW	-	{} cannot be declared inside an `impl` — an `impl` declares methods; mov
 NEW	-	a statement cannot stand inside an `impl` — an `impl` declares methods, and this would never run; move it into a `fun`
 NEW	-	a `let` takes no guard: the let-else form is the `is` test alone, `{respelled}`, with no `let {name} =`
 NEW	-	a `let` takes no guard: the let-else form is the `is` test alone, `opt is Some(let x) else ret;`, with no `let x =`
+NEW	-	a tuple takes no trailing comma; remove the `,` before `)`

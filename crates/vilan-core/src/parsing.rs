@@ -1800,6 +1800,11 @@ const MULTILINE_ATTRIBUTE_ARGUMENT: &str = "an attribute argument here is a one-
      triple-quoted string is an attribute argument only as `[extern(\"\"\"…\"\"\")]`'s host \
      expression, alone";
 
+/// B660: a `,` before a tuple's closing `)`. Curated (diagnostics-standard.md
+/// B6): the rule and the one-action fix.
+const A_TUPLE_TAKES_NO_TRAILING_COMMA: &str = "a tuple takes no trailing comma; remove the \
+     `,` before `)`";
+
 /// B658: the one capture an `is` pattern binds, when it binds exactly one —
 /// the name, the mutability flag and the name's span, mutably, so the
 /// let-else recovery can rename it.
@@ -6630,14 +6635,32 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             if parser.peek_is_ctrl(',') {
                 // A tuple is `expr (',' expr)*` (≥2 elements) with NO trailing comma
-                // — unlike a list literal, the chumsky `tuple` atom has no
-                // `allow_trailing`, so `(a, b,)` declines (a group can't hold a comma
-                // either). Every `,` here must be followed by an expression.
+                // — unlike a list literal, `(a, b,)` is no tuple (a group can't
+                // hold a comma either). B660: the trailing comma is still the
+                // natural slip — a call's arguments, a list, a struct literal and
+                // a signature all take one, and the formatter writes it on every
+                // multi-line one — so it is REFUSED at the comma and read as if
+                // absent, rather than declining the whole atom (which read as
+                // "expected an expression" at the `)`, or as an unclosed `(` once
+                // the tuple was a call's argument).
                 let mut items = vec![first];
                 while parser.eat_ctrl(',') {
+                    if parser.peek_is_ctrl(')') {
+                        parser.errors.push(ParseError {
+                            span: parser.token_span(parser.position - 1),
+                            reason: ParseErrorReason::Rule(A_TUPLE_TAKES_NO_TRAILING_COMMA),
+                            context: Vec::new(),
+                            hint: None,
+                        });
+                        break;
+                    }
                     items.push(parser.parse_tuple_entry()?);
                 }
                 parser.expect_ctrl(')')?;
+                // `(a,)`: the one-entry slip is a group with a stray comma.
+                if items.len() == 1 && !matches!(items[0].0, Node::Labelled(..)) {
+                    return items.pop();
+                }
                 parser.check_tuple_labels(&items);
                 Some((Node::Tuple(items), parser.span_from(start)))
             } else {
