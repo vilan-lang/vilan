@@ -125,6 +125,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**B665: a `css { … } + style()` sum outside `const` is reported AT the sum — "this `css { … } + style()` sum reaches `asset::emit` at run time, which makes every function calling it compile-time-only; write `const` in front of it to build it once, at compile time" — with the caller that leaked it (a closure value, `main`'s call) as the note; the refusal named only the caller's closure ("this closure (it reaches `asset::emit`) is compile-time-only"), in kolt two closures 150 lines from the sum, with no word about it.** The const pass now remembers the call site through which each member joined the compile-time-only set and follows that chain from a leaking site down to the program's own expression that reached the channel, widened to the whole value it is part of (an operand, an argument or receiver of a call that is itself compile-time-only); the sum is reported once however many callers leak it. It applies where the program's own code calls a STD function that reaches the channel (a style chain, a sum over one) in a value the function CONSUMES (an argument, as `.styled(..)`'s): a style constructor that RETURNS its style is meant for a caller's `const`, and a function calling a channel verb directly (`emit`, `read`) is written compile-time-only — both keep the caller's refusal, as does a style built from a runtime binding, which `const` could not evaluate. Pins: `styling::b665_a_runtime_css_sum_is_reported_at_the_sum` (one caller, kolt's two), `b665_the_const_sum_compiles_and_a_runtime_style_keeps_its_refusal`, `diagnostics::b665_a_runtime_css_sum_renders_at_the_sum_in_its_file`. Tracker B665.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->

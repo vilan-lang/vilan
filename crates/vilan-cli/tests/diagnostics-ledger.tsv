@@ -782,3 +782,4 @@ NEW	-	`[track_caller]` on `{name}`, which `{trait_name}` does not declare tracki
 NEW	-	`{name}` is `[track_caller]`, and a `for .. in` loop calls it through the iterator protocol, which cannot pass its caller's location. Call `{name}` yourself inside the loop, or drop `[track_caller]` from it
 NEW	-	drop the `{written}`: `{callee_name}` takes `{parameter_name}` by value, so it cannot take a view of it
 NEW	-	`{callee}` writes `{name}` while `{name}` is lent to this call, so the loan and the write are two paths to one place (a write under a live view); copy it first: `{binder} {copy} = {name}; {call_text}`
+NEW	-	{described} reaches `asset::emit` at run time, which makes every function calling it compile-time-only; write `const` in front of it to build it once, at compile time

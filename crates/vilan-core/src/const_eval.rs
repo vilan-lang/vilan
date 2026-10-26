@@ -1684,6 +1684,14 @@ impl LocalIndex {
     }
 }
 
+/// B665: what [`State::check_const_only`] learned about R, for the refusals
+/// that follow a member's chain to the expression that started it.
+struct RuntimeSeeds<'a> {
+    in_r: &'a HashSet<Id>,
+    const_only: &'a [Id],
+    cause: &'a HashMap<Id, Id>,
+}
+
 struct State<'p, 'src> {
     program: &'p Program<'src>,
     /// Which form this is evaluating — see [`Mode`].
@@ -2295,6 +2303,11 @@ impl<'p, 'src> State<'p, 'src> {
         // R — it only names the diagnostic, so first-in wins is fine.
         let mut in_r: HashSet<Id> = HashSet::default();
         let mut reaches: HashMap<Id, Id> = HashMap::default();
+        // B665: the call site through which each member joined R — the
+        // builtin's call for a seed, the R callee's for a propagated member —
+        // so a refusal can follow the chain down to the expression that
+        // reached the channel at run time.
+        let mut cause: HashMap<Id, Id> = HashMap::default();
         let mut worklist: Vec<Id> = Vec::new();
         let mut boundary_errors: Vec<(Id, Id)> = Vec::new(); // (call site, callee)
         let mut owned_calls: HashSet<Id> = HashSet::default();
@@ -2332,6 +2345,7 @@ impl<'p, 'src> State<'p, 'src> {
                     boundary_errors.push((call.call_id, target));
                 } else if in_r.insert(node.id()) {
                     reaches.insert(node.id(), target);
+                    cause.insert(node.id(), call.call_id);
                     worklist.push(node.id());
                 }
             }
@@ -2371,6 +2385,7 @@ impl<'p, 'src> State<'p, 'src> {
                         if let Some(&builtin) = reaches.get(&member) {
                             reaches.insert(caller_id, builtin);
                         }
+                        cause.insert(caller_id, site.call_id);
                         worklist.push(caller_id);
                     }
                 }
@@ -2395,6 +2410,7 @@ impl<'p, 'src> State<'p, 'src> {
                             if let Some(&builtin) = reaches.get(&member) {
                                 reaches.insert(caller_id, builtin);
                             }
+                            cause.insert(caller_id, *anchor);
                             worklist.push(caller_id);
                         }
                     }
@@ -2425,7 +2441,15 @@ impl<'p, 'src> State<'p, 'src> {
         // ties, and break them the same way every run.
         boundary_errors.sort_by_key(|(site, callee)| (self.span_of(*site).start, site.0, callee.0));
         boundary_errors.dedup();
+        let runtime_seeds = RuntimeSeeds {
+            in_r: &in_r,
+            const_only: &const_only,
+            cause: &cause,
+        };
         for (site, callee) in boundary_errors {
+            if self.refuse_at_runtime_seed(&runtime_seeds, callee, site, "this call reaches it") {
+                continue;
+            }
             let name = self.const_only_name(callee, &reaches);
             self.errors.push((
                 Error {
@@ -2441,7 +2465,7 @@ impl<'p, 'src> State<'p, 'src> {
             ));
         }
 
-        self.check_value_escapes(graph, &in_r, &reaches, &scheduled_arguments);
+        self.check_value_escapes(graph, &in_r, &reaches, &scheduled_arguments, &runtime_seeds);
     }
 
     /// The refined dispatch edges of the program's RUNTIME call sites, keyed by
@@ -2601,6 +2625,7 @@ impl<'p, 'src> State<'p, 'src> {
         in_r: &HashSet<Id>,
         reaches: &HashMap<Id, Id>,
         scheduled_arguments: &HashSet<Id>,
+        runtime_seeds: &RuntimeSeeds<'_>,
     ) {
         let mut escapes: Vec<(Id, Option<Id>)> = Vec::new(); // (site, named function)
 
@@ -2668,6 +2693,13 @@ impl<'p, 'src> State<'p, 'src> {
         });
         escapes.dedup();
         for (site, function_id) in escapes {
+            let (member, what) = match function_id {
+                Some(function_id) => (function_id, "this value reaches it"),
+                None => (site, "this closure reaches it"),
+            };
+            if self.refuse_at_runtime_seed(runtime_seeds, member, site, what) {
+                continue;
+            }
             let subject = match function_id {
                 Some(function_id) => self.const_only_name(function_id, reaches),
                 None => format!(
@@ -2688,6 +2720,218 @@ impl<'p, 'src> State<'p, 'src> {
                 self.source_of(site),
             ));
         }
+    }
+
+    /// B665: a refusal whose cause is an expression the PROGRAM wrote — a
+    /// runtime `css { … } + style()` sum, a style chain outside every `const` —
+    /// is reported AT that expression, with the steer to write `const` in front
+    /// of it, and the site that leaked it (a closure value, `main`'s call) is a
+    /// note. The refusal used to name only the leaking site — kolt's two
+    /// callers, 150 lines from the sum, inside `each_by` and `when_remote_live`
+    /// — though the fix is one word at the sum. Answers whether it reported:
+    /// `false` when the chain bottoms out in std, or the expression reads a
+    /// runtime binding (a `const` could not evaluate it), and the leaking
+    /// site's own refusal stands. One report per expression: a second site
+    /// leaking the same one adds nothing.
+    fn refuse_at_runtime_seed(
+        &mut self,
+        seeds: &RuntimeSeeds<'_>,
+        member: Id,
+        leaking_site: Id,
+        what: &str,
+    ) -> bool {
+        let Some(expression) = self.runtime_seed_expression(seeds, member) else {
+            return false;
+        };
+        let source = self.source_of(expression);
+        let span = self.span_of(expression);
+        let note = Note {
+            span: self.span_of(leaking_site),
+            msg: format!("{what} at run time"),
+            source: Some(self.source_of(leaking_site)),
+        };
+        if self.errors.iter().any(|(error, error_source)| {
+            *error_source == source && error.span == span && error.msg.starts_with("this ")
+        }) {
+            return true;
+        }
+        let described = self.seed_description(expression);
+        self.errors.push((
+            Error {
+                trace: Vec::new(),
+                note: Some(note),
+                span,
+                msg: format!(
+                    "{described} reaches `asset::emit` at run time, which makes every function \
+                     calling it compile-time-only; write `const` in front of it to build it once, \
+                     at compile time"
+                ),
+            },
+            source,
+        ));
+        true
+    }
+
+    /// B665: the expression a member's R-membership started at in the
+    /// program's OWN code — the cause chain followed down to the last call
+    /// site whose callee is a channel verb or a std function, widened to the
+    /// whole value it is part of (`css { … } + style().hover(..)`: an operand,
+    /// an argument or the receiver of a call that is itself compile-time-only)
+    /// — when that expression reads no runtime binding.
+    fn runtime_seed_expression(&self, seeds: &RuntimeSeeds<'_>, member: Id) -> Option<Id> {
+        let is_std = |id: Id| {
+            self.program
+                .source_of(id)
+                .is_some_and(|source| self.program.std_sources.contains(&source))
+        };
+        let callee_of = |call_id: Id| -> Option<Id> {
+            let call = self.program.function_calls.get(&call_id)?;
+            match self.program.entity_map.get(&call.subject_id)? {
+                Expr::Local(target) => Some(*target),
+                _ => None,
+            }
+        };
+        let mut current = member;
+        let mut visited: HashSet<Id> = HashSet::default();
+        let site = loop {
+            if !visited.insert(current) || is_std(current) {
+                return None;
+            }
+            let site = *seeds.cause.get(&current)?;
+            match callee_of(site) {
+                Some(target)
+                    if seeds.in_r.contains(&target)
+                        && !is_std(target)
+                        && !seeds.const_only.contains(&target) =>
+                {
+                    current = target;
+                }
+                // The program's own call of a STD function that reaches the
+                // channel (a style chain, `+` over a style): the expression
+                // to name. A direct call of a channel verb (`emit`, `read`)
+                // is a function written to be compile-time-only, and the
+                // caller that leaked it keeps the refusal.
+                Some(target) if seeds.in_r.contains(&target) && is_std(target) => break site,
+                _ => return None,
+            }
+        };
+        let body = match self.program.functions.get(&current) {
+            Some(function) => function.body.1,
+            None => self.program.closures.get(&current)?.return_,
+        };
+        // The parents of the body's expressions (a closure inside is its own
+        // member, but its entities are walked too: a site never sits in one
+        // without the closure being the member).
+        let mut parent: HashMap<Id, Id> = HashMap::default();
+        let mut pending = vec![body];
+        let mut children = Vec::new();
+        while let Some(id) = pending.pop() {
+            children.clear();
+            crate::captures::push_expression_children(self.program, id, &mut children);
+            for child in &children {
+                parent.entry(*child).or_insert(id);
+            }
+            pending.extend(children.iter().copied());
+        }
+        let compile_time_only_call = |id: Id| {
+            matches!(self.program.entity_map.get(&id), Some(Expr::Call(_)))
+                && callee_of(id).is_some_and(|target| {
+                    seeds.in_r.contains(&target) || seeds.const_only.contains(&target)
+                })
+        };
+        let mut expression = site;
+        while let Some(&above) = parent.get(&expression) {
+            let widens = match self.program.entity_map.get(&above) {
+                Some(Expr::Binary(..) | Expr::Unary(..)) => true,
+                Some(Expr::Call(_)) => compile_time_only_call(above),
+                _ => false,
+            };
+            if !widens {
+                break;
+            }
+            expression = above;
+        }
+        // A value the function RETURNS makes it a style constructor, meant to be
+        // called inside a `const`: its caller keeps the refusal. Only a value
+        // the function consumes itself (`.styled(css { … } + style())` in a
+        // view) is the function's own mistake.
+        let mut tail = body;
+        let returned = loop {
+            if tail == expression {
+                break true;
+            }
+            match self.program.entity_map.get(&tail) {
+                Some(Expr::Block((_, inner))) => tail = *inner,
+                _ => break false,
+            }
+        };
+        (!returned && self.reads_no_runtime_binding(expression)).then_some(expression)
+    }
+
+    /// B665: whether `root` names no runtime binding — a `const` in front of it
+    /// could evaluate it. A parameter or a local declared outside it can.
+    fn reads_no_runtime_binding(&self, root: Id) -> bool {
+        let Some(root_span) = self.program.span_map.get(&root).map(|span| **span) else {
+            return false;
+        };
+        let mut pending = vec![root];
+        let mut children = Vec::new();
+        while let Some(id) = pending.pop() {
+            if let Some(Expr::Local(binding)) = self.program.entity_map.get(&id) {
+                let declared_inside =
+                    self.program.span_map.get(binding).is_some_and(|span| {
+                        span.start >= root_span.start && span.end <= root_span.end
+                    }) && self.program.source_of(*binding) == self.program.source_of(root);
+                let runtime = self.program.parameters.contains_key(binding)
+                    || self
+                        .program
+                        .variables
+                        .get(binding)
+                        .is_some_and(|variable| variable.mutable || variable.initial.is_none());
+                if runtime && !declared_inside {
+                    return false;
+                }
+            }
+            children.clear();
+            crate::captures::push_expression_children(self.program, id, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        true
+    }
+
+    /// B665: how the refusal names the expression — the `css { … } + style()`
+    /// sum it usually is, by its shape.
+    fn seed_description(&self, expression: Id) -> String {
+        match self.program.entity_map.get(&expression) {
+            Some(Expr::Binary(operator, left, right)) => {
+                let css_block = |operand: &Id| {
+                    self.const_set.contains(operand)
+                        && self
+                            .source_text_of(*operand)
+                            .is_some_and(|text| text.trim_start().starts_with("css"))
+                };
+                if matches!(operator, crate::node::BinaryOp::Add)
+                    && (css_block(left) || css_block(right))
+                {
+                    "this `css { … } + style()` sum".to_string()
+                } else {
+                    "this expression".to_string()
+                }
+            }
+            Some(Expr::Call(_)) => "this style chain".to_string(),
+            _ => "this expression".to_string(),
+        }
+    }
+
+    /// The written text of `id`'s span.
+    fn source_text_of(&self, id: Id) -> Option<&'src str> {
+        let span = **self.program.span_map.get(&id)?;
+        let source = self.program.source_of(id)?;
+        self.program
+            .source_texts
+            .iter()
+            .find(|(candidate, _)| *candidate == source)
+            .and_then(|(_, text)| text.get(span.start..span.end))
     }
 
     /// How a const-only callee names itself in a diagnostic: the channel verb

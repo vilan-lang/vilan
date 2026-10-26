@@ -8484,3 +8484,44 @@ fn b656_a_css_binder_at_a_body_top_and_a_css_parameter_are_refused_alone() {
         );
     }
 }
+
+// --- B665: a runtime `css { … } + style()` sum, reported at the sum ----------
+
+const B665_ROW: &str = "import std::reactive::Signal;\nimport std::web::style;\nimport std::web::ui::{ self, View };\nfun row(content: View): View {\n\t<div .styled(css { padding(rem(4 / 16)); } + style::style().hover(style::style().opacity(0.5)))>\n\t\t{content}\n\t</div>\n}\n";
+
+/// B665: a `css { … } + style()` sum outside `const` makes `row` reach
+/// `asset::emit` at run time; the refusal names the SUM and the fix (`const`
+/// in front of it), once — where it used to name only a caller's closure,
+/// with no word about the sum. Kolt's shape had two callers.
+#[test]
+fn b665_a_runtime_css_sum_is_reported_at_the_sum() {
+    let one_caller = format!(
+        "{B665_ROW}fun main() {{\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{{ui::each_values(names, |name| {{\n\t\t\trow(<span>{{name}}</span>)\n\t\t}})}}\n\t</div>);\n}}\n"
+    );
+    assert_fails_browser_once_with(
+        &one_caller,
+        "this `css { … } + style()` sum reaches `asset::emit` at run time, which makes every \
+         function calling it compile-time-only; write `const` in front of it",
+    );
+    let two_callers = format!(
+        "{B665_ROW}fun main() {{\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{{ui::each_values(names, |name| {{\n\t\t\trow(<span>{{name}}</span>)\n\t\t}})}}\n\t\t{{ui::each_values(names, |other| {{\n\t\t\trow(<b>{{other}}</b>)\n\t\t}})}}\n\t</div>);\n}}\n"
+    );
+    assert_fails_browser_once_with(
+        &two_callers,
+        "this `css { … } + style()` sum reaches `asset::emit` at run time",
+    );
+}
+
+/// B665: the fix compiles, and a style built from a RUNTIME value — which a
+/// `const` cannot evaluate — keeps the caller's refusal (the sum is not the
+/// answer there).
+#[test]
+fn b665_the_const_sum_compiles_and_a_runtime_style_keeps_its_refusal() {
+    assert_compiles_browser(
+        "import std::reactive::Signal;\nimport std::web::style;\nimport std::web::ui::{ self, View };\nfun row(content: View): View {\n\t<div .styled(const css { padding(rem(4 / 16)); } + style::style().hover(style::style().opacity(0.5)))>\n\t\t{content}\n\t</div>\n}\nfun main() {\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{ui::each_values(names, |name| {\n\t\t\trow(<span>{name}</span>)\n\t\t})}\n\t</div>);\n}\n",
+    );
+    assert_fails_browser_with(
+        "import std::reactive::Signal;\nimport std::web::style;\nimport std::web::ui::{ self, View };\nfun row(content: View, faded: f64): View {\n\t<div .styled(style::style().opacity(faded))>\n\t\t{content}\n\t</div>\n}\nfun main() {\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{ui::each_values(names, |name| {\n\t\t\trow(<span>{name}</span>, 0.5)\n\t\t})}\n\t</div>);\n}\n",
+        "this closure (it reaches `asset::emit`) is compile-time-only",
+    );
+}

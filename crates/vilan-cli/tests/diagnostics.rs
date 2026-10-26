@@ -2618,3 +2618,49 @@ fn b664_an_impl_headers_refusals_render_in_the_impls_file() {
         );
     }
 }
+
+/// B665: a `css { … } + style()` sum outside `const` renders AT the sum, in
+/// the file that wrote it, with the steer to write `const` in front of it —
+/// the caller's closure (another file here, 150 lines away in kolt) is the
+/// note, no longer the only place named.
+#[test]
+fn b665_a_runtime_css_sum_renders_at_the_sum_in_its_file() {
+    let dir = temp_files(
+        "b665",
+        &[
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ntarget = \"browser\"\nprelude = \"std::web::prelude\"\n",
+            ),
+            (
+                "src/rows.vl",
+                "export *;\nfun row(content: View): View {\n\t<div .styled(css { padding(rem(4 / 16)); } + style::style().hover(style::style().opacity(0.5)))>\n\t\t{content}\n\t</div>\n}\n",
+            ),
+            (
+                "src/main.vl",
+                "import pkg::rows::row;\nfun main() {\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{ui::each_values(names, |name| {\n\t\t\trow(<span>{name}</span>)\n\t\t})}\n\t</div>);\n}\n",
+            ),
+        ],
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("this `css { … } + style()` sum reaches `asset::emit` at run time"),
+        "{stderr}"
+    );
+    assert!(
+        renders_in(
+            &stderr,
+            "rows.vl",
+            "<div .styled(css { padding(rem(4 / 16)); }"
+        ),
+        "the refusal renders at the sum, in rows.vl: {stderr}"
+    );
+    assert!(
+        stderr.contains("this closure reaches it at run time"),
+        "the caller's closure is the note: {stderr}"
+    );
+    assert_eq!(stderr.matches("Error:").count(), 1, "one refusal: {stderr}");
+}
