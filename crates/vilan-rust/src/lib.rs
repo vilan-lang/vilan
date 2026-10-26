@@ -10630,10 +10630,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.reaches_signal = true;
                 return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
             }
-            // M164: `std::http`'s capped body read. It CONSUMES the two handles,
-            // and the callback reads both again afterwards — `std::http`'s
-            // `answer` builds its `Request` out of the one and writes the
-            // response on the other. A handle is
+            // M164: `std::http`'s lazy body. The read CONSUMES the two handles,
+            // and the request is read again afterwards (`Request::bytes` may be
+            // called twice, and `std::http`'s `answer` asks
+            // `__http_body_left_unread` of the same handle). A handle is
             // RETAINED per use, exactly as J6 retains a `Task` read out of a
             // binding: `clone_sites` marks nothing, because on the JS backend a
             // handle is a class instance that `__clone` passes through.
@@ -10647,6 +10647,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 return Ok(Some(format!(
                     "vilan_rt::http::read_body(({request}).clone(), ({response}).clone(), {limit})"
                 )));
+            }
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_body_left_unread",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let limit = self.value_argument(argument_ids, 1, depth)?;
+                return Ok(Some(format!("({request}).body_left_unread({limit})")));
             }
             // M164: one request's answer. The JS helper exists to keep a
             // cancellation from reaching node unhandled; here the callback is

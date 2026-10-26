@@ -40,6 +40,9 @@
 //! refused before a byte is read, and a chunked body (decoded here, RFC 9112
 //! §7.1) is counted as it arrives and refused at the chunk size that crosses it.
 //! A refusal answers `413` and closes; the read ends its task as a cancellation.
+//! A body nobody read is discarded before the close when it is within the cap
+//! (so the client reads its response rather than a reset), and the connection is
+//! closed at once when it is not.
 //!
 //! # Not in v1, by name
 //!
@@ -74,8 +77,8 @@ const READ_CHUNK: usize = 8 * 1024;
 const MAX_HEAD: usize = 64 * 1024;
 
 /// How long a connection closing with body bytes possibly still on the wire — a
-/// refused body — waits, write half shut and reading nothing, before it closes
-/// (M164). Closing a socket with
+/// refused body, or one over the cap that the handler never read — waits, write
+/// half shut and reading nothing, before it closes (M164). Closing a socket with
 /// unread bytes in it sends a RESET rather than a FIN, and a reset can reach
 /// the client before it has read the answer it was sent — the `413` lost on the
 /// way. The wait is Go's `rstAvoidanceDelay` (500 ms): the client has the answer
@@ -457,6 +460,10 @@ enum BodyState {
     Reading { limit: usize },
     /// Read whole.
     Read(Bytes),
+    /// The response ended with it unread and within the cap the server resolved:
+    /// this many bytes are discarded before the connection closes, so the client
+    /// reads its response rather than a reset.
+    Draining { remaining: usize },
     /// Over the cap or malformed: answered, and the connection is closing.
     Refused,
     /// The client went away before it arrived, or the request was answered
@@ -472,6 +479,9 @@ struct Body {
     decoded: Vec<u8>,
     chunks: ChunkDecoder,
     waiters: Vec<Parked>,
+    /// The cap [`Request::body_left_unread`] was asked with — what the drain
+    /// spends at most.
+    drain_limit: Option<usize>,
 }
 
 impl Body {
@@ -482,6 +492,7 @@ impl Body {
             decoded: Vec::new(),
             chunks: ChunkDecoder::new(),
             waiters: Vec::new(),
+            drain_limit: None,
         }
     }
 
@@ -525,7 +536,7 @@ struct Connection {
     /// application's, or a refusal's. One answer per connection: a response
     /// that finds the connection already answered writes nothing.
     answered: Cell<bool>,
-    /// Whether the write half has been shut for a linger.
+    /// Whether the write half has been shut for a drain or a linger.
     write_shut: Cell<bool>,
     /// When a closing connection that may still have body bytes coming stops
     /// waiting for its client to read the answer (see [`LINGER`]).
@@ -555,14 +566,15 @@ impl Connection {
     }
 
     /// Whether the connection should take bytes off the socket this turn: while
-    /// it reads a head, while it is upgraded, and while a body is being read —
-    /// never for a body nobody asked for, which stays in the kernel.
+    /// it reads a head, while it is upgraded, and while a body is being read or
+    /// drained — never for a body nobody asked for, which stays in the kernel.
     fn wants_bytes(&self) -> bool {
         match self.stage.get() {
             Stage::Reading | Stage::Upgraded => true,
-            Stage::Dispatched | Stage::Closing => {
-                matches!(self.body.borrow().state, BodyState::Reading { .. })
-            }
+            Stage::Dispatched | Stage::Closing => matches!(
+                self.body.borrow().state,
+                BodyState::Reading { .. } | BodyState::Draining { .. }
+            ),
             Stage::Closed => false,
         }
     }
@@ -643,6 +655,21 @@ impl Connection {
         self.enqueue(head.as_bytes());
         self.enqueue(message.as_bytes());
         self.stage.set(Stage::Closing);
+    }
+
+    /// Discards what a drain is owed out of the inbox. `true` once the drain is
+    /// over — everything owed taken, or the peer gone.
+    fn advance_drain(&self, hung_up: bool) -> bool {
+        let mut body = self.body.borrow_mut();
+        let BodyState::Draining { remaining } = body.state else {
+            return true;
+        };
+        let mut inbox = self.inbox.borrow_mut();
+        let taken = remaining.min(inbox.len());
+        inbox.drain(..taken);
+        let left = remaining - taken;
+        body.state = BodyState::Draining { remaining: left };
+        left == 0 || hung_up
     }
 
     fn touch(&self) {
@@ -893,6 +920,28 @@ impl Request {
             .map(|(_, value)| str_new(value))
     }
 
+    /// `__http_body_left_unread(request, limit)` — whether answering now leaves
+    /// a body the connection should not drain: unread, and declared over
+    /// `limit` or chunked. A body within `limit` is drained after the response
+    /// instead (`limit` is remembered as the drain's bound). Every response here
+    /// closes the connection anyway, so the answer only decides between a drain
+    /// and an immediate close; `std::http` adds the `Connection: close` it asks
+    /// for, which [`Response`] does not write twice.
+    pub fn body_left_unread(&self, limit: usize) -> bool {
+        let mut body = self.0.connection.body.borrow_mut();
+        if !matches!(body.state, BodyState::Unread) {
+            return false;
+        }
+        match body.framing {
+            Framing::Empty => false,
+            Framing::Length(length) if length <= limit => {
+                body.drain_limit = Some(limit);
+                false
+            }
+            Framing::Length(_) | Framing::Chunked => true,
+        }
+    }
+
     /// `request.headers` — the whole field set as the opaque host object
     /// `std::http` declares it at, which `Request::header` reads named entries
     /// out of with `std::json`'s accessors (dynamic property access has no
@@ -958,7 +1007,7 @@ impl Future for BodyRead {
                 BodyState::Read(bytes) => return Poll::Ready(bytes.clone()),
                 BodyState::Unread => true,
                 BodyState::Reading { .. } => false,
-                BodyState::Refused | BodyState::Gone => {
+                BodyState::Draining { .. } | BodyState::Refused | BodyState::Gone => {
                     drop(body);
                     raise_cancelled()
                 }
@@ -967,7 +1016,8 @@ impl Future for BodyRead {
         if starts {
             let mut body = connection.body.borrow_mut();
             if connection.answered.get() {
-                // Read after the response went out: the connection is closing.
+                // Read after the response went out: the body is the drain's now,
+                // or already gone with the connection.
                 body.settle(BodyState::Gone);
                 drop(body);
                 raise_cancelled();
@@ -1075,7 +1125,19 @@ impl Response {
         if let Some(length) = content_length {
             head.push_str(&format!("Content-Length: {length}\r\n"));
         }
-        head.push_str("Connection: close\r\n\r\n");
+        // `Connection: close` is every response's here (no keep-alive in v1);
+        // `std::http` sets it itself when a body is left unread (M164), and the
+        // field is not written twice.
+        if !self
+            .0
+            .headers
+            .borrow()
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            head.push_str("Connection: close\r\n");
+        }
+        head.push_str("\r\n");
         self.0.connection.enqueue(head.as_bytes());
     }
 
@@ -1386,8 +1448,10 @@ impl Server {
         for connection in connections {
             // A handler still waiting for a body is waiting on the client, not
             // answering: it ends with the connection (its read is cancelled).
-            let waits_on_the_client =
-                matches!(connection.body.borrow().state, BodyState::Reading { .. });
+            let waits_on_the_client = matches!(
+                connection.body.borrow().state,
+                BodyState::Reading { .. } | BodyState::Draining { .. }
+            );
             if matches!(connection.stage.get(), Stage::Reading | Stage::Upgraded)
                 || waits_on_the_client
             {
@@ -1481,7 +1545,7 @@ impl Server {
             return true;
         }
         if connection.stage.get() == Stage::Closing && connection.outbox.borrow().is_empty() {
-            if self.lingers(connection) {
+            if self.lingers(connection, hung_up) {
                 progressed |= read;
             } else {
                 connection.close();
@@ -1504,16 +1568,41 @@ impl Server {
     /// What a connection that has answered does before it closes (M164).
     /// `true` while it is still at it.
     ///
-    /// A connection whose body was refused may still have body bytes on the way:
-    /// it LINGERS — the write half is shut and nothing more is read for
-    /// [`LINGER`], so the client reads its answer before the close that follows
-    /// resets the rest.
-    fn lingers(&self, connection: &Rc<Connection>) -> bool {
-        if !matches!(connection.body.borrow().state, BodyState::Refused) {
-            return false;
-        }
+    /// A body the handler left unread within its cap is DRAINED: the write half
+    /// is shut — the client sees the response end — and what the body still owes
+    /// is read and discarded, so the close finds nothing unread and is a FIN.
+    /// A body that may still be arriving and is NOT drained — refused over the
+    /// cap, or unread past it — makes the connection LINGER: the write half is
+    /// shut and nothing more is read for [`LINGER`], so the client reads its
+    /// answer before the close that follows resets the rest.
+    fn lingers(&self, connection: &Rc<Connection>, hung_up: bool) -> bool {
+        let draining = {
+            let mut body = connection.body.borrow_mut();
+            if let (BodyState::Unread, Framing::Length(length), Some(limit)) =
+                (&body.state, body.framing, body.drain_limit)
+                && length <= limit
+            {
+                body.state = BodyState::Draining { remaining: length };
+            }
+            match body.state {
+                BodyState::Draining { .. } => true,
+                BodyState::Refused => false,
+                // Unread, and not all of it already off the wire.
+                BodyState::Unread => match body.framing {
+                    Framing::Empty => return false,
+                    Framing::Length(length) if connection.inbox.borrow().len() >= length => {
+                        return false;
+                    }
+                    Framing::Length(_) | Framing::Chunked => false,
+                },
+                _ => return false,
+            }
+        };
         if !connection.write_shut.replace(true) {
             let _ = connection.stream.borrow().shutdown(Shutdown::Write);
+        }
+        if draining {
+            return !connection.advance_drain(hung_up);
         }
         let deadline = connection
             .linger_until
@@ -2154,6 +2243,159 @@ mod tests {
         let (status, _, body) = split(&answered);
         assert_eq!(status, "HTTP/1.1 413 Content Too Large");
         assert_eq!(body, "the request body is larger than 8 bytes");
+    }
+
+    /// Polls the executor until `ready` holds — a LIVENESS loop over a fact
+    /// the test's own sequencing establishes, never a sleep standing in for an
+    /// ordering.
+    async fn until(ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "the awaited state never came");
+            crate::executor::sleep(1, None).await;
+        }
+    }
+
+    /// M164's keep-alive rule, natively: a handler that answers WITHOUT reading
+    /// a body within the cap leaves the body to a drain — the response goes out
+    /// and the write half is shut, the connection stays to take what the body
+    /// still owes and discard it, and closes once it has (a FIN, not the reset a
+    /// close over unread bytes sends, which can cost the client its response).
+    ///
+    /// The order is the test's own: the client sends the head, reads the WHOLE
+    /// response (its length is declared), and only then — told so over a
+    /// channel — sends the body. Between the two the server must still hold the
+    /// connection, draining.
+    #[test]
+    fn an_unread_body_within_the_cap_is_drained_before_the_close() {
+        let (send_body, body_may_go) = std::sync::mpsc::channel::<()>();
+        let (response_read, read_signal) = std::sync::mpsc::channel::<String>();
+        let observed = block_on(async move {
+            let handler: Handler = Rc::new(move |request: Request, response: Response| {
+                crate::executor::pin_future(async move {
+                    // `std::http`'s `answer`, for a body within its cap.
+                    assert!(!request.body_left_unread(1024));
+                    response.set_status_code(401);
+                    response.end("sign in");
+                })
+            });
+            let server = create_server(handler);
+            server.listen(0, Rc::new(|| {}));
+            let port = server.port() as u16;
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+                stream
+                    .write_all(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 11\r\n\r\n")
+                    .expect("send the head");
+                let mut response = Vec::new();
+                let mut byte = [0u8; 1];
+                while !String::from_utf8_lossy(&response).ends_with("sign in") {
+                    stream.read_exact(&mut byte).expect("read the response");
+                    response.push(byte[0]);
+                }
+                response_read
+                    .send(String::from_utf8_lossy(&response).into_owned())
+                    .expect("report the response");
+                body_may_go.recv().expect("wait to send the body");
+                stream.write_all(b"hello world").expect("send the body");
+                let mut rest = Vec::new();
+                // A drained close is a FIN: the read ENDS, it does not fail.
+                stream.read_to_end(&mut rest).map(|_| rest.len())
+            });
+            let response = loop {
+                if let Ok(response) = read_signal.try_recv() {
+                    break response;
+                }
+                crate::executor::sleep(1, None).await;
+            };
+            let draining = matches!(
+                server.0.connections.borrow().first().map(|connection| {
+                    matches!(
+                        connection.body.borrow().state,
+                        BodyState::Draining { remaining: 11 }
+                    )
+                }),
+                Some(true)
+            );
+            send_body.send(()).expect("let the body go");
+            let probe = server.clone();
+            until(move || probe.0.connections.borrow().is_empty()).await;
+            server.close(Rc::new(|| {}));
+            let rest = client
+                .join()
+                .expect("the client thread")
+                .map_err(|error| error.to_string());
+            (response, draining, rest)
+        });
+        let (response, draining, rest) = observed;
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response}"
+        );
+        assert!(
+            draining,
+            "with the response out, the connection waits for the body to discard"
+        );
+        assert_eq!(
+            rest.ok(),
+            Some(0),
+            "the drained close ends the read cleanly"
+        );
+    }
+
+    /// The other half of the rule: an unread body OVER the cap (or chunked) is
+    /// not drained — the connection closes once the response is out, without
+    /// waiting for a body the client never sends here.
+    #[test]
+    fn an_unread_body_over_the_cap_closes_once_the_response_is_out() {
+        let answered = block_on(async move {
+            let handler: Handler = Rc::new(move |request: Request, response: Response| {
+                crate::executor::pin_future(async move {
+                    let leaves_it = request.body_left_unread(1024);
+                    if leaves_it {
+                        response.set_header("Connection", "close");
+                    }
+                    response.set_status_code(401);
+                    response.end(&format!("left unread: {leaves_it}"));
+                })
+            });
+            let server = create_server(handler);
+            server.listen(0, Rc::new(|| {}));
+            let port = server.port() as u16;
+            // The client reads to the close; a server that drained would wait
+            // for 2048 bytes this client never sends, and never close.
+            let client = Rc::new(RefCell::new(Some(fetch(
+                port,
+                "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 2048\r\n\r\n",
+            ))));
+            let watched = Rc::clone(&client);
+            until(move || {
+                watched
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_finished())
+            })
+            .await;
+            let response = client
+                .borrow_mut()
+                .take()
+                .expect("the client handle")
+                .join()
+                .expect("the client thread");
+            server.close(Rc::new(|| {}));
+            response
+        });
+        let (status, headers, body) = split(&answered);
+        assert_eq!(status, "HTTP/1.1 401 Unauthorized");
+        assert_eq!(body, "left unread: true");
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|line| line.eq_ignore_ascii_case("connection: close"))
+                .count(),
+            1,
+            "the program's `Connection: close` is not written twice: {headers:?}"
+        );
     }
 
     #[test]

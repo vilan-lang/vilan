@@ -1251,8 +1251,10 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__db_bind");
         added = true;
     }
-    // M164: a refused body lingers its connection.
-    if helpers.iter().any(|helper| *helper == "__http_read_body")
+    // M164: a refused or unread-over-the-cap body lingers its connection.
+    if helpers
+        .iter()
+        .any(|helper| matches!(*helper, "__http_read_body" | "__http_body_left_unread"))
         && !helpers.contains(&"__http_linger")
     {
         helpers.push("__http_linger");
@@ -1303,6 +1305,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__local_get",
         "__response_header",
         "__http_read_body",
+        "__http_body_left_unread",
         "__http_respond",
         "__session_get",
         "__dom_window",
@@ -1615,12 +1618,27 @@ fn helper_source(name: &str) -> &'static str {
              \treturn request.__vilan_body;\n\
              }"
         }
+        // M164's keep-alive rule: an UNREAD body the connection should not drain
+        // — declared over the cap, or chunked (no length to bound the drain by).
+        // A body within the cap is left to node, which discards it and keeps the
+        // connection; `request.complete` is a body that already arrived whole.
+        "__http_body_left_unread" => {
+            "function __http_body_left_unread(request, limit) {\n\
+             \tif (request.__vilan_body !== undefined || request.complete) return false;\n\
+             \tconst declared = request.headers[\"content-length\"];\n\
+             \tconst leaves = declared === undefined\n\
+             \t\t? request.headers[\"transfer-encoding\"] !== undefined\n\
+             \t\t: Number(declared) > limit;\n\
+             \tif (leaves) __http_linger(request);\n\
+             \treturn leaves;\n\
+             }"
+        }
         // M164: a connection closing with body bytes possibly still on the
         // wire half-closes and waits 500 ms before it is destroyed, reading
         // nothing more. Node destroys a `Connection: close` socket the moment
         // the answer is flushed (`destroySoon`), and destroying a socket with
         // unread bytes in it sends a RESET, which can reach the client before it
-        // has read its `413` — so `destroySoon` is this socket's own
+        // has read its `413` or `401` — so `destroySoon` is this socket's own
         // half-close-and-wait (Go's `rstAvoidanceDelay`; the native server's
         // `LINGER` is the same wait). And node DISCARDS an unread request body
         // after the answer (`_dump`) by reading it to its end, which for a

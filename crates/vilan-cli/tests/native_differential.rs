@@ -4229,7 +4229,7 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
     let source = String::from_utf8_lossy(&output.stdout);
     for needle in [
         "vilan_rt::http::create_server",
-        "vilan_rt::http::read_body",
+        ").body_left_unread(",
         ").listen(",
         ").address()",
         ").port()",

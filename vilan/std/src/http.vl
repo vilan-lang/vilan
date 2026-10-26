@@ -128,16 +128,25 @@ export impl NodeSocket {
 }
 
 /// The request body, read whole on the FIRST call for this request and kept for
-/// every later one (M164). At most `limit` bytes are taken: a declared `Content-
-/// Length` over it is refused before a byte of the body is read, and a body without
-/// one (`Transfer-Encoding: chunked`) is counted as it arrives and refused at the
-/// chunk that crosses it. A refusal answers `413` on `reply`, closes the connection
-/// without reading the rest, and ends the caller as a CANCELLATION (an `AbortError`
-/// on node, the executor's cancel natively) — the request is over, so nothing after
-/// the read runs. A client that goes away mid-body ends the caller the same way,
-/// with nothing answered.
+/// every later one (M164: `Request::bytes`'s lazy read). At most `limit` bytes are
+/// taken: a declared `Content-Length` over it is refused before a byte of the body
+/// is read, and a body without one (`Transfer-Encoding: chunked`) is counted as it
+/// arrives and refused at the chunk that crosses it. A refusal answers `413` on
+/// `reply`, closes the connection without reading the rest, and ends the caller as
+/// a CANCELLATION (an `AbortError` on node, the executor's cancel natively) — the
+/// request is over, so nothing after the read runs. A client that goes away mid-
+/// body ends the caller the same way, with nothing answered.
 [extern("__http_read_body")]
 async external fun read_body(node: NodeRequest, reply: NodeResponse, limit: usize): Bytes;
+
+/// Whether answering now would leave a body behind that the connection should not
+/// spend `limit` bytes draining: unread, and either declared over `limit` or of no
+/// declared length (chunked). Such a response says `Connection: close` (M164's
+/// keep-alive rule): a body the handler never read is drained when it is within the
+/// cap — node discards it and keeps the connection, the native server discards it
+/// before it closes — and the connection is closed instead when it is not.
+[extern("__http_body_left_unread")]
+external fun body_left_unread(node: NodeRequest, limit: usize): bool;
 
 /// Runs one request's answer. A CANCELLATION ends it quietly — the body was
 /// refused (`read_body`'s `413` is already on the wire) or the client went away,
@@ -179,9 +188,15 @@ export impl NodeResponse {
 
 // --- Request ---
 
+/// One request, as the handler sees it: the head is here when the handler runs,
+/// and the BODY is not read until the handler asks for it (`bytes`/`body`, M164).
 export struct Request {
 	node: NodeRequest,
-	content: Bytes,
+	/// The response this request is answered on — where a refused body's `413`
+	/// goes.
+	reply: NodeResponse,
+	/// The most body bytes `bytes`/`body` will read: the server's `max_body_bytes`.
+	limit: usize,
 }
 
 export impl Request {
@@ -196,16 +211,28 @@ export impl Request {
 	}
 
 	/// The full request body as text — empty for a body-less request (e.g. a GET).
-	/// Collected when the request arrives, under the server's cap (see
-	/// `Server::start`).
+	/// Read on the first call, as `bytes` is; the same cap applies.
 	fun body(self): str {
-		new_text_decoder().decode(self.content)
+		new_text_decoder().decode(self.bytes())
 	}
 
 	/// The same body as raw bytes, for frames that may be binary (an RPC codec's
 	/// POST).
+	///
+	/// **Read on the first call, not before** (M164): a handler that answers from
+	/// the head alone — a `401` for a request that is not signed in, a `413` off a
+	/// declared `Content-Length`, a quota — never receives the body at all. A later
+	/// call answers the same bytes without reading again.
+	///
+	/// At most the server's cap (`max_body_bytes`, 1 MiB unless the server said
+	/// otherwise) is read. A body over it — a declared `Content-Length` before a
+	/// byte of the body is read, a chunked one at the chunk that crosses it — is
+	/// answered `413 Content Too Large`, the connection is closed without reading
+	/// the rest, and the handler ENDS here, as a cancelled task ends: the request
+	/// is over, so the code after the read does not run and its response is never
+	/// asked for. A client that hangs up mid-body ends the handler the same way.
 	fun bytes(self): Bytes {
-		self.content
+		read_body(self.node, self.reply, self.limit)
 	}
 
 	/// The value of a named request header, or `None` when the request did not
@@ -628,8 +655,10 @@ export impl Server {
 		let upgrade_handler = self.upgrade_handler;
 		let body_limits = self.body_limits;
 		let node_server = node_create_server(|node_request, node_response| {
-			// `respond` is what keeps a refused body's cancellation (M164) from
-			// ending the process on node.
+			// The handler runs on the HEAD: the body stays on the wire until it
+			// asks (`Request::bytes`, M164), under the server's cap. `respond` is
+			// what keeps a refused body's cancellation from ending the process on
+			// node.
 			//
 			// This callback suspends — `request_handler` is `async` and awaited —
 			// which is the proof that nothing downstream of it is synchronous. Said
@@ -683,12 +712,7 @@ fun answer(
 	node_response: NodeResponse,
 ) {
 	let limit = body_limits.server;
-	// Collect the full request body (as BYTES — it may be binary) before
-	// dispatching, under the cap (M164): one over it is answered `413` here and the
-	// handler never runs. `Request` carries a READY body rather than a stream, so
-	// every handler sees one shape.
-	let content = read_body(node_request, node_response, limit);
-	let response = request_handler(Request { node = node_request, content });
+	let response = request_handler(Request { node = node_request, reply = node_response, limit });
 	node_response.set_status_code(response.status);
 	if response.headers.len() == 0 {
 		node_response.set_header_raw("Content-Type", "text/plain");
@@ -696,6 +720,11 @@ fun answer(
 	for header in response.headers {
 		let (name, value) = header;
 		node_response.set_header_raw(name, value);
+	}
+	// A body the handler never read, and that the connection should not drain,
+	// closes the connection with this response (M164's keep-alive rule).
+	if body_left_unread(node_request, limit) {
+		node_response.set_header_raw("Connection", "close");
 	}
 	match response.body {
 		ResponseBody::Text(let text) => node_response.end(text),
@@ -730,11 +759,12 @@ export impl ServerBuilder {
 	}
 
 	/// The most body bytes a request may send (M164) — 1 MiB when this is never
-	/// called. A body over the cap is answered `413 Content Too Large` and its
-	/// connection closed without the rest being read — a declared `Content-Length`
-	/// before any of the body, a chunked body at the chunk that crosses the cap —
-	/// and the handler is never called. The rpc POST leg is a handler like any
-	/// other, so a mounted service is under it too.
+	/// called. The body is read only when a handler asks for it
+	/// (`Request::bytes`/`body`); one over the cap is answered `413 Content Too
+	/// Large` and its connection closed without the rest being read — a declared
+	/// `Content-Length` before any of the body, a chunked body at the chunk that
+	/// crosses the cap. The rpc POST leg reads through the same `Request::bytes`,
+	/// so a mounted service is under it too.
 	fun max_body_bytes(own self, limit: usize): ServerBuilder {
 		self.body_limits.server = limit;
 		self

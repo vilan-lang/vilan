@@ -569,3 +569,73 @@ fn m164_the_default_cap_refuses_an_oversized_body_without_reading_it_on_both_bac
         ),
     ]);
 }
+
+// ------------------------------------------------------- the lazy body ---
+
+/// A handler that answers from the HEAD — `401` for a request that is not
+/// signed in — on a body far over the cap: the client sends only the head, so
+/// the `401` proves the body was never asked for, and the response closes the
+/// connection (a body over the cap is not drained).
+fn a_handler_answering_from_the_head_never_reads_the_body(
+    port: u16,
+    _backend: Backend,
+) -> Result<(), String> {
+    let response = exchange(port, &post_head_keep_alive("/auth", 2 * MIB), b"")?;
+    expect_status(&response, "HTTP/1.1 401 Unauthorized")?;
+    expect_header(&response, "Connection: close")?;
+    expect_body(&response, "sign in")
+}
+
+/// A body within the cap that the handler never read is DRAINED: on node the
+/// connection stays alive, so a request pipelined behind it is answered too;
+/// the native server (no keep-alive) discards it and closes with a FIN.
+fn an_unread_body_within_the_cap_is_drained(port: u16, backend: Backend) -> Result<(), String> {
+    let response = exchange(
+        port,
+        "POST /auth HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello\
+         GET /auth HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        b"",
+    )?;
+    let answered = response.matches("HTTP/1.1 401 Unauthorized").count();
+    let expected = match backend {
+        Backend::Node => 2,
+        Backend::Native => 1,
+    };
+    if answered != expected {
+        return Err(format!(
+            "expected {expected} answer(s) on the connection, got {answered}:\n{response}"
+        ));
+    }
+    Ok(())
+}
+
+/// The body is read once: a second `bytes()` and a `body()` after it answer
+/// the same content.
+fn a_second_read_answers_the_same_body(port: u16, _backend: Backend) -> Result<(), String> {
+    let response = exchange(
+        port,
+        "POST /twice HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
+        b"hello world",
+    )?;
+    expect_status(&response, "HTTP/1.1 200 OK")?;
+    expect_body(&response, "len=11 same=true text=hello world")
+}
+
+#[test]
+fn m164_a_handler_reads_the_body_only_when_it_asks_on_both_backends() {
+    let built = Built::new("request_body_lazy", &cap_server());
+    built.check(&[
+        (
+            "a handler answering from the head never reads the body",
+            a_handler_answering_from_the_head_never_reads_the_body,
+        ),
+        (
+            "an unread body within the cap is drained",
+            an_unread_body_within_the_cap_is_drained,
+        ),
+        (
+            "a second read answers the same body",
+            a_second_read_answers_the_same_body,
+        ),
+    ]);
+}
