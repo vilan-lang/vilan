@@ -94,6 +94,18 @@ export fun view(tag: str): View {
 	View { tag, attributes, children = Shared::new([]), text = Shared::new("") }
 }
 
+/// A `View` that places NOTHING (M170) — the browser twin's empty text node, as the
+/// server writes it: a node with no tag, which `render` writes as no markup at all.
+/// KEEP IN STEP with the browser twin (browser/ui.vl).
+export fun nothing(): View {
+	View {
+		tag = "",
+		attributes = Shared::new([]),
+		children = Shared::new([]),
+		text = Shared::new(""),
+	}
+}
+
 /// Set-or-replace an attribute BY NAME, in place — mirrors the DOM's
 /// `setAttribute`/`className`: a repeated name updates its value and keeps its
 /// position; a new name appends. This is what makes attribute order insertion
@@ -613,6 +625,21 @@ export fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	EachBy { source, key, render }
 }
 
+/// A keyed owner scope with no view (M170), server side: `body` runs once per
+/// element of the CURRENT list, each under its own owner — `each`'s rows with
+/// nothing placed. A server render hears no later change, so no row ever leaves.
+/// KEEP IN STEP with the browser twin (browser/ui.vl).
+export fun each_owned<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>>(
+	own source: S,
+	key: sync |T| K,
+	body: (sync |T| void) context owner_scope,
+) {
+	place_each(nothing(), source, key, |item: T| {
+		body(item);
+		nothing()
+	});
+}
+
 export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
 	fun place(own self, parent: View) {
 		if read_once(self.condition) {
@@ -844,6 +871,10 @@ export fun escape_attribute(value: str): str {
 /// byte-stable output, attributes in insertion order, proper escaping, void
 /// elements without a closing tag.
 export fun render(view: View): str {
+	// `nothing()`: no tag, no markup (M170).
+	if view.tag == "" {
+		ret "";
+	}
 	mut out = "<" + view.tag;
 	for attribute in view.attributes.read() {
 		out = out + " " + attribute.name + "=\"" + escape_attribute(attribute.value) + "\"";

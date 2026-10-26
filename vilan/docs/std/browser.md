@@ -247,6 +247,7 @@ if is_open {
 ```vilan,fragment
 struct View { element: Element }
 fun view(tag: str): View
+fun nothing(): View                                              // places nothing
 fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
@@ -273,6 +274,21 @@ with its `xmlns`. Tags that exist in both vocabularies (`a`, `title`,
 `style`, `script`) resolve to HTML. `class`/`styled` set the `class`
 attribute (not the `className` property), so styling works on SVG nodes
 too.
+
+**A view function with nothing to show returns `ui::nothing()`.** It is
+the mark a `when` or a `swap` leaves where its content goes, an empty text
+node: no element, no box, so a flex row's `gap` leaves no room for it the
+way a placeholder `<span />` would. Place it; it has no element to decorate
+(`attr`, `class` and `child` don't apply to it). A position that is empty
+because of its data says so with `None` in an `Option<View>` hole, `when`
+or `when_some`. On the server it renders as no markup.
+
+```vilan,fragment
+fun notification_bell(): View {
+	model::account() is Some(let account) else ret ui::nothing();
+	<button>"Notifications"</button>
+}
+```
 
 ### View methods
 
@@ -367,6 +383,20 @@ written — between siblings, not after them. They are bare names in the
 Each returned struct implements `Slot`, so it fills any child
 position — including a `{hole}` in element syntax. To place one at the
 parent's current end instead, hand it to `child`: `parent.child(when(..))`.
+
+**Rows that are only owners: `ui::each_owned`.** An `each` row is also how a
+keyed list gives each key its own owner, so a per-row effect lives and dies
+with its row. When the rows have nothing to show, `each_owned(source, key,
+body)` keeps the keyed owners and places nothing: call it where you would
+place an `each`, and `body` runs under a fresh owner for each key that
+arrives, disposed when the key leaves (a key that stays keeps its owner). It
+is a call, not a slot value:
+
+```vilan,fragment
+ui::each_owned(ids, |id| *id, |id| {
+	TaskRecord::find(store, id).effect(|found| note(id, found));
+});
+```
 
 The `View` methods these replaced — `when`, `swap`, `swap_split`, `bind_each`,
 `bind_each_values`, `bind_each_by` — were retired; `parent.swap(s, r)` is now

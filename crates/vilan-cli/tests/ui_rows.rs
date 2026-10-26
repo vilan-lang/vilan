@@ -6603,3 +6603,138 @@ fn a165_the_process_twin_renders_an_optional_child_once() {
     assert_eq!(stdout, "<p>item<b>new</b>!<i>hot</i>end</p>\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- M170: the empty view and the keyed owner scope with no view -------------
+
+/// `ui::nothing()` places an empty text node — the mark a `when` leaves — where a
+/// `View`-typed function has nothing to show, so a flex row's gap leaves no room
+/// for it; a reactive child that turns to `nothing()` and back replaces cleanly.
+/// `ui::each_owned` gives each key its own owner with no DOM at all: a key's
+/// effect runs while the key is in the list, a key that stays keeps its owner
+/// (no second "opened"), and a key that leaves takes its effect with it.
+const NOTHING_APP: &str = r#"import std::io::print;
+import std::reactive::{ Flow, Signal, SignalCell };
+import std::web::ui::{ View, each_owned, mount_root, nothing, view };
+
+fun badge(fresh: bool): View {
+	if !fresh {
+		ret nothing();
+	}
+	view("b").text("new")
+}
+
+fun main() {
+	let ids: SignalCell<List<i32>> = Signal::new([1, 2]);
+	let ticks: SignalCell<i32> = Signal::new(0);
+	let lit: SignalCell<bool> = Signal::new(false);
+	let _root = mount_root("app", || {
+		each_owned(ids, |id| *id, |id| {
+			print(i"row {id} opened");
+			ticks.effect(|tick| print(i"row {id} sees {tick}"));
+		});
+		view("div")
+			.child(view("span").text("a"))
+			.child(badge(false))
+			.child(view("span").text("b"))
+			.child(badge(true))
+			.child(lit.derive(|on| if on { view("i").text("on") } else { nothing() }))
+	});
+	print("--- tick");
+	ticks.set(1);
+	print("--- drop 1, add 3");
+	ids.set([2, 3]);
+	print("--- tick");
+	ticks.set(2);
+	print("--- lit");
+	lit.set(true);
+	lit.set(false);
+}
+
+main();
+"#;
+
+#[test]
+fn m170_nothing_places_no_element_and_each_owned_keys_owners_without_a_view() {
+    let harness = format!(
+        r##"{DOM_STUB}
+require("./app.js");
+const shape = (node) => node.tagName === "#text" ? "text'" + node.textContent + "'" : node.tagName;
+const div = documentRoot.children[0];
+console.log("root " + documentRoot.children.map(shape).join(","));
+console.log("div " + div.children.map(shape).join(","));
+"##
+    );
+    let stdout = build_and_run("nothing", NOTHING_APP, &harness);
+    assert_eq!(
+        stdout,
+        concat!(
+            "row 1 opened\n",
+            "row 1 sees 0\n",
+            "row 2 opened\n",
+            "row 2 sees 0\n",
+            "--- tick\n",
+            "row 1 sees 1\n",
+            "row 2 sees 1\n",
+            "--- drop 1, add 3\n",
+            "row 3 opened\n",
+            "row 3 sees 1\n",
+            "--- tick\n",
+            "row 2 sees 2\n",
+            "row 3 sees 2\n",
+            "--- lit\n",
+            "root div\n",
+            "div span,text'',span,b,text'',text''\n",
+        ),
+        "nothing() is an empty text node, each_owned places nothing and keys its owners"
+    );
+}
+
+/// M170, the process twin: `nothing()` renders as no markup at all — alone and
+/// among siblings — and `each_owned` runs its body once per element of the
+/// current list, each under its own owner, placing nothing.
+const SSR_NOTHING: &str = r#"import std::io::print;
+import std::reactive::{ Owner, Signal, SignalCell, run_with_owner };
+import std::web::ui::{ View, each_owned, nothing, render, view };
+
+fun main() {
+	print(i"[{render(nothing())}]");
+	print(render(view("p").child(view("b").text("x")).child(nothing()).child(view("i").text("y"))));
+	let ids: SignalCell<List<i32>> = Signal::new([1, 2]);
+	run_with_owner(Owner::new(), || {
+		each_owned(ids, |id| *id, |id| print(i"owned {id}"));
+	});
+}
+
+main();
+"#;
+
+#[test]
+fn m170_the_ssr_twin_renders_nothing_as_no_markup() {
+    let dir = temp_project("ssr_nothing");
+    std::fs::create_dir_all(&dir).expect("create the program directory");
+    let source = dir.join("app.vl");
+    std::fs::write(&source, SSR_NOTHING).expect("write the program");
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&source)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new("node")
+        .arg("app.mjs")
+        .current_dir(&dir)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert_eq!(
+        stdout, "[]\n<p><b>x</b><i>y</i></p>\nowned 1\nowned 2\n",
+        "the server's nothing() writes no markup, and each_owned owns rows without placing any"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

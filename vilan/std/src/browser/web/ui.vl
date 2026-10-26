@@ -107,6 +107,34 @@ export fun view(tag: str): View {
 	}
 }
 
+/// A `View` that places NOTHING (M170): what a function typed `View` returns when
+/// it has nothing to show — no account yet, no store yet — without standing an
+/// element in for "nothing". It is the mark a `when` or a `swap` leaves where its
+/// content goes, an empty text node: no box, so a flex row's `gap` leaves no room
+/// for it (a placeholder `<span />` takes one), and no element for a selector or a
+/// screen reader to find.
+///
+///     fun notification_bell(): View {
+///         model::account() is Some(let account) else ret ui::nothing();
+///         <button>…</button>
+///     }
+///
+/// PLACE it, as a child or as a reactive child's value; it has no element to
+/// decorate, so `attr`, `class`, `child` and the other builders do not apply to it.
+/// A child position that is empty because of its DATA says so with its own forms:
+/// `None` in an `Option<View>` hole, `when`, `when_some`. KEEP IN STEP with the
+/// process twin's copy (process/ui.vl), which renders it as no markup.
+export fun nothing(): View {
+	View { element = create_placeholder("") }
+}
+
+/// `document.createTextNode(content)` typed as the `Element` a `View` holds — the
+/// coin `create_document_fragment` already spends (`std::web::dom`): a `View` is
+/// placed by `appendChild`/`insertBefore`/`remove`, which take any node, and
+/// `nothing()` is a view that is only ever placed.
+[extern("document.createTextNode")]
+external fun create_placeholder(content: str): Element;
+
 /// The SVG vocabulary `view` routes through `createElementNS` — the drawing and
 /// paint-server elements, exact-case (the camelCase names cannot be created by
 /// `createElement` at all: it lowercases). Deliberately excludes the HTML-ambiguous
@@ -1274,6 +1302,32 @@ export fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): EachBy<T, K, S, C> {
 	EachBy { source, key, render }
+}
+
+/// A KEYED OWNER SCOPE with no view (M170): one owner per key of `source`, made
+/// when the key arrives and disposed when it leaves, with `body` run under it —
+/// `each`'s row lifetime for rows that are only OWNERS. A per-row effect lives and
+/// dies with its row:
+///
+///     ui::each_owned(ids, |id| *id, |id| {
+///         TaskRecord::find(store, id).effect(|found| note(id, found));
+///     });
+///
+/// Call it where `each` would be placed (it needs the enclosing boundary, which
+/// owns every row); it places nothing in the document. The rows are `each`'s own,
+/// keyed and reconciled the same way (a key that stays keeps its owner across
+/// changes), staged in a fragment the document never sees. KEEP IN STEP with the
+/// process twin's copy (process/ui.vl).
+export fun each_owned<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>>(
+	own source: S,
+	key: sync |T| K,
+	body: (sync |T| void) context owner_scope,
+) {
+	let staging = View { element = create_document_fragment() };
+	each(source, key, |item: T| {
+		body(item);
+		nothing()
+	}).place(staging);
 }
 
 export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
