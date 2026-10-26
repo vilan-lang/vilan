@@ -26,6 +26,11 @@ export impl NodeServer {
 	[extern(method, retains)]
 	external fun listen(self, port: i32, on_ready: || void);
 
+	/// `listen(port, host, on_ready)` — bound to one address (`ServerBuilder::host`,
+	/// M168) instead of every interface.
+	[extern(method, "listen", retains)]
+	external fun listen_on(self, port: i32, host: str, on_ready: || void);
+
 	/// The bound address, once listening — where a port-0 bind's ACTUAL port comes
 	/// from. A TCP server (the only kind this module starts) always answers with an
 	/// address object.
@@ -490,6 +495,8 @@ export struct Server {
 	/// server handed to `on_start` carries the number it picked (so `url()` and
 	/// `port()` are right in both cases).
 	port: i32,
+	/// The address to bind (`ServerBuilder::host`), `None` for every interface.
+	host: Option<str>,
 	request_handler: async |Request| Response,
 	on_start: |Server| void,
 	on_stop: |Server| void,
@@ -511,6 +518,8 @@ export struct Server {
 
 export struct ServerBuilder {
 	port: i32,
+	/// `host(addr)`'s address, `None` (every interface) until one is given.
+	host: Option<str>,
 	// Declared `async` (J2's typed channel): the handler may suspend, and `start()`
 	// awaits its response before writing.
 	request_handler: async |Request| Response,
@@ -541,6 +550,7 @@ export impl Server {
 	fun builder(): ServerBuilder {
 		ServerBuilder {
 			port = 3000,
+			host = None,
 			request_handler = |request| Response::builder().code(404).body("Not Found").build(),
 			on_start = |server| {},
 			on_stop = |server| {},
@@ -558,8 +568,21 @@ export impl Server {
 		self.port
 	}
 
+	/// Where a client on this machine reaches the server: `localhost` unless it is
+	/// bound to one address, which is then the url's host (an IPv6 address in
+	/// brackets). A wildcard bind (`0.0.0.0`, `::`) is every interface, so
+	/// `localhost` again.
 	fun url(self): str {
-		i"http://localhost:{self.port}/"
+		match self.host {
+			Some(let host) if host != "0.0.0.0" && host != "::" => {
+				if host.contains(":") {
+					i"http://[{host}]:{self.port}/"
+				} else {
+					i"http://{host}:{self.port}/"
+				}
+			},
+			_ => i"http://localhost:{self.port}/",
+		}
 	}
 
 	fun start(self) {
@@ -569,6 +592,7 @@ export impl Server {
 		let on_start = self.on_start;
 		let server = self;
 		let port = self.port;
+		let host = self.host;
 		let upgrade_handler = self.upgrade_handler;
 		let node_server = node_create_server(|node_request, node_response| {
 			// Collect the full request body (as BYTES — it may be binary) before
@@ -607,7 +631,7 @@ export impl Server {
 			Some(let handler) => node_server.on_upgrade("upgrade", handler),
 			None => {},
 		}
-		node_server.listen(port, || {
+		let on_ready = || {
 			// The server handed to `on_start` carries the port it actually bound,
 			// which is the whole point of being allowed to request 0 — and the live
 			// listener `stop()` needs (§9.1).
@@ -615,7 +639,11 @@ export impl Server {
 			started.port = bound_port(node_server);
 			started.node = Some(node_server);
 			on_start(started);
-		});
+		};
+		match host {
+			Some(let address) => node_server.listen_on(port, address, on_ready),
+			None => node_server.listen(port, on_ready),
+		}
 	}
 
 	/// Stop listening and fire `on_stop` once the listener has actually closed
@@ -644,6 +672,17 @@ fun bound_port(node_server: NodeServer): i32 {
 export impl ServerBuilder {
 	fun port(own self, port: i32): ServerBuilder {
 		self.port = port;
+		self
+	}
+
+	/// Bind one address instead of every interface (M168): `.host("127.0.0.1")` is
+	/// a server only this machine can reach — a desktop app's own server, a dev
+	/// tool, a test — where the default (no `host`) listens on every interface,
+	/// reachable from the network and, on Windows, asking the firewall. `"::1"` is
+	/// the IPv6 loopback; `"0.0.0.0"` every IPv4 interface. Passed to node's
+	/// `listen(port, host, ..)` as written.
+	fun host(own self, address: str): ServerBuilder {
+		self.host = Some(address);
 		self
 	}
 
@@ -740,6 +779,7 @@ export impl ServerBuilder {
 		let fallback = self.request_handler;
 		Server {
 			port = self.port,
+			host = self.host,
 			request_handler = fold_service_requests(
 				self.services,
 				|request| respond_from_build(assets, cache, fallback, request),

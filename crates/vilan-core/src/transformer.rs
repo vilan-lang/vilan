@@ -1240,6 +1240,17 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__panic");
         added = true;
     }
+    // M165: the four bind-list readers share the binder.
+    if helpers.iter().any(|helper| {
+        matches!(
+            *helper,
+            "__db_run" | "__db_all" | "__db_get" | "__db_run_guarded"
+        )
+    }) && !helpers.contains(&"__db_bind")
+    {
+        helpers.push("__db_bind");
+        added = true;
+    }
     // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
     if helpers.contains(&"__dbg_stack") && !helpers.contains(&"__dbg") {
         helpers.push("__dbg");
@@ -1292,6 +1303,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__dom_query_all",
         "__router_path",
         "__router_url",
+        "__router_state",
+        "__module_dir",
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1581,6 +1594,20 @@ fn helper_source(name: &str) -> &'static str {
         // Router glue (std::web::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
+        // M168: the directory the running module was loaded from — `dist/` for
+        // a built server (`dist/server.mjs`), where `std::build` looks for a
+        // leg's manifest first. `import.meta.dirname` is node's (20.11+), Deno's
+        // and Bun's; a host without it answers `""`, and the working folder is
+        // the fallback.
+        "__module_dir" => {
+            "function __module_dir() {\n\treturn typeof import.meta.dirname === \"string\" ? import.meta.dirname : \"\";\n}"
+        }
+        // M167: the current entry's state, when it is TEXT — the only kind
+        // `std::web::router` writes. The first entry (state `null`) and one
+        // another script pushed with an object both read as `""`.
+        "__router_state" => {
+            "function __router_state() {\n\treturn typeof history.state === \"string\" ? history.state : \"\";\n}"
+        }
         // The whole relative URL, for the query and fragment `location.pathname`
         // leaves out. Deliberately NOT what `current_path()` tracks: a route
         // signal that advanced on every `#anchor` would re-render the page for a
@@ -1615,17 +1642,58 @@ fn helper_source(name: &str) -> &'static str {
         // extern binding forms can't express directly.
         "__db_run" => {
             "function __db_run(statement, parameters) {\n\
-             \tconst result = statement.run(...parameters);\n\
+             \tconst result = statement.run(...__db_bind(parameters));\n\
              \treturn Number(result.lastInsertRowid ?? 0);\n\
              }"
         }
         "__db_all" => {
-            "function __db_all(statement, parameters) {\n\treturn statement.all(...parameters);\n}"
+            "function __db_all(statement, parameters) {\n\treturn statement.all(...__db_bind(parameters));\n}"
         }
         "__db_get" => {
             "function __db_get(statement, parameters) {\n\
-             \tconst row = statement.get(...parameters);\n\
+             \tconst row = statement.get(...__db_bind(parameters));\n\
              \treturn row === undefined ? [ 1 ] : [ 0, row ];\n\
+             }"
+        }
+        // M165: the bind list as SQLite takes it, the native binder's rule
+        // (`vilan-rt-sqlite`'s `bind`): a `bool` is the integer 0 or 1 (node
+        // refuses a JS boolean), and an `Option` already arrived as its payload
+        // or `null` (`__any_option`, at the `any` position it landed at). A
+        // value SQLite cannot hold is refused HERE, naming its index in the
+        // list, rather than by node's own sentence — an array was read as named
+        // parameters ("Unknown named parameter '0'"). The JS value is all that
+        // reaches this far, so the sentence names its shape, not its vilan type.
+        "__db_bind" => {
+            "function __db_bind(parameters) {\n\
+             \treturn parameters.map((value, index) => {\n\
+             \t\tswitch (typeof value) {\n\
+             \t\t\tcase \"number\":\n\
+             \t\t\tcase \"bigint\":\n\
+             \t\t\tcase \"string\":\n\
+             \t\t\t\treturn value;\n\
+             \t\t\tcase \"boolean\":\n\
+             \t\t\t\treturn value ? 1 : 0;\n\
+             \t\t}\n\
+             \t\tif (value === null || value instanceof Uint8Array) {\n\
+             \t\t\treturn value;\n\
+             \t\t}\n\
+             \t\tconst shape = Array.isArray(value) ? \"a struct, tuple, list or enum value\" : typeof value === \"function\" ? \"a closure\" : value === undefined ? \"an absent value\" : \"a host object\";\n\
+             \t\tthrow new Error(\"std::db: cannot bind the parameter at index \" + index + \" of \" + parameters.length + \": \" + shape + \" is not a SQLite value (bind a number, a str, a bool, or an Option of one)\");\n\
+             \t});\n\
+             }"
+        }
+        // M165: an `Option` landing at an `any` position is its payload or
+        // `null`, unwrapped `depth` layers (`Program::any_option_coercions`) —
+        // the native backend's `Any::from` at the same positions.
+        "__any_option" => {
+            "function __any_option(value, depth) {\n\
+             \tfor (let level = 0; level < depth; level++) {\n\
+             \t\tif (value[0] !== 0) {\n\
+             \t\t\treturn null;\n\
+             \t\t}\n\
+             \t\tvalue = value[1];\n\
+             \t}\n\
+             \treturn value;\n\
              }"
         }
         "__db_column" => "function __db_column(row, name) {\n\treturn row[name];\n}",
@@ -1662,7 +1730,7 @@ fn helper_source(name: &str) -> &'static str {
         "__db_run_guarded" => {
             "function __db_run_guarded(statement, parameters) {\n\
              \ttry {\n\
-             \t\tstatement.run(...parameters);\n\
+             \t\tstatement.run(...__db_bind(parameters));\n\
              \t\treturn [ 1 ];\n\
              \t} catch (error) {\n\
              \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
@@ -6188,6 +6256,16 @@ impl<'src> Transformer<'src> {
             }));
         }
         let node = self.walk_entity_seams(id, block)?;
+        // M165: an `Option` landing at an `any` position is its payload or
+        // `null` there, as `Any::from` makes it natively — the value a
+        // `List<any>` bind list hands SQLite.
+        if let Some(&depth) = self.program.any_option_coercions.get(&id) {
+            self.used_helpers.insert("__any_option");
+            return Some(js::Node::Call(
+                Box::new(js::Node::Local("__any_option".to_string())),
+                vec![node, js::Node::Number(depth.to_string(), None)],
+            ));
+        }
         // B340 Q1: a `Callable` value in a closure-typed position. A struct is
         // a plain JS array — it cannot be applied — so the coercion IS the
         // wrapping closure, built here around the finished value so the copy

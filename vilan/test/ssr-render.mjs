@@ -103,6 +103,9 @@ function escape_attribute(value) {
 	return value.replaceAll("&", "&amp;").replaceAll("\"", "&quot;");
 }
 function render(view2) {
+	if (view2[0] === "") {
+		return "";
+	}
 	let out = "<" + view2[0];
 	for (const attribute of view2[1].v) {
 		out = out + " " + attribute[0] + "=\"" + escape_attribute(attribute[1]) + "\"";

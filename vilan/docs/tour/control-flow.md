@@ -229,8 +229,37 @@ that can fall through reaches the continuation on a miss), the `if` has to
 have no `else`, and the test has to be negated — `if slot is Some(let
 task) { ret; }` continues exactly where the pattern *didn't* match.
 
-One edge to know: a `match` can't sit directly inside a larger operator
-expression. Bind it to a local first.
+A `match` is an ordinary operand: `flag && match slot { .. }` and
+`1 + match slot { .. }` both work, and so does a method call on one in
+parentheses. The one edge is a `match` that **begins a statement**. Like
+`if`, `for` and a `{ .. }` block, it is complete at its closing brace, so in
+statement position an operator after it starts a new statement instead of
+continuing it. Parenthesize the `match` there (or bind it to a local), and
+the compiler's message says so if you forget:
+
+```vilan
+fun ready(flag: bool, slot: Option<i32>): bool {
+	flag && match slot {              // an operand: fine anywhere
+		Some(let count) => count > 0,
+		None => false,
+	}
+}
+
+fun next(slot: Option<i32>): i32 {
+	(match slot {                     // begins the statement: parenthesize it
+		Some(let count) => count,
+		None => 0,
+	}) + 1
+}
+
+fun main() {
+	let total = 1 + match Some(2) {   // an operand: fine
+		Some(let count) => count,
+		None => 0,
+	};
+	print(i"{ready(true, Some(3))} {next(None)} {total}");   // true 1 3
+}
+```
 
 Arms that never produce a value (a `ret`, a `panic`, a
 `jump break`/`continue`) don't participate in the match's type. The

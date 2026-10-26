@@ -741,3 +741,141 @@ fn a72_navigate_replace_rewrites_the_current_entry_instead_of_pushing_one() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- M167: history state --------------------------------------------------
+//
+// An app that needs to know WHICH entry back or forward reached — kolt's panel
+// layout, where each entry records the panel that showed its page — had to
+// write `history.state` and `replaceState` externs itself, re-mark every entry
+// right after `navigate` pushed it, and tell a pop from a push by comparing
+// marks inside a `current_path()` effect. The router now stores a state text
+// on the entry it pushes or rewrites, reads it back, and says how the app
+// arrived at each entry.
+
+const STATE_APP: &str = r#"import std::io::print;
+import std::reactive::Flow;
+import std::web::router::{
+	HistoryEntry,
+	current_entry,
+	history_state,
+	navigate,
+	navigate_replace_with,
+	navigate_with,
+	set_history_state,
+};
+import std::web::ui::{ View, mount_root, view };
+
+fun main() {
+	let _root = mount_root("app", || {
+		current_entry().effect(|entry: HistoryEntry| {
+			print(i"entry {entry.path} '{entry.state}' popped={entry.popped} read='{history_state()}'");
+		});
+		view("main")
+			.child(view("button").attr("id", "with").on("click", || navigate_with("/a", "left")))
+			.child(view("button")
+				.attr("id", "replace_with")
+				.on("click", || navigate_replace_with("/b", "right")))
+			.child(view("button").attr("id", "plain").on("click", || navigate("/c")))
+			.child(view("button").attr("id", "mark").on("click", || set_history_state("marked")))
+	});
+}
+
+main();
+"#;
+
+const STATE_HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/router.js"),
+    r##"require("./app.js");
+
+const main = root.children[0];
+const button = (id) => main.find(e => e.attributes.id === id);
+
+console.log("-- with");
+button("with").click();
+console.log("stack " + global.historyEntries.join(",") + " state " + global.history.state);
+console.log("-- replace_with");
+button("replace_with").click();
+console.log("stack " + global.historyEntries.join(",") + " state " + global.history.state);
+console.log("-- plain");
+button("plain").click();
+console.log("stack " + global.historyEntries.join(",") + " state " + global.history.state);
+console.log("-- mark");
+button("mark").click();
+console.log("stack " + global.historyEntries.join(",") + " state " + global.history.state);
+console.log("-- back");
+global.historyEntries.pop();
+global.location.pathname = "/b";
+global.history.state = "right";
+global.window.fire("popstate", {});
+console.log("-- back to the first entry");
+global.location.pathname = "/";
+global.history.state = null;
+global.window.fire("popstate", {});
+"##,
+);
+
+/// M167: `navigate_with` / `navigate_replace_with` store a state text on the
+/// entry they push or rewrite, `set_history_state` rewrites the current
+/// entry's state in place (the stack and the path unmoved), `history_state()`
+/// reads it back (`""` for an entry with none), and `current_entry()` is
+/// written for every navigation and every pop — `popped` true only for a pop.
+#[test]
+fn m167_history_entries_carry_state_and_tell_a_pop_from_a_push() {
+    let dir = temp_project("history_state");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"router_state\"\nroot = \".\"\nentry = \"app.vl\"\ntarget = \"browser\"\n",
+    );
+    write(&dir, "app.vl", STATE_APP);
+    write(&dir, "harness.js", STATE_HARNESS);
+
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new("node")
+        .arg("harness.js")
+        .current_dir(&dir)
+        .output()
+        .expect("run node harness");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "history-state harness failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        stdout,
+        concat!(
+            "entry / '' popped=false read=''\n",
+            "-- with\n",
+            "entry /a 'left' popped=false read='left'\n",
+            "stack /,/a state left\n",
+            "-- replace_with\n",
+            "entry /b 'right' popped=false read='right'\n",
+            "stack /,/b state right\n",
+            "-- plain\n",
+            "entry /c '' popped=false read=''\n",
+            "stack /,/b,/c state \n",
+            "-- mark\n",
+            "entry /c 'marked' popped=false read='marked'\n",
+            "stack /,/b,/c state marked\n",
+            "-- back\n",
+            "entry /b 'right' popped=true read='right'\n",
+            "-- back to the first entry\n",
+            "entry / '' popped=true read=''\n",
+        ),
+        "the entry signal, the stack and the stored state"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

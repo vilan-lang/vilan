@@ -95,6 +95,10 @@ impl Text {
 external struct Event;
 impl Event {
 	fun prevent_default(self)
+	fun default_prevented(self): bool       // defaultPrevented
+	fun stop_propagation(self)              // no ancestor's handler runs
+	fun stop_immediate_propagation(self)    // …nor this element's later ones
+	fun propagation_stopped(self): bool     // cancelBubble
 	fun button(self): i32        // 0 = main button
 	fun meta_key(self): bool
 	fun ctrl_key(self): bool
@@ -111,6 +115,13 @@ impl Event {
 	fun pointer_y(self): f64     // clientY
 }
 ```
+
+**Stopping an event.** A click bubbles from the node it lands on up
+through every ancestor's handlers. A card that selects itself on click and
+holds its own buttons calls `event.stop_propagation()` in each button's
+handler, so pressing the button does not also select the card. The rest of
+the button's own handlers still run; `stop_immediate_propagation` skips
+those too.
 
 Raw `element.on` handlers do **not** establish a turn: that's `View.on`'s
 job — and the `Window` verbs are raw in the same way, so a window handler that
@@ -236,6 +247,7 @@ if is_open {
 ```vilan,fragment
 struct View { element: Element }
 fun view(tag: str): View
+fun nothing(): View                                              // places nothing
 fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
@@ -262,6 +274,21 @@ with its `xmlns`. Tags that exist in both vocabularies (`a`, `title`,
 `style`, `script`) resolve to HTML. `class`/`styled` set the `class`
 attribute (not the `className` property), so styling works on SVG nodes
 too.
+
+**A view function with nothing to show returns `ui::nothing()`.** It is
+the mark a `when` or a `swap` leaves where its content goes, an empty text
+node: no element, no box, so a flex row's `gap` leaves no room for it the
+way a placeholder `<span />` would. Place it; it has no element to decorate
+(`attr`, `class` and `child` don't apply to it). A position that is empty
+because of its data says so with `None` in an `Option<View>` hole, `when`
+or `when_some`. On the server it renders as no markup.
+
+```vilan,fragment
+fun notification_bell(): View {
+	model::account() is Some(let account) else ret ui::nothing();
+	<button>"Notifications"</button>
+}
+```
 
 ### View methods
 
@@ -356,6 +383,20 @@ written — between siblings, not after them. They are bare names in the
 Each returned struct implements `Slot`, so it fills any child
 position — including a `{hole}` in element syntax. To place one at the
 parent's current end instead, hand it to `child`: `parent.child(when(..))`.
+
+**Rows that are only owners: `ui::each_owned`.** An `each` row is also how a
+keyed list gives each key its own owner, so a per-row effect lives and dies
+with its row. When the rows have nothing to show, `each_owned(source, key,
+body)` keeps the keyed owners and places nothing: call it where you would
+place an `each`, and `body` runs under a fresh owner for each key that
+arrives, disposed when the key leaves (a key that stays keeps its owner). It
+is a call, not a slot value:
+
+```vilan,fragment
+ui::each_owned(ids, |id| *id, |id| {
+	TaskRecord::find(store, id).effect(|found| note(id, found));
+});
+```
 
 The `View` methods these replaced — `when`, `swap`, `swap_split`, `bind_each`,
 `bind_each_values`, `bind_each_by` — were retired; `parent.swap(s, r)` is now
@@ -496,6 +537,12 @@ Two things deliberately still ask for the concrete type:
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
 fun navigate(path: str)               // pushState + update current_path
 fun navigate_replace(path: str)       // replaceState — same, WITHOUT a new history entry
+fun navigate_with(path: str, state: str)          // navigate, storing `state` on the entry
+fun navigate_replace_with(path: str, state: str)  // navigate_replace, storing `state`
+fun set_history_state(state: str)     // rewrite the current entry's state, address kept
+fun history_state(): str              // the current entry's state ("" when none)
+struct HistoryEntry { path: str, state: str, popped: bool }
+fun current_entry(): SignalCell<HistoryEntry>   // live; popped = back/forward reached it
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
 fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
@@ -528,6 +575,26 @@ advance `current_path()` identically and both join the caller's ambient turn;
 there is no `navigate(path, replace)` because vilan has neither overloading
 nor default arguments, and a bare `true` at the call site says less than the
 name does.
+
+**An entry can carry state.** `navigate_with(path, state)` and
+`navigate_replace_with(path, state)` store a text on the entry they push or
+rewrite (encode a structure as JSON), and `set_history_state(state)` marks the
+entry you are on after the fact. When back or forward returns to it,
+`history_state()` reads the text back. `current_entry()` is the entry as a
+signal: written by every navigation and every `popstate`, with `popped` true
+only when back or forward reached it. That is how an app tells "the user went
+back" from "a link was followed", for example to restore which panel showed a
+page:
+
+```vilan,fragment
+current_entry().effect(|entry| {
+	if entry.popped {
+		restore(entry.state);
+	} else {
+		follow(entry.path);
+	}
+});
+```
 
 `current_path()` is a singleton signal: every caller gets the same one, and
 the `popstate` listener is wired on first use. `link` renders a real anchor

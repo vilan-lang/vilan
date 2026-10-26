@@ -1,0 +1,48 @@
+// M165: a bind list converts at the `any` it lands at, as the native backend's
+// `Any::from` does - an `Option` is its payload or NULL, at every depth and in
+// every form a `List<any>` is filled (a literal element, a value built in
+// place, an `if` element, `push`) - and a `bool` binds as 0 or 1. `print` and
+// `canonical_hash` take an `Option` as it is; a vilan function's `any`
+// parameter receives the payload.
+import std::db::Database;
+import std::hash::canonical_hash;
+
+fun shown(value: any) {
+	print(value);
+}
+
+fun main() {
+	let db = Database::open(":memory:");
+	db.exec("CREATE TABLE t (label TEXT, n INTEGER, flag INTEGER)");
+	let insert = db.prepare("INSERT INTO t (label, n, flag) VALUES (?, ?, ?)");
+	let some: Option<i32> = Some(1);
+	let none: Option<i32> = None;
+	let deep: Option<Option<i32>> = Some(None);
+	let flag: Option<bool> = Some(true);
+	insert.run(["literal", some, true]);
+	insert.run(["none", none, false]);
+	insert.run(["deep", deep, flag]);
+	insert.run(["built", Some(4), Some(false)]);
+	insert.run(["branch", if true { some } else { none }, true]);
+	mut pushed: List<any> = [];
+	pushed.push("pushed");
+	pushed.push(some);
+	pushed.push(flag);
+	insert.run(pushed);
+	for row in db.prepare("SELECT label, n, flag FROM t ORDER BY rowid").all([]) {
+		let n = match row.is_null("n") {
+			true => "NULL",
+			false => i"{row.integer("n")}",
+		};
+		print(i"{row.text("label")} {n} {row.integer("flag")}");
+	}
+	match db.prepare("SELECT label FROM t WHERE n = ? AND flag = ?").first([some, true]) {
+		Some(let row) => print(i"first {row.text("label")}"),
+		None => print("first none"),
+	}
+	print(db.prepare("SELECT label FROM t WHERE n IS ?").all([none]).len());
+	print(some);
+	shown(some);
+	shown(none);
+	print(canonical_hash(Some(1)) == canonical_hash(1));
+}

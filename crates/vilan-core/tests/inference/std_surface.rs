@@ -8077,3 +8077,84 @@ fn b618_a_task_needs_no_import_to_be_annotated_or_awaited() {
         "7\n",
     );
 }
+
+// --- M165: an `Option` landing at `any` is its payload or nothing ------------
+//
+// `Program::any_option_coercions` records where an `Option` lands at an `any`
+// position and the JS emitter unwraps it there (`__any_option`), as the native
+// backend's `Any::from` does. Each landing the analyzer reaches by a different
+// road gets its own pin: a vilan function's `any` parameter (the inference
+// seam), a `List<any>` literal's element (the literal arm, which does not seed
+// the expectation into its elements), `push` onto a `List<any>` (the receiver's
+// binder, which the call's own substitution rebinds to the argument), and an
+// annotated `let`; and the two exemptions — `print`'s and an external's direct
+// `any` parameter take the value as it is.
+
+#[test]
+fn m165_an_option_at_a_vilan_functions_any_parameter_is_its_payload() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun shown(value: any) {
+            print(value);
+        }
+        fun main() {
+            let some: Option<i32> = Some(1);
+            let none: Option<str> = None;
+            let deep: Option<Option<i32>> = Some(Some(2));
+            let hollow: Option<Option<i32>> = Some(None);
+            shown(some);
+            shown(none);
+            shown(deep);
+            shown(hollow);
+            shown(Some("built"));
+        }
+        "#,
+        "1\nnull\n2\nnull\nbuilt\n",
+    );
+}
+
+#[test]
+fn m165_a_list_any_element_push_and_annotated_let_unwrap_an_option() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun shown(values: List<any>) {
+            for value in values {
+                print(value);
+            }
+        }
+        fun main() {
+            let some: Option<i32> = Some(3);
+            let none: Option<i32> = None;
+            shown([some, none, if true { some } else { none }]);
+            mut pushed: List<any> = [];
+            pushed.push(some);
+            pushed.push(none);
+            shown(pushed);
+            let held: any = some;
+            shown([held]);
+        }
+        "#,
+        "3\nnull\n3\n3\nnull\n3\n",
+    );
+}
+
+#[test]
+fn m165_print_and_an_externals_any_parameter_take_the_option_as_it_is() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash::canonical_hash;
+        [extern("JSON.stringify")]
+        external fun stringify(value: any): str;
+        fun main() {
+            let some: Option<i32> = Some(4);
+            print(some);
+            print(stringify(some));
+            print(canonical_hash(some) == canonical_hash(4));
+        }
+        "#,
+        "Some(4)\n[0,4]\nfalse\n",
+    );
+}

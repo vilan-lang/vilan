@@ -4268,6 +4268,7 @@ const HTTP_PROBE: &str = concat!(
     "fun main() {\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| Response::builder()\n",
     "\t\t\t.set_header(\"Content-Type\", \"text/plain\")\n",
     "\t\t\t.body(\"hello\\n\")\n",
@@ -4549,6 +4550,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "\tregister(\"ada\", \"lovelace1\");\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| answer(request),\n",
     "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
     "\t\ton_stop = |stopped| {},\n",
@@ -5871,6 +5873,7 @@ const STOP_PROBE: &str = concat!(
     "fun main() {\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| Response::builder().body(\"hello\\n\").build(),\n",
     "\t\ton_start = |started| {\n",
     "\t\t\tprint(\"started\");\n",
@@ -6102,6 +6105,7 @@ const OPEN_STREAM_PROBE: &str = concat!(
     "fun main() {\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| Response::builder()\n",
     "\t\t\t.streaming(|stream| stream.send(\"first\\n\"))\n",
     "\t\t\t.build(),\n",
@@ -14387,4 +14391,165 @@ fn b626_a_module_scalar_read_only_through_a_view_answers_on_both_backends() {
         Verdict::Identical,
         "a module scalar read through a view must be declared on JS"
     );
+}
+
+/// M166: a derived `FromJson` reads an `Option` field its object leaves out as
+/// `None` — the same answer as `null` — so a struct that gains an `Option`
+/// field still decodes JSON stored before it. A missing non-`Option` field is
+/// still refused by name, a nested `Option<Option<..>>` reads absent and `null`
+/// alike as the outer `None`, and `to_json` still writes `null`.
+#[test]
+fn m166_a_derived_decoder_reads_an_absent_option_field_as_none_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_json_absent_option.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/json_absent_option.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "ok 1 <none>\n",
+                "ok 2 hi\n",
+                "ok 3 <none>\n",
+                "err missing field id\n",
+                "err expected a string\n",
+                "{\"id\":1,\"note\":null}\n",
+                "{\"id\":1,\"note\":\"x\"}\n",
+                "ok none false {\"depth\":null,\"pair\":null}\n",
+                "ok none false {\"depth\":null,\"pair\":null}\n",
+                "ok some(some) true {\"depth\":7,\"pair\":[1,2]}\n",
+                "true {\"inner\":null}\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
+/// M165: a `List<any>` bind list holds an `Option`'s payload or NULL and a
+/// `bool` as 0 or 1 on both backends — the native backend's `Any::from` and
+/// binder already did; JS handed `node:sqlite` the variant's array ("Unknown
+/// named parameter '0'") and a JS boolean ("cannot be bound"). Every way a
+/// bind list is filled converts: a literal element, a value built in place,
+/// an `if` element, a nested `Option`, `push` onto a `List<any>`. `print` and
+/// `canonical_hash` still take the `Option` as it is, and a vilan function's
+/// `any` parameter receives the payload, as natively.
+#[test]
+fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_bind_conversions.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/db_bind_conversions.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "literal 1 1\n",
+                "none NULL 0\n",
+                "deep NULL 1\n",
+                "built 4 0\n",
+                "branch 1 1\n",
+                "pushed 1 1\n",
+                "first literal\n",
+                "2\n",
+                "Some(1)\n",
+                "1\n",
+                "null\n",
+                "false\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
+/// M169: `List::position` and `Iterator::position` answer the index of the
+/// first element a predicate holds for — over a struct's field, which
+/// `index_of` (equality on the whole element) cannot ask — or `None`, and stop
+/// calling the predicate at the hit; the iterator form counts from where the
+/// iterator stands (`skip(1)` first).
+#[test]
+fn m169_position_finds_the_first_match_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_list_position.vl";
+    std::fs::write(staged.join(file), include_str!("native/list_position.vl"))
+        .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "1\n0\ntrue\ntrue\n1 after 2\n2\n1\ntrue\n",
+            "{backend:?}"
+        );
+    }
+}
+
+/// M168: `ServerBuilder::host(addr)` binds that one address on both backends —
+/// node's `listen(port, host, cb)`, natively the same bind — where a server
+/// with no `host` listens on every interface. The witness is a loopback
+/// address that is NOT `127.0.0.1` (Linux routes all of `127.0.0.0/8` to the
+/// loopback device, so `127.0.0.2` binds): bound there, the server answers on
+/// `127.0.0.2` and REFUSES a connection on `127.0.0.1`, which a bind to every
+/// interface would have accepted. `url()` names the bound address.
+#[cfg(target_os = "linux")]
+#[test]
+fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
+    let staged = stage();
+    let program = "native_probe_bound_host.vl";
+    std::fs::write(
+        staged.join(program),
+        concat!(
+            "import std::http::{ Response, Server };\n",
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tServer::builder()\n",
+            "\t\t.port(0)\n",
+            "\t\t.host(\"127.0.0.2\")\n",
+            "\t\t.on_request(|request| Response::builder().body(\"bound\").build())\n",
+            "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()} url={server.url()}\"))\n",
+            "\t\t.build()\n",
+            "\t\t.start();\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    let (mut native, mut node) = both_servers(&staged, program);
+    for (leg, command) in [("native", &mut native), ("node", &mut node)] {
+        let server = ServerUnderTest::spawn(command);
+        let port = server.port();
+        assert!(
+            server
+                .announcement
+                .ends_with(&format!("url=http://127.0.0.2:{port}/")),
+            "{leg}: `url()` names the bound address: {}",
+            server.announcement
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.2", port))
+            .unwrap_or_else(|error| panic!("{leg}: the bound address answers: {error}"));
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.2\r\nConnection: close\r\n\r\n")
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        assert!(
+            response.starts_with("HTTP/1.1 200") && response.ends_with("bound"),
+            "{leg}: the handler answers on the bound address: {response:?}"
+        );
+        let elsewhere = std::net::TcpStream::connect(("127.0.0.1", port));
+        assert!(
+            elsewhere.is_err(),
+            "{leg}: a server bound to 127.0.0.2 must not accept on 127.0.0.1"
+        );
+    }
 }

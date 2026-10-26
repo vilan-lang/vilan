@@ -44,6 +44,14 @@ JSON is a decode error rather than silent garbage or a crash. Both
 `from_json(text)` and `from_json_value(value)` return `Result<Self, str>`;
 handle it with `!`, `match`, or `is Ok(..)`.
 
+An `Option` field is the one a derived decoder lets an object leave out:
+absent reads as `None`, exactly as `null` does, so a struct that gains an
+`Option` field still decodes JSON written before it (a preference in
+`localStorage`, a row's JSON column). `to_json` still writes the `null`.
+The test is the field's WRITTEN type — `note: Option<str>` — so an alias
+for an `Option`, or a type parameter instantiated at one, must be present
+like any other field.
+
 The two decode methods differ in what they take, not in what they answer:
 `from_json` parses the text (non-crashing) and hands off to
 `from_json_value`, which validates an already-parsed value's shape. That
@@ -68,6 +76,12 @@ struct Point {
 	y: i32,
 }
 
+[derive(Json)]
+struct Note {
+	id: i32,
+	text: Option<str>,
+}
+
 fun main() {
 	let point = Point { x = 1, y = 2 };
 	let text = point.to_json();
@@ -88,6 +102,12 @@ fun main() {
 	match Point::from_json("{\"x\":1}") {
 		Ok(_) => print("decoded"),
 		Err(let reason) => print(reason), // missing field y
+	}
+
+	// An `Option` field may be left out: it reads as `None`.
+	match Note::from_json("{\"id\":1}") {
+		Ok(let note) => print(note.text.is_none()), // true
+		Err(let reason) => print(reason),
 	}
 
 	// So is text that isn't JSON at all.

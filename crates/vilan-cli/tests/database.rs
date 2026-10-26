@@ -531,3 +531,50 @@ main();
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// M165: a value SQLite cannot hold — a struct, a list, a tuple or a
+/// non-`Option` enum, which reached a `List<any>` because `any` takes it — is
+/// refused at the bind by its INDEX in the list, with what may be bound,
+/// rather than by `node:sqlite`'s own sentence (an array was read as named
+/// parameters: "Unknown named parameter '0'"). JS only: natively such a value
+/// cannot be built into a bind list at all (`vilan_rt::Any` has no arm for
+/// it). The run stops — a refused bind is a throw, as a failing statement is.
+#[test]
+fn m165_an_unbindable_parameter_is_refused_naming_its_index() {
+    let dir = migration_project(
+        "unbindable",
+        r#"import std::io::print;
+import std::db::Database;
+
+struct Point {
+	x: i32,
+}
+
+fun main() {
+	let db = Database::open(":memory:");
+	db.exec("CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER)");
+	let insert = db.prepare("INSERT INTO t (a, b, c) VALUES (?, ?, ?)");
+	insert.run([1, true, Some(2)]);
+	print("bound");
+	insert.run([1, 2, Point { x = 3 }]);
+	print("unreachable");
+}
+main();
+"#,
+    );
+    let output = run(&dir, &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "bound\n",
+        "a bool and an Option bind; the struct stops the run"
+    );
+    let stderr = stderr_of_failure(&output, "binding a struct");
+    assert!(
+        stderr.contains(
+            "std::db: cannot bind the parameter at index 2 of 3: a struct, tuple, list or enum \
+             value is not a SQLite value (bind a number, a str, a bool, or an Option of one)"
+        ),
+        "the refusal names the parameter's index:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

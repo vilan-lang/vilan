@@ -274,3 +274,178 @@ green_seals = 0
 blocking = false
 mandate = true
 series = "Order 52 (N174): re-anchored from `let messages = channel.messages();` (gone with the mirrored-store exhibit, kolt@dee494ab) to `channel_name.adopt(channel.current_name());` in the same channel.vl - a statement over a `g.channels()` boundary; the break and its repair are the same shape, the figures start a new series."
+
+# std-55 (Order 55): std grew - `Iterator::position` (a trait default every std iterator
+# instantiates; ~0.25% of math alone), `List::position`, the router's history entry, `ui::nothing`
+# and `each_owned` on both twins, the Json derive's absent-`Option` rule, `ServerBuilder::host`,
+# `build_of`'s lookup beside the module - and M165's `any` landing check on the inference seam
+# (~0.09% of math, measured with the seam off). Measured against v0.52.0 (d18f50d8) on this box;
+# each ratio is the measured one rounded up, plus 0.001.
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.009
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0073"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.009
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0073"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:watch"
+class = "reference"
+ratio = 1.009
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0071"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.009
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0071"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:browser"
+class = "reference"
+ratio = 1.007
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0051"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.007
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0051"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.007
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0054"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.007
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0054"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:router"
+class = "reference"
+ratio = 1.008
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0062"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.008
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0062"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.005
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0039"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.005
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0039"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.006
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0043"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.006
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0043"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:canvas"
+class = "reference"
+ratio = 1.006
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0050"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.006
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0050"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:rpc"
+class = "reference"
+ratio = 1.004
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0026"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.004
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0026"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.004
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0027"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.004
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0027"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.007
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0052"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.007
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0052"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "genapp:46"
+class = "reference"
+ratio = 1.003
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0015"
+item = "M165, M166, M167, M169, M170"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.003
+reason = "std-55: std growth (position, the router entry, ui::nothing/each_owned, the derive's Option rule) and M165's any-landing check; measured x1.0015"
+item = "M165, M166, M167, M169, M170"
