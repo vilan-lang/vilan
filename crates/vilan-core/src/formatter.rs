@@ -4238,8 +4238,8 @@ struct Printer<'src> {
     terminator_end: Option<usize>,
     /// E337/E338: the columns that follow the expression ending at
     /// [`Self::terminator_end`] on its line - the statement's `;` (one), plus
-    /// what a postfix applied after it prints (`!`, `?`, `.field`).
-    /// Meaningful only while `terminator_end` is set.
+    /// what a postfix applied after it prints (`!`, `?`, `.field`), or the
+    /// hole's `}` (one). Meaningful only while `terminator_end` is set.
     terminator_columns: usize,
     /// E314: how many element-body holes (`{ … }`) enclose the expression being
     /// printed. A call's arguments break one per line only inside one — outside
@@ -6840,7 +6840,7 @@ impl<'src> Printer<'src> {
     /// statement's `;` (one) when `expr` is the very expression the terminated
     /// statement being reprinted ends with (the printer pushes the `;` after
     /// it), plus the postfix an enclosing `!` / `?` / `.field` prints after it
-    /// (E337); else none.
+    /// (E337) or the `}` of the hole it stands in (E338); else none.
     fn terminator_after(&self, expr: &Spanned<Node<'src>>) -> usize {
         if self.terminator_end == Some(expr.1.into_range().end) {
             self.terminator_columns
@@ -7843,7 +7843,13 @@ impl<'src> Printer<'src> {
                 // breaking their arguments.
                 let blocked = std::mem::replace(&mut self.arguments_blocked, false);
                 self.hole_depth += 1;
+                // E338: the hole's expression ends where its `}` begins - one
+                // column the call in it counts, as a `;` is for a statement.
+                let enclosing = (self.terminator_end, self.terminator_columns);
+                self.terminator_end = Some(inner.1.into_range().end);
+                self.terminator_columns = 1;
                 self.print_expr(inner);
+                (self.terminator_end, self.terminator_columns) = enclosing;
                 self.hole_depth -= 1;
                 self.arguments_blocked = blocked;
                 self.out.push('}');
@@ -19315,7 +19321,8 @@ mod call_statement_terminator {
     //!
     //! E337 carries the count through a `!` / `?` / `.field` that ends the
     //! statement (`let v = f(a, b, c)!;`: the postfix and the `;` both follow
-    //! the call).
+    //! the call), and E338 gives a call that ends an element hole the hole's
+    //! `}` the same way.
     use super::bailing_constructs::assert_construct;
 
     const CALLEE: &str = "plain_function_call_with_no_chain_at_all";
@@ -19374,26 +19381,52 @@ mod call_statement_terminator {
         }
     }
 
-    /// A call inside an element hole is unchanged: the hole's `}` is not a
-    /// statement terminator, and no statement hook arms there.
+    /// E338: a call inside an element hole ends where the hole's `}` begins, so
+    /// the 101-column hole line splits like the 101-column terminated call
+    /// (E329) - the hole's `}` is the column the statement's `;` is.
+    fn hole(columns: usize, postfix: &str) -> (String, String) {
+        let fixed = 8
+            + 1
+            + "plain_call_with_no_chain(argument_one, argument_two, )".len()
+            + postfix.len()
+            + 1;
+        let last = "a".repeat(columns - fixed);
+        (
+            format!(
+                "fun demo(): View {{\n\t<div>\n\t\t{{plain_call_with_no_chain(argument_one, argument_two, {last}){postfix}}}\n\t</div>\n}}\n"
+            ),
+            format!(
+                "fun demo(): View {{\n\t<div>\n\t\t{{plain_call_with_no_chain(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{last},\n\t\t){postfix}}}\n\t</div>\n}}\n"
+            ),
+        )
+    }
+
     #[test]
-    fn a_call_in_an_element_hole_is_unchanged() {
-        let hole = |columns: usize| {
-            let fixed = 8 + 1 + "plain_call_with_no_chain(argument_one, argument_two, )".len() + 1;
-            let last = "a".repeat(columns - fixed);
-            (
-                format!(
-                    "fun demo(): View {{\n\t<div>\n\t\t{{plain_call_with_no_chain(argument_one, argument_two, {last})}}\n\t</div>\n}}\n"
-                ),
-                format!(
-                    "fun demo(): View {{\n\t<div>\n\t\t{{plain_call_with_no_chain(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{last},\n\t\t)}}\n\t</div>\n}}\n"
-                ),
-            )
-        };
-        let (at_the_budget, _) = hole(100);
+    fn a_hole_line_at_the_budget_stays_inline() {
+        let (at_the_budget, _) = hole(100, "");
         assert_construct(&at_the_budget, &at_the_budget);
-        let (past, split) = hole(102);
+    }
+
+    #[test]
+    fn a_hole_line_one_column_over_splits() {
+        let (over, split) = hole(101, "");
+        assert_construct(&over, &split);
+    }
+
+    #[test]
+    fn a_hole_line_two_columns_over_splits() {
+        let (past, split) = hole(102, "");
         assert_construct(&past, &split);
+    }
+
+    /// E338 with E337: the hole's expression is `f(..)!`, and the `!` and the
+    /// `}` are both columns after the call.
+    #[test]
+    fn a_hole_call_with_a_postfix_counts_the_postfix_and_the_brace() {
+        let (at_the_budget, _) = hole(100, "!");
+        assert_construct(&at_the_budget, &at_the_budget);
+        let (over, split) = hole(101, "!");
+        assert_construct(&over, &split);
     }
 
     /// E337: the call is the subject of a `!` / `?` / `.field` that ends the
