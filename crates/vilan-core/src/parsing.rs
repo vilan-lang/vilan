@@ -2242,6 +2242,9 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
+    /// B656: a binder named `css` was refused and read as the name, so a bare
+    /// `css` after it is that binding's use, not a second refusal.
+    css_binder_refused: bool,
     /// Whether the statement about to be read is the FILE's first (B415): the
     /// one position `mod self;` — the host of the file's platform — may stand
     /// in. Set by
@@ -3054,6 +3057,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             context_stack: Vec::new(),
             preserve_paren_groups,
             in_member_body: false,
+            css_binder_refused: false,
             file_head: false,
             nesting_depth: 0,
             nesting_refusal: None,
@@ -6285,6 +6289,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return Some(initializer);
             }
         }
+        // B656: once a binder named `css` has been refused (and read as that
+        // name), a bare `css` is its USE — read as the name too, silently: the
+        // binding's refusal is the one diagnostic for the one cause.
+        if self.css_binder_refused && self.peek_is(&Token::Css) {
+            let start = self.position;
+            self.bump();
+            return Some((Node::Accessor("css"), self.span_from(start)));
+        }
         self.parse_atom()
     }
 
@@ -8254,6 +8266,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         // parameter, the `,` its argument list could have taken at its `>` —
         // and `fun f(a: List<i32>, 5)` reported "found '>' expected ','" one
         // parameter early. A `let` and a `for` binder read the same production.
+        // B656: `css` is a keyword, and a binder is a parse-time fact — so the
+        // refusal is made HERE, wherever the binder stands (a `let` in a
+        // closure in an element hole included), and the binder is read as the
+        // name it was meant to be. Before, the parse broke at the word and
+        // the keyword diagnostic fired only when the farthest failure happened
+        // to land on it; in a closure inside an element hole it never did, and
+        // a `List<void>` hole error and two "expected `;`" stood in for it.
+        if self.peek_is(&Token::Css) {
+            let span = self.here_span();
+            self.bump();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+            self.css_binder_refused = true;
+            return Some((Pattern::Binding("css", false, span), span));
+        }
         let Some(name) = self.eat_ident() else {
             self.note_expected("a name");
             return None;
