@@ -614,8 +614,14 @@ impl Connection {
                 body.settle(BodyState::Read(bytes));
                 true
             }
+            // The client went away with the body half sent: the read ends as a
+            // cancellation, and so does the connection — nobody is left to
+            // answer, and a connection left `Dispatched` would never close (nor
+            // let a graceful stop finish).
             Decoded::More if hung_up => {
                 body.settle(BodyState::Gone);
+                drop(body);
+                self.close();
                 true
             }
             Decoded::More => progressed,
@@ -2396,6 +2402,47 @@ mod tests {
             1,
             "the program's `Connection: close` is not written twice: {headers:?}"
         );
+    }
+
+    /// A client that hangs up halfway through a body being read: the read
+    /// ends (the handler's code after it does not run) and the connection is
+    /// CLOSED — it was left `Dispatched` forever, holding its socket and keeping
+    /// a graceful stop from finishing.
+    #[test]
+    fn a_client_gone_mid_body_ends_the_read_and_the_connection() {
+        let after_the_read = Rc::new(Cell::new(false));
+        let reached = Rc::clone(&after_the_read);
+        let dispatched = Rc::new(Cell::new(false));
+        let started = Rc::clone(&dispatched);
+        let left = block_on(async move {
+            let handler: Handler = Rc::new(move |request: Request, response: Response| {
+                let reached = Rc::clone(&reached);
+                let started = Rc::clone(&started);
+                crate::executor::pin_future(async move {
+                    started.set(true);
+                    let _body = read_body(request.clone(), response.clone(), 1024).await;
+                    reached.set(true);
+                })
+            });
+            let server = create_server(handler);
+            server.listen(0, Rc::new(|| {}));
+            let port = server.port() as u16;
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+                stream
+                    .write_all(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\nhalf")
+                    .expect("send half a request");
+            });
+            client.join().expect("the client thread");
+            let seen = Rc::clone(&dispatched);
+            until(move || seen.get()).await;
+            let probe = server.clone();
+            until(move || probe.0.connections.borrow().is_empty()).await;
+            server.close(Rc::new(|| {}));
+            server.0.connections.borrow().len()
+        });
+        assert_eq!(left, 0, "the connection closes with its client");
+        assert!(!after_the_read.get(), "the handler ends at the read");
     }
 
     #[test]
