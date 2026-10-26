@@ -392,3 +392,60 @@ main();
         "no B677 warning: {warnings:#?}"
     );
 }
+
+#[test]
+fn b677_a_view_parameter_called_in_a_literal_nested_in_an_owner_body_is_warned() {
+    // kolt's `page: (|str| View) context page_focus` (panels.vl): a clause for
+    // another context injects that one and still CAPTURES the owner, and the
+    // call sits inside a literal handed to a helper inside the `swap` — the
+    // nested literal captures the swap's owner, `page` builds the page under
+    // the owner it was made with (the app root), and nothing releases it on
+    // navigation. Warned at the call, naming the owner body. A `|K| void`
+    // callback an event handler fires inside the body is not the body's own
+    // work and is not warned.
+    let source = r#"
+import std::context::Context;
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ View, swap };
+
+let focus: Context<str> = Context::new();
+
+fun framed(body: (|| View) context focus): View {
+    focus.run("page", || body())
+}
+
+fun area(
+    path: SignalCell<str>,
+    page: (|str| View) context focus,
+    choose: |str| void,
+): View {
+    <div>
+        {swap(path, |now|
+            <div>
+                {framed(|| page(now))}
+                <button on:click(|_event| choose(now))>"pick"</button>
+            </div>)}
+    </div>
+}
+
+fun main() {}
+main();
+"#;
+    let warnings = warning_diagnostics_with_std_on(source, std_spec(), Platform::Browser);
+    let spans: Vec<&str> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("is a closure parameter called inside"))
+        .map(|(_, range)| &source[range.clone()])
+        .collect();
+    assert_eq!(
+        spans,
+        vec!["page(now)"],
+        "the nested view call is warned and the handler's callback is not: {warnings:#?}"
+    );
+    assert!(
+        warnings.iter().any(|(message, _)| message
+            .contains("`page` is a closure parameter called inside `swap`'s body")
+            && message.contains("type it `(sync |str| View) context owner_scope`")),
+        "the warning names the owner body and the fix: {warnings:#?}"
+    );
+}
