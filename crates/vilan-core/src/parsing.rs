@@ -229,6 +229,12 @@ pub enum ParseErrorReason {
         kind: lexing::EscapeErrorKind,
         written: String,
     },
+    /// B654: a triple-quoted attribute argument that breaks the multiline
+    /// rule — the rule's own sentence (`util::multiline_layout`'s).
+    MalformedMultiline(String),
+    /// B654: a triple-quoted string where an attribute takes a one-line one
+    /// (every argument but `[extern(..)]`'s host expression).
+    MultilineAttributeArgument,
     /// B655: a statement in an `impl` body that is not a member.
     NonMemberInImpl(NonMember),
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
@@ -1781,6 +1787,13 @@ fn matching_close(open: char) -> char {
     }
 }
 
+/// B654: a triple-quoted string where an attribute argument is a one-line
+/// string. Curated (diagnostics-standard.md B6): the rule and the one place
+/// the multi-line form IS an attribute argument.
+const MULTILINE_ATTRIBUTE_ARGUMENT: &str = "an attribute argument here is a one-line string; a \
+     triple-quoted string is an attribute argument only as `[extern(\"\"\"…\"\"\")]`'s host \
+     expression, alone";
+
 /// What B655 refuses in an `impl` body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NonMember {
@@ -1945,6 +1958,8 @@ pub fn render(error: &ParseError) -> String {
         ),
         ParseErrorReason::Escape { kind, written } => escape_rule(*kind, written),
         ParseErrorReason::NonMemberInImpl(kind) => non_member_rule(*kind),
+        ParseErrorReason::MalformedMultiline(message) => message.clone(),
+        ParseErrorReason::MultilineAttributeArgument => MULTILINE_ATTRIBUTE_ARGUMENT.to_string(),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -2421,6 +2436,9 @@ fn apply_binding_mutability(pattern: Pattern<'_>, mutable: bool) -> Pattern<'_> 
 enum ExternArg<'src> {
     Word(&'src str),
     Text(&'src str),
+    /// A triple-quoted literal's raw inner text and the token's span (B654):
+    /// legal as the attribute's ONE argument, the host expression.
+    Code(&'src str, Span),
 }
 
 /// Interprets a `[extern(..)]` attribute's arguments into a host binding. A
@@ -2429,6 +2447,7 @@ enum ExternArg<'src> {
 fn extern_binding_from_args<'src>(args: &[ExternArg<'src>]) -> ExternBinding<'src> {
     use ExternArg::{Text, Word};
     match args {
+        [ExternArg::Code(text, _)] => ExternBinding::Code { text },
         [Text(symbol)] => ExternBinding::Function {
             module: None,
             symbol,
@@ -11052,6 +11071,21 @@ impl<'a, 'src> Parser<'a, 'src> {
             if retains {
                 binding.pop();
             }
+            // B654: the host expression stands alone. Beside a form word or a
+            // module it would lower to the empty global symbol, silently, as a
+            // malformed attribute does — so it is refused at the literal.
+            if binding.len() > 1 {
+                for argument in &binding {
+                    if let ExternArg::Code(_, span) = argument {
+                        parser.errors.push(ParseError {
+                            span: *span,
+                            reason: ParseErrorReason::MultilineAttributeArgument,
+                            context: Vec::new(),
+                            hint: None,
+                        });
+                    }
+                }
+            }
             Some((extern_binding_from_args(&binding), retains))
         })
     }
@@ -11071,7 +11105,61 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.bump();
                 Some(ExternArg::Text(text))
             }
+            // B654: the triple-quoted form, raw and multi-line — where a long
+            // host expression lives. Its shape is the multiline rule's, refused
+            // here at the literal as it would be anywhere else (no expression
+            // walk ever sees an attribute argument).
+            Some(Token::MultilineString(text)) => {
+                let text = *text;
+                let span = self.token_span(self.position);
+                self.bump();
+                self.refuse_malformed_multiline(text, span);
+                Some(ExternArg::Code(text, span))
+            }
             _ => None,
+        }
+    }
+
+    /// A STRING attribute argument that is not `[extern(..)]`'s host
+    /// expression — a steer, a reason, a platform pattern: one line. A
+    /// triple-quoted string there is refused AT the literal and read as its
+    /// raw text, so the attribute (and the item under it) still parses; before
+    /// B654 the attribute failed whole and re-read as a list expression, which
+    /// reported "cannot find 'deprecated' in this scope".
+    fn eat_attribute_string(&mut self) -> Option<&'src str> {
+        match self.peek() {
+            Some(Token::String(text)) => {
+                let text = *text;
+                self.bump();
+                Some(text)
+            }
+            Some(Token::MultilineString(text)) => {
+                let text = *text;
+                self.errors.push(ParseError {
+                    span: self.token_span(self.position),
+                    reason: ParseErrorReason::MultilineAttributeArgument,
+                    context: Vec::new(),
+                    hint: None,
+                });
+                self.bump();
+                Some(text)
+            }
+            _ => None,
+        }
+    }
+
+    /// The multiline rule (`util::multiline_layout`) over a triple-quoted
+    /// literal's raw text, refused at the offending text inside it. `span` is
+    /// the whole token's, delimiters included.
+    fn refuse_malformed_multiline(&mut self, text: &'src str, span: Span) {
+        if let Err((message, range)) = crate::util::multiline_layout(text) {
+            let content_start = span.start + "\"\"\"".len();
+            self.errors.push(ParseError {
+                span: (content_start + range.start..content_start + range.end).into(),
+                reason: ParseErrorReason::MalformedMultiline(message),
+                context: Vec::new(),
+                hint: None,
+            });
         }
     }
 
@@ -11142,11 +11230,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             parser.bump();
             parser.expect_ctrl('(')?;
-            let Some(Token::String(steer)) = parser.peek() else {
-                return None;
-            };
-            let steer = *steer;
-            parser.bump();
+            let steer = parser.eat_attribute_string()?;
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(steer)
@@ -11170,11 +11254,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             parser.bump();
             parser.expect_ctrl('(')?;
-            let Some(Token::String(reason)) = parser.peek() else {
-                return None;
-            };
-            let reason = *reason;
-            parser.bump();
+            let reason = parser.eat_attribute_string()?;
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(reason)
@@ -11279,13 +11359,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// One platform pattern: a quoted string with its span.
     fn parse_platform_pattern(&mut self) -> Option<Spanned<&'src str>> {
         let start = self.position;
-        if let Some(Token::String(text)) = self.peek() {
-            let text = *text;
-            self.bump();
-            Some((text, self.span_from(start)))
-        } else {
-            None
-        }
+        let text = self.eat_attribute_string()?;
+        Some((text, self.span_from(start)))
     }
 
     // --- Macro forms ---------------------------------------------------------

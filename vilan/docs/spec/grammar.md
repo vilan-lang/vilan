@@ -220,10 +220,17 @@ named-binder = MEMBER "=" binder ;
 
 extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] [ "," ] ")" "]" ;
 extern-args = STRING [ "," STRING ]              (* global, or module and symbol *)
+            | MULTILINE_STRING                   (* a host expression over lines *)
             | "method" [ "," STRING ]            (* method on the receiver *)
             | ( "get" | "set" ) "," STRING       (* property read / write *)
             | "new" "," STRING [ "," STRING ] ;  (* construction *)
 ```
+
+A triple-quoted string is the first arm's host expression when it does not
+fit on a line: `[extern("""…""")]`, raw and laid out by the multiline rule
+(lexical.md §2), stands alone and is called parenthesized, `(…)(args)`. Every
+other string argument of every attribute is a one-line `STRING`; a
+triple-quoted one there is refused at the literal.
 
 The four arms are the four host bindings. `"method"` is the only form
 word that stands alone: `[extern(method)]` binds the receiver method of

@@ -10468,6 +10468,15 @@ impl<'src> Transformer<'src> {
                 }
                 js::Node::Call(Box::new(js::Node::Local(format!("new {symbol}"))), args)
             }
+            // B654: a triple-quoted host expression, its text laid out by the
+            // multiline rule (the parser refused a malformed one) and called
+            // PARENTHESIZED — a multi-line arrow or `function` written bare
+            // would take the argument list into its own body.
+            ExternBinding::Code { text } => {
+                let code =
+                    crate::util::trim_multiline_string(text).unwrap_or_else(|_| text.to_string());
+                js::Node::Call(Box::new(js::Node::Local(format!("({code})"))), args)
+            }
         }
     }
 
