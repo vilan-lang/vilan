@@ -14,6 +14,7 @@
 
 import pkg::bytes::Bytes;
 import pkg::compare::Ordering;
+import pkg::hash_map::HashMap;
 import pkg::http::{ NodeRequest, NodeSocket, Request, Response, ServerBuilder };
 import pkg::json::{ FromJson, JsonKind, JsonValue, coerce_str, has_json_field };
 import pkg::option::Option::{ self, None, Some };
@@ -47,9 +48,18 @@ import pkg::rpc::{
 // `std::rpc` when `RpcRequest` began carrying it; this path still names it.
 export import pkg::rpc::Session;
 import pkg::shared::Shared;
-import pkg::time::now_millis;
+import pkg::task::ambient_nursery;
+import pkg::time::{ Duration, now_millis, sleep_for };
 import pkg::wire::{ Codec, Frame };
-import pkg::ws::{ WsEvent, WsParser, binary_frame, close_frame, pong_frame, text_frame };
+import pkg::ws::{
+	WsEvent,
+	WsParser,
+	binary_frame,
+	close_frame,
+	close_frame_with,
+	pong_frame,
+	text_frame,
+};
 
 // --- WebSocket handshake (node:crypto) ------------------------------------------
 
@@ -121,6 +131,45 @@ export impl Connection {
 	/// silent drop) once the connection is.
 	fun client<P: ClientProxy>(self): P {
 		P::for_connection(self.id)
+	}
+
+	/// Close this connection from app code (A174, door 2): the wire is closed with
+	/// `reason` — a WebSocket close frame carrying it (code 1000), an SSE stream
+	/// ended — and everything a closed connection releases follows as for a peer
+	/// that went away: the reactive session disposed, the service instance dropped,
+	/// `on_disconnect` told. A client that reconnects dials afresh, so `authorize`
+	/// and every `[rpc]`'s own checks run again — which is how an app ends a
+	/// session whose rights changed (a member removed from an organization, a
+	/// session signed out or deleted elsewhere): a mirror it handed out stops
+	/// streaming with the wire.
+	///
+	/// The close lands on the NEXT tick, after the turn it is called from has
+	/// answered: an `[rpc]` that closes its own connection still answers its
+	/// call, and the client reads the reply before it reads the drop. Answers
+	/// whether a live connection was found (a second close, or one after the
+	/// peer went, finds none).
+	fun close(self, reason: str): bool {
+		close_connection(self.id, reason)
+	}
+}
+
+/// `Connection::close` by connection id — for the app that keeps the id
+/// (`connection.id`, the `on_connect`/`on_disconnect` argument) rather than the
+/// `Connection` value.
+export fun close_connection(connection: i32, reason: str): bool {
+	match closers.read().get(connection) {
+		Some(let close) => {
+			// Free-floating on purpose: the caller's nursery — a handler's run —
+			// may be released with the turn, and the close must outlive it.
+			ambient_nursery.clear(|| {
+				let _closing = async {
+					sleep_for(Duration::millis(0));
+					close(reason);
+				};
+			});
+			true
+		},
+		None => false,
 	}
 }
 
@@ -890,6 +939,13 @@ export impl ServerBuilder {
 /// connection id announced on its SSE stream.
 let connections: Shared<List<(i32, DuplexEnd)>> = Shared::new([]);
 
+/// How to close each live connection from app code, by connection id (A174): a
+/// socket's writes its close frame and destroys itself, a stream's ends. Put in at
+/// accept, before the service instance is built — so an instance that keeps its
+/// `Connection` can close it at any later point — and taken out with the
+/// connection.
+let closers: Shared<HashMap<i32, |str| void>> = Shared::new(HashMap::new());
+
 /// Connection ids — module-level, one counter for the program.
 let next_connection: Shared<i32> = Shared::new(0);
 
@@ -946,6 +1002,7 @@ fun events_response(service: Service): Response {
 				}
 			});
 			connections.write().push((id, wire_end));
+			closers.write().insert(id, |_reason: str| stream.close());
 			stream.on_close(|| {
 				drop_connection(id);
 				on_disconnect(id);
@@ -1283,6 +1340,16 @@ fun accept_socket(
 			Frame::Binary(let bytes) => socket.write_bytes(binary_frame(tag_client_bytes(0, bytes))),
 		}
 	});
+	// `Connection::close` (A174), registered before the instance is built for the
+	// same reason the reverse lane is: the instance may keep its `Connection` and
+	// close it later. A close frame with the reason, then the socket destroyed —
+	// the `close` signal runs the teardown below.
+	closers.write().insert(id, |reason: str| {
+		if !socket.destroyed() {
+			socket.write_bytes(close_frame_with(1000, reason));
+			socket.destroy();
+		}
+	});
 	// The connection's OWN protocol: under `Service::factory` this builds the
 	// instance that answers for this client and nothing else (A38), and every
 	// `respond` below routes through it. `session` is what `authorize` proved about
@@ -1450,6 +1517,7 @@ fun accept_socket(
 /// Forget a closed connection's wire (frames already in flight to it are silently
 /// dropped by the host — see `NodeResponse.write`).
 fun drop_connection(target: i32) {
+	closers.write().remove(target);
 	mut kept: List<(i32, DuplexEnd)> = [];
 	for entry in connections.read() {
 		let (id, wire) = entry;

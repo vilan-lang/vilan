@@ -56,6 +56,19 @@ fun close_frame(): Bytes {
 	encode_frame(0x8, Bytes::alloc(0))
 }
 
+/// A close frame carrying a status code and a reason (RFC 6455 §5.5.1): the code in
+/// two bytes, big-endian, then the reason as UTF-8 — what a peer's `onclose` event
+/// reports as `code` and `reason`. The reason is cut at 123 bytes, the control
+/// frame's payload bound less the code.
+fun close_frame_with(code: i32, reason: str): Bytes {
+	mut head = Bytes::alloc(2);
+	head.set(0, (code >> 8) & 0xFF);
+	head.set(1, code & 0xFF);
+	let text = encode_utf8(reason);
+	let payload = if text.len() > 123 { text.slice(0, 123) } else { text };
+	encode_frame(0x8, Bytes::concat(head, payload))
+}
+
 // --- Parsing (client → server) ------------------------------------------------
 
 /// What one `feed` can surface. Pongs are consumed silently; a `Ping` asks the

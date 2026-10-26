@@ -526,6 +526,11 @@ impl Service {
 impl ServerBuilder {
 	fun with_service(own self, service: Service): ServerBuilder   // repeatable
 }
+impl Connection {
+	fun client<P: ClientProxy>(self): P        // the typed proxy for the connection's [client_service]
+	fun close(self, reason: str): bool         // close the wire from app code (A174)
+}
+fun close_connection(connection: i32, reason: str): bool   // Connection::close by id
 ```
 
 A service is WebSocket upgrade + per-connection session registration
@@ -552,6 +557,21 @@ usually; serving the build's own artifacts is
 One matching rule is worth knowing: a service claims a path **segment** —
 its route exactly, or its route followed by `?` — so `/rpc` does not
 shadow an application's `/rpcs` or `/rpc-docs`.
+
+**Closing a connection from app code.** A service instance that keeps its
+`Connection` (or its id) can end the session behind it:
+`connection.close("signed out")` writes a WebSocket close frame carrying
+the reason (code 1000; an SSE stream is ended) and destroys the socket, and
+everything a closed connection releases follows as for a peer that went
+away — the reactive session, the instance, `on_disconnect`. The close lands
+on the *next tick*, after the turn it is called from has answered, so an
+`[rpc]` that closes its own connection still answers its call. A client
+that reconnects dials afresh: `authorize` and every `[rpc]`'s own checks
+run again, which is how an app takes back what it handed out — a member
+removed from an organization, a session signed out or deleted elsewhere —
+and a mirror the service returned stops streaming with the wire (the
+client's handles read `Refreshing` from the drop, `Closed` if the redial is
+refused). The answer says whether a live connection was found.
 
 ## Envelope & codec layer
 
