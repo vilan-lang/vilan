@@ -854,3 +854,18 @@ class = "reference"
 ratio = 1.004
 reason = "solver-55's checks beside B646's own rows: B647's whole-program module-loan check and the write summary over a WriteSubject, B649's by-value arm, B659's literal prechecks per generic call, B667's match leg record, B670's subtree deferral, B665's cause map. The lane's whole cost on the rebased tip against origin/next @3a0e57ae: x1.00392 instructions:u (B646's share is under its own 1.005 rows)."
 item = "B659"
+series = "Order 52 (N174): re-anchored from `let messages = channel.messages();` (gone with the mirrored-store exhibit, kolt@dee494ab) to `channel_name.adopt(channel.current_name());` in the same channel.vl - a statement over a `g.channels()` boundary; the break and its repair are the same shape, the figures start a new series."
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.005
+reason = "std grew on every program's load: the mirror's keyed tables (M172), the rpc answer under guarded_async (M165), Connection::close (A174) and B677's warning pass — todo +0.24% on the lane's box (math and watch flat)"
+item = "M172"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.005
+reason = "std grew on every program's load: the mirror's keyed tables (M172), the rpc answer under guarded_async (M165), Connection::close (A174) and B677's warning pass — todo +0.24% on the lane's box (math and watch flat)"
+item = "M172"
