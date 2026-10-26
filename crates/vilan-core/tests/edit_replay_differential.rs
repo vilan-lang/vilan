@@ -567,21 +567,25 @@ fn packages_with_one_std_closure_share_one_std_prefix() {
 }
 
 /// A package impl on a std CONCRETE type std's own resolve asks about —
-/// `SignalCell<T>`'s `get`, asked of `SignalCell<T>` itself — for the guard's
-/// refusing case.
+/// `SignalCell<T>`'s `get`, asked of `SignalCell<T>` itself — the case §4.2's
+/// guard refused and the P6a rule decides.
 const PREFIX_PEEK: &str = "import std::reactive::SignalCell;\n\n\
 export trait Peek {\n\tfun get(self): i32;\n}\n\n\
 export impl SignalCell<type T> with Peek {\n\tfun get(self): i32 {\n\t\t0\n\t}\n}\n";
 
-/// **std-prefix P1, §4.2's guard.** A package impl that could answer a
-/// question std's own resolve asked — here a trait impl on std's
-/// `SignalCell<T>` declaring `get`, which std's reactive code looks up on
-/// `SignalCell<T>` — refuses the prefix: the analysis is built in the shape it
-/// would have taken without it (the canonical one: no hot seed), answers what
-/// the clean analysis answers, and the next analysis of the same package does
-/// not try again.
+/// **std-prefix P6a, §4.2 hardened from guard to RULE** (`std-prefix.md`
+/// §14.3). A package impl that could answer a question std's own resolve asks
+/// — a trait impl on std's `SignalCell<T>` declaring `get`, which std's
+/// reactive code looks up on `SignalCell<T>` — used to REFUSE the prefix
+/// (`impl-reached`): the canonical drain resolved std and the package in one
+/// fixpoint, so the impl was in reach of std's resolution there and not over
+/// the prefix. The canonical drain now resolves the tiers before the package's
+/// first node mints, as the prefix world does, so the package is SERVED over
+/// the prefix and answers what the clean analysis answers; the next analysis
+/// is served the stored prefix. The guard is the TEST oracle now: on, it names
+/// this impl (one hit) and refuses nothing.
 #[test]
-fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
+fn p6a_a_package_impl_a_std_question_reaches_is_decided_by_the_rule() {
     let _switch = SWITCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -598,22 +602,34 @@ fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
             ("peek.vl", PREFIX_PEEK),
         ],
     );
-    let refused = observe_over_the_prefix(&package);
-    let remembered = observe_over_the_prefix(&package);
+    let served = observe_over_the_prefix(&package);
+    let again = observe_over_the_prefix(&package);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_tier_oracle(Some(true));
+    let oracle_before = vilan_core::incremental::tier_oracle_hits();
+    let named = observe_over_the_prefix(&package);
+    let oracle_hits = vilan_core::incremental::tier_oracle_hits() - oracle_before;
+    vilan_core::incremental::set_tier_oracle(None);
     package.remove();
     vilan_core::analyzer::base_cache_clear();
     assert!(
-        !refused.census.prefix_world
-            && refused.census.prefix_refusals == 1
-            && refused.census.prefix_refusal == Some("impl-reached"),
-        "the package's impl refuses the prefix: {:?}",
-        refused.census
+        served.census.prefix_world && served.census.prefix_refusals == 0,
+        "the package's impl no longer refuses the prefix: {:?}",
+        served.census
     );
-    assert_eq!(
-        remembered.census.prefix_refusal,
-        Some("refused-before"),
-        "a refused package is not built over the prefix again: {:?}",
-        remembered.census
+    assert!(
+        again.census.prefix_world && again.census.prefix_hits == 1,
+        "and the next analysis is served the stored prefix: {:?}",
+        again.census
+    );
+    assert!(
+        named.census.prefix_world && named.census.tier_oracle_hits == 1,
+        "the oracle names the impl over the prefix, refusing nothing: {:?}",
+        named.census
+    );
+    assert!(
+        oracle_hits >= 2,
+        "and in the clean canonical analysis beside it ({oracle_hits} hits in all)"
     );
 }
 

@@ -274,3 +274,87 @@ green_seals = 0
 blocking = false
 mandate = true
 series = "Order 52 (N174): re-anchored from `let messages = channel.messages();` (gone with the mirrored-store exhibit, kolt@dee494ab) to `channel_name.adopt(channel.current_name());` in the same channel.vl - a statement over a `g.channels()` boundary; the break and its repair are the same shape, the figures start a new series."
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.008
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.692 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.008
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.692 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.006
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.468 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:canvas"
+class = "reference"
+ratio = 1.006
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.468 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.004
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.310 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.004
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.310 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.003
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.235 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.003
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.235 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.002
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.159 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.002
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.159 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.002
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.143 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.002
+reason = "std-prefix P6a: the canonical pre-entry resolve splits at M144's boundary - the tiers (std, the dependencies) resolve before the package's first node mints and the package resolves after its walk, so a program with package modules runs one more fixpoint pass over the constraints std's resolve left open (the prefix shape's own `prefix-package-resolve`, which the paper's cold rows priced at ~0.3 ms); +0.143 % instructions:u of `vilan check` on the lane's box (9800X3D) against next @d18f50d8, single-file programs flat (the package half runs only when the package walked something) and the plain packages down 0.9-1.0 %."
+item = "M157"

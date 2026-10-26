@@ -559,6 +559,21 @@ fn compare_fixture_on(fixture: &Fixture, skip: &[&str], permuted_leg: Leg) -> Ve
 /// load order. Its own pin below.
 const B554_CLASS_EDIT: &str = "from the module loaded first";
 
+/// P6a (`std-prefix.md` §14.3): the tier rule's ORACLE, turned on for a leg
+/// over the std prefix — the guard the rule replaced, demoted to a gate: no
+/// package impl of the permuted packages could have answered a question the
+/// tiers' (std's, and the dependency tier's) resolution asked. Turns the
+/// oracle back off.
+fn assert_no_tier_oracle_hit(before: u64) {
+    let hits = vilan_core::incremental::tier_oracle_hits() - before;
+    vilan_core::incremental::set_tier_oracle(None);
+    assert_eq!(
+        hits, 0,
+        "P6a's oracle: a package impl could have answered a question the tiers' resolution \
+         asked (the `[vilan phase] tier-oracle` line names it)"
+    );
+}
+
 /// **The gate, the classes leg.** The §6 classes package in every state its
 /// script puts it in, and M121's served impls, under every permutation.
 #[test]
@@ -583,6 +598,9 @@ fn the_classes_package_answers_the_same_under_every_permutation() {
 #[test]
 fn the_classes_package_answers_the_same_over_the_std_prefix() {
     vilan_core::incremental::set_std_prefix(Some(true));
+    // P6a: the tier rule's oracle on (see `assert_no_tier_oracle_hit`).
+    vilan_core::incremental::set_tier_oracle(Some(true));
+    let oracle_before = vilan_core::incremental::tier_oracle_hits();
     let mut divergences =
         compare_fixture_on(&CLASSES_FIXTURE, &[B554_CLASS_EDIT], Leg::Incremental);
     divergences.extend(compare_fixture_on(
@@ -592,6 +610,7 @@ fn the_classes_package_answers_the_same_over_the_std_prefix() {
     ));
     vilan_core::analyzer::base_cache_clear();
     vilan_core::incremental::set_std_prefix(None);
+    assert_no_tier_oracle_hit(oracle_before);
     assert!(
         divergences.is_empty(),
         "{} state(s) of the classes package answer differently over the std prefix:\n{}",
@@ -818,11 +837,14 @@ fn m152_programs_with_dependencies_answer_the_same_under_every_permutation() {
     }
     let before = PREFIX_WORLDS.load(std::sync::atomic::Ordering::Relaxed);
     vilan_core::incremental::set_std_prefix(Some(true));
+    vilan_core::incremental::set_tier_oracle(Some(true));
+    let oracle_before = vilan_core::incremental::tier_oracle_hits();
     for fixture in DEPENDENCY_FIXTURES {
         divergences.extend(compare_fixture_on(fixture, &[], Leg::Incremental));
     }
     vilan_core::analyzer::base_cache_clear();
     vilan_core::incremental::set_std_prefix(None);
+    assert_no_tier_oracle_hit(oracle_before);
     assert!(
         divergences.is_empty(),
         "{} state(s) of the dependency programs depend on the load order:\n{}",

@@ -192,6 +192,12 @@ fn compare_state(
 
 fn compare_fixtures(name: &str, fixtures: &[&Fixture]) {
     let cache = cache_directory(name);
+    // P6a (`std-prefix.md` §14.3): the tier rule's ORACLE is on for every leg
+    // (its record rides the world and the file, keyed apart): no package impl
+    // of these fixtures could have answered a question std's resolution asked
+    // — the guard the rule replaced, demoted to this gate.
+    vilan_core::incremental::set_tier_oracle(Some(true));
+    let oracle_before = vilan_core::incremental::tier_oracle_hits();
     let (loads_before, _, _) = vilan_core::analyzer::prefix_file_counts();
     let mut divergences = Vec::new();
     let mut states = 0;
@@ -202,7 +208,14 @@ fn compare_fixtures(name: &str, fixtures: &[&Fixture]) {
         }
     }
     let (loads_after, writes, misses) = vilan_core::analyzer::prefix_file_counts();
+    let oracle_hits = vilan_core::incremental::tier_oracle_hits() - oracle_before;
+    vilan_core::incremental::set_tier_oracle(None);
     let _ = std::fs::remove_dir_all(&cache);
+    assert_eq!(
+        oracle_hits, 0,
+        "P6a's oracle: a package impl of these fixtures could have answered a question the \
+         tiers' resolution asked (the `[vilan phase] tier-oracle` line names it)"
+    );
     assert!(
         divergences.is_empty(),
         "{} state(s) answer differently over the persisted std prefix:\n{}",

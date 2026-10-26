@@ -136,6 +136,64 @@ pub fn set_std_prefix(on: Option<bool>) {
     STD_PREFIX_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
+// --- std-prefix P6a: the tier rule's test oracle ------------------------------
+
+/// 0 = read the environment; 1 = off; 2 = on.
+static TIER_ORACLE_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether this process runs the TIER RULE's oracle (`std-prefix.md` §14.3,
+/// P6a): the standard library and the dependency tier resolve before the entry
+/// package's declarations exist, so an impl the package declares never answers
+/// a question the tiers' own resolution asked. That is a rule, not a guard — no
+/// production analysis records the tiers' questions. The oracle is the guard it
+/// replaced, kept as a TEST: with it on, the tiers' resolve records every
+/// question it asks of the impl table, and once the package's impls have
+/// resolved their subjects each is tested against the record; a package impl
+/// that could have answered one is counted ([`tier_oracle_hits`]) and named on
+/// the `[vilan phase] tier-oracle` line. A hit refuses nothing — both shapes
+/// apply the rule alike — it names a program whose meaning the rule decided,
+/// which is what the estate's census of the oracle (0 at P6a) reads.
+/// [`set_tier_oracle`]'s override, else `VILAN_TIER_ORACLE=on` (read once).
+pub fn tier_oracle() -> bool {
+    match TIER_ORACLE_OVERRIDE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static FROM_ENV: OnceLock<bool> = OnceLock::new();
+            *FROM_ENV.get_or_init(|| {
+                matches!(
+                    std::env::var("VILAN_TIER_ORACLE").as_deref(),
+                    Ok("on" | "1")
+                )
+            })
+        }
+    }
+}
+
+/// Overrides `VILAN_TIER_ORACLE` for this process (`None` restores it) — the
+/// test surface.
+#[doc(hidden)]
+pub fn set_tier_oracle(on: Option<bool>) {
+    let value = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    TIER_ORACLE_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
+/// The process's oracle hits so far ([`tier_oracle`]): package impls that
+/// could have answered a question the tiers' resolution asked.
+static TIER_ORACLE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn tier_oracle_hits() -> u64 {
+    TIER_ORACLE_HITS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn count_tier_oracle_hit() {
+    TIER_ORACLE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
 // --- std-prefix P2: the prefix LAYERED under the world build ------------------
 
 /// 0 = the process default; 1 = off; 2 = on.
@@ -581,8 +639,10 @@ pub struct Census {
     /// std-prefix P1: whether this analysis's world was built over (or as) the
     /// std-only prefix, the prefix worlds the base cache SERVED it, and the
     /// times the prefix was REFUSED (the canonical analysis built instead),
-    /// with the last refusal's reason — `dependencies`, `package-prelude`,
-    /// `reaches-the-entry`, `defines-a-macro`, `impl-reached`, ….
+    /// with the last refusal's reason — `package-prelude`,
+    /// `reaches-the-entry`, `defines-a-macro`, S1's guards over a layered
+    /// world, …. (P6a retired `impl-reached`: since the tiers resolve before
+    /// the package in both shapes, no package impl can refuse the prefix.)
     pub prefix_world: bool,
     /// std-prefix P2: whether the world was LAYERED over the prefix — a world
     /// build (an S1 or canonical miss) that took std from the prefix and
@@ -610,6 +670,10 @@ pub struct Census {
     /// the report asks for (not a clock the gate reads).
     pub prefix_file_bytes: u64,
     pub prefix_file_micros: u64,
+    /// std-prefix P6a: the package impls this analysis's TIER ORACLE found
+    /// able to answer a question the tiers' resolution asked ([`tier_oracle`];
+    /// 0 when the oracle is off).
+    pub tier_oracle_hits: u64,
     /// M159: the post passes' reuse seam as the async pass found it — `None`
     /// when the analysis built no seam (a cold `vilan check` of a world it
     /// did not reuse, a clean analysis, an entry-shaped world).
@@ -706,6 +770,7 @@ thread_local! {
             prefix_checks_written: false,
             prefix_file_bytes: 0,
             prefix_file_micros: 0,
+            tier_oracle_hits: 0,
             post_seam: None,
         })
     };
@@ -1073,7 +1138,7 @@ pub fn report(program: &Program) {
              async-records-filed={} async-record-bytes={} hover-rows-restored={} \
              prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
-             prefix-checks={} prefix-checks-written={} \
+             prefix-checks={} prefix-checks-written={} tier-oracle={} \
              post-seam={}",
             census.base_hits,
             census.base_misses,
@@ -1120,6 +1185,7 @@ pub fn report(program: &Program) {
             census.prefix_file_micros,
             census.prefix_checks.unwrap_or("-"),
             u8::from(census.prefix_checks_written),
+            census.tier_oracle_hits,
             census
                 .post_seam
                 .map_or_else(|| "-".to_string(), |seam| seam.render()),
