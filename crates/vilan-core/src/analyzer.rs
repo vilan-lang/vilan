@@ -4520,6 +4520,11 @@ pub struct Analyzer<'src> {
     /// `never` and marks every frame nested inside the re-entered one inexact
     /// — built on an unfinished neighbour — so only exact answers are recorded.
     return_inference_stack: Vec<(Id, bool)>,
+    /// B667: each walked `match`'s leg bodies, by the match's id — what a
+    /// match still waiting on its constraint is made of, for the return-
+    /// position walk (`self_returning_function`), which runs while the
+    /// constraint queue is drained.
+    match_leg_bodies: HashMap<Id, Vec<Id>>,
     /// `inferred_return_type`'s record: the last exact answer per unannotated
     /// function, for the read-only coercion path (`compare_type`) that cannot
     /// infer on the spot.
@@ -8052,6 +8057,7 @@ impl<'src> Analyzer<'src> {
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
+            match_leg_bodies: HashMap::default(),
             return_depth_refused: false,
             inferred_return_types: HashMap::default(),
             closure_held_targets: HashMap::default(),
@@ -42539,6 +42545,8 @@ impl<'src> Analyzer<'src> {
                 body: body_id,
             });
         }
+        self.match_leg_bodies
+            .insert(id, walked_legs.iter().map(|leg| leg.body).collect());
         self.constraints.push(Constraint::Match(PreppedMatch {
             id,
             subject_id,
@@ -66949,11 +66957,37 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|(_, _, body_id)| (Vec::new(), *body_id))
             .collect();
-        let Some(match_type) =
-            self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs")
-        else {
-            return Resolution::Deferred;
-        };
+        let match_type =
+            match self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs") {
+                Some(match_type) => match_type,
+                None => {
+                    // B667: a leg that calls the function this match is the
+                    // RETURN of — `fun open(how: str) { match how { "right" =>
+                    // open("split"), _ => print("here") } }`, no written return
+                    // type — asks for that function's return, which is this
+                    // match's type: the cycle never resolved. The legs are read as
+                    // the function's own return inference reads them, with the
+                    // function on the inference stack, so the self-call answers
+                    // `never` (it constrains nothing: its value IS the answer under
+                    // construction) and the other legs decide; an `if` in the same
+                    // place always typed this way. Only for a match in the
+                    // function's return position, where its type and the
+                    // function's are one type.
+                    let Some(function_id) =
+                        self.self_returning_function(prepped.id, prepped.scope_id)
+                    else {
+                        return Resolution::Deferred;
+                    };
+                    self.return_inference_stack.push((function_id, false));
+                    let unified =
+                        self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs");
+                    self.return_inference_stack.pop();
+                    match unified {
+                        Some(match_type) => match_type,
+                        None => return Resolution::Deferred,
+                    }
+                }
+            };
         let match_type_id = match_type.get_type_id(self);
         self.resolved_types.insert(prepped.id, match_type_id);
         // Expand each or-pattern leg into one leg per alternative, all sharing the
@@ -67007,6 +67041,85 @@ impl<'src> Analyzer<'src> {
             refused = true;
         }
         refused
+    }
+
+    /// B667: the name of a function with no written return type that `body`
+    /// calls in its tail (through blocks), for the unresolved match's steer.
+    fn unannotated_callee_in_tail(&self, body: Id) -> Option<&'src str> {
+        let mut current = body;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Block((_, tail)) => current = *tail,
+                Expr::Call(call_id) => {
+                    let function_call = self.function_calls.get(call_id)?;
+                    let Some(Expr::Local(callee)) =
+                        self.expr_id_to_expr_map.get(&function_call.subject_id)
+                    else {
+                        return None;
+                    };
+                    return self
+                        .functions
+                        .get(callee)
+                        .filter(|function| function.has_body && function.return_type_id.is_none())
+                        .map(|function| function.name);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// B667: the function with no written return type whose RETURN this
+    /// match is — the function whose body the match's scope sits in, when the
+    /// match is reached from that body's tail through blocks' tails, an `if`'s
+    /// branch tails and a resolved or still-pending `match`'s leg bodies.
+    /// There the match's type and the function's are one type, so a call to
+    /// the function inside a leg (free or a method, resolved or not) is the
+    /// answer under construction. `None` for every other match.
+    fn self_returning_function(&mut self, match_id: Id, scope_id: Id) -> Option<Id> {
+        if self.function_scopes_indexed != self.functions.len() {
+            self.function_by_body_scope = self
+                .functions
+                .iter()
+                .map(|(function_id, function)| (function.body.2, *function_id))
+                .collect();
+            self.function_scopes_indexed = self.functions.len();
+        }
+        let mut scope = scope_id;
+        let mut owner = None;
+        for _ in 0..4096 {
+            if let Some(function_id) = self.function_by_body_scope.get(&scope) {
+                owner = Some(*function_id);
+                break;
+            }
+            scope = self.scopes.get(&scope)?.parent_id?;
+        }
+        let function_id = owner?;
+        let function = self.functions.get(&function_id)?;
+        if !function.has_body || function.return_type_id.is_some() {
+            return None;
+        }
+        let mut pending = vec![function.body.1];
+        while let Some(current) = pending.pop() {
+            if current == match_id {
+                return Some(function_id);
+            }
+            match self.expr_id_to_expr_map.get(&current) {
+                Some(Expr::Block((_, tail))) => pending.push(*tail),
+                Some(Expr::If(branch)) => {
+                    let mut branch_bodies = Vec::new();
+                    if_branch_bodies(branch, &mut branch_bodies);
+                    pending.extend(branch_bodies.into_iter().map(|(_, tail)| tail));
+                }
+                Some(Expr::Match(_, legs)) => pending.extend(legs.iter().map(|leg| leg.body)),
+                None => {
+                    if let Some(bodies) = self.match_leg_bodies.get(&current) {
+                        pending.extend(bodies.iter().copied());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// S4 (editing-dx.md §7.1): the struct-initializer field-count message,
@@ -74392,28 +74505,54 @@ impl<'src> Analyzer<'src> {
                 );
             }
         }
-        let unresolved_matches: Vec<(Id, Span)> = if residuals_are_cascade {
+        let unresolved_matches: Vec<(Id, Span, Vec<Id>)> = if residuals_are_cascade {
             Vec::new()
         } else {
             self.constraints
                 .iter()
                 .filter_map(|constraint| match constraint {
-                    Constraint::Match(prepped) => Some((prepped.subject_id, prepped.span)),
+                    Constraint::Match(prepped) => Some((
+                        prepped.subject_id,
+                        prepped.span,
+                        prepped.legs.iter().map(|leg| leg.body).collect(),
+                    )),
                     _ => None,
                 })
                 .collect()
         };
-        for (subject_id, span) in unresolved_matches {
+        for (subject_id, span, leg_bodies) in unresolved_matches {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
+            // B667: name the leg whose type never settled, and — when that leg
+            // calls a function with no written return type — the fix.
+            let unsettled_leg = leg_bodies.iter().copied().find(|body| {
+                matches!(
+                    self.infer_type(*body, &Type::Unknown, &HashMap::default()),
+                    Type::Unresolved
+                )
+            });
+            let steer = unsettled_leg
+                .and_then(|body| self.unannotated_callee_in_tail(body))
+                .map(|name| {
+                    format!(
+                        "; this leg calls `{name}`, whose return type is inferred from its body — \
+                         write it (`fun {name}(…): <type>`)"
+                    )
+                })
+                .unwrap_or_default();
+            let note = unsettled_leg.map(|body| {
+                Note::here(
+                    **self.span_map.get(&body).unwrap_or(&&EMPTY_SPAN),
+                    "this leg's type is never determined".to_string(),
+                )
+            });
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
-                    note: None,
+                    note,
                     span,
                     msg: format!(
-                        "type of match expression could not be resolved (subject: {})",
-                        subject_str
+                        "type of match expression could not be resolved (subject: {subject_str}){steer}"
                     ),
                 },
                 subject_id,

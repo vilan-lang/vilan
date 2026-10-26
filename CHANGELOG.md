@@ -110,6 +110,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B667: a function with no written return type that calls itself in a `match` leg resolves — `fun open(how: str) { match how { "right" => open("split"), _ => print("here") } }` was refused "type of match expression could not be resolved (subject: str)", and kolt's `Panels::open` (a method, the self-call in a nested `match`) drew it twice.** The match's legs asked for the function's return, which is the match's own type: a cycle an `if` in the same place never met, because return inference reads an `if` inline with the function on its stack (a self-call there answers `never` and the other branches decide). `resolve_match` now does the same for a match in its function's RETURN position — reached from the body's tail through blocks, `if` branches and (pending) `match` legs (`self_returning_function`, the walk's leg bodies kept in `match_leg_bodies`) — so `open` is `void`, `count`'s `0 => 0, _ => 1 + count(n - 1)` is `i32`. A match that still cannot resolve names the leg whose type never settles (a note) and, when that leg calls a function with no written return type, says to write it. B191 is the let-bound sibling (Order 26). Pins: `returns::b667_a_self_call_in_a_match_leg_resolves_from_the_other_legs` (the item's, a numeric leg, a recursive leg, the nested method), and the native differential above. Tracker B667.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->
