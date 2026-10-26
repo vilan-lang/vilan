@@ -466,7 +466,7 @@ none of them is a type to abbreviate.
 
 ```text
 impl  = [ internal-label ] [ platform-attr ] "impl" type [ "with" type { "+" type } ]
-        "{" { statement } "}" ;
+        "{" { function | import ";" | use ";" } "}" ;
 trait = [ deprecated-label ] [ internal-label ] [ platform-attr ]
         [ "[" "resource" "]" ] "trait" IDENT
         [ generic-params ]
@@ -494,7 +494,11 @@ at a `const` parameter's argument position (`impl Ring<type T, const N>`)
 the binder is `const N` or `_`. A literal length outranks a length binder by
 the specificity order (`impl [i32; 3]` over `impl [type T; _]`).
 `with` lists the implemented trait(s). An impl without `with` provides
-inherent members. A trait's `with` lists supertraits.
+inherent members. A trait's `with` lists supertraits. An impl body declares
+methods (and may import names for them): a `struct`, `enum`, `trait`,
+`impl`, `mod`, a binding or a statement written there is refused at its
+keyword (the declaration belongs at the module's top level, a statement in a
+`fun`).
 
 ### Generic parameters and arguments
 

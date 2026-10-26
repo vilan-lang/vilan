@@ -771,3 +771,5 @@ NEW	-	the escape `{written}` is cut short: `\\u` takes four hex digits, `\\u0301
 NEW	-	the escape `{written}` is past the last code point, `\\u{{10FFFF}}`
 NEW	-	the escape `{written}` is half of a UTF-16 surrogate pair, not a character: write the code point it pairs into, `\\u{{1F600}}`, or the pair `\\uD83D\\uDE00`
 NEW	-	`{name}` is set twice in this `{}` literal: a literal sets each field once, and the second value would replace the first; remove one, or name the field it was meant for
+NEW	-	{} cannot be declared inside an `impl` — an `impl` declares methods; move it to the module's top level
+NEW	-	a statement cannot stand inside an `impl` — an `impl` declares methods, and this would never run; move it into a `fun`

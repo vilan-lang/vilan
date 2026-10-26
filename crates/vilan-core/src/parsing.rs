@@ -229,6 +229,8 @@ pub enum ParseErrorReason {
         kind: lexing::EscapeErrorKind,
         written: String,
     },
+    /// B655: a statement in an `impl` body that is not a member.
+    NonMemberInImpl(NonMember),
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1779,6 +1781,100 @@ fn matching_close(open: char) -> char {
     }
 }
 
+/// What B655 refuses in an `impl` body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonMember {
+    /// A declaration: `struct`, `enum`, `trait`, `impl`, `mod`, or a binding
+    /// (`let`/`mut`). `keyword` is the word it is refused at.
+    Item { keyword: ItemKeyword },
+    /// Anything else: an expression or a block, which would never run there.
+    Statement,
+}
+
+/// The keyword a refused `impl`-body item is spanned on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKeyword {
+    Struct,
+    Enum,
+    Trait,
+    Impl,
+    Mod,
+    /// `let`, `mut`, `lazy let`: the binder word written.
+    Binding,
+}
+
+impl ItemKeyword {
+    fn matches(self, token: &Token<'_>) -> bool {
+        match self {
+            ItemKeyword::Struct => *token == Token::Struct,
+            ItemKeyword::Enum => *token == Token::Enum,
+            ItemKeyword::Trait => *token == Token::Trait,
+            ItemKeyword::Impl => *token == Token::Impl,
+            ItemKeyword::Mod => *token == Token::Mod,
+            ItemKeyword::Binding => matches!(token, Token::Let | Token::Mut),
+        }
+    }
+
+    /// The declaration, as the message names it.
+    fn described(self) -> &'static str {
+        match self {
+            ItemKeyword::Struct => "a `struct`",
+            ItemKeyword::Enum => "an `enum`",
+            ItemKeyword::Trait => "a `trait`",
+            ItemKeyword::Impl => "an `impl`",
+            ItemKeyword::Mod => "a `mod`",
+            ItemKeyword::Binding => "a `let`/`mut` binding",
+        }
+    }
+}
+
+/// Whether a statement of an `impl` body is a member, and what it is when
+/// not. A member is a `fun` — under any attribute run, `export` or user macro
+/// attribute it carries. An `import`/`use` is admitted too: it serves every
+/// method (pinned, `macros::an_import_inside_an_impl_body_serves_its_methods`).
+/// A `macro fun` (refused by its own rule), a macro invocation or block (its
+/// expansion decides) and an `Error` (already reported) are left alone.
+fn non_member_kind(node: &Node<'_>) -> Option<NonMember> {
+    let item = |keyword| Some(NonMember::Item { keyword });
+    match node {
+        Node::Func(_)
+        | Node::Import(..)
+        | Node::Use(..)
+        | Node::MacroFun(_)
+        | Node::MacroInvocation(..)
+        | Node::MacroBlock(_)
+        | Node::Error => None,
+        // G24's `const fun` is a member as a plain `fun` is (`const` marks
+        // when it runs); `const (expr)` is a statement, one level down.
+        Node::Export(_, inner, _)
+        | Node::Derive(_, inner)
+        | Node::Service(_, inner)
+        | Node::Const(inner)
+        | Node::MacroAttribute(_, _, _, inner) => non_member_kind(&inner.0),
+        Node::Struct(..) => item(ItemKeyword::Struct),
+        Node::Enum(..) => item(ItemKeyword::Enum),
+        Node::Trait(..) => item(ItemKeyword::Trait),
+        Node::Impl(..) => item(ItemKeyword::Impl),
+        Node::Module(..) => item(ItemKeyword::Mod),
+        Node::Let(..) | Node::LetDestructure(..) => item(ItemKeyword::Binding),
+        _ => Some(NonMember::Statement),
+    }
+}
+
+/// B655's message: the rule and the move.
+fn non_member_rule(kind: NonMember) -> String {
+    match kind {
+        NonMember::Item { keyword } => format!(
+            "{} cannot be declared inside an `impl` — an `impl` declares methods; move it to \
+             the module's top level",
+            keyword.described()
+        ),
+        NonMember::Statement => "a statement cannot stand inside an `impl` — an `impl` \
+             declares methods, and this would never run; move it into a `fun`"
+            .to_string(),
+    }
+}
+
 /// B652's refusal of a string escape that is not one: the sequence as
 /// written, why, and the escapes that exist (diagnostics-standard.md B6 — the
 /// prohibition explains itself and names the sanctioned spelling). An unknown
@@ -1848,6 +1944,7 @@ pub fn render(error: &ParseError) -> String {
              spaced, the `<` after an ascribed type is a comparison"
         ),
         ParseErrorReason::Escape { kind, written } => escape_rule(*kind, written),
+        ParseErrorReason::NonMemberInImpl(kind) => non_member_rule(*kind),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -8849,6 +8946,68 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((statements, self.span_from(start)))
     }
 
+    /// An `impl` body: [`Parser::parse_item_body`]'s `{ statement* }`, with
+    /// every statement that is not a MEMBER refused where it stands (B655).
+    fn parse_impl_body(&mut self) -> Option<Spanned<NodeList<'src>>> {
+        if let Some(clean) = self.attempt(Self::parse_impl_body_clean) {
+            return Some(clean);
+        }
+        self.recover_delimited("implementation body", '{', '}', &[('(', ')'), ('[', ']')])
+            .map(|span| (Vec::new(), span))
+    }
+
+    /// The clean `impl` body. The grammar's body is `{ statement }` — the
+    /// statement parser reads it — but an `impl` DECLARES METHODS, and nothing
+    /// else in it was ever anything: before B655 a `struct` between two methods
+    /// was walked into the impl's member scope and then existed nowhere (a use
+    /// read "unknown struct", in another module "cannot find 'Hidden' in the
+    /// imported path"), a `let` checked clean and was a `ReferenceError` on JS
+    /// and a rustc refusal natively, and a statement never ran. Each is refused
+    /// at its keyword (a statement at itself) and kept in the tree, so the parse
+    /// goes on as it did.
+    fn parse_impl_body_clean(&mut self) -> Option<Spanned<NodeList<'src>>> {
+        let start = self.position;
+        self.expect_ctrl('{')?;
+        let mut statements = Vec::new();
+        loop {
+            if self.peek_is_ctrl('}') || self.at_end() {
+                break;
+            }
+            let statement_start = self.position;
+            match self.parse_statement() {
+                Some(statement) => {
+                    self.refuse_non_member(&statement, statement_start);
+                    statements.push(statement);
+                }
+                None => break,
+            }
+        }
+        self.expect_ctrl('}')?;
+        Some((statements, self.span_from(start)))
+    }
+
+    /// B655's refusal of one `impl`-body statement that is not a member, or
+    /// nothing for a member. The tokens from `statement_start` to the cursor
+    /// are the statement's own, so an item's keyword is found among them past
+    /// any attribute run.
+    fn refuse_non_member(&mut self, statement: &Spanned<Node<'src>>, statement_start: usize) {
+        let Some(kind) = non_member_kind(&statement.0) else {
+            return;
+        };
+        let keyword_span = match kind {
+            NonMember::Item { keyword, .. } => (statement_start..self.position)
+                .find(|&position| keyword.matches(&self.tokens[position].0))
+                .map(|position| self.token_span(position)),
+            NonMember::Statement => None,
+        };
+        self.errors.push(ParseError {
+            span: keyword_span.unwrap_or(statement.1),
+            reason: ParseErrorReason::NonMemberInImpl(kind),
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
     /// `{ function* }` — a trait body: a list of function declarations ONLY (not
     /// arbitrary statements), carrying the `{ .. }` span. A garbled body recovers
     /// to an empty body (chumsky's `nested_delimiters` on the trait body, site 9
@@ -9856,8 +10015,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             Vec::new()
         };
-        let body =
-            self.within_member_body(|parser| parser.parse_item_body("implementation body"))?;
+        let body = self.within_member_body(Self::parse_impl_body)?;
         Some((
             Node::Impl(Box::new(subject), traits, body, labels),
             self.span_from(start),

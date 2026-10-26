@@ -3978,6 +3978,34 @@ fn b652_a_malformed_hex_or_unicode_escape_is_refused() {
     }
 }
 
+#[test]
+fn b655_a_struct_inside_an_impl_is_refused_in_its_own_module() {
+    // The item's package shape: the use in another module read as an export
+    // problem ("cannot find 'Hidden' in the imported path"); the declaring
+    // module now states the cause.
+    let errors = compile_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::counter::{ Hidden };\n\nfun main() {\n\tlet _hidden = Hidden { label = \"x\" };\n}\n",
+            ),
+            (
+                "counter.vl",
+                "struct Counter { value: i32 }\n\nimpl Counter {\n\tfun bump(&mut self) { self.value += 1; }\n\n\
+                 struct Hidden {\n\tlabel: str,\n}\n\n\tfun get(self): i32 { self.value }\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect_err("a struct inside an impl must not compile");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("a `struct` cannot be declared inside an `impl`")),
+        "{errors:#?}"
+    );
+}
+
 // --- Path semantics: library territory is decided on canonicalized paths ---
 // (windows-support.md §5)
 
