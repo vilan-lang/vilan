@@ -12277,6 +12277,21 @@ fn b646_a_tracking_trait_member_names_its_call_site_on_both_backends() {
     );
 }
 
+/// B647: a module-level `mut` binding lent where no write reaches it, a local
+/// lent to a writer, the copy the refusal names, and the by-value twin — a
+/// module binding handed by value to a callee that writes it is a copy, which
+/// JS now takes too (it printed the callee's own push through the parameter)
+/// — the same bytes on both backends (`native/b647_module_binding_copies.*`).
+#[test]
+fn b647_module_binding_loans_and_copies_answer_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_b647_module_binding_copies.vl",
+        include_str!("native/b647_module_binding_copies.vl"),
+        include_str!("native/b647_module_binding_copies.stdout"),
+        "",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // debugging.md S1: `dbg(..)`.
 // ---------------------------------------------------------------------------

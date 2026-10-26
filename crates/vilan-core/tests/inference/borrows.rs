@@ -14803,3 +14803,112 @@ fn b649_a_view_at_a_generic_parameter_over_a_view_holder_still_compiles() {
         "4\n8\n",
     );
 }
+
+// --- B647: a module-level `mut` binding lent to a callee that writes it -----
+
+/// B647 (R-k, spec §6.4 rule 4): lending a module-level `mut` binding — a
+/// `&`, a `&mut`, a view receiver — to a callee whose write summary reaches
+/// it is refused at the argument: the callee's body is a second path to the
+/// place the loan holds. The JS build answered through the binding's object
+/// (`1`, `2`), native through a copy out of its cell or the reentrancy stop
+/// (`0`, a panic). One pin per shape: the item's two, a view receiver, a
+/// write two calls deep, a write through a closure the callee is handed, and
+/// a place under the binding.
+#[test]
+fn b647_a_module_binding_lent_to_a_callee_that_writes_it_is_refused() {
+    let shapes = [
+        (
+            "mut module_items: List<i32> = [];\nfun lent_and_grow(items: &List<i32>) {\n\tmodule_items.push(1);\n\tprint(items.len());\n}\nfun main() { lent_and_grow(&module_items); }\n",
+            "`lent_and_grow` writes `module_items` while `module_items` is lent to this call, so the loan and the write are two paths to one place (a write under a live view); copy it first: `let items = module_items; lent_and_grow(&items)`",
+        ),
+        (
+            "mut module_items: List<i32> = [];\nfun touch(items: &mut List<i32>) {\n\titems.push(1);\n\tmodule_items.push(2);\n\tprint(items.len());\n}\nfun main() { touch(&mut module_items); }\n",
+            "copy it first: `mut items = module_items; touch(&mut items)`",
+        ),
+        (
+            "struct Log { items: List<i32> }\nimpl Log {\n\tfun grown(&self): usize {\n\t\tmodule_log.items.push(1);\n\t\tself.items.len()\n\t}\n}\nmut module_log: Log = Log { items = [] };\nfun main() { print(module_log.grown()); }\n",
+            "`grown` writes `module_log` while `module_log` is lent to this call",
+        ),
+        (
+            "mut module_items: List<i32> = [];\nfun grow() { module_items.push(1); }\nfun deeper() { grow(); }\nfun lent(items: &List<i32>): usize {\n\tdeeper();\n\titems.len()\n}\nfun main() { print(lent(&module_items)); }\n",
+            "`lent` writes `module_items` while `module_items` is lent to this call",
+        ),
+        (
+            "mut module_items: List<i32> = [];\nfun run(items: &List<i32>, then: || void): usize {\n\tthen();\n\titems.len()\n}\nfun main() { print(run(&module_items, || module_items.push(1))); }\n",
+            "`run` writes `module_items` while `module_items` is lent to this call",
+        ),
+        (
+            "struct Shelf { items: List<i32> }\nmut module_shelf: Shelf = Shelf { items = [] };\nfun lent(items: &List<i32>): usize {\n\tmodule_shelf = Shelf { items = [7] };\n\titems.len()\n}\nfun main() { print(lent(&module_shelf.items)); }\n",
+            "`lent` writes `module_shelf` while `module_shelf` is lent to this call",
+        ),
+    ];
+    for (source, message) in shapes {
+        assert_fails_with(source, message);
+    }
+}
+
+/// B647: what the rule leaves alone — a callee that only READS the binding,
+/// a LOCAL `mut` lent to a writer of a module binding, a module binding the
+/// callee does not write, and the copy the message names — each answering
+/// the native backend's answer.
+#[test]
+fn b647_a_loan_no_write_reaches_still_compiles() {
+    assert_compiles_and_runs(
+        concat!(
+            "mut module_items: List<i32> = [];\n",
+            "mut module_other: List<i32> = [];\n",
+            "fun reads(items: &List<i32>): usize { module_items.len() + items.len() }\n",
+            "fun grows_other(items: &List<i32>): usize {\n",
+            "\tmodule_other.push(1);\n",
+            "\titems.len()\n",
+            "}\n",
+            "fun lent_and_grow(items: &List<i32>): usize {\n",
+            "\tmodule_items.push(1);\n",
+            "\titems.len()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(reads(&module_items));\n",
+            "\tprint(grows_other(&module_items));\n",
+            "\tmut local = [5];\n",
+            "\tprint(lent_and_grow(&local));\n",
+            "\tlet items = module_items;\n",
+            "\tprint(lent_and_grow(&items));\n",
+            "\tprint(module_items.len());\n",
+            "}\n",
+        ),
+        "0\n0\n1\n1\n2\n",
+    );
+}
+
+/// B647's by-value twin (met on the way): a module-level `mut` binding handed
+/// BY VALUE to a callee that writes it is a copy, as rule 1 says and the
+/// native backend answered — JS handed over the binding's own object, so
+/// `by_value(module_items)` printed `2` (the callee's push showed through its
+/// parameter) where native printed `1`. A bare `self` receiver the same.
+#[test]
+fn b647_a_module_binding_handed_by_value_to_a_writer_is_a_copy() {
+    assert_compiles_and_runs(
+        concat!(
+            "struct Log { items: List<i32> }\n",
+            "impl Log {\n",
+            "\tfun grown(self): usize {\n",
+            "\t\tmodule_log.items.push(1);\n",
+            "\t\tself.items.len()\n",
+            "\t}\n",
+            "}\n",
+            "mut module_items: List<i32> = [1];\n",
+            "mut module_log: Log = Log { items = [] };\n",
+            "fun by_value(items: List<i32>): usize {\n",
+            "\tmodule_items.push(3);\n",
+            "\titems.len()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(by_value(module_items));\n",
+            "\tprint(module_items.len());\n",
+            "\tprint(module_log.grown());\n",
+            "\tprint(module_log.items.len());\n",
+            "}\n",
+        ),
+        "1\n2\n0\n1\n",
+    );
+}

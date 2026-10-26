@@ -1155,6 +1155,15 @@ the later arguments, never a view held for the call, because the callee
 itself can reach the binding. A scalar, `str`, `Option`, tuple or enum by
 value is still the value the binding held where the argument stands.
 
+The callee's own body is a second path to the binding too. LENDING a
+module-level `mut` binding — a `&` or `&mut` of it or of a place under it,
+or a `&self`/`&mut self` receiver over one — to a callee whose body (or any
+call it makes, a closure it is handed included) writes that binding is a
+write under a live view (rule 4) and is refused at the argument: copy it
+first (`let items = module_items; lent_and_grow(&items)`). Handed BY VALUE
+to such a callee, the binding is copied (rule 1) — the callee's parameter
+never sees the callee's own write.
+
 ## 6.10 `lazy` — a binding initialized at first use
 
 *(Design: [`lazy`](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lazy.md) §2.)*
