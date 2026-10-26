@@ -3780,33 +3780,64 @@ fn diverging_span(
 ) -> Option<Span> {
     let at = first_divergence(canonical_source, canonical_reprint);
     let span_of = |index: usize| original.get(index).map(|(_, span)| *span);
-    // How far the canonicalized stream is still the file's own stream, from
-    // each end. `position` over the zip stops at the shorter of the two, which
-    // is the bound either way.
+    if let Some(index) = exact_index(original, canonical_source, at) {
+        return span_of(index);
+    }
+    // B671: the three alignments above each need the canonicalization to have
+    // touched only ONE side of the divergence - a reordered import run above
+    // it and a dropped trailing comma or a sorted marker head below it defeat
+    // all of them, and the answer then was the first token the
+    // canonicalization moved: the file's first import, 120 lines from the
+    // `match` that lost its `;`. The canonicalizations are all local to a
+    // top-level item (an import RUN is one unit), so the same alignments are
+    // asked of the one item the divergence falls in, where there is at most a
+    // handful of them.
+    if let Some(span) = item_local_span(original, canonical_source, at) {
+        return Some(span);
+    }
     let aligned_prefix = canonical_source
         .iter()
         .zip(original)
         .position(|(canonical, (written, _))| canonical != written)
         .unwrap_or_else(|| canonical_source.len().min(original.len()));
+    span_of(aligned_prefix).or_else(|| original.last().map(|(_, span)| *span))
+}
+
+/// The written index of canonical token `at`, when the canonicalization left
+/// the file's stream alignable: by the common prefix, by the common suffix, or
+/// by matching the canonical remainder as a subsequence (deletions only).
+fn exact_index(
+    original: &[Spanned<Token<'_>>],
+    canonical_source: &[Token<'_>],
+    at: usize,
+) -> Option<usize> {
+    // How far the canonicalized stream is still the file's own stream, from
+    // each end. `position` over the zip stops at the shorter of the two, which
+    // is the bound either way.
+    let aligned_prefix = canonical_source
+        .iter()
+        .zip(original.iter().map(|(token, _)| token))
+        .position(|(canonical, written)| canonical != written)
+        .unwrap_or_else(|| canonical_source.len().min(original.len()));
     if at < aligned_prefix {
-        return span_of(at);
+        return (at < original.len()).then_some(at);
     }
     let aligned_suffix = canonical_source
         .iter()
         .rev()
-        .zip(original.iter().rev())
-        .position(|(canonical, (written, _))| canonical != written)
+        .zip(original.iter().rev().map(|(token, _)| token))
+        .position(|(canonical, written)| canonical != written)
         .unwrap_or_else(|| canonical_source.len().min(original.len()));
     let from_the_end = canonical_source.len() - at.min(canonical_source.len());
     if from_the_end > 0
         && from_the_end <= aligned_suffix
         && let Some(index) = original.len().checked_sub(from_the_end)
     {
-        return span_of(index);
+        return Some(index);
     }
     // E265: the commonest canonicalizations are DELETIONS (a trailing comma,
     // a redundant alias or view prefix), and one deletion on each side of the
-    // divergence defeats both alignments above — a struct's trailing comma at
+    // divergence defeats both alignments above - a struct's trailing comma at
     // line 25 named line 25 for a reprint that parted company at line 127.
     // Where the canonicalized stream past the aligned prefix is still a
     // SUBSEQUENCE of the file's own, the canonicalization there deleted and
@@ -3814,12 +3845,87 @@ fn diverging_span(
     // exactly; the whole remainder must match, which is what tells a deletion
     // from a reordering. Failing that, the same match from the END down to the
     // divergence, for a reordering that happened before it.
-    if let Some(index) = deletion_aligned_index(original, canonical_source, aligned_prefix, at)
+    deletion_aligned_index(original, canonical_source, aligned_prefix, at)
         .or_else(|| deletion_aligned_index_from_the_end(original, canonical_source, at))
-    {
-        return span_of(index);
+}
+
+/// The start of each top-level item of a token stream: after a `;` at depth
+/// zero, and after a `}` at depth zero that nothing continues (`else`, `;`,
+/// `.`, `?`, `as`). A run of consecutive imports is ONE item, because the
+/// canonical import order moves tokens between its statements.
+fn item_starts(tokens: &[Token<'_>]) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut depth: i32 = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Ctrl('{' | '(' | '[') => depth += 1,
+            Token::Ctrl('}' | ')' | ']') => depth -= 1,
+            _ => {}
+        }
+        let ends_an_item = depth == 0
+            && match token {
+                Token::Ctrl(';') => true,
+                Token::Ctrl('}') => !matches!(
+                    tokens.get(index + 1),
+                    Some(
+                        Token::Else
+                            | Token::Ctrl(';' | '.' | '?')
+                            | Token::Op("." | "?.")
+                            | Token::Ident("as")
+                    )
+                ),
+                _ => false,
+            };
+        let next = index + 1;
+        if ends_an_item && next < tokens.len() {
+            let last = *starts.last().expect("starts is never empty");
+            if starts_import(tokens, last) && starts_import(tokens, next) {
+                continue;
+            }
+            starts.push(next);
+        }
     }
-    span_of(aligned_prefix).or_else(|| original.last().map(|(_, span)| *span))
+    starts
+}
+
+/// [`exact_index`] asked of the one top-level item the canonical position
+/// `at` falls in. Needs the canonical stream to be the items' own canonical
+/// streams end to end (a file-level move, as the `export *;` marker's hoist,
+/// makes it `None`).
+fn item_local_span(
+    original: &[Spanned<Token<'_>>],
+    canonical_source: &[Token<'_>],
+    at: usize,
+) -> Option<Span> {
+    let tokens: Vec<Token<'_>> = original.iter().map(|(token, _)| token.clone()).collect();
+    let starts = item_starts(&tokens);
+    let mut canonical_start = 0;
+    for (position, &start) in starts.iter().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(tokens.len());
+        let local = normalize(tokens[start..end].to_vec());
+        let canonical_end = canonical_start + local.len();
+        if canonical_source.get(canonical_start..canonical_end)? != local.as_slice() {
+            return None;
+        }
+        if at < canonical_end {
+            let slice = &original[start..end];
+            let local_at = at - canonical_start;
+            let index = match exact_index(slice, &local, local_at) {
+                Some(index) => index,
+                // The first token the canonicalization moved inside the item;
+                // an item that canonicalizes to itself has none, and is named
+                // at its head.
+                None => local
+                    .iter()
+                    .zip(slice.iter().map(|(token, _)| token))
+                    .position(|(canonical, written)| canonical != written)
+                    .unwrap_or(0),
+            };
+            return slice.get(index).map(|(_, span)| *span);
+        }
+        canonical_start = canonical_end;
+    }
+    None
 }
 
 /// The written index of canonical token `at`, matching `canonical[from..]`
@@ -4509,7 +4615,12 @@ impl<'src> Printer<'src> {
             // make the shape depend on prose.
             let statement_start = self.out.len();
             let comment_cursor = self.cursor;
-            let terminated = Self::needs_semicolon(&item.0);
+            // B671: a block-bearing statement keeps the `;` it was written with.
+            let written_terminator = crate::parsing::is_block_like(&item.0)
+                .then(|| self.written_terminator_after(range.end))
+                .flatten();
+            let terminated = Self::needs_semicolon(&item.0) || written_terminator.is_some();
+            let statement_end = written_terminator.unwrap_or(range.end);
             // E219: this statement's declaration line is its own; the item
             // that ENCLOSES it (a function whose body this is) keeps its own
             // until its own width rule reads it.
@@ -4529,8 +4640,8 @@ impl<'src> Printer<'src> {
                 }
             }
             self.head_start = enclosing_head;
-            self.flush_trailing_comment(range.end);
-            prev_end = range.end;
+            self.flush_trailing_comment(statement_end);
+            prev_end = statement_end;
             index += 1;
         }
         if slot == Some(items.len()) {
@@ -5026,6 +5137,20 @@ impl<'src> Printer<'src> {
         } else {
             path_end
         }
+    }
+
+    /// B671: the offset just past the `;` written right after a block-bearing
+    /// statement (`match found { .. };`) that ends at `end`, if there is one.
+    /// The parser reads the `;` off such a statement and leaves no trace of it
+    /// in the tree, but it is not insignificant: with it the form is a
+    /// statement whose value is thrown away (the arms need not be `()`),
+    /// without it the form must unify to `()`. The reprint keeps it as written.
+    fn written_terminator_after(&self, end: usize) -> Option<usize> {
+        let rest = self.source.get(end..)?;
+        let trimmed = rest.trim_start();
+        trimmed
+            .starts_with(';')
+            .then(|| end + (rest.len() - trimmed.len()) + 1)
     }
 
     /// The end offset of the trailing same-line comment of an item ending at
@@ -18185,6 +18310,53 @@ mod divergence_location {
     }
 
     #[test]
+    fn a_reordering_above_and_canonicalizations_below_do_not_defeat_the_location() {
+        // B671: kolt's task table - an import run the printer sorts at the top,
+        // the lost `;` at line 12, and below it a dropped trailing comma and a
+        // declaration head's markers swapped into THE order. The prefix, the
+        // suffix and the deletion alignments each need the canonicalization to
+        // be on one side only, so none applied, and the fallback named the
+        // first token the canonicalization moved: line 1, the import.
+        let source = "import std::io::print;\nimport std::hash_map::HashMap;\n\n\
+                      fun note(held: HashMap<i32, str>, id: i32, found: Option<str>) {\n\
+                      \tmatch found {\n\
+                      \t\tSome(let text) => held.insert(id, text),\n\
+                      \t\tNone => held.remove(id),\n\
+                      \t}; \n\
+                      }\n\n\
+                      [resource]\n[internal(\"x\")]\nstruct Foo {\n\ta: i32,\n}\n";
+        let printed = "import std::hash_map::HashMap;\nimport std::io::print;\n\n\
+                       fun note(held: HashMap<i32, str>, id: i32, found: Option<str>) {\n\
+                       \tmatch found {\n\
+                       \t\tSome(let text) => held.insert(id, text),\n\
+                       \t\tNone => held.remove(id)\n\
+                       \t}\n\
+                       }\n\n\
+                       [internal(\"x\")]\n[resource]\nstruct Foo {\n\ta: i32\n}\n";
+        let declined = net(source, printed).expect_err("the loss is a token drift");
+        assert_eq!(declined.construct, "};");
+        assert_eq!(declined.line, Some(8));
+    }
+
+    #[test]
+    fn a_divergence_with_nothing_to_align_is_named_inside_its_own_item() {
+        // The fallback no longer reaches for the file's first moved token: a
+        // divergence inside an item that canonicalizes on both sides of it is
+        // named at that item's first moved token, never at an earlier item.
+        let source = "import std::io::print;\nimport std::hash_map::HashMap;\n\n\
+                      fun other(a: i32,): i32 {\n\ta\n}\n\n\
+                      [resource]\n[internal(\"x\")]\nstruct Foo {\n\ta: i32,\n\tb: i32,\n}\n";
+        let printed = "import std::hash_map::HashMap;\nimport std::io::print;\n\n\
+                       fun other(a: i32): i32 {\n\ta\n}\n\n\
+                       [internal(\"x\")]\n[resource]\nstruct Foo {\n\ta: i32\n}\n";
+        let declined = net(source, printed).expect_err("a lost field is a token drift");
+        assert!(
+            declined.line.is_some_and(|line| line >= 8),
+            "the struct's lines, not the imports or `other`: {declined:?}"
+        );
+    }
+
+    #[test]
     fn the_bisect_is_over_the_normalized_streams() {
         // Directly: an insignificant trailing comma the file wrote and the
         // reprint dropped is NOT a divergence, so the bisect must not see one
@@ -19134,6 +19306,100 @@ mod call_statement_terminator {
         assert_construct(&at_the_budget, &at_the_budget);
         let (past, split) = hole(102);
         assert_construct(&past, &split);
+    }
+}
+
+#[cfg(test)]
+mod block_statement_terminator {
+    //! B671: a block-bearing statement - `match`, `if`, `for`, a bare block -
+    //! followed by a written `;` is a statement whose value is thrown away
+    //! (kolt's task table keeps a map in step with `insert`/`remove` arms whose
+    //! values are `()` on one and an `Option` on the other). The parser reads
+    //! the `;` and leaves no trace of it in the tree, so the printer dropped
+    //! it, the token net saw the loss and threw the whole file's reprint away:
+    //! the file stayed unformatted. The `;` is read off the source and kept.
+    use super::bailing_constructs::assert_construct;
+    use super::{format, reprint};
+
+    /// kolt's shape, as written by hand.
+    const TASK_TABLE: &str = "import std::hash_map::HashMap;\n\n\
+        fun note(held: HashMap<i32, str>, id: i32, found: Option<str>) {\n\
+        \tmatch found {\n\
+        \t\tSome(let text) => held.insert(id, text),\n\
+        \t\tNone => held.remove(id),\n\
+        \t};\n\
+        }\n";
+
+    #[test]
+    fn the_repro_is_already_canonical_and_survives_the_reprint() {
+        // `reprint` is the honest half: it answers the decline `format` hides.
+        assert_eq!(reprint(TASK_TABLE), Ok(TASK_TABLE.to_string()));
+        assert_construct(TASK_TABLE, TASK_TABLE);
+    }
+
+    #[test]
+    fn a_match_statement_with_valued_arms_keeps_its_semicolon() {
+        assert_construct(
+            "fun f(c: bool) {\n\tmatch c { true => 1, false => 2, };\n\tg();\n}\n",
+            "fun f(c: bool) {\n\tmatch c {\n\t\ttrue => 1,\n\t\tfalse => 2,\n\t};\n\tg();\n}\n",
+        );
+    }
+
+    #[test]
+    fn the_other_block_bearing_forms_keep_theirs_too() {
+        assert_construct(
+            "fun f(c: bool) {\n\tif c { 1 } else { 2 };\n\tg();\n}\n",
+            "fun f(c: bool) {\n\tif c {\n\t\t1\n\t} else {\n\t\t2\n\t};\n\tg();\n}\n",
+        );
+        assert_construct(
+            "fun f(xs: List<i32>) {\n\tfor x in xs { g(x); };\n}\n",
+            "fun f(xs: List<i32>) {\n\tfor x in xs {\n\t\tg(x);\n\t};\n}\n",
+        );
+        assert_construct(
+            "fun f() {\n\t{ g(); };\n}\n",
+            "fun f() {\n\t{\n\t\tg();\n\t};\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_block_form_without_one_does_not_gain_one() {
+        assert_construct(
+            "fun f(c: bool) {\n\tmatch c { true => g(), false => h() }\n\tg();\n}\n",
+            "fun f(c: bool) {\n\tmatch c {\n\t\ttrue => g(),\n\t\tfalse => h()\n\t}\n\tg();\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_stays_on_the_terminated_line() {
+        assert_construct(
+            "fun f(c: bool) {\n\tmatch c { true => 1, false => 2 }; // both arms\n\tg();\n}\n",
+            "fun f(c: bool) {\n\tmatch c {\n\t\ttrue => 1,\n\t\tfalse => 2\n\t}; // both arms\n\tg();\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_semicolon_on_a_line_of_its_own_joins_the_brace_and_adds_no_blank_line() {
+        assert_construct(
+            "fun f(c: bool) {\n\tmatch c {\n\t\ttrue => 1,\n\t\tfalse => 2,\n\t}\n\t;\n\tg();\n}\n",
+            "fun f(c: bool) {\n\tmatch c {\n\t\ttrue => 1,\n\t\tfalse => 2,\n\t};\n\tg();\n}\n",
+        );
+    }
+
+    #[test]
+    fn nested_in_an_arm_and_a_block_tail_position() {
+        assert_construct(
+            "fun f(c: bool, d: bool) {\n\tmatch c {\n\t\ttrue => {\n\t\t\tmatch d { true => 1, false => 2 };\n\t\t},\n\t\tfalse => {},\n\t}\n}\n",
+            "fun f(c: bool, d: bool) {\n\tmatch c {\n\t\ttrue => {\n\t\t\tmatch d {\n\t\t\t\ttrue => 1,\n\t\t\t\tfalse => 2\n\t\t\t};\n\t\t},\n\t\tfalse => {},\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn the_unformatted_form_formats_once_and_stays() {
+        let messy = "fun f(c: bool){match c{true=>1,false=>2,};}\n";
+        let once = format(messy);
+        assert_ne!(once, messy, "the formatter did not decline the file");
+        assert_eq!(format(&once), once, "twice is once");
+        assert!(once.contains("};"), "{once}");
     }
 }
 
