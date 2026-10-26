@@ -3528,11 +3528,32 @@ impl<'a, 'src> Parser<'a, 'src> {
             None => true,
         };
         if advance {
-            self.farthest_failure = Some(Failure {
-                position,
-                expected: vec![expected.to_string()],
-                context: self.context_stack.clone(),
-            });
+            // The record a failure replaces lends it its buffers: a clean parse
+            // notes at every alternative it backs out of, so a fresh record per
+            // advance was an allocation per note (three, with the context and
+            // the expectation's text) on the keystroke path.
+            match &mut self.farthest_failure {
+                Some(failure) => {
+                    failure.position = position;
+                    failure.expected.truncate(1);
+                    match failure.expected.first_mut() {
+                        Some(first) => {
+                            first.clear();
+                            first.push_str(expected);
+                        }
+                        None => failure.expected.push(expected.to_string()),
+                    }
+                    failure.context.clear();
+                    failure.context.extend_from_slice(&self.context_stack);
+                }
+                None => {
+                    self.farthest_failure = Some(Failure {
+                        position,
+                        expected: vec![expected.to_string()],
+                        context: self.context_stack.clone(),
+                    });
+                }
+            }
         } else if let Some(failure) = &mut self.farthest_failure
             && position == failure.position
             && !failure.expected.iter().any(|e| e == expected)
