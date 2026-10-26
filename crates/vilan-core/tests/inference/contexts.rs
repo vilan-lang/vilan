@@ -216,3 +216,179 @@ fn a_for_loops_next_reading_a_context_is_handed_it() {
         "outside 1\noutside 0\ninside 101\ninside 100\n",
     );
 }
+
+// --- B677: a closure PARAMETER at a `context`-typed parameter, and the silent
+// twin — a plain closure parameter called inside an owner-establishing body.
+
+/// B677's program: `while_on` runs `provide` under an owner of its own and
+/// disposes it; `register` defers `-a` to the ambient owner.
+const B677_THREE_OWNERS: &str = r#"
+import std::io::print;
+import std::reactive::{ Owner, get_owner, owner_scope, run_with_owner };
+
+fun register(name: str) {
+    print(i"+{name}");
+    get_owner().defer(|| print(i"-{name}"));
+}
+
+fun while_on(provide: {provide}) {
+    let owner = Owner::new();
+    run_with_owner(owner, {argument});
+    owner.dispose();
+    print("disposed");
+}
+
+fun main() {
+    let root = Owner::new();
+    run_with_owner(root, || {
+        while_on(|| register("a"));
+    });
+}
+main();
+"#;
+
+#[test]
+fn b677_a_closure_parameter_at_a_context_typed_parameter_is_told_its_clause() {
+    // `run_with_owner(owner, provide)` with `provide: || void` was refused with
+    // the generic landing sentence, whose FIRST choice — a closure literal —
+    // is the trap (`|| provide()` compiles and runs `provide` under the owner
+    // `while_on`'s caller was made with). The refusal names the parameter and
+    // the fix, with the argument's own closure type, the landing's `sync`
+    // marker and its clause; the literal wrap is listed last with why.
+    assert_fails_with(
+        &B677_THREE_OWNERS
+            .replace("{provide}", "|| void")
+            .replace("{argument}", "provide"),
+        "`provide` is a closure parameter; to run it under this context, type it `(sync || void) context owner_scope`",
+    );
+    assert_fails_with(
+        &B677_THREE_OWNERS
+            .replace("{provide}", "|| void")
+            .replace("{argument}", "provide"),
+        "a closure called inside a literal keeps the context it was made in: `|| provide()` would run `provide` under the context the caller was made with",
+    );
+}
+
+#[test]
+fn b677_the_parameter_typed_with_the_clause_runs_under_the_owner_at_the_call() {
+    // The fix the message names: with the clause, `provide` takes the owner at
+    // the call, so `-a` prints when `while_on`'s owner is disposed — before
+    // `disposed`. (With the literal wrap, `-a` never printed: the registration
+    // belonged to `root`, which nothing disposes.)
+    assert_compiles_and_runs(
+        &B677_THREE_OWNERS
+            .replace("{provide}", "(sync || void) context owner_scope")
+            .replace("{argument}", "provide"),
+        "+a\n-a\ndisposed\n",
+    );
+}
+
+#[test]
+fn b677_the_literal_wrap_of_a_plain_closure_parameter_is_warned() {
+    // The accepted-but-wrong form: `|| provide()` at `run_with_owner`. The
+    // warning sits on the call and names the parameter, the body and the
+    // clause that fixes it. The program still runs (and still never prints
+    // `-a`: the warning is the only thing that says why).
+    let source = B677_THREE_OWNERS
+        .replace("{provide}", "|| void")
+        .replace("{argument}", "|| provide()");
+    assert_warns_spanning(
+        &source,
+        "provide()",
+        "`provide` is a closure parameter called inside `run_with_owner`'s body, which establishes an owner: what it builds belongs to the owner it was made under, not this one, and is released with that owner; type it `(sync || void) context owner_scope` so it takes the owner at the call",
+    );
+    assert_compiles_and_runs(&source, "+a\ndisposed\n");
+}
+
+#[test]
+fn b677_a_plain_closure_parameter_called_in_each_owner_body_kind_is_warned() {
+    // The item's update: `swap`, `when` and `each` bodies establish an owner
+    // per instantiation, and a plain `|…| View` parameter called inside one
+    // builds under the owner it was made with (kolt's submenu `probes`, its
+    // `with_org`/`when_loaded` wrappers). One warning per call, at the call.
+    let source = r#"
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ View, each, swap, when };
+
+fun page(
+    show: SignalCell<bool>,
+    items: SignalCell<List<i32>>,
+    probe: |i32| View,
+    banner: || View,
+): View {
+    <div>
+        {swap(show, |on| probe(if on { 1 } else { 0 }))}
+        {when(show, || banner())}
+        {each(items, |item| item, |item| probe(item))}
+    </div>
+}
+
+fun main() {}
+main();
+"#;
+    let warnings = warning_diagnostics_with_std_on(source, std_spec(), Platform::Browser);
+    let spans: Vec<&str> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("is a closure parameter called inside"))
+        .map(|(_, range)| &source[range.clone()])
+        .collect();
+    assert_eq!(
+        spans,
+        vec!["probe(if on { 1 } else { 0 })", "banner()", "probe(item)"],
+        "one warning per call, at the call: {warnings:#?}"
+    );
+    assert!(
+        warnings.iter().any(
+            |(message, _)| message.contains("called inside `swap`'s body")
+                && message.contains("type it `(sync |i32| View) context owner_scope`")
+        ),
+        "the swap warning names the body and the fix: {warnings:#?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|(message, _)| message.contains("called inside `when`'s body")),
+        "the when warning names its body: {warnings:#?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|(message, _)| message.contains("called inside `each`'s body")),
+        "the each warning names its body: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b677_the_fixed_parameter_and_a_value_answering_parameter_are_not_warned() {
+    // A parameter carrying the clause takes the owner at the call — the fixed
+    // form, not warned — and a parameter answering a VALUE (`|i32| i32`) builds
+    // nothing under an owner. A call to the plain parameter outside any owner
+    // body is not warned either.
+    let source = r#"
+import std::reactive::{ Signal, SignalCell, owner_scope };
+import std::web::ui::{ View, swap };
+
+fun page(
+    show: SignalCell<bool>,
+    probe: (sync |i32| View) context owner_scope,
+    count: |i32| i32,
+    plain: |i32| View,
+): View {
+    let outside = plain(0);
+    <div>
+        {swap(show, |on| probe(count(if on { 1 } else { 0 })))}
+        {outside}
+    </div>
+}
+
+fun main() {}
+main();
+"#;
+    let warnings = warning_diagnostics_with_std_on(source, std_spec(), Platform::Browser);
+    assert!(
+        !warnings
+            .iter()
+            .any(|(message, _)| message.contains("is a closure parameter called inside")),
+        "no B677 warning: {warnings:#?}"
+    );
+}

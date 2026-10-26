@@ -1067,6 +1067,176 @@ fn clause_carried_by(
     }
 }
 
+/// B677 (door 1, ruled R-b at Order 55's GO): a plain closure PARAMETER — one
+/// whose type carries no `owner_scope` — called inside a closure literal that
+/// lands at a position establishing the ambient owner (`swap`, `when`, `each`,
+/// `run_with_owner`, an overlay's `attach`, a field or binding typed with the
+/// clause) builds under the owner it was MADE with, not the body's: what it
+/// registers outlives the body's owner and is released with the caller's. In
+/// kolt a submenu's `probes: |…| View` built a store hold per listed name under
+/// the parent menu, piling up a set per opening (30 hovers: 12 s to close,
+/// through M172), and page actions provided "while a page has focus" were never
+/// withdrawn. Warned where the parameter answers a `View` or nothing at all
+/// (`void`: it is called for what it does), with the clause that makes it take
+/// the owner at the call. A parameter whose clause carries `owner_scope` is the
+/// fixed form; a call through a binding or a field is not a parameter's.
+fn warn_plain_closure_parameters_under_owner_bodies(
+    program: &Program,
+    graph: &CallGraph,
+    landing_sites: &[(Id, Carrier, Option<TypeId>)],
+    value_contexts: &HashMap<Id, Vec<Id>>,
+    warnings: &mut Vec<(Error, SourceId)>,
+) {
+    let establishes_owner = |clause: &[Id]| {
+        clause
+            .iter()
+            .any(|&context| context_name(program, context) == "owner_scope")
+    };
+    // C3a's demotion domain: a library's own wrappers (std's `MaybeSignal::bind`
+    // reacts through a plain `|T| void` by design) are not the user's to
+    // retype, so the warning stands only in code the user wrote.
+    let library_spanned = |id: Id| -> bool {
+        program.source_of(id).is_some_and(|source| {
+            program.frozen_sources.contains(&source) || program.dependency_sources.contains(&source)
+        })
+    };
+    let mut warned: HashSet<Id> = HashSet::default();
+    for &(value, destination, destination_type) in landing_sites {
+        let Some(Expr::Closure(closure_id)) = program.entity_map.get(&value) else {
+            continue;
+        };
+        if library_spanned(value) {
+            continue;
+        }
+        let clause: Option<&[Id]> = match destination {
+            Carrier::Value(landing) => value_contexts.get(&landing).map(Vec::as_slice),
+            Carrier::Field(..) | Carrier::Return(_) => {
+                destination_type.and_then(|type_id| clause_of_type(program, type_id))
+            }
+        };
+        if !clause.is_some_and(establishes_owner) {
+            continue;
+        }
+        let (body, sync) = match destination {
+            Carrier::Value(landing) => (
+                program
+                    .parameters
+                    .get(&landing)
+                    .and_then(|parameter| program.functions.get(&parameter.function_id))
+                    .map(|function| format!("`{}`'s body", function.name))
+                    .unwrap_or_else(|| "this body".to_string()),
+                program.sync_values.contains(&landing),
+            ),
+            Carrier::Field(..) | Carrier::Return(_) => ("this body".to_string(), false),
+        };
+        for call in graph.calls_of(*closure_id) {
+            let Some(function_call) = program.function_calls.get(&call.call_id) else {
+                continue;
+            };
+            let Some(Expr::Local(source)) = program.entity_map.get(&function_call.subject_id)
+            else {
+                continue;
+            };
+            let Some(parameter) = program.parameters.get(source) else {
+                continue;
+            };
+            let Some(Type::Closure(_, result, contexts, _)) =
+                program.type_id_to_type_map.get(&parameter.type_id)
+            else {
+                continue;
+            };
+            if establishes_owner(contexts) || !builds_under_the_owner(program, *result) {
+                continue;
+            }
+            if !warned.insert(call.call_id) {
+                continue;
+            }
+            let name = parameter.name;
+            let closure = crate::printer::type_text(program, parameter.type_id, &|type_id| type_id);
+            let sync = if sync { "sync " } else { "" };
+            warnings.push(anchored(
+                program,
+                call.call_id,
+                format!(
+                    "`{name}` is a closure parameter called inside {body}, which establishes an owner: what it builds belongs to the owner it was made under, not this one, and is released with that owner; type it `({sync}{closure}) context owner_scope` so it takes the owner at the call"
+                ),
+            ));
+        }
+    }
+}
+
+/// Whether a closure answering `result` is called for what it BUILDS under
+/// the ambient owner: a `View`, or nothing (`void` — an effect, a provider).
+fn builds_under_the_owner(program: &Program, result: TypeId) -> bool {
+    match program.type_id_to_type_map.get(&result) {
+        Some(Type::Void) => true,
+        Some(Type::Struct(id, _)) => program
+            .structs
+            .get(id)
+            .is_some_and(|declaration| declaration.name == "View"),
+        _ => false,
+    }
+}
+
+/// B677: the refusal a plain closure PARAMETER of the enclosing function earns
+/// at a `context`-typed parameter — `run_with_owner(owner, provide)` with
+/// `provide: || void`. The fix is the parameter's own clause, spelled with the
+/// argument's closure type, the landing's `sync` marker and the landing's
+/// clause (`(sync || void) context owner_scope`); the closure-literal wrap the
+/// generic message leads with is listed LAST, with why it is the trap: a
+/// closure called inside the literal keeps the context it was made in, so
+/// `|| provide()` is accepted and runs `provide` under the owner the caller
+/// was made with. `None` when the argument is not such a parameter.
+fn closure_parameter_refusal(
+    program: &Program,
+    argument: Id,
+    landing: Id,
+    clause: &[Id],
+) -> Option<String> {
+    let Some(Expr::Local(source)) = program.entity_map.get(&argument) else {
+        return None;
+    };
+    let parameter = program.parameters.get(source)?;
+    let Some(Type::Closure(..)) = program.type_id_to_type_map.get(&parameter.type_id) else {
+        return None;
+    };
+    let name = parameter.name;
+    let sync = if program.sync_values.contains(&landing) {
+        "sync "
+    } else {
+        ""
+    };
+    let closure = crate::printer::type_text(program, parameter.type_id, &|type_id| type_id);
+    let spelled = format!("({sync}{closure}) {}", clause_spelling(program, clause));
+    let wrap = literal_wrap_of(program, parameter.type_id, name);
+    Some(format!(
+        "`{name}` is a closure parameter; to run it under this context, type it `{spelled}` — a `context`-typed parameter takes a value with the same `context` clause, a named function or variant, a local closure binding (which adopts the clause), or a closure literal, and a closure called inside a literal keeps the context it was made in: `{wrap}` would run `{name}` under the context the caller was made with"
+    ))
+}
+
+/// The closure-literal wrap of a call to `name` at the closure type `type_id`,
+/// as a caller would write it: `|| name()`, `|value| name(value)`,
+/// `|a, b| name(a, b)`.
+fn literal_wrap_of(program: &Program, type_id: TypeId, name: &str) -> String {
+    let count = match program.type_id_to_type_map.get(&type_id) {
+        Some(Type::Closure(parameters, ..)) => parameters.len(),
+        _ => 0,
+    };
+    let arguments: Vec<&str> = match count {
+        0 => Vec::new(),
+        1 => vec!["value"],
+        _ => ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .into_iter()
+            .take(count)
+            .collect(),
+    };
+    format!(
+        "|{}| {name}({})",
+        arguments.join(", "),
+        arguments.join(", ")
+    )
+}
+
 /// The refusal a value earns for landing in a `context`-typed position it does
 /// not fit (B309). A value carrying a DIFFERENT clause is its own mistake and
 /// names both clauses — the threading can follow a forward only to a position
@@ -2275,6 +2445,12 @@ fn analyze(
                                 *argument,
                                 landing_refusal(program, "parameter", &clause, Some(&found)),
                             ));
+                        } else if let Some(refusal) =
+                            closure_parameter_refusal(program, *argument, *parameter, &clause)
+                        {
+                            // B677: the argument is a plain closure PARAMETER of
+                            // the enclosing function — the fix is its clause.
+                            errors.push(anchored(program, *argument, refusal));
                         } else {
                             errors.push(anchored(program, *argument, "a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause, or a local closure binding (which adopts the clause)"
                                     .to_string()));
@@ -2283,6 +2459,17 @@ fn analyze(
                 }
             }
         }
+
+        // B677 (door 1): a plain closure parameter called inside a body that
+        // establishes the ambient owner builds under the owner it was made
+        // with, silently — warned, with the clause that fixes it.
+        warn_plain_closure_parameters_under_owner_bodies(
+            program,
+            graph,
+            &landing_sites,
+            &value_contexts,
+            warnings,
+        );
 
         // Calls THROUGH an annotated (or adopted) value — after adoption, so
         // a named handler's direct calls demand and thread like any injected

@@ -853,7 +853,8 @@ fn b482_a_callback_value_typed_without_the_clause_is_refused_and_both_migrations
         "#;
     assert_fails_with(
         refused,
-        "a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause",
+        // B677: a closure PARAMETER is told its clause, the literal wrap last.
+        "`react` is a closure parameter; to run it under this context, type it `(|i32| void) context tracking`",
     );
     assert_compiles_and_runs(
         r#"

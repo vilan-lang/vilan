@@ -625,7 +625,8 @@ fn b478_a_clause_less_closure_parameter_is_still_refused() {
             print(relabel(SignalCell::new(1), |n| i"n={n}"));
         }
         "#,
-        "a `context`-typed parameter takes a closure literal, a named function or variant",
+        // B677: a closure PARAMETER is told its clause, the literal wrap last.
+        "`label` is a closure parameter; to run it under this context, type it `(sync |i32| str) context (owner_scope, tracking, ambient_nursery)`",
     );
 }
 
