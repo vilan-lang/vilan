@@ -919,7 +919,10 @@ export class VilanDebugAdapter {
             }
         }
         this.frames.set(id, info);
-        const name = info.resolved?.name ?? (callFrame.functionName || (topLevel ? 'main' : '(anonymous)'));
+        const name =
+            info.resolved?.name ??
+            this.mapFrameName(script, callFrame, generated, awaiting, topLevel) ??
+            (callFrame.functionName || (topLevel ? 'main' : '(anonymous)'));
         if (original && script?.map) {
             const source = script.map.sources[original.source];
             return {
@@ -940,6 +943,53 @@ export class VilanDebugAdapter {
             column: generated.column + 1,
             presentationHint: 'subtle',
         };
+    }
+
+    /// E336: the name of a frame the sidecar has no record for (it describes
+    /// the USER's functions; std's frames are the ones that fall here), from
+    /// the source map. S5 marks every function head - std's included - and
+    /// carries the function's name there, so a frame whose head is marked is
+    /// named by it; a head marked with no name is a closure's, spelled `a
+    /// closure in <the function holding it>` as the sidecar spells a user's.
+    /// V8's own `functionName` infers from the nearest assignment (a closure
+    /// std passed to `with_finally` read `running_wake.v`), so it stays only
+    /// for what the map does not describe: the runtime helpers, a script with
+    /// no map, and an awaiting frame, which carries no function start (it is
+    /// named by V8 unless that is empty, then by the function holding its
+    /// place).
+    private mapFrameName(
+        script: ScriptInfo | undefined,
+        callFrame: any,
+        generated: { line: number; column: number },
+        awaiting: boolean,
+        topLevel: boolean,
+    ): string | undefined {
+        const map = script?.map;
+        if (!map || topLevel) {
+            return undefined;
+        }
+        if (awaiting) {
+            if (callFrame.functionName) {
+                return undefined;
+            }
+            const at = map.original(generated);
+            return at && !map.sources[at.source]?.url.startsWith('vilan:') ? this.closureIn(map, generated) : undefined;
+        }
+        const location = callFrame.functionLocation;
+        if (!location) {
+            return undefined;
+        }
+        const head = { line: location.lineNumber, column: location.columnNumber ?? 0 };
+        const segment = map.segmentAt(head);
+        if (!segment || map.sources[segment.source]?.url.startsWith('vilan:')) {
+            return undefined;
+        }
+        return segment.name !== undefined ? map.names[segment.name] : this.closureIn(map, head);
+    }
+
+    private closureIn(map: SourceMap, place: { line: number; column: number }): string | undefined {
+        const owner = map.enclosingFunctionName(place);
+        return owner === undefined ? undefined : `a closure in ${owner}`;
     }
 
     private dapSource(file: string | undefined, url: string, content: string | undefined, ignored: boolean): unknown {

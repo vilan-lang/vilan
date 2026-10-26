@@ -30,6 +30,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**E336: vilan-dap names a std frame by its vilan function, not by V8's guess — the closure `run_traced` hands `with_finally` shows as `a closure in run_traced`, where it read `running_wake.v` (the property its sibling closure assigns) and std's other closures read `(anonymous)`.** The sidecar describes the user's functions only, so a std frame has no record and the adapter fell back to the inspector's `functionName`, which V8 infers from the nearest assignment. It now reads the source map first: S5 marks every function head, std's included, with the function's `names` entry, so a frame whose head (V8's `functionLocation`) is a marked segment is named by it, and a head marked with no name is a closure's, spelled `a closure in <the function holding it>` as the sidecar spells a user's (the nearest named segment before the head: the emitted functions are flat at the script's top level). V8's name stays only where the map has none to give: the runtime helpers (`__with_finally`), a script with no map, and an awaiting frame, which carries no function start (V8's name unless it is empty). Pins: `session.test.ts`'s traced-wake session asserts the frames carry `a closure in run_traced` and no `running_wake.v` / `(anonymous)` (red before), and `dap.test.ts` pins the map's two new readings. Tracker E336.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->
