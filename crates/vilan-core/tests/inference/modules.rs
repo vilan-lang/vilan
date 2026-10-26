@@ -4006,6 +4006,106 @@ fn b655_a_struct_inside_an_impl_is_refused_in_its_own_module() {
     );
 }
 
+// --- B663: a struct literal heading a `match` subject ------------------------
+
+const NO_MATCH_SUBJECT: &str = "a struct literal can't be a `match` subject here";
+
+#[test]
+fn b663_a_struct_literal_match_subject_is_refused_at_the_literal() {
+    let source = r#"
+        import std::io::print;
+        struct Point { x: i32 }
+        impl Point { fun doubled(self): i32 { self.x * 2 } }
+        fun main() {
+            let label = match Point { x = 2 }.doubled() {
+                4 => "four",
+                _ => "other",
+            };
+            print(label);
+        }
+        "#;
+    // Spanned on the literal, alone: the legs below parse as legs.
+    let start = source.find("Point { x = 2 }").expect("the literal");
+    assert_eq!(
+        failure_diagnostics(source)
+            .into_iter()
+            .map(|(message, range)| (message.starts_with(NO_MATCH_SUBJECT), range))
+            .collect::<Vec<_>>(),
+        vec![(true, start..start + "Point { x = 2 }".len())],
+    );
+    // The two spellings the steer names compile.
+    assert_compiles_and_runs(
+        &source.replace(
+            "match Point { x = 2 }.doubled()",
+            "match (Point { x = 2 }).doubled()",
+        ),
+        "four\n",
+    );
+}
+
+#[test]
+fn b663_inside_element_syntax_the_inner_error_is_reported_where_it_is() {
+    // The item's browser shape: the error used to land as a missing `;` at
+    // the element's closing tag. The struct literal is now its own refusal,
+    // and a DIFFERENT broken statement in the same handler — the general
+    // half — reports at its own line, not at `</form>`.
+    let handler = |statement: &str| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::web::ui::mount_root;
+        struct Point {{ x: i32 }}
+        impl Point {{ fun doubled(self): i32 {{ self.x * 2 }} }}
+        fun main() {{
+            mount_root("app", || <form
+                on:submit(|event| {{
+                    event.prevent_default();
+                    {statement}
+                }})
+            >
+                <input name("a") />
+                <p>"text"</p>
+            </form>);
+        }}
+        "#
+        )
+    };
+    let literal = handler(
+        "match Point { x = 2 }.doubled() {\n\t\t\t\t\t\t4 => print(\"four\"),\n\t\t\t\t\t\t_ => print(\"other\"),\n\t\t\t\t\t}",
+    );
+    let diagnostics = failure_diagnostics_on(&literal, Platform::Browser);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].0.starts_with(NO_MATCH_SUBJECT),
+        "{diagnostics:#?}"
+    );
+
+    let broken = handler("let z = 5 6;");
+    let five = broken.find("5 6").expect("the gap");
+    assert_eq!(
+        failure_diagnostics_on(&broken, Platform::Browser),
+        vec![(
+            "expected `;` to end this statement".to_string(),
+            five..five + 1
+        )],
+    );
+}
+
+#[test]
+fn b663_a_broken_statement_in_a_closure_that_is_a_bodys_tail_reports_at_its_line() {
+    // The same recovery boundary outside markup: a call taking a closure, as
+    // a body's tail expression.
+    let source = "fun run(f: |i32| void) {}\n\nfun view() {\n\trun(|event| {\n\t\tlet z = 5 6;\n\t})\n}\n\nfun main() {}\n";
+    let five = source.find("5 6").expect("the gap");
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(
+            "expected `;` to end this statement".to_string(),
+            five..five + 1
+        )],
+    );
+}
+
 // --- Path semantics: library territory is decided on canonicalized paths ---
 // (windows-support.md §5)
 

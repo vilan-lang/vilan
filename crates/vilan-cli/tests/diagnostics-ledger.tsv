@@ -778,3 +778,4 @@ NEW	-	a `let` takes no guard: the let-else form is the `is` test alone, `{respel
 NEW	-	a `let` takes no guard: the let-else form is the `is` test alone, `opt is Some(let x) else ret;`, with no `let x =`
 NEW	-	a tuple takes no trailing comma; remove the `,` before `)`
 NEW	-	wrap a closure type that is a parameter in parentheses: `({written})` — bare, its `|` closes the outer parameter list
+NEW	-	a struct literal can't be a `match` subject here: the `{{` after a name opens the legs; wrap the literal in parentheses or bind it with `let` first

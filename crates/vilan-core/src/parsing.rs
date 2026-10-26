@@ -1808,6 +1808,12 @@ const MULTILINE_ATTRIBUTE_ARGUMENT: &str = "an attribute argument here is a one-
 const A_TUPLE_TAKES_NO_TRAILING_COMMA: &str = "a tuple takes no trailing comma; remove the \
      `,` before `)`";
 
+/// B663: a struct literal heading a `match` subject. Curated (B6): the rule
+/// and its two ways out.
+const A_STRUCT_LITERAL_IS_NO_MATCH_SUBJECT: &str = "a struct literal can't be a `match` subject \
+     here: the `{` after a name opens the legs; wrap the literal in parentheses or bind it with \
+     `let` first";
+
 /// B658: the one capture an `is` pattern binds, when it binds exactly one —
 /// the name, the mutability flag and the name's span, mutably, so the
 /// let-else recovery can rename it.
@@ -7607,10 +7613,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             // No statement starts here. The block's trailing expression is the
             // other legitimate reading (it is the one thing in a block that needs
             // no `;`), and it must close the block to be one.
-            if let Some(expression) = self.attempt(|parser| {
+            //
+            // B663: the statement attempt that just failed parsed this same
+            // text and failed for the `;` a tail does not take, at the block's
+            // `}` — the FARTHEST failure on record, and a stale one for the
+            // re-parse below. A block inside the tail (a closure's body, an
+            // element's handler) asked the farthest failure what its own
+            // broken statement wanted and was handed that `;`, so `let z = 5
+            // 6;` in an `on:submit` handler was reported as a missing `;` at
+            // the element's closing tag (kolt: sixteen lines below). The tail
+            // attempt runs without it; the farther of the two is kept after.
+            let statement_failure = self.farthest_failure.take();
+            let parsed = self.attempt(|parser| {
                 let expression = parser.parse_discarded(Self::parse_expression)?;
                 parser.peek_is_ctrl('}').then_some(expression)
-            }) {
+            });
+            self.farthest_failure = match (statement_failure, self.farthest_failure.take()) {
+                (Some(statement), Some(tail)) if tail.position > statement.position => Some(tail),
+                (Some(statement), _) => Some(statement),
+                (None, tail) => tail,
+            };
+            if let Some(expression) = parsed {
                 tail = Some(expression);
                 break;
             }
@@ -7799,7 +7822,30 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_match(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Match)?;
-        let subject = self.parse_condition()?;
+        let subject_start = self.position;
+        let mut subject = self.parse_condition()?;
+        // B663: `match Point { x = 2 }.doubled() {` — the subject is a
+        // condition, where a `{` after a bare path opens the legs (a struct
+        // literal would swallow them), so the literal's `x = 2` read as a leg
+        // and failed on its `=`. A leg never begins `name =`, so that shape
+        // after a path subject IS the literal: refused there with the two
+        // spellings that work, and parsed as one so the legs below still read
+        // (inside element syntax the failure used to surface as a missing `;`
+        // at the element's closing tag, sixteen lines down in kolt).
+        if self.struct_literal_heads_the_legs(&subject)
+            && let Some(literal_end) =
+                self.scan_balanced(self.position, '{', '}', &[('(', ')'), ('[', ']')])
+        {
+            self.errors.push(ParseError {
+                span: (self.token_span(subject_start).start..self.token_span(literal_end - 1).end)
+                    .into(),
+                reason: ParseErrorReason::Rule(A_STRUCT_LITERAL_IS_NO_MATCH_SUBJECT),
+                context: Vec::new(),
+                hint: None,
+            });
+            self.position = subject_start;
+            subject = self.parse_expression()?;
+        }
         let legs_start = self.position;
         self.expect_ctrl('{')?;
         let mut legs = Vec::new();
@@ -7814,6 +7860,20 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.expect_ctrl('}')?;
         let legs = (legs, self.span_from(legs_start));
         Some((Node::Match(Box::new(subject), legs), self.span_from(start)))
+    }
+
+    /// B663: whether the `{` at the cursor, after a match `subject` that is a
+    /// bare path, opens a struct LITERAL rather than the legs — `name =` (or
+    /// `name,`/`name }`'s shorthand is a leg too, so only the `=` decides).
+    fn struct_literal_heads_the_legs(&self, subject: &Spanned<Node<'src>>) -> bool {
+        matches!(
+            subject.0,
+            Node::Accessor(_) | Node::AccessorWithGenerics(..) | Node::StaticAccessor(..)
+        ) && self.peek_is_ctrl('{')
+            && self
+                .peek_at(1)
+                .is_some_and(|token| matches!(token, Token::Ident(_)) || is_reserved_word(token))
+            && matches!(self.peek_at(2), Some(Token::Op("=")))
     }
 
     /// One leg: `pattern (, pattern)* (if guard)? => body`.
