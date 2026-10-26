@@ -2285,3 +2285,160 @@ main();
          \"go\",\"now\"\n",
     );
 }
+
+/// M172's program: one org-like store with `{count}` keys, mirrored to one
+/// client; a "table" view holding every key, then a "page" view holding every
+/// key beside it, the page unmounted, then the table. Four phases, each marked
+/// on stdout.
+const M172_HOLDS: &str = r#"
+import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Owner, Source, run_with_owner };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store, StoreSome };
+import std::rpc::{ DuplexEnd, DuplexTransport, ReactiveClient, duplex_pair, local_rpc, register_session };
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Message {
+    id: u53,
+    content: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+    messages: HashMap<u53, Message>,
+    motd: str,
+}
+
+fun seeded(count: u53): Global {
+    mut messages: HashMap<u53, Message> = HashMap::new();
+    mut id: u53 = 0;
+    for id < count {
+        messages.insert(id, Message { id, content = i"m{id}" });
+        id += 1;
+    }
+    Global { messages, motd = "welcome" }
+}
+
+let shared: Store<Global> = Store::new(seeded({count}));
+
+[service(BoardClient)]
+struct Board {}
+
+impl Board {
+    [rpc]
+    fun global(self): Store<Global> {
+        shared
+    }
+}
+
+fun hold_every_key(g: RemoteStoreSome<Global>, count: u53) {
+    mut id: u53 = 0;
+    for id < count {
+        g.messages().at(id).some().content().effect(|_content| {});
+        id += 1;
+    }
+}
+
+fun main() {
+    let count: u53 = {count};
+    let (client_end, server_end) = duplex_pair();
+    register_session(7, server_end, json_codec());
+    let transport = local_rpc(Board {}.dispatcher().into_protocol(json_codec()).for_connection(7));
+    let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+    let g: RemoteStoreSome<Global> = client.global();
+    let table = Owner::new();
+    run_with_owner(table, || hold_every_key(g, count));
+    sleep_for(Duration::millis(0));
+    print("table mounted");
+    let page = Owner::new();
+    run_with_owner(page, || hold_every_key(g, count));
+    sleep_for(Duration::millis(0));
+    print("page mounted");
+    page.dispose();
+    sleep_for(Duration::millis(0));
+    print("page unmounted");
+    table.dispose();
+    sleep_for(Duration::millis(0));
+    print("table unmounted");
+}
+
+main();
+"#;
+
+/// The rule-1 copies (`__clone` calls, recursion included) each phase of
+/// [`M172_HOLDS`] makes at `count` keys, in the order the phases print.
+fn m172_copies_per_phase(count: usize) -> Vec<usize> {
+    let js = compile(&M172_HOLDS.replace("{count}", &count.to_string()))
+        .unwrap_or_else(|errors| panic!("M172's program must compile: {errors:#?}"));
+    let helper = "function __clone(value) {";
+    assert!(
+        js.contains(helper),
+        "the emitted program carries the copy helper"
+    );
+    let counted = format!(
+        "globalThis.__clones = 0;\n\
+         const __print = console.log;\n\
+         console.log = (...parts) => __print(parts.join(\" \") + \" | \" + globalThis.__clones);\n{}",
+        js.replace(
+            helper,
+            "function __clone(value) {\n\tglobalThis.__clones++;"
+        )
+    );
+    let stdout =
+        run_js(&counted).unwrap_or_else(|errors| panic!("M172's program must run: {errors:#?}"));
+    let mut seen = 0;
+    let mut copies = Vec::new();
+    for line in stdout.lines() {
+        let (_, total) = line
+            .rsplit_once(" | ")
+            .expect("every line carries the running copy count");
+        let total: usize = total.trim().parse().expect("the copy count is a number");
+        copies.push(total - seen);
+        seen = total;
+    }
+    assert_eq!(copies.len(), 4, "four phases print:\n{stdout}");
+    copies
+}
+
+#[test]
+fn m172_a_mirrors_holds_and_releases_cost_their_own_entries_not_the_table() {
+    // M172: a store mirror's holds and the client's and server's slot tables
+    // were lists, walked — and, through `Shared::read()`, deep-copied — on
+    // every hold and every release, so a view's h holds under a mirror holding
+    // H cost h × H copies (550 ms to unmount a 152-row list in kolt with its
+    // table open beside it; 12 s through B677's trap). Keyed by what they are
+    // looked up by (hold id, slot number, boundary identity, grant base), a
+    // hold and a release each cost their own entry: four times the keys is
+    // four times the copies, in every phase. Before the fix, 48 → 192 keys
+    // multiplied the page's unmount by 16 (307k → 4.9M copies), its mount by
+    // 13 and the table's mount by 10; after it, by 4.0, 4.0 and 4.0.
+    let small = m172_copies_per_phase(48);
+    let large = m172_copies_per_phase(192);
+    let ratio = |phase: usize| large[phase] as f64 / small[phase] as f64;
+    let phases = ["table mount", "page mount", "page unmount", "table unmount"];
+    for phase in 0..3 {
+        assert!(
+            ratio(phase) < 6.0,
+            "the {}'s copies grew {:.1}× for 4× the keys ({} → {}): a hold or a release walks the table again\n48: {small:?}\n192: {large:?}",
+            phases[phase],
+            ratio(phase),
+            small[phase],
+            large[phase]
+        );
+    }
+    // The table's unmount releases its keys one turn each, and every key's
+    // `gone` is a write the replica diffs over its watched keys — the store's
+    // own cost, filed beside M172 — so it is held to a looser bound than the
+    // mirror's own phases (4.9× measured; 15× before the fix).
+    assert!(
+        ratio(3) < 8.0,
+        "the table unmount's copies grew {:.1}× for 4× the keys ({} → {})\n48: {small:?}\n192: {large:?}",
+        ratio(3),
+        small[3],
+        large[3]
+    );
+}
