@@ -4640,8 +4640,7 @@ impl<'src> Printer<'src> {
                 // `let`) still ends where its value ends, with no `;` after it
                 // (zero columns) - a `!` / `?` / `.field` that ends it is
                 // followed by columns of its own all the same.
-                let enclosing_terminator =
-                    std::mem::replace(&mut self.terminator_end, Some(range.end));
+                let enclosing_terminator = self.terminator_end.replace(range.end);
                 let enclosing_columns =
                     std::mem::replace(&mut self.terminator_columns, usize::from(terminated));
                 self.print_item(item);
