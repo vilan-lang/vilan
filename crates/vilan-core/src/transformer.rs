@@ -1303,6 +1303,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__dom_query_all",
         "__router_path",
         "__router_url",
+        "__router_state",
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1592,6 +1593,12 @@ fn helper_source(name: &str) -> &'static str {
         // Router glue (std::web::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
+        // M167: the current entry's state, when it is TEXT — the only kind
+        // `std::web::router` writes. The first entry (state `null`) and one
+        // another script pushed with an object both read as `""`.
+        "__router_state" => {
+            "function __router_state() {\n\treturn typeof history.state === \"string\" ? history.state : \"\";\n}"
+        }
         // The whole relative URL, for the query and fragment `location.pathname`
         // leaves out. Deliberately NOT what `current_path()` tracks: a route
         // signal that advanced on every `#anchor` would re-render the page for a

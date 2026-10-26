@@ -534,20 +534,28 @@ function installStubDocument(options = {}) {
     // them the same way it fires an element's (`window.fire("resize")`).
     global.window = new StubElement("window");
     global.windowListeners = { bubble: global.window.listeners, capture: global.window.captureListeners };
-    global.location = { pathname: "/" };
+    global.location = { pathname: "/", search: "", hash: "" };
     // The history STACK, not just the current path: `pushState` grows it and
     // `replaceState` rewrites its top, which is the only difference between
     // `navigate` and `navigate_replace` (A72) and therefore the only thing a
     // pin can read. Nothing else has to look at it.
+    //
+    // M167: and the current entry's STATE, as the host keeps it — `null` for
+    // the entry the page loaded on, whatever the last push or replace stored
+    // after that. A harness simulating Back sets it with the pathname before
+    // it fires `popstate`.
     global.historyEntries = ["/"];
     global.history = {
+        state: null,
         pushState(state, title, path) {
             global.location.pathname = path;
             global.historyEntries.push(path);
+            this.state = state;
         },
         replaceState(state, title, path) {
             global.location.pathname = path;
             global.historyEntries[global.historyEntries.length - 1] = path;
+            this.state = state;
         },
     };
     // A121: the resolved style. The stub has no cascade, so a value comes from

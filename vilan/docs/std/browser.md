@@ -507,6 +507,12 @@ Two things deliberately still ask for the concrete type:
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
 fun navigate(path: str)               // pushState + update current_path
 fun navigate_replace(path: str)       // replaceState — same, WITHOUT a new history entry
+fun navigate_with(path: str, state: str)          // navigate, storing `state` on the entry
+fun navigate_replace_with(path: str, state: str)  // navigate_replace, storing `state`
+fun set_history_state(state: str)     // rewrite the current entry's state, address kept
+fun history_state(): str              // the current entry's state ("" when none)
+struct HistoryEntry { path: str, state: str, popped: bool }
+fun current_entry(): SignalCell<HistoryEntry>   // live; popped = back/forward reached it
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
 fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
@@ -539,6 +545,26 @@ advance `current_path()` identically and both join the caller's ambient turn;
 there is no `navigate(path, replace)` because vilan has neither overloading
 nor default arguments, and a bare `true` at the call site says less than the
 name does.
+
+**An entry can carry state.** `navigate_with(path, state)` and
+`navigate_replace_with(path, state)` store a text on the entry they push or
+rewrite (encode a structure as JSON), and `set_history_state(state)` marks the
+entry you are on after the fact. When back or forward returns to it,
+`history_state()` reads the text back. `current_entry()` is the entry as a
+signal: written by every navigation and every `popstate`, with `popped` true
+only when back or forward reached it. That is how an app tells "the user went
+back" from "a link was followed", for example to restore which panel showed a
+page:
+
+```vilan,fragment
+current_entry().effect(|entry| {
+	if entry.popped {
+		restore(entry.state);
+	} else {
+		follow(entry.path);
+	}
+});
+```
 
 `current_path()` is a singleton signal: every caller gets the same one, and
 the `popstate` listener is wired on first use. `link` renders a real anchor
