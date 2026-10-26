@@ -98,12 +98,7 @@ export fun view(tag: str): View {
 /// server writes it: a node with no tag, which `render` writes as no markup at all.
 /// KEEP IN STEP with the browser twin (browser/ui.vl).
 export fun nothing(): View {
-	View {
-		tag = "",
-		attributes = Shared::new([]),
-		children = Shared::new([]),
-		text = Shared::new(""),
-	}
+	view("")
 }
 
 /// Set-or-replace an attribute BY NAME, in place — mirrors the DOM's
