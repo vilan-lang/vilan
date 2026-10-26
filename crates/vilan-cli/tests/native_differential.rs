@@ -12292,6 +12292,21 @@ fn b647_module_binding_loans_and_copies_answer_the_same_on_both_backends() {
     );
 }
 
+/// B659, B667, B670: a literal waiting for a closure's result (method and
+/// free path), a literal tail taking a `ret`'s width, a self-call in a
+/// `match` leg of an unannotated function, a method on an operator's result
+/// over a closure parameter — typed, and answering the same on both backends
+/// (`native/solver55_inference.*`).
+#[test]
+fn solver55_inference_shapes_answer_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_solver55_inference.vl",
+        include_str!("native/solver55_inference.vl"),
+        include_str!("native/solver55_inference.stdout"),
+        "",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // debugging.md S1: `dbg(..)`.
 // ---------------------------------------------------------------------------

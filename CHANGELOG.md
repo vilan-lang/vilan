@@ -115,6 +115,11 @@ written down.
 
 ---
 
+<!-- family: fix -->
+**B670: a method call on an operator's result over a closure parameter waits for the parameter's type, as a method on the parameter itself does — `scale.derive(|value| (value * 100.0).round())` refused "cannot call method 'round' on unknown" where `value.round()` checked.** The method lookup deferred only when its receiver WAS an unfilled closure parameter; it now defers when the receiver is built from one (`value_awaits_a_closure_parameter`, the subtree form B288 added for struct literals), so the product types once `value` is filled. Pins: `tracking::b670_a_method_on_an_operators_result_over_a_closure_parameter_waits` (the item's three, a subtraction under a unary minus, a method on a method's result) and the native differential above. Tracker B670.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->

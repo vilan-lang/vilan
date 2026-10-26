@@ -59782,7 +59782,19 @@ impl<'src> Analyzer<'src> {
             Type::Unresolved => MethodLookup::Defer,
             // An unannotated closure parameter awaiting bidirectional inference
             // defers rather than erroring; once its type lands the call resolves.
-            Type::Unknown if self.is_unknown_closure_parameter(subject_id) => MethodLookup::Defer,
+            // B670: and so does a receiver BUILT from one — `(value *
+            // 100.0).round()` under `scale.derive(|value| ..)` asked for the
+            // product's type before `value` was filled, and refused "cannot
+            // call method 'round' on unknown" where `value.round()` waited.
+            Type::Unknown
+                if self.is_unknown_closure_parameter(subject_id)
+                    || (!matches!(
+                        self.expr_id_to_expr_map.get(&subject_id),
+                        Some(Expr::Local(_) | Expr::Parameter(_))
+                    ) && self.value_awaits_a_closure_parameter(subject_id)) =>
+            {
+                MethodLookup::Defer
+            }
             // A comprehension binder whose element type isn't set yet defers, too.
             Type::Unknown if self.is_untyped_comprehension_binder(subject_id) => {
                 MethodLookup::Defer
