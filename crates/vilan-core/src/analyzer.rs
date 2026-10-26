@@ -83881,9 +83881,11 @@ struct World<'src> {
     source_hashes: Vec<u64>,
     entry_is_module: bool,
     /// B239: this world's entry is a MODULE its siblings import (file mode,
-    /// and something in the load referenced `pkg::<entry>`), so the pre-entry
-    /// `resolve_world` was DEFERRED — nothing here has resolved yet, and the
-    /// post-entry `build()` is the one pass that resolves it all.
+    /// and something in the load referenced `pkg::<entry>`), so the PACKAGE
+    /// half of the pre-entry resolve was DEFERRED — the tiers (std, the
+    /// dependencies) resolved before the package's nodes minted (P6a: they
+    /// never reach `pkg::<entry>`), and the post-entry `build()` resolves the
+    /// package and the entry together.
     ///
     /// M70: such a world IS stored, keyed by the module it excludes
     /// ([`BaseCacheKey::entry_open_module`]), and this flag travels with it —
@@ -83892,10 +83894,12 @@ struct World<'src> {
     /// exactly when the analysis that stored it did, and the entry tail reads
     /// the order off the world rather than off its own load.
     entry_is_open_module: bool,
-    /// Whether the pre-entry `resolve_world` was skipped: the open module's
-    /// order above, or B553's deferred order ([`AnalysisShape::defer_resolve`]).
-    /// The post-entry `build()` is then the one resolve, and the entry tail
-    /// waits for it with everything the pre-entry resolve would have bound.
+    /// Whether the PACKAGE half of the pre-entry resolve was skipped: the open
+    /// module's order above, or B553's deferred order
+    /// ([`AnalysisShape::defer_resolve`]). The tiers resolved alone in every
+    /// order (P6a); the post-entry `build()` then resolves the package with the
+    /// entry, and the entry tail waits for it with everything the pre-entry
+    /// resolve would have bound.
     resolve_deferred: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
@@ -85662,9 +85666,11 @@ struct AnalysisShape {
     cache: bool,
     /// A hot-set world (M110 S1) may be built.
     hot: bool,
-    /// B553: the loaded modules do NOT resolve before the entry walks — the
-    /// whole world resolves once, in the post-entry `build()`, with every
-    /// impl in it (the monolithic order, the one B239's open module takes).
+    /// B553: the package's modules do NOT resolve before the entry walks —
+    /// they resolve once, in the post-entry `build()`, with every package and
+    /// entry impl in it (the order B239's open module takes). The tiers still
+    /// resolve first and alone (P6a: an entry impl never answers their
+    /// questions, so the deferral has nothing to protect there).
     /// Taken when an impl the entry walks answers a question the pre-entry
     /// resolve asked ([`ImplReachLog`]); such a world is neither read from nor
     /// written to the base cache, since what it is keyed by is not what it
@@ -88673,8 +88679,12 @@ fn analyze_inner<'src>(
     // 0 cache hits in a 3-keystroke walk with an unbounded cache) because
     // nothing else ever minted their key. `BaseCacheKey::entry_open_module`
     // carries the excluded module, so the world is offered back to the file it
-    // was built for and to nothing else; it is stored UNRESOLVED, and the hit
-    // path reproduces this very order from the flag the world carries.
+    // was built for and to nothing else; it is stored with its PACKAGE half
+    // unresolved, and the hit path reproduces this very order from the flag
+    // the world carries. (P6a: its tiers resolved before the package minted,
+    // so the stored world carries std resolved and a hit's `build()` resolves
+    // the package and the entry only — kolt's `styles.vl` css keystroke reads
+    // 8.06 -> 6.61 G instructions for it.)
     //
     // It can also still hit a world stored for a DIFFERENT entry that never
     // loaded this file — `base_cache_lookup`'s `entry_is_a_loaded_module`
