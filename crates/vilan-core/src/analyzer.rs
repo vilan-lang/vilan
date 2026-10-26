@@ -34485,16 +34485,76 @@ impl<'src> Analyzer<'src> {
             let Some(parameter_ids) = parameter_ids else {
                 continue;
             };
+            let callee_name = self
+                .functions
+                .get(&callee_id)
+                .map(|function| function.name)
+                .or_else(|| {
+                    self.external_functions
+                        .get(&callee_id)
+                        .map(|external| external.name)
+                })
+                .unwrap_or("the function");
             for (parameter_id, argument_id) in parameter_ids.iter().zip(argument_ids.iter()) {
                 // The required call-site spelling for this parameter — `&`/`&mut`
-                // for a view convention; the implicit `self` receiver and all
-                // by-value conventions need nothing.
+                // for a view convention; the implicit `self` receiver needs
+                // nothing.
                 let kind = match self.parameters.get(parameter_id) {
                     Some(parameter) if parameter.name == "self" => continue,
                     Some(parameter) => match parameter.convention {
                         Convention::RefMut => "&mut",
                         Convention::Ref => "&",
-                        Convention::Bare | Convention::Own => continue,
+                        Convention::Bare | Convention::Own => {
+                            // B649: a written `&`/`&mut` at a BY-VALUE
+                            // parameter lends a view the callee cannot take —
+                            // the JS build handed the scalar view's
+                            // `[cell, key]` pair over AS the value (`==`
+                            // compared an array with a number) where native
+                            // passed the value. A view a by-value callee
+                            // cannot keep is noise: refused, with the fix.
+                            // A generic parameter over a receiver that HOLDS
+                            // views (`shelf.count(0).unwrap_or(&0)` on an
+                            // `Option<&i32>`, B577) takes a view: its `T` is one.
+                            let written_view = match self.expr_id_to_expr_map.get(argument_id) {
+                                Some(Expr::Reference(_, mutable)) => Some(*mutable),
+                                _ => None,
+                            };
+                            let over_a_view_holder = || {
+                                let mut mentioned = Vec::new();
+                                self.collect_generics(
+                                    &parameter.type_id.get_type(self),
+                                    0,
+                                    &mut mentioned,
+                                );
+                                !mentioned.is_empty()
+                                    && argument_ids.first().is_some_and(|receiver| {
+                                        self.receiver_holds_a_view(*receiver)
+                                    })
+                            };
+                            if let Some(mutable) = written_view
+                                && !over_a_view_holder()
+                            {
+                                let written = if mutable { "&mut" } else { "&" };
+                                let parameter_name = parameter.name;
+                                self.push_anchored(
+                                    Error {
+                                        trace: Vec::new(),
+                                        note: None,
+                                        span: **self
+                                            .span_map
+                                            .get(argument_id)
+                                            .unwrap_or(&&EMPTY_SPAN),
+                                        msg: format!(
+                                            "drop the `{written}`: `{callee_name}` takes \
+                                             `{parameter_name}` by value, so it cannot take a \
+                                             view of it"
+                                        ),
+                                    },
+                                    *argument_id,
+                                );
+                            }
+                            continue;
+                        }
                     },
                     None => continue,
                 };
@@ -34507,6 +34567,18 @@ impl<'src> Analyzer<'src> {
                     }, *argument_id);
                 }
             }
+        }
+    }
+
+    /// B649: whether a receiver is a value holding VIEWS — a call returning a
+    /// wrapped view (`Option<&T>`), directly or as an inline transient.
+    fn receiver_holds_a_view(&self, receiver: Id) -> bool {
+        match self.expr_id_to_expr_map.get(&receiver) {
+            Some(Expr::Call(call_id)) => {
+                self.call_returns_wrapped_view(*call_id).is_some()
+                    || self.inline_subject_wrapped_view_shape(receiver).is_some()
+            }
+            _ => self.inline_subject_wrapped_view_shape(receiver).is_some(),
         }
     }
 

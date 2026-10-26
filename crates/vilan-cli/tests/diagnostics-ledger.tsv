@@ -780,3 +780,4 @@ row	flagship	key
 758	-	a struct literal can't be a `match` subject here: the `{{` after a name opens the legs; wrap the literal in parentheses or bind it with `let` first
 NEW	-	`[track_caller]` on `{name}`, which `{trait_name}` does not declare tracking: a call through `{trait_name}` (a bound, a `dyn`) would pass no location. Declare it on the trait's member (`[track_caller]` above `{trait_name}`'s `fun {name}`), where every implementation takes it
 NEW	-	`{name}` is `[track_caller]`, and a `for .. in` loop calls it through the iterator protocol, which cannot pass its caller's location. Call `{name}` yourself inside the loop, or drop `[track_caller]` from it
+NEW	-	drop the `{written}`: `{callee_name}` takes `{parameter_name}` by value, so it cannot take a view of it

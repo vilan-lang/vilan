@@ -95,6 +95,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**B649: a written `&` (or `&mut`) at a BY-VALUE parameter is refused with "drop the `&`: `same` takes `right` by value, so it cannot take a view of it" — the checker accepted it, and the JS build handed a scalar view's `[cell, key]` pair over AS the value, so `numbers.contains(&2)`, `numbers.index_of(&2)`, `same(2, &2)` and `numbers.contains(&two)` printed `false`/`None` on JS and `true`/`Some(1)` natively (a miscompile that closes with the refusal).** Spec §6.3 already called a view in value position an error; `check_view_arguments` now asks it of a `fun`'s or an external's bare and `own` parameters (a `self` receiver is exempt, B562), for a scalar and an aggregate alike. A generic parameter over a receiver that HOLDS views — `shelf.count(0).unwrap_or(&0)` on the `Option<&i32>` a view-returning method answers (B577's shape) — takes a view there and is left alone. Estate: 0 (kolt, the website, the eleven examples, the corpus, the native fixtures — `payload_view_element_reads.vl` is the B577 shape the exemption keeps). Spec §6.3 names the refusal. Pins: `borrows::b649_a_view_at_a_by_value_parameter_is_refused` (the item's four shapes, `&mut`, an aggregate, an `own` parameter), `b649_a_view_where_a_view_is_taken_still_compiles`, `b649_a_view_at_a_generic_parameter_over_a_view_holder_still_compiles`. Tracker B649.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->
