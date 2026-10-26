@@ -612,3 +612,74 @@ done();
         );
     }
 }
+
+// --- M171: stopping an event where it is -------------------------------------
+
+/// M171: a clickable card holding its own buttons — kolt's comment card, which
+/// selects its region on click and holds a Resolve button. The Resolve button
+/// stops its click (`stop_propagation`), so the card does not select; the
+/// button's OTHER handler still runs, because `stop_propagation` stops the
+/// event at the element and not within it. The Archive button stops
+/// immediately (`stop_immediate_propagation`), so its second handler is
+/// skipped as well. A plain click on the card's body reaches the card, and
+/// every handler reads the two flags back (`default_prevented`,
+/// `propagation_stopped`).
+const STOPPED_EVENTS: &str = r#"import std::io::print;
+import std::web::dom::{ Event, create_element, get_element_by_id };
+
+fun main() {
+	let card = get_element_by_id("app");
+	card.on_event("click", |event| {
+		print(i"card selected stopped={event.propagation_stopped()} prevented={event.default_prevented()}");
+	});
+	let resolve = create_element("button");
+	resolve.on_event("click", |event| {
+		event.stop_propagation();
+		event.prevent_default();
+		print(i"resolve stopped={event.propagation_stopped()} prevented={event.default_prevented()}");
+	});
+	resolve.on_event("click", |event| print("resolve second handler"));
+	card.append(resolve);
+	let archive = create_element("button");
+	archive.on_event("click", |event| {
+		event.stop_immediate_propagation();
+		print("archive");
+	});
+	archive.on_event("click", |event| print("archive second handler"));
+	card.append(archive);
+	let body = create_element("p");
+	card.append(body);
+}
+main();
+"#;
+
+#[test]
+fn m171_stop_propagation_keeps_a_buttons_click_from_its_card() {
+    let harness = format!(
+        r#"{DOM_STUB}
+require("./app.js");
+const [resolve, archive, body] = documentRoot.children;
+console.log("-- resolve");
+dispatchEvent(resolve, "click");
+console.log("-- archive");
+dispatchEvent(archive, "click");
+console.log("-- body");
+dispatchEvent(body, "click");
+done();
+"#
+    );
+    let stdout = build_and_run("stopped_events", STOPPED_EVENTS, &harness);
+    assert_eq!(
+        stdout,
+        concat!(
+            "-- resolve\n",
+            "resolve stopped=true prevented=true\n",
+            "resolve second handler\n",
+            "-- archive\n",
+            "archive\n",
+            "-- body\n",
+            "card selected stopped=false prevented=false\n",
+        ),
+        "a stopped click must not reach the card"
+    );
+}

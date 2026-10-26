@@ -95,6 +95,10 @@ impl Text {
 external struct Event;
 impl Event {
 	fun prevent_default(self)
+	fun default_prevented(self): bool       // defaultPrevented
+	fun stop_propagation(self)              // no ancestor's handler runs
+	fun stop_immediate_propagation(self)    // …nor this element's later ones
+	fun propagation_stopped(self): bool     // cancelBubble
 	fun button(self): i32        // 0 = main button
 	fun meta_key(self): bool
 	fun ctrl_key(self): bool
@@ -111,6 +115,13 @@ impl Event {
 	fun pointer_y(self): f64     // clientY
 }
 ```
+
+**Stopping an event.** A click bubbles from the node it lands on up
+through every ancestor's handlers. A card that selects itself on click and
+holds its own buttons calls `event.stop_propagation()` in each button's
+handler, so pressing the button does not also select the card. The rest of
+the button's own handlers still run; `stop_immediate_propagation` skips
+those too.
 
 Raw `element.on` handlers do **not** establish a turn: that's `View.on`'s
 job — and the `Window` verbs are raw in the same way, so a window handler that
