@@ -455,6 +455,23 @@ impl List<type T> {
 		None
 	}
 
+	/// The index of the FIRST element for which `predicate` holds — `None` when
+	/// none does. `index_of` asks by equality; this asks by a condition, so the
+	/// element need not be `PartialEq` and the question can read one field
+	/// (`found.position(|each| each.emoji == emoji)`). `Iterator::position`'s
+	/// eager twin, written out for the reason `filter_map` below gives: through
+	/// `iter()` it would copy the list for a single pass. SHORT-CIRCUITS.
+	fun position(self, predicate: |T| bool): Option<usize> {
+		mut index: usize = 0;
+		for item in self {
+			if predicate(item) {
+				ret Some(index);
+			}
+			index += 1;
+		}
+		None
+	}
+
 	/// `map` and `filter` in one pass: `fn` answers `Some(value)` to keep that
 	/// value and `None` to drop the element, so a partial or fallible projection
 	/// needs neither a two-stage chain nor an `Option` to unwrap afterwards (I3;

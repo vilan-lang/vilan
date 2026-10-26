@@ -14466,3 +14466,24 @@ fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
         );
     }
 }
+
+/// M169: `List::position` and `Iterator::position` answer the index of the
+/// first element a predicate holds for — over a struct's field, which
+/// `index_of` (equality on the whole element) cannot ask — or `None`, and stop
+/// calling the predicate at the hit; the iterator form counts from where the
+/// iterator stands (`skip(1)` first).
+#[test]
+fn m169_position_finds_the_first_match_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_list_position.vl";
+    std::fs::write(staged.join(file), include_str!("native/list_position.vl"))
+        .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "1\n0\ntrue\ntrue\n1 after 2\n2\n1\ntrue\n",
+            "{backend:?}"
+        );
+    }
+}

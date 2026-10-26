@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: feature -->
+**M169: `List::position(predicate)` and `Iterator::position(predicate)` answer the index of the first element a predicate holds for (`Option<usize>`, Rust's name), so "where is the reaction whose emoji is this one" is `found.position(|each| each.emoji == emoji)` rather than `found.map(|each| each.emoji).index_of(emoji)` or a hand loop.** Both short-circuit at the hit. `List::position` is written out beside `find` rather than through `iter()`, which would copy the list for a single pass (the reason `filter_map` gives); `index_of` stays the equality form. Docs: std/collections.md. Pin: `native_differential::m169_position_finds_the_first_match_on_both_backends` (`native/list_position.vl`: a field predicate, no match, an empty list, the short-circuit count, the iterator after `skip` and `map`). Tracker M169.
+
+---
+
 <!-- family: breaking -->
 **M171: `std::web::dom::Event` gains `stop_propagation()`, `stop_immediate_propagation()`, `propagation_stopped()` (`cancelBubble`) and `default_prevented()` beside `prevent_default`, so a clickable card holding its own buttons stops each button's click at the button without a hand-written extern. BREAKING for an app that declared either of the first-named two (or `default_prevented`) on `Event` itself:** a file that imports `std::web::dom::Event` and the app's own extension now meets "'stop_propagation' is already defined for 'Event' by module 'dom', which this file also imports; a file may take only one". Estate: kolt 46 errors in 23 files, all from `src/lib/std_ext.vl`'s `impl Event` declaring `default_prevented` and `stop_propagation` (the same bindings); deleting those two declarations checks clean, and is the patch the owner applies. std, the website, the examples, the corpus and the native tests declare neither (0). The DOM-stub harness dispatches the way the host does: `stopPropagation` lets the current node's remaining handlers run and no further node's, `stopImmediatePropagation` skips those too. Docs: std/browser.md. Pin: `dom_events::m171_stop_propagation_keeps_a_buttons_click_from_its_card` (a card, a stopping button with a second handler, an immediately stopping one, a plain body click; both flags read back). Tracker M171.
 
