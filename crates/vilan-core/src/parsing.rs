@@ -241,6 +241,9 @@ pub enum ParseErrorReason {
     LetElse {
         suggestion: Option<(String, String)>,
     },
+    /// B661: a closure type written bare as a closure type's parameter;
+    /// `written` is its text, which the steer wraps.
+    BareClosureTypeParameter { written: String },
     /// B655: a statement in an `impl` body that is not a member.
     NonMemberInImpl(NonMember),
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
@@ -2009,6 +2012,10 @@ pub fn render(error: &ParseError) -> String {
                  `opt is Some(let x) else ret;`, with no `let x =`"
                 .to_string(),
         },
+        ParseErrorReason::BareClosureTypeParameter { written } => format!(
+            "wrap a closure type that is a parameter in parentheses: `({written})` — bare, its \
+             `|` closes the outer parameter list"
+        ),
         ParseErrorReason::MalformedMultiline(message) => message.clone(),
         ParseErrorReason::MultilineAttributeArgument => MULTILINE_ATTRIBUTE_ARGUMENT.to_string(),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
@@ -8895,9 +8902,22 @@ impl<'a, 'src> Parser<'a, 'src> {
         let parameters = if self.eat_op("||") {
             Vec::new()
         } else if self.eat_op("|") {
-            let parameters = self.comma_list(Self::parse_closure_type_parameter, |parser| {
+            let mut parameters = self.comma_list(Self::parse_closure_type_parameter, |parser| {
                 parser.peek_is_op("|")
             })?;
+            // B661: `|str, |bool| void| void` read its inner `|` as the list's
+            // close after a trailing comma, and the parse broke one token later
+            // with nothing said about the parentheses the inner type needs.
+            while let Some(nested) = self.bare_closure_type_parameter() {
+                parameters.push((None, Box::new(nested)));
+                if self.eat_ctrl(',') {
+                    parameters.extend(
+                        self.comma_list(Self::parse_closure_type_parameter, |parser| {
+                            parser.peek_is_op("|")
+                        })?,
+                    );
+                }
+            }
             self.expect_op("|")?;
             parameters
         } else {
@@ -8911,6 +8931,39 @@ impl<'a, 'src> Parser<'a, 'src> {
             Node::ClosureType(parameters, return_type),
             self.span_from(start),
         ))
+    }
+
+    /// B661: a closure type written BARE as a closure type's parameter —
+    /// `|str, |bool| void| void` — refused with the parenthesized spelling and
+    /// read as that parameter, so the parse (and a struct's other fields) goes
+    /// on. Called where the parameter list just ended in a comma: the `|` there
+    /// is either the list's close after a trailing comma or the opener of a
+    /// bare closure type, and it is the opener when the comma and the `|` share
+    /// a line (the formatter breaks before a trailing comma's close) and a
+    /// whole closure type parses from it, followed by the next `,` or the
+    /// list's own `|`. A trailing comma never meets that: what follows its
+    /// close is the return type, then the surrounding production.
+    fn bare_closure_type_parameter(&mut self) -> Option<Spanned<Node<'src>>> {
+        let comma = self.position.checked_sub(1)?;
+        if !matches!(self.tokens.get(comma), Some((Token::Ctrl(','), _)))
+            || !self.peek_is_op("|")
+            || self.source[self.token_span(comma).end..self.token_span(self.position).start]
+                .contains('\n')
+        {
+            return None;
+        }
+        let nested = self.attempt(|parser| {
+            let nested = parser.parse_closure_type()?;
+            (parser.peek_is_ctrl(',') || parser.peek_is_op("|")).then_some(nested)
+        })?;
+        let written = self.source[nested.1.into_range()].to_string();
+        self.errors.push(ParseError {
+            span: nested.1,
+            reason: ParseErrorReason::BareClosureTypeParameter { written },
+            context: Vec::new(),
+            hint: None,
+        });
+        Some(nested)
     }
 
     /// One closure-type parameter: `(name :)? type`.
@@ -9953,11 +10006,18 @@ impl<'a, 'src> Parser<'a, 'src> {
                 Some((fields, parser.span_from(fields_start)))
             }) {
                 Some(clean) => clean,
-                None => {
-                    let span =
-                        self.recover_delimited("struct body", '{', '}', &[('(', ')'), ('[', ']')])?;
-                    (Vec::new(), span)
-                }
+                None => match self.recover_struct_fields() {
+                    Some(recovered) => recovered,
+                    None => {
+                        let span = self.recover_delimited(
+                            "struct body",
+                            '{',
+                            '}',
+                            &[('(', ')'), ('[', ']')],
+                        )?;
+                        (Vec::new(), span)
+                    }
+                },
             };
             Some(fields)
         } else if self.eat_ctrl(';') {
@@ -9975,6 +10035,141 @@ impl<'a, 'src> Parser<'a, 'src> {
                 labels,
             ),
             self.span_from(start),
+        ))
+    }
+
+    /// B661/B673: a struct body whose clean parse failed, read FIELD BY FIELD.
+    /// The body used to recover to NO fields, so one broken field type took
+    /// the struct's every field with it: each use of another field read
+    /// "struct 'Message' has no field 'next_id'", and each literal "`Provider`
+    /// expects 0 fields" — listed before the parse error, four times over. Now
+    /// a field that parses is kept, a broken one is reported where it broke
+    /// and kept by NAME with an unresolved type (the parse-recovery hole the
+    /// type walk reads silently), so a struct literal and a field read still
+    /// find it. `None` when the body does not balance; the caller's
+    /// whole-body recovery takes that case.
+    fn recover_struct_fields(&mut self) -> Option<Spanned<Vec<Spanned<StructField<'src>>>>> {
+        self.attempt(Self::recover_struct_fields_inner)
+    }
+
+    /// [`Parser::recover_struct_fields`]'s body. `None` — rolled back, for the
+    /// whole-body recovery to take — when a broken field has no `name :` to
+    /// keep it by: a body that garbled from its first token (`struct S { 1 2
+    /// 3 }`) is the "unclosed `{` in struct body" case, not a field's.
+    fn recover_struct_fields_inner(&mut self) -> Option<Spanned<Vec<Spanned<StructField<'src>>>>> {
+        let open = self.position;
+        if !self.peek_is_ctrl('{') {
+            return None;
+        }
+        let end = self.scan_balanced(open, '{', '}', &[('(', ')'), ('[', ']')])?;
+        let close = end - 1;
+        let mut fields = Vec::new();
+        let mut position = open + 1;
+        while position < close {
+            self.position = position;
+            let parsed = self.attempt(|parser| {
+                let field = parser.parse_struct_field()?;
+                Some((field, parser.position))
+            });
+            let resume = match parsed {
+                Some((field, stopped))
+                    if stopped == close
+                        || matches!(self.tokens.get(stopped), Some((Token::Ctrl(','), _))) =>
+                {
+                    fields.push(field);
+                    stopped
+                }
+                parsed => {
+                    let next = self.next_field_boundary(position, close);
+                    let salvaged = self.salvaged_field(position, next)?;
+                    match parsed {
+                        // The field read, and something it cannot take follows.
+                        Some((_, stopped)) => self.emit_failure(
+                            stopped,
+                            vec!["','".to_string(), "'}'".to_string()],
+                            Vec::new(),
+                        ),
+                        None => {
+                            match self.take_failure_within(position.saturating_sub(1), next + 1) {
+                                Some(failure) => self.emit_failure(
+                                    failure.position,
+                                    failure.expected,
+                                    failure.context,
+                                ),
+                                // Nothing inside said what it wanted: the
+                                // type after the name is not one.
+                                None => self.emit_failure(
+                                    (position + 2).min(next),
+                                    vec!["a type".to_string()],
+                                    Vec::new(),
+                                ),
+                            }
+                        }
+                    }
+                    fields.push(salvaged);
+                    next
+                }
+            };
+            position = if resume < close { resume + 1 } else { close };
+        }
+        self.position = end;
+        Some((fields, self.span_from(open)))
+    }
+
+    /// Where the broken field starting at `position` ends: the next `,` at
+    /// bracket depth zero that a line break follows (fields are written one
+    /// to a line, and a `,` inside a closure type's parameters is not one), or
+    /// the body's `close`.
+    fn next_field_boundary(&self, position: usize, close: usize) -> usize {
+        let mut depth = 0usize;
+        for index in position..close {
+            match &self.tokens[index].0 {
+                Token::Ctrl('(' | '[' | '{' | '<') => depth += 1,
+                Token::Ctrl(')' | ']' | '}' | '>') => depth = depth.saturating_sub(1),
+                Token::Ctrl(',')
+                    if depth == 0
+                        && self.source
+                            [self.token_span(index).end..self.token_span(index + 1).start]
+                            .contains('\n') =>
+                {
+                    return index;
+                }
+                _ => {}
+            }
+        }
+        close
+    }
+
+    /// A broken field kept by its name: `[attributes]* name :` at `position`,
+    /// with a recovery hole for its type. `None` when no name reads there.
+    fn salvaged_field(&self, position: usize, end: usize) -> Option<Spanned<StructField<'src>>> {
+        let mut at = position;
+        while matches!(self.tokens.get(at), Some((Token::Ctrl('['), _))) {
+            at = self.scan_balanced(at, '[', ']', &[('(', ')'), ('{', '}')])?;
+        }
+        let (token, name_span) = self.tokens.get(at)?;
+        let name = match token {
+            Token::Ident(name) => *name,
+            token if is_reserved_word(token) => self.source.get(name_span.into_range())?,
+            _ => return None,
+        };
+        if !matches!(self.tokens.get(at + 1), Some((Token::Op(":"), _))) || at + 2 > end {
+            return None;
+        }
+        let type_span: Span = (self.token_span(at + 2).start
+            ..self.token_span(end.saturating_sub(1).max(at + 2)).end)
+            .into();
+        let field_span: Span =
+            (self.token_span(position).start..type_span.end.max(name_span.end)).into();
+        Some((
+            (
+                (name, *name_span),
+                Some((Node::Error, type_span)),
+                Exposure::default(),
+                None,
+                Reactivity::default(),
+            ),
+            field_span,
         ))
     }
 

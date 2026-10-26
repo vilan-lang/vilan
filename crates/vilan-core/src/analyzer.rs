@@ -66313,6 +66313,15 @@ impl<'src> Analyzer<'src> {
         if self.value_awaits_a_closure_parameter(value_id) {
             return FieldValueVerdict::Deferred;
         }
+        // B661/B673: a field whose declared type did not parse is kept by
+        // name with the parse-recovery hole for a type (the parser reported
+        // it), which walks to `Unresolved` — the non-cascading type (B32's
+        // rule). A value assigned to it is accepted silently, as its uses are;
+        // "Expected unresolved" at every literal would be the cascade the
+        // recovery exists to prevent.
+        if matches!(field_type, Type::Unresolved) {
+            return FieldValueVerdict::Accepted(Vec::new());
+        }
         match self.reconcile_type(&value_type, field_type, substitution_context) {
             Some((_unified, bindings)) => FieldValueVerdict::Accepted(bindings),
             None => {
