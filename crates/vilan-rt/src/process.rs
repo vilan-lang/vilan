@@ -47,11 +47,13 @@
 //!   terminal): if it runs out first the read answers an EMPTY chunk, and the
 //!   bytes that arrive afterwards stay for the next read.
 //!
-//! The cost named, as the executor names its own: while a read waits, the loop
-//! wakes every millisecond to look ([`crate::executor`]'s `IO_POLL_INTERVAL`) —
-//! the price of the no-`unsafe`, no-dependency rule (Order 37 R8). Blocking on
-//! the channel until the next timer deadline when stdin is the only live work
-//! is a refinement for later, not a correctness question.
+//! The executor polls its I/O sources once per turn and otherwise sleeps
+//! `IO_POLL_INTERVAL` (1 ms) between looks — the price of the no-`unsafe`,
+//! no-dependency rule (Order 37 R8). When stdin is the ONLY live source, though,
+//! nothing but this reader can produce work, so [`StdinSource::block`] waits on
+//! the reader's channel itself until the next timer deadline, or for as long as
+//! it takes with no timer (F146): a program parked on a silent stdin sleeps in
+//! the kernel instead of waking a thousand times a second.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -61,6 +63,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::bytes::Bytes;
 use crate::executor::{
@@ -356,6 +359,9 @@ struct Stdin {
     registered: bool,
     /// The reads waiting, oldest first.
     waiters: VecDeque<Rc<Waiter>>,
+    /// A chunk [`StdinSource::block`] received while the loop slept on the
+    /// channel, for the next [`StdinSource::poll`] to take.
+    arrived: Option<Option<Vec<u8>>>,
 }
 
 struct Reader {
@@ -373,6 +379,7 @@ thread_local! {
             requested: false,
             registered: false,
             waiters: VecDeque::new(),
+            arrived: None,
         })
     };
 }
@@ -489,13 +496,18 @@ impl IoSource for StdinSource {
             if !stdin.requested {
                 return false;
             }
-            let Some(reader) = &stdin.reader else {
-                return false;
-            };
-            let chunk = match reader.chunks.try_recv() {
-                Ok(chunk) => chunk,
-                Err(mpsc::TryRecvError::Empty) => return false,
-                Err(mpsc::TryRecvError::Disconnected) => None,
+            let chunk = match stdin.arrived.take() {
+                Some(chunk) => chunk,
+                None => {
+                    let Some(reader) = &stdin.reader else {
+                        return false;
+                    };
+                    match reader.chunks.try_recv() {
+                        Ok(chunk) => chunk,
+                        Err(mpsc::TryRecvError::Empty) => return false,
+                        Err(mpsc::TryRecvError::Disconnected) => None,
+                    }
+                }
             };
             stdin.requested = false;
             match chunk {
@@ -508,6 +520,33 @@ impl IoSource for StdinSource {
             pump();
         }
         received
+    }
+
+    /// F146: the loop's wait when stdin is its only live source — block on
+    /// the reader's channel until a chunk arrives or `limit` (the next timer's
+    /// deadline) passes, rather than waking every millisecond to `try_recv`.
+    /// The chunk, if one came, is kept for the next [`StdinSource::poll`], so
+    /// the turn that follows answers it exactly as a poll would have.
+    fn block(&self, limit: Option<Duration>) -> bool {
+        STDIN.with(|stdin| {
+            let mut stdin = stdin.borrow_mut();
+            if !stdin.requested || stdin.arrived.is_some() {
+                return false;
+            }
+            let Some(reader) = &stdin.reader else {
+                return false;
+            };
+            let received = match limit {
+                Some(limit) => match reader.chunks.recv_timeout(limit) {
+                    Ok(chunk) => Some(chunk),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Some(None),
+                },
+                None => Some(reader.chunks.recv().unwrap_or(None)),
+            };
+            stdin.arrived = received;
+            true
+        })
     }
 
     fn is_live(&self) -> bool {
@@ -654,6 +693,50 @@ mod tests {
             ended.answer.borrow_mut().take(),
             Some(Answer::Bytes(None))
         ));
+    }
+
+    /// F146: the sole-source wait blocks on the reader's channel — until its
+    /// limit when nothing arrives, until the chunk when one does — and leaves
+    /// what it received for the next poll, which answers it as a poll would
+    /// have. With no chunk requested there is nothing to wait for.
+    #[test]
+    fn f146_the_stdin_wait_blocks_until_its_limit_or_a_chunk() {
+        let (requests, _requested) = mpsc::channel::<()>();
+        let (sent, chunks) = mpsc::channel::<Option<Vec<u8>>>();
+        STDIN.with(|stdin| {
+            let mut stdin = stdin.borrow_mut();
+            stdin.reader = Some(Reader { requests, chunks });
+            stdin.requested = true;
+            stdin.arrived = None;
+            stdin.buffer.clear();
+            stdin.ended = false;
+        });
+        let source = StdinSource;
+        let started = std::time::Instant::now();
+        assert!(source.block(Some(Duration::from_millis(30))));
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "a silent channel holds the wait to its limit"
+        );
+        assert!(STDIN.with(|stdin| stdin.borrow().arrived.is_none()));
+
+        let sender = sent.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            sender.send(Some(b"ab".to_vec())).expect("send a chunk");
+        });
+        assert!(source.block(None), "no limit: until the chunk");
+        writer.join().expect("the writer thread");
+        assert!(STDIN.with(|stdin| stdin.borrow().arrived == Some(Some(b"ab".to_vec()))));
+        assert!(
+            source.poll(),
+            "the next poll answers the chunk the wait took"
+        );
+        assert!(STDIN.with(|stdin| stdin.borrow().buffer == b"ab"));
+
+        STDIN.with(|stdin| stdin.borrow_mut().requested = false);
+        assert!(!source.block(None), "nothing in flight, nothing to wait on");
+        drop(sent);
     }
 
     #[test]
