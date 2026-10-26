@@ -235,6 +235,12 @@ pub enum ParseErrorReason {
     /// B654: a triple-quoted string where an attribute takes a one-line one
     /// (every argument but `[extern(..)]`'s host expression).
     MultilineAttributeArgument,
+    /// B658: a guard's `else` after a `let`'s value. `suggestion` is the
+    /// statement respelled as the let-else form, with the binding's name, when
+    /// the `is` test binds exactly one capture.
+    LetElse {
+        suggestion: Option<(String, String)>,
+    },
     /// B655: a statement in an `impl` body that is not a member.
     NonMemberInImpl(NonMember),
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
@@ -1794,6 +1800,37 @@ const MULTILINE_ATTRIBUTE_ARGUMENT: &str = "an attribute argument here is a one-
      triple-quoted string is an attribute argument only as `[extern(\"\"\"…\"\"\")]`'s host \
      expression, alone";
 
+/// B658: the one capture an `is` pattern binds, when it binds exactly one —
+/// the name, the mutability flag and the name's span, mutably, so the
+/// let-else recovery can rename it.
+fn single_capture<'pattern, 'src>(
+    pattern: &'pattern mut Pattern<'src>,
+) -> Option<(&'pattern mut &'src str, bool, Span)> {
+    fn collect<'pattern, 'src>(
+        pattern: &'pattern mut Pattern<'src>,
+        found: &mut Vec<(&'pattern mut &'src str, bool, Span)>,
+    ) {
+        match pattern {
+            Pattern::Binding(name, mutable, span) => found.push((name, *mutable, *span)),
+            Pattern::Variant(_, Some(payload)) => {
+                for (inner, _) in payload {
+                    collect(inner, found);
+                }
+            }
+            Pattern::Tuple(items) | Pattern::Array(items) => {
+                for (inner, _) in items {
+                    collect(inner, found);
+                }
+            }
+            Pattern::Labelled(_, inner) => collect(&mut inner.0, found),
+            Pattern::Wildcard | Pattern::Variant(_, None) | Pattern::Literal(_) => {}
+        }
+    }
+    let mut found = Vec::new();
+    collect(pattern, &mut found);
+    if found.len() == 1 { found.pop() } else { None }
+}
+
 /// What B655 refuses in an `impl` body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NonMember {
@@ -1958,6 +1995,15 @@ pub fn render(error: &ParseError) -> String {
         ),
         ParseErrorReason::Escape { kind, written } => escape_rule(*kind, written),
         ParseErrorReason::NonMemberInImpl(kind) => non_member_rule(*kind),
+        ParseErrorReason::LetElse { suggestion } => match suggestion {
+            Some((respelled, name)) => format!(
+                "a `let` takes no guard: the let-else form is the `is` test alone, \
+                 `{respelled}`, with no `let {name} =`"
+            ),
+            None => "a `let` takes no guard: the let-else form is the `is` test alone, \
+                 `opt is Some(let x) else ret;`, with no `let x =`"
+                .to_string(),
+        },
         ParseErrorReason::MalformedMultiline(message) => message.clone(),
         ParseErrorReason::MultilineAttributeArgument => MULTILINE_ATTRIBUTE_ARGUMENT.to_string(),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
@@ -7786,6 +7832,112 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((Node::FuncReturn(value.map(Box::new)), self.span_from(start)))
     }
 
+    /// B658: a `let` whose value is followed by a guard's `else`. The guard
+    /// `c else S;` is a STATEMENT read only at a statement's head, so after a
+    /// binding's `=` the `else` belonged to nothing: at the top of a body it
+    /// was a missing `;`, and inside a block the parse ran on into the
+    /// enclosing `if`'s own `else` and failed in an unrelated call below,
+    /// never naming this line. Refused at `let … =` with the let-else form,
+    /// and parsed as the guard the author meant: when the binding is one name
+    /// and the `is` test binds exactly one, that capture takes the binding's
+    /// name — `let target = target is Some(let t) else ret;` reads as `target
+    /// is Some(let target) else ret;` — so the uses below see the unwrapped
+    /// value instead of failing as a cascade.
+    fn let_else_as_guard(
+        &mut self,
+        start: usize,
+        binder: Spanned<Pattern<'src>>,
+        value: Spanned<Node<'src>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        let equals = (start..self.position)
+            .find(|&position| matches!(self.tokens[position].0, Token::Op("=")))
+            .unwrap_or(start);
+        let head: Span = (self.token_span(start).start..self.token_span(equals).end).into();
+        let else_word = self.here_span();
+        self.bump(); // `else`
+        let otherwise = self.parse_then_branch(false, false)?;
+        let mut condition = value;
+        let suggestion = match (&binder.0, &mut condition.0) {
+            (Pattern::Binding(name, _, _), Node::Is(subject, pattern)) => {
+                let written_subject = self.source[subject.1.into_range()].to_string();
+                let block_reads = |parser: &Self, word: &str| parser.block_reads_name(word);
+                match single_capture(&mut pattern.0) {
+                    // The capture keeps its own name when the code below reads
+                    // IT (the author then meant `let t` and wrote `let x =`
+                    // by habit); otherwise it takes the binding's.
+                    Some(capture) if block_reads(self, capture.0) => {
+                        let written = self.source[pattern.1.into_range()].to_string();
+                        Some((format!("{written_subject} is {written}"), name.to_string()))
+                    }
+                    Some(capture) => {
+                        let pattern_text = self.source[pattern.1.into_range()].to_string();
+                        let capture_text = self.source[capture.2.into_range()].to_string();
+                        let offset = capture.2.start - pattern.1.start;
+                        let renamed = format!(
+                            "{}{}{}",
+                            &pattern_text[..offset],
+                            name,
+                            &pattern_text[offset + capture_text.len()..]
+                        );
+                        *capture.0 = *name;
+                        Some((format!("{written_subject} is {renamed}"), name.to_string()))
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let otherwise_text = self.source[otherwise.1.into_range()].to_string();
+        self.errors.push(ParseError {
+            span: head,
+            reason: ParseErrorReason::LetElse {
+                suggestion: suggestion
+                    .map(|(test, name)| (format!("{test} else {otherwise_text};"), name)),
+            },
+            context: Vec::new(),
+            hint: None,
+        });
+        let span = self.span_from(start);
+        let otherwise_span = otherwise.1;
+        let at = else_word.start;
+        Some(read_as_statement((
+            Node::If(NodeIfBranch::If(Box::new(If {
+                condition: Box::new(condition),
+                then: (
+                    (Vec::new(), Box::new((Node::Void, Span::from(at..at)))),
+                    Span::from(at..at),
+                ),
+                else_: Some((
+                    NodeIfBranch::Else(((Vec::new(), Box::new(otherwise)), otherwise_span)),
+                    otherwise_span,
+                )),
+                spelling: IfSpelling::Then {
+                    then_word: None,
+                    else_word: Some(else_word),
+                    statement: false,
+                },
+            }))),
+            span,
+        )))
+    }
+
+    /// Whether `name` is read as a NAME between the cursor and the end of the
+    /// enclosing block — a token scan to the `}` that closes it (B658's
+    /// rename test; parse-time, so a shadowing re-binding counts as a read).
+    fn block_reads_name(&self, name: &str) -> bool {
+        let mut depth = 0usize;
+        for (token, _) in &self.tokens[self.position..] {
+            match token {
+                Token::Ctrl('{') => depth += 1,
+                Token::Ctrl('}') if depth == 0 => return false,
+                Token::Ctrl('}') => depth -= 1,
+                Token::Ident(word) if *word == name => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// `let`/`mut` binding: `(let|mut) binder (: type)? (= value)?`, lowering a bare
     /// name to `Let` and a destructuring binder to `LetDestructure`.
     fn parse_let(&mut self) -> Option<Spanned<Node<'src>>> {
@@ -7830,11 +7982,21 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
-        let value = if self.eat_op("=") {
+        let mut value = if self.eat_op("=") {
             Some(Box::new(self.parse_expression()?))
         } else {
             None
         };
+        // B658: `let target = target is Some(let t) else ret;` — a guard's
+        // `else` after a binding's value that is an `is` test: the let-else
+        // shape another language spells this way. (Any other value before an
+        // `else` — `let x = ready else 1;` — keeps B459's missing `;`.)
+        if !lazy
+            && self.peek_is(&Token::Else)
+            && let Some(value) = value.take_if(|value| matches!(value.0, Node::Is(..)))
+        {
+            return self.let_else_as_guard(start, (pattern, pattern_span), *value);
+        }
         if lazy {
             // `lazy mut` — the binding is initialized ONCE, at first use, and
             // memoized; a `mut` module global is a different contract (a slot
