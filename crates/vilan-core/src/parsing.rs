@@ -222,6 +222,13 @@ pub enum ParseErrorReason {
     /// went on as if it had been written tight, and `vilan fmt` writes it so.
     /// `written` is the name, `tight` the name with its list respelled.
     SpacedGenerics { written: String, tight: String },
+    /// B652: a backslash sequence in a string body that is not an escape —
+    /// `written` is the sequence as the source spells it (`\q`, `\x4`,
+    /// `\u{110000}`), the span it covers.
+    Escape {
+        kind: lexing::EscapeErrorKind,
+        written: String,
+    },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1772,6 +1779,36 @@ fn matching_close(open: char) -> char {
     }
 }
 
+/// B652's refusal of a string escape that is not one: the sequence as
+/// written, why, and the escapes that exist (diagnostics-standard.md B6 — the
+/// prohibition explains itself and names the sanctioned spelling). An unknown
+/// escape leads with the literal backslash, the likeliest intent (a regex's
+/// `\d`, a Windows path), before the list.
+fn escape_rule(kind: lexing::EscapeErrorKind, written: &str) -> String {
+    use lexing::EscapeErrorKind;
+    match kind {
+        EscapeErrorKind::Unknown => format!(
+            "unknown escape `{written}` in a string: a backslash itself is written `\\\\`, and the \
+             escapes are {}",
+            lexing::STRING_ESCAPES
+        ),
+        EscapeErrorKind::Hex => format!(
+            "the escape `{written}` is cut short: `\\x` takes exactly two hex digits, `\\x41`"
+        ),
+        EscapeErrorKind::Unicode => format!(
+            "the escape `{written}` is cut short: `\\u` takes four hex digits, `\\u0301`, or a \
+             code point in braces, `\\u{{1F600}}`"
+        ),
+        EscapeErrorKind::PastLastCodePoint => {
+            format!("the escape `{written}` is past the last code point, `\\u{{10FFFF}}`")
+        }
+        EscapeErrorKind::LoneSurrogate => format!(
+            "the escape `{written}` is half of a UTF-16 surrogate pair, not a character: write \
+             the code point it pairs into, `\\u{{1F600}}`, or the pair `\\uD83D\\uDE00`"
+        ),
+    }
+}
+
 /// Render one parse error as user-facing text, following the diagnostics standard
 /// (`proposal/diagnostics-standard.md`): "found X expected Y in <context> — <hint>"
 /// for the structured case, the curated rule verbatim, and an unclosed-delimiter
@@ -1810,6 +1847,7 @@ pub fn render(error: &ParseError) -> String {
             "`as {written}` then `<`: a generic list after `as` touches its type, `{tight}` — \
              spaced, the `<` after an ascribed type is a comparison"
         ),
+        ParseErrorReason::Escape { kind, written } => escape_rule(*kind, written),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -1941,19 +1979,31 @@ fn parse_with(source: &str, preserve_paren_groups: bool) -> ParsedWithWarnings<'
     // expressed by the ERROR LIST (empty ⇒ clean), not by a missing tree.
     let mut errors: Vec<ParseError> = lex_errors
         .iter()
-        .map(|error| ParseError {
-            span: (error.position..error.position + error.character.len_utf8()).into(),
+        .map(|error| {
+            let mut end = error.position + error.character.len_utf8();
             // A lexer error that knows WHICH rule the character broke states it;
             // the rest render as the generic "found X expected a token".
-            reason: match error.rule {
-                Some(rule) => ParseErrorReason::Rule(rule),
+            let reason = match error.rule {
+                Some(lexing::LexRule::Statement(rule)) => ParseErrorReason::Rule(rule),
+                // B652: the refused escape, spanned and quoted whole.
+                Some(lexing::LexRule::Escape { kind, length }) => {
+                    end = error.position + length;
+                    ParseErrorReason::Escape {
+                        kind,
+                        written: source[error.position..end].to_string(),
+                    }
+                }
                 None => ParseErrorReason::Expected {
                     found: Found::Character(error.character),
                     expected: vec!["a token".to_string()],
                 },
-            },
-            context: Vec::new(),
-            hint: None,
+            };
+            ParseError {
+                span: (error.position..end).into(),
+                reason,
+                context: Vec::new(),
+                hint: None,
+            }
         })
         .collect();
     errors.append(&mut parser.errors);

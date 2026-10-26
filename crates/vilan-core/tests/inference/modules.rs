@@ -3798,6 +3798,186 @@ fn a_backslash_before_a_crlf_break_after_a_hole_in_a_triple_quoted_string_emits_
     assert!(!javascript.contains(r"\r"), "{javascript}");
 }
 
+// --- B652: a string escape is decoded at lexing, or refused there -----------
+//
+// lexical.md §2 promises JavaScript's string escapes. Until Order 55 the one
+// decoder knew six (`\n \t \r \" \\ \0`) and kept every other escape VERBATIM,
+// on both backends alike: `"\x41"` was four characters, `"\u{1F600}"` nine, and
+// kolt's SQL range bound `"\u{10FFFF}"` a backslash that sorted below every
+// letter. Now every escape the spec lists decodes to one value, and a sequence
+// that is not one is refused at the lexer, spanned on the sequence. (The item's
+// "context-dependent" combining mark and its `pkg::`-import trigger were never two
+// emission paths: each repro differed only in whether the source held the
+// combining mark itself or its escape `\u0301` — pinned below as both.)
+
+#[test]
+fn b652_the_hex_and_unicode_escapes_decode_to_one_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print("\x41".len());
+            print("\u{1F600}".len());
+            print("a\u{10FFFF}".len());
+            print("\x41\u0042\u{43}");
+            print("\uD83D\uDE00" == "\u{1F600}");
+            print("\u{0000041}");
+        }
+        "#,
+        "1\n2\n3\nABC\ntrue\nA\n",
+    );
+}
+
+#[test]
+fn b652_every_single_character_escape_decodes() {
+    // JavaScript's single-character escapes, and the two braces an `i"…"`
+    // writes (spelled alike in a plain string, so moving text between the two
+    // never changes its value).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print(i"{"\b".code_at(0)} {"\f".code_at(0)} {"\v".code_at(0)} {"\0".code_at(0)}");
+            print(i"{"\n".code_at(0)} {"\r".code_at(0)} {"\t".code_at(0)}");
+            print("\' \" \\ \{\}");
+        }
+        "#,
+        "8 12 11 0\n10 13 9\n' \" \\ {}\n",
+    );
+}
+
+#[test]
+fn b652_the_items_five_let_file_measures_each_literal_once() {
+    // The item's file, with `print` for `panic`: `u` is the combining mark
+    // written as itself, `w` the same mark as its escape — both one unit.
+    assert_compiles_and_runs(
+        "import std::io::print;\n\nfun main() {\n\tlet t = \"\\t\";\n\tlet x = \"\\x41\";\n\
+         \tlet u = \"\u{301}\";\n\tlet w = \"\\u0301\";\n\tlet b = \"\\u{1F600}\";\n\tlet q = \"\\\"\";\n\
+         \tprint(i\"t {t.len()} x {x.len()} u {u.len()} w {w.len()} b {b.len()} q {q.len()} u0 {u.code_at(0)} w0 {w.code_at(0)}\");\n}\n",
+        "t 1 x 1 u 1 w 1 b 2 q 1 u0 769 w0 769\n",
+    );
+}
+
+#[test]
+fn b652_an_escape_beside_an_interpolation_hole_is_one_fragment() {
+    // The i-string lexer cuts a fragment at each escape; before B652 it cut
+    // after TWO characters, which would have handed the decoder `\x` and `41`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let n = 1;
+            print(i"\x41{n}\u{1F600}".len());
+            print(i"{n}\u0301{n}".len());
+            print(i"\u{42}{n}\x43");
+        }
+        "#,
+        "4\n3\nB1C\n",
+    );
+}
+
+#[test]
+fn b652_a_pkg_import_does_not_change_a_literals_value() {
+    // The item's second trigger, as a package: a `pkg::` import beside the
+    // literal, the mark written as itself and as its escape.
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::style::{ StyleId };\n\nfun main() {\n\
+                 \tlet direct = \"q\u{301}b\";\n\tlet escaped = \"q\\u0301b\";\n\
+                 \tprint(i\"direct {direct.len()} escaped {escaped.len()} {StyleId}\");\n}\n",
+            ),
+            ("style.vl", "let StyleId: i32 = 7;\n"),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "direct 3 escaped 3 7\n");
+}
+
+#[test]
+fn b652_an_unknown_escape_is_refused_at_the_lexer() {
+    // B672's door, kept: a sequence the decoder does not know is refused, never
+    // kept verbatim — in a plain string, an `i"…"` fragment and a string inside
+    // a hole alike, spanned on the sequence.
+    for (source, spanning) in [
+        ("fun main(): str {\n    \"a\\qb\"\n}\n", "\\q"),
+        ("fun main(): str {\n    \"\\d+\"\n}\n", "\\d"),
+        ("fun main(): str {\n    \"\\1\"\n}\n", "\\1"),
+        (
+            "fun main(): str {\n    let n = 1;\n    i\"{n}\\$\"\n}\n",
+            "\\$",
+        ),
+        ("fun main(): str {\n    i\"{\"\\q\"}\"\n}\n", "\\q"),
+    ] {
+        assert_fails_spanning(source, spanning, "unknown escape `");
+    }
+    assert_fails_with(
+        "fun main(): str {\n    \"\\q\"\n}\n",
+        "unknown escape `\\q` in a string: a backslash itself is written `\\\\`",
+    );
+}
+
+#[test]
+fn b652_a_malformed_hex_or_unicode_escape_is_refused() {
+    for (source, spanning, message) in [
+        (
+            "fun main(): str {\n    \"\\x4\"\n}\n",
+            "\\x4",
+            "`\\x` takes exactly two hex digits",
+        ),
+        (
+            "fun main(): str {\n    \"\\xg1\"\n}\n",
+            "\\x",
+            "`\\x` takes exactly two hex digits",
+        ),
+        (
+            "fun main(): str {\n    \"\\u12\"\n}\n",
+            "\\u12",
+            "`\\u` takes four hex digits",
+        ),
+        (
+            "fun main(): str {\n    \"\\u{}\"\n}\n",
+            "\\u{",
+            "`\\u` takes four hex digits",
+        ),
+        (
+            "fun main(): str {\n    \"\\u{12\"\n}\n",
+            "\\u{12",
+            "`\\u` takes four hex digits",
+        ),
+        (
+            "fun main(): str {\n    \"\\u{110000}\"\n}\n",
+            "\\u{110000}",
+            "is past the last code point",
+        ),
+        (
+            "fun main(): str {\n    \"\\u{1000000000}\"\n}\n",
+            "\\u{1000000000}",
+            "is past the last code point",
+        ),
+        (
+            "fun main(): str {\n    \"\\uD800\"\n}\n",
+            "\\uD800",
+            "half of a UTF-16 surrogate pair",
+        ),
+        (
+            "fun main(): str {\n    \"\\u{DC00}\"\n}\n",
+            "\\u{DC00}",
+            "half of a UTF-16 surrogate pair",
+        ),
+        // A high half followed by something that is not a low half.
+        (
+            "fun main(): str {\n    \"\\uD83D\\u0041\"\n}\n",
+            "\\uD83D",
+            "half of a UTF-16 surrogate pair",
+        ),
+    ] {
+        assert_fails_spanning(source, spanning, message);
+    }
+}
+
 // --- Path semantics: library territory is decided on canonicalized paths ---
 // (windows-support.md §5)
 

@@ -574,7 +574,7 @@ impl Layout {
                     match backing {
                         BackingValue::Int(value) => json.push_str(&value.to_string()),
                         BackingValue::Str(raw) => {
-                            json_string(json, &crate::transformer::unescape_string(raw))
+                            json_string(json, &crate::lexing::unescape_string(raw))
                         }
                     }
                     json.push(']');

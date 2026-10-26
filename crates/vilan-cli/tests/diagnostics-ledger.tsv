@@ -765,3 +765,8 @@ row	flagship	key
 742	-	this call's result `{settled_label}` is never fully determined: nothing it is passed binds '{generic_label}' and nothing its result lands in names it. Write the type on the binding the result lands in (`let value: … = …`){path_door}
 743	-	`{write_text}` writes `{lent_text}` in place while it is lent `&mut` to this call, a write under a live `&mut` view; settle the value first: `let item = {value}; {settled}`
 744	-	`{call_text}`'s result is a temporary, so this assignment is lost; bind it first: `{rewritten}`
+NEW	-	unknown escape `{written}` in a string: a backslash itself is written `\\\\`, and the escapes are {escapes}
+NEW	-	the escape `{written}` is cut short: `\\x` takes exactly two hex digits, `\\x41`
+NEW	-	the escape `{written}` is cut short: `\\u` takes four hex digits, `\\u0301`, or a code point in braces, `\\u{{1F600}}`
+NEW	-	the escape `{written}` is past the last code point, `\\u{{10FFFF}}`
+NEW	-	the escape `{written}` is half of a UTF-16 surrogate pair, not a character: write the code point it pairs into, `\\u{{1F600}}`, or the pair `\\uD83D\\uDE00`

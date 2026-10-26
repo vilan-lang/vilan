@@ -7672,8 +7672,14 @@ const MONO_PROBE: &str = concat!(
 /// its backslashes, so `print("a\nb")` printed `a\nb` natively against the JS
 /// backend's two lines — and because no program in the accepted corpus carried
 /// an escape, the differential never saw it. This is that class, as a probe,
-/// covering each of the six escapes vilan recognises, an unknown escape (which
-/// keeps both characters), and a literal backslash.
+/// covering every escape the lexer admits and a literal backslash.
+///
+/// B652: until Order 55 the decoder knew six escapes and kept every other one
+/// VERBATIM on both backends alike — `"\x41"` was four characters, `"\u{1F600}"`
+/// nine — so agreement alone hid it. The probe's output is now pinned whole,
+/// beside the agreement: the three lengths of the item, the `\u0301` combining
+/// mark of its five-`let` file (`q\u{301}b` is three units), a surrogate pair,
+/// and an escape on each side of an interpolation hole.
 #[test]
 fn a_string_literals_escapes_mean_the_same_thing_on_both_backends() {
     let staged = stage();
@@ -7698,10 +7704,10 @@ fn a_string_literals_escapes_mean_the_same_thing_on_both_backends() {
         "the two backends disagree about a string literal's escapes"
     );
     // Non-vacuous by construction: the JS side really does interpret them.
-    assert!(
-        String::from_utf8_lossy(&javascript.stdout).contains("a\nb"),
-        "the probe's `\\n` must be a real newline on the JS side: {:?}",
-        String::from_utf8_lossy(&javascript.stdout)
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        ESCAPE_PROBE_OUTPUT,
+        "the probe's escapes must decode to their values"
     );
 }
 
@@ -7714,9 +7720,20 @@ const ESCAPE_PROBE: &str = concat!(
     "\tprint(\"cr\\rhere\");\n",
     "\tprint(\"quote\\\"q\");\n",
     "\tprint(\"back\\\\slash\");\n",
-    "\tprint(\"unknown\\u0041escape\");\n",
+    "\tprint(\"unicode\\u0041escape\");\n",
+    "\tprint(\"\\x41\".len());\n",
+    "\tprint(\"\\u{1F600}\".len());\n",
+    "\tprint(\"a\\u{10FFFF}\".len());\n",
+    "\tprint(\"\\uD83D\\uDE00\" == \"\\u{1F600}\");\n",
+    "\tprint(i\"{\"\\b\".code_at(0)} {\"\\f\".code_at(0)} {\"\\v\".code_at(0)} {\"\\0\".code_at(0)} {\"\\'\"} {\"\\{\\}\"}\");\n",
+    "\tlet mark = \"\\u0301\";\n",
+    "\tprint(i\"q{mark}b\".len());\n",
+    "\tprint(\"q\\u0301b\".len());\n",
+    "\tprint(i\"\\x41{1}\\u{1F600}\".len());\n",
     "}\n",
 );
+
+const ESCAPE_PROBE_OUTPUT: &str = "a\nb\ntab\there\ncr\rhere\nquote\"q\nback\\slash\nunicodeAescape\n1\n2\n3\ntrue\n8 12 11 0 ' {}\n3\n3\n4\n";
 
 /// C15's measurement, as a pin rather than as a number in a report: the
 /// emitter's boxed-binding count is REACHABLE, and it is zero over a program
