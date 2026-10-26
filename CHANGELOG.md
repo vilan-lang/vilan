@@ -120,6 +120,11 @@ written down.
 
 ---
 
+<!-- family: diagnostics -->
+**B664: an `impl X with Trait` header's refusals render in the file that wrote the header, at the trait's name — "cannot find trait 'PartialEq'" in a package printed no file, line or span at all (and in kolt borrowed `views.vl:25`, an unrelated import in another file), and "'Action' is not a trait" and "missing 'eq'" did the same.** The conformance loop pushed all three with no file of their own, so each took whichever source the walk had read last (a single-file program happened to be right); they are pushed into the impl's source now (`push_in_source`, the `TraitImplCheck`'s `source_id`). No resolution code moved: the package path was never the trait lookup's, only the diagnostic's attribution. Pin: `diagnostics::b664_an_impl_headers_refusals_render_in_the_impls_file` (the item's three-module repro and the two siblings, rendered by `vilan check .`). Tracker B664.
+
+---
+
 ## v0.52.0 — 2026-10-17
 
 <!-- family: miscompile -->

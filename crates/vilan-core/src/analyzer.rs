@@ -71087,13 +71087,20 @@ impl<'src> Analyzer<'src> {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
                 Some(trait_id) => trait_id,
                 None => {
+                    // B664: in the impl's OWN file. Pushed bare, the error
+                    // took whichever file the walk had last been reading — in
+                    // a package, none the span fit (no location at all) or an
+                    // unrelated one (kolt's `views.vl:25`, an import).
                     let steer = self.import_steer(check.trait_name).unwrap_or_default();
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: check.span,
-                        msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
-                    });
+                    self.push_in_source(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: check.span,
+                            msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
+                        },
+                        check.source_id,
+                    );
                     continue;
                 }
             };
@@ -71101,12 +71108,15 @@ impl<'src> Analyzer<'src> {
             // member with a default body is inherited, so an impl need not
             // provide it.
             if !self.traits.contains_key(&trait_id) {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: check.span,
-                    msg: format!("'{}' is not a trait", check.trait_name),
-                });
+                self.push_in_source(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: check.span,
+                        msg: format!("'{}' is not a trait", check.trait_name),
+                    },
+                    check.source_id,
+                );
                 continue;
             }
             // B273: the impl's `with` clause writes a trait APPLICATION, and
@@ -71553,12 +71563,15 @@ impl<'src> Analyzer<'src> {
                         subject_name, trait_label, member_name, expected_signature
                     )
                 };
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note,
-                    span: check.span,
-                    msg,
-                });
+                self.push_in_source(
+                    Error {
+                        trace: Vec::new(),
+                        note,
+                        span: check.span,
+                        msg,
+                    },
+                    check.source_id,
+                );
             }
         }
 

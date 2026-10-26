@@ -2562,3 +2562,59 @@ fn b382_importing_the_original_is_not_a_use_of_the_re_export() {
         "`Kept` imported from `inner` is not a use of `re`'s deprecated re-export: {warnings:?}"
     );
 }
+
+/// B664: the `impl … with Trait` header's refusals render in the file that
+/// wrote the header, at the trait's name — a missing trait (the item's
+/// three-module repro, which printed no file, line or span at all; kolt saw it
+/// at an unrelated import in another file), a name that is not a trait, and a
+/// missing member. They were pushed with no file of their own and took
+/// whichever the walk had read last.
+#[test]
+fn b664_an_impl_headers_refusals_render_in_the_impls_file() {
+    let entry = "import pkg::other::speed;\nimport pkg::notes::note;\nfun main() { print(i\"{speed()} {note().label}\"); }\n";
+    let other = "export *;\nfun speed(): i32 { 90 }\n";
+    let cases = [
+        (
+            "b664_missing",
+            "export *;\nstruct Action { label: str }\nimpl Action with PartialEq {\n\tfun eq(self, other: Action): bool { self.label == other.label }\n}\nfun note(): Action { Action { label = \"x\" } }\n",
+            "cannot find trait 'PartialEq'",
+            "impl Action with PartialEq {",
+        ),
+        (
+            "b664_not_a_trait",
+            "export *;\nstruct Action { label: str }\nimpl Action with Action {\n}\nfun note(): Action { Action { label = \"x\" } }\n",
+            "'Action' is not a trait",
+            "impl Action with Action {",
+        ),
+        (
+            "b664_member",
+            "export *;\nimport std::compare::PartialEq;\nstruct Action { label: str }\nimpl Action with PartialEq {\n}\nfun note(): Action { Action { label = \"x\" } }\n",
+            "'Action' does not implement trait 'PartialEq': missing 'eq'",
+            "impl Action with PartialEq {",
+        ),
+    ];
+    for (tag, notes, message, header) in cases {
+        let dir = temp_files(
+            tag,
+            &[
+                ("vilan.toml", MANIFEST),
+                ("src/main.vl", entry),
+                ("src/other.vl", other),
+                ("src/notes.vl", notes),
+            ],
+        );
+        let output = vilan(&dir, &["check", "."], true);
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!output.status.success(), "{tag}: {stderr}");
+        assert!(stderr.contains(message), "{tag}: {stderr}");
+        assert!(
+            renders_in(&stderr, "notes.vl", header),
+            "{tag}: the refusal renders in notes.vl, quoting the header: {stderr}"
+        );
+        assert!(
+            !stderr.contains("import pkg::other::speed;"),
+            "{tag}: and never in another file: {stderr}"
+        );
+    }
+}
