@@ -333,6 +333,7 @@ spec/types.md h3 associated-functions
 spec/types.md h2 56-generic-binding-and-inference
 spec/types.md h3 length-parameters-const-n
 spec/types.md h2 57-operator-and-method-dispatch
+spec/types.md h3 which-impls-a-librarys-own-code-sees
 spec/types.md h2 58-conversions-and-coercions
 spec/types.md h3 ascription-exp-as-t
 spec/types.md h3 auto-types-the-toolchain-keeps
