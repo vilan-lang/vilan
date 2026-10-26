@@ -304,8 +304,12 @@ fn every_edit_class_answers_what_a_clean_analysis_answers_over_the_std_prefix() 
     );
     let prefix_worlds = censuses.iter().filter(|census| census.prefix_world).count();
     let prefix_hits: u64 = censuses.iter().map(|census| census.prefix_hits).sum();
+    // A refusal OF the prefix is counted; N179's gates in front of the
+    // attempt (the classes' entry-impl step rebuilds in B553's deferred
+    // order, `resolve-deferred`) name themselves without being one.
     let refusals: Vec<&'static str> = censuses
         .iter()
+        .filter(|census| census.prefix_refusals > 0)
         .filter_map(|census| census.prefix_refusal)
         .collect();
     eprintln!(
