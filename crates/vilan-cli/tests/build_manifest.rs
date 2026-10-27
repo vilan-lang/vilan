@@ -430,13 +430,16 @@ fn build_of_finds_the_build_beside_the_server_from_another_working_folder() {
         .current_dir(&elsewhere)
         .output()
         .expect("run the probe server");
-    let report = combined(&ran);
+    // `build_of` joins the module's folder with std's `/` (on Windows the
+    // folder itself carries `\`), so both sides are read with one separator.
+    let report = combined(&ran).replace('\\', "/");
     assert!(ran.status.success(), "the server runs:\n{report}");
+    let slashed = |name: &str| dist.join(name).display().to_string().replace('\\', "/");
     for expected in [
         "leg=client".to_string(),
         "bundle=client.js".to_string(),
-        format!("serve /client.js <- {}", dist.join("client.js").display()),
-        format!("serve /client.css <- {}", dist.join("client.css").display()),
+        format!("serve /client.js <- {}", slashed("client.js")),
+        format!("serve /client.css <- {}", slashed("client.css")),
     ] {
         assert!(
             report.contains(&expected),
@@ -450,11 +453,11 @@ fn build_of_finds_the_build_beside_the_server_from_another_working_folder() {
         .current_dir(&elsewhere)
         .output()
         .expect("run the probe server");
-    let report = combined(&ran);
+    let report = combined(&ran).replace('\\', "/");
     assert!(
         report.contains(&format!(
             "error: no build manifest at {} (beside the server) or dist/client.chunks.json",
-            dist.join("client.chunks.json").display()
+            slashed("client.chunks.json")
         )),
         "the error names both places it looked:\n{report}"
     );

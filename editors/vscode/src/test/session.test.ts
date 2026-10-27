@@ -543,7 +543,7 @@ test('a traced wake shows the waking write below its cause, and its line in the 
             (event) => event.event === 'output' && event.body.category === 'console' && event.body.output.startsWith('[reactive] '),
         );
         assert.equal(lines.length, 1, JSON.stringify(lines.map((event) => event.body)));
-        assert.match(lines[0].body.output, /^\[reactive\] effect #\d+ woken by cell #\d+ \(made at trace\.vl:\d+:\d+\), set at trace\.vl:\d+:\d+\n$/);
+        assert.match(lines[0].body.output, /^\[reactive\] effect #\d+ at trace\.vl:\d+:\d+ woken by cell #\d+ \(made at trace\.vl:\d+:\d+\), set at trace\.vl:\d+:\d+\n$/);
         assert.equal(lines[0].body.line, writes.get('bump'));
         assert.equal(path.basename(lines[0].body.source?.path ?? ''), fixture);
         // And on stderr, which in a terminal launch is the terminal's.
