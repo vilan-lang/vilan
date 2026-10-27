@@ -136,12 +136,12 @@ function __term_leave() {
 	if (keys === null) return;
 	__vilan_keys = null;
 	if (!keys.terminal) return;
+	process.stdin.setRawMode(false);
+	if (keys.paste) process.stdout.write("\x1b[?2004l");
 	process.removeListener("exit", keys.exit);
 	process.removeListener("SIGTERM", keys.term);
 	process.removeListener("SIGHUP", keys.hup);
 	process.removeListener("SIGINT", keys.int);
-	process.stdin.setRawMode(false);
-	if (keys.paste) process.stdout.write("\x1b[?2004l");
 }
 function set(self, index, value) {
 	self.fill(value, index, index + 1);

@@ -2343,8 +2343,13 @@ fn helper_source(name: &str) -> &'static str {
         // `ResetStdio` resets the termios then too, but not the paste switch)
         // and SIGTERM/SIGHUP/SIGINT, where the handler restores and re-raises the
         // signal with the handler gone, so the process still dies of it as it
-        // would have (exit 128+n). Idempotent: `__term_leave` with nothing
-        // live is a no-op.
+        // would have (exit 128+n). `__term_leave` restores the terminal BEFORE
+        // it drops the listeners: dropping one resets that signal's disposition
+        // to the default at once, and a second copy of the signal (the kernel's
+        // to the whole group plus `vilan run`'s forward of its own, E335) landing
+        // between the two would otherwise end the process with the terminal
+        // still raw and the paste switch on. Idempotent: `__term_leave` with
+        // nothing live is a no-op.
         "__term_enter" => {
             "let __vilan_keys = null;\n\
              function __term_enter() {\n\
@@ -2377,12 +2382,12 @@ fn helper_source(name: &str) -> &'static str {
              \tif (keys === null) return;\n\
              \t__vilan_keys = null;\n\
              \tif (!keys.terminal) return;\n\
+             \tprocess.stdin.setRawMode(false);\n\
+             \tif (keys.paste) process.stdout.write(\"\\x1b[?2004l\");\n\
              \tprocess.removeListener(\"exit\", keys.exit);\n\
              \tprocess.removeListener(\"SIGTERM\", keys.term);\n\
              \tprocess.removeListener(\"SIGHUP\", keys.hup);\n\
              \tprocess.removeListener(\"SIGINT\", keys.int);\n\
-             \tprocess.stdin.setRawMode(false);\n\
-             \tif (keys.paste) process.stdout.write(\"\\x1b[?2004l\");\n\
              }"
         }
         // `std::process::prompt`'s write (A173 S1, E?5): stdout with NO
