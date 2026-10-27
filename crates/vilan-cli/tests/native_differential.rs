@@ -1177,6 +1177,10 @@ const PLATFORM_BOUND_REQUIRED: &[&str] = &[
     // reader over the program's `.stdin` fixture.
     "process-env.vl",
     "stdin-lines.vl",
+    // A173 S2: `process::keys()` and the std `KeyDecoder` — one decoder in
+    // vilan, the bytes from each backend's shared stdin pump.
+    "key-decoder.vl",
+    "stdin-keys.vl",
 ];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
@@ -10227,6 +10231,222 @@ fn a173_both_backends_read_the_corpus_stdin_fixture_line_for_line() {
     );
     for backend in [None, Some("rust")] {
         let run = run_on(&staged, backend, "native_probe_stdin_lines.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
+/// A173 S2, terminal.md §4.4 step 2 — THE GATE: `stdin-keys.vl` reads its
+/// `.stdin` fixture through `process::keys()` and both backends decode the
+/// SAME bytes to the SAME keys, byte for byte: the arrows in CSI and SS3,
+/// ctrl+Right's modifier parameter, Home and End in their spellings, F1, F5,
+/// F12, Alt-x, Ctrl-C as a key, both Backspaces, Tab and Shift+Tab, UTF-8 of
+/// three widths, a bracketed paste holding an ESC and a newline (one `Paste`),
+/// an unknown sequence dropped whole, ESC ESC `q` (Escape, then Alt-q), and a
+/// lone ESC at the end — `Escape` under the pipe rule (§4.3), no timeout.
+///
+/// The keys are WRITTEN OUT, as the line pin above writes its lines: a harness
+/// that dropped the fixture would hand both backends an empty stdin, and two
+/// programs reading nothing agree perfectly. Under its own program name (N158).
+#[test]
+fn a173_s2_both_backends_decode_the_key_fixture_to_the_same_keys() {
+    let staged = stage();
+    for extension in ["vl", "stdin"] {
+        std::fs::copy(
+            staged.join(format!("stdin-keys.{extension}")),
+            staged.join(format!("native_probe_stdin_keys.{extension}")),
+        )
+        .expect("stage the key program under its own name");
+    }
+    let expected = concat!(
+        "1: Key::Char(\"a\") | Press { key = Key::Char(\"a\"), ctrl = false, alt = false, shift = false }\n",
+        "2: Key::Char(\"Z\") | Press { key = Key::Char(\"Z\"), ctrl = false, alt = false, shift = true }\n",
+        "3: Key::Enter | Press { key = Key::Enter, ctrl = false, alt = false, shift = false }\n",
+        "4: Key::Up | Press { key = Key::Up, ctrl = false, alt = false, shift = false }\n",
+        "5: Key::Down | Press { key = Key::Down, ctrl = false, alt = false, shift = false }\n",
+        "6: Key::Right | Press { key = Key::Right, ctrl = true, alt = false, shift = false }\n",
+        "7: Key::Home | Press { key = Key::Home, ctrl = false, alt = false, shift = false }\n",
+        "8: Key::Home | Press { key = Key::Home, ctrl = false, alt = false, shift = false }\n",
+        "9: Key::Home | Press { key = Key::Home, ctrl = false, alt = false, shift = false }\n",
+        "10: Key::End | Press { key = Key::End, ctrl = false, alt = false, shift = false }\n",
+        "11: Key::End | Press { key = Key::End, ctrl = false, alt = false, shift = false }\n",
+        "12: Key::F(1) | Press { key = Key::F(1), ctrl = false, alt = false, shift = false }\n",
+        "13: Key::F(5) | Press { key = Key::F(5), ctrl = false, alt = false, shift = false }\n",
+        "14: Key::F(12) | Press { key = Key::F(12), ctrl = false, alt = false, shift = false }\n",
+        "15: Key::Alt(\"x\") | Press { key = Key::Char(\"x\"), ctrl = false, alt = true, shift = false }\n",
+        "16: Key::Ctrl(\"c\") | Press { key = Key::Char(\"c\"), ctrl = true, alt = false, shift = false }\n",
+        "17: Key::Backspace | Press { key = Key::Backspace, ctrl = false, alt = false, shift = false }\n",
+        "18: Key::Backspace | Press { key = Key::Backspace, ctrl = false, alt = false, shift = false }\n",
+        "19: Key::Tab | Press { key = Key::Tab, ctrl = false, alt = false, shift = false }\n",
+        "20: Key::BackTab | Press { key = Key::Tab, ctrl = false, alt = false, shift = true }\n",
+        "21: Key::Char(\"\u{e9}\") | Press { key = Key::Char(\"\u{e9}\"), ctrl = false, alt = false, shift = false }\n",
+        "22: Key::Char(\"\u{2713}\") | Press { key = Key::Char(\"\u{2713}\"), ctrl = false, alt = false, shift = false }\n",
+        "23: Key::Char(\"\u{1f600}\") | Press { key = Key::Char(\"\u{1f600}\"), ctrl = false, alt = false, shift = false }\n",
+        "24: Key::Paste(\"pa\u{1b}ste\\nX\") | Press { key = Key::Paste(\"pa\u{1b}ste\\nX\"), ctrl = false, alt = false, shift = false }\n",
+        "25: Key::Char(\"?\") | Press { key = Key::Char(\"?\"), ctrl = false, alt = false, shift = false }\n",
+        "26: Key::Enter | Press { key = Key::Enter, ctrl = false, alt = false, shift = false }\n",
+        "27: Key::Escape | Press { key = Key::Escape, ctrl = false, alt = false, shift = false }\n",
+        "28: Key::Alt(\"q\") | Press { key = Key::Char(\"q\"), ctrl = false, alt = true, shift = false }\n",
+        "29: Key::Escape | Press { key = Key::Escape, ctrl = false, alt = false, shift = false }\n",
+        "keys: 29\n",
+        "next past the end is None: true\n",
+    );
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "native_probe_stdin_keys.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
+/// A173 S2, terminal.md §4.4 step 1: the std `KeyDecoder` fed bytes directly
+/// (`key-decoder.vl`), one row per escape-table entry, the malformed and
+/// cut-short sequences that are dropped, and the chunk splits the pipe rule
+/// decides by the bytes alone — written out, and identical on both backends
+/// because both run the one decoder std writes in vilan (§4.1).
+#[test]
+fn a173_s2_the_key_decoder_table_is_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::copy(
+        staged.join("key-decoder.vl"),
+        staged.join("native_probe_key_decoder.vl"),
+    )
+    .expect("stage the decoder program under its own name");
+    let expected = concat!(
+        "arrows CSI\n",
+        "  chunk 1: Key::Up\n",
+        "  chunk 1: Key::Down\n",
+        "  chunk 1: Key::Right\n",
+        "  chunk 1: Key::Left\n",
+        "arrows SS3\n",
+        "  chunk 1: Key::Up\n",
+        "  chunk 1: Key::Down\n",
+        "  chunk 1: Key::Right\n",
+        "  chunk 1: Key::Left\n",
+        "home: CSI H, SS3 H, 1~, 7~\n",
+        "  chunk 1: Key::Home\n",
+        "  chunk 1: Key::Home\n",
+        "  chunk 1: Key::Home\n",
+        "  chunk 1: Key::Home\n",
+        "end: CSI F, SS3 F, 4~, 8~\n",
+        "  chunk 1: Key::End\n",
+        "  chunk 1: Key::End\n",
+        "  chunk 1: Key::End\n",
+        "  chunk 1: Key::End\n",
+        "insert delete pageup pagedown\n",
+        "  chunk 1: Key::Insert\n",
+        "  chunk 1: Key::Delete\n",
+        "  chunk 1: Key::PageUp\n",
+        "  chunk 1: Key::PageDown\n",
+        "F1-F4 SS3\n",
+        "  chunk 1: Key::F(1)\n",
+        "  chunk 1: Key::F(2)\n",
+        "  chunk 1: Key::F(3)\n",
+        "  chunk 1: Key::F(4)\n",
+        "F1-F5 CSI ~\n",
+        "  chunk 1: Key::F(1)\n",
+        "  chunk 1: Key::F(2)\n",
+        "  chunk 1: Key::F(3)\n",
+        "  chunk 1: Key::F(4)\n",
+        "  chunk 1: Key::F(5)\n",
+        "F6-F12 CSI ~\n",
+        "  chunk 1: Key::F(6)\n",
+        "  chunk 1: Key::F(7)\n",
+        "  chunk 1: Key::F(8)\n",
+        "  chunk 1: Key::F(9)\n",
+        "  chunk 1: Key::F(10)\n",
+        "  chunk 1: Key::F(11)\n",
+        "  chunk 1: Key::F(12)\n",
+        "modified: ctrl+Right shift+Up alt+Left ctrl+Delete shift+F1\n",
+        "  chunk 1: Key::Right +ctrl\n",
+        "  chunk 1: Key::Up +shift\n",
+        "  chunk 1: Key::Left +alt\n",
+        "  chunk 1: Key::Delete +ctrl\n",
+        "  chunk 1: Key::F(1) +shift\n",
+        "Enter: cr\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: lf\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: crlf is one\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: cr cr is two\n",
+        "  chunk 1: Key::Enter\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: lf cr is two\n",
+        "  chunk 1: Key::Enter\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: lf lf is two\n",
+        "  chunk 1: Key::Enter\n",
+        "  chunk 1: Key::Enter\n",
+        "Backspace 0x7f and 0x08, Tab, BackTab\n",
+        "  chunk 1: Key::Backspace\n",
+        "  chunk 1: Key::Backspace\n",
+        "  chunk 1: Key::Tab\n",
+        "  chunk 1: Key::BackTab +shift\n",
+        "Ctrl: c d z, NUL, 0x1c\n",
+        "  chunk 1: Key::Ctrl(\"c\") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\"d\") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\"z\") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\" \") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\"\\\\\") +ctrl\n",
+        "Alt: x, X, Backspace, Ctrl-c, e-acute\n",
+        "  chunk 1: Key::Alt(\"x\") +alt\n",
+        "  chunk 1: Key::Alt(\"X\") +alt +shift\n",
+        "  chunk 1: Key::Backspace +alt\n",
+        "  chunk 1: Key::Ctrl(\"c\") +ctrl +alt\n",
+        "  chunk 1: Key::Alt(\"\u{e9}\") +alt\n",
+        "UTF-8: 2, 3 and 4 bytes\n",
+        "  chunk 1: Key::Char(\"\u{e9}\")\n",
+        "  chunk 1: Key::Char(\"\u{2713}\")\n",
+        "  chunk 1: Key::Char(\"\u{1f600}\")\n",
+        "printable ASCII\n",
+        "  chunk 1: Key::Char(\" \")\n",
+        "  chunk 1: Key::Char(\"~\")\n",
+        "  chunk 1: Key::Char(\"0\")\n",
+        "  chunk 1: Key::Char(\"9\")\n",
+        "  chunk 1: Key::Char(\"A\") +shift\n",
+        "  chunk 1: Key::Char(\"z\")\n",
+        "lone ESC at the end\n",
+        "  end: Key::Escape\n",
+        "ESC ESC\n",
+        "  chunk 1: Key::Escape\n",
+        "  end: Key::Escape\n",
+        "ESC [ at the end is Alt-[\n",
+        "  end: Key::Alt(\"[\") +alt\n",
+        "ESC O at the end is Alt-O\n",
+        "  end: Key::Alt(\"O\") +alt +shift\n",
+        "paste with ESC and line endings inside\n",
+        "  chunk 1: Key::Paste(\"a\u{1b}[Bb\\r\\nc\")\n",
+        "  chunk 1: Key::Char(\"z\")\n",
+        "paste never closed\n",
+        "  end: Key::Paste(\"abc\")\n",
+        "dropped: unknown final, private marker, unknown SS3, stray paste end\n",
+        "  chunk 1: Key::Char(\"k\")\n",
+        "dropped: CSI cut by a control byte\n",
+        "  chunk 1: Key::Ctrl(\"g\") +ctrl\n",
+        "dropped: CSI cut by the end\n",
+        "dropped: stray continuation, cut scalar, 0xff\n",
+        "  chunk 1: Key::Char(\"(\")\n",
+        "  chunk 1: Key::Char(\"j\")\n",
+        "dropped: scalar cut by the end\n",
+        "ESC | [ | A: one Up, nothing early (no timeout on a pipe)\n",
+        "  chunk 3: Key::Up\n",
+        "ESC | x: Alt-x, the bytes decide\n",
+        "  chunk 2: Key::Alt(\"x\") +alt\n",
+        "cr | lf: one Enter, at the cr\n",
+        "  chunk 1: Key::Enter\n",
+        "4-byte scalar one byte at a time\n",
+        "  chunk 4: Key::Char(\"\u{1f600}\")\n",
+        "paste with its end split\n",
+        "  chunk 3: Key::Paste(\"ab\")\n",
+        "ESC, then silence, then [A: the timeout resolves Escape\n",
+        "  chunk 2: Key::Escape\n",
+        "  chunk 3: Key::Char(\"[\")\n",
+        "  chunk 3: Key::Char(\"A\") +shift\n",
+        "ESC [ 1 ; 5 split mid-parameters\n",
+        "  chunk 3: Key::Right +ctrl\n",
+    );
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "native_probe_key_decoder.vl");
         assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
         assert_eq!(run.stdout, expected, "{backend:?}");
     }

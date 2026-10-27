@@ -3,7 +3,14 @@
 
 [platform("@process")] mod self;
 
+import pkg::bytes::{ Bytes, decode_utf8 };
+import pkg::compare::PartialEq;
+import pkg::debug::Debug;
+import pkg::drop::Drop;
+import pkg::io::panic;
+import pkg::io::stdout;
 import pkg::option::Option::{ self, None, Some };
+import pkg::shared::Shared;
 import pkg::task::{ CancelSignal, ambient_signal };
 
 export *;
@@ -42,7 +49,7 @@ fun scan(): str {
 /// cursor after it). `None` once stdin has ended, so a loop that asks again on
 /// a bad answer still stops at the end of its input.
 fun prompt(text: str): Option<str> {
-	stdout_write(text);
+	stdout::write(text);
 	read_line()
 }
 
@@ -53,11 +60,617 @@ fun prompt(text: str): Option<str> {
 [extern("__stdin_line")]
 export(in mod) async external fun stdin_line(signal: Option<CancelSignal>): Option<str>;
 
-/// Writes `text` to stdout unterminated and flushed — `prompt`'s half. Not
-/// public: the general no-newline `io` write is A173 S2's, where redraws need it
-/// beside cursor control.
-[extern("__stdout_write")]
-export(in mod) external fun stdout_write(text: str): void;
+// ------------------------------------------------------------------ keys --
+//
+// A173 S2 (proposal/terminal.md §3.2–§4): a key-driven view of the terminal.
+// The backends deliver BYTES — the shared stdin pump `read_line` reads from,
+// in byte mode (`__stdin_bytes`) — and ONE decoder, written here in vilan,
+// turns them into keys on both backends, so identical decoding is a property
+// of construction rather than of two decoders reconciled (§4.1). The only
+// host work is the terminal mode: raw mode and bracketed paste on while a
+// `Keys` lives (`__term_enter`/`__term_leave`; natively `vilan-rt-term`,
+// linked only by a program that reaches `keys()`).
+
+/// One key as a key-driven program matches it: flat, so the common chords read
+/// as variants — `Key::Char("q"), Key::Ctrl("c") => jump break`, `Key::Up =>
+/// ..`. A modifier on a named key (Ctrl+Right, Shift+Up) is `Keys::next_press`'s
+/// `Press`, the same decoded key with its modifier set.
+[derive(PartialEq, Debug)]
+export enum Key {
+	/// One Unicode scalar as typed, shift applied (`"A"`, `"é"`). vilan has no char
+	/// type, so it is a one-scalar `str`.
+	Char(str),
+	/// Ctrl with a scalar: `Ctrl("c")` is byte 0x03, `Ctrl("d")` 0x04. Raw mode
+	/// turns the terminal's signals and end-of-file off, so Ctrl-C is a KEY here,
+	/// not a SIGINT, and Ctrl-D is a key, not the end of input.
+	Ctrl(str),
+	/// Alt (an ESC prefix) with a scalar: `Alt("x")`.
+	Alt(str),
+	/// `\r`, `\n` and `\r\n` each: a terminal's Enter key sends `\r` in raw mode, a
+	/// pipe's line ends with `\n`.
+	Enter,
+	Tab,
+	/// Shift+Tab.
+	BackTab,
+	/// `0x7f` and `0x08` both: terminals differ on which they send.
+	Backspace,
+	Delete,
+	Insert,
+	/// A lone ESC — never `Alt` of nothing.
+	Escape,
+	Up,
+	Down,
+	Left,
+	Right,
+	Home,
+	End,
+	PageUp,
+	PageDown,
+	/// F1..F12.
+	F(i32),
+	/// A bracketed paste, WHOLE: the pasted text is one value, never keystrokes, so
+	/// a pasted `\n` is not an `Enter`.
+	Paste(str),
+}
+
+/// A key with its modifier set — what `Keys::next_press` answers. The key is
+/// NORMALIZED: Ctrl-C is `Press { key = Key::Char("c"), ctrl = true, .. }`,
+/// Shift+Tab is `Key::Tab` with `shift`, and `ctrl`/`alt`/`shift` are set on
+/// named keys too (`ESC [1;5C` is `Key::Right` with `ctrl`). `Ctrl`, `Alt` and
+/// `BackTab` never appear here; they are `Keys::next`'s flattening of it.
+[derive(PartialEq, Debug)]
+export struct Press {
+	key: Key,
+	ctrl: bool,
+	alt: bool,
+	shift: bool,
+}
+
+export impl Press {
+	/// The flat `Key` this press reads as — `Keys::next`'s view: ctrl with a scalar
+	/// is `Ctrl`, alt with a scalar `Alt` (ctrl wins when both are held), Shift+Tab
+	/// `BackTab`; a modifier on any other named key is dropped.
+	fun key(self): Key {
+		match self.key {
+			Key::Char(let scalar) => if self.ctrl {
+				Key::Ctrl(scalar)
+			} else if self.alt {
+				Key::Alt(scalar)
+			} else {
+				Key::Char(scalar)
+			},
+			Key::Tab => if self.shift { Key::BackTab } else { Key::Tab },
+			let other => other,
+		}
+	}
+}
+
+/// A plain press: `key` with no modifier held.
+export(in mod) fun plain(key: Key): Press {
+	Press { key, ctrl = false, alt = false, shift = false }
+}
+
+/// The key-driven view of the terminal (A173 S2): raw mode while the handle lives,
+/// restored at its last use.
+///
+/// A RESOURCE, because raw mode is terminal state that outlives the call that set
+/// it: `keys()` enters it, and `Drop` restores the terminal at the handle's last
+/// use — after a `jump break`, on a panic, and when a nursery cancels the task that
+/// owns it. `process::exit` and a signal restore it too (the `std::process` docs
+/// list each road). One `Keys` at a time: a second `keys()` while one lives panics,
+/// because two owners of one terminal mode cannot both restore it.
+///
+/// On a PIPE (stdin not a terminal) no terminal mode is touched and the bytes
+/// decode by the same grammar with no timeout (terminal.md §4.3), so
+/// `printf 'jj\rq' | vilan run menu.vl` drives a key program exactly as
+/// typing would, and `None` arrives at the end of the input.
+[resource]
+export struct Keys {
+	decoder: Shared<KeyDecoder>,
+	/// Stdin is a terminal: raw mode was entered, and a lone ESC is told from the
+	/// start of a sequence by a timeout.
+	terminal: bool,
+}
+
+/// Opens the terminal's key stream: raw mode (no echo, no line buffering, no signal
+/// keys) and bracketed paste while the handle lives; on a pipe, the same stream
+/// decoded from the piped bytes, with no terminal touched.
+///
+/// ```text
+/// let keys = process::keys();
+/// for {
+///     match keys.next() {
+///         Some(Key::Char("q")), Some(Key::Ctrl("c")), None => jump break,
+///         Some(Key::Up) => move_up(),
+///         Some(let other) => {}
+///     }
+/// }
+/// ```
+fun keys(): Keys {
+	let opened = term_enter();
+	if opened < 0 {
+		panic("process::keys(): a `Keys` is already live — two owners of one terminal mode cannot both restore it; drop the first before opening another");
+	}
+	Keys { decoder = Shared::new(KeyDecoder::new()), terminal = opened == 1 }
+}
+
+export impl Keys {
+	/// The next key, awaiting one; `None` once stdin has ended. Carries the ambient
+	/// cancel signal, as `read_line` does: cancelling abandons the WAIT, never a
+	/// byte — what arrives later is decoded for the next call.
+	fun next(self): Option<Key> {
+		match self.next_press() {
+			Some(let press) => Some(press.key()),
+			None => None,
+		}
+	}
+
+	/// The next key with its modifier set (`Press`), awaiting one; `None` once
+	/// stdin has ended. The same stream as `next`, one decoder, two views.
+	fun next_press(self): Option<Press> {
+		for {
+			let wait = match self.decoder.write().step(self.terminal) {
+				Decoded::Key(let press) => ret Some(press),
+				Decoded::End => ret None,
+				Decoded::Read(let wait) => wait,
+			};
+			match stdin_bytes(ambient_signal(), wait) {
+				Some(let chunk) => self.decoder.write().feed(chunk),
+				None => self.decoder.write().finish(),
+			}
+		}
+	}
+}
+
+export impl Keys with Drop {
+	/// Restores the terminal: raw mode and bracketed paste off. Synchronous (one
+	/// `tcsetattr`, one `setRawMode(false)`), so destruction.md §5 holds with
+	/// nothing asked of it.
+	fun drop(&mut self) {
+		term_leave();
+	}
+}
+
+/// What one decoder step answers `Keys::next_press`.
+export(in mod) enum Decoded {
+	Key(Press),
+	/// Stdin has ended and every byte was decoded.
+	End,
+	/// More bytes are needed: read, waiting at most this many milliseconds (`-1`:
+	/// as long as it takes).
+	Read(i32),
+}
+
+/// The std key decoder (terminal.md §4.1): bytes in, `Press`es out, the one state
+/// machine both backends run. Public so a program — or a test — can decode bytes it
+/// holds: `feed` them, take keys with `next` until it is `None`, and `finish` at
+/// the end of the input to resolve what is pending.
+///
+/// The grammar: UTF-8 scalars from their lead byte; the C0 controls (`\r` and `\n`
+/// Enter — `\r\n` one Enter, whatever the chunks — `\t` Tab, `0x7f` and `0x08`
+/// Backspace, the rest Ctrl with their letter); ESC + a key is that key with Alt;
+/// CSI (`ESC [ params final`: the arrows, Home/End in both spellings, the `~` keys,
+/// F1–F12, `Z` Shift+Tab, the xterm modifier parameter `;2..;8`); SS3 (`ESC O`:
+/// F1–F4, the arrows, Home/End); and the paste brackets `ESC [200~ .. ESC [201~`,
+/// whose content is one `Paste`. A well-formed sequence the grammar does not name
+/// is DROPPED whole, never delivered as typing.
+///
+/// Without a timeout — on a pipe — a lone ESC is `Escape` once the byte after it
+/// cannot continue a sequence, or at the end: the decoded stream depends on the
+/// bytes alone, never on how they were chunked.
+export struct KeyDecoder {
+	/// Bytes fed and not yet decoded start at `at`.
+	pending: Bytes,
+	at: usize,
+	/// The last key was a `\r`: a `\n` that comes next ends the same line.
+	carriage: bool,
+	/// The terminal went quiet with an ESC pending (the timeout): resolve it.
+	idle: bool,
+	/// No more bytes will come: everything pending resolves.
+	ended: bool,
+}
+
+export impl KeyDecoder {
+	fun new(): KeyDecoder {
+		KeyDecoder {
+			pending = Bytes::alloc(0),
+			at = 0,
+			carriage = false,
+			idle = false,
+			ended = false,
+		}
+	}
+
+	/// Appends `bytes` to what is pending. An EMPTY chunk is the terminal's silence
+	/// (the escape timeout ran out): a pending lone ESC resolves.
+	fun feed(&mut self, bytes: Bytes) {
+		if bytes.len() == 0 {
+			self.idle = true;
+		} else {
+			let rest = self.pending.slice(self.at, self.pending.len());
+			self.pending = Bytes::concat(rest, bytes);
+			self.at = 0;
+		}
+	}
+
+	/// The end of the input: every pending byte resolves — a lone ESC is `Escape`,
+	/// an unclosed paste is the `Paste` of what arrived, and an incomplete sequence
+	/// is dropped.
+	fun finish(&mut self) {
+		self.ended = true;
+	}
+
+	/// The next key whose bytes are all here; `None` when what is pending needs
+	/// more bytes (or nothing is pending).
+	fun next(&mut self): Option<Press> {
+		match self.step(false) {
+			Decoded::Key(let press) => Some(press),
+			_ => None,
+		}
+	}
+}
+
+export(in mod) impl KeyDecoder {
+	/// One step for `Keys`: a key, the end, or how long to read for more.
+	/// `terminal` asks for the escape timeout when an ESC is what is pending: 50
+	/// ms, after which a lone ESC is `Escape` (node waits 500 ms, which reads as
+	/// lag; vim's `ttimeoutlen` is 100). A constant on purpose — no knob — and
+	/// never applied to a pipe, whose bytes alone decide.
+	fun step(&mut self, terminal: bool): Decoded {
+		let resolving = self.idle || self.ended;
+		self.idle = false;
+		for {
+			if self.carriage && self.at < self.pending.len() {
+				self.carriage = false;
+				if self.pending.get(self.at) == 10 {
+					self.at += 1;
+				}
+				jump continue;
+			}
+			if self.at >= self.pending.len() {
+				ret if self.ended { Decoded::End } else { Decoded::Read(-1) };
+			}
+			match decode_step(self.pending, self.at, resolving, self.ended) {
+				Step::Found(let press, let used) => {
+					self.carriage = self.pending.get(self.at) == 13;
+					self.at += used;
+					ret Decoded::Key(press);
+				}
+				Step::Skip(let used) => self.at += used,
+				Step::Ambiguous => ret Decoded::Read(if terminal { 50 } else { -1 }),
+				Step::More => ret Decoded::Read(-1),
+			}
+		}
+	}
+}
+
+/// What the grammar finds at the front of the pending bytes.
+export(in mod) enum Step {
+	/// A key, and how many bytes it took.
+	Found(Press, usize),
+	/// Bytes that decode to nothing — a sequence the grammar does not name, a stray
+	/// byte — dropped.
+	Skip(usize),
+	/// An ESC that is either a lone `Escape` or the start of a sequence: the next
+	/// bytes decide, or the terminal's silence does.
+	Ambiguous,
+	/// The start of something longer that only more bytes (or the end) can
+	/// finish: a split scalar, an open paste.
+	More,
+}
+
+/// Decodes the key at `at`. `resolving`: no more bytes are coming for now (a
+/// timeout or the end), so an ESC prefix stands alone; `ended`: none will come at
+/// all.
+export(in mod) fun decode_step(bytes: Bytes, at: usize, resolving: bool, ended: bool): Step {
+	let lead = bytes.get(at);
+	if lead == 27 {
+		decode_escape(bytes, at, resolving, ended)
+	} else if lead >= 128 {
+		decode_scalar(bytes, at, ended)
+	} else {
+		Step::Found(control_or_char(lead), 1)
+	}
+}
+
+/// A key from one byte below 128.
+export(in mod) fun control_or_char(byte: i32): Press {
+	if byte == 13 || byte == 10 {
+		plain(Key::Enter)
+	} else if byte == 9 {
+		plain(Key::Tab)
+	} else if byte == 127 || byte == 8 {
+		plain(Key::Backspace)
+	} else if byte == 0 {
+		// Ctrl+Space (and Ctrl+@) send NUL.
+		Press { key = Key::Char(" "), ctrl = true, alt = false, shift = false }
+	} else if byte < 27 {
+		// 0x01..0x1a: Ctrl with the letter, `a` for 0x01.
+		Press { key = Key::Char(ascii(byte + 96)), ctrl = true, alt = false, shift = false }
+	} else if byte < 32 {
+		// 0x1c..0x1f: Ctrl with `\`, `]`, `^` and `_`.
+		Press { key = Key::Char(ascii(byte + 64)), ctrl = true, alt = false, shift = false }
+	} else {
+		Press {
+			key = Key::Char(ascii(byte)),
+			ctrl = false,
+			alt = false,
+			shift = byte >= 65 && byte <= 90,
+		}
+	}
+}
+
+/// The one-byte string for an ASCII code.
+export(in mod) fun ascii(code: i32): str {
+	let byte = Bytes::alloc(1);
+	byte.set(0, code);
+	decode_utf8(byte)
+}
+
+/// A UTF-8 scalar from its lead byte (at least 128).
+export(in mod) fun decode_scalar(bytes: Bytes, at: usize, ended: bool): Step {
+	let lead = bytes.get(at);
+	let width: usize = if lead >= 194 && lead <= 223 {
+		2
+	} else if lead >= 224 && lead <= 239 {
+		3
+	} else if lead >= 240 && lead <= 244 {
+		4
+	} else {
+		0
+	};
+	if width == 0 {
+		// A continuation byte with no lead, or a byte UTF-8 never uses.
+		ret Step::Skip(1);
+	}
+	let left = bytes.len() - at;
+	mut index: usize = 1;
+	for index < width {
+		if index >= left {
+			ret if ended { Step::Skip(left) } else { Step::More };
+		}
+		let continuation = bytes.get(at + index);
+		if continuation < 128 || continuation > 191 {
+			// The scalar is cut short: drop its lead and what continued it, and
+			// decode the byte that broke it on its own.
+			ret Step::Skip(index);
+		}
+		index += 1;
+	}
+	let scalar = decode_utf8(bytes.slice(at, at + width));
+	Step::Found(plain(Key::Char(scalar)), width)
+}
+
+/// A key that starts with ESC (`at` holds it).
+export(in mod) fun decode_escape(bytes: Bytes, at: usize, resolving: bool, ended: bool): Step {
+	let left = bytes.len() - at;
+	if left == 1 {
+		ret if resolving { Step::Found(plain(Key::Escape), 1) } else { Step::Ambiguous };
+	}
+	let second = bytes.get(at + 1);
+	if second == 91 {
+		decode_csi(bytes, at, resolving, ended)
+	} else if second == 79 {
+		decode_ss3(bytes, at, resolving)
+	} else if second == 27 {
+		// ESC ESC: the first is a lone Escape; the second starts again.
+		Step::Found(plain(Key::Escape), 1)
+	} else {
+		// ESC + a key: that key with Alt.
+		match decode_step(bytes, at + 1, resolving, ended) {
+			Step::Found(let press, let used) => Step::Found(
+				Press {
+					key = press.key,
+					ctrl = press.ctrl,
+					alt = true,
+					shift = press.shift,
+				},
+				used + 1,
+			),
+			Step::Skip(let used) => Step::Skip(used + 1),
+			Step::Ambiguous => Step::Ambiguous,
+			Step::More => Step::More,
+		}
+	}
+}
+
+/// `ESC O x` — SS3: F1–F4, and the arrows and Home/End in the terminal's
+/// application cursor mode.
+export(in mod) fun decode_ss3(bytes: Bytes, at: usize, resolving: bool): Step {
+	if bytes.len() - at < 3 {
+		ret if resolving {
+			Step::Found(Press { key = Key::Char("O"), ctrl = false, alt = true, shift = true }, 2)
+		} else {
+			Step::Ambiguous
+		};
+	}
+	let final = bytes.get(at + 2);
+	match final_key(final) {
+		Some(let key) => Step::Found(plain(key), 3),
+		None => Step::Skip(3),
+	}
+}
+
+/// The key a CSI or SS3 final byte names on its own: `A`..`D` the arrows,
+/// `H`/`F` Home/End, `P`..`S` F1–F4.
+export(in mod) fun final_key(final: i32): Option<Key> {
+	if final == 65 {
+		Some(Key::Up)
+	} else if final == 66 {
+		Some(Key::Down)
+	} else if final == 67 {
+		Some(Key::Right)
+	} else if final == 68 {
+		Some(Key::Left)
+	} else if final == 72 {
+		Some(Key::Home)
+	} else if final == 70 {
+		Some(Key::End)
+	} else if final >= 80 && final <= 83 {
+		Some(Key::F(final - 79))
+	} else {
+		None
+	}
+}
+
+/// The key a `CSI n ~` names.
+export(in mod) fun tilde_key(number: i32): Option<Key> {
+	if number == 1 || number == 7 {
+		Some(Key::Home)
+	} else if number == 2 {
+		Some(Key::Insert)
+	} else if number == 3 {
+		Some(Key::Delete)
+	} else if number == 4 || number == 8 {
+		Some(Key::End)
+	} else if number == 5 {
+		Some(Key::PageUp)
+	} else if number == 6 {
+		Some(Key::PageDown)
+	} else if number >= 11 && number <= 15 {
+		Some(Key::F(number - 10))
+	} else if number >= 17 && number <= 21 {
+		Some(Key::F(number - 11))
+	} else if number == 23 || number == 24 {
+		Some(Key::F(number - 12))
+	} else {
+		None
+	}
+}
+
+/// `ESC [ params intermediates final` — CSI.
+export(in mod) fun decode_csi(bytes: Bytes, at: usize, resolving: bool, ended: bool): Step {
+	let length = bytes.len();
+	mut index = at + 2;
+	// The parameters (`0`..`?`), then the intermediates (space..`/`).
+	for index < length && bytes.get(index) >= 48 && bytes.get(index) <= 63 {
+		index += 1;
+	}
+	let parameters_end = index;
+	for index < length && bytes.get(index) >= 32 && bytes.get(index) <= 47 {
+		index += 1;
+	}
+	if index >= length {
+		if !resolving {
+			ret if index == at + 2 { Step::Ambiguous } else { Step::More };
+		}
+		// Cut short by the silence or the end: `ESC [` alone was Alt+`[`;
+		// anything longer is a sequence that never finished, dropped.
+		ret if index == at + 2 {
+			Step::Found(Press { key = Key::Char("["), ctrl = false, alt = true, shift = false }, 2)
+		} else {
+			Step::Skip(index - at)
+		};
+	}
+	let final = bytes.get(index);
+	if final < 64 || final > 126 {
+		// Not a sequence after all: drop what was read and decode the byte that
+		// broke it on its own.
+		ret Step::Skip(index - at);
+	}
+	let used = index + 1 - at;
+	// The numeric parameters: `n;m` — the key's number, then xterm's modifier (1 +
+	// shift 1, alt 2, ctrl 4, meta 8). A private marker (`?`, `<`, `=`, `>`) names
+	// no key here.
+	mut first = 0;
+	mut second = 0;
+	mut count = 0;
+	mut private = false;
+	mut cursor = at + 2;
+	for cursor < parameters_end {
+		let byte = bytes.get(cursor);
+		if byte >= 48 && byte <= 57 {
+			if count == 0 {
+				count = 1;
+			}
+			if count == 1 {
+				first = first * 10 + (byte - 48);
+			} else if count == 2 {
+				second = second * 10 + (byte - 48);
+			}
+		} else if byte == 59 {
+			count = if count == 0 { 2 } else { count + 1 };
+		} else {
+			private = true;
+		}
+		cursor += 1;
+	}
+	if private || parameters_end != index {
+		ret Step::Skip(used);
+	}
+	if final == 126 {
+		if first == 200 {
+			ret decode_paste(bytes, at, at + used, ended);
+		}
+		ret match tilde_key(first) {
+			Some(let key) => Step::Found(modified(key, second), used),
+			None => Step::Skip(used),
+		};
+	}
+	if final == 90 {
+		ret Step::Found(Press { key = Key::Tab, ctrl = false, alt = false, shift = true }, used);
+	}
+	match final_key(final) {
+		Some(let key) => Step::Found(modified(key, second), used),
+		None => Step::Skip(used),
+	}
+}
+
+/// `key` under xterm's modifier parameter (`0`/`1`: none).
+export(in mod) fun modified(key: Key, parameter: i32): Press {
+	let bits = if parameter > 1 { parameter - 1 } else { 0 };
+	Press {
+		key,
+		shift = bits % 2 == 1,
+		alt = (bits / 2) % 2 == 1 || (bits / 8) % 2 == 1,
+		ctrl = (bits / 4) % 2 == 1,
+	}
+}
+
+/// A bracketed paste: the bytes after `ESC [200~` (at `from`) up to `ESC [201~`, as
+/// one `Paste`. ESC and line endings inside are content.
+export(in mod) fun decode_paste(bytes: Bytes, at: usize, from: usize, ended: bool): Step {
+	let length = bytes.len();
+	mut index = from;
+	for index + 6 <= length {
+		if bytes.get(index) == 27
+			&& bytes.get(index + 1) == 91
+			&& bytes.get(index + 2) == 50
+			&& bytes.get(index + 3) == 48
+			&& bytes.get(index + 4) == 49
+			&& bytes.get(index + 5) == 126 {
+			let text = decode_utf8(bytes.slice(from, index));
+			ret Step::Found(plain(Key::Paste(text)), index + 6 - at);
+		}
+		index += 1;
+	}
+	if ended {
+		// The paste never closed: what arrived is the paste.
+		Step::Found(plain(Key::Paste(decode_utf8(bytes.slice(from, length)))), length - at)
+	} else {
+		Step::More
+	}
+}
+
+/// The host's byte read behind `Keys`: everything the shared stdin pump holds,
+/// awaiting a chunk if it holds nothing; `None` once stdin has ended and every
+/// byte was taken; an EMPTY chunk when `wait_ms` (unless `-1`) passed first.
+/// The same pump `read_line` reads, so the two never race for a byte.
+[extern("__stdin_bytes")]
+export(in mod) async external fun stdin_bytes(
+	signal: Option<CancelSignal>,
+	wait_ms: i32,
+): Option<Bytes>;
+
+/// Enters the key stream's terminal mode: `1` when stdin is a terminal (raw
+/// mode and bracketed paste are now on), `0` on a pipe (nothing touched),
+/// `-1` when a `Keys` is already live (nothing touched; `keys()` panics).
+[extern("__term_enter")]
+export(in mod) external fun term_enter(): i32;
+
+/// Restores what `term_enter` changed, if anything; idempotent.
+[extern("__term_leave")]
+export(in mod) external fun term_leave(): void;
 
 /// The arguments the program was invoked with, excluding the runtime and script
 /// path — e.g. `vilan run prog.vl a b` yields `["a", "b"]`.

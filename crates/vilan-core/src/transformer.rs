@@ -1218,6 +1218,15 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__http_linger");
         added = true;
     }
+    // A173 S2: the line read and the key read share ONE stdin pump.
+    if helpers
+        .iter()
+        .any(|helper| matches!(*helper, "__stdin_line" | "__stdin_bytes"))
+        && !helpers.contains(&"__stdin_pump")
+    {
+        helpers.push("__stdin_pump");
+        added = true;
+    }
     // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
     if helpers.contains(&"__dbg_stack") && !helpers.contains(&"__dbg") {
         helpers.push("__dbg");
@@ -1259,6 +1268,9 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_watch",
         "__fs_watch_stop",
         "__stdin_line",
+        "__stdin_bytes",
+        "__term_enter",
+        "__term_leave",
         "__stdout_write",
         "__local_get",
         "__response_header",
@@ -2173,16 +2185,26 @@ fn helper_source(name: &str) -> &'static str {
         // Q1's exception. Idempotent: a second stop is a no-op, so the
         // destructor stays benign behind any earlier `drop(watcher)`. No
         // public `stop()` surfaces it — the destructor is the only caller.
-        // `std::process::read_line`'s host half (A173 S1): ONE shared stdin
-        // pump, read incrementally — never to EOF first, so an interactive
-        // program answers each line as it is typed. `'data'` appends to the
-        // buffer and `'end'` marks the end; waiters queue and are answered in
-        // order, a line at a time. `\n`, `\r\n` and a lone `\r` each end a line:
-        // a `\r` answers at once and remembers it (`carriage`), so a `\n`
-        // arriving next — in this chunk or the next — is that same ending, and
-        // the split falls identically whatever the chunk boundaries were. At
-        // the end the remainder (if any) is a last line, then `None` (`[1]`)
-        // for every later read.
+        // `std::process`'s stdin (A173 S1, S2): ONE shared pump over
+        // `process.stdin`, read incrementally — never to EOF first, so an
+        // interactive program answers each line (or key) as it arrives. It
+        // holds BYTES (S2: no `setEncoding`, because the key decoder wants
+        // bytes), `'data'` appends and `'end'` marks the end, and waiters queue
+        // and are answered in order. Two kinds of waiter share it, so a line
+        // read and a key read never race for a byte:
+        //
+        // - a LINE waiter (`__stdin_line`, behind `read_line`/`scan`/`prompt`)
+        //   takes the bytes up to the next line ending, decoded as UTF-8 per
+        //   line. `\n`, `\r\n` and a lone `\r` each end a line: a `\r`
+        //   answers at once and remembers it (`carriage`), so a `\n` arriving
+        //   next — in this chunk or the next — is that same ending, and the
+        //   split falls identically whatever the chunk boundaries were. At the
+        //   end the remainder (if any) is a last line, then `None` (`[1]`);
+        // - a BYTES waiter (`__stdin_bytes`, behind `process::Keys`) takes
+        //   everything buffered, `None` at the end, and — given a `wait` — an
+        //   EMPTY chunk if the wait runs out first: the key decoder's escape
+        //   timeout on a terminal. The bytes left there stay for the next
+        //   reader. (`vilan/std/src/process.vl`'s `KeyDecoder` decodes them.)
         //
         // The pump lets go of stdin whenever nobody waits: `pause()` stops the
         // reads and `unref()` stops the handle holding the event loop — without
@@ -2193,44 +2215,75 @@ fn helper_source(name: &str) -> &'static str {
         // redirect's stream has no `ref`/`unref`; it ends by itself.)
         //
         // An abort of the ambient cancel signal removes that waiter and
-        // rejects it with the signal's reason, as `__sleep` does; a line that
-        // arrives later stays buffered for the next reader — cancellation
-        // abandons the WAIT, never a line. The B?1 history: the helper this
-        // replaced called `require("fs")` inside the emitted ES module (`.mjs`
-        // since B86b, v0.33.0), and its own `catch` turned the
-        // `ReferenceError` into "" for every call.
-        "__stdin_line" => {
-            "const __vilan_stdin = { buffer: \"\", ended: false, carriage: false, started: false, waiters: [] };\n\
+        // rejects it with the signal's reason, as `__sleep` does; what arrives
+        // later stays buffered for the next reader — cancellation abandons the
+        // WAIT, never a byte. The B?1 history: the helper S1 replaced called
+        // `require("fs")` inside the emitted ES module (`.mjs` since B86b,
+        // v0.33.0), and its own `catch` turned the `ReferenceError` into ""
+        // for every call.
+        "__stdin_pump" => {
+            "const __vilan_stdin = { buffer: Buffer.alloc(0), ended: false, carriage: false, started: false, waiters: [] };\n\
+             function __stdin_start() {\n\
+             \tconst state = __vilan_stdin;\n\
+             \tif (state.started) return;\n\
+             \tstate.started = true;\n\
+             \tprocess.stdin.on(\"data\", (chunk) => {\n\
+             \t\tstate.buffer = state.buffer.length === 0 ? chunk : Buffer.concat([ state.buffer, chunk ]);\n\
+             \t\t__stdin_pump();\n\
+             \t});\n\
+             \tconst ended = () => {\n\
+             \t\tstate.ended = true;\n\
+             \t\t__stdin_pump();\n\
+             \t};\n\
+             \tprocess.stdin.on(\"end\", ended);\n\
+             \tprocess.stdin.on(\"error\", ended);\n\
+             }\n\
              function __stdin_pump() {\n\
              \tconst state = __vilan_stdin;\n\
              \twhile (state.waiters.length > 0) {\n\
              \t\tif (state.carriage && state.buffer.length > 0) {\n\
-             \t\t\tif (state.buffer[0] === \"\\n\") state.buffer = state.buffer.slice(1);\n\
+             \t\t\tif (state.buffer[0] === 10) state.buffer = state.buffer.subarray(1);\n\
              \t\t\tstate.carriage = false;\n\
              \t\t\tcontinue;\n\
              \t\t}\n\
-             \t\tconst end = state.buffer.search(/[\\r\\n]/);\n\
-             \t\tif (end >= 0) {\n\
-             \t\t\tconst line = state.buffer.slice(0, end);\n\
-             \t\t\tstate.carriage = state.buffer[end] === \"\\r\";\n\
-             \t\t\tstate.buffer = state.buffer.slice(end + 1);\n\
-             \t\t\tstate.waiters.shift().resolve([ 0, line ]);\n\
-             \t\t} else if (state.ended) {\n\
-             \t\t\tconst rest = state.buffer;\n\
-             \t\t\tstate.buffer = \"\";\n\
-             \t\t\tstate.waiters.shift().resolve(rest.length > 0 ? [ 0, rest ] : [ 1 ]);\n\
+             \t\tconst waiter = state.waiters[0];\n\
+             \t\tif (waiter.bytes) {\n\
+             \t\t\tif (state.buffer.length > 0) {\n\
+             \t\t\t\tconst chunk = new Uint8Array(state.buffer);\n\
+             \t\t\t\tstate.buffer = Buffer.alloc(0);\n\
+             \t\t\t\tstate.waiters.shift().resolve([ 0, chunk ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
+             \t\t\tif (state.ended) {\n\
+             \t\t\t\tstate.waiters.shift().resolve([ 1 ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
              \t\t} else {\n\
-             \t\t\tprocess.stdin.ref?.();\n\
-             \t\t\tprocess.stdin.resume();\n\
-             \t\t\treturn;\n\
+             \t\t\tconst end = state.buffer.findIndex((byte) => byte === 10 || byte === 13);\n\
+             \t\t\tif (end >= 0) {\n\
+             \t\t\t\tconst line = state.buffer.toString(\"utf8\", 0, end);\n\
+             \t\t\t\tstate.carriage = state.buffer[end] === 13;\n\
+             \t\t\t\tstate.buffer = state.buffer.subarray(end + 1);\n\
+             \t\t\t\tstate.waiters.shift().resolve([ 0, line ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
+             \t\t\tif (state.ended) {\n\
+             \t\t\t\tconst rest = state.buffer;\n\
+             \t\t\t\tstate.buffer = Buffer.alloc(0);\n\
+             \t\t\t\tstate.waiters.shift().resolve(rest.length > 0 ? [ 0, rest.toString(\"utf8\") ] : [ 1 ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
              \t\t}\n\
+             \t\tprocess.stdin.ref?.();\n\
+             \t\tprocess.stdin.resume();\n\
+             \t\treturn;\n\
              \t}\n\
              \tif (state.started && !state.ended) {\n\
              \t\tprocess.stdin.pause();\n\
              \t\tprocess.stdin.unref?.();\n\
              \t}\n\
              }\n\
-             function __stdin_line(signal) {\n\
+             function __stdin_wait(signal, bytes, wait) {\n\
              \tconst sig = signal && signal[0] === 0 ? signal[1] : undefined;\n\
              \treturn new Promise((resolve, reject) => {\n\
              \t\tif (sig && sig.aborted) {\n\
@@ -2238,34 +2291,98 @@ fn helper_source(name: &str) -> &'static str {
              \t\t\treturn;\n\
              \t\t}\n\
              \t\tconst state = __vilan_stdin;\n\
-             \t\tif (!state.started) {\n\
-             \t\t\tstate.started = true;\n\
-             \t\t\tprocess.stdin.setEncoding(\"utf8\");\n\
-             \t\t\tprocess.stdin.on(\"data\", (chunk) => {\n\
-             \t\t\t\tstate.buffer += chunk;\n\
-             \t\t\t\t__stdin_pump();\n\
-             \t\t\t});\n\
-             \t\t\tconst ended = () => {\n\
-             \t\t\t\tstate.ended = true;\n\
-             \t\t\t\t__stdin_pump();\n\
-             \t\t\t};\n\
-             \t\t\tprocess.stdin.on(\"end\", ended);\n\
-             \t\t\tprocess.stdin.on(\"error\", ended);\n\
-             \t\t}\n\
-             \t\tconst abort = () => {\n\
+             \t\t__stdin_start();\n\
+             \t\tlet timer;\n\
+             \t\tconst withdraw = () => {\n\
              \t\t\tconst parked = state.waiters.indexOf(waiter);\n\
              \t\t\tif (parked >= 0) state.waiters.splice(parked, 1);\n\
+             \t\t\tif (sig) sig.removeEventListener(\"abort\", abort);\n\
+             \t\t\tif (timer !== undefined) clearTimeout(timer);\n\
+             \t\t};\n\
+             \t\tconst abort = () => {\n\
+             \t\t\twithdraw();\n\
              \t\t\treject(sig.reason);\n\
              \t\t\t__stdin_pump();\n\
              \t\t};\n\
-             \t\tconst waiter = { resolve: (line) => {\n\
-             \t\t\tif (sig) sig.removeEventListener(\"abort\", abort);\n\
-             \t\t\tresolve(line);\n\
+             \t\tconst waiter = { bytes, resolve: (value) => {\n\
+             \t\t\twithdraw();\n\
+             \t\t\tresolve(value);\n\
              \t\t} };\n\
              \t\tstate.waiters.push(waiter);\n\
              \t\tif (sig) sig.addEventListener(\"abort\", abort, { once: true });\n\
+             \t\tif (wait >= 0) timer = setTimeout(() => {\n\
+             \t\t\twithdraw();\n\
+             \t\t\tresolve([ 0, new Uint8Array(0) ]);\n\
+             \t\t\t__stdin_pump();\n\
+             \t\t}, wait);\n\
              \t\t__stdin_pump();\n\
              \t});\n\
+             }"
+        }
+        "__stdin_line" => {
+            "function __stdin_line(signal) {\n\
+             \treturn __stdin_wait(signal, false, -1);\n\
+             }"
+        }
+        "__stdin_bytes" => {
+            "function __stdin_bytes(signal, wait) {\n\
+             \treturn __stdin_wait(signal, true, wait);\n\
+             }"
+        }
+        // `std::process::keys()`'s terminal mode (A173 S2): raw mode and
+        // bracketed paste while a `Keys` lives, and nothing at all on a pipe
+        // (terminal.md §4.3 — there is no terminal to tell). `-1` refuses a
+        // second live `Keys`: two owners of one terminal mode cannot both
+        // restore it, and `keys()` panics with that sentence. The paste
+        // switch is written only when stdout is a terminal too, so a program
+        // whose output is redirected never writes it into the file.
+        //
+        // The restore runs from `Keys`'s `Drop` (its last use, a `jump
+        // break`, a panic, a cancelled task) and, while one lives, from
+        // `'exit'` (`process::exit` and an uncaught failure; node's own
+        // `ResetStdio` resets the termios then too, but not the paste switch)
+        // and SIGTERM/SIGHUP/SIGINT, where the handler restores and re-raises the
+        // signal with the handler gone, so the process still dies of it as it
+        // would have (exit 128+n). Idempotent: `__term_leave` with nothing
+        // live is a no-op.
+        "__term_enter" => {
+            "let __vilan_keys = null;\n\
+             function __term_enter() {\n\
+             \tif (__vilan_keys !== null) return -1;\n\
+             \tif (!process.stdin.isTTY) {\n\
+             \t\t__vilan_keys = { terminal: false };\n\
+             \t\treturn 0;\n\
+             \t}\n\
+             \tconst keys = { terminal: true, paste: process.stdout.isTTY === true, exit: () => __term_leave() };\n\
+             \tconst raise = (name) => () => {\n\
+             \t\t__term_leave();\n\
+             \t\tprocess.kill(process.pid, name);\n\
+             \t};\n\
+             \tkeys.term = raise(\"SIGTERM\");\n\
+             \tkeys.hup = raise(\"SIGHUP\");\n\
+             \tkeys.int = raise(\"SIGINT\");\n\
+             \t__vilan_keys = keys;\n\
+             \tprocess.stdin.setRawMode(true);\n\
+             \tif (keys.paste) process.stdout.write(\"\\x1b[?2004h\");\n\
+             \tprocess.on(\"exit\", keys.exit);\n\
+             \tprocess.on(\"SIGTERM\", keys.term);\n\
+             \tprocess.on(\"SIGHUP\", keys.hup);\n\
+             \tprocess.on(\"SIGINT\", keys.int);\n\
+             \treturn 1;\n\
+             }"
+        }
+        "__term_leave" => {
+            "function __term_leave() {\n\
+             \tconst keys = __vilan_keys;\n\
+             \tif (keys === null) return;\n\
+             \t__vilan_keys = null;\n\
+             \tif (!keys.terminal) return;\n\
+             \tprocess.removeListener(\"exit\", keys.exit);\n\
+             \tprocess.removeListener(\"SIGTERM\", keys.term);\n\
+             \tprocess.removeListener(\"SIGHUP\", keys.hup);\n\
+             \tprocess.removeListener(\"SIGINT\", keys.int);\n\
+             \tprocess.stdin.setRawMode(false);\n\
+             \tif (keys.paste) process.stdout.write(\"\\x1b[?2004l\");\n\
              }"
         }
         // `std::process::prompt`'s write (A173 S1, E?5): stdout with NO
@@ -15679,8 +15796,14 @@ const RESERVED_NAMES: &[&str] = &[
     "__dbg_set",
     "__dbg_stack",
     "__vilan_stdin",
+    "__stdin_start",
     "__stdin_pump",
+    "__stdin_wait",
     "__stdin_line",
+    "__stdin_bytes",
+    "__vilan_keys",
+    "__term_enter",
+    "__term_leave",
     "__stdout_write",
     "__parse_i32",
     "__parse_f64",

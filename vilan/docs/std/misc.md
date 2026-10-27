@@ -8,6 +8,7 @@ The small modules that don't need a page of their own: `std::io`,
 
 ```vilan,fragment
 fun print(message: any)                     // console.log
+fun write(text: str)                        // stdout, no newline, flushed (process platforms)
 fun panic(message: str)                     // abort with a message
 fun assert(condition: bool, message: str)   // panic when false
 ```
@@ -24,6 +25,28 @@ float keeps its `.0` and a string is quoted; a backed enum prints its name
 or inside a value, prints its written type, `<closure |i32| i32>` (a named
 function `<closure fun double>`). A host value the printer could
 only name (a `Location`, a DOM node) is handed to the host's console as it is.
+
+`write` puts `text` on standard output with **no newline**, flushed so it is
+on the screen before the program waits: a prompt that leaves the cursor on its
+line, a progress line rewritten in place with `\r`, a key-driven program's
+redraw. `print` always ends the line; a `write` ends one only where its text
+has a `\n`. The two write the same stream, in order. `write` exists on the
+process platforms only (node, deno, bun and the native backend) — a browser
+has no standard output, so a browser build that reaches `write` is refused
+with the chain to it, while `print` stays universal.
+
+```vilan,norun
+import std::io::{ print, write };
+import std::time;
+
+fun main() {
+	for step in [1, 2, 3] {
+		write(i"\rstep {step} of 3");
+		time::sleep(100);
+	}
+	print("");
+}
+```
 
 `panic` is for unreachable states (expected failures are `Result`). A
 `panic` arm in a `match` diverges: the other arms decide the match's

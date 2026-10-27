@@ -439,6 +439,7 @@ std/process.md h2 stdbuild
 std/process.md h2 stdwebdocument
 std/process.md h2 stdprocess
 std/process.md h3 reading-stdin
+std/process.md h3 reading-keys
 std/process.md h2 stdwatch
 std/reactive.md h1 stdreactive-reference
 std/reactive.md h2 at-a-glance

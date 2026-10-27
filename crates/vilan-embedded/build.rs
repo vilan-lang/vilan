@@ -63,8 +63,8 @@ fn main() {
         "embedded-std build: {} holds no src/lib.rs — is this a complete checkout?",
         runtime_root.display()
     );
-    // F18 slice 2, F40 and F45: the OPTIONAL runtime crates (`vilan-rt-sqlite`,
-    // `vilan-rt-crypto`, `vilan-rt-signal`) materialize BESIDE the runtime, under the same hash and
+    // F18 slice 2, F40, F45 and A173 S2: the OPTIONAL runtime crates (`vilan-rt-sqlite`,
+    // `vilan-rt-crypto`, `vilan-rt-signal`, `vilan-rt-term`) materialize BESIDE the runtime, under the same hash and
     // the same root, because the generated cargo manifest reaches each as a
     // sibling of the runtime path (the rulings keep them separate CRATES; they
     // are not separate caches). A program that reaches neither never names
@@ -159,6 +159,11 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         manifest_static: "RT_SIGNAL_MANIFEST",
         item: "F45",
     },
+    OptionalCrate {
+        directory: "vilan-rt-term",
+        manifest_static: "RT_TERM_MANIFEST",
+        item: "A173 S2",
+    },
 ];
 
 /// The `Cargo.toml` a materialized optional crate carries — [`runtime_manifest`]'s
@@ -172,7 +177,22 @@ fn optional_manifest(root: &Path, optional: &OptionalCrate) -> String {
     let manifest = fs::read_to_string(&path).unwrap();
     let package = block_of(&manifest, "[package]");
     let dependencies = block_of(&manifest, "[dependencies]");
-    let generated = format!("{package}\n\n{dependencies}\n\n[workspace]\n");
+    // A173 S2: a PLATFORM's dependencies (`vilan-rt-term`'s `libc` on unix,
+    // `windows-sys` on Windows) are dependencies too, and kept the same way.
+    let mut platform_dependencies = String::new();
+    let mut rest = manifest.as_str();
+    while let Some(start) = rest.find("\n[target.") {
+        let header_end = rest[start + 1..]
+            .find('\n')
+            .map_or(rest.len(), |offset| start + 1 + offset);
+        let header = &rest[start + 1..header_end];
+        if header.ends_with(".dependencies]") {
+            platform_dependencies.push_str("\n\n");
+            platform_dependencies.push_str(block_of(rest, header));
+        }
+        rest = &rest[header_end..];
+    }
+    let generated = format!("{package}\n\n{dependencies}{platform_dependencies}\n\n[workspace]\n");
     format!(
         "/// The `Cargo.toml` `{}` is materialized with ({}):\n\
          /// the real crate's `[package]` and `[dependencies]` blocks plus a\n\

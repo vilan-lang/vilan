@@ -1245,6 +1245,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vilan-rt-term"
+version = "0.52.0"
+dependencies = [
+ "libc",
+ "vilan-rt",
+ "windows-sys",
+]
+
+[[package]]
 name = "vilan-rust"
 version = "0.52.0"
 dependencies = [
