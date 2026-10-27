@@ -149,9 +149,15 @@ export fun build_of(leg: str): Result<LegBuild, BuildError> {
 	// and where a server run from the project root finds it.
 	let fallback = "dist";
 	let fallback_manifest = path::join(fallback, name);
-	let beside = module_dir();
+	// `std::path` is lexical over `/`; on Windows the module's folder and the
+	// working folder come with `\`, so both are read with one separator before they
+	// are compared or joined (a server run from the project root is then described
+	// as `dist` on every platform).
+	let beside = module_dir().replace("\\", "/");
 	mut tried = fallback_manifest;
-	if beside != "" && path::normalize(beside) != path::resolve(cwd(), fallback) {
+	if beside != "" && path::normalize(beside) != path::normalize(
+		path::resolve(cwd().replace("\\", "/"), fallback),
+	) {
 		let beside_manifest = path::join(beside, name);
 		if fs::stat(beside_manifest).is_some() {
 			ret read_build(beside, beside_manifest);

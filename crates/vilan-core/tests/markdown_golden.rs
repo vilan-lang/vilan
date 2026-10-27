@@ -83,7 +83,9 @@ fn walker_source(root: &Path, pages: &[String]) -> String {
         .map(|page| format!("\t\t\"{page}\","))
         .collect::<Vec<_>>()
         .join("\n");
-    let root = root.display();
+    // The root is spelled with `/` (node reads it on Windows too): a `\` in a
+    // vilan string literal is an escape, and B652 refuses an unknown one.
+    let root = root.display().to_string().replace('\\', "/");
     format!(
         r#"
 import std::display::Display;
