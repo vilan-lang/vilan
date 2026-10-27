@@ -10606,6 +10606,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         binding: Option<&ExternBinding<'src>>,
         argument_ids: &[Id],
         depth: usize,
+        span: Span,
     ) -> Result<Option<String>, Error> {
         let Some(binding) = binding else {
             return Ok(None);
@@ -10638,21 +10639,46 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.reaches_signal = true;
                 return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
             }
-            // The two body reads CONSUME the request handle, and the callback
-            // reads the same handle again afterwards — `std::http`'s own
-            // `Server::start` awaits the body and then builds
-            // `Request { node = node_request, .. }` out of it. A handle is
+            // M164: `std::http`'s lazy body. The read CONSUMES the two handles,
+            // and the request is read again afterwards (`Request::bytes` may be
+            // called twice, and `std::http`'s `answer` asks
+            // `__http_body_left_unread` of the same handle). A handle is
             // RETAINED per use, exactly as J6 retains a `Task` read out of a
             // binding: `clone_sites` marks nothing, because on the JS backend a
             // handle is a class instance that `__clone` passes through.
             ExternBinding::Function {
-                module: Some("node:stream/consumers"),
-                symbol: "buffer",
+                module: None,
+                symbol: "__http_read_body",
             } => {
                 let request = self.place_argument(argument_ids, 0, depth)?;
+                let response = self.place_argument(argument_ids, 1, depth)?;
+                let limit = self.value_argument(argument_ids, 2, depth)?;
                 return Ok(Some(format!(
-                    "vilan_rt::http::read_request_bytes(({request}).clone())"
+                    "vilan_rt::http::read_body(({request}).clone(), ({response}).clone(), {limit})"
                 )));
+            }
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_body_left_unread",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let limit = self.value_argument(argument_ids, 1, depth)?;
+                return Ok(Some(format!("({request}).body_left_unread({limit})")));
+            }
+            // M164: one request's answer. The JS helper exists to keep a
+            // cancellation from reaching node unhandled; here the callback is
+            // already a spawned task, where a cancellation settles quietly, so
+            // the call IS the body's future (the call site awaits it).
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_respond",
+            } => {
+                return Ok(Some(self.pinned_body_argument(
+                    argument_ids,
+                    0,
+                    depth,
+                    span,
+                )?));
             }
             // `new TextDecoder()` / `new TextEncoder()` — both stateless for
             // the one encoding vilan has.
@@ -10677,15 +10703,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 module: None,
                 symbol: "TextEncoder",
             } => return Ok(Some("vilan_rt::bytes::TextEncoder".to_string())),
-            ExternBinding::Function {
-                module: Some("node:stream/consumers"),
-                symbol: "text",
-            } => {
-                let request = self.place_argument(argument_ids, 0, depth)?;
-                return Ok(Some(format!(
-                    "vilan_rt::http::read_request_text(({request}).clone())"
-                )));
-            }
             _ => {}
         }
         let Some(receiver) = self.host_receiver_type(target) else {
@@ -11497,7 +11514,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(Some(rendered));
         }
         // F18: the HTTP surface has native bodies in `vilan_rt::http`.
-        if let Some(rendered) = self.http_host_binding(target, binding, argument_ids, depth)? {
+        if let Some(rendered) =
+            self.http_host_binding(target, binding, argument_ids, depth, span)?
+        {
             return Ok(Some(rendered));
         }
         // F18 slice 2: `std::json`'s host seams in `vilan_rt::json`, and

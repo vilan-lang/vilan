@@ -315,8 +315,8 @@ export fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 /// The re-read is the ordinary async `read_bytes`, awaited before the response is
 /// built. Nothing on this path forbids suspending: `serve_build`'s handler is
 /// reached from `respond_from_build`, which is `async` because it awaits the app's
-/// own handler, and the node callback in `Server::start` already suspends on
-/// `read_request_bytes` before a byte is written. A synchronous read here bought
+/// own handler, and the node callback in `Server::start` already suspends on the
+/// request body's read before a byte is written. A synchronous read here bought
 /// nothing, and it once justified its own existence in `std::fs` by claiming this
 /// caller could not suspend.
 ///

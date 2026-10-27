@@ -52,7 +52,7 @@ export async external fun read_file_encoded(path: str, encoding: str): str;
 /// called with NO encoding argument hands back a host `Buffer`, which IS a
 /// `Uint8Array` (runtime-verified: `buffer instanceof Uint8Array` is `true`),
 /// so it binds directly to `Bytes` with no conversion — the same interop
-/// `std::http`'s `read_request_bytes` already relies on.
+/// `std::http`'s request body read relies on (node's `Buffer.concat`).
 [extern("node:fs/promises", "readFile")]
 export async external fun read_bytes(path: str): Bytes;
 

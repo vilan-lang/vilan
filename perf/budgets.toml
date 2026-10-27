@@ -869,3 +869,65 @@ class = "ci"
 ratio = 1.005
 reason = "std grew on every program's load: the mirror's keyed tables (M172), the rpc answer under guarded_async (M165), Connection::close (A174) and B677's warning pass — todo +0.24% on the lane's box (math and watch flat)"
 item = "M172"
+
+# http-55 (M164): std::http's capped, lazy request body - BodyLimits and its mount table, the Request's
+# reply/limit, `answer`, `respond`, `max_body_bytes`/`max_body_bytes_under`/`Request::max_body_bytes`, and
+# the three runtime helpers. Measured against next @ed1a3ddf (a release build of its sources) on this
+# box, release vs release; each ratio is the measured one rounded up, plus 0.001. The cold rows: math
+# x0.9997, watch x1.0006, plain:160 x1.0001, plain:320 x0.9999, genapp:46 x0.9999.
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.003
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0012"
+item = "M164"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.003
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0012"
+item = "M164"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.004
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0022"
+item = "M164"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.004
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0022"
+item = "M164"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.003
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0016"
+item = "M164"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.003
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0016"
+item = "M164"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.003
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0016"
+item = "M164"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.003
+reason = "http-55: std::http's capped, lazy request body (BodyLimits, the lazy Request, the three helpers); measured x1.0016"
+item = "M164"

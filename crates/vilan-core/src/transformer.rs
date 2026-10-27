@@ -1209,6 +1209,15 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__db_bind");
         added = true;
     }
+    // M164: a refused or unread-over-the-cap body lingers its connection.
+    if helpers
+        .iter()
+        .any(|helper| matches!(*helper, "__http_read_body" | "__http_body_left_unread"))
+        && !helpers.contains(&"__http_linger")
+    {
+        helpers.push("__http_linger");
+        added = true;
+    }
     // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
     if helpers.contains(&"__dbg_stack") && !helpers.contains(&"__dbg") {
         helpers.push("__dbg");
@@ -1253,6 +1262,9 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__stdout_write",
         "__local_get",
         "__response_header",
+        "__http_read_body",
+        "__http_body_left_unread",
+        "__http_respond",
         "__session_get",
         "__dom_window",
         "__dom_active_element",
@@ -1497,6 +1509,126 @@ fn helper_source(name: &str) -> &'static str {
         "__response_header" => {
             "function __response_header(response, name) {\n\
              \treturn (response && response.headers ? response.headers.get(name) : null) ?? \"\";\n\
+             }"
+        }
+        // M164: `std::http`'s lazy request body. Read whole on the FIRST call and
+        // kept on the request object, so a later `bytes()` answers the same
+        // promise; at most `limit` bytes — a declared `Content-Length` over it is
+        // refused before a byte of the body is read, a chunked body is counted
+        // per `data` event and refused at the chunk that crosses it. A refusal
+        // answers `413` with `Connection: close` — node destroys the socket once
+        // it is flushed, and the stream is paused, so the rest is never read —
+        // under RFC 9110's phrase (node's table still says `Payload Too Large`;
+        // the native server says the RFC's, so the two answer one status line),
+        // and rejects with an `AbortError`: the handler ends as a cancelled task
+        // does, and `__http_respond` keeps that quiet. A client that goes away
+        // mid-body (`error`, node's `aborted`) ends it the same way — before
+        // M164 that rejection reached node unhandled and ended the process. The
+        // `error` listener stays on: node raises a request's `error` only to a
+        // listener, and a second one with none would.
+        "__http_read_body" => {
+            "function __http_read_body(request, response, limit) {\n\
+             \tif (request.__vilan_body !== undefined) return request.__vilan_body;\n\
+             \trequest.__vilan_body = new Promise((resolve, reject) => {\n\
+             \t\tconst over = (message) => {\n\
+             \t\t\tconst error = new Error(message);\n\
+             \t\t\terror.name = \"AbortError\";\n\
+             \t\t\treturn error;\n\
+             \t\t};\n\
+             \t\tconst refuse = () => {\n\
+             \t\t\trequest.removeAllListeners(\"data\");\n\
+             \t\t\trequest.pause();\n\
+             \t\t\tif (!response.headersSent) {\n\
+             \t\t\t\tresponse.statusCode = 413;\n\
+             \t\t\t\tresponse.statusMessage = \"Content Too Large\";\n\
+             \t\t\t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
+             \t\t\t\tresponse.setHeader(\"Connection\", \"close\");\n\
+             \t\t\t\t__http_linger(request);\n\
+             \t\t\t\tresponse.end(\"the request body is larger than \" + limit + \" bytes\");\n\
+             \t\t\t} else {\n\
+             \t\t\t\trequest.socket.destroy();\n\
+             \t\t\t}\n\
+             \t\t\treject(over(\"the request body is larger than \" + limit + \" bytes\"));\n\
+             \t\t};\n\
+             \t\trequest.on(\"error\", () => reject(over(\"the client went away before the request body arrived\")));\n\
+             \t\tif (request.readableEnded || response.writableEnded) {\n\
+             \t\t\treject(over(\"the request body was read after the request was answered\"));\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t\tconst declared = request.headers[\"content-length\"];\n\
+             \t\tif (declared !== undefined && Number(declared) > limit) {\n\
+             \t\t\trefuse();\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t\tconst chunks = [];\n\
+             \t\tlet total = 0;\n\
+             \t\trequest.on(\"data\", (chunk) => {\n\
+             \t\t\ttotal += chunk.length;\n\
+             \t\t\tif (total > limit) {\n\
+             \t\t\t\tchunks.length = 0;\n\
+             \t\t\t\trefuse();\n\
+             \t\t\t\treturn;\n\
+             \t\t\t}\n\
+             \t\t\tchunks.push(chunk);\n\
+             \t\t});\n\
+             \t\trequest.once(\"end\", () => resolve(Buffer.concat(chunks, total)));\n\
+             \t});\n\
+             \treturn request.__vilan_body;\n\
+             }"
+        }
+        // M164's keep-alive rule: an UNREAD body the connection should not drain
+        // — declared over the cap, or chunked (no length to bound the drain by).
+        // A body within the cap is left to node, which discards it and keeps the
+        // connection; `request.complete` is a body that already arrived whole.
+        "__http_body_left_unread" => {
+            "function __http_body_left_unread(request, limit) {\n\
+             \tif (request.__vilan_body !== undefined || request.complete) return false;\n\
+             \tconst declared = request.headers[\"content-length\"];\n\
+             \tconst leaves = declared === undefined\n\
+             \t\t? request.headers[\"transfer-encoding\"] !== undefined\n\
+             \t\t: Number(declared) > limit;\n\
+             \tif (leaves) __http_linger(request);\n\
+             \treturn leaves;\n\
+             }"
+        }
+        // M164: a connection closing with body bytes possibly still on the
+        // wire half-closes and waits 500 ms before it is destroyed, reading
+        // nothing more. Node destroys a `Connection: close` socket the moment
+        // the answer is flushed (`destroySoon`), and destroying a socket with
+        // unread bytes in it sends a RESET, which can reach the client before it
+        // has read its `413` or `401` — so `destroySoon` is this socket's own
+        // half-close-and-wait (Go's `rstAvoidanceDelay`; the native server's
+        // `LINGER` is the same wait). And node DISCARDS an unread request body
+        // after the answer (`_dump`) by reading it to its end, which for a
+        // refused upload is the whole upload's bandwidth: marking the request
+        // already dumped keeps the socket paused, so the client's writes stall.
+        // `_dumped` is node's own flag; were it renamed, node would read and
+        // discard again, which is slower and still correct.
+        "__http_linger" => {
+            "function __http_linger(request) {\n\
+             \tconst socket = request.socket;\n\
+             \tif (!socket || socket.__vilan_linger) return;\n\
+             \tsocket.__vilan_linger = true;\n\
+             \trequest._dumped = true;\n\
+             \tsocket.destroySoon = function () {\n\
+             \t\tthis.pause();\n\
+             \t\tthis.end();\n\
+             \t\tconst timer = setTimeout(() => this.destroy(), 500);\n\
+             \t\tif (timer.unref) timer.unref();\n\
+             \t};\n\
+             }"
+        }
+        // M164: one request's answer, with a CANCELLATION ended quietly — node
+        // ignores the promise a `createServer` callback returns, so a refused
+        // body's `AbortError` would otherwise be an unhandled rejection, which
+        // ends the process. Any other failure is rethrown, unchanged.
+        "__http_respond" => {
+            "async function __http_respond(body) {\n\
+             \ttry {\n\
+             \t\tawait body();\n\
+             \t} catch (error) {\n\
+             \t\tif (!error || error.name !== \"AbortError\") throw error;\n\
+             \t}\n\
              }"
         }
         "__local_get" => {
