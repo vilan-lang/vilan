@@ -21,17 +21,18 @@
 // scope, so before A106 such a file imported one name per token it used (kolt's
 // `styles.vl:54/103` imported nine, per function).
 //
-// THE SURFACE IS THE 46 NAMES BELOW (A117): the 38 one-line functions and the 8
-// types the import above brings in. `export *;` re-exports what a module BINDS, an
-// aliased import included, so the aliases this file needs on the way in —
-// `open_style`, `scale_step`, `value_piece`, `custom_property` and seventeen
-// `*_condition` spellings — used to resolve from outside as 21 more exports nobody
-// designed, which is a vocabulary with two spellings for everything and A106 door
-// 2's largest objection. They now live INSIDE the one body each is for: a
-// function-scoped import binds in the function's scope and nothing reaches it from
-// another module, which is the whole mechanism. The aliases exist at all because
-// the free name and the local one collide — `hover()` here is the condition and
-// `style::hover` is what it calls — and that is why they cannot simply be dropped.
+// THE SURFACE IS THE 47 NAMES BELOW (A117; `dp` the 47th, A178): the 39 one-line
+// functions and the 8 types the import above brings in. `export *;` re-exports what
+// a module BINDS, an aliased import included, so the aliases this file needs on the
+// way in — `open_style`, `scale_step`, `value_piece`, `custom_property` and
+// seventeen `*_condition` spellings — used to resolve from outside as 21 more
+// exports nobody designed, which is a vocabulary with two spellings for everything
+// and A106 door 2's largest objection. They now live INSIDE the one body each is
+// for: a function-scoped import binds in the function's scope and nothing reaches
+// it from another module, which is the whole mechanism. The aliases exist at all
+// because the free name and the local one collide — `hover()` here is the condition
+// and `style::hover` is what it calls — and that is why they cannot simply be
+// dropped.
 //
 // The keyword-property TYPES ride along for that reason (A106): a chain reads
 // `.cursor(Cursor::Pointer)` whether it is inside a hole or not, so `Cursor`,
@@ -60,6 +61,12 @@ import pkg::web::style::{
 export *;
 
 // --- lengths ------------------------------------------------------------------
+
+/// Design pixels — `dp(8)` is 8px at the root size, 1/16 rem; the property that
+/// receives it writes it in rem (spacing, sizing) or px (a border width).
+fun dp(value: f64): Length {
+	Length::dp(value)
+}
 
 fun rem(value: f64): Length {
 	Length::rem(value)

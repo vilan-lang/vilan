@@ -1,0 +1,42 @@
+// A178 S1 + S2: a `Length` is data (proposal/length.md §3). Its operators,
+// conversions and comparisons run at run time as well as in a `const` (a
+// `style_var` value is a runtime `Length::px(width).css_text()`), so the
+// `Unit` enum, the four operator impls and the comparison impls compile on
+// both backends and answer the same bytes.
+import std::io::print;
+import std::web::style::{ CssValue, Length, Role, Unit, space };
+
+fun show(label: str, length: Length) {
+	print(i"{label}: {length.css_text()} [{length.css_root().replace("\n", " | ")}]");
+}
+
+fun main() {
+	show("px", Length::px(8));
+	show("rem", Length::rem(6 / 16));
+	show("pct", Length::pct(50));
+	show("zero", Length::zero());
+	show("same unit", Length::rem(1) + Length::rem(0.5));
+	show("dp + rem", Length::rem(0.5) + Length::px(1).as_dp());
+	show("px + dp", Length::px(8) + Length::px(1).as_dp());
+	show("px + rem", Length::px(8) + Length::rem(0.5));
+	show("token * 2", space(4) * 2);
+	show("token + px", space(4) + Length::px(1));
+	show("calc * 2", (space(4) + Length::px(1)) * 2);
+	show("two tokens", space(4) - (space(2) + space(4)));
+	show("scaled", Length::px(8) * 1.5);
+	show("halved", Length::px(8) / 2);
+	show("em + pct", Length::em(1) + Length::pct(50));
+	show("zero - token", Length::zero() - space(1));
+	show("as_rem", Length::px(8).as_rem());
+	show("as_px", Length::rem(1).as_px());
+	let dp = Length::rem(0.5).as_dp();
+	print(i"as_dp: {dp.value} {dp.unit is Unit::Dp}");
+	print(i"{Length::px(8) < Length::rem(1)} {Length::rem(1) >= Length::px(16)} {Length::em(2) > Length::em(1)}");
+	print(i"{Length::px(16) == Length::px(16)} {Length::px(16) == Length::rem(1)} {space(4) == space(4)}");
+	show("dp", Length::dp(6));
+	show("dp + dp", Length::dp(8) + Length::dp(4));
+	show("rem + dp", Length::rem(0.5) + Length::dp(1));
+	print(i"dp roles: {Length::dp(1).rendered(Role::Px)} {Length::dp(1).rendered(Role::Rem)} {Length::px(1).rendered(Role::Rem)}");
+}
+
+main();

@@ -7260,15 +7260,18 @@ fn e142_an_aliased_import_resolves_to_the_item_it_renames() {
 // set, a re-export — answered "cannot find `rem` in the imported path". Both
 // rows read a type's self-less functions now, keyed by the module whose file
 // writes the `impl` block, so the enum shape and the struct shape are one rule.
+// (The rows read what a length RENDERS, `css_text()`: since A178 S1 a unit
+// length is its number and unit, and its `text` field is empty.)
 
 #[test]
 fn b317_a_types_static_imports_under_its_bare_name() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::web::style::CssValue;
         import std::web::style::Length::rem;
         fun main() {
-            print(rem(2f).text);
+            print(rem(2f).css_text());
         }
         "#,
         "2rem\n",
@@ -7283,10 +7286,11 @@ fn b317_a_brace_set_of_statics_imports_and_aliases() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::web::style::CssValue;
         import std::web::style::Length::{ px, auto as automatic };
         fun main() {
-            print(px(4f).text);
-            print(automatic().text);
+            print(px(4f).css_text());
+            print(automatic().css_text());
         }
         "#,
         "4px\nauto\n",
@@ -7301,12 +7305,13 @@ fn b317_use_binds_a_static_out_of_a_visible_type() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::web::style::CssValue;
         import std::web::style::Length;
         use Length::em;
         use Length::{ pct as percent };
         fun main() {
-            print(em(1f).text);
-            print(percent(50f).text);
+            print(em(1f).css_text());
+            print(percent(50f).css_text());
         }
         "#,
         "1em\n50%\n",
