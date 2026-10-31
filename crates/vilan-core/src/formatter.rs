@@ -9543,7 +9543,7 @@ impl<'src> Printer<'src> {
         self.print_operand(&if_.condition, 0);
         if then_word.is_some() {
             self.then_form_joint(broken, "then ");
-            self.print_expr(Self::then_form_branch(&if_.then.0));
+            self.print_then_form_arm(Self::then_form_branch(&if_.then.0), broken);
         }
         if let Some((branch, _)) = &if_.else_ {
             self.then_form_joint(broken, "else ");
@@ -9563,13 +9563,40 @@ impl<'src> Printer<'src> {
                         {
                             self.print_then_form_parts(inner, true)
                         }
-                        _ => self.print_expr(body),
+                        _ => self.print_then_form_arm(body, broken),
                     }
                 }
                 // The parser never chains a `then` form through an `if`
                 // branch; printed as the chain it would be, all the same.
                 NodeIfBranch::If(_) => self.print_if_chain(branch, false, Split::Off),
             }
+        }
+    }
+
+    /// One `then`/`else` arm. Inline (`c then a else b` on one line) the arm is
+    /// part of the line the form was measured on and takes no permission of
+    /// its own. In the BROKEN form every arm opens a line of its own (`then …`
+    /// or `else …`, one level in), and that line is measured like a statement's
+    /// (E352): printed inline first, and over budget - the `;` that follows the
+    /// last arm counted, as the statement hook counts it (E329) - printed again
+    /// with the split armed, so a chain there breaks one link per line, a list
+    /// literal one element per line and a call its arguments, exactly as they
+    /// do as a statement's value. Before this the arm was printed with the
+    /// permission dropped, and a chain under `else` stayed one line at any
+    /// width.
+    fn print_then_form_arm(&mut self, arm: &Spanned<Node<'src>>, broken: bool) {
+        if !broken || self.probing {
+            self.print_expr(arm);
+            return;
+        }
+        let start = self.out.len();
+        let cursor = self.cursor;
+        self.print_expr(arm);
+        if self.first_line_over_budget_by(start, self.terminator_after(arm)) {
+            self.out.truncate(start);
+            self.cursor = cursor;
+            self.split = Split::Tail;
+            self.print_expr(arm);
         }
     }
 
@@ -19502,6 +19529,163 @@ mod call_statement_terminator {
             "a".repeat(100)
         );
         assert_construct(&source, &source);
+    }
+}
+
+#[cfg(test)]
+mod then_form_arm_layout {
+    //! E352: an arm of a BROKEN `then … else` form opens a line of its own
+    //! (`then …` / `else …`, one level in), and that line is measured like a
+    //! statement's: a chain there breaks one link per line, a list literal one
+    //! element per line and a call its arguments, at the width they break at
+    //! as a statement's value - the `;` after the last arm counted (E329).
+    //! The arm used to print with the permission dropped, so kolt's
+    //! `facts.private then … else db.prepare(..).all(..).map(..)` came out on
+    //! one 170-column line at any width. Every case runs through
+    //! `assert_construct`: token round trip, idempotence, the canonical form's
+    //! own round trip.
+    use super::bailing_constructs::assert_construct;
+
+    /// The item's repro, as written by hand: already canonical.
+    const REPRO: &str = concat!(
+        "fun main() {\n",
+        "\tlet private = true;\n",
+        "\tlet readers = private\n",
+        "\t\tthen [Row { name = \"only the members\" }]\n",
+        "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")\n",
+        "\t\t\t.filter(|row| row.name.len() > 0)\n",
+        "\t\t\t.map(|row| Row { name = row.name.to_uppercase() });\n",
+        "\tprint(readers.len());\n",
+        "}\n",
+    );
+
+    #[test]
+    fn the_repro_keeps_its_else_chain_one_link_per_line() {
+        assert_construct(REPRO, REPRO);
+    }
+
+    /// The 0.53.0 output - the `else` arm joined onto one 161-column line -
+    /// breaks back into the written shape.
+    #[test]
+    fn the_joined_else_chain_breaks_one_link_per_line() {
+        let joined = concat!(
+            "fun main() {\n",
+            "\tlet private = true;\n",
+            "\tlet readers = private\n",
+            "\t\tthen [Row { name = \"only the members\" }]\n",
+            "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+            ".filter(|row| row.name.len() > 0).map(|row| Row { name = row.name.to_uppercase() });\n",
+            "\tprint(readers.len());\n",
+            "}\n",
+        );
+        assert_construct(joined, REPRO);
+    }
+
+    #[test]
+    fn a_then_arm_chain_breaks_one_link_per_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet a = private then rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+            ".filter(|row| row.name.len() > 0).map(|row| row.name) else [];\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet a = private\n",
+            "\t\tthen rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")\n",
+            "\t\t\t.filter(|row| row.name.len() > 0)\n",
+            "\t\t\t.map(|row| row.name)\n",
+            "\t\telse [];\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    #[test]
+    fn an_else_arm_list_literal_breaks_one_element_per_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet b = private then [] else [first_element_of_the_list, second_element_of_the_list, ",
+            "third_element_of_the_list, fourth];\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet b = private\n",
+            "\t\tthen []\n",
+            "\t\telse [\n",
+            "\t\t\tfirst_element_of_the_list,\n",
+            "\t\t\tsecond_element_of_the_list,\n",
+            "\t\t\tthird_element_of_the_list,\n",
+            "\t\t\tfourth,\n",
+            "\t\t];\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// `\t\telse CALLEE(argument_one, argument_two, aaa..);` whose line is
+    /// `columns` wide, the `;` included: `(inline form, split form)`.
+    fn call_arm(columns: usize) -> (String, String) {
+        const CALLEE: &str = "plain_function_call_with_no_chain";
+        let fixed = 8 + "else ".len() + CALLEE.len() + "(argument_one, argument_two, );".len();
+        let last = "a".repeat(columns - fixed);
+        let head = "fun main() {\n\tlet value = flag\n\t\tthen []\n";
+        (
+            format!("{head}\t\telse {CALLEE}(argument_one, argument_two, {last});\n}}\n"),
+            format!(
+                "{head}\t\telse {CALLEE}(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{last},\n\t\t);\n}}\n"
+            ),
+        )
+    }
+
+    #[test]
+    fn an_else_arm_call_at_the_budget_with_its_semicolon_stays_inline() {
+        let (inline, _) = call_arm(100);
+        assert_construct(&inline, &inline);
+    }
+
+    #[test]
+    fn an_else_arm_call_one_column_over_with_its_semicolon_breaks_its_arguments() {
+        let (inline, split) = call_arm(101);
+        assert_construct(&inline, &split);
+    }
+
+    /// A block's tail has no `;`: the arm's own line is all that is measured.
+    #[test]
+    fn a_tail_then_form_breaks_its_else_chain_too() {
+        let source = concat!(
+            "fun tail(): List<str> {\n",
+            "\tprivate then [] else rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+            ".filter(|row| row.name.len() > 0).map(|row| row.name)\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun tail(): List<str> {\n",
+            "\tprivate\n",
+            "\t\tthen []\n",
+            "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")\n",
+            "\t\t\t.filter(|row| row.name.len() > 0)\n",
+            "\t\t\t.map(|row| row.name)\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// Short arms: a form that fits stays on one line, and a broken form's
+    /// short arms - here a short chain under `else` - stay on theirs.
+    #[test]
+    fn short_arms_stay_on_one_line() {
+        let fits = "fun main() {\n\tlet e = private then rows.first() else rows.filter(|r| r).last();\n}\n";
+        assert_construct(fits, fits);
+        let broken = concat!(
+            "fun main() {\n",
+            "\tlet readers = private_and_a_rather_long_condition_name_that_fills_the_line_up\n",
+            "\t\tthen rows.first()\n",
+            "\t\telse rows.filter(|r| r).last();\n",
+            "}\n",
+        );
+        assert_construct(broken, broken);
     }
 }
 
