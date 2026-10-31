@@ -943,9 +943,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "pin-project-lite",
  "tokio-macros",
@@ -1164,7 +1164,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vilan-cli"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "ariadne",
  "clap",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "vilan-core"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "indexmap",
  "serde",
@@ -1192,18 +1192,18 @@ dependencies = [
 
 [[package]]
 name = "vilan-embedded"
-version = "0.52.0"
+version = "0.53.0"
 
 [[package]]
 name = "vilan-ide"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "vilan-core",
 ]
 
 [[package]]
 name = "vilan-lsp"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "dashmap 6.2.1",
  "libc",
@@ -1218,11 +1218,11 @@ dependencies = [
 
 [[package]]
 name = "vilan-rt"
-version = "0.52.0"
+version = "0.53.0"
 
 [[package]]
 name = "vilan-rt-crypto"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "getrandom",
  "vilan-rt",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "vilan-rt-signal"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "ctrlc",
  "vilan-rt",
@@ -1238,22 +1238,31 @@ dependencies = [
 
 [[package]]
 name = "vilan-rt-sqlite"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "rusqlite",
  "vilan-rt",
 ]
 
 [[package]]
+name = "vilan-rt-term"
+version = "0.53.0"
+dependencies = [
+ "libc",
+ "vilan-rt",
+ "windows-sys",
+]
+
+[[package]]
 name = "vilan-rust"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "vilan-core",
 ]
 
 [[package]]
 name = "vilan-wasm"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "vilan-core",
  "vilan-embedded",

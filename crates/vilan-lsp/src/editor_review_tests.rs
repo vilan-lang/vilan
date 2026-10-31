@@ -2086,6 +2086,56 @@ fn e328_a_generic_payload_variant_hovers_with_its_instantiated_payload() {
     });
 }
 
+/// E333: a generic enum's variant as a LIST or TUPLE element, or as a method
+/// receiver, has no expected type, binding or parameter to read - the
+/// container's recorded type (the list's or tuple's `expr_types` row) and the
+/// member call's subject type are what settle it: `[Some(1), None]` hovers
+/// `Option<i32>::Some(i32)` and `Option<i32>::None`, `(Some("a"), 2)` its
+/// element of the tuple, `Some(4).map(..)` and `Ok(5).map(..)` the receiver's
+/// own instantiation.
+#[test]
+fn e333_a_variant_in_a_container_or_as_a_receiver_hovers_with_its_instantiation() {
+    on_big_stack(|| {
+        let client = "fun main() {\n\
+             \tlet listed = [Some(1), None];\n\
+             \tlet results: List<Result<i32, str>> = [Ok(2), Err(\"bad\")];\n\
+             \tlet pair = (Some(\"a\"), 2);\n\
+             \tlet mixed: (Result<f64, bool>, Option<i32>) = (Ok(3.5), None);\n\
+             \tlet _ = (listed, results, pair, mixed);\n\
+             \tlet _ = Some(4).unwrap_or(0);\n\
+             \tlet _ = None.unwrap_or(7);\n\
+             \tlet _ = Ok(5).unwrap_or_else(|text: str| 0);\n\
+             \tlet _ = Err(\"six\").unwrap_or_else(|text: str| 1);\n}\n";
+        let package = Package::new("e333", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let first_line = |needle: &str| {
+            let hover = document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover.lines().nth(1).unwrap_or_default().to_string()
+        };
+        // A list's elements, annotated or inferred.
+        assert_eq!(first_line("Some(1), None"), "Option<i32>::Some(i32)");
+        assert_eq!(first_line("None];"), "Option<i32>::None");
+        assert_eq!(first_line("Ok(2)"), "Result<i32, str>::Ok(i32)");
+        assert_eq!(first_line("Err(\"bad\")"), "Result<i32, str>::Err(str)");
+        // A tuple's.
+        assert_eq!(first_line("Some(\"a\")"), "Option<str>::Some(str)");
+        assert_eq!(first_line("Ok(3.5)"), "Result<f64, bool>::Ok(f64)");
+        assert_eq!(first_line("None);"), "Option<i32>::None");
+        // A receiver: the instantiation the member call's `self` meets.
+        assert_eq!(first_line("Some(4)"), "Option<i32>::Some(i32)");
+        assert_eq!(first_line("None.unwrap_or"), "Option<i32>::None");
+        assert_eq!(first_line("Ok(5)"), "Result<i32, str>::Ok(i32)");
+        assert_eq!(first_line("Err(\"six\")"), "Result<i32, str>::Err(str)");
+    });
+}
+
 /// E322: an element's links are told from the reader's by the desugar's own
 /// marks (`element_head_links`, B620) and its scaffolding, not by scanning the
 /// text for a `>` and a `.`: `title(<b />)` ends in a `>` and the head link

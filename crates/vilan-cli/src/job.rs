@@ -8,6 +8,15 @@
 //! group and dies with the session). Nothing here adds unix behavior — the
 //! wrapper is a transparent newtype and the pins say so.
 //!
+//! A plain `vilan run` (not `--watch`) is the one wait that is not a restart
+//! round's: [`run_to_end`] spawns the program, waits for it, and on unix
+//! forwards a `SIGTERM`, `SIGHUP` or `SIGINT` the CLI is sent to it (E335) - a
+//! supervisor, an editor task or a harness that stops `vilan run` stops the
+//! program with it, and the program's own death by a signal is what the run
+//! then reports (128 + the signal, as a shell does). The `--watch` rounds keep
+//! their own path (`ManagedChild::kill` on a restart) and no child registered
+//! there, so an interrupt in a watch session behaves as it always did.
+//!
 //! Windows has no such group. `Child::kill` is `TerminateProcess` on the direct
 //! `node.exe` **only**, so a dev server that forked a worker keeps the port and
 //! the next round fails to bind; and if the CLI itself dies (crash, taskkill,
@@ -74,6 +83,222 @@ impl ManagedChild {
         self.child.wait()
     }
 }
+
+/// Spawns the program a plain `vilan run` executes, waits for it to end and
+/// answers its status. `spawn` runs under the forwarding registry's lock
+/// (unix), so a signal that arrives while the child is being started is
+/// forwarded to it once it exists rather than answered by the interrupt hook
+/// that would leave it behind.
+#[cfg(unix)]
+pub fn run_to_end(
+    spawn: impl FnOnce() -> std::io::Result<ManagedChild>,
+) -> std::io::Result<ExitStatus> {
+    let mut child = {
+        let mut registered = forward::registry();
+        let child = spawn()?;
+        *registered = Some(child.child.id() as libc::pid_t);
+        child
+    };
+    forward::wait_unreaped(child.child.id() as libc::pid_t);
+    // Off the registry BEFORE the reaping `wait`: once the child is reaped its
+    // pid may be reused, and a late forwarded signal must not find it.
+    *forward::registry() = None;
+    child.wait()
+}
+
+/// The non-unix form: the Job object [`ManagedChild::adopt`] assigns is the
+/// forwarding (the CLI's death takes the tree).
+#[cfg(not(unix))]
+pub fn run_to_end(
+    spawn: impl FnOnce() -> std::io::Result<ManagedChild>,
+) -> std::io::Result<ExitStatus> {
+    spawn()?.wait()
+}
+
+/// What a signal-ended child reports as an exit code: 128 + the signal's
+/// number, as a shell does. `None` for a normal exit (or off unix).
+#[cfg(unix)]
+pub fn signal_exit_code(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| 128 + signal)
+}
+
+#[cfg(not(unix))]
+pub fn signal_exit_code(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+/// The unix signal pipeline (E335): `SIGINT`, `SIGTERM` and `SIGHUP` are caught
+/// by a handler that only writes the signal's number to a pipe (the one thing a
+/// handler may do), and a thread reads the pipe and either forwards the signal
+/// to the child a plain run has registered or - with none registered, as in a
+/// compile or a watch session - hands it to the interrupt hook, which removes
+/// the temp script and exits 130, as it did when `ctrlc` installed the handler
+/// (`ctrlc` hands its closure no signal number, which forwarding needs).
+#[cfg(unix)]
+mod forward {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::{Mutex, MutexGuard, Once, PoisonError};
+
+    /// The child a plain `vilan run` is waiting on (`None` outside one).
+    static CHILD: Mutex<Option<libc::pid_t>> = Mutex::new(None);
+
+    /// The pipe's write end the handler writes to (-1 before [`install`]).
+    static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+    pub fn registry() -> MutexGuard<'static, Option<libc::pid_t>> {
+        CHILD.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Blocks until the child has exited WITHOUT reaping it (`WNOWAIT`), so the
+    /// pid stays this process's own until the caller has left the registry.
+    /// Any failure returns at once; the caller's `wait` is the authority.
+    pub fn wait_unreaped(pid: libc::pid_t) {
+        loop {
+            // SAFETY: `siginfo_t` is plain data (zeroed is a valid value) and
+            // the pointer is to a live local of that type.
+            let waited = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if waited == 0 {
+                return;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return;
+            }
+        }
+    }
+
+    /// The handler: one two-byte message, the signal's number and whether the
+    /// kernel raised it (a terminal's `Ctrl-C`, which the whole foreground
+    /// group - the child included - has already received).
+    extern "C" fn on_signal(
+        signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        _context: *mut libc::c_void,
+    ) {
+        // SAFETY: the kernel passes a valid `siginfo_t` for an `SA_SIGINFO`
+        // handler; `write` is async-signal-safe and `errno` is restored.
+        unsafe {
+            let saved = *errno_location();
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let from_kernel = !info.is_null() && (*info).si_code == libc::SI_KERNEL;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let from_kernel = {
+                let _ = info;
+                false
+            };
+            let message = [signal as u8, from_kernel as u8];
+            let fd = PIPE_WRITE.load(Ordering::Relaxed);
+            if fd >= 0 {
+                libc::write(fd, message.as_ptr().cast(), message.len());
+            }
+            *errno_location() = saved;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__errno_location() }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__error() }
+    }
+
+    /// Installs the handlers once; `unclaimed(signal)` runs on the reader
+    /// thread for a signal that arrives with no child to forward it to. Best
+    /// effort, as the `ctrlc` install it replaces was: a run is not worth
+    /// failing over a handler the OS refused.
+    pub fn install(unclaimed: fn(i32)) {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` is a two-int array, as `pipe` wants.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return;
+            }
+            for fd in fds {
+                // SAFETY: the two descriptors were just created and are ours.
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+            // SAFETY: as above; the handler must never block.
+            unsafe {
+                let flags = libc::fcntl(fds[1], libc::F_GETFL);
+                libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            PIPE_WRITE.store(fds[1], Ordering::Relaxed);
+            let read_end = fds[0];
+            let spawned = std::thread::Builder::new()
+                .name("vilan-signals".to_string())
+                .spawn(move || reader(read_end, unclaimed));
+            if spawned.is_err() {
+                return;
+            }
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                // SAFETY: a zeroed `sigaction` is a valid starting value; the
+                // handler is an `extern "C"` function of the `SA_SIGINFO`
+                // shape.
+                unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = on_signal as *const () as usize;
+                    action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    libc::sigaction(signal, &action, std::ptr::null_mut());
+                }
+            }
+        });
+    }
+
+    /// The reader thread: forwards each signal to the registered child, or
+    /// hands it to `unclaimed` when there is none.
+    fn reader(read_end: libc::c_int, unclaimed: fn(i32)) {
+        let mut message = [0u8; 2];
+        loop {
+            // SAFETY: reads into a live two-byte buffer.
+            let read = unsafe { libc::read(read_end, message.as_mut_ptr().cast(), 2) };
+            if read == 2 {
+                let signal = i32::from(message[0]);
+                let from_kernel = message[1] != 0;
+                // The registry stays locked across the `kill`: the run clears
+                // it before it reaps the child, so the pid is still ours here.
+                let guard = registry();
+                match *guard {
+                    // A terminal's `Ctrl-C` reached the child with the rest of
+                    // the foreground group: delivering it again would run a
+                    // program's SIGINT handler twice.
+                    Some(_) if signal == libc::SIGINT && from_kernel => {}
+                    Some(pid) => {
+                        // SAFETY: a plain `kill` on the unreaped child.
+                        let _ = unsafe { libc::kill(pid, signal) };
+                    }
+                    None => {
+                        drop(guard);
+                        unclaimed(signal);
+                    }
+                }
+            } else if read < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            } else {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+pub use forward::install as install_signal_forwarding;
 
 #[cfg(windows)]
 mod windows {

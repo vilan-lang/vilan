@@ -143,6 +143,9 @@ pub struct OptionalCrates {
     /// A server's graceful stop on a termination signal — `vilan-rt-signal`
     /// (`ctrlc`; F45, Order 43's R-i). Reached by starting an HTTP server.
     pub signal: bool,
+    /// `process::keys()`'s terminal mode — `vilan-rt-term` (`libc` /
+    /// `windows-sys`; A173 S2). Reached by `keys()` and `Keys`'s `Drop`.
+    pub term: bool,
 }
 
 impl OptionalCrates {
@@ -157,6 +160,9 @@ impl OptionalCrates {
         }
         if self.signal {
             names.push("vilan-rt-signal");
+        }
+        if self.term {
+            names.push("vilan-rt-term");
         }
         names
     }
@@ -524,6 +530,10 @@ struct Emitter<'a, 'src> {
     /// handler that stops its servers gracefully. Set where `createServer` is
     /// lowered, the one door every server passes through.
     reaches_signal: bool,
+    /// Whether this program reaches `process::keys()` and so links
+    /// `vilan-rt-term` (A173 S2) for raw mode. Set where `__term_enter` and
+    /// `__term_leave` are lowered — the two doors the terminal mode has.
+    reaches_term: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -758,6 +768,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_sqlite: false,
             reaches_crypto: false,
             reaches_signal: false,
+            reaches_term: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -848,6 +859,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 sqlite: self.reaches_sqlite,
                 crypto: self.reaches_crypto,
                 signal: self.reaches_signal,
+                term: self.reaches_term,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -10430,6 +10442,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "vilan_rt::process::stdin_line({})",
                 self.value_argument(argument_ids, 0, depth)?
             ),
+            // A173 S2: the byte read behind `process::Keys`, on the same
+            // shared pump and carrying the signal the same way.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__stdin_bytes",
+            } => format!(
+                "vilan_rt::process::stdin_bytes({}, {})",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
             ExternBinding::Function {
                 module: None,
                 symbol: "__nursery_new",
@@ -10453,6 +10475,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // closure it invokes: `await body()` there is `body.await` here, and
             // a `Pin<Box<dyn Future>>` is what lets the join hold it across the
             // drain without the emitted source ever naming `Pin`.
+            // M165: `std::rpc`'s `guarded_async` — the body as a future, as the
+            // join takes it; `Catch` at every poll is the native `try`/`catch`.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__guarded_async",
+            } => format!(
+                "vilan_rt::executor::guarded_async({})",
+                self.pinned_body_argument(argument_ids, 0, depth, span)?
+            ),
             ExternBinding::Function {
                 module: None,
                 symbol: "__nursery_run",
@@ -10597,6 +10628,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         binding: Option<&ExternBinding<'src>>,
         argument_ids: &[Id],
         depth: usize,
+        span: Span,
     ) -> Result<Option<String>, Error> {
         let Some(binding) = binding else {
             return Ok(None);
@@ -10629,21 +10661,46 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.reaches_signal = true;
                 return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
             }
-            // The two body reads CONSUME the request handle, and the callback
-            // reads the same handle again afterwards — `std::http`'s own
-            // `Server::start` awaits the body and then builds
-            // `Request { node = node_request, .. }` out of it. A handle is
+            // M164: `std::http`'s lazy body. The read CONSUMES the two handles,
+            // and the request is read again afterwards (`Request::bytes` may be
+            // called twice, and `std::http`'s `answer` asks
+            // `__http_body_left_unread` of the same handle). A handle is
             // RETAINED per use, exactly as J6 retains a `Task` read out of a
             // binding: `clone_sites` marks nothing, because on the JS backend a
             // handle is a class instance that `__clone` passes through.
             ExternBinding::Function {
-                module: Some("node:stream/consumers"),
-                symbol: "buffer",
+                module: None,
+                symbol: "__http_read_body",
             } => {
                 let request = self.place_argument(argument_ids, 0, depth)?;
+                let response = self.place_argument(argument_ids, 1, depth)?;
+                let limit = self.value_argument(argument_ids, 2, depth)?;
                 return Ok(Some(format!(
-                    "vilan_rt::http::read_request_bytes(({request}).clone())"
+                    "vilan_rt::http::read_body(({request}).clone(), ({response}).clone(), {limit})"
                 )));
+            }
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_body_left_unread",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let limit = self.value_argument(argument_ids, 1, depth)?;
+                return Ok(Some(format!("({request}).body_left_unread({limit})")));
+            }
+            // M164: one request's answer. The JS helper exists to keep a
+            // cancellation from reaching node unhandled; here the callback is
+            // already a spawned task, where a cancellation settles quietly, so
+            // the call IS the body's future (the call site awaits it).
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_respond",
+            } => {
+                return Ok(Some(self.pinned_body_argument(
+                    argument_ids,
+                    0,
+                    depth,
+                    span,
+                )?));
             }
             // `new TextDecoder()` / `new TextEncoder()` — both stateless for
             // the one encoding vilan has.
@@ -10668,15 +10725,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 module: None,
                 symbol: "TextEncoder",
             } => return Ok(Some("vilan_rt::bytes::TextEncoder".to_string())),
-            ExternBinding::Function {
-                module: Some("node:stream/consumers"),
-                symbol: "text",
-            } => {
-                let request = self.place_argument(argument_ids, 0, depth)?;
-                return Ok(Some(format!(
-                    "vilan_rt::http::read_request_text(({request}).clone())"
-                )));
-            }
             _ => {}
         }
         let Some(receiver) = self.host_receiver_type(target) else {
@@ -10689,6 +10737,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.place_argument(argument_ids, 0, depth)?,
                 self.value_argument(argument_ids, 1, depth)?,
                 self.value_argument(argument_ids, 2, depth)?
+            ),
+            // M168: `listen(port, host, cb)` — `ServerBuilder::host`'s bind.
+            ("NodeServer", "listen_on") => format!(
+                "({}).listen_on({}, &{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
             ),
             ("NodeServer", "address") => {
                 format!(
@@ -11480,7 +11536,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(Some(rendered));
         }
         // F18: the HTTP surface has native bodies in `vilan_rt::http`.
-        if let Some(rendered) = self.http_host_binding(target, binding, argument_ids, depth)? {
+        if let Some(rendered) =
+            self.http_host_binding(target, binding, argument_ids, depth, span)?
+        {
             return Ok(Some(rendered));
         }
         // F18 slice 2: `std::json`'s host seams in `vilan_rt::json`, and
@@ -11693,6 +11751,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // boot. The three `RawStat` getters are receiver-keyed in
             // [`Emitter::http_host_binding`].
             (None, "__fs_stat", "raw_stat") => one(self, "fs::stat"),
+            // M168: `std::build`'s "beside the running module" probe. A native
+            // binary is not written into the build's output folder (it lives
+            // under `dist/native/<name>/target/`), so nothing is beside it to
+            // find: the empty answer sends `build_of` to the working folder,
+            // which is where a native server always looked.
+            (None, "__module_dir", "module_dir") => Ok(Some("vilan_rt::str_new(\"\")".to_string())),
             (None, "Date.now", "now_millis") => {
                 Ok(Some("vilan_rt::time::now_millis()".to_string()))
             }
@@ -11700,6 +11764,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `vilan_rt::process` (`env` and `args` are intrinsics, below).
             (None, "process.exit", "exit") => one(self, "process::exit"),
             (None, "process.cwd", "cwd") => Ok(Some("vilan_rt::process::cwd()".to_string())),
+            // A173 S2: `process::keys()`'s terminal mode is FFI, so it is
+            // `vilan-rt-term`'s, and naming it is what links that crate.
+            (None, "__term_enter", _) => {
+                self.reaches_term = true;
+                Ok(Some("vilan_rt_term::enter()".to_string()))
+            }
+            (None, "__term_leave", _) => {
+                self.reaches_term = true;
+                Ok(Some("vilan_rt_term::leave()".to_string()))
+            }
             // A173 S1 / E?5: `prompt`'s unterminated, flushed write.
             (None, "__stdout_write", _) => Ok(Some(format!(
                 "vilan_rt::process::stdout_write(&{})",
@@ -16429,12 +16503,10 @@ fn sanitize(name: &str) -> String {
 /// backend's two lines — and no program in the accepted corpus carried an
 /// escape, so the differential never saw it.
 ///
-/// The escape set is `unescape_string`'s, exactly: `\n`, `\t`, `\r`, `\"`,
-/// `\\`, `\0`, an unknown escape keeping BOTH characters (which is what makes
-/// the lexer's `RAW_BACKSLASH` doubling round-trip), and a CRLF folded to one
-/// `\n` (`windows-support.md` §2). It is reproduced rather than called because
-/// the function is private to `transformer.rs`; the lane's report asks for it to
-/// be shared.
+/// The escape set is `lexing::unescape_string`'s, exactly — the one decoder
+/// both backends call (B652: `\x41`, `\u{1F600}` and every other escape the
+/// lexer admits decode to one value; the rest are refused before code
+/// generation) — and a CRLF folded to one `\n` (`windows-support.md` §2).
 fn rust_string(text: &str) -> String {
     rust_literal(&unescape_string_value(text))
 }
@@ -16463,13 +16535,13 @@ fn rust_literal(value: &str) -> String {
 
 /// The VALUE of a vilan string literal's body.
 ///
-/// F26: `transformer::unescape_string` IS this function and is now `pub`, so
+/// F26: `lexing::unescape_string` IS this function and is `pub`, so
 /// the backend calls it rather than carrying a copy that drifts — a literal's
 /// value must be the same value on both backends, and two implementations of
 /// "what does `\\n` mean" is exactly the shape the differential can only catch
 /// after it has shipped.
 fn unescape_string_value(raw: &str) -> String {
-    vilan_core::transformer::unescape_string(raw).into_owned()
+    vilan_core::lexing::unescape_string(raw).into_owned()
 }
 
 fn describe(resolved: &Type) -> String {

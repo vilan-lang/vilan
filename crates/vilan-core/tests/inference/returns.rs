@@ -3328,6 +3328,108 @@ fn initializer_field_count_mismatch_is_unaffected_by_the_closest_name_scan() {
     );
 }
 
+// --- B653: a struct literal sets each field once ------------------------------
+//
+// `Pair { left = 1, left = 2 }` checked clean and the last value won; a slip
+// that meant another field dropped that field's value whenever the literal
+// still supplied every field. Refused at the second name, the first noted.
+
+const SET_TWICE: &str = "`left` is set twice in this `Pair` literal";
+
+#[test]
+fn b653_a_field_set_twice_is_refused_at_the_second_name() {
+    let source = r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let pair = Pair { left = 1, left = 2 };
+        }
+        "#;
+    assert_fails_spanning_nth(source, "left", 2, SET_TWICE);
+    // The note sits on the FIRST occurrence's name, in this file.
+    let first = source.find("left = 1").expect("the first occurrence");
+    let diagnostics = failure_diagnostics_with_notes(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _, note)| message.contains(SET_TWICE)
+                && note.as_ref().is_some_and(|(text, range, elsewhere)| text
+                    == "`left` is already set here"
+                    && *range == (first..first + "left".len())
+                    && !elsewhere)),
+        "{diagnostics:#?}"
+    );
+    assert_fails_once_with(source, "set twice");
+}
+
+#[test]
+fn b653_the_shorthand_form_is_refused_the_same() {
+    let source = r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let left = 5;
+        	let pair = Pair { left, left };
+        }
+        "#;
+    assert_fails_spanning_nth(source, "left", 3, SET_TWICE);
+    assert_fails_once_with(source, "set twice");
+}
+
+#[test]
+fn b653_a_repeat_beside_a_surplus_is_named_before_the_count() {
+    // The count message cannot name a field when the surplus IS a repeat
+    // (every name is a real field); the repeat is the cause and is reported
+    // alone.
+    let source = r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let pair = Pair { left = 1, right = 2, left = 3 };
+        }
+        "#;
+    assert_fails_once_with(source, SET_TWICE);
+    assert_fails_without(source, "expects 2 fields");
+}
+
+#[test]
+fn b653_a_qualified_or_generic_literal_and_two_distinct_fields_are_checked_alike() {
+    assert_fails_with(
+        r#"
+        struct Pair<T> {
+        	left: T,
+        	right: T,
+        }
+
+        fun main() {
+        	let pair = Pair<i32> { right = 1, right = 2 };
+        }
+        "#,
+        "`right` is set twice in this `Pair` literal",
+    );
+    assert_compiles(
+        r#"
+        struct Pair {
+        	left: i32,
+        	right: i32,
+        }
+
+        fun main() {
+        	let pair = Pair { right = 2, left = 1 };
+        }
+        "#,
+    );
+}
+
 // A missing import segment points at that segment, not the whole statement.
 #[test]
 fn import_segment_error_spans_the_segment() {
@@ -5939,5 +6041,59 @@ fn b537_a_statement_over_an_unbound_return_carries_the_steer_alone() {
     assert_fails_with(
         "import std::io::print;\n\nfun f(y: i32): i32 {\n\treturn (y);\n\tprint(y);\n}\n\nfun main() {\n\tprint(f(1));\n}\n",
         "this body ends without producing a value",
+    );
+}
+
+// --- B667: a self-call in a `match` leg of an unannotated function ----------
+
+/// B667: a function with no written return type that calls itself in a
+/// `match` leg resolves — the self-call's value IS the function's return, so
+/// the other legs decide it (`void` here), as an `if` always did. Pinned: the
+/// item's shape, a numeric return through a recursive leg, a nested `match`
+/// (kolt's `Panels::open`), and a method.
+#[test]
+fn b667_a_self_call_in_a_match_leg_resolves_from_the_other_legs() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun open(how: str) {\n",
+            "\tmatch how {\n",
+            "\t\t\"right\" => open(\"split\"),\n",
+            "\t\t_ => print(i\"open {how}\"),\n",
+            "\t}\n",
+            "}\n",
+            "fun count(n: i32) {\n",
+            "\tmatch n {\n",
+            "\t\t0 => 0,\n",
+            "\t\t_ => 1 + count(n - 1),\n",
+            "\t}\n",
+            "}\n",
+            "fun down(n: i32) {\n",
+            "\tmatch n {\n",
+            "\t\t0 => 100,\n",
+            "\t\t_ => down(n - 1),\n",
+            "\t}\n",
+            "}\n",
+            "struct Panels { side: Option<str> }\n",
+            "impl Panels {\n",
+            "\tfun open(self, how: str) {\n",
+            "\t\tmatch how {\n",
+            "\t\t\t\"right\" => match self.side {\n",
+            "\t\t\t\tSome(let at) => print(i\"beside {at}\"),\n",
+            "\t\t\t\tNone => self.open(\"split\"),\n",
+            "\t\t\t},\n",
+            "\t\t\t_ => print(i\"panel {how}\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\topen(\"right\");\n",
+            "\tlet three: i32 = count(3);\n",
+            "\tlet hundred: i32 = down(4);\n",
+            "\tprint(i\"{three} {hundred}\");\n",
+            "\tPanels { side = None }.open(\"right\");\n",
+            "\tPanels { side = Some(\"left\") }.open(\"right\");\n",
+            "}\n",
+        ),
+        "open split\n3 100\npanel split\nbeside left\n",
     );
 }

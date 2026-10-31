@@ -353,6 +353,21 @@ impl<T> Future for Catch<T> {
     }
 }
 
+/// `__guarded_async` — run `body` to its end, answering `Err(message)` if it
+/// panicked: `guarded`'s async twin, the shape `std::rpc`'s `guarded_async`
+/// names (M165: an `[rpc]` body that throws answers its call with the error).
+/// The JS helper is a `try`/`await`/`catch` returning `[0, value]` or
+/// `[1, message]`; natively [`Catch`] catches at every poll, as a task's own
+/// failure latch does. A cancellation is not the body's failure and keeps
+/// travelling.
+pub async fn guarded_async<T>(body: Boxed<T>) -> Result<T, Str> {
+    match Catch::new(body).await {
+        Ok(value) => Ok(value),
+        Err(Failure::Cancelled) => raise(Failure::Cancelled),
+        Err(Failure::Panic(message, _location)) => Err(message),
+    }
+}
+
 // ------------------------------------------------------------ nurseries ---
 
 /// A nursery's body — `__Nursery`'s fields, plus the two the JS version gets
@@ -1246,6 +1261,19 @@ pub trait IoSource {
     /// fired timer does.
     fn poll(&self) -> bool;
 
+    /// F146: when this is the ONLY live source, the loop asks it to WAIT for
+    /// work itself — at most `limit` (the next timer's deadline), or as long
+    /// as it takes with no timer — instead of sleeping [`IO_POLL_INTERVAL`]
+    /// between polls. `true` if it waited (whatever it received is the next
+    /// [`IoSource::poll`]'s to answer); `false`, the default, if it cannot
+    /// block, and the loop sleeps as before. Only a source whose work arrives
+    /// on a channel can say yes: nothing else can wake the loop while it
+    /// blocks, which is why a second live source turns this off.
+    fn block(&self, limit: Option<Duration>) -> bool {
+        let _ = limit;
+        false
+    }
+
     /// Whether this source can still produce work. A closed listener with no
     /// live connections answers `false`, is dropped from the registry, and the
     /// loop goes back to exiting when the deadline list empties.
@@ -1304,15 +1332,32 @@ fn advance_macrotasks() -> bool {
         // which is allowed to sleep and lets the program exit.
         return advance_timers();
     }
-    let wait = earliest_timer()
-        .map(|slot| slot.deadline.saturating_duration_since(Instant::now()))
-        .map_or(IO_POLL_INTERVAL, |remaining| {
-            remaining.min(IO_POLL_INTERVAL)
-        });
+    let remaining =
+        earliest_timer().map(|slot| slot.deadline.saturating_duration_since(Instant::now()));
+    // F146: a SOLE source that can block waits for its own work until the next
+    // deadline — stdin's reader, parked on a silent terminal or pipe, sleeps in
+    // the kernel rather than waking the loop a thousand times a second.
+    if remaining.is_none_or(|remaining| !remaining.is_zero())
+        && let Some(source) = sole_io_source()
+        && source.block(remaining)
+    {
+        return true;
+    }
+    let wait = remaining.map_or(IO_POLL_INTERVAL, |remaining| {
+        remaining.min(IO_POLL_INTERVAL)
+    });
     if !wait.is_zero() {
         std::thread::sleep(wait);
     }
     true
+}
+
+/// The registry's one source, when it holds exactly one (F146).
+fn sole_io_source() -> Option<Rc<dyn IoSource>> {
+    RUNTIME.with(|runtime| {
+        let io = runtime.io.borrow();
+        (io.len() == 1).then(|| Rc::clone(&io[0]))
+    })
 }
 
 /// `async <body>` — the spawn. Eager: the body runs to its first suspension
@@ -2161,5 +2206,82 @@ mod tests {
         enqueue(second_id);
         drain_microtasks();
         assert!(polled.get(), "the live handle must still wake its task");
+    }
+
+    // -- F146: a SOLE source that can block waits for its work itself --
+
+    /// A source that records the limit every `block` was asked for.
+    struct Recorder {
+        limits: Rc<RefCell<Vec<Option<Duration>>>>,
+        blocks: bool,
+    }
+
+    impl IoSource for Recorder {
+        fn poll(&self) -> bool {
+            false
+        }
+
+        fn block(&self, limit: Option<Duration>) -> bool {
+            self.limits.borrow_mut().push(limit);
+            self.blocks
+        }
+
+        fn is_live(&self) -> bool {
+            true
+        }
+    }
+
+    fn recorder(blocks: bool) -> (Rc<Recorder>, Rc<RefCell<Vec<Option<Duration>>>>) {
+        let limits = Rc::new(RefCell::new(Vec::new()));
+        let source = Rc::new(Recorder {
+            limits: Rc::clone(&limits),
+            blocks,
+        });
+        (source, limits)
+    }
+
+    #[test]
+    fn f146_a_sole_blocking_source_waits_until_the_next_timer_deadline() {
+        let _timer = register_timer(40, || {});
+        let (source, limits) = recorder(true);
+        register_io(source);
+        assert!(advance_macrotasks(), "a turn that waited is a turn");
+        let limits = limits.borrow();
+        assert_eq!(limits.len(), 1, "the sole source was asked to wait once");
+        let limit = limits[0].expect("a timer is due, so the wait is bounded by it");
+        assert!(
+            limit <= Duration::from_millis(40),
+            "the wait ends by the deadline: {limit:?}"
+        );
+    }
+
+    #[test]
+    fn f146_a_sole_blocking_source_with_no_timer_waits_unbounded() {
+        let (source, limits) = recorder(true);
+        register_io(source);
+        assert!(advance_macrotasks());
+        assert_eq!(*limits.borrow(), [None], "no deadline: as long as it takes");
+    }
+
+    #[test]
+    fn f146_two_live_sources_never_block_on_either() {
+        // Neither could wake the loop for the other's work, so the turn
+        // sleeps the poll interval as before.
+        let (first, first_limits) = recorder(true);
+        let (second, second_limits) = recorder(true);
+        register_io(first);
+        register_io(second);
+        assert!(advance_macrotasks());
+        assert!(first_limits.borrow().is_empty());
+        assert!(second_limits.borrow().is_empty());
+    }
+
+    #[test]
+    fn f146_a_source_that_cannot_block_keeps_the_poll_interval() {
+        // `block`'s default answer: the loop falls back to its sleep.
+        let (source, limits) = recorder(false);
+        register_io(source);
+        assert!(advance_macrotasks());
+        assert_eq!(limits.borrow().len(), 1, "asked once, declined");
     }
 }

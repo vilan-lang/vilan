@@ -853,7 +853,8 @@ fn b482_a_callback_value_typed_without_the_clause_is_refused_and_both_migrations
         "#;
     assert_fails_with(
         refused,
-        "a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause",
+        // B677: a closure PARAMETER is told its clause, the literal wrap last.
+        "`react` is a closure parameter; to run it under this context, type it `(|i32| void) context tracking`",
     );
     assert_compiles_and_runs(
         r#"
@@ -916,4 +917,37 @@ fn b482_a_track_in_a_ui_event_handler_is_refused() {
     // clause is only the signature's: the process leg compiles, and a fullstack
     // build is refused by its browser leg.
     assert_compiles(source);
+}
+
+// --- B670: a method on an operator's result over a closure parameter -------
+
+/// B670: `(value * 100.0).round()` under `scale.derive(|value| ..)` waits for
+/// `value` like `value.round()` does — the receiver's type is built from the
+/// closure parameter — instead of refusing "cannot call method 'round' on
+/// unknown". Pinned: the item's three (`a` and `c` always compiled), a
+/// subtraction and a unary minus, and a method on a method's result.
+#[test]
+fn b670_a_method_on_an_operators_result_over_a_closure_parameter_waits() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::reactive::{ MemoCell, Pipe, Signal, SignalCell, Source };\n",
+            "fun a(scale: SignalCell<f64>): MemoCell<f64> {\n",
+            "\tscale.derive(|value| value.round()).memo()\n",
+            "}\n",
+            "fun b(scale: SignalCell<f64>): MemoCell<f64> {\n",
+            "\tscale.derive(|value| (value * 100.0).round()).memo()\n",
+            "}\n",
+            "fun c(scale: SignalCell<f64>): MemoCell<str> {\n",
+            "\tscale.derive(|value| i\"{value.round()}\").memo()\n",
+            "}\n",
+            "fun d(scale: SignalCell<f64>): MemoCell<f64> {\n",
+            "\tscale.derive(|value| (-(value - 3.0)).abs().round()).memo()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet scale = SignalCell::new(2.456);\n",
+            "\tprint(i\"{a(scale).get()} {b(scale).get()} {c(scale).get()} {d(scale).get()}\");\n",
+            "}\n",
+        ),
+        "2 246 2 1\n",
+    );
 }

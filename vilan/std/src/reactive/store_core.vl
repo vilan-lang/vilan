@@ -103,7 +103,7 @@ export struct StoreNode {
 	kids: List<Option<Shared<StoreNode>>>,
 	keyed: Option<Shared<NativeMap<Shared<StoreNode>>>>,
 	feeds: List<StoreFeed>,
-	ids: Option<NativeMap<i32>>,
+	ids: Option<Shared<NativeMap<i32>>>,
 	wire: Option<DeltaLog<WireWrite>>,
 }
 
@@ -129,23 +129,25 @@ fun empty_node(): Shared<StoreNode> {
 /// other store. A tracked read of a handle keeps one edge across runs by it.
 fun identity_at(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
 	let key = canonical_hash(path);
-	match root.read().ids {
-		Some(let ids) => match ids.get(key) {
-			Some(let held) => {
-				ret held;
-			},
-			None => {},
-		},
-		None => {},
-	}
-	let minted = fresh_identity();
-	mut ids: NativeMap<i32> = match root.read().ids {
+	// The table is a cell, as `keyed` is: binding it shares it, where binding
+	// the map itself copied every identity the store had minted — once per ask,
+	// so a mirror's N boundaries cost N² to name (M172).
+	let ids = match root.read().ids {
 		Some(let held) => held,
-		None => NativeMap::new(),
+		None => {
+			let made: Shared<NativeMap<i32>> = Shared::new(NativeMap::new());
+			root.write().ids = Some(made);
+			made
+		},
 	};
-	ids.insert(key, minted);
-	root.write().ids = Some(ids);
-	minted
+	match ids.read().get(key) {
+		Some(let held) => held,
+		None => {
+			let minted = fresh_identity();
+			ids.write().insert(key, minted);
+			minted
+		},
+	}
 }
 
 /// `identity_at`, for the mirror's dedup (A153 S1): one channel per store root,

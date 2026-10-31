@@ -1,6 +1,23 @@
 import { DatabaseSync } from "node:sqlite";
 function __db_all(statement, parameters) {
-	return statement.all(...parameters);
+	return statement.all(...__db_bind(parameters));
+}
+function __db_bind(parameters) {
+	return parameters.map((value, index) => {
+		switch (typeof value) {
+			case "number":
+			case "bigint":
+			case "string":
+				return value;
+			case "boolean":
+				return value ? 1 : 0;
+		}
+		if (value === null || value instanceof Uint8Array) {
+			return value;
+		}
+		const shape = Array.isArray(value) ? "a struct, tuple, list or enum value" : typeof value === "function" ? "a closure" : value === undefined ? "an absent value" : "a host object";
+		throw new Error("std::db: cannot bind the parameter at index " + index + " of " + parameters.length + ": " + shape + " is not a SQLite value (bind a number, a str, a bool, or an Option of one)");
+	});
 }
 function __db_close(database) {
 	database.close();
@@ -9,11 +26,11 @@ function __db_column(row, name) {
 	return row[name];
 }
 function __db_get(statement, parameters) {
-	const row = statement.get(...parameters);
+	const row = statement.get(...__db_bind(parameters));
 	return row === undefined ? [ 1 ] : [ 0, row ];
 }
 function __db_run(statement, parameters) {
-	const result = statement.run(...parameters);
+	const result = statement.run(...__db_bind(parameters));
 	return Number(result.lastInsertRowid ?? 0);
 }
 function drop(self) {

@@ -404,3 +404,62 @@ async fun main() {
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// M168: a built server finds its build BESIDE ITSELF wherever it is started
+/// — kolt's desktop app runs its server from the app's data folder, where the
+/// working folder's `dist/` is nothing of its. The server module is
+/// `dist/server.mjs` and every leg's manifest sits beside it, so `build_of`
+/// reads `<that folder>/client.chunks.json` first and describes the artifacts
+/// by their place there. Missing in both places, the error names both.
+#[test]
+fn build_of_finds_the_build_beside_the_server_from_another_working_folder() {
+    let directory = two_leg_project("beside", true);
+    write(&directory, "src/server.vl", PROBE_SERVER);
+    let built = vilan(&directory, &["build", "."]);
+    assert!(
+        built.status.success(),
+        "build failed:\n{}",
+        combined(&built)
+    );
+    let elsewhere = directory.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("make a working folder that is not the root");
+    let dist = directory.join("dist");
+
+    let ran = Command::new("node")
+        .arg(dist.join("server.mjs"))
+        .current_dir(&elsewhere)
+        .output()
+        .expect("run the probe server");
+    // `build_of` joins the module's folder with std's `/` (on Windows the
+    // folder itself carries `\`), so both sides are read with one separator.
+    let report = combined(&ran).replace('\\', "/");
+    assert!(ran.status.success(), "the server runs:\n{report}");
+    let slashed = |name: &str| dist.join(name).display().to_string().replace('\\', "/");
+    for expected in [
+        "leg=client".to_string(),
+        "bundle=client.js".to_string(),
+        format!("serve /client.js <- {}", slashed("client.js")),
+        format!("serve /client.css <- {}", slashed("client.css")),
+    ] {
+        assert!(
+            report.contains(&expected),
+            "`build_of` should read the build beside the server ({expected:?}):\n{report}"
+        );
+    }
+
+    std::fs::remove_file(dist.join("client.chunks.json")).expect("remove the manifest");
+    let ran = Command::new("node")
+        .arg(dist.join("server.mjs"))
+        .current_dir(&elsewhere)
+        .output()
+        .expect("run the probe server");
+    let report = combined(&ran).replace('\\', "/");
+    assert!(
+        report.contains(&format!(
+            "error: no build manifest at {} (beside the server) or dist/client.chunks.json",
+            slashed("client.chunks.json")
+        )),
+        "the error names both places it looked:\n{report}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}

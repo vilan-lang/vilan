@@ -4,19 +4,20 @@
 // `trace(true)` writes a line per WAKE — each subscriber a write reached, as it
 // runs — naming what woke it:
 //
-//     [reactive] effect #4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
+//     [reactive] effect #4 at src/views.vl:30:8 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
 //     [reactive] derivation #2 woken by cell #1, set at src/main.vl:9:7
 //     [reactive] effect #5 woken by cell #3, set by derivation #2
 //     [reactive] effect #6 woken by derivation #2
 //
 // A subscriber is an `effect` (it acts on a value) or a `derivation` (it publishes
 // one, a relay included), numbered by its id; a cell by its identity. A place is a
-// `[track_caller]` location (S0): where the cell was made (`SignalCell::new`) and
-// the write that woke it (a concrete cell's `set` or `update`), each named only
-// when it is the program's own — std's are left out — and `set by` names the traced
-// wake a write ran inside. A write through the trait (`S: Signal<T>`, `dyn Signal`)
-// and a cell made by `Signal::new` carry no place: a `[track_caller]` trait member
-// is refused, so nothing passes one. A relay's `wake` is woken by the relay.
+// `[track_caller]` location (S0): where the subscriber was made (`effect`, `sub`,
+// `on_change`), where the cell was made (`Signal::new`, `SignalCell::new`) and the
+// write that woke it (`set`, through a bound or a `dyn Signal` too, or `update`),
+// each named only when it is the program's own — std's are left out — and `set by`
+// names the traced wake a write ran inside. The `Signal` and `Flow` members are
+// `[track_caller]` on the TRAIT (B646), so every implementation takes the place and
+// every call passes it. A relay's `wake` is woken by the relay.
 //
 // A wake that waits in a turn's queue runs later, on another stack — at the
 // extent's end, or on a microtask. Queued under the trace, it is wrapped in a host
@@ -51,6 +52,7 @@ export fun trace(on: bool) {
 				draining,
 			),
 			forget = |turn: Turn, id: i32| forget_queued_wake(turn, id),
+			placed = |id: i32, site: Location| note_placed(id, site),
 		};
 	} else {
 		queued_wakes.write() = NativeMap::new();
@@ -89,6 +91,10 @@ let running_wake: Shared<Option<str>> = Shared::new(None);
 /// Where each cell made under the trace was made, by its identity.
 let made_at: Shared<NativeMap<str>> = Shared::new(NativeMap::new());
 
+/// Where each subscriber made under the trace was made (an `effect`, a `sub`, an
+/// `on_change`), by its id.
+let placed_at: Shared<NativeMap<str>> = Shared::new(NativeMap::new());
+
 /// Each queued wake's cause and task, oldest first, by turn and subscriber. A list,
 /// because a subscriber taken out with a wave can be queued again before that wave
 /// runs it: the run takes the oldest, a scrub the newest.
@@ -117,6 +123,14 @@ fun program_place(site: Location): Option<str> {
 fun note_made(identity: i32, site: Location) {
 	match program_place(site) {
 		Some(let place) => made_at.write().insert(identity.hash(), place),
+		None => {},
+	}
+}
+
+/// Remember where the subscriber `id` was made.
+fun note_placed(id: i32, site: Location) {
+	match program_place(site) {
+		Some(let place) => placed_at.write().insert(id.hash(), place),
 		None => {},
 	}
 }
@@ -253,7 +267,11 @@ fun run_traced(subscriber: Subscriber, cause: str, token: Option<i32>) {
 	} else {
 		i"effect #{subscriber.id}"
 	};
-	trace_line(i"[reactive] {woken} woken by {cause}");
+	let named = match placed_at.read().get(subscriber.id.hash()) {
+		Some(let place) => i"{woken} at {place}",
+		None => woken,
+	};
+	trace_line(i"[reactive] {named} woken by {cause}");
 	let outer = running_wake.read();
 	running_wake.write() = Some(woken);
 	with_finally(|| {

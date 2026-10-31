@@ -4,9 +4,20 @@
 // substitution keeps every line in place.
 import std::io::print;
 import std::reactive::trace::trace;
-import std::reactive::{ Flow, FlushPolicy, Pipe, Signal, SignalCell, Source, batch, turn };
+import std::reactive::{
+	Flow,
+	FlushPolicy,
+	Owner,
+	Pipe,
+	Signal,
+	SignalCell,
+	Source,
+	batch,
+	run_with_owner,
+	turn,
+};
 
-/// A write through the trait: a bound names no place.
+/// A write through the trait: a bound's call passes its own place (B646).
 fun write_through<S: Signal<i32>>(cell: S, value: i32) {
 	cell.set(value);
 }
@@ -55,11 +66,24 @@ fun main() {
 		count.update(|&mut value| {
 			value = *value + 1;
 		});
-	} else if path == "unplaced" {
-		// Made by `Signal::new` and written through a bound: the trace has
-		// no place for either (a `[track_caller]` trait member is refused).
-		let _watch = plain.sub(|value| print(i"unplaced {value}"));
+	} else if path == "trait" {
+		// Made by `Signal::new` and written through a bound: both are
+		// `[track_caller]` on the trait (B646), so both name their place.
+		let _watch = plain.sub(|value| print(i"trait {value}"));
 		write_through(plain, 11);
+	} else if path == "object" {
+		// A write through a `dyn Signal`'s table, and a subscriber made
+		// through a `dyn Source`'s: the slots carry the place (B646).
+		let erased: dyn Signal<i32> = count;
+		let source: dyn Source<i32> = count;
+		let _watch = source.on_change(|value| print(i"object {value}"));
+		erased.set(12);
+	} else if path == "effect" {
+		// An effect names where it was made (B646).
+		run_with_owner(Owner::new(), || {
+			count.effect(|value| print(i"effect {value}"));
+		});
+		count.set(13);
 	} else {
 		// Off: the same write, no line.
 		let _watch = count.sub(|value| print(i"off {value}"));

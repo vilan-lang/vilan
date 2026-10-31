@@ -1,0 +1,55 @@
+// B659, B667, B670: the shapes inference now types, answering the same on
+// both backends - a literal waiting for a closure's result, a literal tail
+// taking a `ret`'s width, a self-call in a `match` leg of an unannotated
+// function, and a method on an operator's result over a closure parameter.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ MemoCell, Pipe, SignalCell, Source };
+
+struct Item {
+	depth: usize,
+}
+
+fun pick<U>(fallback: U, read: || U): U {
+	read()
+}
+
+fun first_even(values: List<usize>) {
+	for value in values {
+		if value % 2 == 0 {
+			ret value;
+		}
+	}
+	0
+}
+
+fun open(how: str) {
+	match how {
+		"right" => open("split"),
+		_ => print(i"open {how}"),
+	}
+}
+
+fun count(n: i32) {
+	match n {
+		0 => 0,
+		_ => 1 + count(n - 1),
+	}
+}
+
+fun scaled(scale: SignalCell<f64>): MemoCell<f64> {
+	scale.derive(|value| (value * 100.0).round()).memo()
+}
+
+fun main() {
+	let item: Option<Item> = Some(Item { depth = 4 });
+	let depth: usize = item.map_or(|it| it.depth, 0);
+	let held = Item { depth = 7 };
+	let seven: usize = pick(0, || held.depth);
+	let even: usize = first_even([3, 8, 5]);
+	print(i"{depth} {seven} {even}");
+	open("right");
+	let three: i32 = count(3);
+	print(three);
+	print(scaled(SignalCell::new(2.456)).get());
+}

@@ -10304,3 +10304,121 @@ fn b621_a_container_of_a_non_eq_element_is_not_eq() {
         );
     }
 }
+
+// --- B655: an `impl` body declares methods, and nothing else -----------------
+//
+// The grammar reads an impl body as statements, and everything in it that was
+// not a `fun` was walked into the impl's member scope and then existed
+// nowhere: a `struct` between two methods was "unknown struct" at its use (in
+// another module "cannot find 'Hidden' in the imported path") and silent with
+// none, a `let` checked clean and was a `ReferenceError` on JS, a statement
+// never ran. Each is refused at its keyword; the methods around it still parse.
+
+/// The item's shape: `declaration` between two methods of `Counter`.
+fn inside_an_impl(declaration: &str) -> String {
+    format!(
+        "struct Counter {{ value: i32 }}\n\nimpl Counter {{\n\tfun bump(&mut self) {{ self.value += 1; }}\n\n\
+         {declaration}\n\n\tfun get(self): i32 {{ self.value }}\n}}\n\nfun main() {{\n\tmut counter = Counter {{ value = 1 }};\n\
+         \tcounter.bump();\n\tlet _value = counter.get();\n}}\n"
+    )
+}
+
+#[test]
+fn b655_each_item_kind_inside_an_impl_is_refused_at_its_keyword() {
+    for (declaration, keyword, described) in [
+        ("struct Hidden {\n\tlabel: str,\n}", "struct", "a `struct`"),
+        ("enum Hidden { A, B }", "enum", "an `enum`"),
+        (
+            "trait Hidden {\n\tfun hidden(self): i32;\n}",
+            "trait",
+            "a `trait`",
+        ),
+        (
+            "impl Counter {\n\tfun other(self): i32 { 1 }\n}",
+            "impl Counter {\n\tfun other",
+            "an `impl`",
+        ),
+        (
+            "mod hidden {\n\tfun inner(): i32 { 1 }\n}",
+            "mod",
+            "a `mod`",
+        ),
+        (
+            "[derive(Debug)] struct Hidden { label: str }",
+            "struct Hidden",
+            "a `struct`",
+        ),
+        ("let LIMIT: i32 = 3;", "let", "a `let`/`mut` binding"),
+        ("mut count = 3;", "mut", "a `let`/`mut` binding"),
+    ] {
+        let source = inside_an_impl(declaration);
+        // The keyword's own span: the first match after the first method.
+        let head = source.find("self.value += 1; }").expect("the first method");
+        let start = head + source[head..].find(keyword).expect("the keyword");
+        let word = keyword
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap();
+        let diagnostics = failure_diagnostics(&source);
+        let message = format!(
+            "{described} cannot be declared inside an `impl` — an `impl` declares methods; move it to the module's top level"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(text, range)| *text == message && *range == (start..start + word.len())),
+            "{declaration}: {diagnostics:#?}"
+        );
+        assert_eq!(diagnostics.len(), 1, "{declaration}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn b655_a_statement_inside_an_impl_is_refused_where_it_stands() {
+    for (statement, spanning) in [("print(1);", "print(1)"), ("{ 1 }", "{ 1 }")] {
+        let source = format!("import std::io::print;\n{}", inside_an_impl(statement));
+        assert_fails_spanning(
+            &source,
+            spanning,
+            "a statement cannot stand inside an `impl` — an `impl` declares methods, and this \
+             would never run; move it into a `fun`",
+        );
+    }
+}
+
+#[test]
+fn b655_an_import_inside_an_impl_stays_a_member() {
+    // Not a refusal: an import there serves every method
+    // (`macros::an_import_inside_an_impl_body_serves_its_methods`).
+    assert_compiles(&format!(
+        "import std::io::print;\n{}",
+        inside_an_impl("import std::display::format;")
+    ));
+}
+
+#[test]
+fn b655_the_methods_around_a_refused_item_still_parse_and_members_still_compile() {
+    // The refusal keeps the parse going: `bump` and `get` are still the
+    // impl's, so nothing reports them missing.
+    assert_fails_without(&inside_an_impl("enum Hidden { A, B }"), "has no method");
+    // Every member form compiles as before: attributes, `async`, `external`
+    // with its binding, an associated function, a user-macro-free run.
+    assert_compiles(
+        r#"
+        struct Counter { value: i32 }
+        impl Counter {
+            fun new(): Counter { Counter { value = 0 } }
+            const fun limit(): i32 { 42 }
+            [must_use]
+            fun get(self): i32 { self.value }
+            async fun later(self): i32 { self.value }
+            [extern(method, "toString")]
+            external fun text(self): str;
+        }
+        fun main() {
+            let counter = Counter::new();
+            let _value = counter.get();
+        }
+        "#,
+    );
+}

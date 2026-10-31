@@ -21,13 +21,21 @@ import pkg::shared::Shared;
 import pkg::web::dom::{ Event, window };
 import pkg::web::ui::{ View, chunk_failure, chunk_pending, view };
 
-/// `history.pushState(state, title, path)` — state and title are unused ("").
+/// `history.pushState(state, title, path)` — the title is unused (""); the state is
+/// the entry's text (`navigate_with`), `""` for a plain `navigate`.
 [extern("history.pushState")]
 external fun history_push(state: str, title: str, path: str): void;
 
-/// `history.replaceState(state, title, path)` — state and title are unused ("").
+/// `history.replaceState(state, title, path)` — as `history_push`, over the current
+/// entry.
 [extern("history.replaceState")]
 external fun history_replace(state: str, title: str, path: str): void;
+
+/// `history.state` when it is text, `""` otherwise (via a helper — a global
+/// property has no function form). An entry this module did not write — the first
+/// one, or one another script pushed with an object — reads as `""`.
+[extern("__router_state")]
+external fun read_history_state(): str;
 
 /// `location.pathname` (via a helper — a global property has no function form).
 [extern("__router_path")]
@@ -54,9 +62,31 @@ export external fun location_url(): str;
 [extern("__percent_decode")]
 export external fun percent_decode(text: str): str;
 
+/// A history entry as the app sees it (M167): its path, the text the app stored on
+/// it, and how the app arrived there.
+export struct HistoryEntry {
+	/// `location.pathname` (or the path a `navigate*` call gave).
+	path: str,
+	/// The entry's state text — what `navigate_with`, `navigate_replace_with` or
+	/// `set_history_state` stored on it; `""` for an entry that stores none.
+	state: str,
+	/// `true` when back or forward reached the entry (a `popstate`), `false` when
+	/// the program navigated to it (or it is the entry the page loaded on). The bit
+	/// that tells "the user went back" from "a link was followed" — a layout that
+	/// restores which panel showed a page on Back, and not on a fresh visit, reads
+	/// it.
+	popped: bool,
+}
+
 /// The path-signal singleton (the `std::reactive` module-state pattern) — created
 /// empty at load, wired to the real location on first use.
 let path_signal: SignalCell<str> = SignalCell::new("");
+/// The entry signal beside it (M167), wired with it.
+let entry_signal: SignalCell<HistoryEntry> = SignalCell::new(HistoryEntry {
+	path = "",
+	state = "",
+	popped = false,
+});
 export let wired: Shared<bool> = Shared::new(false);
 
 /// Wire the singleton once: read the current location and subscribe
@@ -68,8 +98,18 @@ export let wired: Shared<bool> = Shared::new(false);
 fun ensure_wired() {
 	if !wired.read() {
 		wired.write() = true;
+		entry_signal.set(HistoryEntry {
+			path = location_path(),
+			state = read_history_state(),
+			popped = false,
+		});
 		path_signal.set(location_path());
 		window().on("popstate", || turn(FlushPolicy::AtSuspension, || {
+			entry_signal.set(HistoryEntry {
+				path = location_path(),
+				state = read_history_state(),
+				popped = true,
+			});
 			path_signal.set(location_path());
 		}));
 	}
@@ -82,12 +122,60 @@ export fun current_path(): SignalCell<str> {
 	path_signal
 }
 
+/// The current history entry, live across every `navigate*` call and back/forward
+/// (M167): its path, its state text, and whether back or forward reached it
+/// (`popped`). `current_path()` is this entry's path alone; read this one where it
+/// matters WHICH entry the user is on and how they got there:
+///
+///     current_entry().effect(|entry| {
+///         if entry.popped {
+///             restore(entry.state);    // back/forward: the entry says what it was
+///         } else {
+///             follow(entry.path);      // a link or a `navigate`
+///         }
+///     });
+///
+/// Every navigation and every pop writes it, also when the path does not change.
+/// Written BEFORE the path signal, so a `current_path()` observer that reads it
+/// sees the entry it was woken for.
+export fun current_entry(): SignalCell<HistoryEntry> {
+	ensure_wired();
+	entry_signal
+}
+
+/// The current entry's state text (`history.state`), `""` when it holds none —
+/// `current_entry().get().state` without subscribing.
+export fun history_state(): str {
+	read_history_state()
+}
+
+/// Rewrites the current entry's state, keeping its address (`history.replaceState`
+/// over `location`'s path, query and fragment): marking the entry a navigation just
+/// made, after the fact. The path signal does not move; the entry signal is
+/// written with the new state, `popped` as it was.
+export fun set_history_state(state: str) {
+	ensure_wired();
+	history_replace(state, "", location_url());
+	let current = entry_signal.get();
+	entry_signal.set(HistoryEntry { path = current.path, state, popped = current.popped });
+}
+
 /// Programmatic navigation: push a history entry and update the path signal. Joins
 /// the caller's ambient turn — an event handler's writes, this one included, settle
 /// as one wave.
 export fun navigate(path: str) {
+	navigate_with(path, "");
+}
+
+/// `navigate`, storing `state` on the entry it pushes (`history.pushState(state,
+/// ..)`; M167): text the app reads back when back or forward returns to the entry
+/// (`current_entry().state`, `history_state()`) — which panel showed the page, a
+/// scroll position, a draft's id. Encode a structure as JSON (`to_json` /
+/// `from_json`).
+export fun navigate_with(path: str, state: str) {
 	ensure_wired();
-	history_push("", "", path);
+	history_push(state, "", path);
+	entry_signal.set(HistoryEntry { path, state, popped = false });
 	path_signal.set(path);
 }
 
@@ -107,8 +195,15 @@ export fun navigate(path: str) {
 /// call site, which a bare `true` does not. Joins the caller's ambient turn,
 /// exactly as `navigate` does.
 export fun navigate_replace(path: str) {
+	navigate_replace_with(path, "");
+}
+
+/// `navigate_replace`, storing `state` on the entry it rewrites — `navigate_with`'s
+/// replacing twin.
+export fun navigate_replace_with(path: str, state: str) {
 	ensure_wired();
-	history_replace("", "", path);
+	history_replace(state, "", path);
+	entry_signal.set(HistoryEntry { path, state, popped = false });
 	path_signal.set(path);
 }
 

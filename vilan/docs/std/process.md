@@ -35,6 +35,13 @@ impl Row {
 Parameters are `?` placeholders. Synchronous by design (fits the rpc
 dispatch path). `desc` and other SQL keywords fail as column names.
 
+A bind list holds numbers, `str`s, `bool`s and `Option`s of them. A `bool`
+binds as the integer 0 or 1, and an `Option` as its value or NULL, so a
+nullable column takes the `Option` directly: `.run([title, status_id])`
+with `status_id: Option<u53>`. Anything else (a struct, a list, a tuple,
+another enum) is refused when the statement runs, naming its index in the
+list: `std::db: cannot bind the parameter at index 2 of 3: …`.
+
 `Database` is a **`resource`**: it has a single owner and *moves* rather than
 copies, and it closes its `node:sqlite` handle at its owner's last use. A
 `let db = Database::open(..)` local closes after the last statement that uses
@@ -75,6 +82,9 @@ channel, is in [Persistence](../guide/persistence.md#migrations-carrying-a-schem
 impl Server { fun builder(): ServerBuilder }
 impl ServerBuilder {
 	fun port(own self, port: i32): ServerBuilder
+	fun host(own self, address: str): ServerBuilder   // bind one address; default: every interface
+	fun max_body_bytes(own self, limit: usize): ServerBuilder   // the body cap; default 1 MiB
+	fun max_body_bytes_under(own self, mount: str, limit: usize): ServerBuilder   // a mount's cap
 	fun on_request(own self, handler: async |Request| Response): ServerBuilder
 	fun on_upgrade(own self, handler: |NodeRequest, NodeSocket, Bytes| void): ServerBuilder
 	fun on_start(own self, callback: |Server| void): ServerBuilder
@@ -93,8 +103,9 @@ impl Server {
 impl Request {
 	fun path(self): str
 	fun method(self): str
-	fun body(self): str      // the body as text
+	fun body(self): str      // the body as text, read on the first call
 	fun bytes(self): Bytes   // the same body raw (binary POSTs)
+	fun max_body_bytes(own self, limit: usize): Request   // this request's cap (a route's)
 	fun header(self, name: str): Option<str>   // a request header, case-insensitive
 }
 impl Response {
@@ -126,6 +137,77 @@ impl CachePolicy {
 	fun cache_control(own self, value: str): CachePolicy       // the field value, verbatim
 }
 ```
+
+**Binding one address.** With no `host`, a server listens on every
+interface, so anything on the network can reach it (and Windows asks the
+user about the firewall). A server meant for this machine only (a desktop
+app's own, a dev tool, a test) binds the loopback: `.host("127.0.0.1")`, or
+`"::1"` for IPv6. `url()` then names that address.
+
+**Request bodies: capped, and read when the handler asks.** A handler runs
+on the request's head. The body stays on the wire until the handler calls
+`bytes()` or `body()`; the first call reads it whole, and a later one
+answers the same bytes. So a handler that can answer from the head alone —
+a `401` for a request that is not signed in, a refusal off a declared
+`Content-Length`, a quota — never receives an upload it is about to turn
+away.
+
+Every read is capped: **1 MiB** unless the app says otherwise. A body over
+the cap is answered `413 Content Too Large` and its connection closed
+without the rest being read — a declared `Content-Length` over the cap
+before a byte of the body arrives, a chunked body (no declared length) at
+the chunk that crosses it, counted as it arrives. The handler ends at the
+read, the way a cancelled task ends: the request is over, so the code after
+the read does not run and its response is never asked for. A client that
+hangs up halfway through a body ends the handler the same way.
+
+Three places choose the cap, the most specific winning:
+
+- `ServerBuilder::max_body_bytes(n)` — the server's own, for every request;
+- `ServerBuilder::max_body_bytes_under(mount, n)` — every path at or under
+  `mount`, by whole segments (`/api/files` covers `/api/files/upload`, not
+  `/api/filesystem`), the longest mount winning;
+- `Request::max_body_bytes(n)` — one route's, chosen in the handler before
+  it reads (a role or a quota can choose it too).
+
+```vilan,norun
+import std::http::{ Request, Response, Server };
+
+fun upload(request: Request): Response {
+	// Answered from the head: the 20 MB a stranger sends is never read.
+	request.header("Authorization") is Some(let _token)
+		else ret Response::builder().code(401).body("sign in first").build();
+	let file = request.max_body_bytes(25 * 1024 * 1024).bytes();
+	Response::builder().body(i"stored {file.len()} bytes").build()
+}
+
+fun main() {
+	Server::builder()
+		.port(3000)
+		.max_body_bytes_under("/api/import/", 8 * 1024 * 1024)
+		.on_request(|request| {
+			match request.path() {
+				"/api/upload" => upload(request),
+				_ => Response::builder().code(404).body("not found").build(),
+			}
+		})
+		.build()
+		.start();
+}
+```
+
+A mounted rpc service's POST leg reads its frame through the same
+`Request::bytes`, so it is under the cap too — a service mounted at
+`/rpc/` takes a cap of its own with `.max_body_bytes_under("/rpc/", n)`.
+
+A body the handler never read is not left in the way of the connection:
+one within the cap is drained (node discards it and keeps the connection
+alive for the client's next request; the native server, which closes every
+connection, discards it before the close so the client reads its response
+rather than a reset), and one over the cap, or chunked, is not — the
+response says `Connection: close` and the connection is closed. The body is
+read whole into memory when it is read; streaming it as it arrives is not
+here yet.
 
 `Request::header` reads one header off the request, and the conditional
 request built on it ships whole. `etag_of` mints a **strong validator** for
@@ -756,8 +838,14 @@ fun build_of(leg: str): Result<LegBuild, BuildError>   // async
 fun require_build(leg: str): LegBuild                  // async; stops if it can't
 ```
 
-`build_of` reads `dist/<leg>.chunks.json`, which every build of a browser
-leg writes. A leg that was never built is `Err(BuildError::NotBuilt)` and
+`build_of` reads `<leg>.chunks.json`, which every build of a browser leg
+writes into `dist/`. It looks **beside the running server** first: a build
+writes `dist/server.mjs` next to every leg's manifest, so a server started
+from any folder (a desktop app's data folder, a service manager's working
+folder) finds its own build. `dist/` under the working folder is the
+fallback, and a missing manifest's error names both places it looked.
+Natively the binary is not written into `dist/`, so a native server looks in
+the working folder's `dist/` only. A leg that was never built is `Err(BuildError::NotBuilt)` and
 not an empty build — the manifest's presence is the difference, which is
 why it is written even when the leg does not split. `require_build` is the
 boot idiom: a server that cannot describe its own build has nothing to
@@ -958,6 +1046,7 @@ fun exit(code: i32)
 fun read_line(): Option<str>           // the next line of stdin; None at its end
 fun scan(): str                        // read_line(), "" at the end
 fun prompt(text: str): Option<str>     // write `text` (no newline), then read_line()
+fun keys(): Keys                       // the key stream: raw mode while it lives
 ```
 
 `args`, `cwd`, `env`, `exit` and the stdin reads work on both backends — the
@@ -1061,9 +1150,133 @@ From v0.33.0 until this reader replaced it, `scan()` read nothing at all on
 the JS backend: its helper called `require` inside the ES module every build
 has emitted since then, and answered `""` for every call. Before v0.33.0 it
 read the whole of stdin before answering the first line, so an interactive
-prompt waited for Ctrl-D; and there was no native implementation. Key-by-key
-input (a raw-mode key stream for menus, pagers and games) is a later slice of
-the same design.
+prompt waited for Ctrl-D; and there was no native implementation.
+
+### Reading keys
+
+A line is the wrong unit for a menu, a pager, a game or any other
+**key-driven** program: it wants each key as it is pressed, arrows included,
+with nothing echoed. `keys()` opens that stream:
+
+```vilan,fragment
+[resource]
+struct Keys;                           // raw mode while it lives; restored at its last use
+
+impl Keys {
+	fun next(self): Option<Key>        // the next key, awaited; None once stdin has ended
+	fun next_press(self): Option<Press> // the same key with its modifier set
+}
+
+enum Key {
+	Char(str),       // one Unicode scalar as typed, shift applied: "a", "A", "é"
+	Ctrl(str),       // Ctrl with a scalar: Ctrl("c") is byte 0x03
+	Alt(str),        // Alt (an ESC prefix) with a scalar: Alt("x")
+	Enter, Tab, BackTab, Backspace, Delete, Insert, Escape,
+	Up, Down, Left, Right, Home, End, PageUp, PageDown,
+	F(i32),          // F1..F12
+	Paste(str),      // a bracketed paste, whole
+}
+
+struct Press { key: Key, ctrl: bool, alt: bool, shift: bool }
+impl Press {
+	fun key(self): Key                 // the flat view `next` answers
+}
+
+struct KeyDecoder;                     // the decoder itself, for bytes a program holds
+impl KeyDecoder {
+	fun new(): KeyDecoder
+	fun feed(&mut self, bytes: Bytes)  // an EMPTY chunk is a terminal's silence
+	fun next(&mut self): Option<Press> // the next complete key, or None for now
+	fun finish(&mut self)              // the end of input: what is pending resolves
+}
+```
+
+The loop reads like `read_line`'s, and ends on the keys the program chooses
+(a leg's comma-separated patterns are an or-pattern):
+
+```vilan,norun
+import std::debug::Debug;
+import std::io::{ print, write };
+import std::option::Option::{ self, None, Some };
+import std::process::{ Key, keys };
+
+fun main() {
+	let keys = keys();
+	mut row = 0;
+	for {
+		match keys.next() {
+			Some(Key::Char("q")), Some(Key::Ctrl("c")), Some(Key::Escape), None => jump break,
+			Some(Key::Up) => row -= 1,
+			Some(Key::Down) => row += 1,
+			Some(let other) => print(other.debug()),
+		}
+		write(i"\rrow {row}   ");
+	}
+	print("");
+}
+```
+
+**The keys.** `Key` is flat so the common chords are variants: `Ctrl("c")`,
+`Alt("x")`. `\r`, `\n` and `\r\n` are each one `Enter` (a terminal's Enter
+key sends `\r`, a pipe's line ends with `\n`); `0x7f` and `0x08` are both
+`Backspace`; a lone ESC is `Escape`, never `Alt` of nothing. Raw mode turns the
+terminal's signal keys off, so **Ctrl-C is a key** (`Ctrl("c")`), not an
+interrupt, and Ctrl-D is a key, not the end of input — a loop that should stop
+on them says so, as the sample does. A modifier on a named key (Ctrl+Right,
+Shift+Up) is `next_press`'s: `Press` carries the same decoded key NORMALIZED
+(`Char("c")` with `ctrl`, `Tab` with `shift`) and all three flags; `next` is
+`next_press` flattened (ctrl with a scalar is `Ctrl`, alt with a scalar `Alt`,
+Shift+Tab `BackTab`, a modifier on any other key dropped). A bracketed paste
+arrives as ONE `Paste` holding the pasted text — a pasted newline is not an
+`Enter`. A sequence the decoder does not name is dropped whole, never typed.
+
+| Bytes | Key |
+|---|---|
+| `ESC [A` `ESC [B` `ESC [C` `ESC [D`, and `ESC O` + the same | `Up` `Down` `Right` `Left` |
+| `ESC [H`, `ESC OH`, `ESC [1~`, `ESC [7~` | `Home` |
+| `ESC [F`, `ESC OF`, `ESC [4~`, `ESC [8~` | `End` |
+| `ESC [2~` `ESC [3~` `ESC [5~` `ESC [6~` | `Insert` `Delete` `PageUp` `PageDown` |
+| `ESC OP`..`ESC OS`, `ESC [11~`..`ESC [15~` | `F(1)`..`F(4)`, `F(1)`..`F(5)` |
+| `ESC [17~`..`ESC [21~`, `ESC [23~`, `ESC [24~` | `F(6)`..`F(10)`, `F(11)`, `F(12)` |
+| `ESC [1;5C` (any of the above with `;2`..`;8`) | `Right` with ctrl (shift 1, alt 2, ctrl 4, plus one) |
+| `ESC [Z` | `BackTab` |
+| `\r`, `\n`, `\r\n` | `Enter` |
+| `\t` / `0x7f`, `0x08` | `Tab` / `Backspace` |
+| `0x01`..`0x1a` (but `\b`, `\t`, `\n`, `\r`) | `Ctrl("a")`..`Ctrl("z")` |
+| `ESC` + a key | that key with alt: `Alt("x")` |
+| `ESC [200~` … `ESC [201~` | `Paste(…)` |
+| a lone `ESC` | `Escape` |
+
+**A pipe.** When stdin is not a terminal, `keys()` touches no terminal mode and
+decodes the same bytes by the same grammar **with no timeout**: a lone ESC is
+`Escape` once the byte after it cannot continue a sequence, or at the end of
+the input. The decoded stream depends on the bytes alone, never on how they
+were chunked or timed, so `printf 'jj\rq' | vilan run menu.vl` and
+`vilan run menu.vl < session.keys` drive a key program exactly as typing
+would, both backends decode them identically, and the stream ends with `None`.
+On a terminal a lone ESC waits 50 ms for the rest of a sequence (node waits
+500 ms; vim's default is 100) — a constant, with no knob.
+
+**The restore.** `Keys` is a resource: it moves rather than copies, a closure
+cannot capture it, and its `Drop` puts the terminal back — raw mode and
+bracketed paste off — at the handle's last use: after the loop, on a
+`jump break`, on a panic, and when a nursery cancels the task that holds it.
+The roads a destructor does not take restore it too: `process::exit` and an
+uncaught failure (the runtime's exit path), and SIGTERM, SIGHUP and SIGINT
+(the terminal is restored, then the signal ends the process as it would
+have). SIGKILL cannot be caught by anything; after one, the shell's `reset`
+restores the terminal. **One `Keys` at a time**: a second `keys()` while one
+lives panics, because two owners of one terminal mode cannot both restore it.
+
+The loop's wait is the line reader's: async, so timers and other tasks keep
+running, and inside a nursery the wait carries the ambient cancel signal —
+cancelling abandons the wait, never a byte. `read_line` and `keys` read the
+same stdin, so a program can ask for a line and then read keys from what
+follows. `KeyDecoder` is the decoder `keys()` runs, on both backends, for a
+program that has bytes of its own to decode. A key-by-key LINE editor (cursor
+movement, history, completion) is not part of `std::process`; `read_line` in
+the terminal's ordinary mode already gives a typed line its echo, Backspace,
+Ctrl-U and Ctrl-W.
 
 Server-side hot-swapping of code is not a thing
 here and is not planned — the node leg restarts.

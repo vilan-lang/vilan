@@ -14707,3 +14707,208 @@ fn a_settled_value_or_a_captured_root_still_compiles() {
         "1\n1\n1\n",
     );
 }
+
+// --- B649: a view at a BY-VALUE parameter ------------------------------------
+
+/// B649 (R-k): a written `&`/`&mut` at a by-value parameter lends a view the
+/// callee cannot take. The JS build handed a scalar view's `[cell, key]` pair
+/// over AS the value (`==` compared an array with a number, `false`) where
+/// native passed the value (`true`); refused at the argument with "drop the
+/// `&`", one pin per shape the item named.
+#[test]
+fn b649_a_view_at_a_by_value_parameter_is_refused() {
+    let shapes = [
+        (
+            "fun same(left: i32, right: i32): bool { left == right }\nfun main() { print(same(2, &2)); }\n",
+            "drop the `&`: `same` takes `right` by value",
+        ),
+        (
+            "fun main() {\n\tlet numbers = [1, 2, 3];\n\tprint(numbers.contains(&2));\n}\n",
+            "drop the `&`: `contains` takes `value` by value",
+        ),
+        (
+            "fun main() {\n\tlet numbers = [1, 2, 3];\n\tprint(numbers.index_of(&2));\n}\n",
+            "drop the `&`: `index_of` takes `value` by value",
+        ),
+        (
+            "fun main() {\n\tlet numbers = [1, 2, 3];\n\tlet two = 2;\n\tprint(numbers.contains(&two));\n}\n",
+            "drop the `&`: `contains` takes `value` by value",
+        ),
+        // `&mut` the same, and an aggregate as much as a scalar.
+        (
+            "fun total(items: List<i32>): usize { items.len() }\nfun main() {\n\tmut items = [1];\n\tprint(total(&mut items));\n}\n",
+            "drop the `&mut`: `total` takes `items` by value",
+        ),
+        (
+            "fun total(items: List<i32>): usize { items.len() }\nfun main() {\n\tlet items = [1];\n\tprint(total(&items));\n}\n",
+            "drop the `&`: `total` takes `items` by value",
+        ),
+        // An `own` parameter takes the value too.
+        (
+            "fun keep(own items: List<i32>): usize { items.len() }\nfun main() {\n\tlet items = [1];\n\tprint(keep(&items));\n}\n",
+            "drop the `&`: `keep` takes `items` by value",
+        ),
+    ];
+    for (source, message) in shapes {
+        assert_fails_with(source, message);
+    }
+}
+
+/// B649: the fix the message names answers the same on both backends, and a
+/// view where the parameter takes one, a method's receiver (`(&n).abs()`
+/// reads through, B562) and a view handed on to a view parameter all still
+/// compile.
+#[test]
+fn b649_a_view_where_a_view_is_taken_still_compiles() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun same(left: i32, right: i32): bool { left == right }\n",
+            "fun peek(value: &i32): i32 { *value }\n",
+            "fun bump(value: &mut i32) { value = *value + 1; }\n",
+            "fun main() {\n",
+            "\tlet numbers = [1, 2, 3];\n",
+            "\tprint(same(2, 2));\n",
+            "\tprint(numbers.contains(2));\n",
+            "\tmut n = -4;\n",
+            "\tprint(peek(&n));\n",
+            "\tbump(&mut n);\n",
+            "\tlet view = &n;\n",
+            "\tprint(peek(view));\n",
+            "}\n",
+        ),
+        "true\ntrue\n-4\n-3\n",
+    );
+}
+
+/// B649: a `&` at a GENERIC parameter whose `T` is a view — `unwrap_or(&0)`
+/// over the `Option<&i32>` a view-returning method hands back (B577's shape) —
+/// is the view the parameter takes, and still compiles. (A `None` there
+/// prints the fallback view's pair on JS — a separate find, B?4 of solver-55.)
+#[test]
+fn b649_a_view_at_a_generic_parameter_over_a_view_holder_still_compiles() {
+    assert_compiles_and_runs(
+        concat!(
+            "struct Shelf { counts: List<i32> }\n",
+            "impl Shelf {\n",
+            "\tfun count(&self, index: usize): Option<&i32> {\n",
+            "\t\tif index < self.counts.len() { Some(&self.counts[index]) } else { None }\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet shelf = Shelf { counts = [3, 4] };\n",
+            "\tprint(shelf.count(0).unwrap_or(&0) + 1);\n",
+            "\tprint(shelf.count(1).unwrap_or(&0) * 2);\n",
+            "}\n",
+        ),
+        "4\n8\n",
+    );
+}
+
+// --- B647: a module-level `mut` binding lent to a callee that writes it -----
+
+/// B647 (R-k, spec §6.4 rule 4): lending a module-level `mut` binding — a
+/// `&`, a `&mut`, a view receiver — to a callee whose write summary reaches
+/// it is refused at the argument: the callee's body is a second path to the
+/// place the loan holds. The JS build answered through the binding's object
+/// (`1`, `2`), native through a copy out of its cell or the reentrancy stop
+/// (`0`, a panic). One pin per shape: the item's two, a view receiver, a
+/// write two calls deep, a write through a closure the callee is handed, and
+/// a place under the binding.
+#[test]
+fn b647_a_module_binding_lent_to_a_callee_that_writes_it_is_refused() {
+    let shapes = [
+        (
+            "mut module_items: List<i32> = [];\nfun lent_and_grow(items: &List<i32>) {\n\tmodule_items.push(1);\n\tprint(items.len());\n}\nfun main() { lent_and_grow(&module_items); }\n",
+            "`lent_and_grow` writes `module_items` while `module_items` is lent to this call, so the loan and the write are two paths to one place (a write under a live view); copy it first: `let items = module_items; lent_and_grow(&items)`",
+        ),
+        (
+            "mut module_items: List<i32> = [];\nfun touch(items: &mut List<i32>) {\n\titems.push(1);\n\tmodule_items.push(2);\n\tprint(items.len());\n}\nfun main() { touch(&mut module_items); }\n",
+            "copy it first: `mut items = module_items; touch(&mut items)`",
+        ),
+        (
+            "struct Log { items: List<i32> }\nimpl Log {\n\tfun grown(&self): usize {\n\t\tmodule_log.items.push(1);\n\t\tself.items.len()\n\t}\n}\nmut module_log: Log = Log { items = [] };\nfun main() { print(module_log.grown()); }\n",
+            "`grown` writes `module_log` while `module_log` is lent to this call",
+        ),
+        (
+            "mut module_items: List<i32> = [];\nfun grow() { module_items.push(1); }\nfun deeper() { grow(); }\nfun lent(items: &List<i32>): usize {\n\tdeeper();\n\titems.len()\n}\nfun main() { print(lent(&module_items)); }\n",
+            "`lent` writes `module_items` while `module_items` is lent to this call",
+        ),
+        (
+            "mut module_items: List<i32> = [];\nfun run(items: &List<i32>, then: || void): usize {\n\tthen();\n\titems.len()\n}\nfun main() { print(run(&module_items, || module_items.push(1))); }\n",
+            "`run` writes `module_items` while `module_items` is lent to this call",
+        ),
+        (
+            "struct Shelf { items: List<i32> }\nmut module_shelf: Shelf = Shelf { items = [] };\nfun lent(items: &List<i32>): usize {\n\tmodule_shelf = Shelf { items = [7] };\n\titems.len()\n}\nfun main() { print(lent(&module_shelf.items)); }\n",
+            "`lent` writes `module_shelf` while `module_shelf` is lent to this call",
+        ),
+    ];
+    for (source, message) in shapes {
+        assert_fails_with(source, message);
+    }
+}
+
+/// B647: what the rule leaves alone — a callee that only READS the binding,
+/// a LOCAL `mut` lent to a writer of a module binding, a module binding the
+/// callee does not write, and the copy the message names — each answering
+/// the native backend's answer.
+#[test]
+fn b647_a_loan_no_write_reaches_still_compiles() {
+    assert_compiles_and_runs(
+        concat!(
+            "mut module_items: List<i32> = [];\n",
+            "mut module_other: List<i32> = [];\n",
+            "fun reads(items: &List<i32>): usize { module_items.len() + items.len() }\n",
+            "fun grows_other(items: &List<i32>): usize {\n",
+            "\tmodule_other.push(1);\n",
+            "\titems.len()\n",
+            "}\n",
+            "fun lent_and_grow(items: &List<i32>): usize {\n",
+            "\tmodule_items.push(1);\n",
+            "\titems.len()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(reads(&module_items));\n",
+            "\tprint(grows_other(&module_items));\n",
+            "\tmut local = [5];\n",
+            "\tprint(lent_and_grow(&local));\n",
+            "\tlet items = module_items;\n",
+            "\tprint(lent_and_grow(&items));\n",
+            "\tprint(module_items.len());\n",
+            "}\n",
+        ),
+        "0\n0\n1\n1\n2\n",
+    );
+}
+
+/// B647's by-value twin (met on the way): a module-level `mut` binding handed
+/// BY VALUE to a callee that writes it is a copy, as rule 1 says and the
+/// native backend answered — JS handed over the binding's own object, so
+/// `by_value(module_items)` printed `2` (the callee's push showed through its
+/// parameter) where native printed `1`. A bare `self` receiver the same.
+#[test]
+fn b647_a_module_binding_handed_by_value_to_a_writer_is_a_copy() {
+    assert_compiles_and_runs(
+        concat!(
+            "struct Log { items: List<i32> }\n",
+            "impl Log {\n",
+            "\tfun grown(self): usize {\n",
+            "\t\tmodule_log.items.push(1);\n",
+            "\t\tself.items.len()\n",
+            "\t}\n",
+            "}\n",
+            "mut module_items: List<i32> = [1];\n",
+            "mut module_log: Log = Log { items = [] };\n",
+            "fun by_value(items: List<i32>): usize {\n",
+            "\tmodule_items.push(3);\n",
+            "\titems.len()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(by_value(module_items));\n",
+            "\tprint(module_items.len());\n",
+            "\tprint(module_log.grown());\n",
+            "\tprint(module_log.items.len());\n",
+            "}\n",
+        ),
+        "1\n2\n0\n1\n",
+    );
+}

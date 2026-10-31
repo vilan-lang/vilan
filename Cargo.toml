@@ -29,6 +29,11 @@ members = [
     # CLI's — so it is a third optional crate, linked only by a program that
     # starts an HTTP server.
     "crates/vilan-rt-signal",
+    # A173 S2 (terminal.md Q3, RULED 2026-10-16): `process::keys()`'s raw mode
+    # is FFI — `tcsetattr` on unix, `SetConsoleMode` on Windows — so `libc` and
+    # `windows-sys` (both already the CLI's) live in a fourth optional crate,
+    # linked only by a program that reaches `keys()`.
+    "crates/vilan-rt-term",
 ]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace

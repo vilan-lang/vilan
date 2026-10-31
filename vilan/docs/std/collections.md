@@ -26,6 +26,7 @@ impl List<type T> {
 	fun filter(self, predicate: |T| bool): List<T>
 	fun filter_map<U>(self, fn: |T| Option<U>): List<U>   // both, one pass
 	fun find(self, predicate: |T| bool): Option<T>
+	fun position(self, predicate: |T| bool): Option<usize>   // index of the first match
 	fun fold<B>(self, init: B, fn: |B, T| B): B
 	fun for_each(self, fn: |T| void)
 	fun reverse(self): List<T>
@@ -89,8 +90,9 @@ fun main() {
 
 ### Searching & equality
 
-`find` takes a predicate and short-circuits; `contains` and `index_of` take a
-value and need `T: PartialEq`. Missing answers are `None`, never a panic.
+`find` and `position` take a predicate and short-circuit: `find` answers the
+element, `position` its index. `contains` and `index_of` take a value and need
+`T: PartialEq`. Missing answers are `None`, never a panic.
 
 A `List<T: PartialEq>` is itself `PartialEq`: `==` compares element-wise,
 length first. Because the impl is conditional, lists nest
@@ -104,6 +106,7 @@ fun main() {
 	print(scores.contains(65));                   // true
 	print(scores.index_of(65).unwrap_or(0));      // 2
 	print(scores.index_of(7).is_none());          // true
+	print(scores.position(|n| n > 50).unwrap_or(0));  // 1
 	print(scores == [40, 91, 65]);                // true
 	print(scores == [40, 91]);                    // false — length first
 }
@@ -776,6 +779,7 @@ fun fold<B>(mut self, init: B, fn: |B, T| B): B
 fun for_each(mut self, fn: |T| void)
 fun count(mut self): i32
 fun any(mut self, predicate: |T| bool): bool     // short-circuits on the first hit
+fun position(mut self, predicate: |T| bool): Option<usize>   // index of the first hit
 fun all(mut self, predicate: |T| bool): bool     // short-circuits on the first miss
 fun rev(mut self): ListIterator<T>               // a BARRIER — see below
 ```

@@ -1,0 +1,57 @@
+// M166: a derived `FromJson` decodes an `Option` field the object leaves out as
+// `None` (as it decodes `null`); a missing non-`Option` field is still refused,
+// and `to_json` still writes `null`.
+import std::json::{ FromJson, Json };
+
+[derive(Json)]
+struct Node {
+	id: u32,
+	note: Option<str>,
+}
+
+[derive(Json)]
+struct Layered {
+	depth: Option<Option<i32>>,
+	pair: Option<List<i32>>,
+}
+
+[derive(Json)]
+struct Wrap<T> {
+	inner: Option<T>,
+}
+
+fun show(result: Result<Node, str>) {
+	match result {
+		Ok(let node) => print(i"ok {node.id} {node.note.unwrap_or("<none>")}"),
+		Err(let reason) => print(i"err {reason}"),
+	}
+}
+
+fun layered(text: str) {
+	match Layered::from_json(text) {
+		Ok(let value) => {
+			let depth = match value.depth {
+				None => "none",
+				Some(None) => "some(none)",
+				Some(Some(_)) => "some(some)",
+			};
+			print(i"ok {depth} {value.pair.is_some()} {value.to_json()}");
+		},
+		Err(let reason) => print(i"err {reason}"),
+	}
+}
+
+fun main() {
+	show(Node::from_json("{\"id\": 1}"));
+	show(Node::from_json("{\"id\": 2, \"note\": \"hi\"}"));
+	show(Node::from_json("{\"id\": 3, \"note\": null}"));
+	show(Node::from_json("{\"note\": \"no id\"}"));
+	show(Node::from_json("{\"id\": 4, \"note\": 5}"));
+	print(Node { id = 1, note = None }.to_json());
+	print(Node { id = 1, note = Some("x") }.to_json());
+	layered("{}");
+	layered("{\"depth\": null, \"pair\": null}");
+	layered("{\"depth\": 7, \"pair\": [1, 2]}");
+	let wrapped: Wrap<i32> = Wrap::from_json("{}").unwrap();
+	print(i"{wrapped.inner.is_none()} {wrapped.to_json()}");
+}

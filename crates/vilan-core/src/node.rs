@@ -83,6 +83,15 @@ pub enum ExternBinding<'src> {
         module: Option<&'src str>,
         symbol: &'src str,
     },
+    // `[extern("""…""")]` (B654) — a host EXPRESSION written over lines: the
+    // triple-quoted literal's raw inner text, trimmed by the multiline rule
+    // (`util::trim_multiline_string`) where it is emitted and called
+    // parenthesized, `(text)(args)`. The one-line `Function` form is the same
+    // binding for an expression that fits on a line; a long host helper had
+    // no spelling before this one.
+    Code {
+        text: &'src str,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

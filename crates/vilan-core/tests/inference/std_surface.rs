@@ -5344,10 +5344,20 @@ fn m107_impls_of_one_trait_over_distinct_types_are_never_compared() {
 /// counter at two sizes in one process; the generated plain package of
 /// `performance-gates.md` §6.2 (24k -> 49k lines) went from x2.80 to x1.94 in
 /// instructions with this and the other M107 indices.
+///
+/// N182: the binary's analyses build over the persisted std prefix (P5), and
+/// the pin counts them as it counts the canonical world's base-cache hits — a
+/// world loaded from the prefix FILE examines the same rows as one the base
+/// cache stored (pinned below). What the first analysis of a process pays on
+/// top is not the world's: its `[derive(PartialEq, Debug)]` expands through
+/// the derive macros' own WORLDS, nested analyses on this thread whose lookups
+/// the thread's counter sees too (962 rows on the 30-type program, once per
+/// process — every later expansion is served). The canonical world's first
+/// analysis was a base-cache MISS, which `served` discards, so it absorbed
+/// them; over a loaded prefix the first analysis is already served, so the
+/// pin warms the expansion first, with one analysis it does not count.
 #[test]
 fn m107_impl_lookups_examine_rows_linear_in_the_package() {
-    // Base-cache hits of one canonical world, counted (see `served` below).
-    without_the_std_prefix();
     fn rows(types: usize) -> (usize, bool) {
         // `performance-gates.md` §6.2's plain module, one per type, in one
         // file: derived `PartialEq` and `Debug`, a list built and walked, an
@@ -5407,6 +5417,29 @@ fn m107_impl_lookups_examine_rows_linear_in_the_package() {
             .map(|(count, _)| count)
             .expect("the base cache serves a repeated analysis of the same world")
     };
+    // N182: the derive expansion's macro worlds, once per process, uncounted.
+    rows(30);
+    // N182: a world LOADED from the persisted prefix examines the rows a
+    // STORED one does — the first analysis after the in-memory cache is
+    // cleared is served the file again (when the binary builds over one), the
+    // next the base cache's copy of it.
+    let loads_before = vilan_core::analyzer::prefix_file_counts().0;
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::prefix_files_forget();
+    let (reloaded, reloaded_served) = rows(30);
+    let loaded_from_the_file = vilan_core::analyzer::prefix_file_counts().0 > loads_before;
+    let stored = served(30);
+    if loaded_from_the_file {
+        assert!(
+            reloaded_served,
+            "a world loaded from the prefix file is served"
+        );
+        assert_eq!(
+            reloaded, stored,
+            "an analysis served a world loaded from the prefix file examined {reloaded} impl \
+             rows where one served the stored world examined {stored} (N182)"
+        );
+    }
     // The MARGINAL rows of each doubling, so std's own share (every lookup
     // reads std's impls of the member too) cancels: linear growth doubles the
     // margin per doubling, quadratic growth quadruples it.
@@ -8075,5 +8108,301 @@ fn b618_a_task_needs_no_import_to_be_annotated_or_awaited() {
         }
         "#,
         "7\n",
+    );
+}
+
+// --- M165: an `Option` landing at `any` is its payload or nothing ------------
+//
+// `Program::any_option_coercions` records where an `Option` lands at an `any`
+// position and the JS emitter unwraps it there (`__any_option`), as the native
+// backend's `Any::from` does. Each landing the analyzer reaches by a different
+// road gets its own pin: a vilan function's `any` parameter (the inference
+// seam), a `List<any>` literal's element (the literal arm, which does not seed
+// the expectation into its elements), `push` onto a `List<any>` (the receiver's
+// binder, which the call's own substitution rebinds to the argument), and an
+// annotated `let`; and the two exemptions — `print`'s and an external's direct
+// `any` parameter take the value as it is.
+
+#[test]
+fn m165_an_option_at_a_vilan_functions_any_parameter_is_its_payload() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun shown(value: any) {
+            print(value);
+        }
+        fun main() {
+            let some: Option<i32> = Some(1);
+            let none: Option<str> = None;
+            let deep: Option<Option<i32>> = Some(Some(2));
+            let hollow: Option<Option<i32>> = Some(None);
+            shown(some);
+            shown(none);
+            shown(deep);
+            shown(hollow);
+            shown(Some("built"));
+        }
+        "#,
+        "1\nnull\n2\nnull\nbuilt\n",
+    );
+}
+
+#[test]
+fn m165_a_list_any_element_push_and_annotated_let_unwrap_an_option() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun shown(values: List<any>) {
+            for value in values {
+                print(value);
+            }
+        }
+        fun main() {
+            let some: Option<i32> = Some(3);
+            let none: Option<i32> = None;
+            shown([some, none, if true { some } else { none }]);
+            mut pushed: List<any> = [];
+            pushed.push(some);
+            pushed.push(none);
+            shown(pushed);
+            let held: any = some;
+            shown([held]);
+        }
+        "#,
+        "3\nnull\n3\n3\nnull\n3\n",
+    );
+}
+
+#[test]
+fn m165_print_and_an_externals_any_parameter_take_the_option_as_it_is() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash::canonical_hash;
+        [extern("JSON.stringify")]
+        external fun stringify(value: any): str;
+        fun main() {
+            let some: Option<i32> = Some(4);
+            print(some);
+            print(stringify(some));
+            print(canonical_hash(some) == canonical_hash(4));
+        }
+        "#,
+        "Some(4)\n[0,4]\nfalse\n",
+    );
+}
+
+/// M165's rpc half: an `[rpc]` body that THROWS answers its call with a `Remote`
+/// error naming the method and the message — the client's awaited call is
+/// rejected, never parked forever — the service answers the next call as
+/// before, and the server's log keeps a line about the throw (on stderr, as the
+/// task's own failure line was). On the base the handler's task died with
+/// `unhandled task error (spawned in …)` and the client heard nothing.
+#[test]
+fn m165_an_rpc_body_that_throws_answers_its_call_and_the_log_keeps_a_line() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+import std::io::{ panic, print };
+import std::json::json_codec;
+import std::result::Result::{ Err, Ok };
+import std::rpc::{ DuplexTransport, local_rpc };
+
+[service(CounterClient)]
+struct Counter {}
+
+impl Counter {
+    [rpc]
+    fun add(self, a: i32, b: i32): i32 {
+        a + b
+    }
+
+    [rpc]
+    fun explode(self, why: str): i32 {
+        panic(why);
+        0
+    }
+}
+
+fun main() {
+    let transport = local_rpc(Counter {}.dispatcher().into_protocol(json_codec()));
+    let client = CounterClient { transport, codec = json_codec() };
+    print(i"add: {client.add(2, 3).debug()}");
+    print(i"explode: {client.explode("boom").debug()}");
+    print(i"add again: {client.add(4, 5).debug()}");
+}
+main();
+"#,
+    );
+    assert_eq!(
+        code, 0,
+        "the program runs to its end:\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert_eq!(
+        stdout,
+        "add: Ok(5)\nexplode: Err(RpcError::Remote(\"`explode` threw: boom\"))\nadd again: Ok(9)\n",
+        "the thrown call is answered and the next one served:\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("rpc `explode` threw, and the call was answered with the error: boom"),
+        "the server log keeps a line about the throw:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unhandled task error"),
+        "the handler's task no longer dies:\n{stderr}"
+    );
+}
+
+#[test]
+fn e332_io_write_runs_on_a_process_platform_with_no_newline() {
+    // `io::write` (E332): standard output with NO newline — the line ends only
+    // where a `print` (or a `\n` in the text) ends it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::{ print, write };
+        fun main() {
+            write("a");
+            write("b");
+            print("c");
+        }
+        "#,
+        "abc\n",
+    );
+}
+
+#[test]
+fn e332_io_write_is_refused_on_the_browser_leg_naming_the_chain() {
+    // A browser has no standard output: `io::write` is declared in the
+    // `@process` module `std::io::stdout` (and re-exported), so the coloring
+    // refuses it as it refuses `process::args()` — while `print`, beside it in
+    // `std::io`, stays universal.
+    assert_fails_browser_with(
+        r#"
+        import std::io::{ print, write };
+        fun main() {
+            print("universal");
+            write("process only");
+        }
+        "#,
+        "main → write (std::io::stdout)",
+    );
+}
+
+#[test]
+fn a173_s2_keys_over_an_empty_stdin_end_at_once() {
+    // No input at all is the end of the stream: `next` and `next_press` are
+    // `None` from the first call, and stay `None`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process::keys;
+        fun main() {
+            let keys = keys();
+            print(keys.next().is_none());
+            print(keys.next_press().is_none());
+            print(keys.next().is_none());
+        }
+        "#,
+        "true\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn a173_s2_the_flat_key_and_the_press_are_two_views_of_one_decode() {
+    // `next_press` normalizes (`Char("c")` + ctrl, `Right` + ctrl, `Tab` +
+    // shift); `Press::key` flattens it the way `Keys::next` does (`Ctrl("c")`,
+    // `Right`, `BackTab`). The flat enum matches with or-patterns (a leg's
+    // comma-separated patterns) over literal payloads — the shape a key loop
+    // is written in.
+    assert_compiles_and_runs(
+        r#"
+        import std::bytes::Bytes;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::process::{ Key, KeyDecoder };
+        fun verdict(key: Key): str {
+            match key {
+                Key::Char("q"), Key::Ctrl("c") => "quit",
+                Key::Right, Key::Left => "move",
+                Key::BackTab => "back",
+                Key::F(let number) => i"f{number}",
+                _ => "other",
+            }
+        }
+        fun main() {
+            let codes = [3, 27, 91, 49, 59, 53, 67, 27, 91, 90, 27, 79, 81, 120];
+            let bytes = Bytes::alloc(codes.len());
+            mut index = 0;
+            for code in codes {
+                bytes.set(index, code);
+                index += 1;
+            }
+            mut decoder = KeyDecoder::new();
+            decoder.feed(bytes);
+            decoder.finish();
+            for {
+                match decoder.next() {
+                    Some(let press) => print(i"{verdict(press.key())} ctrl={press.ctrl} shift={press.shift}"),
+                    None => jump break,
+                }
+            }
+        }
+        "#,
+        "quit ctrl=true shift=false\nmove ctrl=true shift=false\nback ctrl=false shift=true\nf2 ctrl=false shift=false\nother ctrl=false shift=false\n",
+    );
+}
+
+#[test]
+fn a173_s2_a_lone_escape_waits_on_a_pipe_and_resolves_at_the_end() {
+    // The pipe rule (terminal.md §4.3): no timeout, so a lone ESC is not yet
+    // a key — `next` is `None` with the byte pending — until the byte after
+    // it decides (`x`: Alt-x) or the end does (`Escape`). An EMPTY chunk is
+    // a terminal's silence (the timeout's verdict) and resolves it at once.
+    assert_compiles_and_runs(
+        r#"
+        import std::bytes::Bytes;
+        import std::debug::Debug;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::process::KeyDecoder;
+        fun byte(code: i32): Bytes {
+            let one = Bytes::alloc(1);
+            one.set(0, code);
+            one
+        }
+        fun main() {
+            mut decoder = KeyDecoder::new();
+            decoder.feed(byte(27));
+            print(decoder.next().is_none());
+            decoder.feed(byte(120));
+            print(decoder.next().unwrap().key().debug());
+            decoder.feed(byte(27));
+            print(decoder.next().is_none());
+            decoder.feed(Bytes::alloc(0));
+            print(decoder.next().unwrap().key().debug());
+            decoder.feed(byte(27));
+            decoder.finish();
+            print(decoder.next().unwrap().key().debug());
+            print(decoder.next().is_none());
+        }
+        "#,
+        "true\nKey::Alt(\"x\")\ntrue\nKey::Escape\nKey::Escape\ntrue\n",
+    );
+}
+
+#[test]
+fn a173_s2_the_keys_handle_is_a_resource() {
+    // `Keys` owns terminal state: like every resource it moves rather than
+    // copies, and a closure cannot capture one (destruction.md R9) — a key
+    // handler is the pull loop, never a callback holding the handle.
+    assert_fails_with(
+        r#"
+        import std::process::keys;
+        fun main() {
+            let keys = keys();
+            let read = || keys.next();
+            read();
+        }
+        "#,
+        "a closure cannot capture the resource `keys`",
     );
 }

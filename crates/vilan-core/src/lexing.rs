@@ -14,6 +14,8 @@
 //! referee, not any judgement about what a token or span *should* be. Ugly-but-
 //! reproduced behaviours are recorded for the S4/S5 error-quality pass, not fixed.
 
+use std::borrow::Cow;
+
 use crate::span::{Span, Spanned};
 use crate::token::Token;
 
@@ -33,7 +35,21 @@ use crate::token::Token;
 pub struct LexError {
     pub position: usize,
     pub character: char,
-    pub rule: Option<&'static str>,
+    pub rule: Option<LexRule>,
+}
+
+/// The language rule a [`LexError`] states, when it knows one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LexRule {
+    /// A curated rule statement, rendered verbatim.
+    Statement(&'static str),
+    /// B652: a string escape that is not one. The error's `position` is the
+    /// backslash and `length` the bytes of the refused sequence, so the parser
+    /// spans the whole of it and quotes it from the source.
+    Escape {
+        kind: EscapeErrorKind,
+        length: usize,
+    },
 }
 
 /// Lex `source` into its token stream (with spans) and any lexing errors. The
@@ -305,9 +321,13 @@ impl<'src> Lexer<'src> {
             }
         } else if first == b'"' {
             match self.read_string(start) {
-                StringScan::Complete(token, end) => self.push(token, start, end),
+                StringScan::Complete(token, end) => {
+                    self.check_token_escapes(&token);
+                    self.push(token, start, end);
+                }
                 StringScan::LineBreak { content, at } => {
                     self.report_line_break_in_string(start, '"');
+                    self.check_escapes(content);
                     // Salvage (frontend.md §3): what was scanned before the break
                     // becomes the literal's token and lexing resumes AT the break,
                     // so the statement still parses and everything below it lexes
@@ -361,8 +381,38 @@ impl<'src> Lexer<'src> {
         self.errors.push(LexError {
             position,
             character,
-            rule: Some(LINE_BREAK_IN_STRING),
+            rule: Some(LexRule::Statement(LINE_BREAK_IN_STRING)),
         });
+    }
+
+    /// Refuse every escape in a `"…"` body that is not one (B652,
+    /// [`escape_errors`]), each spanned on its own sequence. `body` is a slice
+    /// of the source — every string token's text is — which is how its offset
+    /// is known.
+    fn check_escapes(&mut self, body: &str) {
+        // Most bodies hold no backslash; this is the keystroke path.
+        if !body.contains('\\') {
+            return;
+        }
+        let body_start = body.as_ptr() as usize - self.source.as_ptr() as usize;
+        for error in escape_errors(body) {
+            self.errors.push(LexError {
+                position: body_start + error.offset,
+                character: '\\',
+                rule: Some(LexRule::Escape {
+                    kind: error.kind,
+                    length: error.length,
+                }),
+            });
+        }
+    }
+
+    /// [`Self::check_escapes`] over a plain string token's body; a
+    /// triple-quoted one is raw and has no escapes.
+    fn check_token_escapes(&mut self, token: &Token<'src>) {
+        if let Token::String(body) = token {
+            self.check_escapes(body);
+        }
     }
 
     /// Record an un-lexable character and step over it (one whole char), leaving the
@@ -373,7 +423,7 @@ impl<'src> Lexer<'src> {
             position: self.position,
             character,
             rule: match character {
-                '@' => Some(AT_IS_NOT_A_TOKEN),
+                '@' => Some(LexRule::Statement(AT_IS_NOT_A_TOKEN)),
                 _ => None,
             },
         });
@@ -662,12 +712,28 @@ impl<'src> Lexer<'src> {
                     // above now makes a line terminator unreachable here, so the
                     // count is safe; `lex_multiline_escape` is the one count-based
                     // scanner that still has to take the pair itself.
+                    // The fragment is the WHOLE escape (B652): `\x41` and
+                    // `\u{1F600}` are one value each, so splitting one after its
+                    // second character would hand the decoder `\x` and `41`. A
+                    // sequence that is not an escape is refused here and kept
+                    // as the fragment it spans; the error fails the program
+                    // before any fragment becomes a value.
                     Some(_) => {
-                        let escaped = self.source[self.position + 1..]
-                            .chars()
-                            .next()
-                            .expect("byte present implies a character");
-                        let end = self.position + 1 + escaped.len_utf8();
+                        let length = match read_escape(&self.source[self.position..]) {
+                            Ok((_, length)) => length,
+                            Err(error) => {
+                                self.errors.push(LexError {
+                                    position: self.position,
+                                    character: '\\',
+                                    rule: Some(LexRule::Escape {
+                                        kind: error.kind,
+                                        length: error.length,
+                                    }),
+                                });
+                                error.length.max(1)
+                            }
+                        };
+                        let end = self.position + length;
                         parts.push(IStringPart::Text(&self.source[self.position..end]));
                         self.position = end;
                     }
@@ -830,7 +896,7 @@ impl<'src> Lexer<'src> {
                     self.errors.push(LexError {
                         position: self.position,
                         character: '}',
-                        rule: Some(UNESCAPED_BRACE),
+                        rule: Some(LexRule::Statement(UNESCAPED_BRACE)),
                     });
                     parts.push(IStringPart::Text(
                         &self.source[self.position..self.position + 1],
@@ -1024,7 +1090,7 @@ impl<'src> Lexer<'src> {
         self.errors.push(LexError {
             position: brace_open,
             character: '{',
-            rule: Some(HOLE_IS_NOT_AN_EXPRESSION),
+            rule: Some(LexRule::Statement(HOLE_IS_NOT_AN_EXPRESSION)),
         });
         let mut depth = 0usize;
         let mut at = brace_open;
@@ -1060,7 +1126,10 @@ impl<'src> Lexer<'src> {
                 self.read_string(start)
             };
             match scan {
-                StringScan::Complete(token, end) => (token, end),
+                StringScan::Complete(token, end) => {
+                    self.check_token_escapes(&token);
+                    (token, end)
+                }
                 // A string inside a hole that does not close — at end of input or
                 // at a line break — cannot be recovered locally; the hole is
                 // malformed. A clean source never gets here. The line-break case
@@ -1155,6 +1224,224 @@ const LINE_BREAK_IN_STRING: &str = "a string cannot span lines unless it is trip
 /// instead. (`&'static str` coerces to any `&'src str`, exactly as the seed `""`
 /// fragment does.)
 const RAW_BACKSLASH: &str = "\\\\";
+
+// --- String escapes (B652) ------------------------------------------------
+
+/// The escapes a `"…"` / `i"…"` body may write, as the refusal lists them —
+/// JavaScript's string escapes (lexical.md §2), less the legacy octal forms and
+/// the line continuation, plus the two literal braces an `i"…"` needs (written
+/// alike in a plain string, so moving text between the two never changes it).
+pub const STRING_ESCAPES: &str = "`\\n`, `\\r`, `\\t`, `\\b`, `\\f`, `\\v`, `\\0`, `\\\"`, `\\'`, \
+     `\\\\`, `\\{`, `\\}`, `\\xHH` and `\\u{H…}` (or `\\uHHHH`)";
+
+/// Why a backslash sequence in a string body is not an escape (B652). Each is
+/// refused AT THE LEXER, spanned on the sequence: before B652 an unknown or
+/// unsupported escape was kept verbatim — `"\x41"` was the four characters
+/// `\x41` on both backends, and `"\u{10FFFF}"` (kolt's SQL range bound) a
+/// backslash that sorted below every letter — which is the one reading nobody
+/// writing it can mean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapeErrorKind {
+    /// `\q`: no escape begins with this character.
+    Unknown,
+    /// `\x` not followed by two hex digits.
+    Hex,
+    /// `\u` followed by neither four hex digits nor `{` hex digits `}`.
+    Unicode,
+    /// `\u{…}` past `\u{10FFFF}`.
+    PastLastCodePoint,
+    /// A UTF-16 surrogate (`\uD83D`, `\u{DC00}`) that is not the high half of
+    /// a written pair: it is not a character, and neither backend's string can
+    /// hold it alone (native strings are UTF-8).
+    LoneSurrogate,
+}
+
+/// A refused escape: where its backslash sits within the literal's body, how
+/// many bytes the refused sequence covers, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EscapeError {
+    pub offset: usize,
+    pub length: usize,
+    pub kind: EscapeErrorKind,
+}
+
+/// The escape `\…` at the START of `text`: the character it denotes and the
+/// bytes it spans, or why it is not one (spanning the sequence to refuse).
+///
+/// The ONE reading of an escape, shared by the lexer — which refuses every
+/// error it returns, so no erroneous literal reaches code generation — and by
+/// [`unescape_string`], which builds the value both backends emit.
+pub fn read_escape(text: &str) -> Result<(char, usize), EscapeError> {
+    debug_assert!(text.starts_with('\\'), "an escape starts at its backslash");
+    let refuse = |length: usize, kind: EscapeErrorKind| EscapeError {
+        offset: 0,
+        length,
+        kind,
+    };
+    let Some(escaped) = text[1..].chars().next() else {
+        return Err(refuse(1, EscapeErrorKind::Unknown));
+    };
+    let simple = match escaped {
+        'n' => Some('\n'),
+        't' => Some('\t'),
+        'r' => Some('\r'),
+        'b' => Some('\u{8}'),
+        'f' => Some('\u{c}'),
+        'v' => Some('\u{b}'),
+        '0' => Some('\0'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '\\' => Some('\\'),
+        '{' => Some('{'),
+        '}' => Some('}'),
+        _ => None,
+    };
+    if let Some(character) = simple {
+        return Ok((character, 2));
+    }
+    match escaped {
+        'x' => {
+            let digits = hex_run(&text[2..], 2);
+            if digits < 2 {
+                return Err(refuse(2 + digits, EscapeErrorKind::Hex));
+            }
+            let value = u32::from_str_radix(&text[2..4], 16).expect("two hex digits");
+            Ok((char::from_u32(value).expect("below 0x100"), 4))
+        }
+        'u' => read_unicode_escape(text),
+        other => Err(refuse(1 + other.len_utf8(), EscapeErrorKind::Unknown)),
+    }
+}
+
+/// `\uHHHH` or `\u{H…}` at the start of `text` (whose first two bytes are
+/// `\u`). A high surrogate written `\uHHHH` and followed at once by a low one
+/// is the pair's single character, as JavaScript reads it.
+fn read_unicode_escape(text: &str) -> Result<(char, usize), EscapeError> {
+    let refuse = |length: usize, kind: EscapeErrorKind| EscapeError {
+        offset: 0,
+        length,
+        kind,
+    };
+    let (value, length, braced) = if text[2..].starts_with('{') {
+        let digits = hex_run(&text[3..], usize::MAX);
+        if digits == 0 || !text[3 + digits..].starts_with('}') {
+            return Err(refuse(3 + digits, EscapeErrorKind::Unicode));
+        }
+        let length = 3 + digits + 1;
+        let written = text[3..3 + digits].trim_start_matches('0');
+        // More than six significant digits is past the last code point however
+        // the parse would round it; `from_str_radix` cannot overflow below that.
+        if written.len() > 6 {
+            return Err(refuse(length, EscapeErrorKind::PastLastCodePoint));
+        }
+        let value = if written.is_empty() {
+            0
+        } else {
+            u32::from_str_radix(written, 16).expect("hex digits")
+        };
+        (value, length, true)
+    } else {
+        let digits = hex_run(&text[2..], 4);
+        if digits < 4 {
+            return Err(refuse(2 + digits, EscapeErrorKind::Unicode));
+        }
+        let value = u32::from_str_radix(&text[2..6], 16).expect("four hex digits");
+        (value, 6, false)
+    };
+    if value > 0x10FFFF {
+        return Err(refuse(length, EscapeErrorKind::PastLastCodePoint));
+    }
+    if (0xD800..0xDC00).contains(&value) && !braced {
+        // The high half of a pair: the low half must follow as `\uHHHH`.
+        let rest = &text[length..];
+        if rest.starts_with("\\u") && hex_run(&rest[2..], 4) == 4 {
+            let low = u32::from_str_radix(&rest[2..6], 16).expect("four hex digits");
+            if (0xDC00..0xE000).contains(&low) {
+                let combined = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+                return Ok((
+                    char::from_u32(combined).expect("a surrogate pair is a character"),
+                    length + 6,
+                ));
+            }
+        }
+    }
+    match char::from_u32(value) {
+        Some(character) => Ok((character, length)),
+        None => Err(refuse(length, EscapeErrorKind::LoneSurrogate)),
+    }
+}
+
+/// How many ASCII hex digits open `text`, up to `limit`.
+fn hex_run(text: &str, limit: usize) -> usize {
+    text.bytes()
+        .take(limit)
+        .take_while(u8::is_ascii_hexdigit)
+        .count()
+}
+
+/// Every escape in a `"…"` body that is not one ([`read_escape`]), with its
+/// offset within `body`. Empty for every literal the lexer accepts.
+pub fn escape_errors(body: &str) -> Vec<EscapeError> {
+    let mut errors = Vec::new();
+    let mut offset = 0;
+    while let Some(found) = body[offset..].find('\\') {
+        let at = offset + found;
+        match read_escape(&body[at..]) {
+            Ok((_, length)) => offset = at + length,
+            Err(error) => {
+                errors.push(EscapeError {
+                    offset: at,
+                    ..error
+                });
+                offset = at + error.length.max(1);
+            }
+        }
+    }
+    errors
+}
+
+/// A string literal's VALUE, built from its body as the lexer kept it: every
+/// escape decoded ([`read_escape`] — `\n`, `\x41`, `\u{1F600}`, a `\uD83D\uDE00`
+/// pair, …), and a source CRLF read as one `\n`. Borrows the body unchanged when
+/// it has neither. The one place a literal's text becomes its value, for the
+/// JS emitter, the native one, the debug tables and `dbg` alike — so the value
+/// is the same value on both backends (F26's sharing; B652's decode).
+///
+/// This is where the `\r\n`-is-one-line-terminator rule lands for a plain
+/// `"…"` and for each literal fragment of an `i"…"` (the lexer desugars an
+/// i-string into `String` tokens): `windows-support.md` §2, specification
+/// §2.1. An ESCAPED `\r` is unaffected — it is written, not read from the line
+/// ending — and a lone `\r` in the text is preserved.
+///
+/// An escape the lexer refuses never reaches here from source (the program
+/// fails first); a body built some other way that carries one keeps the
+/// sequence as written, the reading this function had for every unknown escape
+/// before B652.
+pub fn unescape_string(raw: &str) -> Cow<'_, str> {
+    let raw = crate::util::normalize_newlines(raw);
+    if !raw.contains('\\') {
+        return raw;
+    }
+    let mut result = String::with_capacity(raw.len());
+    let mut rest: &str = &raw;
+    while let Some(found) = rest.find('\\') {
+        result.push_str(&rest[..found]);
+        let escape = &rest[found..];
+        match read_escape(escape) {
+            Ok((character, length)) => {
+                result.push(character);
+                rest = &escape[length..];
+            }
+            Err(error) => {
+                let length = error.length.max(1);
+                result.push_str(&escape[..length]);
+                rest = &escape[length..];
+            }
+        }
+    }
+    result.push_str(rest);
+    Cow::Owned(result)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1456,7 +1743,7 @@ mod tests {
         vec![LexError {
             position,
             character,
-            rule: Some(LINE_BREAK_IN_STRING),
+            rule: Some(LexRule::Statement(LINE_BREAK_IN_STRING)),
         }]
     }
 
@@ -1784,7 +2071,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| error.rule != Some(HOLE_IS_NOT_AN_EXPRESSION)),
+                .all(|error| error.rule != Some(LexRule::Statement(HOLE_IS_NOT_AN_EXPRESSION))),
             "the hole is not refused on top of the break: {errors:?}"
         );
         // What follows is the salvage's own noise and not a second statement of
@@ -1803,7 +2090,10 @@ mod tests {
         // the fix opened one spelling, not the backslash.
         let (_tokens, errors) = lex_rejecting(r#"i"{f(\k)}""#);
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert_eq!(errors[0].rule, Some(HOLE_IS_NOT_AN_EXPRESSION));
+        assert_eq!(
+            errors[0].rule,
+            Some(LexRule::Statement(HOLE_IS_NOT_AN_EXPRESSION))
+        );
     }
 
     // --- Interpolated triple-quoted strings (backlog H7) ---------------------
@@ -1982,7 +2272,7 @@ mod tests {
             vec![LexError {
                 position: 1,
                 character: '@',
-                rule: Some(AT_IS_NOT_A_TOKEN),
+                rule: Some(LexRule::Statement(AT_IS_NOT_A_TOKEN)),
             }]
         );
     }
@@ -2019,7 +2309,7 @@ mod tests {
         let (_, at) = tokenize("@media");
         assert_eq!(
             at.iter().map(|error| error.rule).collect::<Vec<_>>(),
-            vec![Some(AT_IS_NOT_A_TOKEN)]
+            vec![Some(LexRule::Statement(AT_IS_NOT_A_TOKEN))]
         );
         assert!(AT_IS_NOT_A_TOKEN.contains(".md"), "names the fix");
         let (_, other) = tokenize("x\\y");
@@ -2055,5 +2345,172 @@ mod tests {
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].position, 1);
         assert_eq!(errors[1].position, 2);
+    }
+
+    // --- B652: every escape decodes at lexing, or is refused there -----------
+
+    #[test]
+    fn b652_each_escape_reads_as_its_character_and_length() {
+        for (text, character, length) in [
+            (r"\n", '\n', 2),
+            (r"\r", '\r', 2),
+            (r"\t", '\t', 2),
+            (r"\b", '\u{8}', 2),
+            (r"\f", '\u{c}', 2),
+            (r"\v", '\u{b}', 2),
+            (r"\0", '\0', 2),
+            (r#"\""#, '"', 2),
+            (r"\'", '\'', 2),
+            (r"\\", '\\', 2),
+            (r"\{", '{', 2),
+            (r"\}", '}', 2),
+            (r"\x41", 'A', 4),
+            (r"\x41BC", 'A', 4),
+            (r"\u0301", '\u{301}', 6),
+            (r"\u{1F600}", '\u{1F600}', 9),
+            (r"\u{10FFFF}", '\u{10FFFF}', 10),
+            (r"\u{000041}", 'A', 10),
+            (r"\uD83D\uDE00", '\u{1F600}', 12),
+        ] {
+            assert_eq!(read_escape(text), Ok((character, length)), "{text}");
+        }
+    }
+
+    #[test]
+    fn b652_each_malformed_escape_is_refused_with_its_extent() {
+        use EscapeErrorKind::*;
+        for (text, length, kind) in [
+            (r"\q", 2, Unknown),
+            (r"\1", 2, Unknown),
+            ("\\é", 3, Unknown),
+            (r"\x", 2, Hex),
+            (r"\x4", 3, Hex),
+            (r"\x4g", 3, Hex),
+            (r"\u", 2, Unicode),
+            (r"\u12", 4, Unicode),
+            (r"\u{", 3, Unicode),
+            (r"\u{}", 3, Unicode),
+            (r"\u{12", 5, Unicode),
+            (r"\u{12x}", 5, Unicode),
+            (r"\u{110000}", 10, PastLastCodePoint),
+            (r"\u{1000000000}", 14, PastLastCodePoint),
+            (r"\uD800", 6, LoneSurrogate),
+            (r"\uDE00", 6, LoneSurrogate),
+            (r"\u{D83D}", 8, LoneSurrogate),
+            (r"\uD83D\u0041", 6, LoneSurrogate),
+        ] {
+            assert_eq!(
+                read_escape(text),
+                Err(EscapeError {
+                    offset: 0,
+                    length,
+                    kind
+                }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn b652_a_literal_is_decoded_whole() {
+        assert_eq!(unescape_string(r"a\x41\u{1F600}b"), "aA\u{1F600}b");
+        assert_eq!(unescape_string(r"q\u0301b").encode_utf16().count(), 3);
+        assert_eq!(unescape_string(r"\\x41"), r"\x41");
+    }
+
+    #[test]
+    fn b652_the_lexer_refuses_a_bad_escape_spanned_on_its_sequence() {
+        let refused = |source: &str| -> Vec<(usize, Option<LexRule>)> {
+            tokenize(source)
+                .1
+                .into_iter()
+                .map(|error| (error.position, error.rule))
+                .collect()
+        };
+        let escape = |kind, length| Some(LexRule::Escape { kind, length });
+        // A plain string, both errors of one body.
+        assert_eq!(
+            refused(r#""a\qb\x4""#),
+            vec![
+                (2, escape(EscapeErrorKind::Unknown, 2)),
+                (5, escape(EscapeErrorKind::Hex, 3)),
+            ]
+        );
+        // An `i"…"` fragment, and a string inside its hole.
+        assert_eq!(
+            refused(r#"i"\q{"\d"}""#),
+            vec![
+                (2, escape(EscapeErrorKind::Unknown, 2)),
+                (6, escape(EscapeErrorKind::Unknown, 2)),
+            ]
+        );
+        // A raw `"""…"""` has no escapes, so nothing in it is refused.
+        assert!(refused("\"\"\"\n\\q\n\"\"\"").is_empty());
+    }
+
+    #[test]
+    fn b652_an_interpolated_escape_is_one_fragment() {
+        assert_eq!(
+            lex(r#"i"\x41{n}\u{1F600}""#),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String(r"\x41"),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("n"),
+                Token::Ctrl(')'),
+                Token::Op("+"),
+                Token::String(r"\u{1F600}"),
+                Token::Ctrl(')'),
+            ]
+        );
+    }
+
+    // --- A literal's value (moved from transformer.rs with the decoder, B652) --
+
+    /// A string literal's value is built from the NORMALIZED source text
+    /// (windows-support.md §2, spec §2): a `\r\n` in the file is one line
+    /// terminator, so a multi-line literal carries `\n` however the file was
+    /// saved. Plain `"…"` and the literal fragments of an `i"…"` both arrive
+    /// here, so both are covered.
+    #[test]
+    fn a_crlf_line_break_in_a_literal_becomes_one_newline() {
+        assert_eq!(unescape_string("alpha\r\nbeta"), "alpha\nbeta");
+        assert_eq!(unescape_string("a\r\nb\r\nc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn a_lone_carriage_return_in_a_literal_is_preserved() {
+        // Classic-Mac endings are deliberately NOT blessed: a `\r` with no
+        // following `\n` is an ordinary character of the value.
+        assert_eq!(unescape_string("a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn an_escaped_carriage_return_survives_normalization() {
+        // `\r` WRITTEN in the literal is a value the author asked for — only a
+        // line ending read off the file normalizes. `\r\n` typed as escapes
+        // stays a two-character CRLF.
+        assert_eq!(unescape_string(r"a\r\nb"), "a\r\nb");
+        assert_eq!(unescape_string(r"a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn a_literal_needing_neither_pass_is_borrowed() {
+        let raw = "plain text";
+        match unescape_string(raw) {
+            std::borrow::Cow::Borrowed(borrowed) => assert!(std::ptr::eq(borrowed, raw)),
+            std::borrow::Cow::Owned(_) => {
+                panic!("an escape-free, CR-free literal must not allocate")
+            }
+        }
+    }
+
+    #[test]
+    fn escapes_and_a_crlf_line_break_compose() {
+        // Both passes on one literal: the CRLF folds, the escapes interpret.
+        assert_eq!(unescape_string("a\\t\r\nb\\\"c"), "a\t\nb\"c");
     }
 }

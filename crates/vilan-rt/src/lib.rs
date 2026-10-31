@@ -624,6 +624,7 @@ pub fn main_guard(body: impl FnOnce() + Send + 'static) {
             .spawn(move || run_guarded_main(body))
             .map(|thread| thread.join().unwrap_or(true))
             .unwrap_or(true);
+        process::run_exit_hooks();
         let (minted, released) = cell_census();
         eprintln!(
             "vilan-native: cells minted={minted} live={}",
@@ -634,7 +635,12 @@ pub fn main_guard(body: impl FnOnce() + Send + 'static) {
         }
         return;
     }
-    if run_guarded_main(body) {
+    let failed = run_guarded_main(body);
+    // A173 S2: what must be undone at process end whatever the road — the
+    // terminal mode `process::keys()` entered, when the `Keys` that owns it
+    // never dropped (a failure that left it in an unfinished task).
+    process::run_exit_hooks();
+    if failed {
         // The hook has already said what happened. `exit` rather than a
         // re-raise, because a re-raise is how 101 comes back.
         std::process::exit(1);

@@ -26,6 +26,11 @@ export impl NodeServer {
 	[extern(method, retains)]
 	external fun listen(self, port: i32, on_ready: || void);
 
+	/// `listen(port, host, on_ready)` — bound to one address (`ServerBuilder::host`,
+	/// M168) instead of every interface.
+	[extern(method, "listen", retains)]
+	external fun listen_on(self, port: i32, host: str, on_ready: || void);
+
 	/// The bound address, once listening — where a port-0 bind's ACTUAL port comes
 	/// from. A TCP server (the only kind this module starts) always answers with an
 	/// address object.
@@ -122,15 +127,36 @@ export impl NodeSocket {
 	}
 }
 
-/// Reads a request's full body (a stream) to text. `node:stream/consumers` `text`
-/// resolves once the body has fully arrived; for a body-less request it's empty.
-[extern("node:stream/consumers", "text")]
-async external fun read_request_body(node: NodeRequest): str;
+/// The request body, read whole on the FIRST call for this request and kept for
+/// every later one (M164: `Request::bytes`'s lazy read). At most `limit` bytes are
+/// taken: a declared `Content-Length` over it is refused before a byte of the body
+/// is read, and a body without one (`Transfer-Encoding: chunked`) is counted as it
+/// arrives and refused at the chunk that crosses it. A refusal answers `413` on
+/// `reply`, closes the connection without reading the rest, and ends the caller as
+/// a CANCELLATION (an `AbortError` on node, the executor's cancel natively) — the
+/// request is over, so nothing after the read runs. A client that goes away mid-
+/// body ends the caller the same way, with nothing answered.
+[extern("__http_read_body")]
+async external fun read_body(node: NodeRequest, reply: NodeResponse, limit: usize): Bytes;
 
-/// The same body as raw bytes (a node `Buffer` IS a Uint8Array) — for frames that
-/// may be binary (`std::rpc::server`'s `/rpc`).
-[extern("node:stream/consumers", "buffer")]
-async external fun read_request_bytes(node: NodeRequest): Bytes;
+/// Whether answering now would leave a body behind that the connection should not
+/// spend `limit` bytes draining: unread, and either declared over `limit` or of no
+/// declared length (chunked). Such a response says `Connection: close` (M164's
+/// keep-alive rule): a body the handler never read is drained when it is within the
+/// cap — node discards it and keeps the connection, the native server discards it
+/// before it closes — and the connection is closed instead when it is not.
+[extern("__http_body_left_unread")]
+external fun body_left_unread(node: NodeRequest, limit: usize): bool;
+
+/// Runs one request's answer. A CANCELLATION ends it quietly — the body was
+/// refused (`read_body`'s `413` is already on the wire) or the client went away,
+/// so the request is over and nobody is waiting for it; every other failure
+/// propagates exactly as it did without this. Node ignores the promise a
+/// `createServer` callback returns, so without it the refusal would be an
+/// unhandled rejection, which ends the process; the native server spawns the
+/// callback as a task, where a cancellation is already quiet.
+[extern("__http_respond")]
+async external fun respond(body: async || void);
 
 export external struct NodeResponse;
 
@@ -162,9 +188,17 @@ export impl NodeResponse {
 
 // --- Request ---
 
+/// One request, as the handler sees it: the head is here when the handler runs,
+/// and the BODY is not read until the handler asks for it (`bytes`/`body`, M164).
 export struct Request {
 	node: NodeRequest,
-	content: Bytes,
+	/// The response this request is answered on — where a refused body's `413`
+	/// goes.
+	reply: NodeResponse,
+	/// The most body bytes `bytes`/`body` will read: the server's `max_body_bytes`,
+	/// or the cap of the mount the path is under (`max_body_bytes_under`), or this
+	/// request's own (`Request::max_body_bytes`).
+	limit: usize,
 }
 
 export impl Request {
@@ -179,15 +213,41 @@ export impl Request {
 	}
 
 	/// The full request body as text — empty for a body-less request (e.g. a GET).
-	/// Collected eagerly when the request arrives (see `Server::start`).
+	/// Read on the first call, as `bytes` is; the same cap applies.
 	fun body(self): str {
-		new_text_decoder().decode(self.content)
+		new_text_decoder().decode(self.bytes())
 	}
 
 	/// The same body as raw bytes, for frames that may be binary (an RPC codec's
 	/// POST).
+	///
+	/// **Read on the first call, not before** (M164): a handler that answers from
+	/// the head alone — a `401` for a request that is not signed in, a `413` off a
+	/// declared `Content-Length`, a quota — never receives the body at all. A later
+	/// call answers the same bytes without reading again.
+	///
+	/// At most the request's cap (`max_body_bytes`, 1 MiB unless the server or the
+	/// handler said otherwise) is read. A body over it — a declared
+	/// `Content-Length` before a byte of the body is read, a chunked one at the
+	/// chunk that crosses it — is answered `413 Content Too Large`, the connection
+	/// is closed without reading the rest, and the handler ENDS here, as a
+	/// cancelled task ends: the request is over, so the code after the read does
+	/// not run and its response is never asked for. A client that hangs up mid-body
+	/// ends the handler the same way.
 	fun bytes(self): Bytes {
-		self.content
+		read_body(self.node, self.reply, self.limit)
+	}
+
+	/// This request's body cap, in place of the server's — the PER-ROUTE override
+	/// (M164). Call it before the first read, in the arm that matched the route:
+	///
+	///	ApiRoute::Upload => upload(request.max_body_bytes(25 * 1024 * 1024)),
+	///
+	/// It can lower the cap as well as raise it, and it is the handler's own
+	/// decision per request — a quota or a role can choose it.
+	fun max_body_bytes(own self, limit: usize): Request {
+		self.limit = limit;
+		self
 	}
 
 	/// The value of a named request header, or `None` when the request did not
@@ -490,6 +550,8 @@ export struct Server {
 	/// server handed to `on_start` carries the number it picked (so `url()` and
 	/// `port()` are right in both cases).
 	port: i32,
+	/// The address to bind (`ServerBuilder::host`), `None` for every interface.
+	host: Option<str>,
 	request_handler: async |Request| Response,
 	on_start: |Server| void,
 	on_stop: |Server| void,
@@ -502,6 +564,8 @@ export struct Server {
 	/// waits on this handler — the socket stays open until something writes to it —
 	/// so a handler that settles later still owns the socket when it does.
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
+	/// The request-body caps (M164): the server's, and each mount's.
+	body_limits: BodyLimits,
 	/// The live listener, once bound — what `stop()` closes. `start()` populates it
 	/// on the copy of `Server` it hands to `on_start`, so stopping a `Server` value
 	/// that was never started (or started elsewhere) is a no-op rather than an
@@ -511,6 +575,8 @@ export struct Server {
 
 export struct ServerBuilder {
 	port: i32,
+	/// `host(addr)`'s address, `None` (every interface) until one is given.
+	host: Option<str>,
 	// Declared `async` (J2's typed channel): the handler may suspend, and `start()`
 	// awaits its response before writing.
 	request_handler: async |Request| Response,
@@ -535,12 +601,57 @@ export struct ServerBuilder {
 	/// headers (kolt.local 025b — §5.10's fence is about defaults, and this is the
 	/// hook, not a default).
 	asset_cache: Option<|str| CachePolicy>,
+	/// The request-body caps `max_body_bytes` and `max_body_bytes_under` set.
+	body_limits: BodyLimits,
+}
+
+/// How many body bytes a request may send (M164): one cap for the whole server and
+/// one per mount, a path prefix — the longest mount a request's path is under wins.
+/// A handler can still choose per request (`Request::max_body_bytes`).
+export struct BodyLimits {
+	server: usize,
+	mounts: List<(str, usize)>,
+}
+
+export impl BodyLimits {
+	/// The caps a server has when the app sets none: 1 MiB for every request (M164,
+	/// R-g) — big enough for every form, JSON call and rpc frame an app sends; an
+	/// upload route raises its own — and no mounts.
+	fun new(): BodyLimits {
+		BodyLimits { server = 1048576, mounts = [] }
+	}
+
+	/// The cap for a request at `target` (path + query): its longest mount's, or
+	/// the server's.
+	fun for_target(self, target: str): usize {
+		let path = target.split("?")[0];
+		mut chosen = self.server;
+		mut chosen_length = 0usize;
+		for mount in self.mounts {
+			let (prefix, limit) = mount;
+			if is_under(path, prefix) && (chosen_length == 0 || prefix.len() >= chosen_length) {
+				chosen = limit;
+				chosen_length = prefix.len();
+			}
+		}
+		chosen
+	}
+}
+
+/// Whether `path` is at or under the mount `prefix`, by whole segments: `/api` and
+/// `/api/` both cover `/api/upload`, and neither covers `/apiary`.
+fun is_under(path: str, prefix: str): bool {
+	if prefix.ends_with("/") {
+		ret path.starts_with(prefix) || path == prefix.substring(0, prefix.len() - 1);
+	}
+	path == prefix || path.starts_with(prefix + "/")
 }
 
 export impl Server {
 	fun builder(): ServerBuilder {
 		ServerBuilder {
 			port = 3000,
+			host = None,
 			request_handler = |request| Response::builder().code(404).body("Not Found").build(),
 			on_start = |server| {},
 			on_stop = |server| {},
@@ -548,6 +659,7 @@ export impl Server {
 			services = [],
 			assets = [],
 			asset_cache = None,
+			body_limits = BodyLimits::new(),
 		}
 	}
 
@@ -558,8 +670,21 @@ export impl Server {
 		self.port
 	}
 
+	/// Where a client on this machine reaches the server: `localhost` unless it is
+	/// bound to one address, which is then the url's host (an IPv6 address in
+	/// brackets). A wildcard bind (`0.0.0.0`, `::`) is every interface, so
+	/// `localhost` again.
 	fun url(self): str {
-		i"http://localhost:{self.port}/"
+		match self.host {
+			Some(let host) if host != "0.0.0.0" && host != "::" => {
+				if host.contains(":") {
+					i"http://[{host}]:{self.port}/"
+				} else {
+					i"http://{host}:{self.port}/"
+				}
+			},
+			_ => i"http://localhost:{self.port}/",
+		}
 	}
 
 	fun start(self) {
@@ -569,45 +694,28 @@ export impl Server {
 		let on_start = self.on_start;
 		let server = self;
 		let port = self.port;
+		let host = self.host;
 		let upgrade_handler = self.upgrade_handler;
+		let body_limits = self.body_limits;
 		let node_server = node_create_server(|node_request, node_response| {
-			// Collect the full request body (as BYTES — it may be binary) before
-			// dispatching: `Request` carries a READY body rather than a stream, so
-			// every handler sees one shape and none has to drive a reader to get at
-			// the bytes.
+			// The handler runs on the HEAD: the body stays on the wire until it
+			// asks (`Request::bytes`, M164), under the cap its path resolves to.
+			// `respond` is what keeps a refused body's cancellation from ending the
+			// process on node.
 			//
-			// This await is also the proof that nothing downstream of it is
-			// synchronous: the callback suspends HERE, before a byte is
-			// written, and `request_handler` is `async` and awaited on the next
-			// line. Said out loud because the comment this replaces claimed the
-			// opposite — "the handler is called indirectly and so can't
-			// suspend" — and a synchronous file read in `std::fs` was justified
-			// by that claim for the length of its life.
-			let content = read_request_bytes(node_request);
-			let response = request_handler(Request { node = node_request, content });
-			node_response.set_status_code(response.status);
-			if response.headers.len() == 0 {
-				node_response.set_header_raw("Content-Type", "text/plain");
-			}
-			for header in response.headers {
-				let (name, value) = header;
-				node_response.set_header_raw(name, value);
-			}
-			match response.body {
-				ResponseBody::Text(let text) => node_response.end(text),
-				ResponseBody::Bytes(let bytes) => node_response.end_bytes(bytes),
-				// The stream response: status and headers are written; hand the
-				// live stream to the app and leave the response open.
-				ResponseBody::Stream(let on_open) => on_open(ResponseStream {
-					node = node_response,
-				}),
-			}
+			// This callback suspends — `request_handler` is `async` and awaited —
+			// which is the proof that nothing downstream of it is synchronous. Said
+			// out loud because an older comment here claimed the opposite ("the
+			// handler is called indirectly and so can't suspend"), and a
+			// synchronous file read in `std::fs` was justified by that claim for
+			// the length of its life.
+			respond(|| answer(request_handler, body_limits, node_request, node_response));
 		});
 		match upgrade_handler {
 			Some(let handler) => node_server.on_upgrade("upgrade", handler),
 			None => {},
 		}
-		node_server.listen(port, || {
+		let on_ready = || {
 			// The server handed to `on_start` carries the port it actually bound,
 			// which is the whole point of being allowed to request 0 — and the live
 			// listener `stop()` needs (§9.1).
@@ -615,7 +723,11 @@ export impl Server {
 			started.port = bound_port(node_server);
 			started.node = Some(node_server);
 			on_start(started);
-		});
+		};
+		match host {
+			Some(let address) => node_server.listen_on(port, address, on_ready),
+			None => node_server.listen(port, on_ready),
+		}
 	}
 
 	/// Stop listening and fire `on_stop` once the listener has actually closed
@@ -635,6 +747,37 @@ export impl Server {
 	}
 }
 
+/// One request, answered: the handler's response written to `node_response`.
+fun answer(
+	request_handler: async |Request| Response,
+	body_limits: BodyLimits,
+	node_request: NodeRequest,
+	node_response: NodeResponse,
+) {
+	let limit = body_limits.for_target(node_request.url());
+	let response = request_handler(Request { node = node_request, reply = node_response, limit });
+	node_response.set_status_code(response.status);
+	if response.headers.len() == 0 {
+		node_response.set_header_raw("Content-Type", "text/plain");
+	}
+	for header in response.headers {
+		let (name, value) = header;
+		node_response.set_header_raw(name, value);
+	}
+	// A body the handler never read, and that the connection should not drain,
+	// closes the connection with this response (M164's keep-alive rule).
+	if body_left_unread(node_request, limit) {
+		node_response.set_header_raw("Connection", "close");
+	}
+	match response.body {
+		ResponseBody::Text(let text) => node_response.end(text),
+		ResponseBody::Bytes(let bytes) => node_response.end_bytes(bytes),
+		// The stream response: status and headers are written; hand the live stream
+		// to the app and leave the response open.
+		ResponseBody::Stream(let on_open) => on_open(ResponseStream { node = node_response }),
+	}
+}
+
 /// The port `node_server` actually bound, read off its `address()` — which is how a
 /// `port(0)` request becomes a number the app (and its clients) can use.
 fun bound_port(node_server: NodeServer): i32 {
@@ -644,6 +787,39 @@ fun bound_port(node_server: NodeServer): i32 {
 export impl ServerBuilder {
 	fun port(own self, port: i32): ServerBuilder {
 		self.port = port;
+		self
+	}
+
+	/// Bind one address instead of every interface (M168): `.host("127.0.0.1")` is
+	/// a server only this machine can reach — a desktop app's own server, a dev
+	/// tool, a test — where the default (no `host`) listens on every interface,
+	/// reachable from the network and, on Windows, asking the firewall. `"::1"` is
+	/// the IPv6 loopback; `"0.0.0.0"` every IPv4 interface. Passed to node's
+	/// `listen(port, host, ..)` as written.
+	fun host(own self, address: str): ServerBuilder {
+		self.host = Some(address);
+		self
+	}
+
+	/// The most body bytes a request may send (M164) — 1 MiB when this is never
+	/// called. The body is read only when a handler asks for it
+	/// (`Request::bytes`/`body`); one over the cap is answered `413 Content Too
+	/// Large` and its connection closed without the rest being read — a declared
+	/// `Content-Length` before any of the body, a chunked body at the chunk that
+	/// crosses the cap. The rpc POST leg reads through the same `Request::bytes`,
+	/// so a mounted service is under it too.
+	fun max_body_bytes(own self, limit: usize): ServerBuilder {
+		self.body_limits.server = limit;
+		self
+	}
+
+	/// The body cap for every request at or under `mount` — a path prefix, by whole
+	/// segments (`/api/files` covers `/api/files/upload`, not `/api/filesystem`) —
+	/// in place of the server's: the PER-MOUNT override (M164). The longest mount a
+	/// path is under wins; repeatable. A handler that matched one route can still
+	/// choose its own (`Request::max_body_bytes`).
+	fun max_body_bytes_under(own self, mount: str, limit: usize): ServerBuilder {
+		self.body_limits.mounts.push((mount, limit));
 		self
 	}
 
@@ -740,6 +916,7 @@ export impl ServerBuilder {
 		let fallback = self.request_handler;
 		Server {
 			port = self.port,
+			host = self.host,
 			request_handler = fold_service_requests(
 				self.services,
 				|request| respond_from_build(assets, cache, fallback, request),
@@ -747,6 +924,7 @@ export impl ServerBuilder {
 			on_start = self.on_start,
 			on_stop = self.on_stop,
 			upgrade_handler = fold_service_upgrades(self.services, self.upgrade_handler),
+			body_limits = self.body_limits,
 			node = None,
 		}
 	}

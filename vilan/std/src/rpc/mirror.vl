@@ -43,7 +43,10 @@
 // collections EMPTY (`StoreWire`), so a write under a key the client does not watch
 // sends that client nothing.
 
-import pkg::hash::Hash;
+import pkg::compare::Ordering;
+import pkg::hash::{ Hash, canonical_hash };
+import pkg::hash_map::HashMap;
+import pkg::hash_set::HashSet;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::store::{
 	MirrorAt,
@@ -122,18 +125,21 @@ struct MirrorWalkers {
 
 /// One GRANT (§4.3): a base path a reply handed out on this connection, the slot
 /// that names it, how many replies handed it out (less the base's `Unsubscribe`s),
-/// and its walkers.
+/// its walkers, and the slots stood under it — what its release takes down.
 struct MirrorGrant {
 	base: i32,
 	path: List<StoreStep>,
 	identity: i32,
 	holds: Shared<i32>,
 	walkers: MirrorWalkers,
+	under: Shared<HashSet<i32>>,
 }
 
 /// One subscribed BOUNDARY: its slot, the grant it stands under, its path below the
 /// grant's base and from the root, the store subscription at its node, and how many
-/// `Subscribe`s hold it.
+/// `Subscribe`s hold it. `stamp` is its place in the channel's opening order — what
+/// a frame's ops are sorted by, so the slots a turn woke cross in the order they
+/// were stood (M172: the slots are keyed by number, not kept in a list).
 struct MirrorSlot {
 	slot: i32,
 	base: i32,
@@ -144,6 +150,7 @@ struct MirrorSlot {
 	/// The boundary is a map's or a set's KEY SET (§2.2 point 3, S3): it is seeded
 	/// and told with `Keys` ops, never with the collection's values.
 	keys: bool,
+	stamp: i32,
 }
 
 /// What one frame's op says, planned before the frame is written.
@@ -178,12 +185,19 @@ struct MirrorChannel {
 	session: ReactiveServer,
 	root: Shared<StoreNode>,
 	cursor: DeltaCursor,
-	grants: Shared<List<MirrorGrant>>,
-	slots: Shared<List<MirrorSlot>>,
-	dirty: Shared<List<i32>>,
+	/// The grants by base slot, and `bases` the base of each grant by the identity
+	/// of its path's node (M172: a reply at a path already granted finds its grant
+	/// without a walk).
+	grants: Shared<HashMap<i32, MirrorGrant>>,
+	bases: Shared<HashMap<i32, i32>>,
+	/// The slots by slot number, looked up and removed in place (M172).
+	slots: Shared<HashMap<i32, MirrorSlot>>,
+	dirty: Shared<HashSet<i32>>,
 	seeding: Shared<List<i32>>,
 	pending: Shared<i32>,
 	next_base: Shared<i32>,
+	/// The opening order of the slots: each slot takes the next stamp.
+	next_stamp: Shared<i32>,
 	/// The client slots released since the last frame: each is told `Gone` in the
 	/// next one, the acknowledgement after which the client forgets the slot's
 	/// reader (A169) — nothing will name it again.
@@ -217,9 +231,10 @@ fun mirror_channel(session: ReactiveServer, root: Shared<StoreNode>): MirrorChan
 		None => {},
 	}
 	let cursor = store_wire_attach(root);
-	let grants: Shared<List<MirrorGrant>> = Shared::new([]);
-	let slots: Shared<List<MirrorSlot>> = Shared::new([]);
-	let dirty: Shared<List<i32>> = Shared::new([]);
+	let grants: Shared<HashMap<i32, MirrorGrant>> = Shared::new(HashMap::new());
+	let bases: Shared<HashMap<i32, i32>> = Shared::new(HashMap::new());
+	let slots: Shared<HashMap<i32, MirrorSlot>> = Shared::new(HashMap::new());
+	let dirty: Shared<HashSet<i32>> = Shared::new(HashSet::new());
 	let seeding: Shared<List<i32>> = Shared::new([]);
 	// Made with NO turn ambient, so neither closure captures the turn of the call
 	// that opened the channel (a closure captures its context at creation, spec
@@ -241,11 +256,13 @@ fun mirror_channel(session: ReactiveServer, root: Shared<StoreNode>): MirrorChan
 		root,
 		cursor,
 		grants,
+		bases,
 		slots,
 		dirty,
 		seeding,
 		pending = Shared::new(0 - 1),
 		next_base = Shared::new(0 - 1),
+		next_stamp = Shared::new(0),
 		acked = Shared::new([]),
 	};
 	mirror_channels.write().push(opened);
@@ -427,9 +444,9 @@ fun joined(head: List<StoreStep>, tail: List<StoreStep>): List<StoreStep> {
 
 /// Wake `slot` of `channel` for the turn, and owe the channel one flush at its
 /// settle: the slot's subscription runs this, holding no part of the slot tree.
-fun mark(channel: i32, slot: i32, dirty: Shared<List<i32>>, pending: Shared<i32>) {
+fun mark(channel: i32, slot: i32, dirty: Shared<HashSet<i32>>, pending: Shared<i32>) {
 	if !dirty.read().contains(slot) {
-		dirty.write().push(slot);
+		dirty.write().insert(slot);
 	}
 	schedule(channel, pending);
 }
@@ -454,28 +471,35 @@ impl MirrorChannel {
 	/// base is subscribed from the reply on: its seed rides in the reply.
 	fun grant(self, path: List<StoreStep>, made: MirrorWalkers): i32 {
 		let identity = store_identity_at(self.root, path);
-		for held in self.grants.read() {
-			if held.identity == identity {
-				held.holds.write() = held.holds.read() + 1;
-				ret held.base;
-			}
+		match self.bases.read().get(identity) {
+			Some(let base) => match self.grants.read().get(base) {
+				Some(let held) => {
+					held.holds.write() = held.holds.read() + 1;
+					ret held.base;
+				},
+				None => {},
+			},
+			None => {},
 		}
 		let base = self.next_base.read();
 		self.next_base.write() = base - 1;
 		self.grants
 			.write()
-			.push(MirrorGrant { base, path, identity, holds = Shared::new(1), walkers = made });
+			.insert(base, MirrorGrant {
+				base,
+				path,
+				identity,
+				holds = Shared::new(1),
+				walkers = made,
+				under = Shared::new(HashSet::new()),
+			});
+		self.bases.write().insert(identity, base);
 		self.open_slot(base, base, [], path);
 		base
 	}
 
 	fun grant_of(self, base: i32): Option<MirrorGrant> {
-		for held in self.grants.read() {
-			if held.base == base {
-				ret Some(held);
-			}
-		}
-		None
+		self.grants.read().get(base)
 	}
 
 	/// Stand a boundary forward: a store subscription at `path` that marks `slot`
@@ -491,12 +515,26 @@ impl MirrorChannel {
 		let watch = turn_scope
 			.clear(|| store_watch(root, path, || mark(channel, slot, dirty, pending)));
 		let keys = match self.grant_of(base) {
-			Some(let grant) => (grant.walkers.reach)(rel) == StoreReach::Keyed,
+			Some(let grant) => {
+				grant.under.write().insert(slot);
+				(grant.walkers.reach)(rel) == StoreReach::Keyed
+			},
 			None => false,
 		};
+		let stamp = self.next_stamp.read();
+		self.next_stamp.write() = stamp + 1;
 		self.slots
 			.write()
-			.push(MirrorSlot { slot, base, rel, path, watch, holds = Shared::new(1), keys });
+			.insert(slot, MirrorSlot {
+				slot,
+				base,
+				rel,
+				path,
+				watch,
+				holds = Shared::new(1),
+				keys,
+				stamp,
+			});
 	}
 
 	/// One control frame, past the channel id.
@@ -548,11 +586,12 @@ impl MirrorChannel {
 	}
 
 	fun hold_slot(self, slot: i32, base: i32, rel: List<StoreStep>) {
-		for held in self.slots.read() {
-			if held.slot == slot {
+		match self.slots.read().get(slot) {
+			Some(let held) => {
 				held.holds.write() = held.holds.read() + 1;
 				ret;
-			}
+			},
+			None => {},
 		}
 		match self.grant_of(base) {
 			Some(let held) => {
@@ -596,48 +635,56 @@ impl MirrorChannel {
 		}
 	}
 
+	/// One hold on `slot` released: with its last the slot goes — its store
+	/// subscription disposed, the slot out of its grant and the table, and the
+	/// client owed the `Gone` that acknowledges the release (A169). In place, by
+	/// number (M172): a release costs the slot, not the table.
 	fun release_slot(self, slot: i32) {
-		mut kept: List<MirrorSlot> = [];
-		for held in self.slots.read() {
-			if held.slot == slot {
+		match self.slots.read().get(slot) {
+			Some(let held) => {
 				let left = held.holds.read() - 1;
 				held.holds.write() = left;
 				if left <= 0 {
-					held.watch.dispose();
+					self.close_slot(held);
 					self.acked.write().push(slot);
-					jump continue;
 				}
-			}
-			kept.push(held);
+			},
+			None => {},
 		}
-		self.slots.write() = kept;
 	}
 
+	/// Take `held` down: its subscription, its place under its grant, its entry.
+	fun close_slot(self, held: MirrorSlot) {
+		held.watch.dispose();
+		self.slots.write().remove(held.slot);
+		match self.grant_of(held.base) {
+			Some(let grant) => grant.under.write().remove(held.slot),
+			None => {},
+		}
+	}
+
+	/// One hold on the grant whose base is `base` released: with its last the grant
+	/// goes, and every slot stood under it — the base's own among them.
 	fun release_grant(self, base: i32) {
-		mut kept: List<MirrorGrant> = [];
-		mut gone = false;
-		for held in self.grants.read() {
-			if held.base == base {
+		match self.grants.read().get(base) {
+			Some(let held) => {
 				let left = held.holds.read() - 1;
 				held.holds.write() = left;
 				if left <= 0 {
-					gone = true;
-					jump continue;
+					for slot in held.under.read().values() {
+						match self.slots.read().get(slot) {
+							Some(let under) => {
+								under.watch.dispose();
+								self.slots.write().remove(slot);
+							},
+							None => {},
+						}
+					}
+					self.grants.write().remove(base);
+					self.bases.write().remove(held.identity);
 				}
-			}
-			kept.push(held);
-		}
-		self.grants.write() = kept;
-		if gone {
-			mut slots: List<MirrorSlot> = [];
-			for held in self.slots.read() {
-				if held.base == base {
-					held.watch.dispose();
-				} else {
-					slots.push(held);
-				}
-			}
-			self.slots.write() = slots;
+			},
+			None => {},
 		}
 	}
 
@@ -645,11 +692,12 @@ impl MirrorChannel {
 	/// subscription released, the cursor off the root's wire log (the last one
 	/// takes the log with it), and the channel out of the table.
 	fun teardown(self) {
-		for held in self.slots.read() {
+		for held in self.slots.read().values() {
 			held.watch.dispose();
 		}
-		self.slots.write() = [];
-		self.grants.write() = [];
+		self.slots.write() = HashMap::new();
+		self.grants.write() = HashMap::new();
+		self.bases.write() = HashMap::new();
 		store_wire_detach(self.root, self.cursor);
 		mut kept: List<MirrorChannel> = [];
 		for held in mirror_channels.read() {
@@ -665,25 +713,60 @@ impl MirrorChannel {
 	fun flush(self) {
 		self.pending.write() = 0 - 1;
 		let dirty = self.dirty.read();
-		self.dirty.write() = [];
+		self.dirty.write() = HashSet::new();
 		let seeding = self.seeding.read();
 		self.seeding.write() = [];
 		let written = store_wire_since(self.root, self.cursor);
 		let acked = self.acked.read();
 		self.acked.write() = [];
 		mut ops: List<MirrorOp> = [];
-		for held in self.slots.read() {
+		// The slots the turn touched — owed a seed, or woken — in the order they
+		// were stood, which is the order the ops have always crossed in: the table
+		// is keyed, so the order is the stamp's (M172).
+		mut touched: List<(i32, i32, bool)> = [];
+		for slot in seeding {
+			match self.slots.read().get(slot) {
+				Some(let held) => touched.push((held.stamp, slot, true)),
+				None => {},
+			}
+		}
+		let seeded = seeding.to_set();
+		for slot in dirty.values() {
+			if seeded.contains(slot) {
+				jump continue;
+			}
+			match self.slots.read().get(slot) {
+				Some(let held) => touched.push((held.stamp, slot, false)),
+				None => {},
+			}
+		}
+		touched = touched.sort_by(|a, b| {
+			let (left, _left_slot, _left_seed) = a;
+			let (right, _right_slot, _right_seed) = b;
+			if left < right {
+				Ordering::Less
+			} else if left > right {
+				Ordering::Greater
+			} else {
+				Ordering::Equal
+			}
+		});
+		for entry in touched {
+			let (_stamp, slot, seed) = entry;
+			let held = match self.slots.read().get(slot) {
+				Some(let found) => found,
+				None => {
+					jump continue;
+				},
+			};
 			let grant = match self.grant_of(held.base) {
 				Some(let found) => found,
 				None => {
 					jump continue;
 				},
 			};
-			if seeding.contains(held.slot) {
+			if seed {
 				ops.push(seed_or_gone(grant, held));
-				jump continue;
-			}
-			if !dirty.contains(held.slot) {
 				jump continue;
 			}
 			match written {
@@ -946,12 +1029,15 @@ fun composed(
 // grant needs no `Subscribe`: the reply that minted it was its subscription.
 
 /// One slot the client named: the grant it stands under, the boundary it
-/// subscribes, and how many holds it has.
+/// subscribes, how many holds it has, and its place in the view's naming order
+/// (`stamp`: what a turn's `Unsubscribe` is sorted by, so the slots cross in the
+/// order they were named whatever order their holds went in — M172).
 struct ClientSlot {
 	slot: i32,
 	base: i32,
 	boundary: MirrorBoundary,
 	holds: Shared<i32>,
+	stamp: i32,
 }
 
 /// The client's end of one mirrored channel.
@@ -964,13 +1050,23 @@ struct MirrorView {
 	routes: Shared<List<MirrorRoute>>,
 	transport: DuplexEnd,
 	codec: Codec,
-	slots: Shared<List<ClientSlot>>,
+	/// The slots by slot number, and `named` the slot of each boundary by the
+	/// boundary's identity: a hold finds its slot and a release its entry without a
+	/// walk, and both mutate the table in place (M172).
+	slots: Shared<HashMap<i32, ClientSlot>>,
+	named: Shared<HashMap<i32, i32>>,
+	/// How many named slots stand strictly BELOW each place in the replica, by the
+	/// place's canonical hash — kept as slots come and go, so a released boundary
+	/// learns whether something still reads its value there without a walk of the
+	/// table (`leave_replica`, M172).
+	covered: Shared<HashMap<Hash, i32>>,
 	/// Released slots whose frames may still be in flight: a frame's values are
 	/// read at their own types, so a slot the client let go of still needs its
 	/// reader until the server acknowledges the release with `Gone` (A169). They
-	/// land in nothing.
-	retired: Shared<List<ClientSlot>>,
+	/// land in nothing. By slot number.
+	retired: Shared<HashMap<i32, ClientSlot>>,
 	next_slot: Shared<i32>,
+	next_stamp: Shared<i32>,
 	subscribing: Shared<List<i32>>,
 	unsubscribing: Shared<List<i32>>,
 	pending: Shared<i32>,
@@ -1015,9 +1111,12 @@ fun mirror_view(client: ReactiveClient, channel: i32): MirrorView {
 		routes = client.routes,
 		transport = client.transport,
 		codec = client.codec,
-		slots = Shared::new([]),
-		retired = Shared::new([]),
+		slots = Shared::new(HashMap::new()),
+		named = Shared::new(HashMap::new()),
+		covered = Shared::new(HashMap::new()),
+		retired = Shared::new(HashMap::new()),
 		next_slot = Shared::new(0),
+		next_stamp = Shared::new(0),
 		subscribing = Shared::new([]),
 		unsubscribing = Shared::new([]),
 		pending = Shared::new(0 - 1),
@@ -1079,13 +1178,49 @@ fun describe_wire_path(path: List<MirrorStep>, serializer: &mut Serializer) {
 impl MirrorView {
 	/// The grant's base is a slot of its own, subscribed by the reply.
 	fun adopt_base(self, base: i32, boundary: MirrorBoundary) {
-		for held in self.slots.read() {
-			if held.slot == base {
+		match self.slots.read().get(base) {
+			Some(let held) => {
 				held.holds.write() = held.holds.read() + 1;
 				ret;
-			}
+			},
+			None => {},
 		}
-		self.slots.write().push(ClientSlot { slot = base, base, boundary, holds = Shared::new(1) });
+		self.name_slot(base, base, boundary);
+	}
+
+	/// Stand `slot` in the table under `base`, next in the naming order.
+	fun name_slot(self, slot: i32, base: i32, boundary: MirrorBoundary) {
+		let stamp = self.next_stamp.read();
+		self.next_stamp.write() = stamp + 1;
+		self.named.write().insert(boundary.identity, slot);
+		self.cover(boundary.place, 1);
+		self.slots
+			.write()
+			.insert(slot, ClientSlot { slot, base, boundary, holds = Shared::new(1), stamp });
+	}
+
+	/// Take `slot` out of the table: it is no longer named, and it no longer covers
+	/// the places above its own.
+	fun unname_slot(self, held: ClientSlot) {
+		self.slots.write().remove(held.slot);
+		self.named.write().remove(held.boundary.identity);
+		self.cover(held.boundary.place, 0 - 1);
+	}
+
+	/// Count a slot at `place` in (`by` 1) or out (`by` -1) of `covered`, for every
+	/// place strictly above it.
+	fun cover(self, place: List<StoreStep>, by: i32) {
+		mut above: List<StoreStep> = [];
+		for step in place {
+			let key = canonical_hash(above);
+			let now = self.covered.read().get(key).unwrap_or(0) + by;
+			if now > 0 {
+				self.covered.write().insert(key, now);
+			} else {
+				self.covered.write().remove(key);
+			}
+			above.push(step);
+		}
 	}
 
 	/// Hold `boundary`, a boundary under the grant whose base is `base`, and answer
@@ -1096,15 +1231,19 @@ impl MirrorView {
 		if boundary.path.is_empty() {
 			ret || {};
 		}
-		for held in self.slots.read() {
-			if held.boundary.identity == boundary.identity {
-				held.holds.write() = held.holds.read() + 1;
-				ret self.releasing(held.slot);
-			}
+		match self.named.read().get(boundary.identity) {
+			Some(let slot) => match self.slots.read().get(slot) {
+				Some(let held) => {
+					held.holds.write() = held.holds.read() + 1;
+					ret self.releasing(slot);
+				},
+				None => {},
+			},
+			None => {},
 		}
 		let slot = self.next_slot.read();
 		self.next_slot.write() = slot + 1;
-		self.slots.write().push(ClientSlot { slot, base, boundary, holds = Shared::new(1) });
+		self.name_slot(slot, base, boundary);
 		self.subscribing.write().push(slot);
 		self.schedule();
 		self.releasing(slot)
@@ -1121,25 +1260,25 @@ impl MirrorView {
 	/// `Unsubscribe`, after the client slots under it, and the server lets the
 	/// grant go (and the channel with its last grant).
 	fun release_base(self, base: i32) {
-		for held in self.slots.read() {
-			if held.slot == base {
-				held.holds.write() = 0;
-			}
+		match self.slots.read().get(base) {
+			Some(let held) => held.holds.write() = 0,
+			None => {},
 		}
 		self.unsubscribing.write().push(base);
 		self.schedule();
 	}
 
 	fun release(self, slot: i32) {
-		for held in self.slots.read() {
-			if held.slot == slot {
+		match self.slots.read().get(slot) {
+			Some(let held) => {
 				let left = held.holds.read() - 1;
 				held.holds.write() = left;
 				if left == 0 {
 					self.unsubscribing.write().push(slot);
 					self.schedule_release();
 				}
-			}
+			},
+			None => {},
 		}
 	}
 
@@ -1184,34 +1323,65 @@ impl MirrorView {
 		self.subscribing.write() = [];
 		let closed = self.unsubscribing.read();
 		self.unsubscribing.write() = [];
+		// Only the slots the turn named or let go of are looked at, each by its
+		// number (M172): a flush costs what the turn did, not the table.
 		mut subscribe: List<ClientSlot> = [];
-		mut unsubscribe: List<i32> = [];
-		mut kept: List<ClientSlot> = [];
-		for held in self.slots.read() {
-			let alive = held.holds.read() > 0;
-			if opened.contains(held.slot) && alive {
-				subscribe.push(held);
+		for slot in opened {
+			match self.slots.read().get(slot) {
+				Some(let held) => {
+					if held.holds.read() > 0 {
+						subscribe.push(held);
+					}
+				},
+				None => {},
 			}
-			if closed.contains(held.slot) && !alive {
-				// The key leaves the replica with its last hold: memory follows
-				// demand (§6.2) — but a base keeps its last value for the next mint
-				// to compare against.
-				if held.slot >= 0 {
-					self.parked.write().push(held);
-				}
-				// A slot whose `Subscribe` went out is told off, and its reader
-				// stays for the frames still in flight — until the server's `Gone`
-				// acknowledges the release (A169). One opened and closed within the
-				// turn never reached the wire.
-				if !opened.contains(held.slot) {
-					unsubscribe.push(held.slot);
-					self.retired.write().push(held);
-				}
+		}
+		let fresh = opened.to_set();
+		mut leaving: List<(i32, i32)> = [];
+		for slot in closed {
+			let held = match self.slots.read().get(slot) {
+				Some(let found) => found,
+				// Let go of twice this turn: the first time took it.
+				None => {
+					jump continue;
+				},
+			};
+			if held.holds.read() > 0 {
 				jump continue;
 			}
-			kept.push(held);
+			self.unname_slot(held);
+			// The key leaves the replica with its last hold: memory follows demand
+			// (§6.2) — but a base keeps its last value for the next mint to compare
+			// against.
+			if slot >= 0 {
+				self.parked.write().push(held);
+			}
+			// A slot whose `Subscribe` went out is told off, and its reader stays
+			// for the frames still in flight — until the server's `Gone`
+			// acknowledges the release (A169). One opened and closed within the
+			// turn never reached the wire.
+			if !fresh.contains(slot) {
+				leaving.push((held.stamp, slot));
+				self.retired.write().insert(slot, held);
+			}
 		}
-		self.slots.write() = kept;
+		// Told off in the order they were named, whatever order their holds went.
+		leaving = leaving.sort_by(|a, b| {
+			let (left, _left_slot) = a;
+			let (right, _right_slot) = b;
+			if left < right {
+				Ordering::Less
+			} else if left > right {
+				Ordering::Greater
+			} else {
+				Ordering::Equal
+			}
+		});
+		mut unsubscribe: List<i32> = [];
+		for entry in leaving {
+			let (_stamp, slot) = entry;
+			unsubscribe.push(slot);
+		}
 		self.leave_replica();
 		let codec = self.codec;
 		let channel = self.channel;
@@ -1255,19 +1425,13 @@ impl MirrorView {
 	/// follows demand (§6.2), and a boundary's value stays only while a boundary
 	/// inside it is still watched.
 	fun leave_replica(self) {
+		if self.parked.read().is_empty() {
+			ret;
+		}
 		mut staying: List<ClientSlot> = [];
 		mut leaving: List<ClientSlot> = [];
 		for parked in self.parked.read() {
-			mut below = false;
-			for held in self.slots.read() {
-				if held.boundary.place.len() > parked.boundary.place.len() && starts_with(
-					held.boundary.place,
-					parked.boundary.place,
-				) {
-					below = true;
-				}
-			}
-			if below {
+			if self.covered.read().contains_key(canonical_hash(parked.boundary.place)) {
 				staying.push(parked);
 			} else {
 				leaving.push(parked);
@@ -1316,33 +1480,18 @@ impl MirrorView {
 
 	/// Forget a released slot's reader, if `slot` is one: whether it was.
 	fun forget_retired(self, slot: i32): bool {
-		mut kept: List<ClientSlot> = [];
-		mut found = false;
-		for held in self.retired.read() {
-			if held.slot == slot {
-				found = true;
-			} else {
-				kept.push(held);
-			}
+		if !self.retired.read().contains_key(slot) {
+			ret false;
 		}
-		if found {
-			self.retired.write() = kept;
-		}
-		found
+		self.retired.write().remove(slot);
+		true
 	}
 
 	fun slot_named(self, slot: i32): Option<ClientSlot> {
-		for held in self.slots.read() {
-			if held.slot == slot {
-				ret Some(held);
-			}
+		match self.slots.read().get(slot) {
+			Some(let held) => Some(held),
+			None => self.retired.read().get(slot),
 		}
-		for held in self.retired.read() {
-			if held.slot == slot {
-				ret Some(held);
-			}
-		}
-		None
 	}
 
 	/// One `Patch`: each op lands through its slot's boundary, in order, inside ONE
@@ -1474,7 +1623,7 @@ impl MirrorView {
 
 /// The view whose slot table is `slots` — how a closure that holds only the table
 /// finds its view again.
-fun find_view(slots: Shared<List<ClientSlot>>): Option<MirrorView> {
+fun find_view(slots: Shared<HashMap<i32, ClientSlot>>): Option<MirrorView> {
 	let identity = slots.identity();
 	for entry in mirror_views.read() {
 		let (_owner, view) = entry;
@@ -1521,7 +1670,11 @@ struct StoreMint<T> {
 	call: async || Result<StoreReply<T>, RpcError>,
 	bound: Shared<Option<(MirrorView, i32)>>,
 	asking: Shared<bool>,
-	holds: Shared<List<MintHold>>,
+	/// The holds by id, and `holding` how many stand on each boundary by the
+	/// boundary's identity — a hold and a release each cost their own entry, not a
+	/// walk of every hold the mirror carries (M172).
+	holds: Shared<HashMap<i32, MintHold>>,
+	holding: Shared<HashMap<i32, i32>>,
 	status: SignalCell<StoreMintStatus>,
 	settle_id: i32,
 	/// What to run when the mirror lets its grant go: the origin table drops its
@@ -1530,12 +1683,13 @@ struct StoreMint<T> {
 	/// The identities of the boundaries heard from in this binding — the base's
 	/// with the reply, a key's with its first `Seed` or `Gone` — which is what
 	/// `known` answers `Heard` for.
-	heard: Shared<List<i32>>,
+	heard: Shared<HashSet<i32>>,
 	/// Moves whenever `known` may answer differently: the link's `heard`.
 	epoch: SignalCell<i32>,
-	/// One cell per boundary a handle's `states()` follows (`follow`), set only
-	/// when its answer changes, and dropped with the boundary's last hold.
-	cells: Shared<List<(i32, SignalCell<MirrorKnown>)>>,
+	/// One cell per boundary a handle's `states()` follows (`follow`), by the
+	/// boundary's identity, set only when its answer changes, and dropped with the
+	/// boundary's last hold.
+	cells: Shared<HashMap<i32, SignalCell<MirrorKnown>>>,
 	/// The key the mint's reconnect hooks are kept under on its client (A153 S4).
 	hooks: i32,
 }
@@ -1549,7 +1703,8 @@ impl StoreMint<type T: StoreWire + Storable> {
 		let release: Shared<Option<|| void>> = Shared::new(None);
 		let mint = self;
 		let boundary = turn_scope.clear(|| mint.hearing(given));
-		self.holds.write().push(MintHold { id, boundary, release });
+		self.holds.write().insert(id, MintHold { id, boundary, release });
+		self.count_hold(boundary.identity, 1);
 		match self.bound.read() {
 			Some(let binding) => {
 				let (view, base) = binding;
@@ -1566,46 +1721,47 @@ impl StoreMint<type T: StoreWire + Storable> {
 		turn_scope.clear(|| || mint.release(id))
 	}
 
-	fun release(self, id: i32) {
-		mut kept: List<MintHold> = [];
-		mut gone: List<i32> = [];
-		mut unbound: List<MirrorBoundary> = [];
-		for held in self.holds.read() {
-			if held.id == id {
-				match held.release.read() {
-					Some(let release) => release(),
-					// Not on a channel (unbound, or its view died with a dropped
-					// connection): nothing to send, but its key still leaves the
-					// replica with its last hold, as the channel's flush does.
-					None => unbound.push(held.boundary),
-				}
-				gone.push(held.boundary.identity);
-			} else {
-				kept.push(held);
-			}
+	/// Count one hold more (`by` 1) or fewer (`by` -1) on the boundary whose
+	/// identity is `identity`; whether any still stands.
+	fun count_hold(self, identity: i32, by: i32): bool {
+		let now = self.holding.read().get(identity).unwrap_or(0) + by;
+		if now > 0 {
+			self.holding.write().insert(identity, now);
+			true
+		} else {
+			self.holding.write().remove(identity);
+			false
 		}
-		self.holds.write() = kept;
-		for boundary in unbound {
-			if !boundary.path.is_empty() && !self.holding(boundary.identity) {
-				batch(|| (boundary.gone)());
-			}
+	}
+
+	fun release(self, id: i32) {
+		let held = match self.holds.read().get(id) {
+			Some(let found) => found,
+			None => {
+				ret;
+			},
+		};
+		self.holds.write().remove(id);
+		let identity = held.boundary.identity;
+		let still_held = self.count_hold(identity, 0 - 1);
+		match held.release.read() {
+			Some(let release) => release(),
+			// Not on a channel (unbound, or its view died with a dropped
+			// connection): nothing to send, but its key still leaves the replica
+			// with its last hold, as the channel's flush does.
+			None => {
+				if !held.boundary.path.is_empty() && !still_held {
+					batch(|| (held.boundary.gone)());
+				}
+			},
 		}
 		// A boundary nobody holds any more is owed a fresh seed when it is held
 		// again: its slot goes with its last hold.
-		for identity in gone {
-			if !self.holding(identity) {
-				self.unhear(identity);
-				mut cells: List<(i32, SignalCell<MirrorKnown>)> = [];
-				for entry in self.cells.read() {
-					let (held, _cell) = entry;
-					if held != identity {
-						cells.push(entry);
-					}
-				}
-				self.cells.write() = cells;
-			}
+		if !still_held {
+			self.unhear(identity);
+			self.cells.write().remove(identity);
 		}
-		if kept.is_empty() {
+		if self.holds.read().is_empty() {
 			// At the settle of the turn the release happens in, so a release and a
 			// re-hold in one turn keep the grant.
 			let mint = self;
@@ -1624,7 +1780,7 @@ impl StoreMint<type T: StoreWire + Storable> {
 				self.bound.write() = None;
 				view.release_base(base);
 				self.status.set(StoreMintStatus::Waiting);
-				self.heard.write() = [];
+				self.heard.write() = HashSet::new();
 				self.touch();
 				self.client.unenlist_store(self.hooks);
 				for retire in self.retire.read() {
@@ -1662,7 +1818,7 @@ impl StoreMint<type T: StoreWire + Storable> {
 	/// `known` may answer differently now: every followed boundary's cell takes its
 	/// answer if it moved, and the link's `heard` moves.
 	fun touch(self) {
-		for entry in self.cells.read() {
+		for entry in self.cells.read().entries() {
 			let (identity, cell) = entry;
 			let now = self.known(identity);
 			if cell.get() != now {
@@ -1675,24 +1831,18 @@ impl StoreMint<type T: StoreWire + Storable> {
 	/// The cell that follows what `known` answers for `identity` (the link's
 	/// `follow`).
 	fun follow(self, identity: i32): SignalCell<MirrorKnown> {
-		for entry in self.cells.read() {
-			let (held, cell) = entry;
-			if held == identity {
-				ret cell;
-			}
+		match self.cells.read().get(identity) {
+			Some(let cell) => cell,
+			None => {
+				let cell = SignalCell::new(self.known(identity));
+				self.cells.write().insert(identity, cell);
+				cell
+			},
 		}
-		let cell = SignalCell::new(self.known(identity));
-		self.cells.write().push((identity, cell));
-		cell
 	}
 
 	fun holding(self, identity: i32): bool {
-		for held in self.holds.read() {
-			if held.boundary.identity == identity {
-				ret true;
-			}
-		}
-		false
+		self.holding.read().contains_key(identity)
 	}
 
 	/// A frame for the boundary `identity` landed. Only a HELD boundary is heard: a
@@ -1700,20 +1850,14 @@ impl StoreMint<type T: StoreWire + Storable> {
 	/// land without saying anything about a boundary nobody watches.
 	fun hear(self, identity: i32) {
 		if self.holding(identity) && !self.heard.read().contains(identity) {
-			self.heard.write().push(identity);
+			self.heard.write().insert(identity);
 			self.touch();
 		}
 	}
 
 	fun unhear(self, identity: i32) {
 		if self.heard.read().contains(identity) {
-			mut kept: List<i32> = [];
-			for held in self.heard.read() {
-				if held != identity {
-					kept.push(held);
-				}
-			}
-			self.heard.write() = kept;
+			self.heard.write().remove(identity);
 			self.touch();
 		}
 	}
@@ -1749,13 +1893,13 @@ impl StoreMint<type T: StoreWire + Storable> {
 				let (view, _base) = binding;
 				view.kill();
 				self.bound.write() = None;
-				for held in self.holds.read() {
+				for held in self.holds.read().values() {
 					held.release.write() = None;
 				}
 			},
 			None => {},
 		}
-		self.heard.write() = [];
+		self.heard.write() = HashSet::new();
 		self.touch();
 	}
 
@@ -1830,9 +1974,9 @@ impl StoreMint<type T: StoreWire + Storable> {
 			self.status.set(StoreMintStatus::Bound);
 			// The reply carried the base's seed: the base is heard, and every other
 			// boundary waits for its own.
-			self.heard.write() = [store_identity_at(self.replica.root, [])];
+			self.heard.write() = [store_identity_at(self.replica.root, [])].to_set();
 			self.touch();
-			for held in self.holds.read() {
+			for held in self.holds.read().values() {
 				held.release.write() = Some(view.hold(held.boundary, reply.base));
 			}
 		});
@@ -1917,13 +2061,14 @@ fun minted_store<T: StoreWire + Storable>(
 		call,
 		bound = Shared::new(None),
 		asking = Shared::new(false),
-		holds = Shared::new([]),
+		holds = Shared::new(HashMap::new()),
+		holding = Shared::new(HashMap::new()),
 		status = SignalCell::new(StoreMintStatus::Waiting),
 		settle_id = fresh_id(),
 		retire,
-		heard = Shared::new([]),
+		heard = Shared::new(HashSet::new()),
 		epoch = SignalCell::new(0),
-		cells = Shared::new([]),
+		cells = Shared::new(HashMap::new()),
 		hooks = fresh_id(),
 	};
 	let link = turn_scope.clear(|| MirrorLink {

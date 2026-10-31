@@ -325,6 +325,12 @@ function defer_to_owner(cleanup, $Z) {
 	}
 	return $ab;
 }
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
+}
 function splice_start(held2, at2) {
 	let $k = null;
 	if (at2 > held2) {
@@ -660,7 +666,7 @@ function set_at(self, at2, value2, $B) {
 	}
 	return $D;
 }
-function set2(self, value2, $E) {
+function set2(self, value2, $E, caller) {
 	self[0].v = __clone(value2);
 	record(self[2], [ 2, __clone(value2) ]);
 	publish(self, $E);
@@ -767,7 +773,7 @@ function map_each(source2, g, $a, $b) {
 				$i = set_at(out, at3, g(value2), $a);
 			} else if ($h[0] === 2) {
 				const items = $h[1];
-				$i = set2(out, map(items, g), $a);
+				$i = set2(out, map(items, g), $a, "std/src/reactive/delta.vl:1143:36");
 			} else {
 				const from = $h[1];
 				const count = $h[2];
@@ -837,7 +843,7 @@ function set_at2(self, at2, value2, $B) {
 	}
 	return $aq;
 }
-function set3(self, value2, $E) {
+function set3(self, value2, $E, caller) {
 	self[0].v = __clone(value2);
 	record2(self[2], [ 2, __clone(value2) ]);
 	publish2(self, $E);
@@ -890,7 +896,7 @@ function map_each2(source2, g, $a, $b) {
 				$ak = set_at2(out, at3, g(value2), $a);
 			} else if ($aj[0] === 2) {
 				const items = $aj[1];
-				$ak = set3(out, map(items, g), $a);
+				$ak = set3(out, map(items, g), $a, "std/src/reactive/delta.vl:1143:36");
 			} else {
 				const from = $aj[1];
 				const count = $aj[2];
@@ -906,12 +912,12 @@ function map_each2(source2, g, $a, $b) {
 	}, $b);
 	return out;
 }
-function on_change(self, observer) {
-	return attach_observer2(self, (value2) => {
+function on_change(self, observer, caller) {
+	return place_subscription(attach_observer2(self, (value2) => {
 		return (() => {
 			return observer(value2, [ 1 ]);
 		})();
-	}, false);
+	}, false), caller);
 }
 function remove_at(self, at2, $au) {
 	return splice2(self, at2, 1, [  ], $au);
@@ -1119,7 +1125,7 @@ function map_each3(source2, g, $a, $b) {
 				$bd = set_at2(out, at3, g(value2), $a);
 			} else if ($bc[0] === 2) {
 				const items = $bc[1];
-				$bd = set3(out, map(items, g), $a);
+				$bd = set3(out, map(items, g), $a, "std/src/reactive/delta.vl:1143:36");
 			} else {
 				const from = $bc[1];
 				const count = $bc[2];
@@ -1135,12 +1141,12 @@ function map_each3(source2, g, $a, $b) {
 	}, $b);
 	return out;
 }
-function on_change2(self, observer) {
-	return attach_observer3(self, (value2) => {
+function on_change2(self, observer, caller) {
+	return place_subscription(attach_observer3(self, (value2) => {
 		return (() => {
 			return observer(value2, [ 1 ]);
 		})();
-	}, false);
+	}, false), caller);
 }
 function push3(self, value2, $ac) {
 	return splice3(self, size(self), 0, [ __clone(value2) ], $ac);
@@ -1242,6 +1248,8 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
 const owner_lists_allocated_count = __shared_new(0);
@@ -1263,7 +1271,7 @@ const derived = map_each2(source, counted, [ 1 ], [ 1 ]);
 on_change(__clone(source), (_list, $at) => {
 	notifications.v = notifications.v + 1;
 	return;
-});
+}, "list-cell.vl:155:22");
 expect("seeded calls", calls.v, 0);
 push(source, "aa", [ 1 ]);
 push(source, "bbb", [ 1 ]);
@@ -1329,7 +1337,7 @@ edit(source, (list) => {
 law("fill through the bound", source, derived);
 console.log("after fill: " + render(get(source)));
 const before_set = calls.v;
-set3(source, [ "n", "oo", "ppp" ], [ 1 ]);
+set3(source, [ "n", "oo", "ppp" ], [ 1 ], "list-cell.vl:243:9");
 law("set(whole)", source, derived);
 expect("set(whole) is the honest N", calls.v - before_set, 3);
 const before_reconcile = calls.v;
@@ -1390,7 +1398,7 @@ const walk_notifications = __shared_new(0);
 on_change2(__clone(walk), (_list, $be) => {
 	walk_notifications.v = walk_notifications.v + 1;
 	return;
-});
+}, "list-cell.vl:322:25");
 walk_calls.v = 0;
 chain_calls.v = 0;
 let naive = 0;
@@ -1429,7 +1437,7 @@ while (turn <= 300) {
 					fresh.push(next_random(100));
 					fill_index = fill_index + 1;
 				}
-				set3(walk, fresh, [ 0, $bf ]);
+				set3(walk, fresh, [ 0, $bf ], "list-cell.vl:366:11");
 			} else if (choice < 22) {
 				let edited = get(walk);
 				__at_put(edited, pick(size3), next_random(100), "list-cell.vl:371:6");

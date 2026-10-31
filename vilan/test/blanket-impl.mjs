@@ -149,6 +149,12 @@ function queue_wakes(turn, subscribers, traced, cause) {
 		enqueue(turn, subscribers);
 	}
 }
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
+}
 function bind(self, react) {
 	react(self);
 }
@@ -165,8 +171,8 @@ function new2(value, caller) {
 	}
 	return cell;
 }
-function new3(value) {
-	return new2(value, "std/src/reactive.vl:2448:15");
+function new3(value, caller) {
+	return new2(value, caller);
 }
 function attach(signal, subscriber) {
 	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
@@ -197,17 +203,17 @@ function attach_observer(self, observer, immediately) {
 	}
 	return subscription;
 }
-function sub(self, observer) {
-	return attach_observer(self, (value) => {
+function sub(self, observer, caller) {
+	return place_subscription(attach_observer(self, (value) => {
 		return (() => {
 			return observer(value, [ 1 ]);
 		})();
-	}, true);
+	}, true), caller);
 }
 function bind2(self, react) {
 	sub(__clone(self), (value, $a) => {
 		return react(value);
-	});
+	}, "blanket-impl.vl:24:24");
 }
 function badge2(label) {
 	bind2(label, (text) => {
@@ -309,10 +315,12 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
 badge("static");
-const live = new3("first");
+const live = new3("first", "blanket-impl.vl:84:21");
 badge2(live);
 set(live, "second", [ 1 ], "blanket-impl.vl:86:7");
 holder(live);

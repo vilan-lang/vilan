@@ -1177,6 +1177,10 @@ const PLATFORM_BOUND_REQUIRED: &[&str] = &[
     // reader over the program's `.stdin` fixture.
     "process-env.vl",
     "stdin-lines.vl",
+    // A173 S2: `process::keys()` and the std `KeyDecoder` — one decoder in
+    // vilan, the bytes from each backend's shared stdin pump.
+    "key-decoder.vl",
+    "stdin-keys.vl",
 ];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
@@ -4229,7 +4233,7 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
     let source = String::from_utf8_lossy(&output.stdout);
     for needle in [
         "vilan_rt::http::create_server",
-        "vilan_rt::http::read_request_bytes",
+        ").body_left_unread(",
         ").listen(",
         ").address()",
         ").port()",
@@ -4262,12 +4266,13 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
 /// reaches the same server.
 const HTTP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| Response::builder()\n",
     "\t\t\t.set_header(\"Content-Type\", \"text/plain\")\n",
     "\t\t\t.body(\"hello\\n\")\n",
@@ -4275,6 +4280,7 @@ const HTTP_PROBE: &str = concat!(
     "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -4502,7 +4508,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "import std::bytes::encode_utf8;\n",
     "import std::crypto::sha256;\n",
     "import std::db::Database;\n",
-    "import std::http::{ Request, Response, Server };\n",
+    "import std::http::{ BodyLimits, Request, Response, Server };\n",
     "import std::io::print;\n",
     "import std::json::{ FromJson, Json };\n",
     "import std::option::Option::None;\n",
@@ -4549,10 +4555,12 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "\tregister(\"ada\", \"lovelace1\");\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| answer(request),\n",
     "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -5865,12 +5873,13 @@ fn a_stopped_server_ends_the_program_the_same_on_both_backends() {
 
 const STOP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| Response::builder().body(\"hello\\n\").build(),\n",
     "\t\ton_start = |started| {\n",
     "\t\t\tprint(\"started\");\n",
@@ -5878,6 +5887,7 @@ const STOP_PROBE: &str = concat!(
     "\t\t},\n",
     "\t\ton_stop = |stopped| print(\"stopped\"),\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -6096,18 +6106,20 @@ fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
 #[cfg(unix)]
 const OPEN_STREAM_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
     "\tlet server = Server {\n",
     "\t\tport = 0,\n",
+    "\t\thost = None,\n",
     "\t\trequest_handler = |request| Response::builder()\n",
     "\t\t\t.streaming(|stream| stream.send(\"first\\n\"))\n",
     "\t\t\t.build(),\n",
     "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
+    "\t\tbody_limits = BodyLimits::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -7672,8 +7684,14 @@ const MONO_PROBE: &str = concat!(
 /// its backslashes, so `print("a\nb")` printed `a\nb` natively against the JS
 /// backend's two lines — and because no program in the accepted corpus carried
 /// an escape, the differential never saw it. This is that class, as a probe,
-/// covering each of the six escapes vilan recognises, an unknown escape (which
-/// keeps both characters), and a literal backslash.
+/// covering every escape the lexer admits and a literal backslash.
+///
+/// B652: until Order 55 the decoder knew six escapes and kept every other one
+/// VERBATIM on both backends alike — `"\x41"` was four characters, `"\u{1F600}"`
+/// nine — so agreement alone hid it. The probe's output is now pinned whole,
+/// beside the agreement: the three lengths of the item, the `\u0301` combining
+/// mark of its five-`let` file (`q\u{301}b` is three units), a surrogate pair,
+/// and an escape on each side of an interpolation hole.
 #[test]
 fn a_string_literals_escapes_mean_the_same_thing_on_both_backends() {
     let staged = stage();
@@ -7698,10 +7716,10 @@ fn a_string_literals_escapes_mean_the_same_thing_on_both_backends() {
         "the two backends disagree about a string literal's escapes"
     );
     // Non-vacuous by construction: the JS side really does interpret them.
-    assert!(
-        String::from_utf8_lossy(&javascript.stdout).contains("a\nb"),
-        "the probe's `\\n` must be a real newline on the JS side: {:?}",
-        String::from_utf8_lossy(&javascript.stdout)
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        ESCAPE_PROBE_OUTPUT,
+        "the probe's escapes must decode to their values"
     );
 }
 
@@ -7714,9 +7732,20 @@ const ESCAPE_PROBE: &str = concat!(
     "\tprint(\"cr\\rhere\");\n",
     "\tprint(\"quote\\\"q\");\n",
     "\tprint(\"back\\\\slash\");\n",
-    "\tprint(\"unknown\\u0041escape\");\n",
+    "\tprint(\"unicode\\u0041escape\");\n",
+    "\tprint(\"\\x41\".len());\n",
+    "\tprint(\"\\u{1F600}\".len());\n",
+    "\tprint(\"a\\u{10FFFF}\".len());\n",
+    "\tprint(\"\\uD83D\\uDE00\" == \"\\u{1F600}\");\n",
+    "\tprint(i\"{\"\\b\".code_at(0)} {\"\\f\".code_at(0)} {\"\\v\".code_at(0)} {\"\\0\".code_at(0)} {\"\\'\"} {\"\\{\\}\"}\");\n",
+    "\tlet mark = \"\\u0301\";\n",
+    "\tprint(i\"q{mark}b\".len());\n",
+    "\tprint(\"q\\u0301b\".len());\n",
+    "\tprint(i\"\\x41{1}\\u{1F600}\".len());\n",
     "}\n",
 );
+
+const ESCAPE_PROBE_OUTPUT: &str = "a\nb\ntab\there\ncr\rhere\nquote\"q\nback\\slash\nunicodeAescape\n1\n2\n3\ntrue\n8 12 11 0 ' {}\n3\n3\n4\n";
 
 /// C15's measurement, as a pin rather than as a number in a report: the
 /// emitter's boxed-binding count is REACHABLE, and it is zero over a program
@@ -10207,6 +10236,222 @@ fn a173_both_backends_read_the_corpus_stdin_fixture_line_for_line() {
     }
 }
 
+/// A173 S2, terminal.md §4.4 step 2 — THE GATE: `stdin-keys.vl` reads its
+/// `.stdin` fixture through `process::keys()` and both backends decode the
+/// SAME bytes to the SAME keys, byte for byte: the arrows in CSI and SS3,
+/// ctrl+Right's modifier parameter, Home and End in their spellings, F1, F5,
+/// F12, Alt-x, Ctrl-C as a key, both Backspaces, Tab and Shift+Tab, UTF-8 of
+/// three widths, a bracketed paste holding an ESC and a newline (one `Paste`),
+/// an unknown sequence dropped whole, ESC ESC `q` (Escape, then Alt-q), and a
+/// lone ESC at the end — `Escape` under the pipe rule (§4.3), no timeout.
+///
+/// The keys are WRITTEN OUT, as the line pin above writes its lines: a harness
+/// that dropped the fixture would hand both backends an empty stdin, and two
+/// programs reading nothing agree perfectly. Under its own program name (N158).
+#[test]
+fn a173_s2_both_backends_decode_the_key_fixture_to_the_same_keys() {
+    let staged = stage();
+    for extension in ["vl", "stdin"] {
+        std::fs::copy(
+            staged.join(format!("stdin-keys.{extension}")),
+            staged.join(format!("native_probe_stdin_keys.{extension}")),
+        )
+        .expect("stage the key program under its own name");
+    }
+    let expected = concat!(
+        "1: Key::Char(\"a\") | Press { key = Key::Char(\"a\"), ctrl = false, alt = false, shift = false }\n",
+        "2: Key::Char(\"Z\") | Press { key = Key::Char(\"Z\"), ctrl = false, alt = false, shift = true }\n",
+        "3: Key::Enter | Press { key = Key::Enter, ctrl = false, alt = false, shift = false }\n",
+        "4: Key::Up | Press { key = Key::Up, ctrl = false, alt = false, shift = false }\n",
+        "5: Key::Down | Press { key = Key::Down, ctrl = false, alt = false, shift = false }\n",
+        "6: Key::Right | Press { key = Key::Right, ctrl = true, alt = false, shift = false }\n",
+        "7: Key::Home | Press { key = Key::Home, ctrl = false, alt = false, shift = false }\n",
+        "8: Key::Home | Press { key = Key::Home, ctrl = false, alt = false, shift = false }\n",
+        "9: Key::Home | Press { key = Key::Home, ctrl = false, alt = false, shift = false }\n",
+        "10: Key::End | Press { key = Key::End, ctrl = false, alt = false, shift = false }\n",
+        "11: Key::End | Press { key = Key::End, ctrl = false, alt = false, shift = false }\n",
+        "12: Key::F(1) | Press { key = Key::F(1), ctrl = false, alt = false, shift = false }\n",
+        "13: Key::F(5) | Press { key = Key::F(5), ctrl = false, alt = false, shift = false }\n",
+        "14: Key::F(12) | Press { key = Key::F(12), ctrl = false, alt = false, shift = false }\n",
+        "15: Key::Alt(\"x\") | Press { key = Key::Char(\"x\"), ctrl = false, alt = true, shift = false }\n",
+        "16: Key::Ctrl(\"c\") | Press { key = Key::Char(\"c\"), ctrl = true, alt = false, shift = false }\n",
+        "17: Key::Backspace | Press { key = Key::Backspace, ctrl = false, alt = false, shift = false }\n",
+        "18: Key::Backspace | Press { key = Key::Backspace, ctrl = false, alt = false, shift = false }\n",
+        "19: Key::Tab | Press { key = Key::Tab, ctrl = false, alt = false, shift = false }\n",
+        "20: Key::BackTab | Press { key = Key::Tab, ctrl = false, alt = false, shift = true }\n",
+        "21: Key::Char(\"\u{e9}\") | Press { key = Key::Char(\"\u{e9}\"), ctrl = false, alt = false, shift = false }\n",
+        "22: Key::Char(\"\u{2713}\") | Press { key = Key::Char(\"\u{2713}\"), ctrl = false, alt = false, shift = false }\n",
+        "23: Key::Char(\"\u{1f600}\") | Press { key = Key::Char(\"\u{1f600}\"), ctrl = false, alt = false, shift = false }\n",
+        "24: Key::Paste(\"pa\u{1b}ste\\nX\") | Press { key = Key::Paste(\"pa\u{1b}ste\\nX\"), ctrl = false, alt = false, shift = false }\n",
+        "25: Key::Char(\"?\") | Press { key = Key::Char(\"?\"), ctrl = false, alt = false, shift = false }\n",
+        "26: Key::Enter | Press { key = Key::Enter, ctrl = false, alt = false, shift = false }\n",
+        "27: Key::Escape | Press { key = Key::Escape, ctrl = false, alt = false, shift = false }\n",
+        "28: Key::Alt(\"q\") | Press { key = Key::Char(\"q\"), ctrl = false, alt = true, shift = false }\n",
+        "29: Key::Escape | Press { key = Key::Escape, ctrl = false, alt = false, shift = false }\n",
+        "keys: 29\n",
+        "next past the end is None: true\n",
+    );
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "native_probe_stdin_keys.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
+/// A173 S2, terminal.md §4.4 step 1: the std `KeyDecoder` fed bytes directly
+/// (`key-decoder.vl`), one row per escape-table entry, the malformed and
+/// cut-short sequences that are dropped, and the chunk splits the pipe rule
+/// decides by the bytes alone — written out, and identical on both backends
+/// because both run the one decoder std writes in vilan (§4.1).
+#[test]
+fn a173_s2_the_key_decoder_table_is_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::copy(
+        staged.join("key-decoder.vl"),
+        staged.join("native_probe_key_decoder.vl"),
+    )
+    .expect("stage the decoder program under its own name");
+    let expected = concat!(
+        "arrows CSI\n",
+        "  chunk 1: Key::Up\n",
+        "  chunk 1: Key::Down\n",
+        "  chunk 1: Key::Right\n",
+        "  chunk 1: Key::Left\n",
+        "arrows SS3\n",
+        "  chunk 1: Key::Up\n",
+        "  chunk 1: Key::Down\n",
+        "  chunk 1: Key::Right\n",
+        "  chunk 1: Key::Left\n",
+        "home: CSI H, SS3 H, 1~, 7~\n",
+        "  chunk 1: Key::Home\n",
+        "  chunk 1: Key::Home\n",
+        "  chunk 1: Key::Home\n",
+        "  chunk 1: Key::Home\n",
+        "end: CSI F, SS3 F, 4~, 8~\n",
+        "  chunk 1: Key::End\n",
+        "  chunk 1: Key::End\n",
+        "  chunk 1: Key::End\n",
+        "  chunk 1: Key::End\n",
+        "insert delete pageup pagedown\n",
+        "  chunk 1: Key::Insert\n",
+        "  chunk 1: Key::Delete\n",
+        "  chunk 1: Key::PageUp\n",
+        "  chunk 1: Key::PageDown\n",
+        "F1-F4 SS3\n",
+        "  chunk 1: Key::F(1)\n",
+        "  chunk 1: Key::F(2)\n",
+        "  chunk 1: Key::F(3)\n",
+        "  chunk 1: Key::F(4)\n",
+        "F1-F5 CSI ~\n",
+        "  chunk 1: Key::F(1)\n",
+        "  chunk 1: Key::F(2)\n",
+        "  chunk 1: Key::F(3)\n",
+        "  chunk 1: Key::F(4)\n",
+        "  chunk 1: Key::F(5)\n",
+        "F6-F12 CSI ~\n",
+        "  chunk 1: Key::F(6)\n",
+        "  chunk 1: Key::F(7)\n",
+        "  chunk 1: Key::F(8)\n",
+        "  chunk 1: Key::F(9)\n",
+        "  chunk 1: Key::F(10)\n",
+        "  chunk 1: Key::F(11)\n",
+        "  chunk 1: Key::F(12)\n",
+        "modified: ctrl+Right shift+Up alt+Left ctrl+Delete shift+F1\n",
+        "  chunk 1: Key::Right +ctrl\n",
+        "  chunk 1: Key::Up +shift\n",
+        "  chunk 1: Key::Left +alt\n",
+        "  chunk 1: Key::Delete +ctrl\n",
+        "  chunk 1: Key::F(1) +shift\n",
+        "Enter: cr\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: lf\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: crlf is one\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: cr cr is two\n",
+        "  chunk 1: Key::Enter\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: lf cr is two\n",
+        "  chunk 1: Key::Enter\n",
+        "  chunk 1: Key::Enter\n",
+        "Enter: lf lf is two\n",
+        "  chunk 1: Key::Enter\n",
+        "  chunk 1: Key::Enter\n",
+        "Backspace 0x7f and 0x08, Tab, BackTab\n",
+        "  chunk 1: Key::Backspace\n",
+        "  chunk 1: Key::Backspace\n",
+        "  chunk 1: Key::Tab\n",
+        "  chunk 1: Key::BackTab +shift\n",
+        "Ctrl: c d z, NUL, 0x1c\n",
+        "  chunk 1: Key::Ctrl(\"c\") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\"d\") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\"z\") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\" \") +ctrl\n",
+        "  chunk 1: Key::Ctrl(\"\\\\\") +ctrl\n",
+        "Alt: x, X, Backspace, Ctrl-c, e-acute\n",
+        "  chunk 1: Key::Alt(\"x\") +alt\n",
+        "  chunk 1: Key::Alt(\"X\") +alt +shift\n",
+        "  chunk 1: Key::Backspace +alt\n",
+        "  chunk 1: Key::Ctrl(\"c\") +ctrl +alt\n",
+        "  chunk 1: Key::Alt(\"\u{e9}\") +alt\n",
+        "UTF-8: 2, 3 and 4 bytes\n",
+        "  chunk 1: Key::Char(\"\u{e9}\")\n",
+        "  chunk 1: Key::Char(\"\u{2713}\")\n",
+        "  chunk 1: Key::Char(\"\u{1f600}\")\n",
+        "printable ASCII\n",
+        "  chunk 1: Key::Char(\" \")\n",
+        "  chunk 1: Key::Char(\"~\")\n",
+        "  chunk 1: Key::Char(\"0\")\n",
+        "  chunk 1: Key::Char(\"9\")\n",
+        "  chunk 1: Key::Char(\"A\") +shift\n",
+        "  chunk 1: Key::Char(\"z\")\n",
+        "lone ESC at the end\n",
+        "  end: Key::Escape\n",
+        "ESC ESC\n",
+        "  chunk 1: Key::Escape\n",
+        "  end: Key::Escape\n",
+        "ESC [ at the end is Alt-[\n",
+        "  end: Key::Alt(\"[\") +alt\n",
+        "ESC O at the end is Alt-O\n",
+        "  end: Key::Alt(\"O\") +alt +shift\n",
+        "paste with ESC and line endings inside\n",
+        "  chunk 1: Key::Paste(\"a\u{1b}[Bb\\r\\nc\")\n",
+        "  chunk 1: Key::Char(\"z\")\n",
+        "paste never closed\n",
+        "  end: Key::Paste(\"abc\")\n",
+        "dropped: unknown final, private marker, unknown SS3, stray paste end\n",
+        "  chunk 1: Key::Char(\"k\")\n",
+        "dropped: CSI cut by a control byte\n",
+        "  chunk 1: Key::Ctrl(\"g\") +ctrl\n",
+        "dropped: CSI cut by the end\n",
+        "dropped: stray continuation, cut scalar, 0xff\n",
+        "  chunk 1: Key::Char(\"(\")\n",
+        "  chunk 1: Key::Char(\"j\")\n",
+        "dropped: scalar cut by the end\n",
+        "ESC | [ | A: one Up, nothing early (no timeout on a pipe)\n",
+        "  chunk 3: Key::Up\n",
+        "ESC | x: Alt-x, the bytes decide\n",
+        "  chunk 2: Key::Alt(\"x\") +alt\n",
+        "cr | lf: one Enter, at the cr\n",
+        "  chunk 1: Key::Enter\n",
+        "4-byte scalar one byte at a time\n",
+        "  chunk 4: Key::Char(\"\u{1f600}\")\n",
+        "paste with its end split\n",
+        "  chunk 3: Key::Paste(\"ab\")\n",
+        "ESC, then silence, then [A: the timeout resolves Escape\n",
+        "  chunk 2: Key::Escape\n",
+        "  chunk 3: Key::Char(\"[\")\n",
+        "  chunk 3: Key::Char(\"A\") +shift\n",
+        "ESC [ 1 ; 5 split mid-parameters\n",
+        "  chunk 3: Key::Right +ctrl\n",
+    );
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, "native_probe_key_decoder.vl");
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
 /// F57: every platform-bound corpus program the backend ACCEPTS prints what
 /// node prints, the ones it refuses say which construct stopped them, and the
 /// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
@@ -12080,15 +12325,17 @@ const REACTIVE_TRACE: &str = include_str!("native/reactive_trace.vl");
 const REACTIVE_TRACE_FILE: &str = "native_probe_reactive_trace.vl";
 
 /// E257 S8: `std::reactive::trace(true)` writes one line per wake to stderr —
-/// the woken subscriber, the cell that woke it with where it was made, and the
-/// write's place (a `[track_caller]` location, S0) — the same bytes on both
-/// backends, one pin per wake path: a write with no turn (inline), a write
-/// queued in an ambient turn (`batch`), a derivation's write joining the
-/// DRAINING turn (`set by`), a write after its turn settled (one microtask
-/// drains it), a relay's wake (`distinct`), `update`, a cell made by
-/// `Signal::new` and written through a bound (no place: a `[track_caller]`
-/// trait member is refused), and the trace off. Native has no host task to
-/// tag a queued wake with (`console.createTask` is the JS backend's): the
+/// the woken subscriber with where it was made, the cell that woke it with
+/// where it was made, and the write's place (a `[track_caller]` location, S0)
+/// — the same bytes on both backends, one pin per wake path: a write with no
+/// turn (inline), a write queued in an ambient turn (`batch`), a derivation's
+/// write joining the DRAINING turn (`set by`), a write after its turn settled
+/// (one microtask drains it), a relay's wake (`distinct`), `update`, a cell
+/// made by `Signal::new` and written through a bound, a write through a `dyn
+/// Signal` with a subscriber made through a `dyn Source` (B646: the `Signal`
+/// and `Flow` members are `[track_caller]` on the trait, so every one of these
+/// names its place), an `effect`, and the trace off. Native has no host task
+/// to tag a queued wake with (`console.createTask` is the JS backend's): the
 /// lines are the same, only a debugger's async stack differs.
 #[test]
 fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
@@ -12109,7 +12356,8 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "inline 1\ninline 2\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"inline {value}\")", "sub"),
                     made(file),
                     site(file, "count.set(2)", "set")
                 ),
@@ -12119,7 +12367,8 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "turn 1\nqueued\nturn 3\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"turn {value}\")", "sub"),
                     made(file),
                     site(file, "count.set(3)", "set")
                 ),
@@ -12130,9 +12379,10 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 "draining 2\ndraining 8\n".to_string(),
                 format!(
                     "[reactive] derivation #0 woken by cell #1 (made at {}), set at {}\n\
-                     [reactive] effect #1 woken by cell #3, set by derivation #0\n",
+                     [reactive] effect #1 at {} woken by cell #3, set by derivation #0\n",
                     made(file),
-                    site(file, "batch(|| count.set(4))", "set")
+                    site(file, "batch(|| count.set(4))", "set"),
+                    site(file, "print(i\"draining {value}\")", "sub"),
                 ),
             )
         }),
@@ -12140,7 +12390,8 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "late 1\nbefore the microtask\nlate 5\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"late {value}\")", "sub"),
                     made(file),
                     site(file, "later = Some(|| count.set(5))", "set")
                 ),
@@ -12151,9 +12402,10 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 "relay 1\nrelay 6\n".to_string(),
                 format!(
                     "[reactive] derivation #1 woken by cell #1 (made at {}), set at {}\n\
-                     [reactive] effect #0 woken by derivation #1\n",
+                     [reactive] effect #0 at {} woken by derivation #1\n",
                     made(file),
-                    site(file, "count.set(6)", "set")
+                    site(file, "count.set(6)", "set"),
+                    site(file, "print(i\"relay {value}\")", "sub"),
                 ),
             )
         }),
@@ -12161,16 +12413,44 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
             (
                 "update 1\nupdate 2\n".to_string(),
                 format!(
-                    "[reactive] effect #0 woken by cell #1 (made at {}), set at {}\n",
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"update {value}\")", "sub"),
                     made(file),
                     site(file, "count.update(", "update")
                 ),
             )
         }),
-        ("unplaced", |_, _, _| {
+        ("trait", |file, _, site| {
             (
-                "unplaced 10\nunplaced 11\n".to_string(),
-                "[reactive] effect #0 woken by cell #2\n".to_string(),
+                "trait 10\ntrait 11\n".to_string(),
+                format!(
+                    "[reactive] effect #0 at {} woken by cell #2 (made at {}), set at {}\n",
+                    site(file, "print(i\"trait {value}\")", "sub"),
+                    site(file, "Signal::new(10)", "new"),
+                    site(file, "\tcell.set(value);", "set"),
+                ),
+            )
+        }),
+        ("object", |file, made, site| {
+            (
+                "object 12\n".to_string(),
+                format!(
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"object {value}\")", "on_change"),
+                    made(file),
+                    site(file, "erased.set(12)", "set"),
+                ),
+            )
+        }),
+        ("effect", |file, made, site| {
+            (
+                "effect 1\neffect 13\n".to_string(),
+                format!(
+                    "[reactive] effect #0 at {} woken by cell #1 (made at {}), set at {}\n",
+                    site(file, "print(i\"effect {value}\")", "effect"),
+                    made(file),
+                    site(file, "count.set(13)", "set"),
+                ),
             )
         }),
         ("off", |_, _, _| {
@@ -12203,6 +12483,52 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
     });
     let wrong: Vec<String> = legs.into_iter().flatten().collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+/// B646: `[track_caller]` declared on a trait member names every call site
+/// the same way on both backends — a static call, a call through a bound
+/// after monomorphization, a call through a `dyn` table's slot (the native
+/// object trait's method takes the `Location` parameter), a default reached
+/// through the type and through the table, a `T::member()` static, a path
+/// call, and a tracking caller forwarding its own location.
+#[test]
+fn b646_a_tracking_trait_member_names_its_call_site_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_b646_trait_track_caller.vl",
+        include_str!("native/b646_trait_track_caller.vl"),
+        include_str!("native/b646_trait_track_caller.stdout"),
+        "",
+    );
+}
+
+/// B647: a module-level `mut` binding lent where no write reaches it, a local
+/// lent to a writer, the copy the refusal names, and the by-value twin — a
+/// module binding handed by value to a callee that writes it is a copy, which
+/// JS now takes too (it printed the callee's own push through the parameter)
+/// — the same bytes on both backends (`native/b647_module_binding_copies.*`).
+#[test]
+fn b647_module_binding_loans_and_copies_answer_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_b647_module_binding_copies.vl",
+        include_str!("native/b647_module_binding_copies.vl"),
+        include_str!("native/b647_module_binding_copies.stdout"),
+        "",
+    );
+}
+
+/// B659, B667, B670: a literal waiting for a closure's result (method and
+/// free path), a literal tail taking a `ret`'s width, a self-call in a
+/// `match` leg of an unannotated function, a method on an operator's result
+/// over a closure parameter — typed, and answering the same on both backends
+/// (`native/solver55_inference.*`).
+#[test]
+fn solver55_inference_shapes_answer_the_same_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_solver55_inference.vl",
+        include_str!("native/solver55_inference.vl"),
+        include_str!("native/solver55_inference.stdout"),
+        "",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -14370,6 +14696,22 @@ fn a_for_loops_next_reading_a_context_answers_on_both_backends() {
     );
 }
 
+/// M165: an `[rpc]` body that throws answers its call with a `Remote` error
+/// naming the method and the message on both backends — the client's awaited
+/// call is rejected, never parked — and the service answers the next call.
+#[test]
+fn m165_an_rpc_body_that_throws_answers_its_call_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_rpc_body_throws.vl";
+    std::fs::write(staged.join(file), include_str!("native/rpc_body_throws.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, file),
+        Verdict::Identical,
+        "a thrown rpc body must answer its call the same natively"
+    );
+}
+
 /// B626: a module scalar read only through a view — a `const let`, a `let`, a
 /// `mut` written through `&mut`, a read inside a closure — answers the same on
 /// both backends (JS shook the binding out and threw `ReferenceError`).
@@ -14387,4 +14729,165 @@ fn b626_a_module_scalar_read_only_through_a_view_answers_on_both_backends() {
         Verdict::Identical,
         "a module scalar read through a view must be declared on JS"
     );
+}
+
+/// M166: a derived `FromJson` reads an `Option` field its object leaves out as
+/// `None` — the same answer as `null` — so a struct that gains an `Option`
+/// field still decodes JSON stored before it. A missing non-`Option` field is
+/// still refused by name, a nested `Option<Option<..>>` reads absent and `null`
+/// alike as the outer `None`, and `to_json` still writes `null`.
+#[test]
+fn m166_a_derived_decoder_reads_an_absent_option_field_as_none_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_json_absent_option.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/json_absent_option.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "ok 1 <none>\n",
+                "ok 2 hi\n",
+                "ok 3 <none>\n",
+                "err missing field id\n",
+                "err expected a string\n",
+                "{\"id\":1,\"note\":null}\n",
+                "{\"id\":1,\"note\":\"x\"}\n",
+                "ok none false {\"depth\":null,\"pair\":null}\n",
+                "ok none false {\"depth\":null,\"pair\":null}\n",
+                "ok some(some) true {\"depth\":7,\"pair\":[1,2]}\n",
+                "true {\"inner\":null}\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
+/// M165: a `List<any>` bind list holds an `Option`'s payload or NULL and a
+/// `bool` as 0 or 1 on both backends — the native backend's `Any::from` and
+/// binder already did; JS handed `node:sqlite` the variant's array ("Unknown
+/// named parameter '0'") and a JS boolean ("cannot be bound"). Every way a
+/// bind list is filled converts: a literal element, a value built in place,
+/// an `if` element, a nested `Option`, `push` onto a `List<any>`. `print` and
+/// `canonical_hash` still take the `Option` as it is, and a vilan function's
+/// `any` parameter receives the payload, as natively.
+#[test]
+fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_bind_conversions.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/db_bind_conversions.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "literal 1 1\n",
+                "none NULL 0\n",
+                "deep NULL 1\n",
+                "built 4 0\n",
+                "branch 1 1\n",
+                "pushed 1 1\n",
+                "first literal\n",
+                "2\n",
+                "Some(1)\n",
+                "1\n",
+                "null\n",
+                "false\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
+/// M169: `List::position` and `Iterator::position` answer the index of the
+/// first element a predicate holds for — over a struct's field, which
+/// `index_of` (equality on the whole element) cannot ask — or `None`, and stop
+/// calling the predicate at the hit; the iterator form counts from where the
+/// iterator stands (`skip(1)` first).
+#[test]
+fn m169_position_finds_the_first_match_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_list_position.vl";
+    std::fs::write(staged.join(file), include_str!("native/list_position.vl"))
+        .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "1\n0\ntrue\ntrue\n1 after 2\n2\n1\ntrue\n",
+            "{backend:?}"
+        );
+    }
+}
+
+/// M168: `ServerBuilder::host(addr)` binds that one address on both backends —
+/// node's `listen(port, host, cb)`, natively the same bind — where a server
+/// with no `host` listens on every interface. The witness is a loopback
+/// address that is NOT `127.0.0.1` (Linux routes all of `127.0.0.0/8` to the
+/// loopback device, so `127.0.0.2` binds): bound there, the server answers on
+/// `127.0.0.2` and REFUSES a connection on `127.0.0.1`, which a bind to every
+/// interface would have accepted. `url()` names the bound address.
+#[cfg(target_os = "linux")]
+#[test]
+fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
+    let staged = stage();
+    let program = "native_probe_bound_host.vl";
+    std::fs::write(
+        staged.join(program),
+        concat!(
+            "import std::http::{ Response, Server };\n",
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tServer::builder()\n",
+            "\t\t.port(0)\n",
+            "\t\t.host(\"127.0.0.2\")\n",
+            "\t\t.on_request(|request| Response::builder().body(\"bound\").build())\n",
+            "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()} url={server.url()}\"))\n",
+            "\t\t.build()\n",
+            "\t\t.start();\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    let (mut native, mut node) = both_servers(&staged, program);
+    for (leg, command) in [("native", &mut native), ("node", &mut node)] {
+        let server = ServerUnderTest::spawn(command);
+        let port = server.port();
+        assert!(
+            server
+                .announcement
+                .ends_with(&format!("url=http://127.0.0.2:{port}/")),
+            "{leg}: `url()` names the bound address: {}",
+            server.announcement
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.2", port))
+            .unwrap_or_else(|error| panic!("{leg}: the bound address answers: {error}"));
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.2\r\nConnection: close\r\n\r\n")
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        assert!(
+            response.starts_with("HTTP/1.1 200") && response.ends_with("bound"),
+            "{leg}: the handler answers on the bound address: {response:?}"
+        );
+        let elsewhere = std::net::TcpStream::connect(("127.0.0.1", port));
+        assert!(
+            elsewhere.is_err(),
+            "{leg}: a server bound to 127.0.0.2 must not accept on 127.0.0.1"
+        );
+    }
 }

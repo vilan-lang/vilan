@@ -1,6 +1,6 @@
 [package]
 name = "vilan-cli"
-version = "0.52.0"
+version = "0.53.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The vilan language toolchain"
@@ -24,6 +24,12 @@ sha2 = "0.10"
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Console"] }
 
+# E335: `vilan run` forwards the signal it was sent to its child, and the
+# forwarding needs the signal's NUMBER (`ctrlc` hands its closure none) and the
+# raw `kill` / `waitid`. Already in the lockfile through `ctrlc`'s own `nix`.
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
 # Test-only, and only for the clock: the const-pass scaling gate
 # (`tests/perf_baseline.rs`) asserts a ratio of THREAD CPU TIME so that ten
 # sibling test suites cannot red it (backlog M15), and neither platform exposes
@@ -36,9 +42,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 # vilan-lsp, so this adds no third-party surface.
 [dev-dependencies]
 serde_json = "1"
-
-[target."cfg(unix)".dev-dependencies]
-libc = "0.2"
 
 [target."cfg(windows)".dev-dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }

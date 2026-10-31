@@ -75,7 +75,7 @@ pub fn record_host_gaps(gaps: Vec<String>) {
 
 /// The optional runtime crates the last emit reached, and so which of them the
 /// cargo project written for it depends on (F18 slice 2's `vilan-rt-sqlite`,
-/// F40's `vilan-rt-crypto`, F45's `vilan-rt-signal`). Recorded on the same terms as the three above, for
+/// F40's `vilan-rt-crypto`, F45's `vilan-rt-signal`, A173 S2's `vilan-rt-term`). Recorded on the same terms as the three above, for
 /// the same reason: the fact belongs to the COMPILE and the manifest is written
 /// after it.
 static OPTIONAL_CRATES: std::sync::Mutex<vilan_rust::OptionalCrates> =
@@ -83,6 +83,7 @@ static OPTIONAL_CRATES: std::sync::Mutex<vilan_rust::OptionalCrates> =
         sqlite: false,
         crypto: false,
         signal: false,
+        term: false,
     });
 
 pub fn record_optional_crates(reached: vilan_rust::OptionalCrates) {
@@ -548,7 +549,15 @@ pub fn run(unit: &Unit, platform: Platform, args: &[String]) -> ExitCode {
         Ok(binary) => binary,
         Err(code) => return code,
     };
-    crate::exit_code_of(Command::new(&binary).args(args).status())
+    // E335: the binary is waited on through the same forwarding wait as the
+    // node program, so a signal sent to `vilan run` reaches it.
+    crate::install_interrupt_hook();
+    crate::exit_code_of(crate::job::run_to_end(|| {
+        Command::new(&binary)
+            .args(args)
+            .spawn()
+            .map(crate::job::ManagedChild::adopt)
+    }))
 }
 
 #[cfg(test)]

@@ -1,0 +1,30 @@
+// M169: `Iterator::position` and `List::position` answer the index of the
+// first element a predicate holds for, or `None`, and stop at the hit.
+import std::iterator::Iterator;
+
+struct Reaction {
+	emoji: str,
+	count: i32,
+}
+
+fun main() {
+	let found = [
+		Reaction { emoji = "+1", count = 2 },
+		Reaction { emoji = "tada", count = 1 },
+		Reaction { emoji = "+1", count = 5 },
+	];
+	print(found.position(|each| each.emoji == "tada").unwrap_or(99));
+	print(found.position(|each| each.emoji == "+1").unwrap_or(99));
+	print(found.position(|each| each.emoji == "eyes").is_none());
+	let empty: List<Reaction> = [];
+	print(empty.position(|each| each.count > 0).is_none());
+	mut asked = 0;
+	let hit = [3, 8, 13, 21].position(|n| {
+		asked += 1;
+		n > 5
+	});
+	print(i"{hit.unwrap_or(99)} after {asked}");
+	print([10, 20, 30].iter().position(|n| n == 30).unwrap_or(99));
+	print([10, 20, 30].iter().skip(1).position(|n| n == 30).unwrap_or(99));
+	print([10, 20, 30].iter().map(|n| n * 2).position(|n| n == 7).is_none());
+}

@@ -114,6 +114,22 @@ trait Iterator<T> {
 		false
 	}
 
+	/// The position of the FIRST value `predicate` holds for, counting from 0 —
+	/// `None` when none does (Rust's name). Short-circuits on the first hit, so
+	/// it can answer over an unbounded source; `index_of` is the same question
+	/// asked by equality, and this is it asked by a condition
+	/// (`reactions.position(|each| each.emoji == emoji)`).
+	fun position(mut self, predicate: |T| bool): Option<usize> {
+		mut index: usize = 0;
+		for value in self {
+			if predicate(value) {
+				ret Some(index);
+			}
+			index += 1;
+		}
+		None
+	}
+
 	/// Whether `predicate` holds for every value — vacuously true when there are
 	/// none. Short-circuits on the first miss.
 	fun all(mut self, predicate: |T| bool): bool {

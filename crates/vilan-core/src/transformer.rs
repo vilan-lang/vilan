@@ -1170,48 +1170,6 @@ fn collect_reference_if(branch: &js::IfBranch, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Interprets a string literal's backslash escapes into the characters they
-/// denote (`\n` -> newline, `\t`, `\r`, `\"`, `\\`, `\0`), so the value is the
-/// real text — the JS formatter then re-escapes it for output. Borrows the slice
-/// unchanged when it has no escapes. An unknown escape keeps both characters.
-///
-/// This is where a string literal's VALUE is built from source text — for a
-/// plain `"…"` and for each literal fragment of an `i"…"` alike (the lexer
-/// desugars an i-string into `String` tokens) — so it is where the
-/// `\r\n`-is-one-line-terminator rule lands (`windows-support.md` §2,
-/// specification §2.1): a multi-line literal's value carries `\n` per source
-/// line break whatever the file's on-disk encoding, exactly as a triple-quoted
-/// literal already does. An ESCAPED `\r` is unaffected — it is written, not read
-/// from the line ending — and a lone `\r` in the text is preserved.
-pub fn unescape_string(raw: &str) -> Cow<'_, str> {
-    let raw = crate::util::normalize_newlines(raw);
-    if !raw.contains('\\') {
-        return raw;
-    }
-    let mut result = String::with_capacity(raw.len());
-    let mut characters = raw.chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            result.push(character);
-            continue;
-        }
-        match characters.next() {
-            Some('n') => result.push('\n'),
-            Some('t') => result.push('\t'),
-            Some('r') => result.push('\r'),
-            Some('"') => result.push('"'),
-            Some('\\') => result.push('\\'),
-            Some('0') => result.push('\0'),
-            Some(other) => {
-                result.push('\\');
-                result.push(other);
-            }
-            None => result.push('\\'),
-        }
-    }
-    Cow::Owned(result)
-}
-
 /// The helpers a helper's own body calls, added to a sorted helper list so a
 /// program that reaches the caller also emits the callee.
 ///
@@ -1238,6 +1196,35 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
     }) && !helpers.contains(&"__panic")
     {
         helpers.push("__panic");
+        added = true;
+    }
+    // M165: the four bind-list readers share the binder.
+    if helpers.iter().any(|helper| {
+        matches!(
+            *helper,
+            "__db_run" | "__db_all" | "__db_get" | "__db_run_guarded"
+        )
+    }) && !helpers.contains(&"__db_bind")
+    {
+        helpers.push("__db_bind");
+        added = true;
+    }
+    // M164: a refused or unread-over-the-cap body lingers its connection.
+    if helpers
+        .iter()
+        .any(|helper| matches!(*helper, "__http_read_body" | "__http_body_left_unread"))
+        && !helpers.contains(&"__http_linger")
+    {
+        helpers.push("__http_linger");
+        added = true;
+    }
+    // A173 S2: the line read and the key read share ONE stdin pump.
+    if helpers
+        .iter()
+        .any(|helper| matches!(*helper, "__stdin_line" | "__stdin_bytes"))
+        && !helpers.contains(&"__stdin_pump")
+    {
+        helpers.push("__stdin_pump");
         added = true;
     }
     // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
@@ -1281,9 +1268,15 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_watch",
         "__fs_watch_stop",
         "__stdin_line",
+        "__stdin_bytes",
+        "__term_enter",
+        "__term_leave",
         "__stdout_write",
         "__local_get",
         "__response_header",
+        "__http_read_body",
+        "__http_body_left_unread",
+        "__http_respond",
         "__session_get",
         "__dom_window",
         "__dom_active_element",
@@ -1292,6 +1285,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__dom_query_all",
         "__router_path",
         "__router_url",
+        "__router_state",
+        "__module_dir",
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1528,6 +1523,126 @@ fn helper_source(name: &str) -> &'static str {
              \treturn (response && response.headers ? response.headers.get(name) : null) ?? \"\";\n\
              }"
         }
+        // M164: `std::http`'s lazy request body. Read whole on the FIRST call and
+        // kept on the request object, so a later `bytes()` answers the same
+        // promise; at most `limit` bytes — a declared `Content-Length` over it is
+        // refused before a byte of the body is read, a chunked body is counted
+        // per `data` event and refused at the chunk that crosses it. A refusal
+        // answers `413` with `Connection: close` — node destroys the socket once
+        // it is flushed, and the stream is paused, so the rest is never read —
+        // under RFC 9110's phrase (node's table still says `Payload Too Large`;
+        // the native server says the RFC's, so the two answer one status line),
+        // and rejects with an `AbortError`: the handler ends as a cancelled task
+        // does, and `__http_respond` keeps that quiet. A client that goes away
+        // mid-body (`error`, node's `aborted`) ends it the same way — before
+        // M164 that rejection reached node unhandled and ended the process. The
+        // `error` listener stays on: node raises a request's `error` only to a
+        // listener, and a second one with none would.
+        "__http_read_body" => {
+            "function __http_read_body(request, response, limit) {\n\
+             \tif (request.__vilan_body !== undefined) return request.__vilan_body;\n\
+             \trequest.__vilan_body = new Promise((resolve, reject) => {\n\
+             \t\tconst over = (message) => {\n\
+             \t\t\tconst error = new Error(message);\n\
+             \t\t\terror.name = \"AbortError\";\n\
+             \t\t\treturn error;\n\
+             \t\t};\n\
+             \t\tconst refuse = () => {\n\
+             \t\t\trequest.removeAllListeners(\"data\");\n\
+             \t\t\trequest.pause();\n\
+             \t\t\tif (!response.headersSent) {\n\
+             \t\t\t\tresponse.statusCode = 413;\n\
+             \t\t\t\tresponse.statusMessage = \"Content Too Large\";\n\
+             \t\t\t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
+             \t\t\t\tresponse.setHeader(\"Connection\", \"close\");\n\
+             \t\t\t\t__http_linger(request);\n\
+             \t\t\t\tresponse.end(\"the request body is larger than \" + limit + \" bytes\");\n\
+             \t\t\t} else {\n\
+             \t\t\t\trequest.socket.destroy();\n\
+             \t\t\t}\n\
+             \t\t\treject(over(\"the request body is larger than \" + limit + \" bytes\"));\n\
+             \t\t};\n\
+             \t\trequest.on(\"error\", () => reject(over(\"the client went away before the request body arrived\")));\n\
+             \t\tif (request.readableEnded || response.writableEnded) {\n\
+             \t\t\treject(over(\"the request body was read after the request was answered\"));\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t\tconst declared = request.headers[\"content-length\"];\n\
+             \t\tif (declared !== undefined && Number(declared) > limit) {\n\
+             \t\t\trefuse();\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t\tconst chunks = [];\n\
+             \t\tlet total = 0;\n\
+             \t\trequest.on(\"data\", (chunk) => {\n\
+             \t\t\ttotal += chunk.length;\n\
+             \t\t\tif (total > limit) {\n\
+             \t\t\t\tchunks.length = 0;\n\
+             \t\t\t\trefuse();\n\
+             \t\t\t\treturn;\n\
+             \t\t\t}\n\
+             \t\t\tchunks.push(chunk);\n\
+             \t\t});\n\
+             \t\trequest.once(\"end\", () => resolve(Buffer.concat(chunks, total)));\n\
+             \t});\n\
+             \treturn request.__vilan_body;\n\
+             }"
+        }
+        // M164's keep-alive rule: an UNREAD body the connection should not drain
+        // — declared over the cap, or chunked (no length to bound the drain by).
+        // A body within the cap is left to node, which discards it and keeps the
+        // connection; `request.complete` is a body that already arrived whole.
+        "__http_body_left_unread" => {
+            "function __http_body_left_unread(request, limit) {\n\
+             \tif (request.__vilan_body !== undefined || request.complete) return false;\n\
+             \tconst declared = request.headers[\"content-length\"];\n\
+             \tconst leaves = declared === undefined\n\
+             \t\t? request.headers[\"transfer-encoding\"] !== undefined\n\
+             \t\t: Number(declared) > limit;\n\
+             \tif (leaves) __http_linger(request);\n\
+             \treturn leaves;\n\
+             }"
+        }
+        // M164: a connection closing with body bytes possibly still on the
+        // wire half-closes and waits 500 ms before it is destroyed, reading
+        // nothing more. Node destroys a `Connection: close` socket the moment
+        // the answer is flushed (`destroySoon`), and destroying a socket with
+        // unread bytes in it sends a RESET, which can reach the client before it
+        // has read its `413` or `401` — so `destroySoon` is this socket's own
+        // half-close-and-wait (Go's `rstAvoidanceDelay`; the native server's
+        // `LINGER` is the same wait). And node DISCARDS an unread request body
+        // after the answer (`_dump`) by reading it to its end, which for a
+        // refused upload is the whole upload's bandwidth: marking the request
+        // already dumped keeps the socket paused, so the client's writes stall.
+        // `_dumped` is node's own flag; were it renamed, node would read and
+        // discard again, which is slower and still correct.
+        "__http_linger" => {
+            "function __http_linger(request) {\n\
+             \tconst socket = request.socket;\n\
+             \tif (!socket || socket.__vilan_linger) return;\n\
+             \tsocket.__vilan_linger = true;\n\
+             \trequest._dumped = true;\n\
+             \tsocket.destroySoon = function () {\n\
+             \t\tthis.pause();\n\
+             \t\tthis.end();\n\
+             \t\tconst timer = setTimeout(() => this.destroy(), 500);\n\
+             \t\tif (timer.unref) timer.unref();\n\
+             \t};\n\
+             }"
+        }
+        // M164: one request's answer, with a CANCELLATION ended quietly — node
+        // ignores the promise a `createServer` callback returns, so a refused
+        // body's `AbortError` would otherwise be an unhandled rejection, which
+        // ends the process. Any other failure is rethrown, unchanged.
+        "__http_respond" => {
+            "async function __http_respond(body) {\n\
+             \ttry {\n\
+             \t\tawait body();\n\
+             \t} catch (error) {\n\
+             \t\tif (!error || error.name !== \"AbortError\") throw error;\n\
+             \t}\n\
+             }"
+        }
         "__local_get" => {
             "function __local_get(key) {\n\treturn localStorage.getItem(key) ?? \"\";\n}"
         }
@@ -1581,6 +1696,20 @@ fn helper_source(name: &str) -> &'static str {
         // Router glue (std::web::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
+        // M168: the directory the running module was loaded from — `dist/` for
+        // a built server (`dist/server.mjs`), where `std::build` looks for a
+        // leg's manifest first. `import.meta.dirname` is node's (20.11+), Deno's
+        // and Bun's; a host without it answers `""`, and the working folder is
+        // the fallback.
+        "__module_dir" => {
+            "function __module_dir() {\n\treturn typeof import.meta.dirname === \"string\" ? import.meta.dirname : \"\";\n}"
+        }
+        // M167: the current entry's state, when it is TEXT — the only kind
+        // `std::web::router` writes. The first entry (state `null`) and one
+        // another script pushed with an object both read as `""`.
+        "__router_state" => {
+            "function __router_state() {\n\treturn typeof history.state === \"string\" ? history.state : \"\";\n}"
+        }
         // The whole relative URL, for the query and fragment `location.pathname`
         // leaves out. Deliberately NOT what `current_path()` tracks: a route
         // signal that advanced on every `#anchor` would re-render the page for a
@@ -1615,17 +1744,58 @@ fn helper_source(name: &str) -> &'static str {
         // extern binding forms can't express directly.
         "__db_run" => {
             "function __db_run(statement, parameters) {\n\
-             \tconst result = statement.run(...parameters);\n\
+             \tconst result = statement.run(...__db_bind(parameters));\n\
              \treturn Number(result.lastInsertRowid ?? 0);\n\
              }"
         }
         "__db_all" => {
-            "function __db_all(statement, parameters) {\n\treturn statement.all(...parameters);\n}"
+            "function __db_all(statement, parameters) {\n\treturn statement.all(...__db_bind(parameters));\n}"
         }
         "__db_get" => {
             "function __db_get(statement, parameters) {\n\
-             \tconst row = statement.get(...parameters);\n\
+             \tconst row = statement.get(...__db_bind(parameters));\n\
              \treturn row === undefined ? [ 1 ] : [ 0, row ];\n\
+             }"
+        }
+        // M165: the bind list as SQLite takes it, the native binder's rule
+        // (`vilan-rt-sqlite`'s `bind`): a `bool` is the integer 0 or 1 (node
+        // refuses a JS boolean), and an `Option` already arrived as its payload
+        // or `null` (`__any_option`, at the `any` position it landed at). A
+        // value SQLite cannot hold is refused HERE, naming its index in the
+        // list, rather than by node's own sentence — an array was read as named
+        // parameters ("Unknown named parameter '0'"). The JS value is all that
+        // reaches this far, so the sentence names its shape, not its vilan type.
+        "__db_bind" => {
+            "function __db_bind(parameters) {\n\
+             \treturn parameters.map((value, index) => {\n\
+             \t\tswitch (typeof value) {\n\
+             \t\t\tcase \"number\":\n\
+             \t\t\tcase \"bigint\":\n\
+             \t\t\tcase \"string\":\n\
+             \t\t\t\treturn value;\n\
+             \t\t\tcase \"boolean\":\n\
+             \t\t\t\treturn value ? 1 : 0;\n\
+             \t\t}\n\
+             \t\tif (value === null || value instanceof Uint8Array) {\n\
+             \t\t\treturn value;\n\
+             \t\t}\n\
+             \t\tconst shape = Array.isArray(value) ? \"a struct, tuple, list or enum value\" : typeof value === \"function\" ? \"a closure\" : value === undefined ? \"an absent value\" : \"a host object\";\n\
+             \t\tthrow new Error(\"std::db: cannot bind the parameter at index \" + index + \" of \" + parameters.length + \": \" + shape + \" is not a SQLite value (bind a number, a str, a bool, or an Option of one)\");\n\
+             \t});\n\
+             }"
+        }
+        // M165: an `Option` landing at an `any` position is its payload or
+        // `null`, unwrapped `depth` layers (`Program::any_option_coercions`) —
+        // the native backend's `Any::from` at the same positions.
+        "__any_option" => {
+            "function __any_option(value, depth) {\n\
+             \tfor (let level = 0; level < depth; level++) {\n\
+             \t\tif (value[0] !== 0) {\n\
+             \t\t\treturn null;\n\
+             \t\t}\n\
+             \t\tvalue = value[1];\n\
+             \t}\n\
+             \treturn value;\n\
              }"
         }
         "__db_column" => "function __db_column(row, name) {\n\treturn row[name];\n}",
@@ -1662,7 +1832,7 @@ fn helper_source(name: &str) -> &'static str {
         "__db_run_guarded" => {
             "function __db_run_guarded(statement, parameters) {\n\
              \ttry {\n\
-             \t\tstatement.run(...parameters);\n\
+             \t\tstatement.run(...__db_bind(parameters));\n\
              \t\treturn [ 1 ];\n\
              \t} catch (error) {\n\
              \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
@@ -2015,16 +2185,26 @@ fn helper_source(name: &str) -> &'static str {
         // Q1's exception. Idempotent: a second stop is a no-op, so the
         // destructor stays benign behind any earlier `drop(watcher)`. No
         // public `stop()` surfaces it — the destructor is the only caller.
-        // `std::process::read_line`'s host half (A173 S1): ONE shared stdin
-        // pump, read incrementally — never to EOF first, so an interactive
-        // program answers each line as it is typed. `'data'` appends to the
-        // buffer and `'end'` marks the end; waiters queue and are answered in
-        // order, a line at a time. `\n`, `\r\n` and a lone `\r` each end a line:
-        // a `\r` answers at once and remembers it (`carriage`), so a `\n`
-        // arriving next — in this chunk or the next — is that same ending, and
-        // the split falls identically whatever the chunk boundaries were. At
-        // the end the remainder (if any) is a last line, then `None` (`[1]`)
-        // for every later read.
+        // `std::process`'s stdin (A173 S1, S2): ONE shared pump over
+        // `process.stdin`, read incrementally — never to EOF first, so an
+        // interactive program answers each line (or key) as it arrives. It
+        // holds BYTES (S2: no `setEncoding`, because the key decoder wants
+        // bytes), `'data'` appends and `'end'` marks the end, and waiters queue
+        // and are answered in order. Two kinds of waiter share it, so a line
+        // read and a key read never race for a byte:
+        //
+        // - a LINE waiter (`__stdin_line`, behind `read_line`/`scan`/`prompt`)
+        //   takes the bytes up to the next line ending, decoded as UTF-8 per
+        //   line. `\n`, `\r\n` and a lone `\r` each end a line: a `\r`
+        //   answers at once and remembers it (`carriage`), so a `\n` arriving
+        //   next — in this chunk or the next — is that same ending, and the
+        //   split falls identically whatever the chunk boundaries were. At the
+        //   end the remainder (if any) is a last line, then `None` (`[1]`);
+        // - a BYTES waiter (`__stdin_bytes`, behind `process::Keys`) takes
+        //   everything buffered, `None` at the end, and — given a `wait` — an
+        //   EMPTY chunk if the wait runs out first: the key decoder's escape
+        //   timeout on a terminal. The bytes left there stay for the next
+        //   reader. (`vilan/std/src/process.vl`'s `KeyDecoder` decodes them.)
         //
         // The pump lets go of stdin whenever nobody waits: `pause()` stops the
         // reads and `unref()` stops the handle holding the event loop — without
@@ -2035,44 +2215,75 @@ fn helper_source(name: &str) -> &'static str {
         // redirect's stream has no `ref`/`unref`; it ends by itself.)
         //
         // An abort of the ambient cancel signal removes that waiter and
-        // rejects it with the signal's reason, as `__sleep` does; a line that
-        // arrives later stays buffered for the next reader — cancellation
-        // abandons the WAIT, never a line. The B?1 history: the helper this
-        // replaced called `require("fs")` inside the emitted ES module (`.mjs`
-        // since B86b, v0.33.0), and its own `catch` turned the
-        // `ReferenceError` into "" for every call.
-        "__stdin_line" => {
-            "const __vilan_stdin = { buffer: \"\", ended: false, carriage: false, started: false, waiters: [] };\n\
+        // rejects it with the signal's reason, as `__sleep` does; what arrives
+        // later stays buffered for the next reader — cancellation abandons the
+        // WAIT, never a byte. The B?1 history: the helper S1 replaced called
+        // `require("fs")` inside the emitted ES module (`.mjs` since B86b,
+        // v0.33.0), and its own `catch` turned the `ReferenceError` into ""
+        // for every call.
+        "__stdin_pump" => {
+            "const __vilan_stdin = { buffer: Buffer.alloc(0), ended: false, carriage: false, started: false, waiters: [] };\n\
+             function __stdin_start() {\n\
+             \tconst state = __vilan_stdin;\n\
+             \tif (state.started) return;\n\
+             \tstate.started = true;\n\
+             \tprocess.stdin.on(\"data\", (chunk) => {\n\
+             \t\tstate.buffer = state.buffer.length === 0 ? chunk : Buffer.concat([ state.buffer, chunk ]);\n\
+             \t\t__stdin_pump();\n\
+             \t});\n\
+             \tconst ended = () => {\n\
+             \t\tstate.ended = true;\n\
+             \t\t__stdin_pump();\n\
+             \t};\n\
+             \tprocess.stdin.on(\"end\", ended);\n\
+             \tprocess.stdin.on(\"error\", ended);\n\
+             }\n\
              function __stdin_pump() {\n\
              \tconst state = __vilan_stdin;\n\
              \twhile (state.waiters.length > 0) {\n\
              \t\tif (state.carriage && state.buffer.length > 0) {\n\
-             \t\t\tif (state.buffer[0] === \"\\n\") state.buffer = state.buffer.slice(1);\n\
+             \t\t\tif (state.buffer[0] === 10) state.buffer = state.buffer.subarray(1);\n\
              \t\t\tstate.carriage = false;\n\
              \t\t\tcontinue;\n\
              \t\t}\n\
-             \t\tconst end = state.buffer.search(/[\\r\\n]/);\n\
-             \t\tif (end >= 0) {\n\
-             \t\t\tconst line = state.buffer.slice(0, end);\n\
-             \t\t\tstate.carriage = state.buffer[end] === \"\\r\";\n\
-             \t\t\tstate.buffer = state.buffer.slice(end + 1);\n\
-             \t\t\tstate.waiters.shift().resolve([ 0, line ]);\n\
-             \t\t} else if (state.ended) {\n\
-             \t\t\tconst rest = state.buffer;\n\
-             \t\t\tstate.buffer = \"\";\n\
-             \t\t\tstate.waiters.shift().resolve(rest.length > 0 ? [ 0, rest ] : [ 1 ]);\n\
+             \t\tconst waiter = state.waiters[0];\n\
+             \t\tif (waiter.bytes) {\n\
+             \t\t\tif (state.buffer.length > 0) {\n\
+             \t\t\t\tconst chunk = new Uint8Array(state.buffer);\n\
+             \t\t\t\tstate.buffer = Buffer.alloc(0);\n\
+             \t\t\t\tstate.waiters.shift().resolve([ 0, chunk ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
+             \t\t\tif (state.ended) {\n\
+             \t\t\t\tstate.waiters.shift().resolve([ 1 ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
              \t\t} else {\n\
-             \t\t\tprocess.stdin.ref?.();\n\
-             \t\t\tprocess.stdin.resume();\n\
-             \t\t\treturn;\n\
+             \t\t\tconst end = state.buffer.findIndex((byte) => byte === 10 || byte === 13);\n\
+             \t\t\tif (end >= 0) {\n\
+             \t\t\t\tconst line = state.buffer.toString(\"utf8\", 0, end);\n\
+             \t\t\t\tstate.carriage = state.buffer[end] === 13;\n\
+             \t\t\t\tstate.buffer = state.buffer.subarray(end + 1);\n\
+             \t\t\t\tstate.waiters.shift().resolve([ 0, line ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
+             \t\t\tif (state.ended) {\n\
+             \t\t\t\tconst rest = state.buffer;\n\
+             \t\t\t\tstate.buffer = Buffer.alloc(0);\n\
+             \t\t\t\tstate.waiters.shift().resolve(rest.length > 0 ? [ 0, rest.toString(\"utf8\") ] : [ 1 ]);\n\
+             \t\t\t\tcontinue;\n\
+             \t\t\t}\n\
              \t\t}\n\
+             \t\tprocess.stdin.ref?.();\n\
+             \t\tprocess.stdin.resume();\n\
+             \t\treturn;\n\
              \t}\n\
              \tif (state.started && !state.ended) {\n\
              \t\tprocess.stdin.pause();\n\
              \t\tprocess.stdin.unref?.();\n\
              \t}\n\
              }\n\
-             function __stdin_line(signal) {\n\
+             function __stdin_wait(signal, bytes, wait) {\n\
              \tconst sig = signal && signal[0] === 0 ? signal[1] : undefined;\n\
              \treturn new Promise((resolve, reject) => {\n\
              \t\tif (sig && sig.aborted) {\n\
@@ -2080,34 +2291,103 @@ fn helper_source(name: &str) -> &'static str {
              \t\t\treturn;\n\
              \t\t}\n\
              \t\tconst state = __vilan_stdin;\n\
-             \t\tif (!state.started) {\n\
-             \t\t\tstate.started = true;\n\
-             \t\t\tprocess.stdin.setEncoding(\"utf8\");\n\
-             \t\t\tprocess.stdin.on(\"data\", (chunk) => {\n\
-             \t\t\t\tstate.buffer += chunk;\n\
-             \t\t\t\t__stdin_pump();\n\
-             \t\t\t});\n\
-             \t\t\tconst ended = () => {\n\
-             \t\t\t\tstate.ended = true;\n\
-             \t\t\t\t__stdin_pump();\n\
-             \t\t\t};\n\
-             \t\t\tprocess.stdin.on(\"end\", ended);\n\
-             \t\t\tprocess.stdin.on(\"error\", ended);\n\
-             \t\t}\n\
-             \t\tconst abort = () => {\n\
+             \t\t__stdin_start();\n\
+             \t\tlet timer;\n\
+             \t\tconst withdraw = () => {\n\
              \t\t\tconst parked = state.waiters.indexOf(waiter);\n\
              \t\t\tif (parked >= 0) state.waiters.splice(parked, 1);\n\
+             \t\t\tif (sig) sig.removeEventListener(\"abort\", abort);\n\
+             \t\t\tif (timer !== undefined) clearTimeout(timer);\n\
+             \t\t};\n\
+             \t\tconst abort = () => {\n\
+             \t\t\twithdraw();\n\
              \t\t\treject(sig.reason);\n\
              \t\t\t__stdin_pump();\n\
              \t\t};\n\
-             \t\tconst waiter = { resolve: (line) => {\n\
-             \t\t\tif (sig) sig.removeEventListener(\"abort\", abort);\n\
-             \t\t\tresolve(line);\n\
+             \t\tconst waiter = { bytes, resolve: (value) => {\n\
+             \t\t\twithdraw();\n\
+             \t\t\tresolve(value);\n\
              \t\t} };\n\
              \t\tstate.waiters.push(waiter);\n\
              \t\tif (sig) sig.addEventListener(\"abort\", abort, { once: true });\n\
+             \t\tif (wait >= 0) timer = setTimeout(() => {\n\
+             \t\t\twithdraw();\n\
+             \t\t\tresolve([ 0, new Uint8Array(0) ]);\n\
+             \t\t\t__stdin_pump();\n\
+             \t\t}, wait);\n\
              \t\t__stdin_pump();\n\
              \t});\n\
+             }"
+        }
+        "__stdin_line" => {
+            "function __stdin_line(signal) {\n\
+             \treturn __stdin_wait(signal, false, -1);\n\
+             }"
+        }
+        "__stdin_bytes" => {
+            "function __stdin_bytes(signal, wait) {\n\
+             \treturn __stdin_wait(signal, true, wait);\n\
+             }"
+        }
+        // `std::process::keys()`'s terminal mode (A173 S2): raw mode and
+        // bracketed paste while a `Keys` lives, and nothing at all on a pipe
+        // (terminal.md §4.3 — there is no terminal to tell). `-1` refuses a
+        // second live `Keys`: two owners of one terminal mode cannot both
+        // restore it, and `keys()` panics with that sentence. The paste
+        // switch is written only when stdout is a terminal too, so a program
+        // whose output is redirected never writes it into the file.
+        //
+        // The restore runs from `Keys`'s `Drop` (its last use, a `jump
+        // break`, a panic, a cancelled task) and, while one lives, from
+        // `'exit'` (`process::exit` and an uncaught failure; node's own
+        // `ResetStdio` resets the termios then too, but not the paste switch)
+        // and SIGTERM/SIGHUP/SIGINT, where the handler restores and re-raises the
+        // signal with the handler gone, so the process still dies of it as it
+        // would have (exit 128+n). `__term_leave` restores the terminal BEFORE
+        // it drops the listeners: dropping one resets that signal's disposition
+        // to the default at once, and a second copy of the signal (the kernel's
+        // to the whole group plus `vilan run`'s forward of its own, E335) landing
+        // between the two would otherwise end the process with the terminal
+        // still raw and the paste switch on. Idempotent: `__term_leave` with
+        // nothing live is a no-op.
+        "__term_enter" => {
+            "let __vilan_keys = null;\n\
+             function __term_enter() {\n\
+             \tif (__vilan_keys !== null) return -1;\n\
+             \tif (!process.stdin.isTTY) {\n\
+             \t\t__vilan_keys = { terminal: false };\n\
+             \t\treturn 0;\n\
+             \t}\n\
+             \tconst keys = { terminal: true, paste: process.stdout.isTTY === true, exit: () => __term_leave() };\n\
+             \tconst raise = (name) => () => {\n\
+             \t\t__term_leave();\n\
+             \t\tprocess.kill(process.pid, name);\n\
+             \t};\n\
+             \tkeys.term = raise(\"SIGTERM\");\n\
+             \tkeys.hup = raise(\"SIGHUP\");\n\
+             \tkeys.int = raise(\"SIGINT\");\n\
+             \t__vilan_keys = keys;\n\
+             \tprocess.stdin.setRawMode(true);\n\
+             \tif (keys.paste) process.stdout.write(\"\\x1b[?2004h\");\n\
+             \tprocess.on(\"exit\", keys.exit);\n\
+             \tprocess.on(\"SIGTERM\", keys.term);\n\
+             \tprocess.on(\"SIGHUP\", keys.hup);\n\
+             \tprocess.on(\"SIGINT\", keys.int);\n\
+             \treturn 1;\n\
+             }"
+        }
+        "__term_leave" => {
+            "function __term_leave() {\n\
+             \tconst keys = __vilan_keys;\n\
+             \tif (keys === null) return;\n\
+             \t__vilan_keys = null;\n\
+             \tif (!keys.terminal) return;\n\
+             \tprocess.stdin.setRawMode(false);\n\
+             \tif (keys.paste) process.stdout.write(\"\\x1b[?2004l\");\n\
+             \tprocess.removeListener(\"exit\", keys.exit);\n\
+             \tprocess.removeListener(\"SIGTERM\", keys.term);\n\
+             \tprocess.removeListener(\"SIGHUP\", keys.hup);\n\
+             \tprocess.removeListener(\"SIGINT\", keys.int);\n\
              }"
         }
         // `std::process::prompt`'s write (A173 S1, E?5): stdout with NO
@@ -6188,6 +6468,16 @@ impl<'src> Transformer<'src> {
             }));
         }
         let node = self.walk_entity_seams(id, block)?;
+        // M165: an `Option` landing at an `any` position is its payload or
+        // `null` there, as `Any::from` makes it natively — the value a
+        // `List<any>` bind list hands SQLite.
+        if let Some(&depth) = self.program.any_option_coercions.get(&id) {
+            self.used_helpers.insert("__any_option");
+            return Some(js::Node::Call(
+                Box::new(js::Node::Local("__any_option".to_string())),
+                vec![node, js::Node::Number(depth.to_string(), None)],
+            ));
+        }
         // B340 Q1: a `Callable` value in a closure-typed position. A struct is
         // a plain JS array — it cannot be applied — so the coercion IS the
         // wrapping closure, built here around the finished value so the copy
@@ -6457,7 +6747,7 @@ impl<'src> Transformer<'src> {
                 };
                 js::Node::Number(whole, fraction.map(|x| x.to_string()))
             }
-            Expr::String(x) => js::Node::String(unescape_string(x)),
+            Expr::String(x) => js::Node::String(crate::lexing::unescape_string(x)),
             // debugging.md S0: a `[track_caller]` call's location argument —
             // `std::debug::Location` is its text on this backend.
             Expr::CallerLocation(anchor) => {
@@ -8997,7 +9287,7 @@ impl<'src> Transformer<'src> {
             // The declaration carries the RAW literal text, so it unescapes at
             // emission exactly like any other string literal.
             BackingValue::Str(text) => Some(js::Node::String(Cow::Owned(
-                unescape_string(text).into_owned(),
+                crate::lexing::unescape_string(text).into_owned(),
             ))),
         }
     }
@@ -10509,6 +10799,15 @@ impl<'src> Transformer<'src> {
                         .insert(symbol.to_string());
                 }
                 js::Node::Call(Box::new(js::Node::Local(format!("new {symbol}"))), args)
+            }
+            // B654: a triple-quoted host expression, its text laid out by the
+            // multiline rule (the parser refused a malformed one) and called
+            // PARENTHESIZED — a multi-line arrow or `function` written bare
+            // would take the argument list into its own body.
+            ExternBinding::Code { text } => {
+                let code =
+                    crate::util::trim_multiline_string(text).unwrap_or_else(|_| text.to_string());
+                js::Node::Call(Box::new(js::Node::Local(format!("({code})"))), args)
             }
         }
     }
@@ -15502,8 +15801,14 @@ const RESERVED_NAMES: &[&str] = &[
     "__dbg_set",
     "__dbg_stack",
     "__vilan_stdin",
+    "__stdin_start",
     "__stdin_pump",
+    "__stdin_wait",
     "__stdin_line",
+    "__stdin_bytes",
+    "__vilan_keys",
+    "__term_enter",
+    "__term_leave",
     "__stdout_write",
     "__parse_i32",
     "__parse_f64",
@@ -16427,7 +16732,6 @@ mod tests {
     use super::{
         Formatter, HashMap, HashSet, NameGenerator, NameSeed, NameStyle, bodyless_refusal_frame,
         canonical_instance_body, js, readable_name_probes, reset_readable_name_probes,
-        unescape_string,
     };
     use crate::id::Id;
 
@@ -16635,49 +16939,5 @@ mod tests {
         assert_eq!(padded.between("-", "-(2)"), " ");
         assert_eq!(padded.between("7", "-"), " ");
         assert_eq!(padded.between("", ""), " ");
-    }
-
-    /// A string literal's value is built from the NORMALIZED source text
-    /// (windows-support.md §2, spec §2): a `\r\n` in the file is one line
-    /// terminator, so a multi-line literal carries `\n` however the file was
-    /// saved. Plain `"…"` and the literal fragments of an `i"…"` both arrive
-    /// here, so both are covered.
-    #[test]
-    fn a_crlf_line_break_in_a_literal_becomes_one_newline() {
-        assert_eq!(unescape_string("alpha\r\nbeta"), "alpha\nbeta");
-        assert_eq!(unescape_string("a\r\nb\r\nc"), "a\nb\nc");
-    }
-
-    #[test]
-    fn a_lone_carriage_return_in_a_literal_is_preserved() {
-        // Classic-Mac endings are deliberately NOT blessed: a `\r` with no
-        // following `\n` is an ordinary character of the value.
-        assert_eq!(unescape_string("a\rb"), "a\rb");
-    }
-
-    #[test]
-    fn an_escaped_carriage_return_survives_normalization() {
-        // `\r` WRITTEN in the literal is a value the author asked for — only a
-        // line ending read off the file normalizes. `\r\n` typed as escapes
-        // stays a two-character CRLF.
-        assert_eq!(unescape_string(r"a\r\nb"), "a\r\nb");
-        assert_eq!(unescape_string(r"a\rb"), "a\rb");
-    }
-
-    #[test]
-    fn a_literal_needing_neither_pass_is_borrowed() {
-        let raw = "plain text";
-        match unescape_string(raw) {
-            std::borrow::Cow::Borrowed(borrowed) => assert!(std::ptr::eq(borrowed, raw)),
-            std::borrow::Cow::Owned(_) => {
-                panic!("an escape-free, CR-free literal must not allocate")
-            }
-        }
-    }
-
-    #[test]
-    fn escapes_and_a_crlf_line_break_compose() {
-        // Both passes on one literal: the CRLF folds, the escapes interpret.
-        assert_eq!(unescape_string("a\\t\r\nb\\\"c"), "a\t\nb\"c");
     }
 }

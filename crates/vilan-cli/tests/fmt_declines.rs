@@ -194,3 +194,36 @@ fn a_cargo_target_directory_is_not_walked_and_a_module_named_target_is() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B671: kolt's task table kept a map in step with `insert`/`remove` arms in a
+/// `match ... { ... };` statement. The `;` is the statement's, the tree keeps
+/// no trace of it, and the reprint used to drop it: the net threw the whole
+/// file's reprint away and `vilan fmt` declined (exit 2) over a file `vilan
+/// check` accepts.
+const TERMINATED_MATCH: &str = "import std::hash_map::HashMap;\n\nfun note(held: HashMap<i32, str>, id: i32, found: Option<str>) {\n\tmatch found {\n\t\tSome(let text) => held.insert(id, text),\n\t\tNone => held.remove(id)\n\t};\n}\n";
+
+#[test]
+fn a_match_statement_with_a_semicolon_is_formatted_not_declined() {
+    let canonical = TERMINATED_MATCH;
+    let messy = TERMINATED_MATCH
+        .replace("\n\t\t", " ")
+        .replace("\n\t};", " };");
+    assert_ne!(messy, canonical);
+    let dir = tree("b671", &[("main.vl", &messy)]);
+    // The unformatted file is reported as unformatted (1), not declined (2).
+    let output = vilan_fmt(&dir, &["--check"]);
+    let text = streams(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("would reformat") && !text.contains("declined"),
+        "{text}"
+    );
+    // Written, it round-trips to the canonical text, and that text is clean.
+    let output = vilan_fmt(&dir, &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", streams(&output));
+    let after = std::fs::read_to_string(dir.join("main.vl")).expect("read the file back");
+    assert_eq!(after, canonical);
+    let output = vilan_fmt(&dir, &["--check"]);
+    assert_eq!(output.status.code(), Some(0), "{}", streams(&output));
+    let _ = std::fs::remove_dir_all(&dir);
+}

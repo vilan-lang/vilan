@@ -205,13 +205,15 @@ fn every_sampled_program_emits_the_same_bytes_over_a_loaded_prefix() {
     let _ = std::fs::remove_dir_all(&cache);
 }
 
-/// M144's shape through the file: a package whose entry imports two sibling
-/// modules beside `std::path`, emitted natively over a loaded prefix, names
-/// its std items exactly as the canonical build does (`basename_<id>`) — the
-/// package's own names are the prefix shape's (the find in the lane's
-/// report) and are compared between the built and the loaded prefix only.
+/// M144's shape through the file — and M157's: a package whose entry imports
+/// two sibling modules beside `std::path`, emitted natively, names EVERY item
+/// alike in the canonical build, over the prefix built in the process, and
+/// over the loaded file — std's (`basename_<id>`, M144) and, since P6a, the
+/// package's own (`two_<id>`, `three_<id>`): the canonical drain resolves the
+/// tiers before the package's first node mints, as the prefix world does, so
+/// the two shapes are one id layout and the whole Rust text is one text.
 #[test]
-fn m144_a_package_with_siblings_names_std_the_same_over_a_loaded_prefix() {
+fn m157_a_package_with_siblings_emits_the_same_rust_in_every_shape() {
     let cache = support::scratch_dir("prefix-roundtrip-m144");
     let package = support::scratch_dir("prefix-roundtrip-m144-pkg");
     std::fs::create_dir_all(package.join("src")).expect("src");
@@ -247,26 +249,126 @@ fn m144_a_package_with_siblings_names_std_the_same_over_a_loaded_prefix() {
     );
     let loaded = emit(&entry, Some("rust"), "on", Some(&cache)).expect("the repro emits natively");
     assert_eq!(loaded.prefix_file, "loaded");
-    assert_eq!(
-        loaded.stdout, built.stdout,
-        "the loaded prefix must emit the built prefix's bytes"
-    );
-    let std_name = |bytes: &[u8]| -> String {
+    let name = |bytes: &[u8], item: &str| -> String {
         let text = String::from_utf8_lossy(bytes);
         text.lines()
             .find_map(|line| {
                 line.split_whitespace()
-                    .find(|word| word.starts_with("basename_"))
+                    .find(|word| word.starts_with(&format!("{item}_")))
             })
-            .map(|word| word.trim_end_matches('(').to_string())
-            .expect("basename's native name")
+            .map(|word| word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("{item}'s native name"))
     };
-    assert_eq!(
-        std_name(&loaded.stdout),
-        std_name(&canonical.stdout),
-        "M144: std's items are named alike in the canonical and the loaded-prefix build"
-    );
+    for item in ["basename", "two", "three"] {
+        assert_eq!(
+            name(&built.stdout, item),
+            name(&canonical.stdout, item),
+            "M157: `{item}` is named alike in the canonical build and over the built prefix"
+        );
+        assert_eq!(
+            name(&loaded.stdout, item),
+            name(&canonical.stdout, item),
+            "M157: `{item}` is named alike in the canonical build and over the loaded prefix"
+        );
+    }
+    for (shape, other) in [
+        ("built", &built),
+        ("written", &written),
+        ("loaded", &loaded),
+    ] {
+        assert!(
+            other.stdout == canonical.stdout,
+            "M157: the {shape} prefix's Rust is the canonical build's, byte for byte"
+        );
+    }
     let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_dir_all(&package);
+}
+
+/// **P6a, the rule and its oracle** (`std-prefix.md` §14.3): a package module
+/// declaring an impl that COULD answer a question std's own resolution asks —
+/// an inherent blanket `len` over every type, and std looks `len` up on its
+/// lists and strings — was refused the std prefix by §4.2's guard
+/// (`impl-reached`, member `len`), so the program built canonically and its
+/// native names differed from any prefix build's. Under the rule the tiers
+/// resolve before the package's first node in both shapes: the program takes
+/// the prefix, both shapes emit one Rust text and one JavaScript text, and
+/// the guard — kept as the TEST oracle (`VILAN_TIER_ORACLE=on`) — names the
+/// impl as the one whose meaning the rule decided, in both shapes, without
+/// refusing anything. The oracle off, nothing is recorded or named.
+#[test]
+fn p6a_a_package_impl_std_could_have_asked_about_is_decided_by_the_rule() {
+    let package = support::scratch_dir("prefix-roundtrip-p6a-oracle");
+    std::fs::create_dir_all(package.join("src")).expect("src");
+    std::fs::write(
+        package.join("vilan.toml"),
+        "[package]\nname = \"oracle\"\n[entry.main]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        package.join("src/main.vl"),
+        "import pkg::b::two;\n\nfun main() {\n\tprint(two());\n}\n",
+    )
+    .expect("entry");
+    std::fs::write(
+        package.join("src/b.vl"),
+        "export fun two(): i32 {\n\t2\n}\n\nimpl type T {\n\tfun len(self): i32 {\n\t\t0\n\t}\n}\n",
+    )
+    .expect("b");
+    let entry = package.join("src/main.vl");
+    let run = |backend: Option<&str>, prefix: &str, oracle: &str| -> (Vec<u8>, String) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+        command
+            .arg("build")
+            .arg("--stdout")
+            .arg(&entry)
+            .env("VILAN_STD", std_dir())
+            .env(
+                "VILAN_RT",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../vilan-rt"),
+            )
+            .env("VILAN_STD_PREFIX", prefix)
+            .env("VILAN_TIER_ORACLE", oracle)
+            .env("VILAN_COUNTERS", "1")
+            .env("VILAN_WORLD_CACHE", "off");
+        if let Some(backend) = backend {
+            command.args(["--backend", backend]);
+        }
+        let output = command.output().expect("run vilan");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{prefix}/{oracle}: {stderr}");
+        (output.stdout, stderr)
+    };
+    for backend in [None, Some("rust")] {
+        let (canonical, canonical_log) = run(backend, "off", "on");
+        let (prefixed, prefixed_log) = run(backend, "on", "on");
+        assert!(
+            canonical == prefixed,
+            "P6a: one {} text in both shapes",
+            backend.unwrap_or("js")
+        );
+        assert!(
+            prefixed_log.contains("prefix-world=1") && prefixed_log.contains("prefix-refusals=0"),
+            "the package takes the prefix — the guard's refusal is retired:\n{prefixed_log}"
+        );
+        for (shape, log) in [("canonical", &canonical_log), ("prefix", &prefixed_log)] {
+            assert!(
+                log.contains("[vilan phase] tier-oracle member `len`")
+                    && log.contains("tier-oracle=1"),
+                "the oracle names the impl in the {shape} shape:\n{log}"
+            );
+        }
+        let (quiet, quiet_log) = run(backend, "off", "off");
+        assert!(
+            quiet == canonical,
+            "the oracle observes and changes nothing"
+        );
+        assert!(
+            quiet_log.contains("tier-oracle=0") && !quiet_log.contains("[vilan phase] tier-oracle"),
+            "the oracle off, nothing is recorded:\n{quiet_log}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&package);
 }
 
@@ -351,8 +453,9 @@ fn m152_fullstacks_members_emit_the_same_bytes_over_a_loaded_dependency_tier() {
 /// (`report`) over a dependency whose surface re-exports a module of its own,
 /// emitted natively over a loaded std-and-dependencies prefix, names every
 /// DEPENDENCY item exactly as the canonical build does — the dependency walks
-/// before the package's first node in both shapes — so M144's residue (the
-/// package's own names, a P6 paper) is not widened to the dependency tier.
+/// before the package's first node in both shapes — and, since P6a (the tiers
+/// resolve before the package's first node in both shapes, M157), every
+/// package item too: the whole Rust text is the canonical build's.
 #[test]
 fn m152_a_dependency_names_its_items_the_same_over_a_loaded_prefix() {
     let cache = support::scratch_dir("prefix-roundtrip-m152-ids");
@@ -424,6 +527,12 @@ fn m152_a_dependency_names_its_items_the_same_over_a_loaded_prefix() {
         names(&loaded.stdout),
         names(&canonical.stdout),
         "every dependency item keeps its canonical name over the loaded prefix"
+    );
+    // P6a: and the package's own module (`report`) too — the whole Rust text
+    // is the canonical build's, built and loaded.
+    assert!(
+        built.stdout == canonical.stdout && loaded.stdout == canonical.stdout,
+        "M157: the package's items keep their canonical names over the prefix"
     );
     let canonical_js = emit(&entry, None, "off", None).expect("the fixture emits");
     let loaded_js = emit(&entry, None, "on", Some(&cache)).expect("the fixture emits");

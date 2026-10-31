@@ -58,7 +58,8 @@ The whole surface fits in a few lines:
 Two habits to keep:
 
 - Values always go through `?` placeholders. Never interpolate them into
-  the SQL string.
+  the SQL string. A nullable column takes an `Option` (`None` binds NULL)
+  and a flag column takes a `bool` (0 or 1).
 - Don't name a column with an SQL keyword. `desc` is the one that bites
   in practice: spell it `description`.
 

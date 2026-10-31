@@ -2778,7 +2778,7 @@ impl Panel<type T> {
 \t}
 
 \tfun label(self): SignalCell<str> {
-\t\tcombine((self.title, self.count)).map(|pair| i\"{pair.0} ({pair.1})\")
+\t\tcombine((self.title, self.count)).derive(|pair| i\"{pair.0} ({pair.1})\").cell()
 \t}
 
 \tfun bump(self) {
@@ -3537,7 +3537,7 @@ fun main() {
     /// `#[ignore]`d for its cost, not its verdict — it lands a full-size
     /// analysis, which is the same minutes the two budget gates pay.
     #[test]
-    #[ignore = "E126: the exhibit-shape gate — a full-size view exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    #[ignore = "E334: the exhibit-shape gate stays ignored - the generator's `Combine<(str, i32)>.map` (no such method in v0.52.0: `Pipe` stages are `.derive(..).cell()`) is fixed and the exhibit analyzes clean, but its census (257,606 entities, 27,870 substitutions, 575 implementations) now sits against RECORDED_* from 2026-09-04 (99,522 / 18,745 / 433) at 2.59x entities, outside the 2x band; today's kolt measures 634,908 / 35,988 / 1,224, so re-recording needs the owner's call on the subject's size. Full-size view exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
     fn the_view_exhibit_tracks_the_recorded_application_shape() {
         let (directory, document, analysis) = land_view(GATE_FUNCTIONS);
         let shape = census(&document);
@@ -3628,9 +3628,9 @@ fun main() {
              entry never colours",
         );
         assert!(
-            VIEW_STATE_MODULE.contains("combine((self.title, self.count)).map(")
+            VIEW_STATE_MODULE.contains("combine((self.title, self.count)).derive(")
                 && VIEW_STATE_MODULE.contains("fun render_label<S: Source<str>>"),
-            "the state module carries the generic std surface — `combine`, `map` and a \
+            "the state module carries the generic std surface — `combine`, `derive` and a \
              `Source`-bounded parameter — and without it the exhibit's generic instantiation \
              is the icon chain alone",
         );

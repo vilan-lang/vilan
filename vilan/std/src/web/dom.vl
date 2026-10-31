@@ -740,6 +740,29 @@ impl Event {
 	[extern(method, "preventDefault")]
 	external fun prevent_default(self): void;
 
+	/// Whether a handler cancelled the default action (`event.defaultPrevented`) —
+	/// what a delegating handler further up asks before acting on a click a nested
+	/// control already claimed.
+	[extern(get, "defaultPrevented")]
+	external fun default_prevented(self): bool;
+
+	/// Stops the event at the element it is on (`event.stopPropagation()`): the
+	/// rest of this element's handlers still run, and no ancestor's do. A card that
+	/// selects on click and holds its own buttons stops each button's click here,
+	/// so the press does not also select the card.
+	[extern(method, "stopPropagation")]
+	external fun stop_propagation(self): void;
+
+	/// `stop_propagation`, and the handlers after this one on the SAME element are
+	/// skipped too (`event.stopImmediatePropagation()`).
+	[extern(method, "stopImmediatePropagation")]
+	external fun stop_immediate_propagation(self): void;
+
+	/// Whether a handler stopped the event's propagation (`event.cancelBubble`,
+	/// the DOM's legacy name for the flag `stop_propagation` sets).
+	[extern(get, "cancelBubble")]
+	external fun propagation_stopped(self): bool;
+
 	/// The mouse button (`event.button`): 0 is the main button.
 	[extern(get, "button")]
 	external fun button(self): i32;

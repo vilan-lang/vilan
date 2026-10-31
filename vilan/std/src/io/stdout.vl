@@ -1,0 +1,19 @@
+// `std::io::stdout` — standard output with no newline (E332), the one door
+// `std::io::write` re-exports and `std::process::prompt` writes its prompt through.
+// A module of its own, and a small one, for two reasons: `write` needs the
+// `@process` platform (a browser has no standard output, so a browser build that
+// reaches it is refused naming the chain, while `print` stays universal), and
+// `std::io` — which nearly every program loads — must not load `std::process` to
+// get it (that import alone made the smallest example's check 15% dearer).
+
+[platform("@process")] mod self;
+
+export *;
+
+/// Writes `text` to standard output with NO newline, flushed so it is on the screen
+/// before the program waits — the door for a prompt that leaves the cursor on its
+/// line, a progress line rewritten in place (`\r`), and every redraw a key-driven
+/// program makes. `print` is `console.log`, which always ends the line; this is
+/// `process.stdout.write`, and natively `print!` with a flush.
+[extern("__stdout_write")]
+external fun write(text: str): void;

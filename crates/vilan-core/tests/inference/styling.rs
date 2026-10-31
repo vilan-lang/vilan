@@ -8419,3 +8419,109 @@ fn b620_a_long_head_nests_no_deeper_than_its_chain() {
     assert_compiles(&program(&format!("view(\"div\"){chain}")));
     assert_compiles(&program(&format!("<div {head} />")));
 }
+
+// --- B656: `css` refused wherever a binder takes it, and nothing after it ----
+//
+// `css` is a keyword; a binder named `css` is a parse-time fact. The refusal
+// used to fire only when the farthest failure landed on the word — at the top
+// of a body, and then SECOND, after the cascade it caused — and inside a
+// closure in an element hole never: a `List<void>` hole error and two
+// "expected `;`" stood in for it. The binder is now refused where it stands
+// and read as the name, so its uses read as that name and nothing cascades.
+
+const CSS_IS_A_KEYWORD: &str = "`css` is a keyword: it begins a `css { … }` block.";
+
+#[test]
+fn b656_a_css_binder_in_a_closure_in_an_element_hole_is_the_one_diagnostic() {
+    let source = r#"
+        import std::web::ui::mount_root;
+        fun main() {
+            let items = ["a", "b"];
+            mount_root("app", || <div>
+                {items.map(|item| {
+                    let css = "color:red";
+                    <span style(css)>{item}</span>
+                })}
+            </div>);
+        }
+        "#;
+    let diagnostics = failure_diagnostics_on(source, Platform::Browser);
+    let start = source.find("css = ").expect("the binder");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|(message, range)| (message.starts_with(CSS_IS_A_KEYWORD), range.clone()))
+            .collect::<Vec<_>>(),
+        vec![(true, start..start + 3)],
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b656_a_css_binder_at_a_body_top_and_a_css_parameter_are_refused_alone() {
+    for (source, binder) in [
+        (
+            "fun main(): str {\n\tlet css = \"color:red\";\n\tcss\n}\n",
+            "css = ",
+        ),
+        (
+            "fun paint(css: str): str {\n\tcss\n}\n\nfun main() {}\n",
+            "css: ",
+        ),
+        (
+            "fun main() {\n\tlet paint = |css: str| { css };\n}\n",
+            "css: ",
+        ),
+        ("fun main() {\n\tfor css in [\"a\"] {}\n}\n", "css in"),
+    ] {
+        let diagnostics = failure_diagnostics(source);
+        let start = source.find(binder).expect("the binder");
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert!(
+            diagnostics[0].0.starts_with(CSS_IS_A_KEYWORD)
+                && diagnostics[0].1 == (start..start + 3),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+}
+
+// --- B665: a runtime `css { … } + style()` sum, reported at the sum ----------
+
+const B665_ROW: &str = "import std::reactive::Signal;\nimport std::web::style;\nimport std::web::ui::{ self, View };\nfun row(content: View): View {\n\t<div .styled(css { padding(rem(4 / 16)); } + style::style().hover(style::style().opacity(0.5)))>\n\t\t{content}\n\t</div>\n}\n";
+
+/// B665: a `css { … } + style()` sum outside `const` makes `row` reach
+/// `asset::emit` at run time; the refusal names the SUM and the fix (`const`
+/// in front of it), once — where it used to name only a caller's closure,
+/// with no word about the sum. Kolt's shape had two callers.
+#[test]
+fn b665_a_runtime_css_sum_is_reported_at_the_sum() {
+    let one_caller = format!(
+        "{B665_ROW}fun main() {{\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{{ui::each_values(names, |name| {{\n\t\t\trow(<span>{{name}}</span>)\n\t\t}})}}\n\t</div>);\n}}\n"
+    );
+    assert_fails_browser_once_with(
+        &one_caller,
+        "this `css { … } + style()` sum reaches `asset::emit` at run time, which makes every \
+         function calling it compile-time-only; write `const` in front of it",
+    );
+    let two_callers = format!(
+        "{B665_ROW}fun main() {{\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{{ui::each_values(names, |name| {{\n\t\t\trow(<span>{{name}}</span>)\n\t\t}})}}\n\t\t{{ui::each_values(names, |other| {{\n\t\t\trow(<b>{{other}}</b>)\n\t\t}})}}\n\t</div>);\n}}\n"
+    );
+    assert_fails_browser_once_with(
+        &two_callers,
+        "this `css { … } + style()` sum reaches `asset::emit` at run time",
+    );
+}
+
+/// B665: the fix compiles, and a style built from a RUNTIME value — which a
+/// `const` cannot evaluate — keeps the caller's refusal (the sum is not the
+/// answer there).
+#[test]
+fn b665_the_const_sum_compiles_and_a_runtime_style_keeps_its_refusal() {
+    assert_compiles_browser(
+        "import std::reactive::Signal;\nimport std::web::style;\nimport std::web::ui::{ self, View };\nfun row(content: View): View {\n\t<div .styled(const css { padding(rem(4 / 16)); } + style::style().hover(style::style().opacity(0.5)))>\n\t\t{content}\n\t</div>\n}\nfun main() {\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{ui::each_values(names, |name| {\n\t\t\trow(<span>{name}</span>)\n\t\t})}\n\t</div>);\n}\n",
+    );
+    assert_fails_browser_with(
+        "import std::reactive::Signal;\nimport std::web::style;\nimport std::web::ui::{ self, View };\nfun row(content: View, faded: f64): View {\n\t<div .styled(style::style().opacity(faded))>\n\t\t{content}\n\t</div>\n}\nfun main() {\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{ui::each_values(names, |name| {\n\t\t\trow(<span>{name}</span>, 0.5)\n\t\t})}\n\t</div>);\n}\n",
+        "this closure (it reaches `asset::emit`) is compile-time-only",
+    );
+}

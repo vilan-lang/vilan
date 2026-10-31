@@ -625,7 +625,8 @@ fn b478_a_clause_less_closure_parameter_is_still_refused() {
             print(relabel(SignalCell::new(1), |n| i"n={n}"));
         }
         "#,
-        "a `context`-typed parameter takes a closure literal, a named function or variant",
+        // B677: a closure PARAMETER is told its clause, the literal wrap last.
+        "`label` is a closure parameter; to run it under this context, type it `(sync |i32| str) context (owner_scope, tracking, ambient_nursery)`",
     );
 }
 
@@ -766,5 +767,97 @@ fn a_callable_struct_still_coerces_into_a_closure_slot() {
         }
         "#,
         "6\n8\n",
+    );
+}
+
+// --- B661 (+B673): a closure type that is a parameter is written in parentheses -
+
+#[test]
+fn b661_a_bare_closure_type_parameter_is_refused_with_the_parenthesized_spelling() {
+    let source =
+        "struct Holder {\n\tname: str,\n\trun: |str, |bool| void| void,\n}\n\nfun main() {}\n";
+    let start = source.find("|bool| void").expect("the inner type");
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(
+            "wrap a closure type that is a parameter in parentheses: `(|bool| void)` — bare, \
+             its `|` closes the outer parameter list"
+                .to_string(),
+            start..start + "|bool| void".len()
+        )],
+    );
+}
+
+#[test]
+fn b661_b673_the_structs_other_fields_and_its_literals_stay_whole() {
+    // B673's kolt shape: four constructors and two field reads below the
+    // broken field reported "`Provider` expects 0 fields" and "no field"
+    // each; the struct keeps every field and only the type is reported.
+    let source = r#"
+        struct Provider {
+            name: str,
+            check: |List<str>, |List<str>| void| void,
+            next_id: i32,
+        }
+        fun make(): Provider {
+            Provider { name = "a", check = |words, done| {}, next_id = 1 }
+        }
+        fun other(): Provider {
+            Provider { name = "b", check = |words, done| {}, next_id = 2 }
+        }
+        fun main() {
+            let provider = make();
+            let next = provider.next_id;
+            let name = other().name;
+        }
+        "#;
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].0.contains("`(|List<str>| void)`"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b673_a_field_whose_type_breaks_keeps_its_name_and_its_siblings() {
+    // Any broken field type, not only the closure one: the body is read field
+    // by field, the broken field kept by name with an unresolved type.
+    let source = r#"
+        struct Provider {
+            name: str,
+            check: i32 i32,
+            next_id: i32,
+        }
+        fun make(): Provider {
+            Provider { name = "a", check = 1, next_id = 1 }
+        }
+        fun main() {
+            let provider = make();
+            let next = provider.next_id;
+        }
+        "#;
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].0.starts_with("found 'i32' expected ','"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b661_the_trailing_comma_and_the_parenthesized_forms_still_parse() {
+    assert_compiles(
+        r#"
+        struct Holder {
+            run: |str, (|bool| void)| void,
+            wide: |
+                str,
+                i32,
+            | void,
+            group: |(|| void)| void,
+        }
+        fun main() {}
+        "#,
     );
 }

@@ -432,15 +432,36 @@ function flatten(node) {
 /// CAPTURE listeners on the way DOWN to the target, then the target's own and
 /// every ancestor's on the way back UP. The order is the whole point of the
 /// capture surface, so the stub has to get it right rather than fire a list.
+///
+/// M171: and stop where the host stops — `stopPropagation` lets the rest of
+/// the current node's handlers run and no further node's, and
+/// `stopImmediatePropagation` skips the current node's remaining handlers
+/// too. `cancelBubble` and `defaultPrevented` read the two flags back.
 function dispatchEvent(target, type, extra = {}) {
     const chain = [];
     for (let walk = target; walk; walk = walk.parent) chain.unshift(walk);
-    const event = { target, type, preventDefault() { this.prevented = true; }, ...extra };
+    const event = {
+        target, type,
+        prevented: false, stopped: false, stoppedImmediately: false,
+        preventDefault() { this.prevented = true; },
+        get defaultPrevented() { return this.prevented; },
+        stopPropagation() { this.stopped = true; },
+        stopImmediatePropagation() { this.stopped = true; this.stoppedImmediately = true; },
+        get cancelBubble() { return this.stopped; },
+        ...extra,
+    };
     const stubWindow = global.window;
-    for (const handler of (stubWindow.captureListeners[type] || [])) handler(event);
-    for (const node of chain) for (const handler of (node.captureListeners[type] || [])) handler(event);
-    for (const node of chain.slice().reverse()) for (const handler of (node.listeners[type] || [])) handler(event);
-    for (const handler of (stubWindow.listeners[type] || [])) handler(event);
+    const phases = [stubWindow.captureListeners[type]]
+        .concat(chain.map(node => node.captureListeners[type]))
+        .concat(chain.slice().reverse().map(node => node.listeners[type]))
+        .concat([stubWindow.listeners[type]]);
+    for (const handlers of phases) {
+        if (event.stopped) break;
+        for (const handler of (handlers || [])) {
+            if (event.stoppedImmediately) break;
+            handler(event);
+        }
+    }
     return event;
 }
 
@@ -513,20 +534,28 @@ function installStubDocument(options = {}) {
     // them the same way it fires an element's (`window.fire("resize")`).
     global.window = new StubElement("window");
     global.windowListeners = { bubble: global.window.listeners, capture: global.window.captureListeners };
-    global.location = { pathname: "/" };
+    global.location = { pathname: "/", search: "", hash: "" };
     // The history STACK, not just the current path: `pushState` grows it and
     // `replaceState` rewrites its top, which is the only difference between
     // `navigate` and `navigate_replace` (A72) and therefore the only thing a
     // pin can read. Nothing else has to look at it.
+    //
+    // M167: and the current entry's STATE, as the host keeps it — `null` for
+    // the entry the page loaded on, whatever the last push or replace stored
+    // after that. A harness simulating Back sets it with the pathname before
+    // it fires `popstate`.
     global.historyEntries = ["/"];
     global.history = {
+        state: null,
         pushState(state, title, path) {
             global.location.pathname = path;
             global.historyEntries.push(path);
+            this.state = state;
         },
         replaceState(state, title, path) {
             global.location.pathname = path;
             global.historyEntries[global.historyEntries.length - 1] = path;
+            this.state = state;
         },
     };
     // A121: the resolved style. The stub has no cascade, so a value comes from

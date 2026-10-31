@@ -149,6 +149,12 @@ function queue_wakes(turn, subscribers, traced, cause) {
 		enqueue(turn, subscribers);
 	}
 }
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
+}
 function middle(items) {
 	return items[1];
 }
@@ -177,11 +183,11 @@ function new2(value, caller) {
 	}
 	return cell;
 }
-function new3(value) {
-	return new2(value, "std/src/reactive.vl:2448:15");
+function new3(value, caller) {
+	return new2(value, caller);
 }
-function new4(value) {
-	return new2(value, "std/src/reactive.vl:2448:15");
+function new4(value, caller) {
+	return new2(value, caller);
 }
 function get(self) {
 	return __clone(self[0].v);
@@ -270,12 +276,12 @@ function attach_observer(self, observer, immediately) {
 	}
 	return subscription;
 }
-function sub(self, observer) {
-	return attach_observer(self, (value) => {
+function sub(self, observer, caller) {
+	return place_subscription(attach_observer(self, (value) => {
 		return (() => {
 			return observer(value, [ 1 ]);
 		})();
-	}, true);
+	}, true), caller);
 }
 function gather(sources, $a) {
 	const snapshot = () => {
@@ -283,12 +289,12 @@ function gather(sources, $a) {
 			return get(source);
 		});
 	};
-	const derived = new4(snapshot());
+	const derived = new4(snapshot(), "spread-parameters.vl:38:24");
 	sources.map((source) => {
 		return sub(__clone(source), (_, $b) => {
 			set(derived, snapshot(), $a, "spread-parameters.vl:40:11");
 			return;
-		});
+		}, "spread-parameters.vl:39:51");
 	});
 	return derived;
 }
@@ -358,6 +364,8 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
 console.log(String(middle([ 4, 5, 6 ])));
@@ -368,8 +376,8 @@ console.log(String(swap_pack([ 1, 2 ])));
 console.log(String(outer([ 3, 4 ])));
 const inner = [ 10, 11 ];
 console.log(String(width([ ...inner, 12 ])));
-const count = new3(20);
-const name = new4("hi");
+const count = new3(20, "spread-parameters.vl:55:22");
+const name = new4("hi", "spread-parameters.vl:56:21");
 const both = gather([ __clone(count), name ], [ 1 ]);
 console.log(String(get(both)[0]));
 set2(count, 21, [ 1 ], "spread-parameters.vl:59:8");

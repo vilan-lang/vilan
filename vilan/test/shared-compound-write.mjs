@@ -411,7 +411,7 @@ function advance(self, carried) {
 			if ($x[0] === 0) {
 				const message2 = $x[1];
 				$y = (() => {
-					throw __panic(message2, "std/src/reactive.vl:1291:27");
+					throw __panic(message2, "std/src/reactive.vl:1294:27");
 				})();
 			} else {
 				$y = undefined;
@@ -427,6 +427,12 @@ function get_owner($K) {
 }
 function release_runs(runs2) {
 	dispose2([ runs2[0], runs2[0].v[0] ]);
+}
+function place_subscription(subscription, site) {
+	if (tracing.v) {
+		trace_hooks.v[8](subscription[1], site);
+	}
+	return subscription;
 }
 function also_releasing(handle, release) {
 	const previous = handle[3].v;
@@ -478,7 +484,7 @@ function run_body(runs2, body) {
 		})(run);
 	} else {
 		$D = (() => {
-			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1402:11");
+			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1405:11");
 		})();
 	}
 	return $D;
@@ -512,12 +518,12 @@ function attach_observer(self, observer, immediately) {
 	}
 	return subscription;
 }
-function on_change(self, observer) {
-	return attach_observer(self, (value) => {
+function on_change(self, observer, caller) {
+	return place_subscription(attach_observer(self, (value) => {
 		return (() => {
 			return observer(value, [ 1 ]);
 		})();
-	}, false);
+	}, false), caller);
 }
 function is_empty(self) {
 	return self.length === 0;
@@ -538,7 +544,7 @@ function take(self, item, $L) {
 	});
 	return __clone(item);
 }
-function effect_on_change(self, body, $j, $k) {
+function effect_on_change(self, body, $j, $k, caller) {
 	const runs2 = new3();
 	const subscription = on_change(self, (value, $l) => {
 		return run_body(runs2, ($m, $n) => {
@@ -546,7 +552,7 @@ function effect_on_change(self, body, $j, $k) {
 				return body(value, $m, [ 1 ], $n);
 			})();
 		});
-	});
+	}, caller);
 	also_releasing(subscription, () => {
 		return release_runs(runs2);
 	});
@@ -637,6 +643,8 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
 const no_cleanups = __shared_new([  ]);
@@ -669,11 +677,11 @@ run_with_owner(watching, ($e) => {
 	effect_on_change(__clone(a), (_x, $f, $g, $h) => {
 		const $i = [ runs, "v" ];
 		return runs.v = $i[0][$i[1]] + 1;
-	}, [ 1 ], $e);
+	}, [ 1 ], $e, "shared-compound-write.vl:44:5");
 	effect_on_change(__clone(b), (_x, $X, $Y, $Z) => {
 		const $aa = [ runs, "v" ];
 		return runs.v = $aa[0][$aa[1]] + 10;
-	}, [ 1 ], $e);
+	}, [ 1 ], $e, "shared-compound-write.vl:45:5");
 	return;
 });
 set(a, 1, [ 1 ], "shared-compound-write.vl:47:4");

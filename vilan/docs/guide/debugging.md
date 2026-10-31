@@ -186,10 +186,40 @@ fun main() {
 ```
 
 A chain of tracking functions reports the outermost caller. A closure written
-inside one is not tracking: its panic names its own line. The attribute is
-refused on a trait method (a call through a trait is dispatched, and no call
-site knows to pass a location), and a tracking function cannot be passed as a
-value; wrap it in a closure.
+inside one is not tracking: its panic names its own line. A tracking function
+cannot be passed as a value; wrap it in a closure.
+
+On a trait method, the attribute belongs to the TRAIT: declared on the trait's
+member, every implementation takes the call site (whether it writes the
+attribute or not), and every call passes it — through a generic bound and a
+`dyn` object too. An implementation cannot mark a member its trait does not,
+since a call through the trait would have no site to pass.
+
+```vilan
+import std::debug::caller;
+
+trait Check {
+	[track_caller]
+	fun check(self): str;
+}
+
+struct Always {}
+
+impl Always with Check {
+	fun check(self): str {
+		caller().text()   // the line that called `check`, however it was reached
+	}
+}
+
+fun through<T: Check>(value: T): str {
+	value.check()   // this line
+}
+
+fun main() {
+	print(Always {}.check());
+	print(through(Always {}));
+}
+```
 
 ## In a debugger
 

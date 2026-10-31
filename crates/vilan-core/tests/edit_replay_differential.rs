@@ -304,8 +304,12 @@ fn every_edit_class_answers_what_a_clean_analysis_answers_over_the_std_prefix() 
     );
     let prefix_worlds = censuses.iter().filter(|census| census.prefix_world).count();
     let prefix_hits: u64 = censuses.iter().map(|census| census.prefix_hits).sum();
+    // A refusal OF the prefix is counted; N179's gates in front of the
+    // attempt (the classes' entry-impl step rebuilds in B553's deferred
+    // order, `resolve-deferred`) name themselves without being one.
     let refusals: Vec<&'static str> = censuses
         .iter()
+        .filter(|census| census.prefix_refusals > 0)
         .filter_map(|census| census.prefix_refusal)
         .collect();
     eprintln!(
@@ -567,21 +571,25 @@ fn packages_with_one_std_closure_share_one_std_prefix() {
 }
 
 /// A package impl on a std CONCRETE type std's own resolve asks about —
-/// `SignalCell<T>`'s `get`, asked of `SignalCell<T>` itself — for the guard's
-/// refusing case.
+/// `SignalCell<T>`'s `get`, asked of `SignalCell<T>` itself — the case §4.2's
+/// guard refused and the P6a rule decides.
 const PREFIX_PEEK: &str = "import std::reactive::SignalCell;\n\n\
 export trait Peek {\n\tfun get(self): i32;\n}\n\n\
 export impl SignalCell<type T> with Peek {\n\tfun get(self): i32 {\n\t\t0\n\t}\n}\n";
 
-/// **std-prefix P1, §4.2's guard.** A package impl that could answer a
-/// question std's own resolve asked — here a trait impl on std's
-/// `SignalCell<T>` declaring `get`, which std's reactive code looks up on
-/// `SignalCell<T>` — refuses the prefix: the analysis is built in the shape it
-/// would have taken without it (the canonical one: no hot seed), answers what
-/// the clean analysis answers, and the next analysis of the same package does
-/// not try again.
+/// **std-prefix P6a, §4.2 hardened from guard to RULE** (`std-prefix.md`
+/// §14.3). A package impl that could answer a question std's own resolve asks
+/// — a trait impl on std's `SignalCell<T>` declaring `get`, which std's
+/// reactive code looks up on `SignalCell<T>` — used to REFUSE the prefix
+/// (`impl-reached`): the canonical drain resolved std and the package in one
+/// fixpoint, so the impl was in reach of std's resolution there and not over
+/// the prefix. The canonical drain now resolves the tiers before the package's
+/// first node mints, as the prefix world does, so the package is SERVED over
+/// the prefix and answers what the clean analysis answers; the next analysis
+/// is served the stored prefix. The guard is the TEST oracle now: on, it names
+/// this impl (one hit) and refuses nothing.
 #[test]
-fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
+fn p6a_a_package_impl_a_std_question_reaches_is_decided_by_the_rule() {
     let _switch = SWITCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -598,22 +606,83 @@ fn a_package_impl_a_std_question_reaches_refuses_the_std_prefix() {
             ("peek.vl", PREFIX_PEEK),
         ],
     );
-    let refused = observe_over_the_prefix(&package);
-    let remembered = observe_over_the_prefix(&package);
+    let served = observe_over_the_prefix(&package);
+    let again = observe_over_the_prefix(&package);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::incremental::set_tier_oracle(Some(true));
+    let oracle_before = vilan_core::incremental::tier_oracle_hits();
+    let named = observe_over_the_prefix(&package);
+    let oracle_hits = vilan_core::incremental::tier_oracle_hits() - oracle_before;
+    vilan_core::incremental::set_tier_oracle(None);
     package.remove();
     vilan_core::analyzer::base_cache_clear();
     assert!(
-        !refused.census.prefix_world
-            && refused.census.prefix_refusals == 1
-            && refused.census.prefix_refusal == Some("impl-reached"),
-        "the package's impl refuses the prefix: {:?}",
-        refused.census
+        served.census.prefix_world && served.census.prefix_refusals == 0,
+        "the package's impl no longer refuses the prefix: {:?}",
+        served.census
     );
-    assert_eq!(
-        remembered.census.prefix_refusal,
-        Some("refused-before"),
-        "a refused package is not built over the prefix again: {:?}",
-        remembered.census
+    assert!(
+        again.census.prefix_world && again.census.prefix_hits == 1,
+        "and the next analysis is served the stored prefix: {:?}",
+        again.census
+    );
+    assert!(
+        named.census.prefix_world && named.census.tier_oracle_hits == 1,
+        "the oracle names the impl over the prefix, refusing nothing: {:?}",
+        named.census
+    );
+    assert!(
+        oracle_hits >= 2,
+        "and in the clean canonical analysis beside it ({oracle_hits} hits in all)"
+    );
+}
+
+/// **N179: a program the std prefix is not ATTEMPTED for says why.** The
+/// reuse gate in front of the attempt is syntactic — an entry whose text says
+/// `macro` may define one, which would register into the world's registry —
+/// so a program that only MENTIONS the word (the corpus's `crypto`, `db`,
+/// `file`, `watch` say it in a comment) takes the canonical path. The census
+/// read `prefix-world 0 prefix-refusal -` for it, neither served nor why; it
+/// names the gate now (`macro-text`), without counting a refusal of the
+/// prefix, and the analysis answers what the clean one does. A program the
+/// gate passes is served, with no reason.
+#[test]
+fn n179_a_program_the_prefix_is_not_attempted_for_names_the_gate() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let mentions = Package::write(
+        "prefix_macro_text",
+        NODE,
+        &[(
+            "main.vl",
+            "// No macro is defined here; the word is enough for the gate.\n\
+             fun main() {\n\tprint(\"ok\");\n}\n",
+        )],
+    );
+    let plain = Package::write(
+        "prefix_plain_text",
+        NODE,
+        &[("main.vl", "fun main() {\n\tprint(\"ok\");\n}\n")],
+    );
+    let not_taken = observe_over_the_prefix(&mentions);
+    let taken = observe_over_the_prefix(&plain);
+    mentions.remove();
+    plain.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        !not_taken.census.prefix_world
+            && not_taken.census.prefix_refusal == Some("macro-text")
+            && not_taken.census.prefix_refusals == 0,
+        "the gate in front of the prefix is named, and is not a refusal of it: {:?}",
+        not_taken.census
+    );
+    assert!(
+        taken.census.prefix_world && taken.census.prefix_refusal.is_none(),
+        "a program the gate passes is served with no reason: {:?}",
+        taken.census
     );
 }
 

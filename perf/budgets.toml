@@ -47,180 +47,180 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 246_054_728
-measured_at = "v0.52.0's seal"
+ceiling = 249_511_737
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 307_292_719
-measured_at = "v0.52.0's seal"
+ceiling = 309_249_054
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_311_684_500
-measured_at = "v0.52.0's seal"
+ceiling = 1_320_729_931
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_713_464_567
-measured_at = "v0.52.0's seal"
+ceiling = 2_777_348_943
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_416_572_330
-measured_at = "v0.52.0's seal"
+ceiling = 1_428_627_939
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_463_358_948
-measured_at = "v0.52.0's seal"
+ceiling = 1_474_489_112
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_054_378_898
-measured_at = "v0.52.0's seal"
+ceiling = 3_135_735_765
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_319_862_769
-measured_at = "v0.52.0's seal"
+ceiling = 1_334_447_168
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_539_280_769
-measured_at = "v0.52.0's seal"
+ceiling = 1_548_674_718
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_697_041_969
-measured_at = "v0.52.0's seal"
+ceiling = 3_775_899_646
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_851_874_960
-measured_at = "v0.52.0's seal"
+ceiling = 3_940_795_609
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 7_143_071_807
-measured_at = "v0.52.0's seal"
+ceiling = 7_168_811_916
+measured_at = "v0.53.0's seal"
 
 [[row]]
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 260_077_866
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 263_771_320
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 323_287_445
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 325_234_676
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_372_402_463
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 1_381_489_478
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_835_535_459
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 2_897_341_758
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_477_623_205
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 1_490_527_360
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_526_402_468
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 1_538_671_054
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_187_994_729
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 3_277_232_758
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_379_069_413
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 1_395_562_584
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_607_419_678
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 1_614_434_653
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_857_160_752
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 3_941_073_589
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_017_955_112
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 4_108_340_550
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 7_433_236_819
-measured_at = "v0.52.0's seal (ci rows from CI's perf job at 6c460ca4dd)"
+ceiling = 7_453_824_040
+measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
 tolerance = 0.005
 
 [[growth]]

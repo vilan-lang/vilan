@@ -1,0 +1,69 @@
+// B646: `[track_caller]` declared on a trait member - every implementation takes
+// the hidden location and every call passes it (static, bound, `dyn`, a default,
+// a `T::member()` static, a path call, a tracking caller forwarding its own).
+import std::debug::caller;
+import std::io::print;
+trait Probe {
+	[track_caller]
+	fun probe(self, label: str): str;
+	[track_caller]
+	fun fallback(self): str {
+		"default " + caller().text()
+	}
+}
+trait Make {
+	[track_caller]
+	fun make(): str;
+}
+struct P {}
+impl P with Probe {
+	fun probe(self, label: str): str {
+		label + " " + caller().text()
+	}
+}
+impl P with Make {
+	fun make(): str {
+		"make " + caller().text()
+	}
+}
+struct Q {}
+impl Q with Probe {
+	[track_caller]
+	fun probe(self, label: str): str {
+		label + " q " + caller().text()
+	}
+	fun fallback(self): str {
+		"q " + caller().text()
+	}
+}
+fun bound<T: Probe>(value: T): str {
+	value.probe("bound")
+}
+fun object(value: dyn Probe): str {
+	value.probe("dyn")
+}
+fun object_default(value: dyn Probe): str {
+	value.fallback()
+}
+fun build<T: Make>(): str {
+	T::make()
+}
+[track_caller]
+fun forwarding<T: Probe>(value: T): str {
+	value.probe("forwarded")
+}
+fun main() {
+	print(P {}.probe("static"));
+	print(Q {}.probe("static"));
+	print(bound(P {}));
+	print(bound(Q {}));
+	print(object(P {}));
+	print(object(Q {}));
+	print(P {}.fallback());
+	print(object_default(P {}));
+	print(object_default(Q {}));
+	print(build<P>());
+	print(P::make());
+	print(forwarding(Q {}));
+	print(Probe::probe(P {}, "path"));
+}

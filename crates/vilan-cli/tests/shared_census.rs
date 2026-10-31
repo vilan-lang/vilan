@@ -25,9 +25,10 @@
 //! `Serialize`/`Deserialize` take `&mut self` and `Wire::describe`/`rebuild`
 //! take `&mut S`/`&mut D`, so the visitors' state lives in plain fields.
 //!
-//! The ONE F residue left is recorded in `FRAME_SCOPED_BLOCKED` with its
-//! reason. It is not an oversight: it is the language telling the code what
-//! shape it may have.
+//! The F residues left are recorded in `FRAME_SCOPED_BLOCKED` with their
+//! reason — one reason, twice: an awaiting `next` on a resource (`fs::Reader`,
+//! and since A173 S2 `process::Keys`). It is not an oversight: it is the
+//! language telling the code what shape it may have.
 
 use std::path::{Path, PathBuf};
 
@@ -57,6 +58,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "memo.vl",
         1,
         "E: the memo cache outlives every maker's scope",
+    ),
+    (
+        "process.vl",
+        1,
+        "F (blocked: `Keys::next` awaits, so no `&mut self` — A173 S2's \
+         decoder state, `Reader`'s cursor's shape)",
     ),
     (
         "process/web/ui.vl",
@@ -138,7 +145,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive/store_core.vl",
-        4,
+        5,
         "E: a store's cells, all minted by the store and reached through every \
          copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
          (`Store::new`), each node of its slot tree, and a slot's subscription \
@@ -146,17 +153,20 @@ const CENSUS: &[(&str, usize, &str)] = &[
          `store.vl` at A149 S3 (so `std::web::ui` stops loading the collection \
          layer); +1 there: a keyed node's table of children (a map's keys, a \
          set's members, a keyed list's keys), made by the first subscription \
-         under a key and read by every write's diff. A collection flow's feed \
-         keeps its state in `mut` bindings its closures capture, so `store.vl` \
-         itself mints none",
+         under a key and read by every write's diff; +1 at M172 (Order 55): the \
+         root's identity table (`ids`), a cell as `keyed` is, because binding \
+         the map copied every identity minted once per boundary a mirror named. \
+         A collection flow's feed keeps its state in `mut` bindings its \
+         closures capture, so `store.vl` itself mints none",
     ),
     (
         "reactive/trace.vl",
-        5,
+        6,
         "R (E257 S8): the reactive trace's module-level state, program \
          lifetime — the write site a traced `set` leaves for its `notify`, the \
-         traced wake running now, each cell's birthplace by identity, the \
-         queued wakes' causes and tasks, and the task-token counter",
+         traced wake running now, each cell's birthplace by identity, each \
+         subscriber's birthplace by id (B646), the queued wakes' causes and \
+         tasks, and the task-token counter",
     ),
     (
         "reactive/transient.vl",
@@ -189,8 +199,15 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc/mirror.vl",
-        31,
-        "R + E: the open mirror channels, the client's views and the failed \
+        37,
+        "R + E (+6 at M172, Order 55: the tables keyed by what they are looked \
+         up by — on the server the base of each grant by its path's identity \
+         (`bases`), the slots under each grant (`under`) and the opening-order \
+         stamp source; on the client the slot of each boundary by identity \
+         (`named`), how many named slots stand below each place (`covered`) \
+         and the naming-order stamp source; and per store mirror the hold \
+         count per boundary (`holding`) — every one reached through every copy \
+         of its record): the open mirror channels, the client's views and the failed \
          mints' last errors (three module bindings), and the cells every copy of \
          a record reaches — on the server per channel the grants, the slots, the \
          turn's dirty and seeding lists, its pending flush, the next base \
@@ -205,8 +222,9 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc/server.vl",
-        6,
-        "R + O: the registry, the server's stats",
+        7,
+        "R + O: the registry, the server's stats; +1 at A174 (Order 55): the \
+         closers by connection id (`Connection::close`), a module binding",
     ),
     (
         "shared.vl",
@@ -259,15 +277,25 @@ const VISITOR_STATE_UNBOXED: &[(&str, &str)] = &[
 ///
 /// It is ONE file now. `json.vl`'s six and `binary.vl`'s four left with A108;
 /// this one cannot follow them, and the reason is not the receiver.
-const FRAME_SCOPED_BLOCKED: &[(&str, usize, &str)] = &[(
-    "fs.vl",
-    1,
-    "`Reader.cursor` is FORCED rather than chosen, and the type's own \
-     doc-comment says so: `Reader::next` awaits the read, and a `&mut` view \
-     may not be held across a suspension (spec §6.3), so a plain field behind \
-     `&mut self` is not a shape this method may have — which is exactly why \
-     A108's receiver change reached the other ten and not this one.",
-)];
+const FRAME_SCOPED_BLOCKED: &[(&str, usize, &str)] = &[
+    (
+        "fs.vl",
+        1,
+        "`Reader.cursor` is FORCED rather than chosen, and the type's own \
+         doc-comment says so: `Reader::next` awaits the read, and a `&mut` view \
+         may not be held across a suspension (spec §6.3), so a plain field behind \
+         `&mut self` is not a shape this method may have — which is exactly why \
+         A108's receiver change reached the other ten and not this one.",
+    ),
+    (
+        "process.vl",
+        1,
+        "`Keys.decoder` (A173 S2) is `Reader.cursor` again: `Keys::next` awaits \
+         the next bytes, so the decoder's state cannot be a plain field behind \
+         `&mut self` (spec §6.3) — and the decoder itself, `KeyDecoder`, takes \
+         `&mut self` everywhere, so the cell is the ONE place the shape is forced.",
+    ),
+];
 
 fn std_source_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src")
@@ -332,7 +360,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 239,
+        total, 249,
         "the total number of `Shared` construction sites in std changed"
     );
 

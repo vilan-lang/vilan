@@ -1105,7 +1105,7 @@ fun trace(on: bool)
 write reached, as it runs — naming what woke it:
 
 ```text
-[reactive] effect #4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
+[reactive] effect #4 at src/views.vl:30:8 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
 [reactive] derivation #2 woken by cell #1, set at src/main.vl:9:7
 [reactive] effect #5 woken by cell #3, set by derivation #2
 [reactive] effect #6 woken by derivation #2
@@ -1114,13 +1114,14 @@ write reached, as it runs — naming what woke it:
 A subscriber is an `effect` (it acts on a value) or a `derivation` (a pipe's
 stage, a `.memo()`, a relay), numbered by its id; a cell by its identity,
 which is the same number on every line. The places are `[track_caller]`
-locations: where the cell was made by `SignalCell::new`, and the `set` or
-`update` that wrote it — each named only when it is your code's, never std's.
-A write std makes inside a traced wake (a `.memo()` publishing its value)
-says `set by` that wake instead, and a relay's wake (`distinct`, `switch`)
-names the relay. A cell made by `Signal::new`, and a write through a
-`S: Signal<T>` bound or a `dyn Signal`, carry no place: a trait member cannot
-track its caller.
+locations: where the effect was made (`effect`, `sub`, `on_change`), where the
+cell was made (`Signal::new`, `SignalCell::new`), and the `set` or `update`
+that wrote it — each named only when it is your code's, never std's. The
+`Signal` and `Flow` members track their caller on the trait itself, so a
+write through a `S: Signal<T>` bound or a `dyn Signal` names its place as a
+concrete cell's does. A write std makes inside a traced wake (a `.memo()`
+publishing its value) says `set by` that wake instead, and a relay's wake
+(`distinct`, `switch`) names the relay.
 
 The lines are the same bytes on both backends. Turn the trace on before the
 cells you want named are made (a cell remembers where it was made only while

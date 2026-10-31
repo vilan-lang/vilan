@@ -77,6 +77,18 @@ const EXCLUDED: &[(&str, &str)] = &[
     ),
     ("process-env.vl", "host environment (`__env`, `__args`)"),
     (
+        "key-decoder.vl",
+        "host `Uint8Array` (`std::process::KeyDecoder` decodes `Bytes`; A173 S2) — \
+         the macro world's evaluator has no typed array; the JS and native \
+         backends are the program's two observers",
+    ),
+    (
+        "stdin-keys.vl",
+        "async + host stdin (`__stdin_bytes`, `__term_enter`; A173 S2) — the \
+         macro world's evaluator has no stdin; the JS and native backends are \
+         the program's two observers, over its `.stdin` fixture",
+    ),
+    (
         "stdin-lines.vl",
         "async + host stdin (`__stdin_line`; A173 S1) — the macro world's \
          evaluator has no stdin; the JS and native backends are the program's \

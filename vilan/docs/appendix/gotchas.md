@@ -8,8 +8,12 @@ organized by message instead of by topic.
 
 ## Language
 
-- **`match` can't be an operator operand.**
-  `(match x { … }) + 1` → bind the match to a local first.
+- **A `match` that begins a statement ends at its closing brace.**
+  `match x { … } + 1` as a function's last line is two statements, and
+  the compiler refuses it; write `(match x { … }) + 1`. Anywhere else a
+  `match` is an ordinary operand: `flag && match x { … }` and
+  `let n = 1 + match x { … };` work as written. The same goes for `if`,
+  `for` and a `{ … }` block.
 - **A bare integer literal adapts to its peer; two typed variables
   don't.** `stamp + 1000` and `stamp < 1000` are fine on an `i53` (the
   literal takes the peer's type), but mixing two differently-typed

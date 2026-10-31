@@ -330,54 +330,17 @@ struct ImplReachLog {
     /// two-phase order has always resolved std before the entry walked, and
     /// what std's lookups answer is std's to decide (the deferred order would
     /// otherwise put a user's blanket in reach of std's own calls). It still
-    /// counts against a HOT impl, which a canonical analysis would have walked
-    /// before std resolved.
+    /// counts against a HOT impl: since P6a the tiers resolve before ANY
+    /// package node exists, so this log never sees their first resolve — a
+    /// std question here is one the package half asked again (a constraint
+    /// std's own resolve left open), and the canonical package half asks it
+    /// with the hot modules walked.
     asked_by_std: bool,
     /// How many impls the world held when its recorded resolve ended — every
     /// impl from this index on joined after it. `None` for a world that never
     /// resolved before its entry (the deferred order), whose impls were all
     /// there to be asked.
     floor: Option<usize>,
-}
-
-impl ImplReachLog {
-    /// std-prefix P2: the questions of this (std's, filter `everything`) log
-    /// that `filter` would have recorded — a member question about one of its
-    /// names, or anything when it records everything.
-    fn kept_by(&self, filter: &ReachFilter) -> ImplReachLog {
-        let members = self
-            .members
-            .iter()
-            .filter(|(name, _)| filter.everything || filter.members.contains(&***name))
-            .map(|(name, receivers)| (name.clone(), receivers.clone()))
-            .collect();
-        let traits = match filter.everything {
-            true => self.traits.clone(),
-            false => HashMap::default(),
-        };
-        ImplReachLog {
-            members,
-            traits,
-            ..ImplReachLog::default()
-        }
-    }
-
-    /// Adds `other`'s questions to this log's (a receiver asked by a package
-    /// source on either side stays asked by one).
-    fn absorb(&mut self, other: ImplReachLog) {
-        for (name, receivers) in other.members {
-            let into = self.members.entry(name).or_default();
-            for (receiver, asked) in receivers {
-                note_receiver(into, &receiver, asked);
-            }
-        }
-        for (trait_id, receivers) in other.traits {
-            let into = self.traits.entry(trait_id).or_default();
-            for (receiver, asked) in receivers {
-                note_receiver(into, &receiver, asked);
-            }
-        }
-    }
 }
 
 /// Which questions an [`ImplReachLog`] keeps, read off the LATE files' syntax
@@ -4557,6 +4520,11 @@ pub struct Analyzer<'src> {
     /// `never` and marks every frame nested inside the re-entered one inexact
     /// — built on an unfinished neighbour — so only exact answers are recorded.
     return_inference_stack: Vec<(Id, bool)>,
+    /// B667: each walked `match`'s leg bodies, by the match's id — what a
+    /// match still waiting on its constraint is made of, for the return-
+    /// position walk (`self_returning_function`), which runs while the
+    /// constraint queue is drained.
+    match_leg_bodies: HashMap<Id, Vec<Id>>,
     /// `inferred_return_type`'s record: the last exact answer per unannotated
     /// function, for the read-only coercion path (`compare_type`) that cannot
     /// infer on the spot.
@@ -5439,6 +5407,13 @@ pub struct Analyzer<'src> {
     // the lookups that hold `&mut self`; the log is written only while
     // `recording`, and never read until the resolve that wrote it has ended.
     impl_reach: std::cell::RefCell<ImplReachLog>,
+    /// std-prefix P6a: the tier rule's ORACLE, while it is pending — every
+    /// question the tiers' resolve asked of the impl table (filter
+    /// `everything`; its `floor` is the first package impl), recorded only
+    /// when the oracle is on ([`crate::incremental::tier_oracle`]), and tested
+    /// against the package's impls once they have resolved
+    /// ([`Analyzer::check_tier_oracle`]).
+    tier_oracle: Option<ImplReachLog>,
     #[serde(skip)]
     macro_expression_expansions: HashMap<usize, &'static Spanned<Node<'static>>>,
     // Expression sites whose expansion failed — already diagnosed; they walk
@@ -5761,6 +5736,14 @@ pub struct Analyzer<'src> {
     /// the repeated inference passes over one site report once.
     dyn_refusals_reported: HashSet<Id>,
     callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// M165: every expression an `Option` value lands at an `any` position at,
+    /// with how many `Option` layers it is. See [`Program::any_option_coercions`].
+    any_option_coercions: HashMap<Id, usize>,
+    /// M165: a method call's impl binders the RECEIVER binds to `any`
+    /// (`List<any>`'s `T`), by call — an argument at a parameter typed by one
+    /// lands at the `any` (`params.push(maybe)`), though the call's own
+    /// substitution binds the binder to the argument's type.
+    any_bound_receiver_binders: HashMap<Id, Vec<TypeId>>,
     /// A124 R3: every expression a concrete value is erased into a trait object
     /// at — the expression's own id, and the value's own type, which is what the
     /// emitter builds the vtable from. Recorded by
@@ -8074,6 +8057,7 @@ impl<'src> Analyzer<'src> {
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
+            match_leg_bodies: HashMap::default(),
             return_depth_refused: false,
             inferred_return_types: HashMap::default(),
             closure_held_targets: HashMap::default(),
@@ -8248,6 +8232,7 @@ impl<'src> Analyzer<'src> {
             macro_signatures: HashMap::default(),
             pending_macro_references: Vec::new(),
             impl_reach: std::cell::RefCell::default(),
+            tier_oracle: None,
             macro_expression_expansions: HashMap::default(),
             macro_failed_sites: HashSet::default(),
             module_scope_ids: HashSet::default(),
@@ -8308,6 +8293,8 @@ impl<'src> Analyzer<'src> {
             supertrait_self_at_call: HashMap::default(),
             expected_types: HashMap::default(),
             callable_coercions: HashMap::default(),
+            any_option_coercions: HashMap::default(),
+            any_bound_receiver_binders: HashMap::default(),
             dyn_coercions: HashMap::default(),
             dyn_tuple_coercions: HashMap::default(),
             parameter_erasures: Vec::new(),
@@ -33076,6 +33063,278 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B647 (spec §6.4, rule 4): a call that LENDS a module-level `mut`
+    /// binding — a written `&`/`&mut` of it or of a place under it, or a
+    /// `&self`/`&mut self` receiver over one — to a callee whose write summary
+    /// reaches that binding is refused at the argument: the callee's body is
+    /// a second path to the place the loan holds, and the two backends
+    /// answered differently (`lent_and_grow(&module_items)` with the callee
+    /// pushing into `module_items` printed `1` on JS, where the `&` is the
+    /// binding's object, and `0` natively, a copy out of its `thread_local!`
+    /// cell; `touch(&mut module_items)` printed `2` on JS and stopped natively
+    /// with the runtime's reentrancy sentence). Asked of the whole program on
+    /// every analysis (the callee may sit in another module), and nothing at
+    /// all for a program with no module-level `mut` binding — the estate.
+    fn check_module_binding_loans(&mut self) {
+        let module_mut = self.module_mut_bindings();
+        if module_mut.is_empty() {
+            return;
+        }
+        let mut loans: Vec<(Id, Id, Id, Convention)> = Vec::new();
+        for (call_expr_id, function_call) in &self.function_calls {
+            let parameters: &[Id] = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                Some(Expr::Local(callee_id)) => self
+                    .method_signature_ref(*callee_id)
+                    .map(|(parameters, _)| parameters)
+                    .unwrap_or_default(),
+                _ => &[],
+            };
+            for (position, argument_id) in function_call.argument_ids.iter().enumerate() {
+                let (place, lent) = match self.expr_id_to_expr_map.get(argument_id) {
+                    Some(Expr::Reference(operand, true)) => (*operand, Convention::RefMut),
+                    Some(Expr::Reference(operand, false)) => (*operand, Convention::Ref),
+                    _ => match parameters
+                        .get(position)
+                        .and_then(|parameter| self.parameters.get(parameter))
+                    {
+                        // A view receiver lends implicitly (`items.len()` over a
+                        // `&self`); a view parameter refuses a bare place
+                        // already (no implicit borrow).
+                        Some(parameter)
+                            if parameter.name == "self"
+                                && matches!(
+                                    parameter.convention,
+                                    Convention::Ref | Convention::RefMut
+                                ) =>
+                        {
+                            (*argument_id, parameter.convention)
+                        }
+                        _ => continue,
+                    },
+                };
+                if let Some(root) = self.place_root_binding(place)
+                    && module_mut.contains(&root)
+                {
+                    loans.push((*call_expr_id, *argument_id, root, lent));
+                }
+            }
+        }
+        if loans.is_empty() {
+            return;
+        }
+        let calls = std::cell::OnceCell::new();
+        let writes = self.module_writes(&module_mut, self.calls_index(&calls));
+        let mut summaries: HashMap<Id, HashMap<Id, bool>> = HashMap::default();
+        let mut refusals: Vec<(Id, Id, Id, Convention)> = Vec::new();
+        for (call_expr_id, argument_id, root, lent) in loans {
+            let subject = WriteSubject::Module(root, &writes);
+            if self.call_reaches_a_write(
+                call_expr_id,
+                &subject,
+                self.calls_index(&calls),
+                summaries.entry(root).or_default(),
+            ) {
+                refusals.push((call_expr_id, argument_id, root, lent));
+            }
+        }
+        refusals.sort_unstable_by_key(|(_, argument_id, ..)| argument_id.0);
+        for (call_expr_id, argument_id, root, lent) in refusals {
+            self.refuse_module_binding_loan(call_expr_id, argument_id, root, lent);
+        }
+    }
+
+    /// B647: the module-level bindings declared `mut` — a top-level `mut` of
+    /// the entry file or of a loaded module.
+    fn module_mut_bindings(&self) -> HashSet<Id> {
+        // `module_level_binding_ids`' scope test, asked of the `mut` bindings
+        // alone and without a pass over every scope: a module body's scope,
+        // or a root scope (the entry file's).
+        let module_scopes: HashSet<Id> =
+            self.modules.values().map(|module| module.body.1).collect();
+        self.variables
+            .values()
+            .filter(|variable| variable.mutable)
+            .map(|variable| variable.id)
+            .filter(|variable_id| {
+                self.expr_id_to_scope_id_map
+                    .get(variable_id)
+                    .is_some_and(|scope_id| {
+                        let home =
+                            expansion_home_scope(&self.generated_expansion_scopes, *scope_id);
+                        module_scopes.contains(&home)
+                            || self
+                                .scopes
+                                .get(&home)
+                                .is_some_and(|scope| scope.parent_id.is_none())
+                    })
+            })
+            .collect()
+    }
+
+    /// B647: every write of a module-level `mut` binding — an assignment whose
+    /// target's spine roots at it, or a call lending such a place `&mut` —
+    /// and the bindings a call through a closure VALUE may reach: written
+    /// (through any call) by a closure literal's body or by a function taken
+    /// as a value.
+    fn module_writes(&self, module_mut: &HashSet<Id>, calls: &LexicalCandidates) -> ModuleWrites {
+        let mut writes = ModuleWrites::default();
+        for (expr_id, expr) in &self.expr_id_to_expr_map {
+            let root = match expr {
+                Expr::Assignment(target, _) => self.place_root_binding(*target),
+                Expr::Call(call_id) => self.function_calls.get(call_id).and_then(|function_call| {
+                    self.lent_argument_positions(function_call)
+                        .into_iter()
+                        .find_map(|position| {
+                            self.place_root_binding(function_call.argument_ids[position])
+                                .filter(|root| module_mut.contains(root))
+                        })
+                }),
+                _ => None,
+            };
+            if let Some(root) = root
+                && module_mut.contains(&root)
+            {
+                writes.sites.push((*expr_id, root));
+            }
+        }
+        let written: HashSet<Id> = writes.sites.iter().map(|(_, binding)| *binding).collect();
+        if written.is_empty() {
+            return writes;
+        }
+        // The bodies a call through a value can run: every closure literal's,
+        // and every function named other than as a call's callee.
+        let subjects: HashSet<Id> = self
+            .function_calls
+            .values()
+            .map(|function_call| function_call.subject_id)
+            .collect();
+        let mut bodies: Vec<Id> = self
+            .closures
+            .values()
+            .map(|closure| closure.return_)
+            .collect();
+        bodies.extend(
+            self.expr_id_to_expr_map
+                .iter()
+                .filter_map(|(expr_id, expr)| match expr {
+                    Expr::Local(function_id)
+                        if !subjects.contains(expr_id)
+                            && self.functions.contains_key(function_id) =>
+                    {
+                        Some(*function_id)
+                    }
+                    _ => None,
+                }),
+        );
+        bodies.sort_unstable_by_key(|id| id.0);
+        bodies.dedup();
+        let mut through_values = HashSet::default();
+        for binding in written {
+            let subject = WriteSubject::Module(binding, &writes);
+            let mut summaries = HashMap::default();
+            if bodies
+                .iter()
+                .any(|body| self.function_reaches_a_write(*body, &subject, calls, &mut summaries))
+            {
+                through_values.insert(binding);
+            }
+        }
+        writes.through_values = through_values;
+        writes
+    }
+
+    /// B647: a write of the module-level `binding` inside `expr_id`'s span.
+    fn spans_a_module_write(&self, expr_id: Id, binding: Id, writes: &ModuleWrites) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        writes.sites.iter().any(|(write_id, written)| {
+            *written == binding
+                && self.source_of_id(*write_id) == Some(source)
+                && self.one_span_space(expr_id, *write_id)
+                && self.span_map.get(write_id).is_some_and(|write_span| {
+                    write_span.start >= span.start && write_span.end <= span.end
+                })
+        })
+    }
+
+    /// B647's refusal, at the lent argument, with the copy-first steer.
+    fn refuse_module_binding_loan(
+        &mut self,
+        call_expr_id: Id,
+        argument_id: Id,
+        root: Id,
+        lent: Convention,
+    ) {
+        let text_of = |analyzer: &Self, id: Id| -> Option<&'src str> {
+            let span = **analyzer.span_map.get(&id)?;
+            analyzer
+                .source_of_id(id)
+                .and_then(|source| analyzer.source_text(source))
+                .and_then(|text| text.get(span.into_range()))
+        };
+        let name = self
+            .variables
+            .get(&root)
+            .map(|variable| variable.name)
+            .unwrap_or("the binding");
+        let function_call = self.function_calls.get(&call_expr_id);
+        let (callee, parameter_name) = match function_call
+            .and_then(|function_call| self.expr_id_to_expr_map.get(&function_call.subject_id))
+        {
+            Some(Expr::Local(callee_id)) => {
+                let callee = self
+                    .functions
+                    .get(callee_id)
+                    .map(|function| function.name)
+                    .unwrap_or("the callee");
+                let position = function_call
+                    .and_then(|function_call| {
+                        function_call
+                            .argument_ids
+                            .iter()
+                            .position(|argument| *argument == argument_id)
+                    })
+                    .unwrap_or(0);
+                let parameter_name = self
+                    .method_signature_ref(*callee_id)
+                    .and_then(|(parameters, _)| parameters.get(position).copied())
+                    .and_then(|parameter| self.parameters.get(&parameter))
+                    .map(|parameter| parameter.name);
+                (callee, parameter_name)
+            }
+            _ => ("the callee", None),
+        };
+        let copy = match parameter_name {
+            Some(parameter) if parameter != "self" && parameter != name => parameter.to_string(),
+            _ => format!("{name}_copy"),
+        };
+        let argument_text = text_of(self, argument_id).unwrap_or(name);
+        let settled_argument = argument_text.replacen(name, &copy, 1);
+        let call_text = text_of(self, call_expr_id)
+            .filter(|text| !text.contains('\n'))
+            .map(|text| text.replacen(argument_text, &settled_argument, 1))
+            .unwrap_or_else(|| format!("{callee}({settled_argument})"));
+        let binder = match lent {
+            Convention::RefMut => "mut",
+            _ => "let",
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{callee}` writes `{name}` while `{name}` is lent to this call, so the loan \
+                     and the write are two paths to one place (a write under a live view); copy \
+                     it first: `{binder} {copy} = {name}; {call_text}`"
+                ),
+            },
+            argument_id,
+        );
+    }
+
     /// The argument positions a call lends `&mut` — a `&mut self` receiver or
     /// `&mut` parameter (`log.items.push(..)`, `log.bump(..)`), or a written
     /// `&mut` argument (`add(&mut log.items, ..)`). B?2 / B639.
@@ -34504,16 +34763,76 @@ impl<'src> Analyzer<'src> {
             let Some(parameter_ids) = parameter_ids else {
                 continue;
             };
+            let callee_name = self
+                .functions
+                .get(&callee_id)
+                .map(|function| function.name)
+                .or_else(|| {
+                    self.external_functions
+                        .get(&callee_id)
+                        .map(|external| external.name)
+                })
+                .unwrap_or("the function");
             for (parameter_id, argument_id) in parameter_ids.iter().zip(argument_ids.iter()) {
                 // The required call-site spelling for this parameter — `&`/`&mut`
-                // for a view convention; the implicit `self` receiver and all
-                // by-value conventions need nothing.
+                // for a view convention; the implicit `self` receiver needs
+                // nothing.
                 let kind = match self.parameters.get(parameter_id) {
                     Some(parameter) if parameter.name == "self" => continue,
                     Some(parameter) => match parameter.convention {
                         Convention::RefMut => "&mut",
                         Convention::Ref => "&",
-                        Convention::Bare | Convention::Own => continue,
+                        Convention::Bare | Convention::Own => {
+                            // B649: a written `&`/`&mut` at a BY-VALUE
+                            // parameter lends a view the callee cannot take —
+                            // the JS build handed the scalar view's
+                            // `[cell, key]` pair over AS the value (`==`
+                            // compared an array with a number) where native
+                            // passed the value. A view a by-value callee
+                            // cannot keep is noise: refused, with the fix.
+                            // A generic parameter over a receiver that HOLDS
+                            // views (`shelf.count(0).unwrap_or(&0)` on an
+                            // `Option<&i32>`, B577) takes a view: its `T` is one.
+                            let written_view = match self.expr_id_to_expr_map.get(argument_id) {
+                                Some(Expr::Reference(_, mutable)) => Some(*mutable),
+                                _ => None,
+                            };
+                            let over_a_view_holder = || {
+                                let mut mentioned = Vec::new();
+                                self.collect_generics(
+                                    &parameter.type_id.get_type(self),
+                                    0,
+                                    &mut mentioned,
+                                );
+                                !mentioned.is_empty()
+                                    && argument_ids.first().is_some_and(|receiver| {
+                                        self.receiver_holds_a_view(*receiver)
+                                    })
+                            };
+                            if let Some(mutable) = written_view
+                                && !over_a_view_holder()
+                            {
+                                let written = if mutable { "&mut" } else { "&" };
+                                let parameter_name = parameter.name;
+                                self.push_anchored(
+                                    Error {
+                                        trace: Vec::new(),
+                                        note: None,
+                                        span: **self
+                                            .span_map
+                                            .get(argument_id)
+                                            .unwrap_or(&&EMPTY_SPAN),
+                                        msg: format!(
+                                            "drop the `{written}`: `{callee_name}` takes \
+                                             `{parameter_name}` by value, so it cannot take a \
+                                             view of it"
+                                        ),
+                                    },
+                                    *argument_id,
+                                );
+                            }
+                            continue;
+                        }
                     },
                     None => continue,
                 };
@@ -34526,6 +34845,18 @@ impl<'src> Analyzer<'src> {
                     }, *argument_id);
                 }
             }
+        }
+    }
+
+    /// B649: whether a receiver is a value holding VIEWS — a call returning a
+    /// wrapped view (`Option<&T>`), directly or as an inline transient.
+    fn receiver_holds_a_view(&self, receiver: Id) -> bool {
+        match self.expr_id_to_expr_map.get(&receiver) {
+            Some(Expr::Call(call_id)) => {
+                self.call_returns_wrapped_view(*call_id).is_some()
+                    || self.inline_subject_wrapped_view_shape(receiver).is_some()
+            }
+            _ => self.inline_subject_wrapped_view_shape(receiver).is_some(),
         }
     }
 
@@ -35328,6 +35659,10 @@ impl<'src> Analyzer<'src> {
         // M110 S7b: built at the first ask — a served keystroke whose live
         // positions never reach B457's call-through test pays nothing for it.
         let calls_index = |analyzer: &Self| -> &LexicalCandidates { analyzer.calls_index(calls) };
+        // B647's by-value twin: the module-level `mut` bindings, and (at the
+        // first argument over one) every write of them.
+        let module_mut = self.module_mut_bindings();
+        let module_writes: std::cell::OnceCell<ModuleWrites> = std::cell::OnceCell::new();
         // M19 T1b: a reused module's decisions are restored below. Every
         // position this loop `consider`s is a sub-expression of the entry it
         // is standing on, so skipping the expression skips exactly the rows
@@ -35519,9 +35854,38 @@ impl<'src> Analyzer<'src> {
                                         &mut HashMap::default(),
                                     )
                                 });
+                        // B647's by-value twin: a module-level `mut` binding (or
+                        // a place under one) handed BY VALUE — a bare
+                        // parameter or a bare `self` — to a callee that writes
+                        // it: JS handed over the binding's own object, so the
+                        // callee's parameter saw the callee's write, where
+                        // natively it is a copy out of the binding's cell. The
+                        // argument is a copy (rule 1).
+                        let module_binding_the_callee_writes = parameter.convention
+                            == Convention::Bare
+                            && !module_mut.is_empty()
+                            && !matches!(
+                                self.expr_id_to_expr_map.get(argument_id),
+                                Some(Expr::Reference(..))
+                            )
+                            && self
+                                .place_root_binding(*argument_id)
+                                .filter(|root| module_mut.contains(root))
+                                .is_some_and(|root| {
+                                    let writes = module_writes.get_or_init(|| {
+                                        self.module_writes(&module_mut, calls_index(self))
+                                    });
+                                    self.function_reaches_a_write(
+                                        callee_id,
+                                        &WriteSubject::Module(root, writes),
+                                        calls_index(self),
+                                        &mut HashMap::default(),
+                                    )
+                                });
                         if parameter.convention == Convention::Own
                             || is_shared_read_receiver
                             || read_the_callee_writes
+                            || module_binding_the_callee_writes
                         {
                             consider(self, *argument_id, None);
                         }
@@ -36672,18 +37036,7 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B457: whether one call can reach an in-place write of `cell` — the
-    /// callee's WRITE SUMMARY. A function with a body answers for its own span
-    /// and every call in it (memoized per function, and a function already
-    /// being asked answers no, so recursion terminates; its own writes are
-    /// counted where it is first asked). An external writes no vilan cell
-    /// (`Shared::write` IS the write, counted by the span test), and a variant
-    /// builds a value. A dispatched member answers for every body of its name.
-    /// A call through a closure LITERAL — applied where it is written, or
-    /// named by an immutable `let` whose initializer is one (B634) — answers
-    /// for the literal's body, as a function answers for its own. Any other
-    /// call through a closure VALUE (a subscriber, a parameter, a `mut`
-    /// binding, a field) is unknown statically, and answers whether ANY write
-    /// mutates the cell in place.
+    /// callee's WRITE SUMMARY ([`Self::call_reaches_a_write`] for a cell).
     fn call_reaches_an_in_place_write(
         &self,
         call_id: Id,
@@ -36691,9 +37044,30 @@ impl<'src> Analyzer<'src> {
         calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
-        if self.shared_cells.reads.contains_key(&call_id)
-            || self.shared_cells.writes.contains_key(&call_id)
-        {
+        self.call_reaches_a_write(call_id, &WriteSubject::Cell(cell), calls, summaries)
+    }
+
+    /// B457 / B647: whether one call can reach a write of `subject` — the
+    /// callee's WRITE SUMMARY. A function with a body answers for its own
+    /// span and every call in it (memoized per function, and a function
+    /// already being asked answers no, so recursion terminates; its own
+    /// writes are counted where it is first asked). An external writes no
+    /// vilan place (`Shared::write` IS the write, counted by the span test),
+    /// and a variant builds a value. A dispatched member answers for every
+    /// body of its name. A call through a closure LITERAL — applied where it
+    /// is written, or named by an immutable `let` whose initializer is one
+    /// (B634) — answers for the literal's body, as a function answers for its
+    /// own. Any other call through a closure VALUE (a subscriber, a
+    /// parameter, a `mut` binding, a field) is unknown statically, and
+    /// answers the subject's own worst case ([`WriteSubject::unknown`]).
+    fn call_reaches_a_write(
+        &self,
+        call_id: Id,
+        subject: &WriteSubject<'_>,
+        calls: &LexicalCandidates,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        if subject.is_the_access(self, call_id) {
             return false;
         }
         let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -36726,12 +37100,12 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|function| function.has_body)
                 })
                 .collect();
-            return candidates.into_iter().any(|member| {
-                self.function_reaches_an_in_place_write(member, cell, calls, summaries)
-            });
+            return candidates
+                .into_iter()
+                .any(|member| self.function_reaches_a_write(member, subject, calls, summaries));
         }
         if let Some(body) = self.closure_literal_body(function_call.subject_id) {
-            return self.function_reaches_an_in_place_write(body, cell, calls, summaries);
+            return self.function_reaches_a_write(body, subject, calls, summaries);
         }
         match self.expr_id_to_expr_map.get(&function_call.subject_id) {
             Some(Expr::Local(callee)) => {
@@ -36748,12 +37122,11 @@ impl<'src> Analyzer<'src> {
                     .get(callee)
                     .is_some_and(|function| function.has_body)
                 {
-                    return self
-                        .function_reaches_an_in_place_write(*callee, cell, calls, summaries);
+                    return self.function_reaches_a_write(*callee, subject, calls, summaries);
                 }
-                self.shared_cells.mutated.contains(&cell)
+                subject.unknown(self)
             }
-            _ => self.shared_cells.mutated.contains(&cell),
+            _ => subject.unknown(self),
         }
     }
 
@@ -36786,16 +37159,29 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B457: a function's write summary for `cell` — an in-place write inside
-    /// its span, or a call inside it that reaches one. B634: a closure
-    /// literal's BODY answers here too (`function_id` is then the body's
-    /// expression, whose span is the body's). The calls come from
-    /// `calls`' span index (M96): filtering the whole expression map per
-    /// function asked made the summary O(functions × expressions) — 48
-    /// summaries, ~95M instructions each, on kolt's client.
+    /// its span, or a call inside it that reaches one
+    /// ([`Self::function_reaches_a_write`] for a cell).
     fn function_reaches_an_in_place_write(
         &self,
         function_id: Id,
         cell: CellSlot,
+        calls: &LexicalCandidates,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        self.function_reaches_a_write(function_id, &WriteSubject::Cell(cell), calls, summaries)
+    }
+
+    /// B457 / B647: a function's write summary for `subject` — a write inside
+    /// its span, or a call inside it that reaches one. B634: a closure
+    /// literal's BODY answers here too (`function_id` is then the body's
+    /// expression, whose span is the body's). The calls come from `calls`'
+    /// span index (M96): filtering the whole expression map per function
+    /// asked made the summary O(functions × expressions) — 48 summaries, ~95M
+    /// instructions each, on kolt's client. `summaries` is one subject's.
+    fn function_reaches_a_write(
+        &self,
+        function_id: Id,
+        subject: &WriteSubject<'_>,
         calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
@@ -36805,7 +37191,7 @@ impl<'src> Analyzer<'src> {
         // In progress: no until proven otherwise (a recursive call adds no
         // write the function's own span does not already hold).
         summaries.insert(function_id, false);
-        let answer = self.spans_an_in_place_write(function_id, cell) || {
+        let answer = subject.spans_a_write(self, function_id) || {
             let (Some(source), Some(span)) = (
                 self.source_of_id(function_id),
                 self.span_map.get(&function_id),
@@ -36816,7 +37202,7 @@ impl<'src> Analyzer<'src> {
                 .inside(source, span.start, span.end)
                 .into_iter()
                 .filter(|call_id| self.one_span_space(function_id, *call_id))
-                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, calls, summaries))
+                .any(|call_id| self.call_reaches_a_write(call_id, subject, calls, summaries))
         };
         summaries.insert(function_id, answer);
         answer
@@ -42159,6 +42545,8 @@ impl<'src> Analyzer<'src> {
                 body: body_id,
             });
         }
+        self.match_leg_bodies
+            .insert(id, walked_legs.iter().map(|leg| leg.body).collect());
         self.constraints.push(Constraint::Match(PreppedMatch {
             id,
             subject_id,
@@ -43023,22 +43411,14 @@ impl<'src> Analyzer<'src> {
         if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
             self.record_type_context_clause(return_type_id, names, body_scope_id, None);
         }
-        // debugging.md S0: `[track_caller]`'s location travels as a hidden
-        // trailing parameter, threaded at every STATIC call. A trait member is
-        // reached by dispatch — a `dyn` table, a generic bound — where no one
-        // call site knows it is calling a tracking function, so the attribute
-        // is refused there rather than silently reporting nothing.
-        if function.track_caller && (self.walking_trait_body || self.walking_trait_impl_body) {
-            self.diagnostics.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span: function.name.1,
-                msg: "`[track_caller]` is not supported on a trait method: a call through \
-                      a trait is dispatched, so no call site knows to pass its location. \
-                      Mark a free function or an inherent method instead"
-                    .to_string(),
-            });
-        }
+        // debugging.md S0, B646: `[track_caller]`'s location travels as a
+        // hidden trailing parameter. On a trait member it is part of the
+        // trait's CONTRACT: declared on the trait, every implementation takes
+        // the hidden location and every call through the trait passes it (a
+        // static call, a bound's call, a `dyn` table's slot). Whether an
+        // implementation's own mark agrees with its trait is decided after
+        // analysis, where the implementation's trait is known
+        // (`track_caller::imply_trait_tracking`).
         if function.external {
             // An `external` function is an intrinsic: no Vilan body, a
             // declared (or void) return type, registered as an external
@@ -46340,21 +46720,50 @@ impl<'src> Analyzer<'src> {
         // for it; every other call walks its arguments in place, allocating
         // nothing.
         let mut order: Vec<usize> = Vec::new();
-        let mut first_literal = argument_ids.len();
         if literal_last {
             order.extend(0..argument_ids.len());
             order.sort_by_key(|index| self.is_unsuffixed_numeric(argument_ids[*index]));
-            first_literal = order
-                .iter()
-                .position(|index| self.is_unsuffixed_numeric(argument_ids[*index]))
-                .unwrap_or(order.len());
         }
         let mut closures_read = !literal_last;
-        let schedule = (0..argument_ids.len()).map(|step| match literal_last {
-            true => order[step],
-            false => step,
-        });
-        for (step, index) in schedule.enumerate() {
+        // B659: an unsuffixed literal at a generic only a closure argument's
+        // RESULT fixes (`map_or(|it| it.depth, 0)`, `U` from the closure)
+        // waits for that closure — typed first it took `i32` and bound `U`,
+        // and the closure was refused against `|Item| i32`. Skipped in the
+        // first phase, read LAST in the second, and not at all while a closure
+        // has not typed (the call then defers with the generic open).
+        let deferred_literals = self.literals_awaiting_a_closure_result(
+            &parameter_ids,
+            argument_ids,
+            self_parameter_offset,
+            &bindable,
+            substitution,
+        );
+        let deferred_tail: &[usize] = match skip_closures {
+            true => &[],
+            false => &deferred_literals,
+        };
+        // An iterator, not a collected list: this runs once per call per
+        // attempt (M30 counted 856,908 on kolt), and almost every call has
+        // nothing deferred.
+        let schedule = || {
+            (0..argument_ids.len())
+                .map(|step| match literal_last {
+                    true => order[step],
+                    false => step,
+                })
+                .filter(|index| !deferred_literals.contains(index))
+                .chain(deferred_tail.iter().copied())
+        };
+        let first_literal = match literal_last {
+            true => schedule()
+                .position(|index| self.is_unsuffixed_numeric(argument_ids[index]))
+                .unwrap_or(argument_ids.len()),
+            false => argument_ids.len(),
+        };
+        for (step, index) in schedule().enumerate() {
+            if deferred_literals.contains(&index) && unresolved_closure_argument {
+                break;
+            }
             if !closures_read && step == first_literal {
                 closures_read = true;
                 self.derive_generics_from_bounds(&bindable, &bindable, substitution);
@@ -46471,6 +46880,87 @@ impl<'src> Analyzer<'src> {
         // substitution keys on.
         self.derive_generics_from_bounds(&bindable, &bindable, substitution);
         unresolved_closure_argument
+    }
+
+    /// B659: the argument positions holding an unsuffixed numeric literal whose
+    /// parameter mentions a generic that a CLOSURE argument fixes through its
+    /// result alone — `map_or<U>(self, f: |T| U, default: U)`'s `default`. A
+    /// generic the closure's PARAMETERS also carry (`fold`'s accumulator) is
+    /// the literal's to fix, since the closure cannot type without it (B589).
+    fn literals_awaiting_a_closure_result(
+        &self,
+        parameter_ids: &[Id],
+        argument_ids: &[Id],
+        self_parameter_offset: usize,
+        bindable: &[TypeId],
+        substitution: &SubstitutionContext,
+    ) -> Vec<usize> {
+        // The common call has no closure argument, or no literal one: answer
+        // without reading a parameter type. (A closure and a literal are two
+        // arguments.)
+        if argument_ids.len() < 2 {
+            return Vec::new();
+        }
+        let has_closure = argument_ids.iter().any(|argument_id| {
+            matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            )
+        });
+        if !has_closure
+            || !argument_ids
+                .iter()
+                .any(|argument_id| self.is_unsuffixed_numeric(*argument_id))
+        {
+            return Vec::new();
+        }
+        let parameter_type = |index: usize| {
+            parameter_ids
+                .get(index + self_parameter_offset)
+                .and_then(|parameter_id| self.parameters.get(parameter_id))
+                .map(|parameter| parameter.type_id.get_type(self))
+        };
+        let mut result_generics: Vec<TypeId> = Vec::new();
+        for (index, argument_id) in argument_ids.iter().enumerate() {
+            if !matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            ) {
+                continue;
+            }
+            let Some(Type::Closure(parameters, returned, _, _)) = parameter_type(index) else {
+                continue;
+            };
+            let mut in_parameters = Vec::new();
+            for parameter in &parameters {
+                self.collect_generics(&parameter.get_type(self), 0, &mut in_parameters);
+            }
+            let mut in_result = Vec::new();
+            self.collect_generics(&returned.get_type(self), 0, &mut in_result);
+            result_generics.extend(in_result.into_iter().filter(|generic| {
+                bindable.contains(generic)
+                    && !in_parameters.contains(generic)
+                    && !substitution.contains_key(generic)
+            }));
+        }
+        if result_generics.is_empty() {
+            return Vec::new();
+        }
+        argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(index, argument_id)| {
+                self.is_unsuffixed_numeric(**argument_id)
+                    && parameter_type(*index).is_some_and(|parameter_type| {
+                        let mut mentioned = Vec::new();
+                        self.collect_generics(&parameter_type, 0, &mut mentioned);
+                        mentioned
+                            .iter()
+                            .any(|generic| result_generics.contains(generic))
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Every constraint a call to `member_id` may bind: the callee's OWN
@@ -47476,6 +47966,9 @@ impl<'src> Analyzer<'src> {
         self.note_callable_coercion(expr_id, constraint, &inferred);
         self.note_variant_coercion(expr_id, &inferred);
         self.note_dyn_coercion(expr_id, constraint, &inferred, substitution_context);
+        if matches!(constraint, Type::Any | Type::Generic(_)) {
+            self.note_any_option_coercion(expr_id, constraint, &inferred, substitution_context);
+        }
         inferred
     }
 
@@ -48101,6 +48594,123 @@ impl<'src> Analyzer<'src> {
         })
     }
 
+    /// M165: an `Option` value landing at an `any` position — an element of a
+    /// `List<any>` bind list, `params.push(maybe)` on one, an `any` parameter —
+    /// is its payload or nothing there, as the native backend's `Any::from`
+    /// makes it: `Some(1)` is `1` and `None` is `null`, so `std::db` binds the
+    /// value or NULL instead of handing `node:sqlite` the variant's array (read
+    /// as named parameters: "Unknown named parameter '0'"). Recorded with the
+    /// value's `Option` depth, which the JS emitter unwraps (`walk_entity`).
+    ///
+    /// The shape test comes first, as [`Self::note_dyn_coercion`]'s does: an
+    /// `any` expectation is a vanishing minority of inference entries. The
+    /// forms are the callable coercion's allow-list, for its reason — an
+    /// expectation forwarded through a block or an `if` reaches the leaf the
+    /// emitter walks in the landing position, and only the leaf converts — plus
+    /// the bare `None` (a `Some(1)` built in place is a call). The direct `any`
+    /// parameters of `print` and of an external function take the value as it
+    /// is; the call path drops those ([`Self::keep_any_option_coercion`]).
+    fn note_any_option_coercion(
+        &mut self,
+        expr_id: Id,
+        constraint: &Type,
+        inferred: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        let landing = match constraint {
+            Type::Any => true,
+            Type::Generic(constraint_id) => substitution_context
+                .get(constraint_id)
+                .is_some_and(|bound| matches!(bound.borrow_type(self), Type::Any)),
+            _ => false,
+        };
+        if !landing {
+            return;
+        }
+        if !matches!(
+            self.expr_id_to_expr_map.get(&expr_id),
+            Some(
+                Expr::Local(_)
+                    | Expr::Field(..)
+                    | Expr::Index(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Call(_)
+                    | Expr::EnumVariant(..)
+                    | Expr::Dereference(_)
+                    | Expr::Ascribe(_)
+            )
+        ) {
+            return;
+        }
+        self.record_any_option_landing(expr_id, inferred);
+    }
+
+    /// M165: `value_id`, of type `value`, lands at an `any` position as it
+    /// stands — recorded when it is an `Option`, with its depth
+    /// (`Option<Option<i32>>` is two layers).
+    fn record_any_option_landing(&mut self, value_id: Id, value: &Type) {
+        let mut depth = 0;
+        let mut layer = value.clone();
+        while let Type::Enum(enum_id, arguments) = &layer
+            && Some(*enum_id) == self.option_enum_id
+            && arguments.len() == 1
+        {
+            depth += 1;
+            layer = arguments[0].get_type(self);
+        }
+        if depth > 0 {
+            self.any_option_coercions.insert(value_id, depth);
+        }
+    }
+
+    /// M165: the impl's binders the receiver fills with `any`, read position
+    /// by position (`List<T>` against `List<any>` is `T`). Reconciling the two
+    /// binds nothing for them — `any` absorbs — so the call's substitution
+    /// later binds each to its argument's type instead.
+    fn receiver_binders_at_any(&self, impl_subject: &Type, subject: &Type) -> Vec<TypeId> {
+        let (impl_arguments, subject_arguments) = match (impl_subject, subject) {
+            (
+                Type::Struct(impl_id, impl_arguments),
+                Type::Struct(subject_id, subject_arguments),
+            )
+            | (Type::Enum(impl_id, impl_arguments), Type::Enum(subject_id, subject_arguments))
+                if impl_id == subject_id && impl_arguments.len() == subject_arguments.len() =>
+            {
+                (impl_arguments, subject_arguments)
+            }
+            _ => return Vec::new(),
+        };
+        // Borrowed, not cloned: this runs on every resolved method call, and a
+        // receiver with an `any` argument is a vanishing minority of them.
+        impl_arguments
+            .iter()
+            .zip(subject_arguments)
+            .filter_map(|(impl_argument, subject_argument)| {
+                match (
+                    impl_argument.borrow_type(self),
+                    subject_argument.borrow_type(self),
+                ) {
+                    (Type::Generic(binder), Type::Any) => Some(*binder),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// M165: an argument at a DIRECT `any` parameter of `print` or of an
+    /// external function is handed over as it is — `print(maybe)` prints
+    /// `Some(1)`, and `canonical_hash(Some(1))` keys the variant, not `1` — so
+    /// the conversion [`Self::note_any_option_coercion`] recorded there is
+    /// dropped. A generic parameter bound to `any` (`List<any>::push`) keeps it.
+    fn keep_any_option_coercion(&mut self, callee_id: Id, parameter_type: &Type, argument_id: Id) {
+        if matches!(parameter_type, Type::Any)
+            && (Some(callee_id) == self.print_fn_id
+                || self.external_functions.contains_key(&callee_id))
+        {
+            self.any_option_coercions.remove(&argument_id);
+        }
+    }
+
     /// B340 Q1: record an expression at which a `Callable` value coerces to a
     /// closure. This is the ONE place a value's own type and the type its
     /// position wants are both in hand for every landing the language has — an
@@ -48696,6 +49306,15 @@ impl<'src> Analyzer<'src> {
                             .unwrap_or(Type::Function(function_id)),
                         other => other,
                     };
+                    // M165: an element of a literal handed to a `List<any>`
+                    // (`statement.run([maybe, name])`) lands at the `any`
+                    // itself. The expectation is not seeded into the element
+                    // (the note above), so the element was typed undirected and
+                    // nothing inside it recorded the landing; the element is
+                    // the one place to convert, whatever its form.
+                    if matches!(expected_element, Some(Type::Any)) {
+                        self.record_any_option_landing(*item_id, &item_type);
+                    }
                     element_type = match self.reconcile_type(
                         &element_type,
                         &item_type,
@@ -51187,6 +51806,40 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnInference {
+        // B659's second shape: the tail is read first, so an unsuffixed
+        // literal tail took `i32` before a `ret` naming the width was read —
+        // `{ for .. { found then ret at; } 0 }` with `at: usize` refused the
+        // `ret` against the literal's default. The literal is a NUMBER, not
+        // an `i32`: the first value-carrying item that is not one (and whose
+        // type is numeric) directs it, as an annotation would.
+        let literal_hint = match initial_expectation {
+            Type::Unknown
+                if evidence
+                    .first()
+                    .and_then(|(_, value_id)| *value_id)
+                    .is_some_and(|value_id| self.is_unsuffixed_numeric(value_id)) =>
+            {
+                let others: Vec<Id> = evidence
+                    .iter()
+                    .skip(1)
+                    .filter_map(|(_, value_id)| *value_id)
+                    .filter(|value_id| !self.is_unsuffixed_numeric(*value_id))
+                    .collect();
+                others.into_iter().find_map(|value_id| {
+                    let value_type = self.infer_type_inner(
+                        value_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    );
+                    self.numeric_primitive_name(&value_type)
+                        .is_some()
+                        .then_some(value_type)
+                })
+            }
+            _ => None,
+        };
+        let initial_expectation = literal_hint.as_ref().unwrap_or(initial_expectation);
         let mut running: Option<(Type, ReturnOrigin)> = None;
         let mut last_resort: Option<Type> = None;
         let mut disagreements = Vec::new();
@@ -54287,6 +54940,100 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// std-prefix P6a (`std-prefix.md` §14.3, the rule): the TIERS' resolve —
+    /// std's, and the dependency tier's — run after their walk and BEFORE the
+    /// entry package's first node mints, in every shape: the canonical drain
+    /// at M144's boundary, and the std-only prefix world, whose resolve this
+    /// is. The package resolves after its own walk, over the tiers' settled
+    /// answers; an impl it declares never answers a question asked here.
+    ///
+    /// Nothing is recorded for that rule to be checked against: the entry
+    /// package cannot answer these questions, so there is nothing to refuse.
+    /// The ORACLE ([`crate::incremental::tier_oracle`], a test) records every
+    /// question all the same, for [`Self::check_tier_oracle`] to test the
+    /// package's impls against once they have resolved. The record touches no
+    /// reach floor and no census row the production log reads.
+    fn resolve_tiers(&mut self) {
+        let oracle = crate::incremental::tier_oracle() && !crate::macros::in_macro_world();
+        if oracle {
+            let pending = std::mem::replace(
+                self.impl_reach.get_mut(),
+                ImplReachLog {
+                    recording: true,
+                    filter: ReachFilter {
+                        everything: true,
+                        members: Default::default(),
+                    },
+                    ..ImplReachLog::default()
+                },
+            );
+            self.resolve_world();
+            let mut log = std::mem::replace(self.impl_reach.get_mut(), pending);
+            log.recording = false;
+            log.floor = Some(self.implementations.len());
+            self.tier_oracle = Some(log);
+        } else {
+            self.resolve_world();
+        }
+    }
+
+    /// std-prefix P6a: the PACKAGE half of the pre-entry resolve, after the
+    /// package has walked over the tiers' settled answers — the canonical
+    /// drain's and the prefix world's alike. What it asks of the impl table is
+    /// recorded under `filter` (M121 / B553: the late files' impls, the
+    /// entry's and a hot set's, are tested against it once they resolve).
+    ///
+    /// A package that added nothing since the tiers resolved — a single-file
+    /// program, whose pre-entry world IS the tiers' — has nothing for the
+    /// fixpoint to settle: the tiers' resolve already ran it to a stall over
+    /// exactly these constraints. So it runs no second pass over them (that
+    /// pass was the whole cost of the split, ~0.5 % of a small program's
+    /// check), and the reach log still draws its floor, which M110 S2a reads.
+    /// `walked_from` is the entity counter where the tiers' world ended.
+    fn resolve_package_half(&mut self, filter: Option<ReachFilter>, walked_from: Option<u32>) {
+        let added = walked_from != Some(self.entity_id);
+        match filter {
+            Some(filter) => {
+                self.begin_impl_reach_log(filter);
+                if added {
+                    self.resolve_world();
+                }
+                self.end_impl_reach_log();
+            }
+            None if added => self.resolve_world(),
+            None => {}
+        }
+    }
+
+    /// std-prefix P6a: the tier rule's oracle, as the entry is about to walk —
+    /// once the package half has resolved its impls' subjects (the pre-entry
+    /// resolve, or `resolve_package_over_prefix`) and before `build()`, which
+    /// is where the old guard asked and where an impl's own binder still reads
+    /// as the hole it is. A package impl that could have answered a question
+    /// the tiers' resolve asked — a program whose meaning the rule decided —
+    /// is counted and named; nothing is refused (both shapes apply the rule
+    /// alike). The entry's impls are not walked yet (M121 never let them
+    /// answer a tier's question), and a world that defers its package half to
+    /// `build()` (B553, B239/M70's open module) has no resolved package impl
+    /// here to test: the oracle covers the two-phase order, where every
+    /// program the estate builds takes it.
+    fn check_tier_oracle(&mut self) {
+        let Some(log) = self.tier_oracle.take() else {
+            return;
+        };
+        // Every package impl counts against every tier question (`hot`).
+        let Some(reached) = self.reach_verdict(&log, 0..u32::MAX) else {
+            return;
+        };
+        crate::incremental::count_tier_oracle_hit();
+        if !crate::macros::in_macro_world() {
+            crate::incremental::update_census(|census| census.tier_oracle_hits += 1);
+            if crate::phase_timing_enabled() || crate::counters::counters_enabled() {
+                eprintln!("[vilan phase] tier-oracle {}", reached.first);
+            }
+        }
+    }
+
     /// M121 / B553: start recording what this resolve asks of the impl table
     /// ([`ImplReachLog`]). Called around the PRE-STORE resolve only — the one
     /// whose answers the impls walked after it (the entry's, a hot set's) must
@@ -54374,6 +55121,16 @@ impl<'src> Analyzer<'src> {
         // M110 S2a reads the floor after the verdict took the log.
         self.prefix_impl_count = self.impl_reach.get_mut().floor;
         let log = std::mem::take(self.impl_reach.get_mut());
+        self.reach_verdict(&log, hot_sources)
+    }
+
+    /// [`Self::impl_reach`]'s test over a given `log`: every impl from its
+    /// floor on, against the questions it recorded.
+    fn reach_verdict(
+        &mut self,
+        log: &ImplReachLog,
+        hot_sources: std::ops::Range<u32>,
+    ) -> Option<ImplReached> {
         let floor = log.floor?;
         if floor >= self.implementations.len() || (log.members.is_empty() && log.traits.is_empty())
         {
@@ -57579,7 +58336,33 @@ impl<'src> Analyzer<'src> {
                     // B600: the other arguments, for a callee generic the call
                     // leaves open that an argument was typed in.
                     let mut typed_arguments: Vec<Id> = Vec::new();
-                    for (index, parameter_id) in parameters.iter().enumerate() {
+                    // B659: a literal at a generic only a closure argument's
+                    // result fixes is read after that closure (`pick(0, ||
+                    // held.depth)`), as on the method path.
+                    let deferred_literals = match argument_ids.len() >= 2
+                        && argument_ids.iter().any(|argument_id| {
+                            matches!(
+                                self.expr_id_to_expr_map.get(argument_id),
+                                Some(Expr::Closure(_))
+                            )
+                        }) {
+                        true => {
+                            let bindable = self.callee_bindable_generics(function_id);
+                            self.literals_awaiting_a_closure_result(
+                                &parameters,
+                                argument_ids,
+                                0,
+                                &bindable,
+                                &substitution_context,
+                            )
+                        }
+                        false => Vec::new(),
+                    };
+                    let order = (0..parameters.len())
+                        .filter(|index| !deferred_literals.contains(index))
+                        .chain(deferred_literals.iter().copied());
+                    for index in order {
+                        let parameter_id = &parameters[index];
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
@@ -57617,6 +58400,7 @@ impl<'src> Analyzer<'src> {
                         // language's own conversion on JS, which needs to
                         // know it is one. Anything else keeps its type for
                         // S3: an aggregate prints through the printer.
+                        self.keep_any_option_coercion(function_id, &parameter_type, argument_id);
                         if Some(function_id) == self.print_fn_id {
                             if self.is_a_number_type(&argument_type) {
                                 self.number_print_arguments.insert(argument_id);
@@ -58485,6 +59269,11 @@ impl<'src> Analyzer<'src> {
                             &mut bindings,
                         );
                         self.bind_open_context_slot(&impl_subject, &subject_type, &mut bindings);
+                        let any_binders =
+                            self.receiver_binders_at_any(&impl_subject, &subject_type);
+                        if !any_binders.is_empty() {
+                            self.any_bound_receiver_binders.insert(id, any_binders);
+                        }
                         if !bindings.is_empty() {
                             self.method_call_substitution.insert(id, bindings);
                         }
@@ -58993,7 +59782,19 @@ impl<'src> Analyzer<'src> {
             Type::Unresolved => MethodLookup::Defer,
             // An unannotated closure parameter awaiting bidirectional inference
             // defers rather than erroring; once its type lands the call resolves.
-            Type::Unknown if self.is_unknown_closure_parameter(subject_id) => MethodLookup::Defer,
+            // B670: and so does a receiver BUILT from one — `(value *
+            // 100.0).round()` under `scale.derive(|value| ..)` asked for the
+            // product's type before `value` was filled, and refused "cannot
+            // call method 'round' on unknown" where `value.round()` waited.
+            Type::Unknown
+                if self.is_unknown_closure_parameter(subject_id)
+                    || (!matches!(
+                        self.expr_id_to_expr_map.get(&subject_id),
+                        Some(Expr::Local(_) | Expr::Parameter(_))
+                    ) && self.value_awaits_a_closure_parameter(subject_id)) =>
+            {
+                MethodLookup::Defer
+            }
             // A comprehension binder whose element type isn't set yet defers, too.
             Type::Unknown if self.is_untyped_comprehension_binder(subject_id) => {
                 MethodLookup::Defer
@@ -59562,6 +60363,12 @@ impl<'src> Analyzer<'src> {
             return Resolution::Deferred;
         }
         let slot_type = slot.get_type(self);
+        // M165: `params.push(maybe)` on a `List<any>` lands the value at the
+        // `any` — the slot's own channel, so the call's argument check never
+        // types it against the `any` itself.
+        if matches!(slot_type, Type::Any) {
+            self.record_any_option_landing(argument_id, &argument_type);
+        }
         if !matches!(slot_type, Type::Unknown) {
             if self
                 .reconcile_type(&argument_type, &slot_type, &HashMap::default())
@@ -59769,6 +60576,21 @@ impl<'src> Analyzer<'src> {
             let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
                 return Resolution::Deferred;
+            }
+            // M165: a parameter the receiver binds to `any` (`push` on a
+            // `List<any>`) — see `any_bound_receiver_binders`. The call's own
+            // entry is asked first: almost no call has one.
+            let lands_at_any =
+                self.any_bound_receiver_binders
+                    .get(&call_id)
+                    .is_some_and(|binders| {
+                        matches!(
+                            declared_id.map(|declared| declared.borrow_type(self)),
+                            Some(Type::Generic(binder)) if binders.contains(binder)
+                        )
+                    });
+            if lands_at_any {
+                self.record_any_option_landing(*argument_id, &argument_type);
             }
             // B353 — an UNANNOTATED closure parameter whose one-shot slot has
             // not been filled yet is `Unknown`, and `Unknown` reconciles with
@@ -66147,11 +66969,37 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|(_, _, body_id)| (Vec::new(), *body_id))
             .collect();
-        let Some(match_type) =
-            self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs")
-        else {
-            return Resolution::Deferred;
-        };
+        let match_type =
+            match self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs") {
+                Some(match_type) => match_type,
+                None => {
+                    // B667: a leg that calls the function this match is the
+                    // RETURN of — `fun open(how: str) { match how { "right" =>
+                    // open("split"), _ => print("here") } }`, no written return
+                    // type — asks for that function's return, which is this
+                    // match's type: the cycle never resolved. The legs are read as
+                    // the function's own return inference reads them, with the
+                    // function on the inference stack, so the self-call answers
+                    // `never` (it constrains nothing: its value IS the answer under
+                    // construction) and the other legs decide; an `if` in the same
+                    // place always typed this way. Only for a match in the
+                    // function's return position, where its type and the
+                    // function's are one type.
+                    let Some(function_id) =
+                        self.self_returning_function(prepped.id, prepped.scope_id)
+                    else {
+                        return Resolution::Deferred;
+                    };
+                    self.return_inference_stack.push((function_id, false));
+                    let unified =
+                        self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs");
+                    self.return_inference_stack.pop();
+                    match unified {
+                        Some(match_type) => match_type,
+                        None => return Resolution::Deferred,
+                    }
+                }
+            };
         let match_type_id = match_type.get_type_id(self);
         self.resolved_types.insert(prepped.id, match_type_id);
         // Expand each or-pattern leg into one leg per alternative, all sharing the
@@ -66169,6 +67017,121 @@ impl<'src> Analyzer<'src> {
         self.expr_id_to_expr_map
             .insert(prepped.id, Expr::Match(prepped.subject_id, legs));
         Resolution::Resolved
+    }
+
+    /// B653: a struct literal names each field once. `Pair { left = 1, left =
+    /// 2 }` checked clean and the LAST value won — a copy-paste slip meant for
+    /// another field dropped that field's value silently whenever the literal
+    /// still happened to supply every field (`Pair { left, left }`, the
+    /// shorthand, the same). Refused at the SECOND occurrence's name, the first
+    /// as the note, and before the count check, whose message cannot name a
+    /// field when the surplus is a repeat. Reports every repeat of the literal,
+    /// each against the occurrence it repeats.
+    fn refuse_repeated_field(&mut self, constraint: &StructInitializerConstraint<'src>) -> bool {
+        let mut refused = false;
+        for (index, (name, _, _, name_span)) in constraint.fields.iter().enumerate() {
+            let Some((_, _, _, first_span)) = constraint.fields[..index]
+                .iter()
+                .find(|(earlier, ..)| earlier == name)
+            else {
+                continue;
+            };
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: Some(crate::error::Note::here(
+                    *first_span,
+                    format!("`{name}` is already set here"),
+                )),
+                span: *name_span,
+                msg: format!(
+                    "`{name}` is set twice in this `{}` literal: a literal sets each field once, \
+                     and the second value would replace the first; remove one, or name the field \
+                     it was meant for",
+                    constraint.struct_name
+                ),
+            });
+            refused = true;
+        }
+        refused
+    }
+
+    /// B667: the name of a function with no written return type that `body`
+    /// calls in its tail (through blocks), for the unresolved match's steer.
+    fn unannotated_callee_in_tail(&self, body: Id) -> Option<&'src str> {
+        let mut current = body;
+        loop {
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Block((_, tail)) => current = *tail,
+                Expr::Call(call_id) => {
+                    let function_call = self.function_calls.get(call_id)?;
+                    let Some(Expr::Local(callee)) =
+                        self.expr_id_to_expr_map.get(&function_call.subject_id)
+                    else {
+                        return None;
+                    };
+                    return self
+                        .functions
+                        .get(callee)
+                        .filter(|function| function.has_body && function.return_type_id.is_none())
+                        .map(|function| function.name);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// B667: the function with no written return type whose RETURN this
+    /// match is — the function whose body the match's scope sits in, when the
+    /// match is reached from that body's tail through blocks' tails, an `if`'s
+    /// branch tails and a resolved or still-pending `match`'s leg bodies.
+    /// There the match's type and the function's are one type, so a call to
+    /// the function inside a leg (free or a method, resolved or not) is the
+    /// answer under construction. `None` for every other match.
+    fn self_returning_function(&mut self, match_id: Id, scope_id: Id) -> Option<Id> {
+        if self.function_scopes_indexed != self.functions.len() {
+            self.function_by_body_scope = self
+                .functions
+                .iter()
+                .map(|(function_id, function)| (function.body.2, *function_id))
+                .collect();
+            self.function_scopes_indexed = self.functions.len();
+        }
+        let mut scope = scope_id;
+        let mut owner = None;
+        for _ in 0..4096 {
+            if let Some(function_id) = self.function_by_body_scope.get(&scope) {
+                owner = Some(*function_id);
+                break;
+            }
+            scope = self.scopes.get(&scope)?.parent_id?;
+        }
+        let function_id = owner?;
+        let function = self.functions.get(&function_id)?;
+        if !function.has_body || function.return_type_id.is_some() {
+            return None;
+        }
+        let mut pending = vec![function.body.1];
+        while let Some(current) = pending.pop() {
+            if current == match_id {
+                return Some(function_id);
+            }
+            match self.expr_id_to_expr_map.get(&current) {
+                Some(Expr::Block((_, tail))) => pending.push(*tail),
+                Some(Expr::If(branch)) => {
+                    let mut branch_bodies = Vec::new();
+                    if_branch_bodies(branch, &mut branch_bodies);
+                    pending.extend(branch_bodies.into_iter().map(|(_, tail)| tail));
+                }
+                Some(Expr::Match(_, legs)) => pending.extend(legs.iter().map(|leg| leg.body)),
+                None => {
+                    if let Some(bodies) = self.match_leg_bodies.get(&current) {
+                        pending.extend(bodies.iter().copied());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// S4 (editing-dx.md §7.1): the struct-initializer field-count message,
@@ -66276,6 +67239,15 @@ impl<'src> Analyzer<'src> {
         // -parameter sweep (B131) rather than silently.
         if self.value_awaits_a_closure_parameter(value_id) {
             return FieldValueVerdict::Deferred;
+        }
+        // B661/B673: a field whose declared type did not parse is kept by
+        // name with the parse-recovery hole for a type (the parser reported
+        // it), which walks to `Unresolved` — the non-cascading type (B32's
+        // rule). A value assigned to it is accepted silently, as its uses are;
+        // "Expected unresolved" at every literal would be the cascade the
+        // recovery exists to prevent.
+        if matches!(field_type, Type::Unresolved) {
+            return FieldValueVerdict::Accepted(Vec::new());
         }
         match self.reconcile_type(&value_type, field_type, substitution_context) {
             Some((_unified, bindings)) => FieldValueVerdict::Accepted(bindings),
@@ -66534,6 +67506,9 @@ impl<'src> Analyzer<'src> {
         let struct_fields = struct_.fields.clone();
         let struct_name_span = struct_.name_span;
         if self.refuse_internal_field_write(constraint, struct_id, &struct_fields) {
+            return Resolution::Failed;
+        }
+        if self.refuse_repeated_field(constraint) {
             return Resolution::Failed;
         }
         if constraint.fields.len() != struct_fields.len() {
@@ -70112,13 +71087,20 @@ impl<'src> Analyzer<'src> {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
                 Some(trait_id) => trait_id,
                 None => {
+                    // B664: in the impl's OWN file. Pushed bare, the error
+                    // took whichever file the walk had last been reading — in
+                    // a package, none the span fit (no location at all) or an
+                    // unrelated one (kolt's `views.vl:25`, an import).
                     let steer = self.import_steer(check.trait_name).unwrap_or_default();
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: check.span,
-                        msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
-                    });
+                    self.push_in_source(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: check.span,
+                            msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
+                        },
+                        check.source_id,
+                    );
                     continue;
                 }
             };
@@ -70126,12 +71108,15 @@ impl<'src> Analyzer<'src> {
             // member with a default body is inherited, so an impl need not
             // provide it.
             if !self.traits.contains_key(&trait_id) {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: check.span,
-                    msg: format!("'{}' is not a trait", check.trait_name),
-                });
+                self.push_in_source(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: check.span,
+                        msg: format!("'{}' is not a trait", check.trait_name),
+                    },
+                    check.source_id,
+                );
                 continue;
             }
             // B273: the impl's `with` clause writes a trait APPLICATION, and
@@ -70578,12 +71563,15 @@ impl<'src> Analyzer<'src> {
                         subject_name, trait_label, member_name, expected_signature
                     )
                 };
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note,
-                    span: check.span,
-                    msg,
-                });
+                self.push_in_source(
+                    Error {
+                        trace: Vec::new(),
+                        note,
+                        span: check.span,
+                        msg,
+                    },
+                    check.source_id,
+                );
             }
         }
 
@@ -73542,28 +74530,54 @@ impl<'src> Analyzer<'src> {
                 );
             }
         }
-        let unresolved_matches: Vec<(Id, Span)> = if residuals_are_cascade {
+        let unresolved_matches: Vec<(Id, Span, Vec<Id>)> = if residuals_are_cascade {
             Vec::new()
         } else {
             self.constraints
                 .iter()
                 .filter_map(|constraint| match constraint {
-                    Constraint::Match(prepped) => Some((prepped.subject_id, prepped.span)),
+                    Constraint::Match(prepped) => Some((
+                        prepped.subject_id,
+                        prepped.span,
+                        prepped.legs.iter().map(|leg| leg.body).collect(),
+                    )),
                     _ => None,
                 })
                 .collect()
         };
-        for (subject_id, span) in unresolved_matches {
+        for (subject_id, span, leg_bodies) in unresolved_matches {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
+            // B667: name the leg whose type never settled, and — when that leg
+            // calls a function with no written return type — the fix.
+            let unsettled_leg = leg_bodies.iter().copied().find(|body| {
+                matches!(
+                    self.infer_type(*body, &Type::Unknown, &HashMap::default()),
+                    Type::Unresolved
+                )
+            });
+            let steer = unsettled_leg
+                .and_then(|body| self.unannotated_callee_in_tail(body))
+                .map(|name| {
+                    format!(
+                        "; this leg calls `{name}`, whose return type is inferred from its body — \
+                         write it (`fun {name}(…): <type>`)"
+                    )
+                })
+                .unwrap_or_default();
+            let note = unsettled_leg.map(|body| {
+                Note::here(
+                    **self.span_map.get(&body).unwrap_or(&&EMPTY_SPAN),
+                    "this leg's type is never determined".to_string(),
+                )
+            });
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
-                    note: None,
+                    note,
                     span,
                     msg: format!(
-                        "type of match expression could not be resolved (subject: {})",
-                        subject_str
+                        "type of match expression could not be resolved (subject: {subject_str}){steer}"
                     ),
                 },
                 subject_id,
@@ -75121,6 +76135,62 @@ enum CellSlot {
     Unknown,
 }
 
+/// What a WRITE SUMMARY is asked about (B457, B647): whether a function — its
+/// own span and every call it makes — can write it.
+enum WriteSubject<'a> {
+    /// A `Shared` cell, written IN PLACE (B457: a rebind installs a fresh
+    /// value and leaves the storage a read handed out alone).
+    Cell(CellSlot),
+    /// A module-level `mut` binding, written at all — an assignment to it or
+    /// to a place under it, or a call lending such a place `&mut` (B647).
+    Module(Id, &'a ModuleWrites),
+}
+
+/// B647: every write of a module-level `mut` binding in the program, and the
+/// bindings a call through an unknown closure value may write.
+#[derive(Default)]
+struct ModuleWrites {
+    /// `(writing expression, binding)`: an assignment whose target's spine
+    /// roots at the binding, or a call lending such a place `&mut`.
+    sites: Vec<(Id, Id)>,
+    /// The bindings written inside some closure literal's body or by a
+    /// function taken as a value — what a call through a closure VALUE may
+    /// reach.
+    through_values: HashSet<Id>,
+}
+
+impl WriteSubject<'_> {
+    /// A write of the subject inside `expr_id`'s source span.
+    fn spans_a_write(&self, analyzer: &Analyzer<'_>, expr_id: Id) -> bool {
+        match self {
+            WriteSubject::Cell(cell) => analyzer.spans_an_in_place_write(expr_id, *cell),
+            WriteSubject::Module(binding, writes) => {
+                analyzer.spans_a_module_write(expr_id, *binding, writes)
+            }
+        }
+    }
+
+    /// Whether `call_id` IS the subject's own access rather than a call that
+    /// runs code: a cell's `read()`/`write()`.
+    fn is_the_access(&self, analyzer: &Analyzer<'_>, call_id: Id) -> bool {
+        match self {
+            WriteSubject::Cell(_) => {
+                analyzer.shared_cells.reads.contains_key(&call_id)
+                    || analyzer.shared_cells.writes.contains_key(&call_id)
+            }
+            WriteSubject::Module(..) => false,
+        }
+    }
+
+    /// The answer for a call nothing here can see into — a closure value.
+    fn unknown(&self, analyzer: &Analyzer<'_>) -> bool {
+        match self {
+            WriteSubject::Cell(cell) => analyzer.shared_cells.mutated.contains(cell),
+            WriteSubject::Module(binding, writes) => writes.through_values.contains(binding),
+        }
+    }
+}
+
 /// B267: the program's `Shared` cells — which slots can hold the same one, and
 /// which of those cells a write ever mutates IN PLACE.
 ///
@@ -76139,6 +77209,12 @@ pub struct Program<'src> {
     /// in the program — the vtable's slot set (§6.2's reachability).
     pub dyn_dispatched_members: HashSet<(Id, &'src str)>,
     pub callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// M165: the expressions an `Option` value lands at an `any` position at,
+    /// with its `Option` depth. The JS emitter unwraps each to its payload or
+    /// `null` (`walk_entity`), which is what the native backend's `Any::from`
+    /// does at the same positions — so a `List<any>` bind list holds the value
+    /// or NULL on both.
+    pub any_option_coercions: HashMap<Id, usize>,
     /// B462: references to a tuple variant standing for a closure, as
     /// `(enum, variant, arity, the closure type)` — eta-expanded at the site.
     pub variant_coercions: HashMap<Id, (Id, usize, usize, TypeId)>,
@@ -80425,6 +81501,11 @@ pub(crate) struct BaseCacheKey {
     /// Empty for every key but a prefix built for a program with dependencies,
     /// so every key minted before this field existed is unchanged.
     dependency_tier: Vec<String>,
+    /// std-prefix P6a: the world carries the tier rule's ORACLE record
+    /// ([`crate::incremental::tier_oracle`], a test): the tiers' resolve
+    /// recorded every question it asked, which a world built without the
+    /// oracle does not hold — so the two are two worlds (and two files).
+    tier_oracle: bool,
 }
 
 /// One retained base world and the claims that keep its borrows alive (M23).
@@ -82738,6 +83819,9 @@ fn prefix_file_key(key: &BaseCacheKey) -> crate::prefix_file::Key {
             .iter()
             .chain(&key.dependency_tier)
             .cloned()
+            // P6a: the tier oracle's record rides the world; its file is
+            // another file.
+            .chain(key.tier_oracle.then(|| "tier-oracle".to_string()))
             .collect(),
         tiers: if key.dependency_tier.is_empty() {
             vec![crate::prefix_file::STD_TIER.to_string()]
@@ -83743,15 +84827,16 @@ fn hot_set_imports_a_use_inferred_binding(
 /// std-prefix P1 (`std-prefix.md` §4.2): the package half of the canonical
 /// two-phase resolve, over a std-only prefix whose own resolve was std's alone.
 ///
-/// The package's constraints resolve first, recorded under the ENTRY's filter
-/// as the canonical pre-entry resolve records them (B553's question, asked of
-/// the entry's impls after its walk). Then §4.2's guard, once the package's
-/// impls have resolved their subjects: the prefix recorded every question
-/// std's resolve asked ([`ImplReachLog`], filter `everything`), and a package
-/// impl — every impl between the prefix's floor and the package's is one —
-/// that could have answered one means std's answers are not the canonical
-/// analysis's; the caller builds canonically ([`shape_after_impl_reach`]:
-/// `by_hot`).
+/// The package's constraints resolve over the tiers' settled answers,
+/// recorded under the ENTRY's filter as the canonical pre-entry resolve
+/// records them (B553's question, asked of the entry's impls after its walk).
+///
+/// P6a (§14.3): this is the canonical order too — the canonical drain resolves
+/// the tiers before the package's first node mints, as the prefix world does —
+/// so §4.2's guard is the RULE: a package impl never answers a question std's
+/// (or a dependency's) resolution asked, in either shape, and there is nothing
+/// to refuse. The guard survives as a test oracle
+/// ([`Analyzer::check_tier_oracle`]).
 ///
 /// M110 S1's third guard (a use-inferred binding a hot module imports) has no
 /// work here: the package walks in the canonical order among itself, after
@@ -83759,58 +84844,29 @@ fn hot_set_imports_a_use_inferred_binding(
 ///
 /// std-prefix P2: a LAYERED world records what its own key's filter asks
 /// (`ReachFilter` of the entry and S1's hot set — the late files of the world
-/// it becomes), and keeps std's questions that filter would have kept beside
-/// the package's: the world is stored as S1's or the canonical miss stores
-/// it, and that world's resolve asked both at once.
+/// it becomes): the world is stored as S1's or the canonical miss stores it,
+/// and that miss's package half asked those questions.
 fn resolve_package_over_prefix(
     world: &mut World<'_>,
     nodes: &Spanned<NodeList<'_>>,
     layered: Option<&Layered>,
-) -> Result<(), ImplReached> {
+) {
     let resolve_started = crate::prefix_file::now();
-    let package_sources = world.prefix_len as u32..world.sources.len() as u32;
     let analyzer = &mut world.analyzer;
-    let std_log = std::mem::take(analyzer.impl_reach.get_mut());
     analyzer.source_paths = world.sources.clone();
     let filter = match layered {
         Some(layered) => layered.world_key.reach.clone(),
         None => ReachFilter::of(std::iter::once(&nodes.0)),
     };
-    let kept_std = match (layered, &filter) {
-        (Some(_), Some(filter)) => Some(std_log.kept_by(filter)),
-        _ => None,
-    };
-    match filter {
-        Some(filter) => {
-            analyzer.begin_impl_reach_log(filter);
-            analyzer.resolve_world();
-            analyzer.end_impl_reach_log();
-        }
-        None => analyzer.resolve_world(),
-    }
-    let mut package_log = std::mem::replace(analyzer.impl_reach.get_mut(), std_log);
-    let verdict = analyzer.impl_reach(package_sources);
-    if let Some(kept_std) = kept_std {
-        package_log.absorb(kept_std);
-        analyzer.prefix_impl_count = package_log.floor;
-    }
-    *analyzer.impl_reach.get_mut() = package_log;
+    // The stored world ended where the package began walking over it.
+    let walked_from = analyzer.prefix_entity_end;
+    analyzer.resolve_package_half(filter, walked_from);
     if crate::phase_timing_enabled() {
         eprintln!(
             "[vilan phase] prefix-package-resolve us={}",
             crate::prefix_file::micros_since(resolve_started)
         );
     }
-    if let Some(mut reached) = verdict {
-        // The impl guard's plant (M110 S1) lets a package impl through too.
-        if crate::incremental::planted(crate::incremental::Plant::ImplGuardOff) {
-            reached.by_hot = false;
-        }
-        if reached.by_hot || reached.by_entry {
-            return Err(reached);
-        }
-    }
-    Ok(())
 }
 
 /// The resolved pre-entry world — everything `analyze` builds before the
@@ -83826,9 +84882,11 @@ struct World<'src> {
     source_hashes: Vec<u64>,
     entry_is_module: bool,
     /// B239: this world's entry is a MODULE its siblings import (file mode,
-    /// and something in the load referenced `pkg::<entry>`), so the pre-entry
-    /// `resolve_world` was DEFERRED — nothing here has resolved yet, and the
-    /// post-entry `build()` is the one pass that resolves it all.
+    /// and something in the load referenced `pkg::<entry>`), so the PACKAGE
+    /// half of the pre-entry resolve was DEFERRED — the tiers (std, the
+    /// dependencies) resolved before the package's nodes minted (P6a: they
+    /// never reach `pkg::<entry>`), and the post-entry `build()` resolves the
+    /// package and the entry together.
     ///
     /// M70: such a world IS stored, keyed by the module it excludes
     /// ([`BaseCacheKey::entry_open_module`]), and this flag travels with it —
@@ -83837,10 +84895,12 @@ struct World<'src> {
     /// exactly when the analysis that stored it did, and the entry tail reads
     /// the order off the world rather than off its own load.
     entry_is_open_module: bool,
-    /// Whether the pre-entry `resolve_world` was skipped: the open module's
-    /// order above, or B553's deferred order ([`AnalysisShape::defer_resolve`]).
-    /// The post-entry `build()` is then the one resolve, and the entry tail
-    /// waits for it with everything the pre-entry resolve would have bound.
+    /// Whether the PACKAGE half of the pre-entry resolve was skipped: the open
+    /// module's order above, or B553's deferred order
+    /// ([`AnalysisShape::defer_resolve`]). The tiers resolved alone in every
+    /// order (P6a); the post-entry `build()` then resolves the package with the
+    /// entry, and the entry tail waits for it with everything the pre-entry
+    /// resolve would have bound.
     resolve_deferred: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
@@ -83931,6 +84991,19 @@ fn note_hot_refusal(reason: &'static str, key: &BaseCacheKey) {
             census.prefix_refusals += 1;
             census.prefix_refusal = Some(reason);
         }
+    });
+}
+
+/// N179: the std-prefix world (P1) asked for and not attempted — a gate in
+/// front of the attempt said no. Named in the census's `prefix-refusal`
+/// column; not a refusal OF the prefix (`prefix-refusals` counts those), and
+/// the analysis the census describes is not over it, whatever an abandoned
+/// earlier attempt of the same analysis was.
+fn note_prefix_not_taken(reason: &'static str) {
+    crate::incremental::update_census(|census| {
+        census.prefix_world = false;
+        census.prefix_layered = false;
+        census.prefix_refusal = Some(reason);
     });
 }
 
@@ -84610,6 +85683,117 @@ enum DeferredMint<'src> {
     },
 }
 
+/// The namespace scopes a deferred mint registers under: std's, the entry
+/// package's (`pkg`), and the global scope every module scope is a child of.
+#[derive(Clone, Copy)]
+struct OriginScopes {
+    std: Id,
+    pkg: Id,
+    global: Id,
+}
+
+/// M144: mints one tier's deferred non-std nodes ([`DeferredMint`]) — its pure
+/// namespaces first, then its modules and the entry's alias, each set in
+/// discovery order, as `load_hot_modules` mints a package over a stored prefix.
+/// Returns each body's row in the drain's `loaded` list with the module scope
+/// its node now has. Called once for the dependency tier (M152) and once for
+/// the entry package, after the tiers resolve (P6a).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drain's node tables, threaded through as the drain holds them"
+)]
+fn mint_deferred_nodes<'src>(
+    analyzer: &mut Analyzer<'src>,
+    mints: Vec<DeferredMint<'src>>,
+    module_nodes: &mut HashMap<(Origin, &'src str), Id>,
+    deferred_requests: &mut Vec<(Origin, &'src str)>,
+    module_scopes: &mut HashMap<&'src str, Id>,
+    pkg_module_names: &mut HashSet<&'src str>,
+    scopes: OriginScopes,
+) -> Vec<(usize, Id)> {
+    let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = mints
+        .into_iter()
+        .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
+    let mut minted: Vec<(usize, Id)> = Vec::new();
+    for mint in namespaces.into_iter().chain(bodies) {
+        let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
+            Origin::Std => scopes.std,
+            Origin::Pkg => scopes.pkg,
+            Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
+        };
+        match mint {
+            DeferredMint::Namespace {
+                origin,
+                name,
+                children,
+            } => {
+                let origin_scope_id = origin_scope_of(analyzer, origin);
+                let module_id = ensure_module_node(
+                    analyzer,
+                    module_nodes,
+                    deferred_requests,
+                    origin,
+                    name,
+                    origin_scope_id,
+                    scopes.global,
+                );
+                analyzer.namespace_only_modules.insert(module_id, children);
+                if origin == Origin::Pkg {
+                    pkg_module_names.insert(name);
+                }
+            }
+            DeferredMint::EntryAlias { name } => {
+                let module_id = analyzer.new_entity_id();
+                analyzer.modules.insert(
+                    module_id,
+                    Module {
+                        id: module_id,
+                        name,
+                        body: (Vec::new(), scopes.global),
+                    },
+                );
+                analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+                analyzer.source_ranges.push(SourceRange {
+                    start: module_id.0,
+                    end: module_id.0 + 1,
+                    source: SourceId(0),
+                });
+                analyzer
+                    .expr_id_to_expr_map
+                    .insert(module_id, Expr::Module(module_id));
+                analyzer
+                    .mut_scope_for_scope_id(scopes.pkg)
+                    .name_to_id_map
+                    .insert(name, module_id);
+            }
+            DeferredMint::Body {
+                origin,
+                name,
+                module_source_id,
+                directory_holds_a_lib_body,
+                loaded_index,
+            } => {
+                let origin_scope_id = origin_scope_of(analyzer, origin);
+                let module_scope_id = mint_module_node(
+                    analyzer,
+                    module_nodes,
+                    deferred_requests,
+                    module_scopes,
+                    pkg_module_names,
+                    origin,
+                    name,
+                    origin_scope_id,
+                    scopes.global,
+                    module_source_id,
+                    directory_holds_a_lib_body,
+                );
+                minted.push((loaded_index, module_scope_id));
+            }
+        }
+    }
+    minted
+}
+
 /// A65: the entity a module PATH denotes, created if this analysis has not
 /// met it yet — the parent chain first, so `lib::ui` exists before
 /// `lib::ui::widget` registers under it.
@@ -85241,12 +86425,11 @@ fn std_prefix_keys(
         entry_pkg: None,
         entry_open_module: None,
         hot: None,
-        // Every question std's resolve asks is recorded: the impls that may
-        // answer one are whichever package builds over the prefix.
-        reach: Some(ReachFilter {
-            everything: true,
-            members: Default::default(),
-        }),
+        // P6a: std's resolve records nothing — no package impl answers a
+        // question the tiers' resolution asks (`std-prefix.md` §14.3), so
+        // there is nothing for one to be tested against. (The tier oracle,
+        // a test, records them in `Analyzer::tier_oracle`, keyed apart.)
+        reach: None,
         std_prefix: true,
         dependency_tier: tier.map(|tier| tier.rows).unwrap_or_default(),
         ..base_cache_key.clone()
@@ -85484,9 +86667,11 @@ struct AnalysisShape {
     cache: bool,
     /// A hot-set world (M110 S1) may be built.
     hot: bool,
-    /// B553: the loaded modules do NOT resolve before the entry walks — the
-    /// whole world resolves once, in the post-entry `build()`, with every
-    /// impl in it (the monolithic order, the one B239's open module takes).
+    /// B553: the package's modules do NOT resolve before the entry walks —
+    /// they resolve once, in the post-entry `build()`, with every package and
+    /// entry impl in it (the order B239's open module takes). The tiers still
+    /// resolve first and alone (P6a: an entry impl never answers their
+    /// questions, so the deferral has nothing to protect there).
     /// Taken when an impl the entry walks answers a question the pre-entry
     /// resolve asked ([`ImplReachLog`]); such a world is neither read from nor
     /// written to the base cache, since what it is keyed by is not what it
@@ -85739,6 +86924,7 @@ fn analyze_inner<'src>(
         reach: None,
         std_prefix: false,
         dependency_tier: Vec::new(),
+        tier_oracle: crate::incremental::tier_oracle() && !crate::macros::in_macro_world(),
     };
     let base_cacheable = shape.cache
         && !entry_is_inside_std
@@ -85846,6 +87032,36 @@ fn analyze_inner<'src>(
         && shape.hot
         && hot_shape_allowed
         && !crate::macros::in_macro_world();
+    // N179: a program the prefix is asked for and NOT attempted says why, so
+    // the census reads every program by name (`prefix-world 0 prefix-refusal
+    // macro-text`) rather than `-`. A refusal of an attempt (the hot shapes'
+    // guards, `refused-before`) has already said so; these are the gates in
+    // front of the attempt — the reuse gate's own reasons, and the shapes a
+    // rebuild narrows to.
+    if crate::incremental::std_prefix() && !std_prefix_wanted && !crate::macros::in_macro_world() {
+        let reason = if !shape.cache {
+            // A rebuild without the cache: generated code demanded a module
+            // the served world never loaded (`expand_entry_over_world`).
+            Some("uncached")
+        } else if shape.defer_resolve {
+            // B553: an entry impl answered a pre-entry question.
+            Some("resolve-deferred")
+        } else if !shape.std_prefix || !shape.hot {
+            // A narrowed retry: the refusal that narrowed it was noted.
+            None
+        } else if entry_is_inside_std {
+            Some("inside-std")
+        } else if !base_cacheable {
+            // The entry's text says `macro` (the reuse gate is syntactic: a
+            // macro-DEFINING entry registers into the world's registry).
+            Some("macro-text")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            note_prefix_not_taken(reason);
+        }
+    }
     let hot_world = match std_prefix_wanted
         .then(|| std_prefix_set(&entry_pkg_seeds, entry_path, pkg_root, workspace))
     {
@@ -86016,23 +87232,11 @@ fn analyze_inner<'src>(
                 shape_after_hot_load(refusal, &refusal_key, shape),
             );
         }
-        // std-prefix P1: the package resolves over std's settled answers, before
-        // the entry walks — the canonical two-phase order with std's half done
-        // alone (§4.2) — unless a package impl answers a question std asked.
-        if base_cache_key.std_prefix
-            && let Err(reached) = resolve_package_over_prefix(&mut world, nodes, layered.as_ref())
-        {
-            let shape = shape_after_impl_reach(shape, &reached, Some(&refusal_key));
-            return analyze_inner(
-                nodes,
-                entry_source,
-                std,
-                pkg_root,
-                entry_path,
-                platform,
-                workspace,
-                shape,
-            );
+        // std-prefix P1: the package resolves over the tiers' settled
+        // answers, before the entry walks — the canonical two-phase order with
+        // the tiers' half done alone, which is the canonical order (P6a).
+        if base_cache_key.std_prefix {
+            resolve_package_over_prefix(&mut world, nodes, layered.as_ref());
         }
         // std-prefix P2: the layered world is stored under its own key, and
         // its hot set (S1's) walks over it.
@@ -87857,6 +89061,14 @@ fn analyze_inner<'src>(
     // tier walks in the prefix, the package after it as the hot set), so a
     // dependency's ids — and the emitted order of its declarations against
     // the package's — are one answer in both shapes.
+    //
+    // P6a (`std-prefix.md` §14.3): and the TIERS RESOLVE before the first
+    // package node mints — std and the dependency tier, together — exactly
+    // as the std-only prefix world resolves before the package walks over it.
+    // So the two shapes are one id layout (M157: the entities std's resolve
+    // mints come before the package's nodes in both), and an impl the entry
+    // package declares never answers a question the tiers' resolution asks —
+    // the entry's rule since M121, extended to its package.
     let (dependency_mints, package_mints): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) =
         deferred_mints.into_iter().partition(|mint| {
             matches!(
@@ -87871,204 +89083,29 @@ fn analyze_inner<'src>(
             )
         });
     let mut deferred_requests: Vec<(Origin, &str)> = Vec::new();
-    for (phase, phase_mints) in [dependency_mints, package_mints].into_iter().enumerate() {
-        let (namespaces, bodies): (Vec<DeferredMint<'src>>, Vec<DeferredMint<'src>>) = phase_mints
-            .into_iter()
-            .partition(|mint| matches!(mint, DeferredMint::Namespace { .. }));
-        for mint in namespaces.into_iter().chain(bodies) {
-            let origin_scope_of = |analyzer: &Analyzer<'src>, origin: Origin| match origin {
-                Origin::Std => std_scope_id,
-                Origin::Pkg => pkg_scope_id,
-                Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
-            };
-            match mint {
-                DeferredMint::Namespace {
-                    origin,
-                    name,
-                    children,
-                } => {
-                    let origin_scope_id = origin_scope_of(&analyzer, origin);
-                    let module_id = ensure_module_node(
-                        &mut analyzer,
-                        &mut module_nodes,
-                        &mut deferred_requests,
-                        origin,
-                        name,
-                        origin_scope_id,
-                        global_scope_id,
-                    );
-                    analyzer.namespace_only_modules.insert(module_id, children);
-                    if origin == Origin::Pkg {
-                        pkg_module_names.insert(name);
-                    }
-                }
-                DeferredMint::EntryAlias { name } => {
-                    let module_id = analyzer.new_entity_id();
-                    analyzer.modules.insert(
-                        module_id,
-                        Module {
-                            id: module_id,
-                            name,
-                            body: (Vec::new(), global_scope_id),
-                        },
-                    );
-                    analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-                    analyzer.source_ranges.push(SourceRange {
-                        start: module_id.0,
-                        end: module_id.0 + 1,
-                        source: SourceId(0),
-                    });
-                    analyzer
-                        .expr_id_to_expr_map
-                        .insert(module_id, Expr::Module(module_id));
-                    analyzer
-                        .mut_scope_for_scope_id(pkg_scope_id)
-                        .name_to_id_map
-                        .insert(name, module_id);
-                }
-                DeferredMint::Body {
-                    origin,
-                    name,
-                    module_source_id,
-                    directory_holds_a_lib_body,
-                    loaded_index,
-                } => {
-                    let origin_scope_id = origin_scope_of(&analyzer, origin);
-                    let module_scope_id = mint_module_node(
-                        &mut analyzer,
-                        &mut module_nodes,
-                        &mut deferred_requests,
-                        &mut module_scopes,
-                        &mut pkg_module_names,
-                        origin,
-                        name,
-                        origin_scope_id,
-                        global_scope_id,
-                        module_source_id,
-                        directory_holds_a_lib_body,
-                    );
-                    loaded[loaded_index].3 = Some(module_scope_id);
-                }
-            }
-        }
-        if phase == 0 {
-            // M152: the dependencies' modules, then each dependency's `lib.vl`
-            // into its own namespace (its public surface), mirroring the `std` lib
-            // walk above.
-            for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
-                if !matches!(origin, Origin::Dep(_)) {
-                    continue;
-                }
-                let module_scope_id =
-                    module_scope_id.expect("M144: a dependency's node is minted above");
-                walk_module(
-                    &mut analyzer,
-                    ast,
-                    text,
-                    module_scope_id,
-                    *source_id,
-                    *origin,
-                );
-            }
-            for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in
-                &dependency_lib_walks
-            {
-                let root_start = analyzer.entity_id;
-                analyzer.set_current_source(*source_id);
-                analyzer.module_scope_ids.insert(*namespace_scope_id);
-                let start = analyzer.entity_id;
-                analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
-                analyzer.source_ranges.push(SourceRange {
-                    start,
-                    end: analyzer.entity_id,
-                    source: *source_id,
-                });
-                // Macro-generated items (derives included) walk into the lib's
-                // namespace — or into the inline `mod` that declared the deriving
-                // item (B201).
-                for generated in generated_by_source.get(source_id).into_iter().flatten() {
-                    let scope_id = analyzer
-                        .declaring_module_scope(*namespace_scope_id, &generated.module_path);
-                    analyzer.walk_generated_expansion(
-                        generated.nodes,
-                        scope_id,
-                        generated.origin,
-                        *source_id,
-                    );
-                }
-                analyzer
-                    .dependency_root_ranges
-                    .push((root_start, analyzer.entity_id));
-            }
-        }
+    let origin_scopes = OriginScopes {
+        std: std_scope_id,
+        pkg: pkg_scope_id,
+        global: global_scope_id,
+    };
+    for (loaded_index, module_scope_id) in mint_deferred_nodes(
+        &mut analyzer,
+        dependency_mints,
+        &mut module_nodes,
+        &mut deferred_requests,
+        &mut module_scopes,
+        &mut pkg_module_names,
+        origin_scopes,
+    ) {
+        loaded[loaded_index].3 = Some(module_scope_id);
     }
-    debug_assert!(
-        deferred_requests
-            .iter()
-            .all(|(origin, name)| module_nodes.contains_key(&(*origin, name))),
-        "M144: a deferred mint asked for a module the discovery never reached"
-    );
-    // Every loaded module's importable names, read syntactically before its
-    // walk. A prelude module publishes exactly these (prelude.md §8), and
-    // reading them here is what lets `seed_preludes` answer "what does
-    // `std::web::prelude` make ambient" without re-parsing anything. (After
-    // std's walk since M144, which reads none of them: `seed_preludes` runs
-    // in the resolve, once everything has walked.)
-    for (_name, ast, _text, module_scope_id, _source_id, _origin) in &loaded {
-        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
-        let mut importables = Vec::new();
-        collect_importables(&ast.0, &mut importables);
-        analyzer.prelude_exports.insert(
-            module_scope_id,
-            importables
-                .into_iter()
-                .map(|importable| importable.name)
-                .collect(),
-        );
-    }
-    // A dependency's `lib.vl` walks into the dependency's NAMESPACE scope, not
-    // into a module scope in `loaded` — so its ambient set is queued here, from
-    // the same package's own prelude. (std's `lib.vl` is the twin case and
-    // needs nothing: std declares `prelude = false`.)
-    for (source_id, namespace_scope_id, lib_ast, package_index, _lib_text) in &dependency_lib_walks
-    {
-        let mut importables = Vec::new();
-        collect_importables(&lib_ast.0, &mut importables);
-        analyzer.prelude_exports.insert(
-            *namespace_scope_id,
-            importables
-                .into_iter()
-                .map(|importable| importable.name)
-                .collect(),
-        );
-        if let Some(path) = workspace.packages[*package_index].prelude.module_path() {
-            analyzer
-                .prelude_seeds
-                .push((*namespace_scope_id, path.to_string(), *source_id));
-        }
-    }
-    // Queue each module's ambient set, from the prelude ITS OWN package
-    // declares (prelude.md §7 — never the consumer's, never inherited).
-    for (_name, _ast, _text, module_scope_id, source_id, origin) in &loaded {
-        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
-        let prelude = match origin {
-            Origin::Std => &std.prelude,
-            Origin::Pkg => &workspace.entry_prelude,
-            Origin::Dep(index) => &workspace.packages[*index].prelude,
-        };
-        if let Some(path) = prelude.module_path() {
-            analyzer
-                .prelude_seeds
-                .push((module_scope_id, path.to_string(), *source_id));
-        }
-    }
-    // M144: the package's modules walk after their nodes (a dependency's
-    // walked with its own, M152).
+    // M152: the dependencies' modules, then each dependency's `lib.vl` into its
+    // own namespace (its public surface), mirroring the `std` lib walk above.
     for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
-        if *origin != Origin::Pkg {
+        if !matches!(origin, Origin::Dep(_)) {
             continue;
         }
-        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        let module_scope_id = module_scope_id.expect("M144: a dependency's node is minted above");
         walk_module(
             &mut analyzer,
             ast,
@@ -88077,6 +89114,99 @@ fn analyze_inner<'src>(
             *source_id,
             *origin,
         );
+    }
+    for (source_id, namespace_scope_id, lib_ast, _package_index, _lib_text) in &dependency_lib_walks
+    {
+        let root_start = analyzer.entity_id;
+        analyzer.set_current_source(*source_id);
+        analyzer.module_scope_ids.insert(*namespace_scope_id);
+        let start = analyzer.entity_id;
+        analyzer.walk_module_items(&lib_ast.0, *namespace_scope_id);
+        analyzer.source_ranges.push(SourceRange {
+            start,
+            end: analyzer.entity_id,
+            source: *source_id,
+        });
+        // Macro-generated items (derives included) walk into the lib's
+        // namespace — or into the inline `mod` that declared the deriving
+        // item (B201).
+        for generated in generated_by_source.get(source_id).into_iter().flatten() {
+            let scope_id =
+                analyzer.declaring_module_scope(*namespace_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                *source_id,
+            );
+        }
+        analyzer
+            .dependency_root_ranges
+            .push((root_start, analyzer.entity_id));
+    }
+    // Every loaded module's importable names, read syntactically before its
+    // walk. A prelude module publishes exactly these (prelude.md §8), and
+    // reading them here is what lets `seed_preludes` answer "what does
+    // `std::web::prelude` make ambient" without re-parsing anything. (After
+    // std's walk since M144, which reads none of them: `seed_preludes` runs
+    // in the resolve, once everything has walked.) The tiers' modules here,
+    // before the tiers resolve (P6a); the package's once its nodes mint.
+    let publish_importables =
+        |analyzer: &mut Analyzer<'src>, ast: &Spanned<NodeList<'src>>, scope_id: Id| {
+            let mut importables = Vec::new();
+            collect_importables(&ast.0, &mut importables);
+            analyzer.prelude_exports.insert(
+                scope_id,
+                importables
+                    .into_iter()
+                    .map(|importable| importable.name)
+                    .collect(),
+            );
+        };
+    for (_name, ast, _text, module_scope_id, _source_id, origin) in &loaded {
+        if *origin == Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every tier's module node is minted");
+        publish_importables(&mut analyzer, ast, module_scope_id);
+    }
+    // A dependency's `lib.vl` walks into the dependency's NAMESPACE scope, not
+    // into a module scope in `loaded` — so its ambient set is queued here, from
+    // the same package's own prelude. (std's `lib.vl` is the twin case and
+    // needs nothing: std declares `prelude = false`.)
+    for (source_id, namespace_scope_id, lib_ast, package_index, _lib_text) in &dependency_lib_walks
+    {
+        publish_importables(&mut analyzer, lib_ast, *namespace_scope_id);
+        if let Some(path) = workspace.packages[*package_index].prelude.module_path() {
+            analyzer
+                .prelude_seeds
+                .push((*namespace_scope_id, path.to_string(), *source_id));
+        }
+    }
+    // Queue each module's ambient set, from the prelude ITS OWN package
+    // declares (prelude.md §7 — never the consumer's, never inherited). The
+    // tiers' modules here; the package's below, after the tiers resolve.
+    let queue_prelude = |analyzer: &mut Analyzer<'src>,
+                         module_scope_id: Id,
+                         source_id: SourceId,
+                         origin: Origin| {
+        let prelude = match origin {
+            Origin::Std => &std.prelude,
+            Origin::Pkg => &workspace.entry_prelude,
+            Origin::Dep(index) => &workspace.packages[index].prelude,
+        };
+        if let Some(path) = prelude.module_path() {
+            analyzer
+                .prelude_seeds
+                .push((module_scope_id, path.to_string(), source_id));
+        }
+    };
+    for (_name, _ast, _text, module_scope_id, source_id, origin) in &loaded {
+        if *origin == Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every tier's module node is minted");
+        queue_prelude(&mut analyzer, module_scope_id, *source_id, *origin);
     }
     // Remember `panic` so its calls can be typed as never and lowered to a throw.
     if let Some(io_scope_id) = module_scopes.get("io") {
@@ -88462,6 +89592,64 @@ fn analyze_inner<'src>(
             .insert("Task", task_struct_id);
     }
 
+    // P6a (`std-prefix.md` §14.3): the TIERS resolve here, alone — after
+    // std's and the dependencies' walk and the lang items above, before the
+    // first package node mints — in every order the pre-entry resolve takes:
+    // the two-phase one, and B553's and B239/M70's deferred ones, which defer
+    // only the PACKAGE half to the entry's `build()` (the entry cannot answer
+    // a tier's question, so nothing a deferral protects waits here). A world
+    // whose entry IS a module (a std or dependency file opened directly)
+    // keeps the monolithic order: its tiers hold the entry.
+    let phase_base_start = crate::PhaseClock::now();
+    if !entry_is_module {
+        analyzer.source_paths = sources.clone();
+        analyzer.resolve_tiers();
+    }
+    let tiers_entity_end = (!entry_is_module).then_some(analyzer.entity_id);
+    let phase_tiers = phase_base_start.elapsed();
+    // M144: the package's nodes, after the tiers' resolve (P6a).
+    for (loaded_index, module_scope_id) in mint_deferred_nodes(
+        &mut analyzer,
+        package_mints,
+        &mut module_nodes,
+        &mut deferred_requests,
+        &mut module_scopes,
+        &mut pkg_module_names,
+        origin_scopes,
+    ) {
+        loaded[loaded_index].3 = Some(module_scope_id);
+    }
+    debug_assert!(
+        deferred_requests
+            .iter()
+            .all(|(origin, name)| module_nodes.contains_key(&(*origin, name))),
+        "M144: a deferred mint asked for a module the discovery never reached"
+    );
+    for (_name, ast, _text, module_scope_id, source_id, origin) in &loaded {
+        if *origin != Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        publish_importables(&mut analyzer, ast, module_scope_id);
+        queue_prelude(&mut analyzer, module_scope_id, *source_id, *origin);
+    }
+    // M144: the package's modules walk after their nodes (a dependency's
+    // walked with its own, M152).
+    for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
+        if *origin != Origin::Pkg {
+            continue;
+        }
+        let module_scope_id = module_scope_id.expect("M144: every module node is minted above");
+        walk_module(
+            &mut analyzer,
+            ast,
+            text,
+            module_scope_id,
+            *source_id,
+            *origin,
+        );
+    }
+
     // A normal entry is walked here in the global scope. When the entry is a std
     // module it was already walked (as its module) in the loop above, so skip
     // this to avoid analyzing it twice.
@@ -88492,31 +89680,31 @@ fn analyze_inner<'src>(
     // 0 cache hits in a 3-keystroke walk with an unbounded cache) because
     // nothing else ever minted their key. `BaseCacheKey::entry_open_module`
     // carries the excluded module, so the world is offered back to the file it
-    // was built for and to nothing else; it is stored UNRESOLVED, and the hit
-    // path reproduces this very order from the flag the world carries.
+    // was built for and to nothing else; it is stored with its PACKAGE half
+    // unresolved, and the hit path reproduces this very order from the flag
+    // the world carries. (P6a: its tiers resolved before the package minted,
+    // so the stored world carries std resolved and a hit's `build()` resolves
+    // the package and the entry only — kolt's `styles.vl` css keystroke reads
+    // 8.06 -> 6.61 G instructions for it.)
     //
     // It can also still hit a world stored for a DIFFERENT entry that never
     // loaded this file — `base_cache_lookup`'s `entry_is_a_loaded_module`
     // refuses every world that did.
     let entry_is_open_module =
         entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
-    let phase_base_start = crate::PhaseClock::now();
+    //
+    // P6a: this is the PACKAGE half of the pre-entry resolve; the tiers'
+    // resolved before the package's nodes minted (above), in every order.
+    let phase_package_start = crate::PhaseClock::now();
     let resolve_deferred = entry_is_open_module || shape.defer_resolve;
     if !entry_is_module && !resolve_deferred {
         analyzer.source_paths = sources.clone();
         // M121 / B553: what this resolve asks of the impl table is recorded,
         // so the impls walked after it — the entry's, a hot set's — can be
         // tested against it once they have resolved (`impl_reach`).
-        match &base_cache_key.reach {
-            Some(filter) => {
-                analyzer.begin_impl_reach_log(filter.clone());
-                analyzer.resolve_world();
-                analyzer.end_impl_reach_log();
-            }
-            None => analyzer.resolve_world(),
-        }
+        analyzer.resolve_package_half(base_cache_key.reach.clone(), tiers_entity_end);
     }
-    let phase_base = phase_base_start.elapsed();
+    let phase_base = phase_tiers + phase_package_start.elapsed();
     let prefix_len = sources.len();
     // M110 S1's third guard, decided while the prefix's resolution is fresh
     // and BEFORE the store, so a refused hot world is never stored: a prefix
@@ -88681,23 +89869,10 @@ fn analyze_inner<'src>(
             shape_after_hot_load(refusal, &refusal_key, shape),
         );
     }
-    // std-prefix P1: the package resolves over std's settled answers, before
-    // the entry walks — the canonical two-phase order with std's half done
-    // alone (§4.2) — unless a package impl answers a question std asked.
-    if base_cache_key.std_prefix
-        && let Err(reached) = resolve_package_over_prefix(&mut world, nodes, layered.as_ref())
-    {
-        let shape = shape_after_impl_reach(shape, &reached, Some(&refusal_key));
-        return analyze_inner(
-            nodes,
-            entry_source,
-            std,
-            pkg_root,
-            entry_path,
-            platform,
-            workspace,
-            shape,
-        );
+    // std-prefix P1: the package resolves over the tiers' settled answers,
+    // before the entry walks — the canonical order since P6a.
+    if base_cache_key.std_prefix {
+        resolve_package_over_prefix(&mut world, nodes, layered.as_ref());
     }
     // std-prefix P2: the layered world, stored under its own key where the
     // prefix it was built over could be (the closure check above), and its
@@ -88989,6 +90164,9 @@ fn analyze_over_world<'src>(
         {
             analyzer.select_platform_twins(&nodes.0, entry_text);
         }
+        // P6a: the tier rule's oracle (a test), before the entry's impls
+        // exist and while the package's binders still read as holes.
+        analyzer.check_tier_oracle();
         let entry_walk_start = analyzer.entity_id;
         analyzer.entry_walk_start = Some(entry_walk_start);
         analyzer.walk_module_items(&nodes.0, global_scope_id);
@@ -89407,6 +90585,10 @@ fn analyze_over_world<'src>(
         analyzer.check_reseat_escape();
     }
     unless_cancelled! {
+        // B647: a loan of a module-level `mut` binding against the callee's
+        // write summary — whole-program (the callee may sit in another
+        // module), so outside the Class A window.
+        analyzer.check_module_binding_loans();
         analyzer.check_wire_boundary();
         analyzer.check_json_boundary();
         analyzer.check_hashable_boundary();
@@ -91218,6 +92400,7 @@ fn analyze_over_world<'src>(
         tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
+        any_option_coercions: std::mem::take(&mut analyzer.any_option_coercions),
         variant_coercions: std::mem::take(&mut analyzer.variant_coercions),
         dyn_coercions: std::mem::take(&mut analyzer.dyn_coercions),
         dyn_tuple_coercions: std::mem::take(&mut analyzer.dyn_tuple_coercions),

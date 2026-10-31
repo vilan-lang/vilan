@@ -63,6 +63,11 @@ export impl Database with Drop {
 /// `row[name]`) — the `__db_*` runtime helpers. The three column readers share
 /// one helper; the vilan signature supplies the type (trust the schema, and
 /// guard NULLABLE columns with `is_null`).
+///
+/// A bind list holds what SQLite stores (M165): an `Option` is its value or NULL
+/// (converted where it lands in the `List<any>`, as `vilan_rt::Any` holds one
+/// natively), a `bool` binds as 0 or 1, and anything else is refused at the bind,
+/// naming its index in the list.
 [extern("__db_run")]
 external fun statement_run(statement: Statement, parameters: List<any>): i32;
 

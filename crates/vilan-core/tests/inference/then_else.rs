@@ -343,3 +343,91 @@ fn r15_nested_guards_each_publish_into_their_own_block() {
         "cannot find 'n'",
     );
 }
+
+// --- B658: `let x = c else S;` is refused at its own line, as the guard ------
+//
+// The guard `c else S;` is a statement; after a `let`'s `=` its `else`
+// belonged to nothing. Inside a block the parse ran on into the enclosing
+// `if`'s `else` and failed in an unrelated call below it. Refused at
+// `let … =`, with the let-else form respelled, and parsed as that guard.
+
+#[test]
+fn b658_the_items_let_else_inside_a_block_is_reported_at_its_line() {
+    let source = r#"
+        fun consume(value: str, link: Option<str>) {}
+        fun pick(target: Option<str>, inserting: bool) {
+            if inserting {
+                let target = target is Some(let t) else ret;
+                consume(target, Some(target));
+            } else {
+                consume("x", target);
+            }
+        }
+        fun main() {}
+        "#;
+    // The one diagnostic, on `let target =`; the uses below read the
+    // unwrapped value (the capture takes the binding's name), so they do not
+    // cascade.
+    let start = source.find("let target =").expect("the let");
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(
+        diagnostics,
+        vec![(
+            "a `let` takes no guard: the let-else form is the `is` test alone, `target is \
+             Some(let target) else ret;`, with no `let target =`"
+                .to_string(),
+            start..start + "let target =".len()
+        )],
+    );
+}
+
+#[test]
+fn b658_a_capture_read_below_keeps_its_name_and_other_shapes_take_the_generic_steer() {
+    // The code below reads `t`: the author meant the capture, so it keeps its
+    // name and only `let x =` is the slip.
+    let read_capture = r#"
+        fun consume(value: str) {}
+        fun pick(target: Option<str>) {
+            let x = target is Some(let t) else ret;
+            consume(t);
+        }
+        fun main() {}
+        "#;
+    let diagnostics = failure_diagnostics(read_capture);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0]
+            .0
+            .contains("`target is Some(let t) else ret;`, with no `let x =`"),
+        "{diagnostics:#?}"
+    );
+    // A test that binds two captures has no one name to give: the generic form.
+    assert_fails_once_with(
+        r#"
+        fun pick(pair: Option<(i32, i32)>) {
+            let both = pair is Some((let a, let b)) else ret;
+        }
+        fun main() {}
+        "#,
+        "`opt is Some(let x) else ret;`, with no `let x =`",
+    );
+}
+
+#[test]
+fn b658_the_rewritten_guard_runs_as_the_let_else_form() {
+    // Not a program that compiles (the refusal fails it) — the recovered
+    // tree's shape is held by the absence of every downstream diagnostic in
+    // the first pin; this one holds the top-of-body spelling, which used to
+    // read "expected `;`" at the `else`.
+    assert_fails_once_with(
+        r#"
+        fun consume(value: str) {}
+        fun pick(target: Option<str>) {
+            let target = target is Some(let t) else ret;
+            consume(target);
+        }
+        fun main() {}
+        "#,
+        "with no `let target =`",
+    );
+}

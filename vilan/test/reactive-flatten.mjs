@@ -455,7 +455,7 @@ function advance(self, carried) {
 			if ($C[0] === 0) {
 				const message2 = $C[1];
 				$D = (() => {
-					throw __panic(message2, "std/src/reactive.vl:1291:27");
+					throw __panic(message2, "std/src/reactive.vl:1294:27");
 				})();
 			} else {
 				$D = undefined;
@@ -548,8 +548,8 @@ function reconnect(tracker, lists, target) {
 		let $U = null;
 		if ($T[0] === 0) {
 			const index = $T[1];
-			__at_put(kept, index, true, "std/src/reactive.vl:1708:5");
-			next.push(__clone(__at(held, index, "std/src/reactive.vl:1709:15")));
+			__at_put(kept, index, true, "std/src/reactive.vl:1711:5");
+			next.push(__clone(__at(held, index, "std/src/reactive.vl:1712:15")));
 			$U = undefined;
 		} else {
 			next.push([ dependency[0], dependency[1](relay_for(tracker, target)) ]);
@@ -561,7 +561,7 @@ function reconnect(tracker, lists, target) {
 	lists.v[2] = next;
 	let index2 = 0;
 	for (const edge of held) {
-		if (!(__at(kept, index2, "std/src/reactive.vl:1723:7"))) {
+		if (!(__at(kept, index2, "std/src/reactive.vl:1726:7"))) {
 			detach(edge[1]);
 		}
 		index2 = index2 + 1;
@@ -573,12 +573,12 @@ function reusable(held, kept, identity, position) {
 	let $Q = null;
 	if ($P[0] === 0) {
 		const wanted = $P[1];
-		if (position < held.length && !(__at(kept, position, "std/src/reactive.vl:1746:9")) && same_identity(__at(held, position, "std/src/reactive.vl:1747:22")[0], wanted)) {
+		if (position < held.length && !(__at(kept, position, "std/src/reactive.vl:1749:9")) && same_identity(__at(held, position, "std/src/reactive.vl:1750:22")[0], wanted)) {
 			return [ 0, position ];
 		}
 		let index = 0;
 		while (index < held.length) {
-			if (!(__at(kept, index, "std/src/reactive.vl:1752:9")) && same_identity(__at(held, index, "std/src/reactive.vl:1752:38")[0], wanted)) {
+			if (!(__at(kept, index, "std/src/reactive.vl:1755:9")) && same_identity(__at(held, index, "std/src/reactive.vl:1755:38")[0], wanted)) {
 				return [ 0, index ];
 			}
 			index = index + 1;
@@ -718,11 +718,11 @@ function new3(value, caller) {
 	}
 	return cell3;
 }
-function new4(value) {
-	return new3(value, "std/src/reactive.vl:2448:15");
+function new4(value, caller) {
+	return new3(value, caller);
 }
-function new5(value) {
-	return new3(value, "std/src/reactive.vl:2448:15");
+function new5(value, caller) {
+	return new3(value, caller);
 }
 function switch2(self, select) {
 	return [ self, select ];
@@ -767,7 +767,7 @@ function run_body(runs, body) {
 		})(run);
 	} else {
 		$I = (() => {
-			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1402:11");
+			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1405:11");
 		})();
 	}
 	return $I;
@@ -917,9 +917,9 @@ function take(self, item, $aM) {
 function cell(self, $g, $h) {
 	const instance = start3(self);
 	const pull = instance[0];
-	const cached = new3(pull(), "std/src/reactive.vl:2347:28");
+	const cached = new3(pull(), "std/src/reactive.vl:2388:28");
 	const refreshed = instance[1](subscriber_of(() => {
-		set(cached, pull(), $g, "std/src/reactive.vl:2351:11");
+		set(cached, pull(), $g, "std/src/reactive.vl:2392:11");
 		return;
 	}, true));
 	also_releasing(refreshed, instance[2]);
@@ -972,7 +972,7 @@ function run_body2(runs, body) {
 		})(run);
 	} else {
 		$bg = (() => {
-			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1402:11");
+			throw __panic("a renewed run carries its nursery", "std/src/reactive.vl:1405:11");
 		})();
 	}
 	return $bg;
@@ -1030,9 +1030,9 @@ function start5(self) {
 function cell2(self, $g, $h) {
 	const instance = start5(self);
 	const pull = instance[0];
-	const cached = new3(pull(), "std/src/reactive.vl:2347:28");
+	const cached = new3(pull(), "std/src/reactive.vl:2388:28");
 	const refreshed = instance[1](subscriber_of(() => {
-		set(cached, pull(), $g, "std/src/reactive.vl:2351:11");
+		set(cached, pull(), $g, "std/src/reactive.vl:2392:11");
 		return;
 	}, true));
 	also_releasing(refreshed, instance[2]);
@@ -1062,14 +1062,16 @@ const trace_hooks = __shared_new([ (_identity, _site) => {
 	return false;
 }, (_turn, _id) => {
 	return;
+}, (_id, _site) => {
+	return;
 } ]);
 const waking = __shared_new([ 1 ]);
 const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
 const run_nurseries_allocated_count = __shared_new(0);
-const first = new4(1);
-const second = new4(10);
-const outer = new5(__clone(first));
+const first = new4(1, "reactive-flatten.vl:9:22");
+const second = new4(10, "reactive-flatten.vl:10:23");
+const outer = new5(__clone(first), "reactive-flatten.vl:11:22");
 const $aR = comp(($a) => {
 	return memo(switch2(__clone(outer), (inner, $b, $c, $d) => {
 		return __clone(inner);
