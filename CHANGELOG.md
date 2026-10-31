@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**E352: `vilan fmt` measures each arm of a broken `then … else` form on the line it opens - a method chain under `else` breaks one link per line, as the same chain does as a statement's value, where it was joined onto one line at any width.** Over budget, a `then … else` form breaks before each `then` and `else`, one level in (B459 Q5); each arm then starts a line of its own, but it was printed without the width permission the statement hook armed, so a chain, a list literal or a call there stayed on that line however long it was (kolt's `mark_unseen`, `facts.private then … else db.prepare(..).all(..).map(..)`, reflowed to 170 columns on every `vilan fmt .`). An arm's line is now measured like a statement's: printed inline first and, over budget, printed again with the split armed - a chain one link per line, indented one level past the `else`, a list literal one element per line, a call its arguments - with the `;` after the last arm counted (E329): 100 columns with the `;` stays, 101 breaks. A form that fits on one line is untouched, and so is a short arm of a broken one. A reflow of lines that were over the budget; no file stops parsing. Estate: the tree's own `.vl` 0; kolt 18 files, every one a `then`/`else` arm over the budget (its `mark_unseen` now stays as written). Pins: `formatter::then_form_arm_layout` (the repro both ways, the `then` arm, a list literal, a call at 100 and 101 columns, a block's tail, short arms), `inference::then_else::e352_a_then_else_chain_arm_formats_to_itself_and_still_runs`. Tracker E352.
+
 ## v0.53.0 — 2026-10-27
 
 > Performance: this release was cut over a performance verdict that was not green (the performance verdict at c50a0a58 is RED - perf-c50a0a589300a8a97da4641e3b10a9f68d185aba.json names the rows). The exhibit, not the compiler: E121's 'model.vl keystroke, importers open' target of 500 ms is read at 670-720 ms by the BASE v0.52.0 itself on the seal's exhibit kolt@46c5b59 (490 ms on Order 54's older exhibit), and the tip sits inside that base-to-base spread (instructions x1.02); every other row is green or faster (css x0.78, parse break x0.80); the target is re-based under N186 in Order 56
