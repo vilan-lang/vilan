@@ -462,3 +462,33 @@ fn e352_a_then_else_chain_arm_formats_to_itself_and_still_runs() {
     assert_eq!(vilan_core::formatter::format(&formatted), formatted);
     assert_compiles_and_runs(&formatted, "1\n");
 }
+
+/// E353: a statement under `// vilan-fmt: skip` keeps E352's shape exactly as
+/// written - here the `else` chain joined onto one long line, which the width
+/// rule would otherwise break - and the formatted program is the same program.
+#[test]
+fn e353_a_skipped_statement_formats_to_itself_and_still_runs() {
+    let written = concat!(
+        "struct Row {\n",
+        "\tname: str,\n",
+        "}\n",
+        "\n",
+        "fun rows_of(query: str): List<Row> {\n",
+        "\t[Row { name = query }]\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet private = true;\n",
+        "\t// vilan-fmt: skip\n",
+        "\tlet readers = private\n",
+        "\t\tthen [Row { name = \"only the members\" }]\n",
+        "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+        ".filter(|row| row.name.len() > 0).map(|row| Row { name = row.name.to_uppercase() });\n",
+        "\tprint(readers.len());\n",
+        "}\n",
+    );
+    let formatted = vilan_core::formatter::format(written);
+    assert_eq!(formatted, written);
+    assert_eq!(vilan_core::formatter::format(&formatted), formatted);
+    assert_compiles_and_runs(&formatted, "1\n");
+}
