@@ -544,6 +544,42 @@ is the current directory. Formatting is conservative and a fixed point:
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.
 
+**`// vilan-fmt: skip` keeps one statement or item exactly as written.** Put
+the comment on the line immediately above the node — a statement in a body (a
+block's final expression included) or an item at module level or inside an
+`impl`, `trait` or `mod` — and `vilan fmt` prints that one node as you wrote
+it: its first line at the surrounding indentation, every later line byte for
+byte, its own indentation included. The comment stays where it is, and text
+after it, past a space, is yours (`// vilan-fmt: skip - E352`, the bug it
+works around). It is an escape hatch for a layout the formatter gets wrong,
+so it is deliberately narrow:
+
+- It reaches ONE node: the next statement or item, and nothing after it.
+- It must be on the line *immediately* above. With a blank line or another
+  comment in between, or code before it on its own line, it is an ordinary
+  comment, left where it is, and the node is formatted.
+- A top-level `import` belongs to the file's canonical import block and is
+  always formatted; the comment above one is an ordinary comment. An `import`
+  inside a body is skipped like any other statement.
+- A match leg, a field or an argument is not a statement: the comment above one
+  is an ordinary comment.
+
+```vilan
+fun main() {
+	// vilan-fmt: skip - a matrix reads as rows
+	let grid = [
+		1, 0, 0,
+		0, 1, 0,
+		0, 0, 1,
+	];
+	print(grid.len());
+}
+```
+
+A skipped node never makes `--check` fail, and `--check` lists every one it
+honored, as `path:line: vilan-fmt: skip` at the comment's line, so a
+workaround does not quietly outlive the bug it works around.
+
 **Comments are left exactly as you typed them, unless you ask.** The formatter
 lays code out to a width and leaves prose alone, so a `//` line runs as far as
 its author took it and a paragraph edited in the middle keeps its ragged
