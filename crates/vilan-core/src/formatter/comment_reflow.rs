@@ -56,6 +56,8 @@ pub(super) const MARKERS: &[&str] = &["///", "//!", "//"];
 /// line structure is a contract with a tool and not a typographic choice.
 ///
 /// `witness:` / `witness-absent:` are `corpus.rs`'s claim directives;
+/// `vilan-fmt:` is the formatter's own (`// vilan-fmt: skip`, E353) - re-filled
+/// into the line above, it would stop being a directive;
 /// `GENERATED(` / `END GENERATED(` are the seams `grammar_sync.rs` and
 /// `mime_table_sync.rs` splice generated fragments between (`build.vl`'s mime
 /// table is the in-tree one). The general rule in [`is_directive`] covers a
@@ -64,6 +66,7 @@ pub(super) const MARKERS: &[&str] = &["///", "//!", "//"];
 const TOOLCHAIN_DIRECTIVES: &[&str] = &[
     "witness:",
     "witness-absent:",
+    "vilan-fmt:",
     "GENERATED(",
     "END GENERATED(",
 ];

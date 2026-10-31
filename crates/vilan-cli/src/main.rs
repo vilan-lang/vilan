@@ -280,10 +280,14 @@ enum Command {
     },
     /// Format vilan source files in place. Already-formatted (and any not-yet
     /// formattable) files are left untouched.
+    ///
+    /// A line comment `// vilan-fmt: skip` on the line immediately above a
+    /// statement or an item keeps that one node exactly as written.
     Fmt {
         /// Files or directories to format. Defaults to the current directory.
         paths: Vec<PathBuf>,
-        /// Report files that would change without rewriting them (exit 1 if any).
+        /// Report files that would change without rewriting them (exit 1 if any),
+        /// and list each `// vilan-fmt: skip` honored as `path:line: vilan-fmt: skip`.
         #[arg(long)]
         check: bool,
     },
@@ -2727,8 +2731,24 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
         // `fmt --check vilan/std` green over it, and an idempotency pin on one
         // file is what caught it. `reprint` says which happened, and a decline
         // is reported by name here instead of being counted as clean.
-        let formatted = match vilan_core::formatter::reprint_with(&source, options) {
-            Ok(formatted) => formatted,
+        let formatted = match vilan_core::formatter::reprint_listing_skips(&source, options) {
+            Ok((formatted, skipped)) => {
+                // E353: `--check` names every `// vilan-fmt: skip` it honored,
+                // so a workaround stays in sight of the bug it works around.
+                // A skip never fails the check.
+                if check {
+                    for line in skipped {
+                        println!(
+                            "{}",
+                            paint::out(
+                                paint::Style::DIM,
+                                &format!("{}:{line}: vilan-fmt: skip", file.display())
+                            )
+                        );
+                    }
+                }
+                formatted
+            }
             Err(decline) => {
                 report_decline(file, &decline);
                 declined += 1;

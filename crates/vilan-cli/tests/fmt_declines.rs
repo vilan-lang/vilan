@@ -227,3 +227,44 @@ fn a_match_statement_with_a_semicolon_is_formatted_not_declined() {
     assert_eq!(output.status.code(), Some(0), "{}", streams(&output));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// E353: a node under `// vilan-fmt: skip` keeps its written layout, and the
+/// file it sits in is otherwise canonical - so `--check` passes over it (a
+/// skip never fails the check) and LISTS it, `path:line: vilan-fmt: skip` at
+/// the directive's line, so the workaround stays in sight of the bug it works
+/// around. Write mode keeps the node and lists nothing.
+const SKIPPED: &str =
+    "fun main() {\n\tlet a = 1;\n\t// vilan-fmt: skip\n\tlet   b =   [1,2,\n\t\t3];\n}\n";
+
+#[test]
+fn a_skipped_node_never_fails_check_and_check_lists_it() {
+    let dir = tree("e353", &[("main.vl", SKIPPED)]);
+    let output = vilan_fmt(&dir, &["--check"]);
+    let text = streams(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("main.vl:3: vilan-fmt: skip"), "{text}");
+    assert!(!text.contains("would reformat"), "{text}");
+    let output = vilan_fmt(&dir, &[]);
+    let text = streams(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(!text.contains("vilan-fmt: skip"), "{text}");
+    let after = std::fs::read_to_string(dir.join("main.vl")).expect("read the file back");
+    assert_eq!(after, SKIPPED);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The listing does not hide the rest of the file: a skipped node beside one
+/// that would reformat is listed, and the file still fails the check.
+#[test]
+fn a_skip_beside_an_unformatted_line_is_listed_and_the_file_still_fails() {
+    let messy = SKIPPED.replace("let a = 1;", "let  a  =  1;");
+    let dir = tree("e353_messy", &[("main.vl", &messy)]);
+    let output = vilan_fmt(&dir, &["--check"]);
+    let text = streams(&output);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("main.vl:3: vilan-fmt: skip") && text.contains("would reformat"),
+        "{text}"
+    );
+}
