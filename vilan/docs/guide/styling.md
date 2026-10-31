@@ -378,6 +378,16 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   `--space-4` still declared. `as_rem()`/`as_px()` convert at 16px = 1rem,
   and lengths compare with `<`; both refuse, at build time, a unit whose
   size depends on layout (`em`, `%`, `vh`, `vw`).
+- **`dp`, design pixels.** `Length::dp(8)` (`dp(8)` in a hole) is the
+  8 of a design measured in pixels, at the root size — 1/16 rem — and the
+  property decides how to write it. In `padding(dp(8))` it is
+  `padding:0.5rem`, so the spacing grows with the reader's text size, as
+  rem should; in a border, `.border(dp(1), gray(300))`, it is `1px`, so a
+  hairline stays a hairline at any text size. Spacing and sizing are rem,
+  border widths are px, and anywhere no property chooses (`raw`, a block's
+  undotted `border(..)` declaration, `piece`) it is rem. `px(..)` and
+  `rem(..)` keep meaning exactly that unit everywhere; reach for `dp` when
+  the number came from a design, and for `px` when you mean CSS pixels.
 - **`Color`** has `Color::white()`, `Color::black()`,
   `Color::transparent()`, `Color::current()` (CSS's `currentColor` — the
   element's own text colour, for a border or an SVG fill that follows

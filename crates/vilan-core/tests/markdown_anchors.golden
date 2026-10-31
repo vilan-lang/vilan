@@ -508,6 +508,7 @@ std/strings.md h2 into-conversions
 std/style.md h1 stdwebstyle-reference
 std/style.md h2 constructors-and-values
 std/style.md h3 lengths-are-data
+std/style.md h3 design-pixels-dp
 std/style.md h2 style-methods
 std/style.md h2 conditions
 std/style.md h3 the-condition-values

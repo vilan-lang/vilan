@@ -86,7 +86,29 @@ export enum Unit {
 	Text,
 }
 
+/// The unit a PROPERTY prefers for a `dp` length (proposal/length.md §4), and the
+/// only thing it decides: an explicit `px`/`rem`/... is written as given. Each
+/// property builder names its role — `Rem` for spacing and sizing, which should
+/// follow the reader's text size, `Px` for the hairlines (the border widths), which
+/// should stay crisp at any size. `raw` and `piece` know no property and render
+/// `Rem`.
+export enum Role {
+	Rem,
+	Px,
+}
+
 export impl Length {
+	/// DESIGN PIXELS (proposal/length.md §2): `dp(8)` is 8px at the root size —
+	/// 1/16 rem — measured as a design measurement rather than a CSS unit. It
+	/// carries no unit preference: the property that receives it picks one
+	/// (`Role`), so `padding(dp(8))` writes `0.5rem` and follows the reader's text
+	/// size while `border(dp(1), ..)` writes `1px` and stays a hairline. Anywhere
+	/// no property chooses — `raw`, `piece`, `css_text()` — it is rem. The number
+	/// is exact: `dp(6)` is `0.375rem`, the f64 `6 / 16`.
+	fun dp(value: f64): Length {
+		unit_length(value, Unit::Dp)
+	}
+
 	fun px(value: f64): Length {
 		unit_length(value, Unit::Px)
 	}
@@ -166,12 +188,24 @@ export impl Length {
 		text_length(i"var({name})", "")
 	}
 
+	/// This length's CSS text with a `dp` written in `role`'s unit — `Role::Rem` as
+	/// `{value / 16}rem`, `Role::Px` as `{value}px`. Every other length renders as
+	/// it always does: an explicit unit is never re-unitized. `css_text()` is
+	/// `rendered(Role::Rem)`.
+	fun rendered(self, role: Role): str {
+		if self.unit is Unit::Dp && role is Role::Px {
+			i"{self.value}px"
+		} else {
+			length_text(self)
+		}
+	}
+
 	/// The one constant the conversions go through: 16 CSS px to 1rem, the
 	/// browsers' default root font size. Not a setting — the root size that matters
 	/// is the reader's, which no program can know, and `rem` exists so that it need
 	/// not.
 	fun root_px(): f64 {
-		ROOT_PX_VALUE
+		root_px_value()
 	}
 
 	/// This length in `rem`. Defined on `px`, `rem` and `dp` lengths, through
@@ -182,7 +216,7 @@ export impl Length {
 		if self.unit is Unit::Rem {
 			self
 		} else {
-			unit_length(px_amount(self, "as_rem") / ROOT_PX_VALUE, Unit::Rem)
+			unit_length(px_amount(self, "as_rem") / root_px_value(), Unit::Rem)
 		}
 	}
 
@@ -206,8 +240,13 @@ export impl Length {
 	}
 }
 
-/// The constant behind `Length::root_px()`.
-const let ROOT_PX_VALUE = 16f;
+/// The constant behind `Length::root_px()`. A function rather than a module
+/// `const let`: a module binding read only from a function that an OPERATOR
+/// reaches (`a > b` -> `PartialOrd::gt` -> `partial_compare` -> here) is not
+/// declared in the emitted JS, a ReferenceError at run time.
+fun root_px_value(): f64 {
+	16f
+}
 
 fun unit_length(value: f64, unit: Unit): Length {
 	Length { value, unit, text = "", root = "" }
@@ -217,13 +256,12 @@ fun text_length(text: str, root: str): Length {
 	Length { value = 0f, unit = Unit::Text, text, root }
 }
 
-/// A length's text, with a `Dp` length written in `rem`. (A property builder writes
-/// a `Dp` in the unit its property prefers; this is the role-less rendering every
-/// other position gets.)
+/// A length's text, with a `Dp` length written in `rem` — the role-less rendering
+/// (`Length::rendered` is the role-taking one a property builder asks for).
 fun length_text(length: Length): str {
 	match length.unit {
 		Unit::Text => length.text,
-		Unit::Dp => i"{length.value / ROOT_PX_VALUE}rem",
+		Unit::Dp => i"{length.value / root_px_value()}rem",
 		_ => i"{length.value}{css_suffix(length.unit)}",
 	}
 }
@@ -249,7 +287,7 @@ fun px_amount(length: Length, what: str): f64 {
 	match length.unit {
 		Unit::Px => length.value,
 		Unit::Dp => length.value,
-		Unit::Rem => length.value * ROOT_PX_VALUE,
+		Unit::Rem => length.value * root_px_value(),
 		_ => panic(i"Length::{what} cannot convert {length_text(length)}: only px, rem and dp lengths convert (16px is 1rem); an em, %, vh or vw length depends on where it is used, and a token, calc, var or raw value has no number to convert"),
 	}
 }
@@ -376,7 +414,7 @@ fun combine(a: Length, b: Length, operator: str): Length {
 /// A `dp` length's number in `px` or `rem`.
 fun as_unit(length: Length, unit: Unit): f64 {
 	if unit is Unit::Rem {
-		length.value / ROOT_PX_VALUE
+		length.value / root_px_value()
 	} else {
 		length.value
 	}
@@ -2106,7 +2144,18 @@ export impl Style {
 	}
 
 	/// An untyped property with a `Length` value. Exactly `raw` at that
-	/// instantiation, kept for the spelling the surface has always had.
+	/// instantiation, kept for the spelling the surface has always had — and so a
+	/// `dp` is written in rem, `Role::Rem`, the role-less default.
+	///
+	/// THE ROLE TABLE (proposal/length.md §4) is this file's builders: every
+	/// typed length builder below that writes through `with_length` — `gap`, the
+	/// `padding*` and `margin*` families, `width`/`height`/`size`, `min_*`/`max_*`,
+	/// `top`/`right`/`bottom`/`left`/`inset`, `radius`, `font_size`,
+	/// `letter_spacing`, `line_height_length` — is `Role::Rem`, and the border
+	/// widths (`with_border`) are `Role::Px`. (The rem builders keep their
+	/// one-line `with_length` bodies on purpose: the formatter's canonical-order
+	/// table and the editor's chain-to-block refactor read a builder's slots off
+	/// that body.)
 	fun with_length(self, property: str, value: Length): Style {
 		self.raw(property, value)
 	}
@@ -2296,9 +2345,10 @@ export impl Style {
 	}
 
 	/// The one border body: `<width> solid <color>` on whichever edge the property
-	/// names. `solid` is baked in because the demand sweep found ZERO non-`solid`
-	/// borders across every line of styling written in the language — a
-	/// `BorderStyle` enum's other variants would be speculation (§0bis.3).
+	/// names. The width is a hairline: a `dp` renders in px (`Role::Px`). `solid`
+	/// is baked in because the demand sweep found ZERO non-`solid` borders across
+	/// every line of styling written in the language — a `BorderStyle` enum's other
+	/// variants would be speculation (§0bis.3).
 	fun with_border(self, property: str, width: Length, color: Color): Style {
 		let root = width.root;
 		if root != "" {
@@ -2311,7 +2361,7 @@ export impl Style {
 		if color.root != "" {
 			emit("css", color.root);
 		}
-		self.rule("", "", property, i"{property}:{length_text(width)} solid {color.text}")
+		self.rule("", "", property, i"{property}:{width.rendered(Role::Px)} solid {color.text}")
 	}
 
 	fun border(self, width: Length, color: Color): Style {

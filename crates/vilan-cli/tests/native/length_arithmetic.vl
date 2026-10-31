@@ -1,10 +1,10 @@
-// A178 S1: a `Length` is data (proposal/length.md §3). Its operators,
+// A178 S1 + S2: a `Length` is data (proposal/length.md §3). Its operators,
 // conversions and comparisons run at run time as well as in a `const` (a
 // `style_var` value is a runtime `Length::px(width).css_text()`), so the
 // `Unit` enum, the four operator impls and the comparison impls compile on
 // both backends and answer the same bytes.
 import std::io::print;
-import std::web::style::{ CssValue, Length, Unit, space };
+import std::web::style::{ CssValue, Length, Role, Unit, space };
 
 fun show(label: str, length: Length) {
 	print(i"{label}: {length.css_text()} [{length.css_root().replace("\n", " | ")}]");
@@ -33,6 +33,10 @@ fun main() {
 	print(i"as_dp: {dp.value} {dp.unit is Unit::Dp}");
 	print(i"{Length::px(8) < Length::rem(1)} {Length::rem(1) >= Length::px(16)} {Length::em(2) > Length::em(1)}");
 	print(i"{Length::px(16) == Length::px(16)} {Length::px(16) == Length::rem(1)} {space(4) == space(4)}");
+	show("dp", Length::dp(6));
+	show("dp + dp", Length::dp(8) + Length::dp(4));
+	show("rem + dp", Length::rem(0.5) + Length::dp(1));
+	print(i"dp roles: {Length::dp(1).rendered(Role::Px)} {Length::dp(1).rendered(Role::Rem)} {Length::px(1).rendered(Role::Rem)}");
 }
 
 main();

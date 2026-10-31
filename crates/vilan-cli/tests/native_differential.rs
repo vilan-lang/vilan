@@ -14892,10 +14892,11 @@ fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
     }
 }
 
-/// A178 S1: `Length` is data — a number and a `Unit`, or a text — and its
+/// A178 S1 + S2: `Length` is data — a number and a `Unit`, or a text — and its
 /// operators (`+ - * /` through std's traits), conversions (`as_rem`, `as_px`,
 /// `as_dp`) and comparisons (`PartialOrd` across px/rem/dp, structural `==`)
-/// answer the same bytes on both backends, a token's `:root` lines included.
+/// answer the same bytes on both backends, a token's `:root` lines included;
+/// a `dp` renders in the role it is asked for (S2).
 #[test]
 fn a178_length_arithmetic_is_identical_on_both_backends() {
     let staged = stage();
@@ -14932,6 +14933,10 @@ fn a178_length_arithmetic_is_identical_on_both_backends() {
                 "as_dp: 8 true\n",
                 "true true true\n",
                 "true false true\n",
+                "dp: 0.375rem []\n",
+                "dp + dp: 0.75rem []\n",
+                "rem + dp: 0.5625rem []\n",
+                "dp roles: 1px 0.0625rem 1px\n",
             ),
             "{backend:?}"
         );
