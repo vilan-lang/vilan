@@ -3658,6 +3658,17 @@ pub fn reprint(original: &str) -> Result<String, Decline> {
 /// tests — keeps the canonical output it had, and a tool that has read a
 /// manifest opts in explicitly.
 pub fn reprint_with(original: &str, options: FormatOptions) -> Result<String, Decline> {
+    reprint_listing_skips(original, options).map(|(text, _)| text)
+}
+
+/// [`reprint_with`], also answering the LINES of every `// vilan-fmt: skip`
+/// directive that kept a node as written (E353), in source order and 1-based,
+/// so `vilan fmt --check` can list them: a skip is a workaround for a
+/// formatter bug, and a listed one does not quietly outlive the bug.
+pub fn reprint_listing_skips(
+    original: &str,
+    options: FormatOptions,
+) -> Result<(String, Vec<usize>), Decline> {
     let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
     let source: &str = &normalized;
     let Some(original_tokens) = code_tokens_spanned(source) else {
@@ -3675,7 +3686,29 @@ pub fn reprint_with(original: &str, options: FormatOptions) -> Result<String, De
         return Err(decline(source, declined.reason, declined.span));
     }
     verify_reprint(source, &original_tokens, &printer.out)?;
-    Ok(printer.out)
+    // A rollback reprints what it rolled back, so one directive can be met
+    // more than once; the set is what is listed.
+    let mut skipped: Vec<usize> = printer
+        .skipped
+        .iter()
+        .map(|offset| source[..*offset].matches('\n').count() + 1)
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    Ok((printer.out, skipped))
+}
+
+/// E353's directive: a line comment reading `// vilan-fmt: skip` on the line
+/// immediately above a statement or an item keeps that one node's source as
+/// written. Text after it, past a space, is the author's reason
+/// (`// vilan-fmt: skip - E352`) and changes nothing.
+const SKIP_DIRECTIVE: &str = "// vilan-fmt: skip";
+
+/// Whether one comment's text is [`SKIP_DIRECTIVE`], alone or followed by a
+/// reason after whitespace (`// vilan-fmt: skipped` is not the directive).
+fn is_skip_directive(text: &str) -> bool {
+    text.strip_prefix(SKIP_DIRECTIVE)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
 }
 
 /// The safety net over a finished reprint: the two independent checks that
@@ -4255,6 +4288,10 @@ struct Printer<'src> {
     /// an element cut mid-literal there is the overflow the argument list
     /// breaks to answer, even when the first line stays inside the budget.
     width_element_splits: usize,
+    /// E353: the source offset of every `// vilan-fmt: skip` directive that
+    /// kept a node as written - met again by a rollback's reprint, so the
+    /// caller deduplicates.
+    skipped: Vec<usize>,
 }
 
 /// `[resource]`, on a line of its own above the declaration like every other
@@ -4300,6 +4337,7 @@ impl<'src> Printer<'src> {
             hole_depth: 0,
             tuple_forced: false,
             width_element_splits: 0,
+            skipped: Vec::new(),
         }
     }
 
@@ -4504,6 +4542,67 @@ impl<'src> Printer<'src> {
         }
     }
 
+    /// E353: the offset of the `// vilan-fmt: skip` comment that governs the
+    /// node starting at `node_start`, if one does. It must be on the line
+    /// IMMEDIATELY above the node's first line and alone on it, and the node
+    /// must open its own line: a blank line or another comment between the
+    /// two, or code before the directive on its line, makes it an ordinary
+    /// comment the formatter leaves where it is.
+    fn skip_directive_above(&self, node_start: usize) -> Option<usize> {
+        let before = &self.source[..node_start];
+        let newline = before.rfind('\n')?;
+        if !before[newline + 1..]
+            .bytes()
+            .all(|byte| byte == b' ' || byte == b'\t')
+        {
+            return None;
+        }
+        let previous_start = before[..newline].rfind('\n').map_or(0, |at| at + 1);
+        let line = &before[previous_start..newline];
+        let text = line.trim();
+        if !is_skip_directive(text) {
+            return None;
+        }
+        // A real comment, not the inside of a string literal ending there.
+        let comment_start = previous_start + (line.len() - line.trim_start().len());
+        self.comments
+            .binary_search_by_key(&comment_start, |(span, _)| span.into_range().start)
+            .ok()
+            .map(|_| comment_start)
+    }
+
+    /// E353: prints the node at `start..end` exactly as written - the first
+    /// line at the indentation the printer is at, every later line byte for
+    /// byte, its own indentation included (rustfmt's `#[rustfmt::skip]` keeps
+    /// them the same way) - with the `;` written right after it (an import's
+    /// own included, which its span leaves out), or the one the printer owes
+    /// a terminated statement when none was written. The comments inside are
+    /// part of the text, so the cursor moves past them. Returns the source
+    /// offset the node's text ends at.
+    fn print_skipped_node(
+        &mut self,
+        directive: usize,
+        start: usize,
+        end: usize,
+        terminated: bool,
+    ) -> usize {
+        let semicolon = self.written_terminator_after(end);
+        let stop = semicolon.unwrap_or(end);
+        self.out.push_str(&self.source[start..stop]);
+        if terminated && semicolon.is_none() {
+            self.out.push(';');
+        }
+        while self
+            .comments
+            .get(self.cursor)
+            .is_some_and(|(span, _)| span.into_range().start < stop)
+        {
+            self.cursor += 1;
+        }
+        self.skipped.push(directive);
+        stop
+    }
+
     /// Consumes and returns the next pending comment when it is a trailing
     /// same-line comment of whatever ends at `after` (`import x; // note`), so a
     /// caller reordering the items it belongs to can re-emit it in the new
@@ -4627,6 +4726,15 @@ impl<'src> Printer<'src> {
                 .flatten();
             let terminated = Self::needs_semicolon(&item.0) || written_terminator.is_some();
             let statement_end = written_terminator.unwrap_or(range.end);
+            // E353: a node under `// vilan-fmt: skip` is printed as written,
+            // and the width rule never sees it.
+            if let Some(directive) = self.skip_directive_above(range.start) {
+                let end = self.print_skipped_node(directive, range.start, range.end, terminated);
+                self.flush_trailing_comment(end);
+                prev_end = end;
+                index += 1;
+                continue;
+            }
             // E219: this statement's declaration line is its own; the item
             // that ENCLOSES it (a function whose body this is) keeps its own
             // until its own width rule reads it.
@@ -6628,25 +6736,34 @@ impl<'src> Printer<'src> {
                 self.blank_line();
             }
             self.line();
-            // A block's tail expression is a statement position too (it is the
-            // block's value), so it takes the same width rule.
-            let statement_start = self.out.len();
-            let comment_cursor = self.cursor;
-            let enclosing_head = self.head_start.take();
-            self.print_expr(tail);
-            if self.begin_split_reprint(statement_start, comment_cursor) {
-                // E337: the tail has no terminator, but a postfix that ends it
-                // is followed by columns the call under it must count.
-                let enclosing = (self.terminator_end, self.terminator_columns);
-                self.terminator_end = Some(tail_range.end);
-                self.terminator_columns = 0;
+            // E353: the tail is a statement position, so the directive reaches
+            // it as it reaches the statements above it.
+            if let Some(directive) = self.skip_directive_above(tail_range.start) {
+                let end =
+                    self.print_skipped_node(directive, tail_range.start, tail_range.end, false);
+                self.flush_trailing_comment(end);
+                prev_end = end;
+            } else {
+                // A block's tail expression is a statement position too (it is the
+                // block's value), so it takes the same width rule.
+                let statement_start = self.out.len();
+                let comment_cursor = self.cursor;
+                let enclosing_head = self.head_start.take();
                 self.print_expr(tail);
-                (self.terminator_end, self.terminator_columns) = enclosing;
-                self.split = Split::Off;
+                if self.begin_split_reprint(statement_start, comment_cursor) {
+                    // E337: the tail has no terminator, but a postfix that ends it
+                    // is followed by columns the call under it must count.
+                    let enclosing = (self.terminator_end, self.terminator_columns);
+                    self.terminator_end = Some(tail_range.end);
+                    self.terminator_columns = 0;
+                    self.print_expr(tail);
+                    (self.terminator_end, self.terminator_columns) = enclosing;
+                    self.split = Split::Off;
+                }
+                self.head_start = enclosing_head;
+                self.flush_trailing_comment(tail_range.end);
+                prev_end = tail_range.end;
             }
-            self.head_start = enclosing_head;
-            self.flush_trailing_comment(tail_range.end);
-            prev_end = tail_range.end;
         }
         self.flush_comments_before(range.end, prev_end);
         self.indent -= 1;
@@ -9543,7 +9660,7 @@ impl<'src> Printer<'src> {
         self.print_operand(&if_.condition, 0);
         if then_word.is_some() {
             self.then_form_joint(broken, "then ");
-            self.print_expr(Self::then_form_branch(&if_.then.0));
+            self.print_then_form_arm(Self::then_form_branch(&if_.then.0), broken);
         }
         if let Some((branch, _)) = &if_.else_ {
             self.then_form_joint(broken, "else ");
@@ -9563,13 +9680,40 @@ impl<'src> Printer<'src> {
                         {
                             self.print_then_form_parts(inner, true)
                         }
-                        _ => self.print_expr(body),
+                        _ => self.print_then_form_arm(body, broken),
                     }
                 }
                 // The parser never chains a `then` form through an `if`
                 // branch; printed as the chain it would be, all the same.
                 NodeIfBranch::If(_) => self.print_if_chain(branch, false, Split::Off),
             }
+        }
+    }
+
+    /// One `then`/`else` arm. Inline (`c then a else b` on one line) the arm is
+    /// part of the line the form was measured on and takes no permission of
+    /// its own. In the BROKEN form every arm opens a line of its own (`then …`
+    /// or `else …`, one level in), and that line is measured like a statement's
+    /// (E352): printed inline first, and over budget - the `;` that follows the
+    /// last arm counted, as the statement hook counts it (E329) - printed again
+    /// with the split armed, so a chain there breaks one link per line, a list
+    /// literal one element per line and a call its arguments, exactly as they
+    /// do as a statement's value. Before this the arm was printed with the
+    /// permission dropped, and a chain under `else` stayed one line at any
+    /// width.
+    fn print_then_form_arm(&mut self, arm: &Spanned<Node<'src>>, broken: bool) {
+        if !broken || self.probing {
+            self.print_expr(arm);
+            return;
+        }
+        let start = self.out.len();
+        let cursor = self.cursor;
+        self.print_expr(arm);
+        if self.first_line_over_budget_by(start, self.terminator_after(arm)) {
+            self.out.truncate(start);
+            self.cursor = cursor;
+            self.split = Split::Tail;
+            self.print_expr(arm);
         }
     }
 
@@ -19502,6 +19646,447 @@ mod call_statement_terminator {
             "a".repeat(100)
         );
         assert_construct(&source, &source);
+    }
+}
+
+#[cfg(test)]
+mod then_form_arm_layout {
+    //! E352: an arm of a BROKEN `then … else` form opens a line of its own
+    //! (`then …` / `else …`, one level in), and that line is measured like a
+    //! statement's: a chain there breaks one link per line, a list literal one
+    //! element per line and a call its arguments, at the width they break at
+    //! as a statement's value - the `;` after the last arm counted (E329).
+    //! The arm used to print with the permission dropped, so kolt's
+    //! `facts.private then … else db.prepare(..).all(..).map(..)` came out on
+    //! one 170-column line at any width. Every case runs through
+    //! `assert_construct`: token round trip, idempotence, the canonical form's
+    //! own round trip.
+    use super::bailing_constructs::assert_construct;
+
+    /// The item's repro, as written by hand: already canonical.
+    const REPRO: &str = concat!(
+        "fun main() {\n",
+        "\tlet private = true;\n",
+        "\tlet readers = private\n",
+        "\t\tthen [Row { name = \"only the members\" }]\n",
+        "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")\n",
+        "\t\t\t.filter(|row| row.name.len() > 0)\n",
+        "\t\t\t.map(|row| Row { name = row.name.to_uppercase() });\n",
+        "\tprint(readers.len());\n",
+        "}\n",
+    );
+
+    #[test]
+    fn the_repro_keeps_its_else_chain_one_link_per_line() {
+        assert_construct(REPRO, REPRO);
+    }
+
+    /// The 0.53.0 output - the `else` arm joined onto one 161-column line -
+    /// breaks back into the written shape.
+    #[test]
+    fn the_joined_else_chain_breaks_one_link_per_line() {
+        let joined = concat!(
+            "fun main() {\n",
+            "\tlet private = true;\n",
+            "\tlet readers = private\n",
+            "\t\tthen [Row { name = \"only the members\" }]\n",
+            "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+            ".filter(|row| row.name.len() > 0).map(|row| Row { name = row.name.to_uppercase() });\n",
+            "\tprint(readers.len());\n",
+            "}\n",
+        );
+        assert_construct(joined, REPRO);
+    }
+
+    #[test]
+    fn a_then_arm_chain_breaks_one_link_per_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet a = private then rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+            ".filter(|row| row.name.len() > 0).map(|row| row.name) else [];\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet a = private\n",
+            "\t\tthen rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")\n",
+            "\t\t\t.filter(|row| row.name.len() > 0)\n",
+            "\t\t\t.map(|row| row.name)\n",
+            "\t\telse [];\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    #[test]
+    fn an_else_arm_list_literal_breaks_one_element_per_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet b = private then [] else [first_element_of_the_list, second_element_of_the_list, ",
+            "third_element_of_the_list, fourth];\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet b = private\n",
+            "\t\tthen []\n",
+            "\t\telse [\n",
+            "\t\t\tfirst_element_of_the_list,\n",
+            "\t\t\tsecond_element_of_the_list,\n",
+            "\t\t\tthird_element_of_the_list,\n",
+            "\t\t\tfourth,\n",
+            "\t\t];\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// `\t\telse CALLEE(argument_one, argument_two, aaa..);` whose line is
+    /// `columns` wide, the `;` included: `(inline form, split form)`.
+    fn call_arm(columns: usize) -> (String, String) {
+        const CALLEE: &str = "plain_function_call_with_no_chain";
+        let fixed = 8 + "else ".len() + CALLEE.len() + "(argument_one, argument_two, );".len();
+        let last = "a".repeat(columns - fixed);
+        let head = "fun main() {\n\tlet value = flag\n\t\tthen []\n";
+        (
+            format!("{head}\t\telse {CALLEE}(argument_one, argument_two, {last});\n}}\n"),
+            format!(
+                "{head}\t\telse {CALLEE}(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{last},\n\t\t);\n}}\n"
+            ),
+        )
+    }
+
+    #[test]
+    fn an_else_arm_call_at_the_budget_with_its_semicolon_stays_inline() {
+        let (inline, _) = call_arm(100);
+        assert_construct(&inline, &inline);
+    }
+
+    #[test]
+    fn an_else_arm_call_one_column_over_with_its_semicolon_breaks_its_arguments() {
+        let (inline, split) = call_arm(101);
+        assert_construct(&inline, &split);
+    }
+
+    /// A block's tail has no `;`: the arm's own line is all that is measured.
+    #[test]
+    fn a_tail_then_form_breaks_its_else_chain_too() {
+        let source = concat!(
+            "fun tail(): List<str> {\n",
+            "\tprivate then [] else rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+            ".filter(|row| row.name.len() > 0).map(|row| row.name)\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun tail(): List<str> {\n",
+            "\tprivate\n",
+            "\t\tthen []\n",
+            "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")\n",
+            "\t\t\t.filter(|row| row.name.len() > 0)\n",
+            "\t\t\t.map(|row| row.name)\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// Short arms: a form that fits stays on one line, and a broken form's
+    /// short arms - here a short chain under `else` - stay on theirs.
+    #[test]
+    fn short_arms_stay_on_one_line() {
+        let fits = "fun main() {\n\tlet e = private then rows.first() else rows.filter(|r| r).last();\n}\n";
+        assert_construct(fits, fits);
+        let broken = concat!(
+            "fun main() {\n",
+            "\tlet readers = private_and_a_rather_long_condition_name_that_fills_the_line_up\n",
+            "\t\tthen rows.first()\n",
+            "\t\telse rows.filter(|r| r).last();\n",
+            "}\n",
+        );
+        assert_construct(broken, broken);
+    }
+}
+
+#[cfg(test)]
+mod skip_directive {
+    //! E353: `// vilan-fmt: skip` on the line immediately above a statement or
+    //! an item keeps that ONE node as written - its first line at the
+    //! printer's indentation, every later line byte for byte - and leaves the
+    //! directive where it is. Anything between the two (a blank line, another
+    //! comment), or code before the directive on its line, makes it an
+    //! ordinary comment. Every case runs through `assert_construct`: token
+    //! round trip, idempotence, the canonical form's own round trip.
+    use super::bailing_constructs::assert_construct;
+    use super::{FormatOptions, reprint_listing_skips, reprint_with};
+
+    fn skipped_lines(source: &str) -> Vec<usize> {
+        reprint_listing_skips(source, FormatOptions::default())
+            .expect("the reprint succeeds")
+            .1
+    }
+
+    #[test]
+    fn a_skipped_statement_keeps_its_layout_while_its_neighbours_are_formatted() {
+        let source = concat!(
+            "fun   main() {\n",
+            "\tlet   a = 1;\n",
+            "\t// vilan-fmt: skip\n",
+            "\tlet   b =   [1,2,\n",
+            "\t\t3];\n",
+            "\tlet c   = 2;\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet a = 1;\n",
+            "\t// vilan-fmt: skip\n",
+            "\tlet   b =   [1,2,\n",
+            "\t\t3];\n",
+            "\tlet c = 2;\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+        assert_eq!(skipped_lines(source), vec![3]);
+    }
+
+    /// Module level, and inside an `impl` and a `mod`: an item is a node too.
+    /// The item's attribute is part of it, and only the next item is kept.
+    #[test]
+    fn a_skipped_item_keeps_its_layout_at_every_item_level() {
+        let source = concat!(
+            "// vilan-fmt: skip\n",
+            "fun   kept() {  1  }\n",
+            "\n",
+            "fun   formatted() {  1  }\n",
+            "\n",
+            "// vilan-fmt: skip\n",
+            "[derive(Debug)]\n",
+            "struct   S { a: i32 }\n",
+            "\n",
+            "impl   S {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tfun  method(self) {  self.go( ) }\n",
+            "\tfun  other(self) {  self.go( ) }\n",
+            "}\n",
+            "\n",
+            "mod   inner {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tfun  f() {   }\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "// vilan-fmt: skip\n",
+            "fun   kept() {  1  }\n",
+            "\n",
+            "fun formatted() {\n",
+            "\t1\n",
+            "}\n",
+            "\n",
+            "// vilan-fmt: skip\n",
+            "[derive(Debug)]\n",
+            "struct   S { a: i32 }\n",
+            "\n",
+            "impl S {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tfun  method(self) {  self.go( ) }\n",
+            "\tfun other(self) {\n",
+            "\t\tself.go()\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "mod inner {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tfun  f() {   }\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+        assert_eq!(skipped_lines(source), vec![1, 6, 11, 17]);
+    }
+
+    #[test]
+    fn a_skipped_trait_member_keeps_its_layout() {
+        let source = concat!(
+            "trait   Shape {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tfun  area(self):   f64;\n",
+            "\tfun  name(self):   str;\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "trait Shape {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tfun  area(self):   f64;\n",
+            "\tfun name(self): str;\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// E352's shape, joined onto one 161-column line: the width rule breaks
+    /// it one link per line, and under the directive it stays as written. A
+    /// layout the formatter would change, whichever way E352 went.
+    #[test]
+    fn a_node_the_width_rule_would_break_stays_on_its_one_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tlet readers = private then [Row { name = \"only the members\" }] else rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+            ".filter(|row| row.name.len() > 0).map(|row| Row { name = row.name.to_uppercase() });\n",
+            "}\n",
+        );
+        assert_construct(source, source);
+        let without = source.replace("\t// vilan-fmt: skip\n", "");
+        assert_ne!(super::format(&without), without, "the control reflows");
+    }
+
+    /// The first line takes the printer's indentation; the lines after it keep
+    /// the indentation they were written with, as rustfmt's skip does.
+    #[test]
+    fn the_first_line_is_reindented_and_the_rest_are_kept() {
+        let source = concat!(
+            "fun main() {\n",
+            "        // vilan-fmt: skip\n",
+            "        let   b =   [1,\n",
+            "                  2];\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\t// vilan-fmt: skip\n",
+            "\tlet   b =   [1,\n",
+            "                  2];\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// A block's tail is a statement position; a trailing comment and the
+    /// comments inside the node ride with it.
+    #[test]
+    fn a_tail_and_the_comments_inside_and_after_a_skipped_node_are_kept() {
+        let source = concat!(
+            "fun total(a: i32): i32 {\n",
+            "\tlet   b = a;\n",
+            "\t// vilan-fmt: skip\n",
+            "\ta  +   // the first\n",
+            "\t\t  b // the second\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun total(a: i32): i32 {\n",
+            "\tlet b = a;\n",
+            "\t// vilan-fmt: skip\n",
+            "\ta  +   // the first\n",
+            "\t\t  b // the second\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+        assert_eq!(skipped_lines(source), vec![3]);
+    }
+
+    /// The directive must be on the line IMMEDIATELY above the node. A blank
+    /// line, another comment, or code before it on its own line makes it an
+    /// ordinary comment: it stays where it is, and the node is formatted.
+    #[test]
+    fn a_directive_not_immediately_above_its_node_is_an_ordinary_comment() {
+        let source = concat!(
+            "fun main() {\n",
+            "\t// vilan-fmt: skip\n",
+            "\n",
+            "\tlet   a = 1;\n",
+            "\t// vilan-fmt: skip\n",
+            "\t// a note between\n",
+            "\tlet   b = 2;\n",
+            "\tlet c = 3; // vilan-fmt: skip\n",
+            "\tlet   d = 4;\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\t// vilan-fmt: skip\n",
+            "\n",
+            "\tlet a = 1;\n",
+            "\t// vilan-fmt: skip\n",
+            "\t// a note between\n",
+            "\tlet b = 2;\n",
+            "\tlet c = 3; // vilan-fmt: skip\n",
+            "\tlet d = 4;\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+        assert_eq!(skipped_lines(source), Vec::<usize>::new());
+    }
+
+    /// Text after the directive, past a space, is the author's reason; a word
+    /// that merely starts with `skip` is not the directive.
+    #[test]
+    fn a_reason_after_the_directive_is_allowed_and_a_longer_word_is_not_it() {
+        let source = concat!(
+            "fun main() {\n",
+            "\t// vilan-fmt: skip - E352, until 0.54\n",
+            "\tlet   a = 1;\n",
+            "\t// vilan-fmt: skipped\n",
+            "\tlet   b = 2;\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\t// vilan-fmt: skip - E352, until 0.54\n",
+            "\tlet   a = 1;\n",
+            "\t// vilan-fmt: skipped\n",
+            "\tlet b = 2;\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+        assert_eq!(skipped_lines(source), vec![2]);
+    }
+
+    /// A top-level import takes part in the file's canonical import layout, so
+    /// it is always formatted; the directive above one is an ordinary comment
+    /// (and, like any comment there, ends the sorted run). A
+    /// block-scoped import is printed where it stands and is skipped like any
+    /// other statement - its `;`, which its span leaves out, included.
+    #[test]
+    fn a_top_level_import_is_formatted_and_a_block_import_is_skipped() {
+        let source = concat!(
+            "import std::io::print;\n",
+            "// vilan-fmt: skip\n",
+            "import   std::hash_map::{HashSet,   HashMap};\n",
+            "\n",
+            "fun main() {\n",
+            "\t// vilan-fmt: skip\n",
+            "\timport   std::hash_map::{HashSet,   HashMap};\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "import std::io::print;\n",
+            "// vilan-fmt: skip\n",
+            "import std::hash_map::{ HashMap, HashSet };\n",
+            "\n",
+            "fun main() {\n",
+            "\t// vilan-fmt: skip\n",
+            "\timport   std::hash_map::{HashSet,   HashMap};\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+        assert_eq!(skipped_lines(source), vec![6]);
+    }
+
+    /// `[fmt] wrap_comments` never re-fills the directive into the paragraph
+    /// above it, which would stop it being a directive.
+    #[test]
+    fn wrapping_comments_never_joins_the_directive_into_its_paragraph() {
+        let source = concat!(
+            "fun main() {\n",
+            "\t// A short note\n",
+            "\t// vilan-fmt: skip\n",
+            "\tlet   a = 1;\n",
+            "}\n",
+        );
+        let options = FormatOptions {
+            wrap_comments: true,
+            comment_width: 80,
+        };
+        assert_eq!(reprint_with(source, options).as_deref(), Ok(source));
     }
 }
 

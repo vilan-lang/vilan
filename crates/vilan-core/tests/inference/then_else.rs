@@ -431,3 +431,64 @@ fn b658_the_rewritten_guard_runs_as_the_let_else_form() {
         "with no `let target =`",
     );
 }
+
+/// E352's repro, as kolt's session wrote it: `vilan fmt` keeps the `else`
+/// arm's chain one link per line (it joined it onto one 161-column line), the
+/// output is a fixed point, and the formatted program is the same program -
+/// it compiles and prints what the written one prints.
+#[test]
+fn e352_a_then_else_chain_arm_formats_to_itself_and_still_runs() {
+    let written = concat!(
+        "struct Row {\n",
+        "\tname: str,\n",
+        "}\n",
+        "\n",
+        "fun rows_of(query: str): List<Row> {\n",
+        "\t[Row { name = query }]\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet private = true;\n",
+        "\tlet readers = private\n",
+        "\t\tthen [Row { name = \"only the members\" }]\n",
+        "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")\n",
+        "\t\t\t.filter(|row| row.name.len() > 0)\n",
+        "\t\t\t.map(|row| Row { name = row.name.to_uppercase() });\n",
+        "\tprint(readers.len());\n",
+        "}\n",
+    );
+    let formatted = vilan_core::formatter::format(written);
+    assert_eq!(formatted, written);
+    assert_eq!(vilan_core::formatter::format(&formatted), formatted);
+    assert_compiles_and_runs(&formatted, "1\n");
+}
+
+/// E353: a statement under `// vilan-fmt: skip` keeps E352's shape exactly as
+/// written - here the `else` chain joined onto one long line, which the width
+/// rule would otherwise break - and the formatted program is the same program.
+#[test]
+fn e353_a_skipped_statement_formats_to_itself_and_still_runs() {
+    let written = concat!(
+        "struct Row {\n",
+        "\tname: str,\n",
+        "}\n",
+        "\n",
+        "fun rows_of(query: str): List<Row> {\n",
+        "\t[Row { name = query }]\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet private = true;\n",
+        "\t// vilan-fmt: skip\n",
+        "\tlet readers = private\n",
+        "\t\tthen [Row { name = \"only the members\" }]\n",
+        "\t\telse rows_of(\"SELECT account_id FROM membership WHERE organization_id = ?\")",
+        ".filter(|row| row.name.len() > 0).map(|row| Row { name = row.name.to_uppercase() });\n",
+        "\tprint(readers.len());\n",
+        "}\n",
+    );
+    let formatted = vilan_core::formatter::format(written);
+    assert_eq!(formatted, written);
+    assert_eq!(vilan_core::formatter::format(&formatted), formatted);
+    assert_compiles_and_runs(&formatted, "1\n");
+}
