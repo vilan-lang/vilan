@@ -29,7 +29,13 @@ impl Length {
 	fun var(name: str): Length     // a CSS custom-property reference ("--w")
 	fun calc(expression: str): Length  // "100% - 2rem" — no calc(..) wrapper
 	fun raw(expression: str): Length   // a COMPLETE value, verbatim: "clamp(..)"
+
+	fun root_px(): f64             // 16 — the one constant: 16px = 1rem
+	fun as_rem(self): Length       // px, rem and dp lengths only
+	fun as_px(self): Length
+	fun as_dp(self): Length
 }
+// + - between lengths, * / by an f64; < <= > >= and == (see "Lengths are data")
 
 impl Color {
 	fun white(): Color
@@ -81,6 +87,37 @@ or `view.style_var` writing it at runtime). Both spell the name with its
 nothing says so until the page is wrong. `.alpha()` composes over it
 through the same relative-colour form, so a variable-backed colour
 translucifies exactly like a ramp token.
+
+### Lengths are data
+
+A `Length` is a number and a `Unit` — `Length::px(8)` is `8` of `Unit::Px`,
+rendered `8px` at the edge — or, for `auto`, the bare `0`, `var`, `calc`,
+`raw` and the `space` tokens, a **text** length (`Unit::Text`) that keeps
+its whole value. So lengths compute:
+
+| Expression | Renders |
+|---|---|
+| `rem(1) + rem(0.5)` | `1.5rem` — one unit stays that unit |
+| `px(8) * 1.5`, `px(8) / 2` | `12px`, `4px` — scaling a unit length scales its number |
+| `px(8) + rem(0.5)` | `calc(8px + 0.5rem)` — two units are CSS's own answer |
+| `em(1) + pct(50)` | `calc(1em + 50%)` |
+| `space(4) * 2` | `calc(var(--space-4) * 2)` — a token composes through `calc` |
+| `space(4) + px(1)` | `calc(var(--space-4) + 1px)`, and `--space-4` is still declared |
+| `(space(4) + px(1)) * 2` | `calc((var(--space-4) + 1px) * 2)` — a `calc` keeps composing |
+| `zero() + px(3)` | `3px` — the bare `0` is the zero, never `calc(0 + ..)` |
+
+A length built from several tokens declares every one of them on the sheet.
+`auto` is not a quantity and refuses arithmetic, and dividing by zero is
+refused — at build time, since a style is built in a `const`.
+
+`as_rem`, `as_px` and `as_dp` convert between the three units with a fixed
+size, through `Length::root_px()` (16px = 1rem); on an `em`, a `%`, a
+viewport unit or a text length they fail the build, because those have no
+size until layout. Lengths of one unit compare by number, and `px`, `rem`
+and `dp` compare with each other through the same constant; comparing any
+other mix fails the build ("compare lengths in one unit; convert first").
+`==` is structural: `px(16) == rem(1)` is `false`, since they are different
+CSS.
 
 `calc` wraps and `raw` does not: `Length::calc(e)` is
 `Length::raw("calc(" + e + ")")`. Write `calc` for arithmetic, `raw` for a
@@ -202,7 +239,7 @@ declaration onto the stylesheet, so `.raw("padding", space(4))` is never a
 dangling `var()`. `with_length` and `with_color` are `raw` at those two value
 types, kept for the spelling the surface has always had.
 
-Pass the value, not its text: `space(4).text` is the string
+Pass the value, not its text: `space(4).css_text()` is the string
 `var(--space-4)` with the declaration left behind, and a `str` carries no
 token.
 

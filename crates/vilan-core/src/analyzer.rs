@@ -38462,13 +38462,13 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         let meant = match name {
-            "Length" | "Color" => "`.text` (the field) or `Length::raw(…)`",
+            "Length" | "Color" => "`.css_text()` or `Length::raw(…)`",
             _ => "`.raw(…)`",
         };
         Some(format!(
             "; did you mean {meant}? `css` became the `css {{ … }}` block's keyword, and the \
              style values' `css` members were renamed out of its way: `Length::css(…)` is now \
-             `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.text`"
+             `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.css_text()`"
         ))
     }
 

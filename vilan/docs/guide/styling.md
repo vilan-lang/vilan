@@ -369,6 +369,15 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   writing *arithmetic* and want the wrapper supplied; use `raw` when the
   value is already whole, which is also what lets one named expression be
   reused across several properties. An empty value stops the build.
+- **Lengths compute.** A `Length` is a number and a unit (or, for a
+  token, `calc`, `var`, `raw`, `auto` and `zero()`, its text), so `+` and
+  `-` take two lengths and `*` and `/` a number: `Length::rem(1) +
+  Length::rem(0.5)` is `1.5rem`, and a mix CSS cannot fold — `px` with
+  `rem`, any token — is written as the `calc(..)` CSS would want,
+  `space(4) + Length::px(1)` being `calc(var(--space-4) + 1px)` with
+  `--space-4` still declared. `as_rem()`/`as_px()` convert at 16px = 1rem,
+  and lengths compare with `<`; both refuse, at build time, a unit whose
+  size depends on layout (`em`, `%`, `vh`, `vw`).
 - **`Color`** has `Color::white()`, `Color::black()`,
   `Color::transparent()`, `Color::current()` (CSS's `currentColor` — the
   element's own text colour, for a border or an SVG fill that follows
@@ -462,8 +471,8 @@ and stay available; they are `raw` at those two value types.
 
 Reach for the value, not its text. A token is a *pair* — the reference
 (`var(--space-4)`) and the `:root` line that declares it — and reading the
-`.text` field of one hands over the reference alone, so `space(4).text` puts a
-`var()` on the sheet that nothing defines. (That is the field, not the
+text of one hands over the reference alone, so `space(4).css_text()` puts a
+`var()` on the sheet that nothing defines. (That is the rendering, not the
 `Length::raw(..)` constructor above, which is a value in its own right and
 declares nothing to lose.) Passing `space(4)` itself keeps the pair together.
 

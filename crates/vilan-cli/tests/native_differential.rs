@@ -14891,3 +14891,49 @@ fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
         );
     }
 }
+
+/// A178 S1: `Length` is data — a number and a `Unit`, or a text — and its
+/// operators (`+ - * /` through std's traits), conversions (`as_rem`, `as_px`,
+/// `as_dp`) and comparisons (`PartialOrd` across px/rem/dp, structural `==`)
+/// answer the same bytes on both backends, a token's `:root` lines included.
+#[test]
+fn a178_length_arithmetic_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_length_arithmetic.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/length_arithmetic.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "px: 8px []\n",
+                "rem: 0.375rem []\n",
+                "pct: 50% []\n",
+                "zero: 0 []\n",
+                "same unit: 1.5rem []\n",
+                "dp + rem: 0.5625rem []\n",
+                "px + dp: 9px []\n",
+                "px + rem: calc(8px + 0.5rem) []\n",
+                "token * 2: calc(var(--space-4) * 2) [:root{--space-4:1rem}]\n",
+                "token + px: calc(var(--space-4) + 1px) [:root{--space-4:1rem}]\n",
+                "calc * 2: calc((var(--space-4) + 1px) * 2) [:root{--space-4:1rem}]\n",
+                "two tokens: calc(var(--space-4) - (var(--space-2) + var(--space-4))) [:root{--space-4:1rem} | :root{--space-2:0.5rem}]\n",
+                "scaled: 12px []\n",
+                "halved: 4px []\n",
+                "em + pct: calc(1em + 50%) []\n",
+                "zero - token: calc(var(--space-1) * -1) [:root{--space-1:0.25rem}]\n",
+                "as_rem: 0.5rem []\n",
+                "as_px: 16px []\n",
+                "as_dp: 8 true\n",
+                "true true true\n",
+                "true false true\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}

@@ -7778,7 +7778,11 @@ fn a_pseudo_class_name_cannot_claim_the_pseudo_element_marker() {
 // in, they are red with `css_rename_steer` planted out.
 
 /// The half of the rename both readings spell.
-const CSS_FIELD_RENAME_NOTE: &str = "the `.css` field of a `Length` or a `Color` is now `.text`";
+/// `.css_text()` rather than the `.text` field since A178 S1: a unit length's
+/// `text` is empty (its number and unit are fields of their own), and the
+/// rendering is the `CssValue` method on both values.
+const CSS_FIELD_RENAME_NOTE: &str =
+    "the `.css` field of a `Length` or a `Color` is now `.css_text()`";
 
 #[test]
 fn b471_a_css_field_read_on_a_length_names_the_rename() {
@@ -8524,4 +8528,405 @@ fn b665_the_const_sum_compiles_and_a_runtime_style_keeps_its_refusal() {
         "import std::reactive::Signal;\nimport std::web::style;\nimport std::web::ui::{ self, View };\nfun row(content: View, faded: f64): View {\n\t<div .styled(style::style().opacity(faded))>\n\t\t{content}\n\t</div>\n}\nfun main() {\n\tlet names = Signal::new([\"a\", \"b\"]);\n\tlet _root = ui::mount_root(\"app\", || <div>\n\t\t{ui::each_values(names, |name| {\n\t\t\trow(<span>{name}</span>, 0.5)\n\t\t})}\n\t</div>);\n}\n",
         "this closure (it reaches `asset::emit`) is compile-time-only",
     );
+}
+
+// --- A178 S1: a `Length` is data (proposal/length.md §1, §3) -----------------
+//
+// `Length { value, unit, text, root }`: a unit length is a number and a `Unit`
+// rendered at the edge exactly as the constructors always rendered it; a text
+// length (`auto`, `0`, `var`, `calc`, `raw`, a `space` token) keeps its text.
+// The operators follow §3's table, one pin per row, through BOTH paths: the
+// rendering a program reads at run time (`css_text()`), and the declaration a
+// `const` style writes onto the sheet.
+
+/// What `expression` renders as, read at run time through `css_text()` and
+/// its `:root` lines through `css_root()`.
+#[track_caller]
+fn a178_renders(expression: &str, expected_text: &str, expected_root: &str) {
+    assert_compiles_and_runs(
+        &format!(
+            "import std::io::print;\nimport std::web::style::{{ CssValue, Length, Unit, space }};\nfun main() {{\n\tlet length = {expression};\n\tprint(length.css_text());\n\tprint(length.css_root());\n}}\nmain();\n"
+        ),
+        &format!("{expected_text}\n{expected_root}\n"),
+    );
+}
+
+/// The stylesheet a `const` style puts `expression` into, as `padding`.
+fn a178_padding_sheet(expression: &str) -> String {
+    style_css(&format!(
+        "import std::web::style::{{ Length, Unit, space, style }};\nlet _s = const style().padding({expression});\nfun main() {{}}\nmain();\n"
+    ))
+}
+
+#[test]
+fn a178_every_constructor_renders_the_text_it_always_rendered() {
+    for (expression, expected) in [
+        ("Length::px(8)", "8px"),
+        ("Length::px(0.5)", "0.5px"),
+        ("Length::rem(0.5)", "0.5rem"),
+        ("Length::rem(6 / 16)", "0.375rem"),
+        ("Length::em(1.5)", "1.5em"),
+        ("Length::pct(50)", "50%"),
+        ("Length::vh(100)", "100vh"),
+        ("Length::vw(-2)", "-2vw"),
+        ("Length::auto()", "auto"),
+        ("Length::zero()", "0"),
+        ("Length::calc(\"100% - 2rem\")", "calc(100% - 2rem)"),
+        (
+            "Length::raw(\"clamp(1px, 2vw, 3px)\")",
+            "clamp(1px, 2vw, 3px)",
+        ),
+        ("Length::var(\"--w\")", "var(--w)"),
+    ] {
+        a178_renders(expression, expected, "");
+    }
+    a178_renders("space(4)", "var(--space-4)", ":root{--space-4:1rem}");
+}
+
+#[test]
+fn a178_a_unit_length_is_its_number_and_unit_and_a_token_is_its_text() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::web::style::{ Length, Unit, space };
+        fun main() {
+            let eight = Length::px(8);
+            print(i"{eight.value} {eight.unit is Unit::Px} '{eight.text}'");
+            let token = space(4);
+            print(i"{token.value} {token.unit is Unit::Text} '{token.text}'");
+        }
+        main();
+        "#,
+        "8 true ''\n0 true 'var(--space-4)'\n",
+    );
+}
+
+/// §3 row 1: same unit → that unit (`dp` is pinned with its constructor in S2;
+/// here it is reached through `as_dp`).
+#[test]
+fn a178_a_sum_of_one_unit_stays_that_unit() {
+    a178_renders("Length::rem(1) + Length::rem(0.5)", "1.5rem", "");
+    a178_renders("Length::px(8) - Length::px(3)", "5px", "");
+    a178_renders("Length::em(1) + Length::em(0.25)", "1.25em", "");
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::web::style::{ Length, Unit };
+        fun main() {
+            let sum = Length::px(8).as_dp() + Length::px(4).as_dp();
+            print(i"{sum.value} {sum.unit is Unit::Dp}");
+        }
+        main();
+        "#,
+        "12 true\n",
+    );
+}
+
+/// §3 row 3: a `dp` BRIDGES `px` and `rem` — the other side's unit wins, through
+/// 16px = 1rem, from either side.
+#[test]
+fn a178_a_dp_meets_a_rem_in_rem() {
+    a178_renders("Length::rem(0.5) + Length::px(1).as_dp()", "0.5625rem", "");
+    a178_renders("Length::px(1).as_dp() + Length::rem(0.5)", "0.5625rem", "");
+    a178_renders("Length::rem(1) - Length::px(4).as_dp()", "0.75rem", "");
+}
+
+/// §3 row 4.
+#[test]
+fn a178_a_dp_meets_a_px_in_px() {
+    a178_renders("Length::px(8) + Length::px(1).as_dp()", "9px", "");
+    a178_renders("Length::px(1).as_dp() + Length::px(8)", "9px", "");
+}
+
+/// §3 row 5: `px` and `rem` are not the same at any root size but 16, so the
+/// answer is CSS's.
+#[test]
+fn a178_px_and_rem_compose_through_calc() {
+    a178_renders("Length::px(8) + Length::rem(0.5)", "calc(8px + 0.5rem)", "");
+    a178_renders("Length::rem(0.5) - Length::px(8)", "calc(0.5rem - 8px)", "");
+}
+
+/// §3 row 6: a token composes through `calc` and KEEPS its `:root` line — on
+/// the sheet, not only in the value.
+#[test]
+fn a178_a_token_composes_through_calc_and_keeps_its_root_line() {
+    a178_renders(
+        "space(4) * 2",
+        "calc(var(--space-4) * 2)",
+        ":root{--space-4:1rem}",
+    );
+    a178_renders(
+        "space(4) + Length::px(1)",
+        "calc(var(--space-4) + 1px)",
+        ":root{--space-4:1rem}",
+    );
+    let css = a178_padding_sheet("space(4) + Length::px(1)");
+    assert!(
+        css.contains("{padding:calc(var(--space-4) + 1px)}"),
+        "{css}"
+    );
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+}
+
+/// §3 row 7: scaling a unit length scales its number.
+#[test]
+fn a178_a_unit_length_scales_its_number() {
+    a178_renders("Length::px(8) * 1.5", "12px", "");
+    a178_renders("Length::px(8) / 2", "4px", "");
+    a178_renders("Length::rem(0.25) * 3", "0.75rem", "");
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::web::style::{ Length, Unit };
+        fun main() {
+            let up = Length::px(8).as_dp() * 1.5;
+            let down = Length::px(8).as_dp() / 2;
+            print(i"{up.value} {up.unit is Unit::Dp} {down.value} {down.unit is Unit::Dp}");
+        }
+        main();
+        "#,
+        "12 true 4 true\n",
+    );
+}
+
+/// §3 row 8: two non-bridged units are CSS's answer.
+#[test]
+fn a178_em_and_pct_compose_through_calc() {
+    a178_renders("Length::em(1) + Length::pct(50)", "calc(1em + 50%)", "");
+    a178_renders("Length::vh(100) - Length::rem(4)", "calc(100vh - 4rem)", "");
+}
+
+/// A `calc` result is a text length and keeps composing: its body is taken
+/// out of its wrapper, parenthesized where CSS would read it differently.
+#[test]
+fn a178_a_calc_keeps_composing_without_nesting_calc() {
+    a178_renders(
+        "(space(4) + Length::px(1)) * 2",
+        "calc((var(--space-4) + 1px) * 2)",
+        ":root{--space-4:1rem}",
+    );
+    a178_renders(
+        "Length::px(8) + Length::rem(1) + Length::em(1)",
+        "calc(8px + 1rem + 1em)",
+        "",
+    );
+    a178_renders(
+        "Length::px(8) - (Length::rem(1) + Length::em(1))",
+        "calc(8px - (1rem + 1em))",
+        "",
+    );
+    a178_renders(
+        "Length::calc(\"100% - 2rem\") / 2",
+        "calc((100% - 2rem) / 2)",
+        "",
+    );
+    // A `raw` value that only LOOKS like one call is not unwrapped.
+    a178_renders(
+        "Length::raw(\"calc(1px) + calc(2px)\") * 2",
+        "calc(calc(1px) + calc(2px) * 2)",
+        "",
+    );
+}
+
+/// Every token a composed length was built from reaches the sheet, each once —
+/// through a property, `raw`, `piece`, a border and a declaration block.
+#[test]
+fn a178_a_length_built_from_two_tokens_declares_both() {
+    a178_renders(
+        "space(4) + space(2) + space(4)",
+        "calc(var(--space-4) + var(--space-2) + var(--space-4))",
+        ":root{--space-4:1rem}\n:root{--space-2:0.5rem}",
+    );
+    let css = style_css(
+        r#"
+        import std::web::style::{ Color, declarations, declare, piece, space, style };
+        let _s = const style()
+            .padding(space(4) + space(2))
+            .raw("margin", space(1) + space(3))
+            .border(space(5) - space(6), Color::gray(300))
+            .raw("gap", piece(space(8) * 2));
+        const declare(".x", declarations().length("--w", space(10) + space(12)));
+        fun main() {}
+        main();
+        "#,
+    );
+    for step in [1, 2, 3, 4, 5, 6, 8, 10, 12] {
+        let line = format!(":root{{--space-{step}:");
+        assert_eq!(css.matches(&line).count(), 1, "--space-{step}: {css}");
+    }
+    assert!(
+        css.contains("{border:calc(var(--space-5) - var(--space-6)) solid var(--gray-300)}"),
+        "{css}"
+    );
+}
+
+/// `zero()` is the arithmetic's zero: `calc(0 + 1px)` is not CSS (a bare `0` in
+/// a `calc` is a number), so it never renders one.
+#[test]
+fn a178_the_bare_zero_is_the_arithmetics_zero() {
+    a178_renders("Length::zero() + Length::px(3)", "3px", "");
+    a178_renders("Length::px(3) - Length::zero()", "3px", "");
+    a178_renders("Length::zero() - Length::px(3)", "-3px", "");
+    a178_renders(
+        "Length::zero() - space(1)",
+        "calc(var(--space-1) * -1)",
+        ":root{--space-1:0.25rem}",
+    );
+    a178_renders("Length::zero() * 2", "0", "");
+}
+
+/// `auto` is no quantity — refused at build time, naming itself.
+#[test]
+fn a178_auto_in_arithmetic_fails_the_build() {
+    assert_fails_with(
+        "import std::web::style::{ Length, style };\nlet _s = const style().width(Length::auto() + Length::px(1));\nfun main() {}\nmain();\n",
+        "Length::auto() is not a quantity, so it cannot take '+'",
+    );
+    assert_fails_with(
+        "import std::web::style::{ Length, style };\nlet _s = const style().width(Length::auto() * 2);\nfun main() {}\nmain();\n",
+        "Length::auto() is not a quantity, so it cannot take '*'",
+    );
+}
+
+#[test]
+fn a178_a_length_divided_by_zero_fails_the_build() {
+    assert_fails_with(
+        "import std::web::style::{ Length, style };\nlet _s = const style().width(Length::px(8) / 0);\nfun main() {}\nmain();\n",
+        "8px divided by zero has no size",
+    );
+}
+
+/// The conversions, through the one constant (16px = 1rem), on the three
+/// units that have a fixed size; a same-unit conversion is the length itself.
+#[test]
+fn a178_px_rem_and_dp_convert_through_sixteen() {
+    a178_renders("Length::px(8).as_rem()", "0.5rem", "");
+    a178_renders("Length::rem(1).as_px()", "16px", "");
+    a178_renders("Length::rem(0.3).as_rem()", "0.3rem", "");
+    a178_renders("Length::px(0.3).as_px()", "0.3px", "");
+    a178_renders("Length::rem(0.5).as_dp().as_px()", "8px", "");
+    a178_renders("Length::px(6).as_dp().as_rem()", "0.375rem", "");
+    assert_compiles_and_runs(
+        "import std::io::print;\nimport std::web::style::Length;\nfun main() {\n\tprint(Length::root_px());\n}\nmain();\n",
+        "16\n",
+    );
+}
+
+/// A conversion that has no answer fails the BUILD (a style is a `const`),
+/// one case per refused kind: the context-relative units and the text ones.
+#[test]
+fn a178_a_conversion_without_an_answer_fails_the_build() {
+    for (expression, expected) in [
+        (
+            "Length::em(1).as_rem()",
+            "Length::as_rem cannot convert 1em",
+        ),
+        (
+            "Length::pct(50).as_px()",
+            "Length::as_px cannot convert 50%",
+        ),
+        (
+            "Length::vh(10).as_dp()",
+            "Length::as_dp cannot convert 10vh",
+        ),
+        (
+            "Length::vw(10).as_rem()",
+            "Length::as_rem cannot convert 10vw",
+        ),
+        (
+            "space(4).as_px()",
+            "Length::as_px cannot convert var(--space-4)",
+        ),
+        (
+            "Length::auto().as_rem()",
+            "Length::as_rem cannot convert auto",
+        ),
+        (
+            "Length::calc(\"1px + 1em\").as_dp()",
+            "Length::as_dp cannot convert calc(1px + 1em)",
+        ),
+    ] {
+        assert_fails_with(
+            &format!(
+                "import std::web::style::{{ Length, space, style }};\nlet _s = const style().width({expression});\nfun main() {{}}\nmain();\n"
+            ),
+            expected,
+        );
+    }
+}
+
+/// `PartialOrd`: one unit by number, `px`/`rem`/`dp` with each other.
+#[test]
+fn a178_lengths_of_one_unit_or_the_bridged_three_compare() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::web::style::Length;
+        fun main() {
+            print(Length::px(2) > Length::px(1));
+            print(Length::em(1) <= Length::em(1));
+            print(Length::px(8) < Length::rem(1));
+            print(Length::rem(1) >= Length::px(16));
+            print(Length::px(16).as_dp() > Length::rem(1.5));
+        }
+        main();
+        "#,
+        "true\ntrue\ntrue\ntrue\nfalse\n",
+    );
+}
+
+/// Mixed units beyond the bridged three fail the build, naming both.
+#[test]
+fn a178_comparing_lengths_of_unrelated_units_fails_the_build() {
+    for (expression, expected) in [
+        (
+            "Length::em(1) < Length::px(10)",
+            "cannot compare 1em with 10px",
+        ),
+        (
+            "Length::pct(50) > Length::vw(50)",
+            "cannot compare 50% with 50vw",
+        ),
+        (
+            "space(4) < space(6)",
+            "cannot compare var(--space-4) with var(--space-6)",
+        ),
+    ] {
+        assert_fails_with(
+            &format!(
+                "import std::web::style::{{ Length, space }};\nlet _c = const {expression};\nfun main() {{}}\nmain();\n"
+            ),
+            expected,
+        );
+    }
+}
+
+/// `Eq` is structural: `px(16)` and `rem(1)` are different CSS.
+#[test]
+fn a178_length_equality_is_structural() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::web::style::{ Length, space };
+        fun main() {
+            print(Length::px(16) == Length::px(16));
+            print(Length::px(16) == Length::rem(1));
+            print(space(4) == space(4));
+            print(space(4) == Length::var("--space-4"));
+            print(Length::px(8) + Length::px(8) == Length::px(16));
+        }
+        main();
+        "#,
+        "true\nfalse\ntrue\nfalse\ntrue\n",
+    );
+}
+
+/// The rendering is the property's declaration, unchanged — the same rule and
+/// class as a length written out (the content hash is over the text).
+#[test]
+fn a178_an_arithmetic_result_writes_the_rule_its_literal_writes() {
+    let sum = a178_padding_sheet("Length::rem(0.25) + Length::rem(0.25)");
+    let literal = a178_padding_sheet("Length::rem(0.5)");
+    assert_eq!(sum, literal);
+    assert!(literal.contains("{padding:0.5rem}"), "{literal}");
 }

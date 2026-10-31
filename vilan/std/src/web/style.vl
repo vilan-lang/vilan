@@ -40,73 +40,106 @@
 // so a family resolves by AUTHORING order, the way every other merge here
 // does, and never by the class-name sort.
 
-import pkg::compare::{ Ord, Ordering };
+import pkg::compare::{ Eq, Ord, Ordering, PartialEq, PartialOrd };
 import pkg::hash_map::HashMap;
 import pkg::io::panic;
-import pkg::operators::Add;
+import pkg::operators::{ Add, Div, Mul, Sub };
 import pkg::option::Option::{ self, None, Some };
 import pkg::range::Range;
 import pkg::web::asset::{ emit, schedule_at_end, stage, staged };
 
 // --- values -------------------------------------------------------------------
 
-/// A CSS length: a token's IDENTITY (`var(--space-4)`) or a literal unit. `root`
-/// carries the token's `:root` declaration ("" when none).
+/// A CSS length, as DATA (proposal/length.md §1). Two kinds share the type:
+///
+/// - a UNIT length is `value` + `unit` — `Length::px(8)` is `8` of `Px` — and
+///   renders `{value}{unit}` at the edge (`8px`), the text every constructor has
+///   always produced;
+/// - a TEXT length (`unit` is `Unit::Text`) keeps its whole value in `text`:
+///   `auto`, the bare `0`, `var(--w)`, `calc(..)`, a `raw` value, and the tokens
+///   `space(step)` mints (`var(--space-4)`). The text is not modelled; it never
+///   was.
+///
+/// `root` carries the `:root` lines a token needs on the sheet ("" when none). A
+/// length composed by arithmetic out of several tokens carries every one of their
+/// lines, one per line of `root`.
 export struct Length {
+	/// The number, for a unit length; 0 for a text length.
+	value: f64,
+	unit: Unit,
+	/// The whole value, for a text length; "" for a unit length.
 	text: str,
 	root: str,
 }
 
+/// Which kind a `Length` is: one of the six CSS units it renders with (`Pct` is
+/// `%`), the design pixel `Dp` (1/16 rem; a property picks the unit it renders in),
+/// or `Text` — a length whose whole value is its `text`.
+export enum Unit {
+	Dp,
+	Px,
+	Rem,
+	Em,
+	Pct,
+	Vh,
+	Vw,
+	Text,
+}
+
 export impl Length {
 	fun px(value: f64): Length {
-		Length { text = i"{value}px", root = "" }
+		unit_length(value, Unit::Px)
 	}
 
 	fun rem(value: f64): Length {
-		Length { text = i"{value}rem", root = "" }
+		unit_length(value, Unit::Rem)
 	}
 
 	/// Relative to the element's own font size — the unit `letter_spacing` and
 	/// optical spacing are written in.
 	fun em(value: f64): Length {
-		Length { text = i"{value}em", root = "" }
+		unit_length(value, Unit::Em)
 	}
 
 	fun pct(value: f64): Length {
-		Length { text = i"{value}%", root = "" }
+		unit_length(value, Unit::Pct)
 	}
 
 	/// Viewport units. `min_height(Length::vh(100.0))` is the full-height shell.
 	fun vh(value: f64): Length {
-		Length { text = i"{value}vh", root = "" }
+		unit_length(value, Unit::Vh)
 	}
 
 	fun vw(value: f64): Length {
-		Length { text = i"{value}vw", root = "" }
+		unit_length(value, Unit::Vw)
 	}
 
 	fun auto(): Length {
-		Length { text = "auto", root = "" }
+		text_length("auto", "")
 	}
 
 	/// Bare `0` — the unit-less zero CSS accepts for any length, and what the
 	/// `min-width:0` flex idiom and the `inset:0` fill-the-parent idiom are written
 	/// as. `space(0)` renders `var(--space-0)` and `Length::px(0.0)` renders `0px`;
 	/// all three compute the same, and this one is the spelling.
+	///
+	/// In arithmetic it is the zero: `zero() + x` is `x`, `zero() * n` is `zero()`
+	/// — never `calc(0 + x)`, which CSS refuses (a bare `0` inside `calc` is a
+	/// number, not a length).
 	fun zero(): Length {
-		Length { text = "0", root = "" }
+		text_length("0", "")
 	}
 
 	/// A `calc()` expression, written WITHOUT the wrapper:
-	/// `Length::calc("100% - 2rem")`. The property stays typed while the arithmetic
-	/// — which the `Length` representation deliberately does not model — rides a
-	/// string. Composes with tokens through their rendered form, e.g.
-	/// `Length::calc("100vh - var(--space-16)")`.
+	/// `Length::calc("100% - 2rem")`. Composes with tokens through their rendered
+	/// form, e.g. `Length::calc("100vh - var(--space-16)")` — though the operators
+	/// below compose lengths without writing the text: `vh(100) - space(16)` is
+	/// that same `calc`, and it declares `--space-16` too.
 	///
 	/// Sugar over `raw`: `Length::calc(e)` is `Length::raw("calc(" + e + ")")`.
 	fun calc(expression: str): Length {
 		check_not_blank("Length::calc", expression);
-		Length { text = i"calc({expression})", root = "" }
+		text_length(i"calc({expression})", "")
 	}
 
 	/// A complete CSS value, verbatim — `Color::hex`'s twin for lengths, and
@@ -120,7 +153,7 @@ export impl Length {
 	/// at the cost of a wrapper the author did not write.)
 	fun raw(expression: str): Length {
 		check_not_blank("Length::raw", expression);
-		Length { text = expression, root = "" }
+		text_length(expression, "")
 	}
 
 	/// The typed end of the dynamic-value channel: pairs with
@@ -130,12 +163,301 @@ export impl Length {
 	/// browser can tell you about it.
 	fun var(name: str): Length {
 		check_custom_property_name(name);
-		Length { text = i"var({name})", root = "" }
+		text_length(i"var({name})", "")
+	}
+
+	/// The one constant the conversions go through: 16 CSS px to 1rem, the
+	/// browsers' default root font size. Not a setting — the root size that matters
+	/// is the reader's, which no program can know, and `rem` exists so that it need
+	/// not.
+	fun root_px(): f64 {
+		ROOT_PX_VALUE
+	}
+
+	/// This length in `rem`. Defined on `px`, `rem` and `dp` lengths, through
+	/// `root_px()`; any other length panics — at build time, since a style is built
+	/// in a `const` — because an `em`, a `%`, a viewport unit or a token has no
+	/// fixed size in rem.
+	fun as_rem(self): Length {
+		if self.unit is Unit::Rem {
+			self
+		} else {
+			unit_length(px_amount(self, "as_rem") / ROOT_PX_VALUE, Unit::Rem)
+		}
+	}
+
+	/// This length in CSS `px` — `as_rem`'s twin, on the same three units.
+	fun as_px(self): Length {
+		if self.unit is Unit::Px {
+			self
+		} else {
+			unit_length(px_amount(self, "as_px"), Unit::Px)
+		}
+	}
+
+	/// This length in design pixels (`dp`, 1/16 rem) — `as_rem`'s twin, on the same
+	/// three units.
+	fun as_dp(self): Length {
+		if self.unit is Unit::Dp {
+			self
+		} else {
+			unit_length(px_amount(self, "as_dp"), Unit::Dp)
+		}
+	}
+}
+
+/// The constant behind `Length::root_px()`.
+const let ROOT_PX_VALUE = 16f;
+
+fun unit_length(value: f64, unit: Unit): Length {
+	Length { value, unit, text = "", root = "" }
+}
+
+fun text_length(text: str, root: str): Length {
+	Length { value = 0f, unit = Unit::Text, text, root }
+}
+
+/// A length's text, with a `Dp` length written in `rem`. (A property builder writes
+/// a `Dp` in the unit its property prefers; this is the role-less rendering every
+/// other position gets.)
+fun length_text(length: Length): str {
+	match length.unit {
+		Unit::Text => length.text,
+		Unit::Dp => i"{length.value / ROOT_PX_VALUE}rem",
+		_ => i"{length.value}{css_suffix(length.unit)}",
+	}
+}
+
+/// The CSS unit a unit length renders with. `Dp` is not a CSS unit (it renders as
+/// `rem` or `px`) and a `Text` length has no suffix.
+fun css_suffix(unit: Unit): str {
+	match unit {
+		Unit::Px => "px",
+		Unit::Rem => "rem",
+		Unit::Em => "em",
+		Unit::Pct => "%",
+		Unit::Vh => "vh",
+		Unit::Vw => "vw",
+		Unit::Dp => "",
+		Unit::Text => "",
+	}
+}
+
+/// The size of a `px`/`rem`/`dp` length in CSS px at the root size. `what` names
+/// the operation for the panic every other length gets.
+fun px_amount(length: Length, what: str): f64 {
+	match length.unit {
+		Unit::Px => length.value,
+		Unit::Dp => length.value,
+		Unit::Rem => length.value * ROOT_PX_VALUE,
+		_ => panic(i"Length::{what} cannot convert {length_text(length)}: only px, rem and dp lengths convert (16px is 1rem); an em, %, vh or vw length depends on where it is used, and a token, calc, var or raw value has no number to convert"),
+	}
+}
+
+fun is_bridged(unit: Unit): bool {
+	unit is Unit::Px || unit is Unit::Rem || unit is Unit::Dp
+}
+
+fun same_unit(a: Unit, b: Unit): bool {
+	match a {
+		Unit::Dp => b is Unit::Dp,
+		Unit::Px => b is Unit::Px,
+		Unit::Rem => b is Unit::Rem,
+		Unit::Em => b is Unit::Em,
+		Unit::Pct => b is Unit::Pct,
+		Unit::Vh => b is Unit::Vh,
+		Unit::Vw => b is Unit::Vw,
+		Unit::Text => b is Unit::Text,
+	}
+}
+
+/// The bare `0` (`Length::zero()`), the arithmetic's zero.
+fun is_bare_zero(length: Length): bool {
+	length.unit is Unit::Text && length.text == "0"
+}
+
+/// `auto` is not a quantity: `calc(auto + 1px)` is not CSS. Refused by name rather
+/// than written into a declaration the browser drops.
+fun check_quantity(length: Length, operator: str) {
+	if length.unit is Unit::Text && length.text == "auto" {
+		panic(i"Length::auto() is not a quantity, so it cannot take '{operator}' — auto has no size until layout; write the length you mean, or a raw(\"..\") value");
+	}
+}
+
+/// A length as one OPERAND of a `calc()`. A `calc(..)` written whole loses its
+/// wrapper, so `(space(4) + px(1)) * 2` renders `calc((var(--space-4) + 1px) * 2)`
+/// rather than a `calc` inside a `calc`; its body keeps parentheses unless it is a
+/// term of a sum, where CSS's own left-to-right `+`/`-` reads it the same without
+/// them (`a + b + c`, but `a - (b + c)`).
+fun calc_operand(length: Length, bare: bool): str {
+	let text = length_text(length);
+	if length.unit is Unit::Text && is_whole_calc(text) {
+		let body = text.substring(5usize, text.len() - 1usize);
+		if bare {
+			body
+		} else {
+			"(" + body + ")"
+		}
+	} else {
+		text
+	}
+}
+
+/// Whether `text` is ONE `calc(..)` call: it opens `calc(` and that parenthesis
+/// closes at the last byte. (`calc(1px) + calc(2px)` written as `raw` text opens
+/// and ends the same way and is not one.)
+fun is_whole_calc(text: str): bool {
+	if !text.starts_with("calc(") || !text.ends_with(")") {
+		ret false;
+	}
+	mut depth = 0;
+	for index in Range::new(4, text.len().as_i32()) {
+		let code = text.code_at(index.as_usize());
+		if code == 40u32 {
+			depth += 1;
+		} else if code == 41u32 {
+			depth -= 1;
+			if depth == 0 {
+				ret index.as_usize() == text.len() - 1usize;
+			}
+		}
+	}
+	false
+}
+
+/// The `:root` lines of two lengths, each once, in the order met. Every surface
+/// that writes a value onto the sheet (`Style::raw`, `with_border`, `piece`,
+/// `Declarations::raw`) puts each line on it separately — the asset channel
+/// dedups by LINE — and writes the `emit` itself rather than through a helper,
+/// so the const-only check's chain still names `emit` first.
+fun union_roots(a: str, b: str): str {
+	if b == "" || a == b {
+		ret a;
+	}
+	if a == "" {
+		ret b;
+	}
+	let held = a.split("\n");
+	mut joined = a;
+	for line in b.split("\n") {
+		if line != "" && !held.contains(line) {
+			joined = joined + "\n" + line;
+		}
+	}
+	joined
+}
+
+/// `a + b` / `a - b` (proposal/length.md §3): one unit stays that unit; a `dp`
+/// meets a `px` or a `rem` in the other side's unit (a dp is 1px at the root size,
+/// 1/16 rem); anything else is CSS's own answer, a `calc` of the two renderings,
+/// carrying both sides' `:root` lines.
+fun combine(a: Length, b: Length, operator: str): Length {
+	check_quantity(a, operator);
+	check_quantity(b, operator);
+	let sign = if operator == "+" { 1f } else { -1f };
+	if is_bare_zero(b) {
+		a
+	} else if is_bare_zero(a) {
+		scale(b, sign, "*")
+	} else if !(a.unit is Unit::Text) && same_unit(a.unit, b.unit) {
+		unit_length(a.value + sign * b.value, a.unit)
+	} else if a.unit is Unit::Dp && (b.unit is Unit::Px || b.unit is Unit::Rem) {
+		unit_length(as_unit(a, b.unit) + sign * b.value, b.unit)
+	} else if b.unit is Unit::Dp && (a.unit is Unit::Px || a.unit is Unit::Rem) {
+		unit_length(a.value + sign * as_unit(b, a.unit), a.unit)
+	} else {
+		text_length(
+			i"calc({calc_operand(a, true)} {operator} {calc_operand(b, operator == "+")})",
+			union_roots(a.root, b.root),
+		)
+	}
+}
+
+/// A `dp` length's number in `px` or `rem`.
+fun as_unit(length: Length, unit: Unit): f64 {
+	if unit is Unit::Rem {
+		length.value / ROOT_PX_VALUE
+	} else {
+		length.value
+	}
+}
+
+/// `a * factor` / `a / factor`: a unit length scales its number; a text length is a
+/// `calc`, its `:root` lines kept.
+fun scale(a: Length, factor: f64, operator: str): Length {
+	check_quantity(a, operator);
+	if operator == "/" && factor == 0f {
+		panic(i"{length_text(a)} divided by zero has no size");
+	}
+	if is_bare_zero(a) {
+		a
+	} else if a.unit is Unit::Text {
+		text_length(i"calc({calc_operand(a, false)} {operator} {factor})", a.root)
+	} else if operator == "/" {
+		unit_length(a.value / factor, a.unit)
+	} else {
+		unit_length(a.value * factor, a.unit)
+	}
+}
+
+export impl Length with Add {
+	fun add(self, b: Length): Length {
+		combine(self, b, "+")
+	}
+}
+
+export impl Length with Sub {
+	fun sub(self, b: Length): Length {
+		combine(self, b, "-")
+	}
+}
+
+export impl Length with Mul<f64> {
+	fun mul(self, b: f64): Length {
+		scale(self, b, "*")
+	}
+}
+
+export impl Length with Div<f64> {
+	fun div(self, b: f64): Length {
+		scale(self, b, "/")
+	}
+}
+
+/// Structural: the same number in the same unit, or the same text and lines.
+/// `px(16) == rem(1)` is `false` — they are different CSS.
+export impl Length with PartialEq {
+	fun eq(self, b: Length): bool {
+		same_unit(self.unit, b.unit)
+			&& self.value == b.value
+			&& self.text == b.text
+			&& self.root == b.root
+	}
+}
+
+export impl Length with Eq {}
+
+/// Lengths of one unit compare by number; `px`, `rem` and `dp` compare with each
+/// other through 16px = 1rem. Anything else panics — at build time, in a `const` —
+/// since `1em` against `10px` has no answer until layout.
+export impl Length with PartialOrd {
+	fun partial_compare(self, b: Length): Option<Ordering> {
+		if !(self.unit is Unit::Text) && same_unit(self.unit, b.unit) {
+			self.value.partial_compare(b.value)
+		} else if is_bridged(self.unit) && is_bridged(b.unit) {
+			px_amount(self, "partial_compare").partial_compare(px_amount(b, "partial_compare"))
+		} else {
+			panic(i"cannot compare {length_text(self)} with {length_text(b)}: compare lengths in one unit (px, rem and dp compare with each other); convert first")
+		}
 	}
 }
 
 /// The spacing scale (Tailwind's, rem-based). The scale is data; the validation is
 /// const evaluation — an unknown step fails the build.
+///
+/// A step is a TOKEN, a text length: `space(4) + px(1)` is
+/// `calc(var(--space-4) + 1px)` and still declares `--space-4`, because the token's
+/// value is the theme's, not the program's.
 export fun space(step: i32): Length {
 	let value = match step {
 		0 => "0px",
@@ -153,7 +475,7 @@ export fun space(step: i32): Length {
 		24 => "6rem",
 		_ => panic(i"unknown spacing step {step} (the scale has 0-6, 8, 10, 12, 16, 20, 24)"),
 	};
-	Length { text = i"var(--space-{step})", root = i":root\{--space-{step}:{value}\}" }
+	text_length(i"var(--space-{step})", i":root\{--space-{step}:{value}\}")
 }
 
 /// A CSS color: a ramp token's identity (`var(--gray-50)`) or a literal.
@@ -524,8 +846,9 @@ export trait CssValue {
 	/// The declaration's value text, exactly as it renders into CSS.
 	fun css_text(self): str;
 
-	/// The `:root` line declaring this value's theme token, or `""` when the value
-	/// declares nothing.
+	/// The `:root` lines declaring this value's theme tokens, one per line, or `""`
+	/// when the value declares nothing. A single token is a single line; a `Length`
+	/// composed out of several tokens (`space(4) + space(2)`) carries each.
 	fun css_root(self): str;
 }
 
@@ -540,10 +863,11 @@ export impl str with CssValue {
 	}
 }
 
-/// A length — a token's identity plus the `:root` line that defines it.
+/// A length — its rendered text (`8px`, `var(--space-4)`), plus the `:root` lines
+/// its tokens need.
 export impl Length with CssValue {
 	fun css_text(self): str {
-		self.text
+		length_text(self)
 	}
 
 	fun css_root(self): str {
@@ -582,7 +906,7 @@ export trait CssPiece {
 	/// The piece's text, exactly as it renders into the value.
 	fun piece_text(self): str;
 
-	/// The `:root` line declaring this piece's theme token, or `""`.
+	/// The `:root` lines declaring this piece's theme tokens, or `""`.
 	fun piece_root(self): str;
 }
 
@@ -648,7 +972,7 @@ export impl bool with CssPiece {
 
 export impl Length with CssPiece {
 	fun piece_text(self): str {
-		self.text
+		length_text(self)
 	}
 
 	fun piece_root(self): str {
@@ -677,7 +1001,11 @@ export impl Color with CssPiece {
 export fun piece<V: CssPiece>(value: V): str {
 	let root = value.piece_root();
 	if root != "" {
-		emit("css", root);
+		for line in root.split("\n") {
+			if line != "" {
+				emit("css", line);
+			}
+		}
 	}
 	value.piece_text()
 }
@@ -1768,7 +2096,11 @@ export impl Style {
 		check_property_name(property);
 		let root = value.css_root();
 		if root != "" {
-			emit("css", root);
+			for line in root.split("\n") {
+				if line != "" {
+					emit("css", line);
+				}
+			}
 		}
 		self.rule("", "", property, property + ":" + value.css_text())
 	}
@@ -1968,13 +2300,18 @@ export impl Style {
 	/// borders across every line of styling written in the language — a
 	/// `BorderStyle` enum's other variants would be speculation (§0bis.3).
 	fun with_border(self, property: str, width: Length, color: Color): Style {
-		if width.root != "" {
-			emit("css", width.root);
+		let root = width.root;
+		if root != "" {
+			for line in root.split("\n") {
+				if line != "" {
+					emit("css", line);
+				}
+			}
 		}
 		if color.root != "" {
 			emit("css", color.root);
 		}
-		self.rule("", "", property, i"{property}:{width.text} solid {color.text}")
+		self.rule("", "", property, i"{property}:{length_text(width)} solid {color.text}")
 	}
 
 	fun border(self, width: Length, color: Color): Style {
@@ -2502,7 +2839,11 @@ export impl Declarations {
 		mut roots = self.roots;
 		let root = value.css_root();
 		if root != "" {
-			roots.push(root);
+			for line in root.split("\n") {
+				if line != "" {
+					roots.push(line);
+				}
+			}
 		}
 		let pair = property + ":" + text;
 		Declarations { text = if self.text == "" { pair } else { self.text + ";" + pair }, roots }
