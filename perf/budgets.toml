@@ -360,6 +360,20 @@ reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role en
 item = "A178"
 
 [[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.012
+reason = "A178 S1+S2: std::web::style's Length became data and every program importing style analyzes it; the lane bumped this subject's ci class only - lane b689 found the reference class already red on next's own std at x1.011 of the v0.53.0 ceiling (the seal re-measures)"
+item = "A178"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.012
+reason = "A178 S1+S2: std::web::style's Length became data and every program importing style analyzes it; the lane bumped this subject's ci class only - lane b689 found the reference class already red on next's own std at x1.011 of the v0.53.0 ceiling (the seal re-measures)"
+item = "A178"
+
+[[bump]]
 subject = "example:fullstack"
 class = "ci"
 ratio = 1.01
