@@ -325,16 +325,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Shape::Map {
                 label,
-                field: (_, field),
+                keys: (_, keys),
+                values: (_, values),
                 key,
                 value: entry_value,
             } => {
                 let key_printer = self.native_printer_for(key, span)?;
                 let value_printer = self.native_printer_for(entry_value, span)?;
                 format!(
-                    "vilan_rt::show::members({}, &value.{}.values(), false, |entry| (format!(\"{{}} => \", {key_printer}(&entry.0).flat()), {value_printer}(&entry.1)))",
+                    "vilan_rt::show::members({}, &value.{}.iter().map(|(_, key)| key).zip(value.{}.iter().map(|(_, value)| value)).collect::<Vec<_>>(), false, |entry| (format!(\"{{}} => \", {key_printer}(entry.0).flat()), {value_printer}(entry.1)))",
                     rust_literal(&format!("{label} {{")),
-                    sanitize(&field)
+                    sanitize(&keys),
+                    sanitize(&values)
                 )
             }
             Shape::Set {

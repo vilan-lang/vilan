@@ -162,22 +162,17 @@ function format(value) {
 	return to_string(value);
 }
 function new2() {
-	const table = new Map();
-	return [ table ];
+	const keys = new Map();
+	const values = new Map();
+	return [ keys, values ];
 }
 function insert(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
+	const hash2 = hash(key);
+	self[0].set(hash2, __clone(key));
+	self[1].set(hash2, __clone(value));
 }
 function get(self, key) {
-	const $n = __map_get(self[0], hash(key));
-	let $o = null;
-	if ($n[0] === 0) {
-		const entry = $n[1];
-		$o = [ 0, __clone(entry[1]) ];
-	} else {
-		$o = [ 1 ];
-	}
-	return $o;
+	return __map_get(self[1], hash(key));
 }
 function to_json(self) {
 	let result = "[";
@@ -192,32 +187,32 @@ function to_json(self) {
 	return result + "]";
 }
 function from_json_value2(value) {
-	let $t = null;
+	let $r = null;
 	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
-	$t;
+	$r;
 	let result = [  ];
 	for (const element of value) {
-		const $v = result;
-		const $u = from_json_value(element);
-		if ($u[0] === 1) {
-			return $u;
+		const $t = result;
+		const $s = from_json_value(element);
+		if ($s[0] === 1) {
+			return $s;
 		}
-		$v.push($u[1]);
+		$t.push($s[1]);
 	}
 	return [ 0, result ];
 }
 function from_json2(text) {
-	const $r = __try_parse_json(text);
-	let $s = null;
-	if ($r[0] === 0) {
-		const value = $r[1];
-		$s = from_json_value2(value);
+	const $p = __try_parse_json(text);
+	let $q = null;
+	if ($p[0] === 0) {
+		const value = $p[1];
+		$q = from_json_value2(value);
 	} else {
-		$s = [ 1, "not valid JSON" ];
+		$q = [ 1, "not valid JSON" ];
 	}
-	return $s;
+	return $q;
 }
 const count = 42;
 const step = 5;
@@ -267,14 +262,14 @@ const positions = [ 0, 3, 2147483647 ];
 const encoded = to_json(positions);
 console.log(encoded);
 const decoded = from_json2(encoded);
-const $w = decoded;
-let $x = null;
-if ($w[0] === 0) {
-	const back2 = $w[1];
-	$x = console.log("" + back2.length + " " + __at(back2, 2, "usize.vl:75:41"));
+const $u = decoded;
+let $v = null;
+if ($u[0] === 0) {
+	const back2 = $u[1];
+	$v = console.log("" + back2.length + " " + __at(back2, 2, "usize.vl:75:41"));
 } else {
-	const reason2 = $w[1];
-	$x = console.log(reason2);
+	const reason2 = $u[1];
+	$v = console.log(reason2);
 }
-$x;
+$v;
 //# sourceMappingURL=usize.mjs.map

@@ -37,24 +37,24 @@ function slot_of(key) {
 	return [ __at(parts, 0, "std/src/web/style.vl:1245:17"), __at(parts, 1, "std/src/web/style.vl:1245:39"), __at(parts, 2, "std/src/web/style.vl:1245:60") ];
 }
 function family_longhands(property) {
-	const $f = property;
-	let $g = null;
-	if ($f === "padding") {
-		$g = ";padding-top;padding-right;padding-bottom;padding-left;";
-	} else if ($f === "margin") {
-		$g = ";margin-top;margin-right;margin-bottom;margin-left;";
-	} else if ($f === "inset") {
-		$g = ";top;right;bottom;left;";
-	} else if ($f === "flex") {
-		$g = ";flex-grow;flex-shrink;flex-basis;";
-	} else if ($f === "background") {
-		$g = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
-	} else if ($f === "border") {
-		$g = border_longhands();
+	const $d = property;
+	let $e = null;
+	if ($d === "padding") {
+		$e = ";padding-top;padding-right;padding-bottom;padding-left;";
+	} else if ($d === "margin") {
+		$e = ";margin-top;margin-right;margin-bottom;margin-left;";
+	} else if ($d === "inset") {
+		$e = ";top;right;bottom;left;";
+	} else if ($d === "flex") {
+		$e = ";flex-grow;flex-shrink;flex-basis;";
+	} else if ($d === "background") {
+		$e = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
+	} else if ($d === "border") {
+		$e = border_longhands();
 	} else {
-		$g = "";
+		$e = "";
 	}
-	return $g;
+	return $e;
 }
 function border_longhands() {
 	let out = ";border-width;border-style;border-color;";
@@ -97,86 +97,74 @@ function class_list(self) {
 function add(self, b) {
 	let rules = __clone(self[0]);
 	for (const key of keys(b[0])) {
-		const $d = get(b[0], key);
-		let $e = null;
-		if ($d[0] === 0) {
-			const entry = $d[1];
+		const $b = get(b[0], key);
+		let $c = null;
+		if ($b[0] === 0) {
+			const entry = $b[1];
 			const slot = slot_of(key);
 			rules = without_covered(rules, slot[0], slot[1], slot[2]);
 			insert(rules, key, entry);
-			$e = undefined;
+			$c = undefined;
 		} else {
-			$e = undefined;
+			$c = undefined;
 		}
-		$e;
+		$c;
 	}
 	return [ rules ];
 }
 function values(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry.slice(1, 3)));
-	}
-	return result;
+	return __map_values(self[1]);
 }
 function keys(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
-	}
-	return result;
+	return __map_values(self[0]);
 }
 function get(self, key) {
-	const $b = __map_get(self[0], hash(key));
-	let $c = null;
-	if ($b[0] === 0) {
-		const entry = $b[1];
-		$c = [ 0, __clone(entry.slice(1, 3)) ];
-	} else {
-		$c = [ 1 ];
-	}
-	return $c;
+	return __map_get(self[1], hash(key));
 }
 function remove(self, key) {
-	self[0].delete(hash(key));
+	const hash2 = hash(key);
+	self[0].delete(hash2);
+	self[1].delete(hash2);
 }
 function insert(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
+	const hash2 = hash(key);
+	self[0].set(hash2, __clone(key));
+	self[1].set(hash2, __clone(value));
 }
-const card = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
-const active = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
+const card = [ [ new Map([ [ "::display", "::display" ], [ "::padding", "::padding" ], [ "::background-color", "::background-color" ], [ ":hover:background-color", ":hover:background-color" ] ]), new Map([ [ "::display", [ "sbiovxm", "display:flex" ] ], [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ], [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
+const active = [ [ new Map([ [ "::padding", "::padding" ] ]), new Map([ [ "::padding", [ "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
 console.log(class_list(card));
 console.log(class_list(add(card, active)));
-const wide = [ [ new Map([ [ "::width", [ "::width", "s178hckh", "width:37px" ] ] ]) ] ];
+const wide = [ [ new Map([ [ "::width", "::width" ] ]), new Map([ [ "::width", [ "s178hckh", "width:37px" ] ] ]) ] ];
 console.log(class_list(wide));
-const responsive = [ [ new Map([ [ "640px::padding", [ "640px::padding", "sl8ru5a", "padding:var(--space-2)" ] ], [ "1024px::padding", [ "1024px::padding", "s4x9b8s", "padding:var(--space-3)" ] ] ]) ] ];
+const responsive = [ [ new Map([ [ "640px::padding", "640px::padding" ], [ "1024px::padding", "1024px::padding" ] ]), new Map([ [ "640px::padding", [ "sl8ru5a", "padding:var(--space-2)" ] ], [ "1024px::padding", [ "s4x9b8s", "padding:var(--space-3)" ] ] ]) ] ];
 console.log(class_list(responsive));
 const dark = [ [ "^[data-theme=\"dark\"]" ] ];
-const themed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] hover:background-color", [ "768px:^[data-theme=\"dark\"] hover:background-color", "sayz5ok", "background-color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"]:background-color", [ ":^[data-theme=\"dark\"]:background-color", "s120e6x3", "background-color:var(--gray-900)" ] ], [ ":^[data-theme=\"dark\"] hover:background-color", [ ":^[data-theme=\"dark\"] hover:background-color", "ss3fj9l", "background-color:var(--gray-700)" ] ] ]) ] ];
+const themed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] hover:background-color", "768px:^[data-theme=\"dark\"] hover:background-color" ], [ ":^[data-theme=\"dark\"]:background-color", ":^[data-theme=\"dark\"]:background-color" ], [ ":^[data-theme=\"dark\"] hover:background-color", ":^[data-theme=\"dark\"] hover:background-color" ] ]), new Map([ [ "768px:^[data-theme=\"dark\"] hover:background-color", [ "sayz5ok", "background-color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"]:background-color", [ "s120e6x3", "background-color:var(--gray-900)" ] ], [ ":^[data-theme=\"dark\"] hover:background-color", [ "ss3fj9l", "background-color:var(--gray-700)" ] ] ]) ] ];
 console.log(class_list(themed));
-const translucent = [ [ new Map([ [ "::color", [ "::color", "s1kwp696", "color:rgb(from var(--gray-900) r g b / 0.08)" ] ], [ "::background-color", [ "::background-color", "s12ne3o2", "background-color:rgba(27, 6, 13, 0.9)" ] ] ]) ] ];
+const translucent = [ [ new Map([ [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::color", [ "s1kwp696", "color:rgb(from var(--gray-900) r g b / 0.08)" ] ], [ "::background-color", [ "s12ne3o2", "background-color:rgba(27, 6, 13, 0.9)" ] ] ]) ] ];
 console.log(class_list(translucent));
-const painted = [ [ new Map([ [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ "::background-image", [ "::background-image", "s1fek3dv", "background-image:linear-gradient(90deg, var(--blue-600) 0%, transparent 100%)" ] ], [ ":hover:background-image", [ ":hover:background-image", "s1lsiu5q", "background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)" ] ] ]) ] ];
+const painted = [ [ new Map([ [ "::background-color", "::background-color" ], [ "::background-image", "::background-image" ], [ ":hover:background-image", ":hover:background-image" ] ]), new Map([ [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ], [ "::background-image", [ "s1fek3dv", "background-image:linear-gradient(90deg, var(--blue-600) 0%, transparent 100%)" ] ], [ ":hover:background-image", [ "s1lsiu5q", "background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)" ] ] ]) ] ];
 console.log(class_list(painted));
-const framed = [ [ new Map([ [ "::display", [ "::display", "s2m9jw6", "display:inline-flex" ] ], [ "::padding-top", [ "::padding-top", "stbzxoc", "padding-top:var(--space-2)" ] ], [ "::margin-left", [ "::margin-left", "s10oplpw", "margin-left:auto" ] ], [ "::border-top", [ "::border-top", "s1sb4lgm", "border-top:1px solid var(--gray-300)" ] ] ]) ] ];
+const framed = [ [ new Map([ [ "::display", "::display" ], [ "::padding-top", "::padding-top" ], [ "::margin-left", "::margin-left" ], [ "::border-top", "::border-top" ] ]), new Map([ [ "::display", [ "s2m9jw6", "display:inline-flex" ] ], [ "::padding-top", [ "stbzxoc", "padding-top:var(--space-2)" ] ], [ "::margin-left", [ "s10oplpw", "margin-left:auto" ] ], [ "::border-top", [ "s1sb4lgm", "border-top:1px solid var(--gray-300)" ] ] ]) ] ];
 console.log(class_list(framed));
 console.log("s1mnphwb");
-const zeroed = [ [ new Map([ [ "::inset", [ "::inset", "s1ucbaf9", "inset:0" ] ], [ "::left", [ "::left", "s1ypvw5g", "left:clamp(120px, 30%, 185px)" ] ], [ "::min-width", [ "::min-width", "sitgfdt", "min-width:0" ] ], [ "::max-width", [ "::max-width", "s63dg6q", "max-width:calc(100% - 2rem)" ] ] ]) ] ];
+const zeroed = [ [ new Map([ [ "::inset", "::inset" ], [ "::left", "::left" ], [ "::min-width", "::min-width" ], [ "::max-width", "::max-width" ] ]), new Map([ [ "::inset", [ "s1ucbaf9", "inset:0" ] ], [ "::left", [ "s1ypvw5g", "left:clamp(120px, 30%, 185px)" ] ], [ "::min-width", [ "sitgfdt", "min-width:0" ] ], [ "::max-width", [ "s63dg6q", "max-width:calc(100% - 2rem)" ] ] ]) ] ];
 console.log(class_list(zeroed));
-const accented = [ [ new Map([ [ "::background-color", [ "::background-color", "sumjtxl", "background-color:var(--accent)" ] ], [ "::border-color", [ "::border-color", "s1rhkqzm", "border-color:rgb(from var(--accent) r g b / 0.5)" ] ] ]) ] ];
+const accented = [ [ new Map([ [ "::background-color", "::background-color" ], [ "::border-color", "::border-color" ] ]), new Map([ [ "::background-color", [ "sumjtxl", "background-color:var(--accent)" ] ], [ "::border-color", [ "s1rhkqzm", "border-color:rgb(from var(--accent) r g b / 0.5)" ] ] ]) ] ];
 console.log(class_list(accented));
-const perceptual = [ [ new Map([ [ "::color", [ "::color", "s1ouskes", "color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)" ] ], [ "::background-color", [ "::background-color", "s1yxmxe6", "background-color:oklch(0.62 0.19 313)" ] ] ]) ] ];
+const perceptual = [ [ new Map([ [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::color", [ "s1ouskes", "color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)" ] ], [ "::background-color", [ "s1yxmxe6", "background-color:oklch(0.62 0.19 313)" ] ] ]) ] ];
 console.log(class_list(perceptual));
-const squared = [ [ new Map([ [ "::width", [ "::width", "s178h6ec", "width:1rem" ] ], [ "::height", [ "::height", "s22ylrq", "height:1rem" ] ] ]) ] ];
+const squared = [ [ new Map([ [ "::width", "::width" ], [ "::height", "::height" ] ]), new Map([ [ "::width", [ "s178h6ec", "width:1rem" ] ], [ "::height", [ "s22ylrq", "height:1rem" ] ] ]) ] ];
 console.log(class_list(squared));
 console.log("s178h6ec s22zdhz");
 const open = [ [ "[data-open=\"true\"]" ] ];
-const disclosed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", "s1dwvy7w", "color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", "s1jqpl5k", "background-color:var(--gray-800)" ] ], [ ":[data-open=\"true\"]:display", [ ":[data-open=\"true\"]:display", "s11vlq4c", "display:flex" ] ], [ ":[data-open=\"true\"] hover:background-color", [ ":[data-open=\"true\"] hover:background-color", "s1j5l6ea", "background-color:var(--gray-100)" ] ] ]) ] ];
+const disclosed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color" ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color" ], [ ":[data-open=\"true\"]:display", ":[data-open=\"true\"]:display" ], [ ":[data-open=\"true\"] hover:background-color", ":[data-open=\"true\"] hover:background-color" ] ]), new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ "s1dwvy7w", "color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ "s1jqpl5k", "background-color:var(--gray-800)" ] ], [ ":[data-open=\"true\"]:display", [ "s11vlq4c", "display:flex" ] ], [ ":[data-open=\"true\"] hover:background-color", [ "s1j5l6ea", "background-color:var(--gray-100)" ] ] ]) ] ];
 console.log(class_list(disclosed));
-const gated = [ [ new Map([ [ ":!^[data-theme=\"dark\"]:background-color", [ ":!^[data-theme=\"dark\"]:background-color", "s1jayb7s", "background-color:var(--gray-900)" ] ], [ ":^[data-collapsed]:display", [ ":^[data-collapsed]:display", "s4ss8fz", "display:none" ] ], [ ":[data-selected]:color", [ ":[data-selected]:color", "st2ig1a", "color:var(--gray-50)" ] ], [ ":![disabled] hover:background-color", [ ":![disabled] hover:background-color", "s1pk9f1d", "background-color:var(--gray-100)" ] ], [ ":!hover:color", [ ":!hover:color", "s6t6iu5", "color:var(--gray-700)" ] ] ]) ] ];
+const gated = [ [ new Map([ [ ":!^[data-theme=\"dark\"]:background-color", ":!^[data-theme=\"dark\"]:background-color" ], [ ":^[data-collapsed]:display", ":^[data-collapsed]:display" ], [ ":[data-selected]:color", ":[data-selected]:color" ], [ ":![disabled] hover:background-color", ":![disabled] hover:background-color" ], [ ":!hover:color", ":!hover:color" ] ]), new Map([ [ ":!^[data-theme=\"dark\"]:background-color", [ "s1jayb7s", "background-color:var(--gray-900)" ] ], [ ":^[data-collapsed]:display", [ "s4ss8fz", "display:none" ] ], [ ":[data-selected]:color", [ "st2ig1a", "color:var(--gray-50)" ] ], [ ":![disabled] hover:background-color", [ "s1pk9f1d", "background-color:var(--gray-100)" ] ], [ ":!hover:color", [ "s6t6iu5", "color:var(--gray-700)" ] ] ]) ] ];
 console.log(class_list(gated));
-const stacked = [ [ new Map([ [ "768px:>*:gap", [ "768px:>*:gap", "svmscer", "gap:var(--space-2)" ] ], [ ":>*:margin-top", [ ":>*:margin-top", "sxzag36", "margin-top:var(--space-2)" ] ], [ ":>*+*:margin-top", [ ":>*+*:margin-top", "skr9oll", "margin-top:var(--space-4)" ] ] ]) ] ];
+const stacked = [ [ new Map([ [ "768px:>*:gap", "768px:>*:gap" ], [ ":>*:margin-top", ":>*:margin-top" ], [ ":>*+*:margin-top", ":>*+*:margin-top" ] ]), new Map([ [ "768px:>*:gap", [ "svmscer", "gap:var(--space-2)" ] ], [ ":>*:margin-top", [ "sxzag36", "margin-top:var(--space-2)" ] ], [ ":>*+*:margin-top", [ "skr9oll", "margin-top:var(--space-4)" ] ] ]) ] ];
 console.log(class_list(stacked));
-const tiled = [ [ new Map([ [ "::line-height", [ "::line-height", "snq90yh", "line-height:24px" ] ], [ "::background-image", [ "::background-image", "s5hidsk", "background-image:url(tile.png)" ] ], [ "::background-size", [ "::background-size", "skugn91", "background-size:120px 120px" ] ] ]) ] ];
+const tiled = [ [ new Map([ [ "::line-height", "::line-height" ], [ "::background-image", "::background-image" ], [ "::background-size", "::background-size" ] ]), new Map([ [ "::line-height", [ "snq90yh", "line-height:24px" ] ], [ "::background-image", [ "s5hidsk", "background-image:url(tile.png)" ] ], [ "::background-size", [ "skugn91", "background-size:120px 120px" ] ] ]) ] ];
 console.log(class_list(tiled));
 //# sourceMappingURL=style.mjs.map

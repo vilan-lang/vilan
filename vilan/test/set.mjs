@@ -24,7 +24,7 @@ function new2() {
 	return [ table ];
 }
 function insert(self, value2) {
-	self[0].set(hash2(value2), value2);
+	self[0].set(hash2(value2), __clone(value2));
 }
 function len(self) {
 	return self[0].size;
@@ -39,7 +39,7 @@ function is_empty(self) {
 	return len(self) === 0;
 }
 function insert2(self, value2) {
-	self[0].set(hash(value2), value2);
+	self[0].set(hash(value2), __clone(value2));
 }
 function contains2(self, value2) {
 	return self[0].has(hash(value2));

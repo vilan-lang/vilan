@@ -11,7 +11,8 @@
 //
 // This is the former `Map` intrinsic: `new` is `new Map()`, `insert` is `.set`,
 // `get` returns an `Option<V>` (a copy), and `keys`/`values` are cloned `List`
-// snapshots in insertion order.
+// snapshots in insertion order. `lend`/`lend_mut` hand the slot under a key to a
+// closure IN PLACE, copying nothing (B689, proposal/hash-map-lend.md §3.1).
 import pkg::hash::Hash;
 import pkg::option::Option;
 
@@ -22,9 +23,23 @@ external struct NativeMap<V>;
 impl NativeMap<type V> {
 	external fun new(): NativeMap<V>;
 
-	external fun insert(&mut self, key: Hash, value: V): void;
+	/// `own value`: the table KEEPS what it is given (as `List::push` does), so a
+	/// place passed here is copied in rather than aliased by the host map.
+	external fun insert(&mut self, key: Hash, own value: V): void;
 
 	external fun get(self, key: Hash): Option<V>;
+
+	/// `read` called once with the slot under `key` — `&Some(value)` in place while
+	/// the key is present, `&None` otherwise — answering what `read` answers. The
+	/// value is never cloned.
+	external fun lend<U>(self, key: Hash, read: |&Option<V>| U): U;
+
+	/// `write` called once with a writable slot under `key`; when it returns the
+	/// table reflects the slot. A slot left `None` is removed (gone from
+	/// `contains_key`, `len` and every walk); a slot made `Some` under an absent
+	/// key is inserted LAST, as `insert` does; a present key keeps its place
+	/// whatever was written. The value is never cloned.
+	external fun lend_mut<U>(&mut self, key: Hash, write: |&mut Option<V>| U): U;
 
 	external fun contains_key(self, key: Hash): bool;
 

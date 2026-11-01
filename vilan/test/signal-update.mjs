@@ -50,8 +50,9 @@ function hash2(self) {
 	return __hash(self);
 }
 function new2() {
-	const table = new Map();
-	return [ table ];
+	const keys = new Map();
+	const values = new Map();
+	return [ keys, values ];
 }
 function fresh_id() {
 	const id = next_subscriber_id.v;
@@ -337,7 +338,9 @@ function new7(value, caller) {
 	return new5(value, caller);
 }
 function insert(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
+	const hash3 = hash(key);
+	self[0].set(hash3, __clone(key));
+	self[1].set(hash3, __clone(value));
 }
 function notify2(self, $b) {
 	const traced = tracing.v;
@@ -386,7 +389,7 @@ function update2(self, mutate, $a, caller) {
 	notify2(self, $a);
 }
 function len(self) {
-	return self[0].size;
+	return self[1].size;
 }
 function update3(self, mutate, $a, caller) {
 	if (tracing.v) {

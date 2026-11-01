@@ -476,21 +476,17 @@ impl<'src> Transformer<'src> {
             },
             Shape::Map {
                 label,
-                field: (field, _),
+                keys: (keys, _),
+                values: (values, _),
                 key,
                 value,
-            } => {
-                let key_width = self.flat_width(key);
-                let value_width = self.flat_width(value);
-                Layout::Map {
-                    label,
-                    field,
-                    key: element(self, recorder, key),
-                    value: element(self, recorder, value),
-                    key_width,
-                    value_width,
-                }
-            }
+            } => Layout::Map {
+                label,
+                keys,
+                values,
+                key: element(self, recorder, key),
+                value: element(self, recorder, value),
+            },
             Shape::Set {
                 label,
                 field: (field, _),

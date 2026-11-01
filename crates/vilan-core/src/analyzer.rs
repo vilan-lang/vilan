@@ -75780,6 +75780,15 @@ pub enum Intrinsic {
     MapInsert,
     // `Map.get(key): Option<V>` -> a runtime helper returning the Option form.
     MapGet,
+    // `Map.lend(key, read): U` -> `read` called once with the slot under `key`
+    // IN PLACE (`[ 0, value ]` aliasing the stored value, or `[ 1 ]`), nothing
+    // cloned (B689, hash-map-lend.md §3.1). Runs user code.
+    MapLend,
+    // `Map.lend_mut(key, write): U` -> `write` called once with a writable
+    // view of the slot, and the table made to reflect it afterwards: `None`
+    // removes the key, `Some` under an absent key inserts it last. Runs user
+    // code and writes its receiver.
+    MapLendMut,
     // `Map.contains_key(key): bool` -> native `.has(key)`.
     MapContainsKey,
     // `Map.remove(key)` -> native `.delete(key)`.
@@ -90429,7 +90438,7 @@ fn analyze_over_world<'src>(
     // authoritative: `infer_bumps` seeds it and does not re-infer the body. Rows
     // whose module is not loaded resolve to `None` and drop out — the table is
     // inert until a container is actually used (the `try_trait_id` precedent).
-    let bumps_rows: [(Option<Id>, bool); 11] = {
+    let bumps_rows: [(Option<Id>, bool); 12] = {
         // Resolve a method id inside the impl of a resolved container struct
         // (the `intrinsics` table's own pattern), matching the impl subject by
         // nominal id.
@@ -90466,6 +90475,9 @@ fn analyze_over_world<'src>(
             (container_method(native_map_struct, "insert"), true),
             // `NativeMap::remove` — a hash remove.
             (container_method(native_map_struct, "remove"), true),
+            // `NativeMap::lend_mut` — writes a slot, inserting or removing the
+            // key as the slot comes back (B689): a geometry op like the two above.
+            (container_method(native_map_struct, "lend_mut"), true),
             // `Map::insert` — a value-keyed insert over `NativeMap` (§1: Map insert bumps).
             (container_method(map_struct, "insert"), true),
             // `Map::remove` — a value-keyed remove.
@@ -90938,6 +90950,8 @@ fn analyze_over_world<'src>(
                     ("new", Intrinsic::MapNew),
                     ("insert", Intrinsic::MapInsert),
                     ("get", Intrinsic::MapGet),
+                    ("lend", Intrinsic::MapLend),
+                    ("lend_mut", Intrinsic::MapLendMut),
                     ("contains_key", Intrinsic::MapContainsKey),
                     ("remove", Intrinsic::MapRemove),
                     ("len", Intrinsic::MapLen),

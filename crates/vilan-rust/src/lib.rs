@@ -16194,6 +16194,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::MapNew => "vilan_rt::Map::new()".to_string(),
             Intrinsic::MapInsert => format!("{}.insert({}, {})", next(), next(), next()),
             Intrinsic::MapGet => format!("{}.get(&{}).cloned()", next(), next()),
+            // B689: the slot lent in place. The closure arrives as an
+            // `Rc<dyn Fn>`, which implements no `Fn` trait itself, so it is
+            // bound and CALLED inside the `FnOnce` the runtime takes — the
+            // `sort_by` comparator's shape. The key is bound first because
+            // Rust evaluates the receiver's borrow before the arguments.
+            Intrinsic::MapLend => {
+                let receiver = next();
+                let key = next();
+                let read = next();
+                format!(
+                    "{{ let __key = {key}; let __read = {read}; \
+                     {receiver}.lend(&__key, move |slot| __read(slot)) }}"
+                )
+            }
+            Intrinsic::MapLendMut => {
+                let receiver = next();
+                let key = next();
+                let write = next();
+                format!(
+                    "{{ let __key = {key}; let __write = {write}; \
+                     {receiver}.lend_mut(__key, move |slot| __write(slot)) }}"
+                )
+            }
             Intrinsic::MapContainsKey => format!("{}.contains_key(&{})", next(), next()),
             Intrinsic::MapRemove => format!("{}.remove(&{})", next(), next()),
             Intrinsic::MapLen => format!("{}.len()", next()),

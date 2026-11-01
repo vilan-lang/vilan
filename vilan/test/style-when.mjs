@@ -37,24 +37,24 @@ function slot_of(key) {
 	return [ __at(parts, 0, "std/src/web/style.vl:1245:17"), __at(parts, 1, "std/src/web/style.vl:1245:39"), __at(parts, 2, "std/src/web/style.vl:1245:60") ];
 }
 function family_longhands(property) {
-	const $e = property;
-	let $f = null;
-	if ($e === "padding") {
-		$f = ";padding-top;padding-right;padding-bottom;padding-left;";
-	} else if ($e === "margin") {
-		$f = ";margin-top;margin-right;margin-bottom;margin-left;";
-	} else if ($e === "inset") {
-		$f = ";top;right;bottom;left;";
-	} else if ($e === "flex") {
-		$f = ";flex-grow;flex-shrink;flex-basis;";
-	} else if ($e === "background") {
-		$f = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
-	} else if ($e === "border") {
-		$f = border_longhands();
+	const $c = property;
+	let $d = null;
+	if ($c === "padding") {
+		$d = ";padding-top;padding-right;padding-bottom;padding-left;";
+	} else if ($c === "margin") {
+		$d = ";margin-top;margin-right;margin-bottom;margin-left;";
+	} else if ($c === "inset") {
+		$d = ";top;right;bottom;left;";
+	} else if ($c === "flex") {
+		$d = ";flex-grow;flex-shrink;flex-basis;";
+	} else if ($c === "background") {
+		$d = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
+	} else if ($c === "border") {
+		$d = border_longhands();
 	} else {
-		$f = "";
+		$d = "";
 	}
-	return $f;
+	return $d;
 }
 function border_longhands() {
 	let out = ";border-width;border-style;border-color;";
@@ -81,20 +81,20 @@ function without_covered(rules, media, condition, property) {
 	return out;
 }
 function when(self, condition, delta) {
-	let $g = null;
+	let $e = null;
 	if (condition) {
-		$g = add(self, delta);
+		$e = add(self, delta);
 	} else {
-		$g = __clone(self);
+		$e = __clone(self);
 	}
-	return $g;
+	return $e;
 }
 function class_list(self) {
 	let out = "";
 	for (const entry of values(self[0])) {
-		const $h = entry;
-		const class2 = $h[0];
-		const _declaration = $h[1];
+		const $f = entry;
+		const class2 = $f[0];
+		const _declaration = $f[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -106,18 +106,18 @@ function class_list(self) {
 function add(self, b) {
 	let rules = __clone(self[0]);
 	for (const key of keys(b[0])) {
-		const $c = get(b[0], key);
-		let $d = null;
-		if ($c[0] === 0) {
-			const entry = $c[1];
+		const $a = get(b[0], key);
+		let $b = null;
+		if ($a[0] === 0) {
+			const entry = $a[1];
 			const slot = slot_of(key);
 			rules = without_covered(rules, slot[0], slot[1], slot[2]);
 			insert(rules, key, entry);
-			$d = undefined;
+			$b = undefined;
 		} else {
-			$d = undefined;
+			$b = undefined;
 		}
-		$d;
+		$b;
 	}
 	return [ rules ];
 }
@@ -135,39 +135,27 @@ function built(is_chosen2, is_muted2) {
 	return class_list(out);
 }
 function keys(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
-	}
-	return result;
+	return __map_values(self[0]);
 }
 function get(self, key) {
-	const $a = __map_get(self[0], hash(key));
-	let $b = null;
-	if ($a[0] === 0) {
-		const entry = $a[1];
-		$b = [ 0, __clone(entry.slice(1, 3)) ];
-	} else {
-		$b = [ 1 ];
-	}
-	return $b;
+	return __map_get(self[1], hash(key));
 }
 function remove(self, key) {
-	self[0].delete(hash(key));
+	const hash2 = hash(key);
+	self[0].delete(hash2);
+	self[1].delete(hash2);
 }
 function insert(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
+	const hash2 = hash(key);
+	self[0].set(hash2, __clone(key));
+	self[1].set(hash2, __clone(value));
 }
 function values(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry.slice(1, 3)));
-	}
-	return result;
+	return __map_values(self[1]);
 }
-const base = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvp8", "padding:var(--space-2)" ] ], [ "::color", [ "::color", "s1hbuywq", "color:var(--gray-900)" ] ], [ "::background-color", [ "::background-color", "sdoeicu", "background-color:#ffffff" ] ] ]) ] ];
-const chosen = [ [ new Map([ [ "::color", [ "::color", "s1ip1dgv", "color:var(--blue-900)" ] ], [ "::background-color", [ "::background-color", "s1do7ev5", "background-color:var(--blue-100)" ] ] ]) ] ];
-const muted = [ [ new Map([ [ "::color", [ "::color", "s1hbr49h", "color:var(--gray-400)" ] ] ]) ] ];
+const base = [ [ new Map([ [ "::padding", "::padding" ], [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::padding", [ "s1ufvp8", "padding:var(--space-2)" ] ], [ "::color", [ "s1hbuywq", "color:var(--gray-900)" ] ], [ "::background-color", [ "sdoeicu", "background-color:#ffffff" ] ] ]) ] ];
+const chosen = [ [ new Map([ [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::color", [ "s1ip1dgv", "color:var(--blue-900)" ] ], [ "::background-color", [ "s1do7ev5", "background-color:var(--blue-100)" ] ] ]) ] ];
+const muted = [ [ new Map([ [ "::color", "::color" ] ]), new Map([ [ "::color", [ "s1hbr49h", "color:var(--gray-400)" ] ] ]) ] ];
 let cell = 0;
 while (cell < 4) {
 	const is_chosen = cell % 2 === 1;

@@ -10,6 +10,9 @@ function __hash(value) {
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
 }
+function __map_keys(map) {
+	return [ ...map.keys() ].map(__clone);
+}
 function __map_values(map) {
 	return [ ...map.values() ].map(__clone);
 }
@@ -23,84 +26,87 @@ function eq(self, b) {
 	return self === b;
 }
 function new2() {
-	const table = new Map();
-	return [ table ];
+	const keys2 = new Map();
+	const values2 = new Map();
+	return [ keys2, values2 ];
 }
 function insert(self, key2, value2) {
-	self[0].set(hash(key2), [ __clone(key2), __clone(value2) ]);
+	const hash3 = hash(key2);
+	self[0].set(hash3, __clone(key2));
+	self[1].set(hash3, __clone(value2));
 }
 function len(self) {
-	return self[0].size;
+	return self[1].size;
 }
 function contains_key(self, key2) {
-	return self[0].has(hash(key2));
+	return self[1].has(hash(key2));
 }
 function get(self, key2) {
-	const $a = __map_get(self[0], hash(key2));
+	return __map_get(self[1], hash(key2));
+}
+function unwrap_or(self, fallback) {
+	const $a = self;
 	let $b = null;
 	if ($a[0] === 0) {
-		const entry2 = $a[1];
-		$b = [ 0, __clone(entry2[1]) ];
+		const x = __clone($a[1]);
+		$b = x;
 	} else {
-		$b = [ 1 ];
+		$b = __clone(fallback);
 	}
 	return $b;
 }
-function unwrap_or(self, fallback) {
-	const $c = self;
-	let $d = null;
-	if ($c[0] === 0) {
-		const x = __clone($c[1]);
-		$d = x;
-	} else {
-		$d = __clone(fallback);
-	}
-	return $d;
-}
 function is_some(self) {
-	const $e = self;
-	return $e[0] === 0;
+	const $c = self;
+	return $c[0] === 0;
 }
 function remove(self, key2) {
-	self[0].delete(hash(key2));
+	const hash3 = hash(key2);
+	self[0].delete(hash3);
+	self[1].delete(hash3);
 }
 function is_empty(self) {
 	return len(self) === 0;
 }
 function insert2(self, key2, value2) {
-	self[0].set(hash2(key2), [ __clone(key2), __clone(value2) ]);
+	const hash3 = hash2(key2);
+	self[0].set(hash3, __clone(key2));
+	self[1].set(hash3, __clone(value2));
 }
 function get2(self, key2) {
-	const $f = __map_get(self[0], hash2(key2));
-	let $g = null;
-	if ($f[0] === 0) {
-		const entry2 = $f[1];
-		$g = [ 0, __clone(entry2[1]) ];
-	} else {
-		$g = [ 1 ];
-	}
-	return $g;
+	return __map_get(self[1], hash2(key2));
 }
 function keys(self) {
-	let result = [  ];
-	for (const entry2 of __map_values(self[0])) {
-		result.push(__clone(entry2[0]));
-	}
-	return result;
-}
-function values(self) {
-	let result = [  ];
-	for (const entry2 of __map_values(self[0])) {
-		result.push(__clone(entry2[1]));
-	}
-	return result;
-}
-function entries(self) {
 	return __map_values(self[0]);
 }
+function values(self) {
+	return __map_values(self[1]);
+}
+function entries(self) {
+	let result = [  ];
+	for (const hash3 of __map_keys(self[1])) {
+		const $f = __map_get(self[0], hash3);
+		let $g = null;
+		if ($f[0] === 0) {
+			const key2 = $f[1];
+			const $h = __map_get(self[1], hash3);
+			let $i = null;
+			if ($h[0] === 0) {
+				const value2 = $h[1];
+				$i = result.push([ key2, value2 ]);
+			} else {
+				$i = undefined;
+			}
+			$g = $i;
+		} else {
+			$g = undefined;
+		}
+		$g;
+	}
+	return result;
+}
 function contains_value(self, value2) {
-	for (const entry2 of __map_values(self[0])) {
-		if (eq(entry2[1], value2)) {
+	for (const held of __map_values(self[1])) {
+		if (eq(held, value2)) {
 			return true;
 		}
 	}

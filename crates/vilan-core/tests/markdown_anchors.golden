@@ -365,6 +365,7 @@ std/collections.md h3 appending-a-run
 std/collections.md h3 joining
 std/collections.md h2 fixed-arrays-t-n
 std/collections.md h2 hashmapk-v
+std/collections.md h3 reading-and-writing-in-place
 std/collections.md h2 hashsett
 std/collections.md h2 memok-v
 std/collections.md h2 hashable

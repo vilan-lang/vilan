@@ -1439,9 +1439,15 @@ impl<T: Json + Clone> Json for Lazy<T> {
 /// on the JS side (`JSON.stringify` for an object, the value itself for a
 /// scalar); here the key's own `Hash`/`Eq` stand in, which is the same
 /// equivalence for every key type in S1a's scope.
+///
+/// A slot is `(key, Option<value>)`: the TOMBSTONE a removal leaves sits on
+/// the value (B689, hash-map-lend.md §2), so a present entry's value is a real
+/// `Option<V>` in memory and [`Map::lend`] hands it out as `&Option<V>` without
+/// copying it. An emptied slot's key stays until [`Map::compact`] drops it; the
+/// index never names one.
 pub struct Map<K, V> {
     index: HashMap<K, usize>,
-    entries: Vec<Option<(K, V)>>,
+    entries: Vec<(K, Option<V>)>,
     live: usize,
 }
 
@@ -1464,10 +1470,10 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
         match self.index.get(&key) {
             // A re-insert keeps the ORIGINAL position, exactly as a JS `Map`
             // does — the order is first-insertion order, not last-write order.
-            Some(slot) => self.entries[*slot] = Some((key, value)),
+            Some(slot) => self.entries[*slot] = (key, Some(value)),
             None => {
                 self.index.insert(key.clone(), self.entries.len());
-                self.entries.push(Some((key, value)));
+                self.entries.push((key, Some(value)));
                 self.live += 1;
             }
         }
@@ -1476,8 +1482,45 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
     pub fn get(&self, key: &K) -> Option<&V> {
         self.index
             .get(key)
-            .and_then(|slot| self.entries[*slot].as_ref())
-            .map(|(_, value)| value)
+            .and_then(|slot| self.entries[*slot].1.as_ref())
+    }
+
+    /// `read` called once with the slot under `key` — `&Some(value)` IN PLACE
+    /// while the key is held, `&None` otherwise — answering what `read`
+    /// answers. Nothing is cloned (`NativeMap::lend`, hash-map-lend.md §3.1).
+    pub fn lend<U>(&self, key: &K, read: impl FnOnce(&Option<V>) -> U) -> U {
+        match self.index.get(key) {
+            Some(slot) => read(&self.entries[*slot].1),
+            None => read(&None),
+        }
+    }
+
+    /// `write` called once with a WRITABLE slot under `key`, and the table
+    /// made to reflect it afterwards: a slot left `None` is removed (the key
+    /// gone from `contains_key`, `len` and every walk, compacting as
+    /// [`Map::remove`] does), a slot made `Some` under an absent key is
+    /// inserted LAST, and a present key keeps its place whatever was written.
+    /// Nothing is cloned (`NativeMap::lend_mut`).
+    pub fn lend_mut<U>(&mut self, key: K, write: impl FnOnce(&mut Option<V>) -> U) -> U {
+        match self.index.get(&key).copied() {
+            Some(slot) => {
+                let answer = write(&mut self.entries[slot].1);
+                if self.entries[slot].1.is_none() {
+                    self.index.remove(&key);
+                    self.live -= 1;
+                    self.compact_if_sparse();
+                }
+                answer
+            }
+            None => {
+                let mut fresh = None;
+                let answer = write(&mut fresh);
+                if let Some(value) = fresh {
+                    self.insert(key, value);
+                }
+                answer
+            }
+        }
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
@@ -1486,12 +1529,18 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
 
     pub fn remove(&mut self, key: &K) {
         if let Some(slot) = self.index.remove(key)
-            && self.entries[slot].take().is_some()
+            && self.entries[slot].1.take().is_some()
         {
             self.live -= 1;
-            if self.entries.len() - self.live > self.live {
-                self.compact();
-            }
+            self.compact_if_sparse();
+        }
+    }
+
+    /// M91's rule, shared by [`Map::remove`] and [`Map::lend_mut`]'s removal:
+    /// compact once the tombstones outnumber the live entries.
+    fn compact_if_sparse(&mut self) {
+        if self.entries.len() - self.live > self.live {
+            self.compact();
         }
     }
 
@@ -1511,11 +1560,14 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
     fn compact(&mut self) {
         let entries = std::mem::take(&mut self.entries);
         let mut kept = Vec::with_capacity(self.live);
-        for (key, value) in entries.into_iter().flatten() {
+        for (key, value) in entries {
+            if value.is_none() {
+                continue;
+            }
             if let Some(slot) = self.index.get_mut(&key) {
                 *slot = kept.len();
             }
-            kept.push(Some((key, value)));
+            kept.push((key, value));
         }
         self.entries = kept;
         let floor = self.live.max(8) * 2;
@@ -1547,7 +1599,7 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.entries
             .iter()
-            .filter_map(|entry| entry.as_ref().map(|(key, value)| (key, value)))
+            .filter_map(|(key, value)| value.as_ref().map(|value| (key, value)))
     }
 }
 
@@ -2636,6 +2688,115 @@ mod tests {
         }
         assert_eq!(set.values(), vec![999]);
         assert!(set.entries.entries.len() <= 3);
+    }
+
+    /// B689: `lend` reads the stored `Option<V>` IN PLACE — the very slot,
+    /// not a copy — and `&None` for an absent key, calling its reader once.
+    #[test]
+    fn lend_reads_the_stored_slot_in_place_and_none_when_absent() {
+        let mut map: Map<i32, Vec<i32>> = Map::new();
+        map.insert(1, vec![1, 2, 3]);
+        let stored = map.get(&1).map(|list| list.as_ptr());
+        let lent = map.lend(&1, |slot| slot.as_ref().map(|list| list.as_ptr()));
+        assert_eq!(lent, stored, "the reader sees the stored list itself");
+        let mut calls = 0;
+        let absent = map.lend(&2, |slot| {
+            calls += 1;
+            slot.is_none()
+        });
+        assert!(absent);
+        assert_eq!(calls, 1);
+        map.remove(&1);
+        assert!(
+            map.lend(&1, |slot| slot.is_none()),
+            "a removed key reads None"
+        );
+    }
+
+    /// B689 / M182: `lend_mut` — a write lands in place and the key keeps its
+    /// position; a slot left `None` removes the key (len, contains_key and
+    /// the walk all agree); a slot made `Some` under an absent key goes LAST;
+    /// a `None` left under an absent key inserts nothing.
+    #[test]
+    fn lend_mut_writes_in_place_inserts_last_and_removes_on_none() {
+        let mut map: Map<i32, Vec<i32>> = Map::new();
+        map.insert(1, vec![10]);
+        map.insert(2, vec![20]);
+        map.insert(3, vec![30]);
+        let answer = map.lend_mut(1, |slot| {
+            if let Some(list) = slot {
+                list.push(11);
+            }
+            "written"
+        });
+        assert_eq!(answer, "written");
+        assert_eq!(map.keys(), vec![1, 2, 3], "a present key keeps its place");
+        assert_eq!(map.get(&1), Some(&vec![10, 11]));
+
+        map.lend_mut(2, |slot| *slot = None);
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key(&2));
+        assert_eq!(map.keys(), vec![1, 3]);
+        assert_eq!(map.values(), vec![vec![10, 11], vec![30]]);
+
+        map.lend_mut(4, |slot| {
+            assert!(slot.is_none(), "an absent key lends None");
+            *slot = Some(vec![40]);
+        });
+        map.lend_mut(2, |slot| *slot = Some(vec![22]));
+        assert_eq!(map.keys(), vec![1, 3, 4, 2], "new keys go last");
+        assert_eq!(map.len(), 4);
+
+        map.lend_mut(9, |_| {});
+        assert!(
+            !map.contains_key(&9),
+            "a None under an absent key is no insert"
+        );
+        assert_eq!(map.len(), 4);
+
+        map.lend_mut(3, |slot| *slot = Some(vec![33]));
+        assert_eq!(
+            map.keys(),
+            vec![1, 3, 4, 2],
+            "a replaced value keeps its key's place"
+        );
+        assert_eq!(map.get(&3), Some(&vec![33]));
+    }
+
+    /// The tombstone on the value: removals through `remove` AND through
+    /// `lend_mut` count against `live` and trip M91's compaction alike, and
+    /// the walk keeps insertion order through it, the index following.
+    #[test]
+    fn removals_through_lend_mut_compact_like_remove_and_keep_the_order() {
+        let mut map: Map<i32, i32> = Map::new();
+        for key in 0..10 {
+            map.insert(key, key);
+        }
+        for key in [0, 2, 4] {
+            map.remove(&key);
+        }
+        for key in [6, 8] {
+            map.lend_mut(key, |slot| *slot = None);
+        }
+        assert_eq!(map.len(), 5);
+        assert_eq!(map.live, 5);
+        assert!(
+            map.entries.len() <= 2 * map.len(),
+            "{} slots for {} live after five removals: compacted",
+            map.entries.len(),
+            map.len()
+        );
+        assert_eq!(map.keys(), vec![1, 3, 5, 7, 9]);
+        for key in [1, 3, 5, 7, 9] {
+            assert_eq!(map.lend(&key, |slot| *slot), Some(key), "index follows");
+        }
+        map.lend_mut(1, |slot| *slot = None);
+        map.insert(1, 100);
+        assert_eq!(
+            map.keys(),
+            vec![3, 5, 7, 9, 1],
+            "a key removed and re-made goes last"
+        );
     }
 
     #[test]

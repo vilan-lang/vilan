@@ -307,21 +307,18 @@ export function walker(value: any, types: any[], root: number, read: string, ...
             }
             case 'cell':
                 return group(type.label + '(', ')', false, [['', show(current[type.field].v, type.value)]], false, 'c');
-            case 'map':
+            case 'map': {
+                // Two tables of one insertion order (B689): the keys at
+                // `type.keys`, the values at `type.values`, side by side.
+                const stored = Array.from(current[type.values].values());
                 return members(
                     type.label + ' {',
-                    Array.from(current[type.field].values()),
-                    (pair: any): [string, Doc] => {
-                        const key = type.keyWidth === 1 ? pair[0] : pair.slice(0, type.keyWidth);
-                        const entry =
-                            type.valueWidth === 1
-                                ? pair[type.keyWidth]
-                                : pair.slice(type.keyWidth, type.keyWidth + type.valueWidth);
-                        return [one(show(key, type.key)) + ' => ', show(entry, type.value)];
-                    },
+                    Array.from(current[type.keys].values(), (key: any, index: number) => [key, stored[index]]),
+                    (entry: any): [string, Doc] => [one(show(entry[0], type.key)) + ' => ', show(entry[1], type.value)],
                     false,
                     'm',
                 );
+            }
             case 'set':
                 return members(
                     type.label + ' {',

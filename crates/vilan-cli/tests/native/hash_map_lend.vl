@@ -1,0 +1,126 @@
+// B689 / M182 (proposal/hash-map-lend.md §4.8): a `HashMap` read and written in
+// place — `peek`, `modify`, `update` — and the store's keyed step that lends
+// through them, on both backends. Every line is one of §4's semantics 1-4 or a
+// read, write or removal through `Store<HashMap<K, V>>::at(key)`.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::reactive::store::Store;
+import std::shared::Shared;
+
+[derive(PartialEq, Storable)]
+struct Record {
+	title: str,
+	notes: List<str>,
+}
+
+[derive(Storable)]
+struct State {
+	records: HashMap<i32, Record>,
+}
+
+fun fresh(runs: Shared<i32>): List<i32> {
+	runs.write() = runs.read() + 1;
+	[0]
+}
+
+fun main() {
+	// 1: `peek` reads `&None` on a miss and the stored value on a hit, and sees
+	// a write made through `modify`.
+	mut scores: HashMap<str, List<i32>> = HashMap::new();
+	print(scores.peek("ada", |slot| slot.is_none()));
+	scores.insert("ada", [1, 2]);
+	print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
+	scores.modify("ada", |slot: &mut Option<List<i32>>| {
+		match &mut slot {
+			Some(let list) => list.push(3),
+			None => {},
+		}
+	});
+	print(scores.get("ada").unwrap_or([]));
+
+	// 2: `modify` leaving `None` removes the key everywhere.
+	mut ages: HashMap<str, i32> = HashMap::new();
+	ages.insert("ada", 36);
+	ages.insert("alan", 41);
+	ages.insert("grace", 85);
+	let was = ages.modify("alan", |slot| {
+		let held = slot.unwrap_or(0);
+		slot = None;
+		held
+	});
+	print(was);
+	print(ages.contains_key("alan"));
+	print(ages.len());
+	print(ages.keys());
+	print(ages.values());
+
+	// 3: `Some` under an absent key goes last; a present key keeps its place;
+	// `None` under an absent key inserts nothing.
+	ages.modify("linus", |slot| {
+		slot = Some(54);
+	});
+	ages.modify("ada", |slot| {
+		slot = Some(37);
+	});
+	ages.modify("ken", |slot| {});
+	ages.insert("alan", 42);
+	for entry in ages.entries() {
+		print(i"{entry.0} {entry.1}");
+	}
+
+	// 4: `update` makes `missing` only on a miss, then changes in place.
+	let runs = Shared::new(0);
+	mut groups: HashMap<i32, List<i32>> = HashMap::new();
+	mut index = 0;
+	for index < 7 {
+		groups.update(index % 2, fresh(runs), |list| list.push(index));
+		index += 1;
+	}
+	print(groups.get(0).unwrap_or([]));
+	print(groups.get(1).unwrap_or([]));
+	print(runs.read());
+	// The two tables compare as one map: the same keys, equal values, any order.
+	mut reordered: HashMap<i32, List<i32>> = HashMap::new();
+	reordered.insert(1, groups.get(1).unwrap_or([]));
+	reordered.insert(0, groups.get(0).unwrap_or([]));
+	print(groups == reordered);
+	reordered.update(0, [], |list| list.push(99));
+	print(groups == reordered);
+
+	// `insert` keeps COPIES of the key and the value (`own value` on the
+	// table's insert): the caller's later writes reach neither table, nor a
+	// set's member.
+	mut lists: HashMap<List<i32>, List<i32>> = HashMap::new();
+	mut key = [1];
+	mut value = [10];
+	lists.insert(key, value);
+	key.push(2);
+	value.push(20);
+	print(lists.keys());
+	print(lists.values());
+	mut set: HashSet<List<i32>> = HashSet::new();
+	mut member = [1];
+	set.insert(member);
+	member.push(2);
+	for item in set {
+		print(item);
+	}
+
+	// The store's keyed step: a read through `at(1).some().title()`, a write
+	// through it, an insert and a removal through `at(key).set(..)`.
+	mut records: HashMap<i32, Record> = HashMap::new();
+	records.insert(1, Record { title = "first", notes = ["a", "b"] });
+	let store = Store::new(State { records });
+	let title = store.records().at(1).some().title();
+	print(title.get().unwrap_or("?"));
+	let _renamed = title.patch("renamed");
+	print(title.get().unwrap_or("?"));
+	store.records().at(2).set(Some(Record { title = "second", notes = [] }));
+	print(store.records().len());
+	store.records().at(1).set(None);
+	print(store.records().len());
+	print(store.records().at(1).get().is_none());
+	print(store.records().at(2).some().title().get().unwrap_or("?"));
+	print(store.records().at(2).some().notes().get().map_or(|notes| notes.len(), 9usize));
+}

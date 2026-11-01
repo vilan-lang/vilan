@@ -128,7 +128,7 @@ fun needy(tag: str) {
     print(tag + " " + current.get());
 }
 
-fun peek(): str {
+fun peek_current(): str {
     match current.get_safe() {
         Some(let value) => value,
         None => "none",
@@ -140,8 +140,8 @@ fun relay() {
     let again = || needy("inner");
     again();
     needy("outer again");
-    print(peek());
-    print(peek());
+    print(peek_current());
+    print(peek_current());
 }
 
 fun main() {
@@ -158,8 +158,8 @@ fun main() {
         needy[0], needy[1],
         "the closure keeps its own entity: {needy:?}"
     );
-    let peek = threaded_arguments(source, "relay", "peek");
-    assert_eq!(peek.len(), 2, "two calls of `peek`: {peek:?}");
+    let peek = threaded_arguments(source, "relay", "peek_current");
+    assert_eq!(peek.len(), 2, "two calls of `peek_current`: {peek:?}");
     assert_ne!(
         peek[0], peek[1],
         "a `Some(..)` wrap is a call per site: {peek:?}"

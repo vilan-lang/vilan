@@ -372,3 +372,31 @@ class = "ci"
 ratio = 1.009
 reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0059 of the base v0.53.0 on the lane's box"
 item = "A178"
+
+[[bump]]
+subject = "example:math"
+class = "reference"
+ratio = 1.01
+reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0072 of next's std (7911d954) under the lane's build on the lane's box"
+item = "B689"
+
+[[bump]]
+subject = "example:math"
+class = "ci"
+ratio = 1.01
+reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0072 of next's std (7911d954) under the lane's build on the lane's box"
+item = "B689"
+
+[[bump]]
+subject = "example:watch"
+class = "reference"
+ratio = 1.01
+reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0071 of next's std (7911d954) under the lane's build on the lane's box"
+item = "B689"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.01
+reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0071 of next's std (7911d954) under the lane's build on the lane's box"
+item = "B689"

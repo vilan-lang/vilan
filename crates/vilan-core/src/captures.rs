@@ -359,6 +359,7 @@ pub fn mutates_its_receiver(intrinsic: Intrinsic) -> bool {
             | Intrinsic::ListSortBy
             | Intrinsic::MapInsert
             | Intrinsic::MapRemove
+            | Intrinsic::MapLendMut
             | Intrinsic::SetInsert
             | Intrinsic::SetRemove
     )
