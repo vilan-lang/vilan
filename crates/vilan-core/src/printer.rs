@@ -77,11 +77,13 @@ pub enum Shape {
         field: (usize, String),
         value: TypeId,
     },
-    /// S1b: std's `HashMap<K, V>` — `HashMap { k => v, .. }`, its entries
-    /// the `(K, V)` pairs of the table at `field`, in insertion order.
+    /// S1b: std's `HashMap<K, V>` — `HashMap { k => v, .. }`, its keys the
+    /// table at `keys` and its values the table at `values` (B689: two tables
+    /// of one insertion order), walked side by side.
     Map {
         label: String,
-        field: (usize, String),
+        keys: (usize, String),
+        values: (usize, String),
         key: TypeId,
         value: TypeId,
     },
@@ -548,7 +550,8 @@ fn std_handle_shape(program: &Program, struct_id: Id, arguments: &[TypeId]) -> O
         }),
         "HashMap" => Some(Shape::Map {
             label: "HashMap".to_string(),
-            field: field("table")?,
+            keys: field("keys")?,
+            values: field("values")?,
             key: *arguments.first()?,
             value: *arguments.get(1)?,
         }),

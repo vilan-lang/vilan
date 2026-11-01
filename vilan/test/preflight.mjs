@@ -22,12 +22,8 @@ function class_list(self) {
 	return out;
 }
 function values(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry.slice(1, 3)));
-	}
-	return result;
+	return __map_values(self[1]);
 }
-const card = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ] ]) ] ];
+const card = [ [ new Map([ [ "::display", "::display" ] ]), new Map([ [ "::display", [ "sbiovxm", "display:flex" ] ] ]) ] ];
 console.log(class_list(card));
 //# sourceMappingURL=preflight.mjs.map

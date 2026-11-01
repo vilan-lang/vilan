@@ -1,14 +1,14 @@
 # Emitted `__clone` call sites per corpus golden — the copy-elision
 # census (lifetimes.md §11, slice S2). Regenerate with
 # VILAN_REGENERATE_COPY_ELISION_CENSUS=1 cargo test -p vilan-cli --test copy_elision_census
-# total	591
+# total	579
 adapt	0
 arena	6
 asset_bundle	0
 async-await	0
 async-promise-all	0
 await-postfix	0
-backed-enum-keys	6
+backed-enum-keys	7
 blanket-impl	10
 bool	0
 borrows	0
@@ -22,7 +22,7 @@ const	0
 copy-elision	0
 copy-in-loop	1
 crypto	3
-css-block	9
+css-block	6
 db	0
 default	0
 default-generic-param	0
@@ -80,7 +80,7 @@ macro-block	0
 macro-derive	0
 macro-invoke	0
 main-ret	0
-map	12
+map	8
 match-ergonomics	0
 match-patterns	0
 math	4
@@ -96,7 +96,7 @@ option-view	0
 parse-bool	3
 parse-f64	2
 parse-i32	2
-preflight	1
+preflight	0
 prelude	1
 process-env	2
 range	0
@@ -105,7 +105,7 @@ reactive-flatten	31
 reactive-keyed	1
 reactive-on-change	35
 reactive-owner	31
-reactive-selector	22
+reactive-selector	23
 reactive-turns	11
 reconcile-index	5
 recursion	0
@@ -116,7 +116,7 @@ resource_take	2
 result-combinators	16
 scoped-import	0
 self-return	0
-set	1
+set	3
 shared	0
 shared-compound-write	16
 side-effect-let	0
@@ -128,10 +128,10 @@ stdin-lines	2
 string-interpolation	0
 string-methods	0
 struct-literal-call	0
-style	9
-style-when	11
+style	6
+style-when	8
 subscript	1
-theme	1
+theme	0
 time	5
 trait-default	0
 transparent-references	1
@@ -140,7 +140,7 @@ tuple-access	0
 tuple-spread	10
 unary-minus	0
 unsigned-saturate	0
-usize	6
+usize	5
 usize-literals	4
 usize-underflow	0
 value-semantics	3

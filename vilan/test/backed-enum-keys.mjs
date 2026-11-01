@@ -20,46 +20,41 @@ function hash3(self) {
 	return __hash(self);
 }
 function new2() {
-	const table = new Map();
-	return [ table ];
+	const keys = new Map();
+	const values = new Map();
+	return [ keys, values ];
 }
 function insert(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
+	const hash4 = hash(key);
+	self[0].set(hash4, __clone(key));
+	self[1].set(hash4, __clone(value));
 }
 function get(self, key) {
-	const $a = __map_get(self[0], hash(key));
+	return __map_get(self[1], hash(key));
+}
+function unwrap_or(self, fallback) {
+	const $a = self;
 	let $b = null;
 	if ($a[0] === 0) {
-		const entry = $a[1];
-		$b = [ 0, __clone(entry[1]) ];
+		const x = __clone($a[1]);
+		$b = x;
 	} else {
-		$b = [ 1 ];
+		$b = __clone(fallback);
 	}
 	return $b;
 }
-function unwrap_or(self, fallback) {
-	const $c = self;
-	let $d = null;
-	if ($c[0] === 0) {
-		const x = __clone($c[1]);
-		$d = x;
-	} else {
-		$d = __clone(fallback);
-	}
-	return $d;
-}
 function contains_key(self, key) {
-	return self[0].has(hash(key));
+	return self[1].has(hash(key));
 }
 function len(self) {
-	return self[0].size;
+	return self[1].size;
 }
 function new3() {
 	const table = new Map();
 	return [ table ];
 }
 function insert2(self, value) {
-	self[0].set(hash2(value), value);
+	self[0].set(hash2(value), __clone(value));
 }
 function contains(self, value) {
 	return self[0].has(hash2(value));
@@ -68,7 +63,7 @@ function len2(self) {
 	return self[0].size;
 }
 function insert3(self, value) {
-	self[0].set(hash3(value), value);
+	self[0].set(hash3(value), __clone(value));
 }
 function contains2(self, value) {
 	return self[0].has(hash3(value));

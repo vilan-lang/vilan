@@ -677,6 +677,351 @@ fn i8_hash_map_get_or_insert_stores_the_key_it_was_given() {
     );
 }
 
+// --- B689 / M182: a `HashMap` read and written in place --------------------
+//
+// proposal/hash-map-lend.md §4. `peek` lends the slot under a key as an
+// `&Option<V>`, `modify` as an `&mut Option<V>` whose final state the map
+// takes on (None removes, Some under an absent key inserts LAST, a present key
+// keeps its place), and `update` is M182's grouping idiom over `modify`. The
+// native leg of 1-4 is `native_differential`'s
+// `b689_hash_map_lends_in_place_on_both_backends`.
+
+/// §4.1: `peek` on an absent key reads `&None`; on a present key it reads the
+/// stored value, and a write through `modify` is what the next `peek` sees.
+#[test]
+fn b689_peek_reads_the_slot_and_sees_a_write_through_modify() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut scores: HashMap<str, List<i32>> = HashMap::new();
+            print(scores.peek("ada", |slot| slot.is_none()));
+            scores.insert("ada", [1, 2]);
+            print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
+            scores.modify("ada", |slot: &mut Option<List<i32>>| {
+                match &mut slot {
+                    Some(let list) => list.push(3),
+                    None => {},
+                }
+            });
+            print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
+            print(scores.get("ada").unwrap_or([]));
+            print(scores.peek("alan", |slot| slot.is_some()));
+        }
+        "#,
+        "true\n2\n3\n[1, 2, 3]\nfalse\n",
+    );
+}
+
+/// §4.2: `modify` leaving the slot `None` removes the key — `contains_key`,
+/// `len`, `keys()`, `values()` and `entries()` all agree it is gone — and its
+/// answer is the writer's.
+#[test]
+fn b689_modify_leaving_none_removes_the_key() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut ages: HashMap<str, i32> = HashMap::new();
+            ages.insert("ada", 36);
+            ages.insert("alan", 41);
+            ages.insert("grace", 85);
+            let was = ages.modify("alan", |slot| {
+                let held = slot.unwrap_or(0);
+                slot = None;
+                held
+            });
+            print(was);
+            print(ages.contains_key("alan"));
+            print(ages.len());
+            print(ages.keys());
+            print(ages.values());
+            print(ages.entries().len());
+            print(ages.get("alan").is_none());
+        }
+        "#,
+        "41\nfalse\n2\n[\"ada\", \"grace\"]\n[36, 85]\n2\ntrue\n",
+    );
+}
+
+/// §4.3: `modify` making the slot `Some` under an ABSENT key inserts it last;
+/// under a PRESENT key the key keeps its position whatever is written; a `None`
+/// left under an absent key inserts nothing.
+#[test]
+fn b689_modify_inserts_an_absent_key_last_and_keeps_a_present_keys_place() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut ages: HashMap<str, i32> = HashMap::new();
+            ages.insert("ada", 36);
+            ages.insert("alan", 41);
+            ages.modify("grace", |slot| {
+                slot = Some(85);
+            });
+            ages.modify("ada", |slot| {
+                slot = Some(37);
+            });
+            ages.modify("linus", |slot| {});
+            print(ages.keys());
+            print(ages.values());
+            print(ages.contains_key("linus"));
+            ages.modify("alan", |slot| {
+                slot = None;
+            });
+            ages.modify("alan", |slot| {
+                slot = Some(42);
+            });
+            for entry in ages.entries() {
+                print(i"{entry.0} {entry.1}");
+            }
+        }
+        "#,
+        "[\"ada\", \"alan\", \"grace\"]\n[37, 41, 85]\nfalse\nada 37\ngrace 85\nalan 42\n",
+    );
+}
+
+/// §4.4: `update` on a miss inserts `missing` and then applies `change`; on a
+/// hit only `change` runs — and `missing`, being `lazy`, is not evaluated at all
+/// there (its maker counts its runs through a `Shared`).
+#[test]
+fn m182_update_makes_missing_only_on_a_miss_and_changes_in_place() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::shared::Shared;
+
+        fun fresh(runs: Shared<i32>): List<i32> {
+            runs.write() = runs.read() + 1;
+            [0]
+        }
+
+        fun main() {
+            let runs = Shared::new(0);
+            mut groups: HashMap<str, List<i32>> = HashMap::new();
+            groups.update("a", fresh(runs), |list| list.push(1));
+            groups.update("a", fresh(runs), |list| list.push(2));
+            groups.update("b", fresh(runs), |list| list.push(3));
+            groups.update("a", fresh(runs), |list| list.push(4));
+            print(groups.get("a").unwrap_or([]));
+            print(groups.get("b").unwrap_or([]));
+            print(groups.keys());
+            print(runs.read());
+        }
+        "#,
+        "[0, 1, 2, 4]\n[0, 3]\n[\"a\", \"b\"]\n2\n",
+    );
+}
+
+/// M182's grouping idiom, the item's own repro rewritten on `update`: rows
+/// into each key's list in insertion order, every push landing in place.
+#[test]
+fn m182_update_groups_rows_under_their_keys() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut groups: HashMap<i32, List<i32>> = HashMap::new();
+            mut index = 0;
+            for index < 10 {
+                groups.update(index % 3, [], |list| list.push(index));
+                index += 1;
+            }
+            for entry in groups.entries() {
+                print(entry.0);
+                print(entry.1);
+            }
+        }
+        "#,
+        "0\n[0, 3, 6, 9]\n1\n[1, 4, 7]\n2\n[2, 5, 8]\n",
+    );
+}
+
+/// Value semantics through the two tables: `insert` KEEPS a copy of the key
+/// and the value it is given (`NativeMap::insert` takes `own value`, as
+/// `List::push` does), so the caller's later writes to its own bindings do not
+/// reach the map — nor, through the same external, a `HashSet`'s member, which
+/// the JS backend aliased before. A value copied OUT by `get` is the caller's.
+#[test]
+fn b689_insert_keeps_copies_of_what_it_is_given() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        fun main() {
+            mut map: HashMap<List<i32>, List<i32>> = HashMap::new();
+            mut key = [1];
+            mut value = [10];
+            map.insert(key, value);
+            key.push(2);
+            value.push(20);
+            print(map.keys());
+            print(map.values());
+            mut got = map.get([1]).unwrap_or([]);
+            got.push(30);
+            print(map.values());
+            mut set: HashSet<List<i32>> = HashSet::new();
+            mut member = [1];
+            set.insert(member);
+            member.push(2);
+            print(set.contains([1]));
+            for item in set {
+                print(item);
+            }
+        }
+        "#,
+        "[[1]]\n[[10]]\n[[10]]\ntrue\n[1]\n",
+    );
+}
+
+/// The body of the emitted `function {name}(` — through its matching brace.
+fn emitted_function<'js>(js: &'js str, name: &str) -> &'js str {
+    let head = format!("function {name}(");
+    let start = js
+        .find(&head)
+        .unwrap_or_else(|| panic!("no `{head}` in the output:\n{js}"));
+    let mut depth = 0usize;
+    for (offset, character) in js[start..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &js[start..start + offset + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{head}` never closes")
+}
+
+/// §4.5, the CODEGEN SHAPE of B689's repro: the store's keyed step lends the
+/// map's slot — `at`'s two closures call `peek`/`modify`, which hand the slot
+/// to `__map_lend`/`__map_lend_mut`, and NONE of the four clones anything. A
+/// read through `at(1).some().title().get()` copies only the leaf (the
+/// timings are the lane report's: a timing is not a gate).
+#[test]
+fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
+    let js = compile(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::reactive::store::Store;
+
+        [derive(PartialEq, Storable)]
+        struct Record {
+            title: str,
+            notes: List<str>,
+        }
+
+        [derive(Storable)]
+        struct State {
+            records: HashMap<i32, Record>,
+        }
+
+        fun main() {
+            mut records: HashMap<i32, Record> = HashMap::new();
+            records.insert(1, Record { title = "first", notes = ["a", "b"] });
+            let store = Store::new(State { records });
+            print(store.records().at(1).some().title().get().unwrap_or("?"));
+            let _changed = store.records().at(1).some().title().patch("renamed");
+            print(store.records().at(1).some().title().get().unwrap_or("?"));
+        }
+        "#,
+    )
+    .expect("the B689 repro compiles");
+    let at = emitted_function(&js, "at");
+    // The emitter suffixes a name another function already took (`peek2`),
+    // so the two the step calls are read off its own body.
+    let callee = |method: &str| -> String {
+        let marker = "(held, key, f)";
+        at.match_indices(marker)
+            .map(|(end, _)| {
+                let head = &at[..end];
+                let start = head
+                    .rfind(|character: char| !(character.is_alphanumeric() || character == '_'))
+                    .map_or(0, |offset| offset + 1);
+                head[start..].to_string()
+            })
+            .find(|name| name.starts_with(method))
+            .unwrap_or_else(|| panic!("the keyed step lends through `{method}`:\n{at}"))
+    };
+    let (peek, modify) = (callee("peek"), callee("modify"));
+    for name in ["at", &peek, &modify, "__map_lend", "__map_lend_mut"] {
+        let body = emitted_function(&js, name);
+        // The one copy on the path is of the KEY, and only when `modify` makes
+        // a key the map did not hold (the keys table keeps its own, as
+        // `insert` does); the value is never copied.
+        let without_the_new_key = body.replace("__clone(key)", "");
+        assert!(
+            !without_the_new_key.contains("__clone"),
+            "`{name}` copies on the keyed step:\n{body}"
+        );
+    }
+    assert!(
+        emitted_function(&js, &peek).contains("__map_lend("),
+        "`peek` is the in-place lend"
+    );
+    assert!(
+        emitted_function(&js, &modify).contains("__map_lend_mut("),
+        "`modify` is the in-place write"
+    );
+}
+
+/// §4.5 run, and §4.6: the same reads and writes through `at(key)` answer the
+/// values they did when the step copied — a write through `some().title()`
+/// lands in the map, `at(2).set(Some(..))` inserts, `at(1).set(None)` removes.
+#[test]
+fn b689_a_store_write_through_the_keyed_step_lands_in_place() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::reactive::store::Store;
+
+        [derive(PartialEq, Storable)]
+        struct Record {
+            title: str,
+            notes: List<str>,
+        }
+
+        [derive(Storable)]
+        struct State {
+            records: HashMap<i32, Record>,
+        }
+
+        fun main() {
+            mut records: HashMap<i32, Record> = HashMap::new();
+            records.insert(1, Record { title = "first", notes = ["a"] });
+            let store = Store::new(State { records });
+            let title = store.records().at(1).some().title();
+            print(title.get().unwrap_or("?"));
+            let _changed = title.patch("renamed");
+            print(title.get().unwrap_or("?"));
+            store.records().at(2).set(Some(Record { title = "second", notes = [] }));
+            print(store.records().len());
+            store.records().at(1).set(None);
+            print(store.records().len());
+            print(store.records().at(1).get().is_none());
+            print(store.records().at(2).some().title().get().unwrap_or("?"));
+        }
+        "#,
+        "first\nrenamed\n2\n1\ntrue\nsecond\n",
+    );
+}
+
 /// `Memo::get_or_insert` stays three steps (read, make, write) rather than a
 /// call to `HashMap::get_or_insert` through `write()`, because a maker may ask
 /// the same memo again: the memoized recursion. Pinned so a "thin wrapper"

@@ -57,13 +57,10 @@ function __dbg_members(open, items, show, fill) {
 	}
 	return __dbg_group(open, "}", true, entries, fill);
 }
-function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {
-	const items = Array.from(table.values());
-	return __dbg_members(open, items, (pair) => {
-		const key = keyWidth === 1 ? pair[0] : pair.slice(0, keyWidth);
-		const value = valueWidth === 1 ? pair[keyWidth] : pair.slice(keyWidth, keyWidth + valueWidth);
-		return [ __dbg_flat(showKey(key)) + " => ", showValue(value) ];
-	});
+function __dbg_map(open, keys, values, showKey, showValue) {
+	const stored = Array.from(values.values());
+	const items = Array.from(keys.values(), (key, index) => [ key, stored[index] ]);
+	return __dbg_members(open, items, (entry) => [ __dbg_flat(showKey(entry[0])) + " => ", showValue(entry[1]) ]);
 }
 function __dbg_set(open, table, show, fill) {
 	return __dbg_members(open, Array.from(table.values()), (item) => [ "", show(item) ], fill);
@@ -413,7 +410,7 @@ function new3() {
 	return [ table ];
 }
 function insert(self, value) {
-	self[0].set(hash2(value), value);
+	self[0].set(hash2(value), __clone(value));
 }
 function to_set(self) {
 	let result = new3();
@@ -446,11 +443,14 @@ function to_list5(self) {
 	return result;
 }
 function new4() {
-	const table = new Map();
-	return [ table ];
+	const keys = new Map();
+	const values = new Map();
+	return [ keys, values ];
 }
 function insert2(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
+	const hash3 = hash(key);
+	self[0].set(hash3, __clone(key));
+	self[1].set(hash3, __clone(value));
 }
 function to_map(self) {
 	let result = new4();
@@ -460,36 +460,28 @@ function to_map(self) {
 	return result;
 }
 function get(self, key) {
-	const $M = __map_get(self[0], hash(key));
+	return __map_get(self[1], hash(key));
+}
+function unwrap_or(self, fallback) {
+	const $M = self;
 	let $N = null;
 	if ($M[0] === 0) {
-		const entry2 = $M[1];
-		$N = [ 0, __clone(entry2[1]) ];
+		const x = __clone($M[1]);
+		$N = x;
 	} else {
-		$N = [ 1 ];
+		$N = __clone(fallback);
 	}
 	return $N;
 }
-function unwrap_or(self, fallback) {
-	const $O = self;
-	let $P = null;
-	if ($O[0] === 0) {
-		const x = __clone($O[1]);
-		$P = x;
-	} else {
-		$P = __clone(fallback);
-	}
-	return $P;
-}
 function count2(self) {
 	let seen = 0;
-	const $Q = self;
+	const $O = self;
 	while (true) {
-		const $R = next3($Q);
-		if ($R[0] !== 0) {
+		const $P = next3($O);
+		if ($P[0] !== 0) {
 			break;
 		}
-		const _value = $R[1];
+		const _value = $P[1];
 		seen = seen + 1;
 	}
 	return seen;

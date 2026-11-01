@@ -1682,24 +1682,21 @@ impl<'a> Interpreter<'a> {
             }
             "__dbg_map" => {
                 let open = take(0);
-                let items = map_or_set_values(&take(1))?;
-                let (show_key, show_value) = (take(2), take(3));
-                let key_width = expect_number(&take(4))? as usize;
-                let value_width = expect_number(&take(5))? as usize;
+                let keys = map_or_set_values(&take(1))?;
+                let values = map_or_set_values(&take(2))?;
+                let (show_key, show_value) = (take(3), take(4));
+                let items = keys
+                    .into_iter()
+                    .zip(values)
+                    .map(|(key, value)| array(vec![key, value]))
+                    .collect();
                 self.dbg_members(
                     open,
                     items,
-                    |interpreter, pair| {
-                        let slots = array_items(&pair)?;
-                        let slice = |from: usize, width: usize| -> Value<'a> {
-                            if width == 1 {
-                                slots.get(from).cloned().unwrap_or(Value::Undefined)
-                            } else {
-                                array(slots.iter().skip(from).take(width).cloned().collect())
-                            }
-                        };
-                        let key = slice(0, key_width);
-                        let value = slice(key_width, value_width);
+                    |interpreter, entry| {
+                        let slots = array_items(&entry)?;
+                        let key = slots.first().cloned().unwrap_or(Value::Undefined);
+                        let value = slots.get(1).cloned().unwrap_or(Value::Undefined);
                         let key_document = interpreter.call_value(&show_key, vec![key])?;
                         let label = format!("{} => ", dbg_flat(&key_document)?);
                         let value_document = interpreter.call_value(&show_value, vec![value])?;
@@ -2552,6 +2549,43 @@ impl<'a> Interpreter<'a> {
                     Some((_, value)) => Ok(option_some(deep_clone(value))),
                     None => Ok(option_none()),
                 }
+            }
+            // B689: the slot as an `Option` view ALIASING the stored value —
+            // `Value`'s aggregates are `Rc`-shared, so `value.clone()` is the
+            // in-place view the emitted helper hands out, never a deep copy.
+            "__map_lend" => {
+                let map = expect_map(&take(0))?;
+                let key = Key::of(&take(1))?;
+                let read = take(2);
+                let view = match map.borrow().get(&key) {
+                    Some((_, value)) => option_some(value.clone()),
+                    None => option_none(),
+                };
+                self.call_value(&read, vec![view])
+            }
+            // The writable twin: the table is written back from the view once
+            // `write` returns — `Some` sets the slot (a present key keeps its
+            // position, an absent one goes last), `None` removes the key.
+            "__map_lend_mut" => {
+                let map = expect_map(&take(0))?;
+                let key_value = take(1);
+                let key = Key::of(&key_value)?;
+                let write = take(2);
+                let view = match map.borrow().get(&key) {
+                    Some((_, value)) => option_some(value.clone()),
+                    None => option_none(),
+                };
+                let answer = self.call_value(&write, vec![view.clone()])?;
+                let slot = array_items(&view)?;
+                match (slot.first(), slot.get(1)) {
+                    (Some(Value::Number(tag)), Some(value)) if *tag == 0.0 => {
+                        map.borrow_mut().insert(key, (key_value, value.clone()));
+                    }
+                    _ => {
+                        map.borrow_mut().shift_remove(&key);
+                    }
+                }
+                Ok(answer)
             }
             "__map_keys" => {
                 let map = expect_map(&take(0))?;

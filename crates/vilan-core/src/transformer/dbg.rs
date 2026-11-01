@@ -460,23 +460,21 @@ impl<'src> Transformer<'src> {
             }
             Shape::Map {
                 label,
-                field: (index, _),
+                keys: (keys, _),
+                values: (values, _),
                 key,
                 value: entry_value,
             } => {
-                let key_width = self.flat_width(key);
-                let value_width = self.flat_width(entry_value);
                 let key_printer = self.printer_for(key);
                 let value_printer = self.printer_for(entry_value);
                 call(
                     "__dbg_map",
                     vec![
                         text(format!("{label} {{")),
-                        slot(index),
+                        slot(keys),
+                        slot(values),
                         js::Node::Local(key_printer),
                         js::Node::Local(value_printer),
-                        js::Node::Number(key_width.to_string(), None),
-                        js::Node::Number(value_width.to_string(), None),
                     ],
                 )
             }

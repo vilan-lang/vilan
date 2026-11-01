@@ -1073,8 +1073,11 @@ export impl Store<Option<type P>> {
 	/// The `Some` payload, as a handle through it.
 	fun some(self): StoreSome<P> {
 		self.variant(1, |held: &Option<P>, f: |&P| void| {
-			match held {
-				Some(let payload) => f(&payload),
+			// In place too (B689): matched through `&`, the capture is a view into
+			// the payload, so the native backend reads it where it is rather than
+			// copying the whole `Option` to destructure it.
+			match &held {
+				Some(let payload) => f(payload),
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {
@@ -1097,8 +1100,11 @@ export impl Store<Option<type P>> {
 export impl StoreSome<Option<type P>> {
 	fun some(self): StoreSome<P> {
 		self.variant(1, |held: &Option<P>, f: |&P| void| {
-			match held {
-				Some(let payload) => f(&payload),
+			// In place too (B689): matched through `&`, the capture is a view into
+			// the payload, so the native backend reads it where it is rather than
+			// copying the whole `Option` to destructure it.
+			match &held {
+				Some(let payload) => f(payload),
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {

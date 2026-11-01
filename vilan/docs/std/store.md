@@ -296,7 +296,11 @@ A collection field takes its declared shape — no derive to write:
   slot is that key's alone: a write to key 7 wakes the readers of key 7 and
   nobody else. `at(key).set(None)` removes the key, and `.some()` reaches into
   a present value. `insert(key, value)` and `remove(key)` are the same two
-  writes.
+  writes. The step lends the map's slot IN PLACE on both backends
+  (`HashMap::peek` / `modify`): a read of one field through
+  `at(key).some().title()` copies only that field, however large the value it
+  sits in, and a write through `at(key)` lands where the value is — no copy out
+  and back in.
 - a **`HashSet<T>`** likewise: `contains(x)` is a `Store<bool>`, and
   `set(true)`/`set(false)` (or `insert`/`remove`) add and remove `x`.
 - a **`List<T>`** is a SEQUENCE node. Every `SequenceCell` write — `push`,

@@ -24,7 +24,7 @@ remainder	0	1	0
 numeric-types	1	6	0
 option-view	0	1	0
 dyn-objects	39	73	25
-usize	6	14	0
+usize	7	16	0
 usize-literals	1	6	0
 unsigned-saturate	0	17	0
 bytes-aliasing	3	7	1
@@ -32,7 +32,7 @@ delta-law	25	76	12
 reactive-on-change	39	103	22
 reactive-flatten	43	110	37
 list-cell	71	188	21
-reactive-selector	17	56	11
+reactive-selector	16	56	11
 f64-print-boundary	0	0	0
 f64-print-negative-zero	0	0	0
 non-bmp-string-length	0	0	0

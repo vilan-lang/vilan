@@ -148,8 +148,17 @@ export import pkg::reactive::store_core::{
 
 /// What `map` holds under the key whose hash is `hash` — one value, copied.
 fun value_at<K: Hashable, V>(map: &HashMap<K, V>, hash: Hash): Option<V> {
-	match map.table.get(hash) {
-		Some(let entry) => Some(entry.1),
+	map.values.get(hash)
+}
+
+/// The `(key, value)` entry `map` holds under the key whose hash is `hash` — both
+/// copied, read off the map's two tables.
+fun entry_at<K: Hashable, V>(map: &HashMap<K, V>, hash: Hash): Option<(K, V)> {
+	match map.keys.get(hash) {
+		Some(let key) => match map.values.get(hash) {
+			Some(let value) => Some((key, value)),
+			None => None,
+		},
 		None => None,
 	}
 }
@@ -189,12 +198,12 @@ export impl HashMap<type K: Hashable, type V: Storable> with Storable {
 			}
 		}
 		if fed || (here && !changed) {
-			for hash in self.table.keys() {
+			for hash in self.values.keys() {
 				if fed || !changed {
 					if store_keyed(node, hash).is_none() {
-						let moved = match self.table.get(hash) {
-							Some(let mine) => match other.table.get(hash) {
-								Some(let theirs) => differs(&mine.1, &theirs.1, woken),
+						let moved = match self.values.get(hash) {
+							Some(let mine) => match other.values.get(hash) {
+								Some(let theirs) => differs(&mine, &theirs, woken),
 								None => true,
 							},
 							None => false,
@@ -206,9 +215,9 @@ export impl HashMap<type K: Hashable, type V: Storable> with Storable {
 					}
 				}
 			}
-			for hash in other.table.keys() {
+			for hash in other.values.keys() {
 				if (fed || !changed)
-					&& !self.table.contains_key(hash)
+					&& !self.values.contains_key(hash)
 					&& store_keyed(node, hash).is_none() {
 					changed = true;
 					store_touch(node, StoreTouch::Key(hash), woken);
@@ -523,7 +532,7 @@ fun map_feed<K: Hashable, V>(
 			olds = [];
 			lend(|map: &HashMap<K, V>| {
 				for hash in pending.keys {
-					olds.push(map.table.get(hash));
+					olds.push(entry_at(map, hash));
 				}
 			});
 		},
@@ -539,11 +548,11 @@ fun map_feed<K: Hashable, V>(
 				mut index: usize = 0;
 				for index < keys.len() {
 					match olds[index] {
-						Some(let was) => match map.table.get(keys[index]) {
+						Some(let was) => match entry_at(map, keys[index]) {
 							Some(let now) => log.record(MapOp::Put(now.0, Some(was.1), now.1)),
 							None => log.record(MapOp::Delete(was.0, was.1)),
 						},
-						None => match map.table.get(keys[index]) {
+						None => match entry_at(map, keys[index]) {
 							Some(let now) => log.record(MapOp::Put(now.0, None, now.1)),
 							None => {},
 						},
@@ -754,19 +763,16 @@ export impl Store<HashMap<type K: Hashable, type V>> {
 	/// The value under `key`, as a handle that depends on that key only: a write to
 	/// another key never wakes it. A `Store<Option<V>>`, so `set(None)` removes the
 	/// key, `.some()` reaches into a present value, and its subscription's slot
-	/// lives as long as its subscriptions do (Q12).
+	/// lives as long as its subscriptions do (Q12). The step LENDS the map's slot
+	/// in place (`peek` / `modify`, B689): a read below it copies only the leaf it
+	/// returns, and a write through it lands where the value is.
 	fun at(self, key: K): Store<Option<V>> {
-		self.descend(StoreStep::Key(key.hash()), |held: &HashMap<K, V>, f: |&Option<V>| void| {
-			let value = held.get(key);
-			f(&value);
-		}, |held: &mut HashMap<K, V>, f: |&mut Option<V>| void| {
-			mut value = held.get(key);
-			f(&mut value);
-			match value {
-				Some(let now) => held.insert(key, now),
-				None => held.remove(key),
-			}
-		})
+		self
+			.descend(
+				StoreStep::Key(key.hash()),
+				|held: &HashMap<K, V>, f: |&Option<V>| void| held.peek(key, f),
+				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| held.modify(key, f),
+			)
 	}
 }
 
@@ -785,17 +791,12 @@ export impl Store<HashMap<type K: Hashable, type V: Storable>> {
 /// A map field inside a variant: the same keyed step, through the variant.
 export impl StoreSome<HashMap<type K: Hashable, type V>> {
 	fun at(self, key: K): StoreSome<Option<V>> {
-		self.descend(StoreStep::Key(key.hash()), |held: &HashMap<K, V>, f: |&Option<V>| void| {
-			let value = held.get(key);
-			f(&value);
-		}, |held: &mut HashMap<K, V>, f: |&mut Option<V>| void| {
-			mut value = held.get(key);
-			f(&mut value);
-			match value {
-				Some(let now) => held.insert(key, now),
-				None => held.remove(key),
-			}
-		})
+		self
+			.descend(
+				StoreStep::Key(key.hash()),
+				|held: &HashMap<K, V>, f: |&Option<V>| void| held.peek(key, f),
+				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| held.modify(key, f),
+			)
 	}
 }
 

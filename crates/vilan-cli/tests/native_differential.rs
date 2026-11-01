@@ -10845,6 +10845,30 @@ fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
     );
 }
 
+/// B689 / M182 (hash-map-lend.md §4.8): `HashMap::peek`/`modify`/`update`
+/// and the store's keyed step that lends through them answer alike on both
+/// backends — a miss reads `None`, a write through `modify` is what the next
+/// read sees, `None` removes the key everywhere, `Some` under an absent key
+/// goes last while a present key keeps its place, `update` makes `missing`
+/// only on a miss, and a read, a write, an insert and a removal through
+/// `Store<HashMap<K, V>>::at(key)` land in the map. The runtime half (the
+/// value-side tombstone, `lend_mut`'s order and compaction) is `vilan-rt`'s
+/// `lend_mut_writes_in_place_inserts_last_and_removes_on_none`.
+#[test]
+fn b689_hash_map_lends_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_hash_map_lend.vl"),
+        include_str!("native/hash_map_lend.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_hash_map_lend.vl"),
+        Verdict::Identical,
+        "a map read and written in place must answer alike on both backends"
+    );
+}
+
 /// F65 (native-45 STOPPED it as the analyzer's; solver-b-45 fixed the record):
 /// a generic function whose return is inferred, called at two instantiations,
 /// emitted ONE instantiation's return type for every instance. `wrap<T>(x: T):

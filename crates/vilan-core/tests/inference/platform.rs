@@ -1690,15 +1690,15 @@ fn a_function_referencing_a_colored_global_inherits_its_line() {
 
         let cache = read_file_to_str("cache.txt");
 
-        fun peek(): str {
+        fun read_cache(): str {
             cache
         }
 
         fun main() {}
         "#,
-        "peek",
+        "read_cache",
     )
-    .expect("`peek` runs the initializer by referencing the binding");
+    .expect("`read_cache` runs the initializer by referencing the binding");
     assert_eq!(
         line,
         "requires the `@process` platform its file declares (via `cache → read_file_to_str (std::fs)`)"

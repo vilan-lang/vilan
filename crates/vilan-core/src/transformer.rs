@@ -2468,13 +2468,10 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              \treturn __dbg_group(open, \"}\", true, entries, fill);\n\
              }\n\
-             function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {\n\
-             \tconst items = Array.from(table.values());\n\
-             \treturn __dbg_members(open, items, (pair) => {\n\
-             \t\tconst key = keyWidth === 1 ? pair[0] : pair.slice(0, keyWidth);\n\
-             \t\tconst value = valueWidth === 1 ? pair[keyWidth] : pair.slice(keyWidth, keyWidth + valueWidth);\n\
-             \t\treturn [ __dbg_flat(showKey(key)) + \" => \", showValue(value) ];\n\
-             \t});\n\
+             function __dbg_map(open, keys, values, showKey, showValue) {\n\
+             \tconst stored = Array.from(values.values());\n\
+             \tconst items = Array.from(keys.values(), (key, index) => [ key, stored[index] ]);\n\
+             \treturn __dbg_members(open, items, (entry) => [ __dbg_flat(showKey(entry[0])) + \" => \", showValue(entry[1]) ]);\n\
              }\n\
              function __dbg_set(open, table, show, fill) {\n\
              \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ], fill);\n\
@@ -2661,6 +2658,25 @@ fn helper_source(name: &str) -> &'static str {
         // value so the result can't alias the map (value semantics).
         "__map_get" => {
             "function __map_get(map, key) {\n\treturn map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];\n}"
+        }
+        // `Map.lend(key, read)` / `Map.lend_mut(key, write)` (B689,
+        // hash-map-lend.md §3.1) — the slot under `key` as an `Option` view
+        // that ALIASES the stored value (no `__clone`: the `&`/`&mut`
+        // discipline is what makes the alias safe, as `descend`'s closures
+        // already rely on). After a write the table reflects the view: `Some`
+        // is set back (a present key keeps its position, an absent one goes
+        // last — a JS `Map`'s own `set`), `None` deletes the key.
+        "__map_lend" => {
+            "function __map_lend(map, key, read) {\n\treturn read(map.has(key) ? [ 0, map.get(key) ] : [ 1 ]);\n}"
+        }
+        "__map_lend_mut" => {
+            "function __map_lend_mut(map, key, write) {\n\
+             \tconst view = map.has(key) ? [ 0, map.get(key) ] : [ 1 ];\n\
+             \tconst answer = write(view);\n\
+             \tif (view[0] === 0) map.set(key, view[1]);\n\
+             \telse map.delete(key);\n\
+             \treturn answer;\n\
+             }"
         }
         // `Map.keys()`/`Map.values(): List<_>` — a fresh array snapshot (cloned, so
         // it can't alias the map's stored entries) in insertion order.
@@ -11085,6 +11101,20 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
+            Intrinsic::MapLend => {
+                self.used_helpers.insert("__map_lend");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__map_lend".to_string())),
+                    args.collect(),
+                )
+            }
+            Intrinsic::MapLendMut => {
+                self.used_helpers.insert("__map_lend_mut");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__map_lend_mut".to_string())),
+                    args.collect(),
+                )
+            }
             Intrinsic::MapContainsKey => native_method(&mut args, "has"),
             Intrinsic::MapRemove => native_method(&mut args, "delete"),
             Intrinsic::MapLen => js::Node::Property(
@@ -15825,6 +15855,8 @@ const RESERVED_NAMES: &[&str] = &[
     "__option_take",
     "__option_replace",
     "__map_get",
+    "__map_lend",
+    "__map_lend_mut",
     "__map_keys",
     "__map_values",
     "__task",

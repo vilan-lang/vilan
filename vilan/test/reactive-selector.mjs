@@ -492,7 +492,7 @@ function of(self, key, $J) {
 		$L = existing;
 	} else {
 		const cell = new4(key === self[1].v, "std/src/reactive.vl:3040:46");
-		self[0].v.set(hash2, cell);
+		self[0].v.set(hash2, __clone(cell));
 		defer_to_owner(() => {
 			self[0].v.delete(hash2);
 			return;

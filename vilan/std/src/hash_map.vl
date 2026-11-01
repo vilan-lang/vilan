@@ -6,10 +6,13 @@
 // the end. Keys are compared **by value** — a
 // scalar or a backed enum keys directly (the enum IS its backing value), and a
 // struct or unbacked/payload enum keys once it derives `Hashable` (I1). Each key
-// is turned into a canonical `Hash` via `key.hash()`, which keys the underlying
-// native map; the original key is stored alongside the value so `keys()`
-// returns real `K`s, and mutating the original afterward can't desync the map
-// (value semantics snapshot it on insert).
+// is turned into a canonical `Hash` via `key.hash()`, which keys the two
+// underlying native maps: `keys` holds the original key, so `keys()` returns
+// real `K`s and mutating the original afterward can't desync the map (value
+// semantics snapshot it on insert), and `values` holds the value, so a value is
+// a slot of its own that `peek` and `modify` reach IN PLACE (B689,
+// proposal/hash-map-lend.md §2). Every write touches both tables inside one
+// method, which is what keeps them in step.
 import pkg::compare::{ Eq, PartialEq };
 import pkg::debug::Debug;
 import pkg::default::Default;
@@ -20,25 +23,66 @@ import pkg::option::Option::{ self, None, Some };
 export *;
 
 struct HashMap<K: Hashable, V> {
-	table: NativeMap<(K, V)>,
+	keys: NativeMap<K>,
+	values: NativeMap<V>,
 }
 
 impl HashMap<type K: Hashable, type V> {
 	fun new(): HashMap<K, V> {
-		let table: NativeMap<(K, V)> = NativeMap::new();
-		HashMap { table }
+		let keys: NativeMap<K> = NativeMap::new();
+		let values: NativeMap<V> = NativeMap::new();
+		HashMap { keys, values }
 	}
 
 	fun insert(&mut self, key: K, value: V) {
-		self.table.insert(key.hash(), (key, value));
+		let hash = key.hash();
+		self.keys.insert(hash, key);
+		self.values.insert(hash, value);
 	}
 
-	/// A copy of the value stored under `key`, or `None` if absent.
+	/// A copy of the value stored under `key`, or `None` if absent — ONE copy, of
+	/// the value alone (the table's own `get`; B689).
 	fun get(self, key: K): Option<V> {
-		match self.table.get(key.hash()) {
-			Some(let entry) => Some(entry.1),
-			None => None,
+		self.values.get(key.hash())
+	}
+
+	/// Read the slot under `key` in place: `&Some(value)` while the key is held,
+	/// `&None` otherwise. Copies nothing; what `read` copies out is its own.
+	fun peek<U>(self, key: K, read: |&Option<V>| U): U {
+		self.values.lend(key.hash(), read)
+	}
+
+	/// Write the slot under `key` in place. Leave it `None` and the key is gone;
+	/// make it `Some` under an absent key and the key is inserted (last); a
+	/// present key keeps its place whatever is written.
+	fun modify<U>(&mut self, key: K, write: |&mut Option<V>| U): U {
+		let hash = key.hash();
+		let answer = self.values.lend_mut(hash, write);
+		if self.values.contains_key(hash) {
+			if !self.keys.contains_key(hash) {
+				self.keys.insert(hash, key);
+			}
+		} else {
+			self.keys.remove(hash);
 		}
+		answer
+	}
+
+	/// Change the value under `key` where it is — the one `missing` makes,
+	/// inserted first, when there is none (M182's grouping idiom:
+	/// `groups.update(key, [], |list| list.push(row))`, O(1) per push). `missing`
+	/// is evaluated only on a miss; `change` runs on the freshly made value too.
+	fun update(&mut self, key: K, lazy missing: V, change: |&mut V| void) {
+		self.modify(key, |slot: &mut Option<V>| {
+			match &mut slot {
+				Some(let value) => change(value),
+				None => {
+					mut made = missing;
+					change(&mut made);
+					slot = Some(made);
+				},
+			}
+		});
 	}
 
 	/// The value stored under `key` — or, when there is none, the one `make`
@@ -51,26 +95,29 @@ impl HashMap<type K: Hashable, type V> {
 	/// that reads a context reads the caller's. The key is hashed once.
 	fun get_or_insert(&mut self, key: K, make: || V): V {
 		let hash = key.hash();
-		match self.table.get(hash) {
-			Some(let entry) => entry.1,
+		match self.values.get(hash) {
+			Some(let held) => held,
 			None => {
 				let made = make();
-				self.table.insert(hash, (key, made));
+				self.keys.insert(hash, key);
+				self.values.insert(hash, made);
 				made
 			},
 		}
 	}
 
 	fun contains_key(self, key: K): bool {
-		self.table.contains_key(key.hash())
+		self.values.contains_key(key.hash())
 	}
 
 	fun remove(&mut self, key: K) {
-		self.table.remove(key.hash());
+		let hash = key.hash();
+		self.keys.remove(hash);
+		self.values.remove(hash);
 	}
 
 	fun len(self): usize {
-		self.table.len()
+		self.values.len()
 	}
 
 	fun is_empty(self): bool {
@@ -80,27 +127,30 @@ impl HashMap<type K: Hashable, type V> {
 	/// `List` snapshots of the keys / values, in insertion order — iterate with
 	/// `for key in map.keys()`.
 	fun keys(self): List<K> {
-		mut result: List<K> = [];
-		for entry in self.table.values() {
-			result.push(entry.0);
-		}
-		result
+		self.keys.values()
 	}
 
 	fun values(self): List<V> {
-		mut result: List<V> = [];
-		for entry in self.table.values() {
-			result.push(entry.1);
-		}
-		result
+		self.values.values()
 	}
 
 	/// A `List` snapshot of `(key, value)` pairs, in insertion order — the paired
 	/// counterpart to `keys()`/`values()`, for walking both together without
 	/// zipping two separate snapshots by hand:
-	/// `for entry in map.entries() { entry.0; entry.1 }`.
+	/// `for entry in map.entries() { entry.0; entry.1 }`. The two tables share one
+	/// insertion order, so a walk of the hashes reads each pair off both.
 	fun entries(self): List<(K, V)> {
-		self.table.values()
+		mut result: List<(K, V)> = [];
+		for hash in self.values.keys() {
+			match self.keys.get(hash) {
+				Some(let key) => match self.values.get(hash) {
+					Some(let value) => result.push((key, value)),
+					None => {},
+				},
+				None => {},
+			}
+		}
+		result
 	}
 }
 
@@ -111,8 +161,8 @@ impl HashMap<type K: Hashable, type V> {
 impl HashMap<type K: Hashable, type V: PartialEq> {
 	/// Whether any stored value equals `value`. For a KEY, use `contains_key`.
 	fun contains_value(self, value: V): bool {
-		for entry in self.table.values() {
-			if entry.1.eq(value) {
+		for held in self.values.values() {
+			if held.eq(value) {
 				ret true;
 			}
 		}
@@ -129,18 +179,21 @@ impl HashMap<type K: Hashable, type V: PartialEq> {
 /// Equal lengths, then every key of `self` found in `other` with an equal value:
 /// that is both inclusions, since two key sets of one size with one inside the
 /// other are the same set. Keys compare by their canonical `Hash` — the identity
-/// the map itself keys by.
+/// the map itself keys by — so no key is hashed again.
 impl HashMap<type K: Hashable, type V: PartialEq> with PartialEq {
 	fun eq(self, other: HashMap<K, V>): bool {
-		if self.table.len() != other.table.len() {
+		if self.values.len() != other.values.len() {
 			ret false;
 		}
-		for entry in self.table.values() {
-			match other.table.get(entry.0.hash()) {
-				Some(let theirs) => {
-					if !entry.1.eq(theirs.1) {
-						ret false;
-					}
+		for hash in self.values.keys() {
+			match self.values.get(hash) {
+				Some(let mine) => match other.values.get(hash) {
+					Some(let theirs) => {
+						if !mine.eq(theirs) {
+							ret false;
+						}
+					},
+					None => ret false,
 				},
 				None => ret false,
 			}

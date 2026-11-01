@@ -249,7 +249,10 @@ and a function may take one (`fun total<const N>(values: [i32; N])`). The
 impl HashMap<type K: Hashable, type V> {
 	fun new(): HashMap<K, V>
 	fun insert(&mut self, key: K, value: V)
-	fun get(self, key: K): Option<V>
+	fun get(self, key: K): Option<V>                      // one copy of the held value
+	fun peek<U>(self, key: K, read: |&Option<V>| U): U    // read the slot in place
+	fun modify<U>(&mut self, key: K, write: |&mut Option<V>| U): U   // write the slot in place
+	fun update(&mut self, key: K, lazy missing: V, change: |&mut V| void)   // change in place, `missing` first on a miss
 	fun get_or_insert(&mut self, key: K, make: || V): V   // the held value, or make() stored and answered
 	fun contains_key(self, key: K): bool
 	fun remove(&mut self, key: K)
@@ -365,6 +368,43 @@ fun main() {
 	print(lengths.get_or_insert("alpha", || "alpha".len()));  // 5 -- made and stored
 	print(lengths.get_or_insert("alpha", || 0));              // 5 -- held; the maker did not run
 	print(lengths.len());                                     // 1
+}
+```
+
+### Reading and writing in place
+
+`get` answers a COPY of the value — one copy, which is the right answer for a
+value you keep. To read a part of a large value, or to change it, reach the
+slot where it is instead. `peek` hands its reader the slot under `key` as an
+`&Option<V>` — `Some(value)` in place while the key is held, `None` otherwise —
+and copies nothing; what the reader copies out is its own. `modify` hands its
+writer an `&mut Option<V>`, and the map takes on whatever the slot holds when
+the writer returns: leave it `None` and the key is gone; make it `Some` under a
+key the map did not hold and the key is inserted, last; a key that was there
+keeps its place whatever was written. Both answer what their closure answers.
+
+`update` is the everyday case of `modify`: change the value under `key` where it
+is, inserting `missing` first when there is none. `missing` is `lazy`, so it is
+evaluated only on a miss, and `change` runs on the fresh value too. Grouping
+rows under their keys is then one push per row, never a copy of the list:
+
+```vilan
+import std::hash_map::HashMap;
+
+fun main() {
+	mut groups: HashMap<i32, List<i32>> = HashMap::new();
+	for row in [1, 2, 3, 4, 5, 6, 7] {
+		groups.update(row % 3, [], |list| list.push(row));
+	}
+	print(groups.get(1).unwrap_or([]));                    // [1, 4, 7]
+	print(groups.peek(2, |slot| slot.map_or(|list| list.len(), 0usize)));   // 2
+	let gone = groups.modify(0, |slot| {
+		let held = slot.is_some();
+		slot = None;
+		held
+	});
+	print(gone);                                           // true
+	print(groups.keys());                                  // [1, 2]
 }
 ```
 
