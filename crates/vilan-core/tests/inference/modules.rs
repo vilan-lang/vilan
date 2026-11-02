@@ -7828,6 +7828,231 @@ fn b515_a_trait_in_scope_is_accepted() {
     );
 }
 
+// --- B688: an extension block's methods need its module in scope ------------
+//
+// An INHERENT member of an `impl` written outside its subject's module —
+// `std::display`'s `impl List<type T: Display> { fun join }` — is a trait with
+// no name, and B515's rule had never asked it: once ANY file of the build
+// loaded the block's module, the method resolved in every file, and a build of
+// the same file alone refused it. The file must reach the block's module.
+
+const B688_WORDS: &str =
+    "export fun joined(list: List<str>): str {\n\tlist.map(|each| each).join(\", \")\n}\n";
+
+const B688_OTHER: &str = "import std::display::Display;\n\nexport fun listed(list: List<str>): str {\n\tlist.join(\"; \")\n}\n";
+
+/// B688's three-file repro: `words.vl` leans on `other.vl`'s import of
+/// `std::display`. Refused in the build that holds `other.vl`, at `join`, in
+/// `words.vl`, naming the module and the import — as the build without
+/// `other.vl` refuses it (there with the "no method" steer, the block never
+/// having loaded). Either way the file is wrong on its own, and says so.
+#[test]
+fn b688_the_items_three_file_repro_is_refused_in_the_build_as_alone() {
+    let wide = analyze_package(
+        &[
+            ("words.vl", B688_WORDS),
+            ("other.vl", B688_OTHER),
+            (
+                "main.vl",
+                "import pkg::other::listed;\nimport pkg::words::joined;\n\nfun main() {\n\tprint(listed([\"x\"]));\n\tprint(joined([\"a\", \"b\"]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    );
+    let refusal = wide
+        .diagnostics
+        .iter()
+        .find(|(message, ..)| message.contains("`join` comes from the"))
+        .unwrap_or_else(|| panic!("the wide build refuses `join`: {:?}", wide.diagnostics));
+    assert_eq!(refusal.2.as_deref(), Some("words.vl"));
+    assert_eq!(&B688_WORDS[refusal.1.clone()], "join");
+    assert!(
+        refusal.0.contains(
+            "block in `std::display`, which extends a type declared elsewhere, and this file \
+             does not import `std::display` or a name from it"
+        ) && refusal
+            .0
+            .ends_with("Import it (`import std::display::Display;`)"),
+        "{}",
+        refusal.0
+    );
+    assert_eq!(
+        vilan_core::analyzer::trait_scope_import(&refusal.0),
+        Some("import std::display::Display;"),
+        "the editor's quick fix reads the import back"
+    );
+    let narrow = analyze_package(
+        &[
+            ("words.vl", B688_WORDS),
+            (
+                "main.vl",
+                "import pkg::words::joined;\n\nfun main() {\n\tprint(joined([\"a\", \"b\"]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    );
+    assert!(
+        narrow
+            .diagnostics
+            .iter()
+            .any(|(message, ..)| message
+                .contains("has no method 'join'; import std::display::Display")),
+        "the narrow build refuses it too: {:?}",
+        narrow.diagnostics
+    );
+}
+
+/// The fix the refusal names: `words.vl` imports from the block's module (the
+/// trait the block's bound names), and the wide build runs.
+#[test]
+fn b688_a_file_that_imports_the_blocks_module_resolves() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "words.vl",
+                &format!("import std::display::Display;\n\n{B688_WORDS}"),
+            ),
+            ("other.vl", B688_OTHER),
+            (
+                "main.vl",
+                "import pkg::other::listed;\nimport pkg::words::joined;\n\nfun main() {\n\tprint(listed([\"x\"]));\n\tprint(joined([\"a\", \"b\"]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("the file that imports the block's module resolves");
+    assert_eq!(stdout, "x\na, b\n");
+}
+
+/// The prelude admits what it binds, with no import written: the base
+/// prelude's `Option` reaches `option.vl`, whose `impl List<type T>`
+/// answers `get`, and its `Iterator` answers `map`'s trait members — in a
+/// MODULE, where B688 asks. A block of a std module every program loads
+/// (`compare.vl`'s `contains`) is `List`'s own wherever it is called.
+#[test]
+fn b688_the_prelude_and_the_always_loaded_core_still_admit() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "lists.vl",
+                "export fun probe(list: List<i32>): i32 {\n\tlet first = list.get(0).unwrap_or(0);\n\tlet doubled = list.iter().map(|each| each * 2).to_list();\n\tif list.contains(3) {\n\t\tfirst + doubled[1]\n\t} else {\n\t\t0\n\t}\n}\n",
+            ),
+            (
+                "main.vl",
+                "import pkg::lists::probe;\n\nfun main() {\n\tprint(probe([1, 2, 3]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("the prelude and the core admit their blocks");
+    assert_eq!(stdout, "5\n");
+}
+
+/// A DERIVED block's file is its attribute's (B354): `[derive(Debug)]` on
+/// `Point` in `shapes.vl` writes `impl Point with Debug` there, and a file
+/// that imports `Point` reaches it — `debug` is not refused though the file
+/// never names `Debug`. And a block written beside one of its subject's
+/// ARGUMENTS (`impl Box<Point>` in `shapes.vl`, the shape `[derive(Store)]`
+/// writes as `impl RemoteStore<AccountState>`) is that type's own surface.
+#[test]
+fn b688_a_derived_block_and_a_block_beside_its_argument_type_are_reached() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "boxes.vl",
+                "export struct Box<T> {\n\tvalue: T,\n}\n",
+            ),
+            (
+                "shapes.vl",
+                "import std::debug::Debug;\nimport pkg::boxes::Box;\n\n[derive(Debug)]\nexport struct Point {\n\tx: i32,\n}\n\nexport impl Box<Point> {\n\tfun x_of(self): i32 {\n\t\tself.value.x\n\t}\n}\n",
+            ),
+            (
+                "user.vl",
+                "import pkg::boxes::Box;\nimport pkg::shapes::Point;\n\nexport fun show(): str {\n\tlet boxed = Box { value = Point { x = 4 } };\n\tlet point = Point { x = 1 };\n\ti\"{point.debug()} {boxed.x_of()}\"\n}\n",
+            ),
+            (
+                "main.vl",
+                "import pkg::user::show;\n\nfun main() {\n\tprint(show());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("a derived block and an argument-type block are reached");
+    assert_eq!(stdout, "Point { x = 1 } 4\n");
+}
+
+/// A program's own extension block: `extra.vl` extends `Thing` (declared in
+/// `thing.vl`). A file that imports `Thing` alone is refused at `bump`, naming
+/// `pkg::extra` and an import from it; importing from `extra` — by a name, or
+/// by a selector-only statement, or by a statement written inside the
+/// function body — resolves.
+#[test]
+fn b688_a_programs_own_extension_block_needs_its_module() {
+    let thing = "export struct Thing {\n\tn: i32,\n}\n";
+    let extra = "import pkg::thing::Thing;\n\nexport impl Thing {\n\tfun bump(self): i32 {\n\t\tself.n + 1\n\t}\n}\n\nexport fun helper(): i32 {\n\t8\n}\n";
+    let main = "import pkg::user::run;\nimport pkg::extra::helper;\n\nfun main() {\n\tprint(run() + helper());\n}\n";
+    let refused = analyze_package(
+        &[
+            ("thing.vl", thing),
+            ("extra.vl", extra),
+            (
+                "user.vl",
+                "import pkg::thing::Thing;\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+            ),
+            ("main.vl", main),
+        ],
+        "main.vl",
+    );
+    assert!(
+        refused.diagnostics.iter().any(|(message, _, file)| {
+            file.as_deref() == Some("user.vl")
+                && message.contains("`bump` comes from the `impl Thing` block in `pkg::extra`")
+                && message.ends_with("Import it (`import pkg::extra::helper;`)")
+        }),
+        "{:?}",
+        refused.diagnostics
+    );
+    for user in [
+        "import pkg::thing::Thing;\nimport pkg::extra::helper;\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+        "import pkg::thing::Thing;\nimport pkg::extra::{ (impl Thing) };\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+        "import pkg::thing::Thing;\n\nexport fun run(): i32 {\n\timport pkg::extra::helper;\n\tThing { n = 1 }.bump()\n}\n",
+    ] {
+        let (_, stdout) = compile_and_run_package(
+            &[
+                ("thing.vl", thing),
+                ("extra.vl", extra),
+                ("user.vl", user),
+                ("main.vl", main),
+            ],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("{user}: {errors:?}"));
+        assert_eq!(stdout, "10\n");
+    }
+}
+
+/// B688's reach reads every import statement of the file, wherever it is
+/// written: a TRAIT imported inside a function body brings its methods in
+/// scope there (B535 refused it as no import at all — std's macro bodies
+/// import `macro_std` that way).
+#[test]
+fn b688_a_trait_imported_inside_a_function_body_is_in_scope() {
+    assert_compiles(
+        r#"
+        import std::markdown;
+
+        fun shown(): str {
+            import std::display::Display;
+            42.to_string()
+        }
+
+        fun main() {
+            print(shown());
+        }
+        "#,
+    );
+}
+
 // --- B553: an impl written in the ENTRY serves every module -----------------
 //
 // Impls are program-wide (no orphan rule), so an `impl` a module's code calls
