@@ -88,6 +88,193 @@ fn must_use_consumed_result_no_warning() {
     );
 }
 
+// --- E356: an `own self` builder's dropped result ---------------------------
+
+/// E356's program (kolt's `Overlay::on_close`, standalone): `on_close` takes
+/// `own self`, sets a field and answers the `Dialog` it built. `{statement}`
+/// is how `main` calls it.
+const E356_DIALOG: &str = r#"
+struct Dialog {
+    title: str,
+    on_close: Option<|| void>,
+}
+
+impl Dialog {
+    fun on_close(own self, fn: || void): Dialog {
+        self.on_close = Some(fn);
+        self
+    }
+
+    fun close(self) {
+        if self.on_close is Some(let fn) {
+            fn();
+        }
+    }
+}
+
+fun main() {
+    {binding} dialog = Dialog { title = "Link", on_close = None };
+    {statement}
+    dialog.close();
+}
+"#;
+
+fn e356_program(binding: &str, statement: &str) -> String {
+    E356_DIALOG
+        .replace("{binding}", binding)
+        .replace("{statement}", statement)
+}
+
+/// The item's repro: ONE warning, at the call, naming the method, the type it
+/// built, the binding that still holds the old value and the rebinding.
+#[test]
+fn e356_a_dropped_own_self_builder_warns_once_at_the_call() {
+    let source = e356_program("let", "dialog.on_close(|| print(\"closed\"));");
+    let spanned = warning_diagnostics(&source);
+    let builder: Vec<&(String, std::ops::Range<usize>)> = spanned
+        .iter()
+        .filter(|(message, _)| message.contains("takes `own self`"))
+        .collect();
+    assert_eq!(builder.len(), 1, "{spanned:#?}");
+    assert_eq!(
+        &source[builder[0].1.clone()],
+        "dialog.on_close(|| print(\"closed\"))"
+    );
+    assert_eq!(
+        builder[0].0,
+        "`on_close` takes `own self` and answers the `Dialog` it built, which this statement \
+         drops — `dialog` still holds the value from before; bind the result: `let dialog = \
+         dialog.on_close(…)`"
+    );
+    // A `mut` binding is told to assign rather than to shadow.
+    let source = e356_program("mut", "dialog.on_close(|| print(\"closed\"));");
+    assert!(
+        warnings(&source).iter().any(|message| message.ends_with(
+            "`dialog` still holds the value from before; assign the result: `dialog = \
+             dialog.on_close(…)`"
+        )),
+        "{:?}",
+        warnings(&source)
+    );
+}
+
+/// The bound forms are clean, and they run the hook.
+#[test]
+fn e356_the_bound_result_is_clean() {
+    let source = e356_program("let", "let dialog = dialog.on_close(|| print(\"closed\"));");
+    assert!(warnings(&source).is_empty(), "{:?}", warnings(&source));
+    assert_compiles_and_runs(&source, "closed\n");
+    let source = e356_program("mut", "dialog = dialog.on_close(|| print(\"closed\"));");
+    assert!(warnings(&source).is_empty(), "{:?}", warnings(&source));
+}
+
+/// Not a builder: an `own self` method answering `void` or another type, and a
+/// `self` (borrowing) method answering `Self`, are untouched — and a
+/// `[must_use]` builder keeps its own warning, once.
+#[test]
+fn e356_other_shapes_are_untouched_and_must_use_changes_nothing() {
+    let messages = warnings(
+        r#"
+        struct Counter {
+            n: i32,
+        }
+
+        impl Counter {
+            fun consume(own self) {
+                print(self.n);
+            }
+
+            fun into_count(own self): i32 {
+                self.n
+            }
+
+            fun copied(self): Counter {
+                Counter { n = self.n }
+            }
+
+            [must_use]
+            fun bumped(own self): Counter {
+                Counter { n = self.n + 1 }
+            }
+        }
+
+        fun main() {
+            let counter = Counter { n = 1 };
+            counter.copied();
+            counter.bumped();
+            counter.into_count();
+            counter.consume();
+        }
+        "#,
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("takes `own self`")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("`[must_use]`"))
+            .count(),
+        1,
+        "{messages:?}"
+    );
+}
+
+/// Through a TRAIT: the impl's builder answers `Self`, and a call through a
+/// bound (the trait's own declaration) warns the same way.
+#[test]
+fn e356_a_builder_through_a_trait_warns() {
+    let messages = warnings(
+        r#"
+        trait Tagged {
+            fun tagged(own self, tag: str): Self;
+        }
+
+        struct Note {
+            tag: str,
+        }
+
+        impl Note with Tagged {
+            fun tagged(own self, tag: str): Note {
+                self.tag = tag;
+                self
+            }
+        }
+
+        fun retag<T: Tagged>(value: T): T {
+            value.tagged("generic");
+            value
+        }
+
+        fun main() {
+            let note = Note { tag = "" };
+            note.tagged("x");
+            print(retag(note).tag);
+        }
+        "#,
+    );
+    let builders: Vec<&String> = messages
+        .iter()
+        .filter(|message| message.contains("`tagged` takes `own self`"))
+        .collect();
+    assert_eq!(builders.len(), 2, "{messages:?}");
+    assert!(
+        builders
+            .iter()
+            .any(|message| message.contains("`note` still holds")),
+        "{messages:?}"
+    );
+    assert!(
+        builders
+            .iter()
+            .any(|message| message.contains("`value` still holds")),
+        "{messages:?}"
+    );
+}
+
 // --- [deprecated] (proposal/deprecation.md) ---------------------------------
 
 /// A copy of the real std with one extra module, `std::deprecated_probe`,

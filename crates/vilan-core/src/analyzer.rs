@@ -35402,6 +35402,11 @@ impl<'src> Analyzer<'src> {
         );
     }
 
+    ///
+    /// E356: a BUILDER's dropped result warns the same way, unmarked — a method
+    /// taking `own self` and answering a value of the receiver's own type,
+    /// called as a statement, built a new value and dropped it, while the
+    /// receiver binding still holds the one from before ([`Self::dropped_builder`]).
     fn check_must_use(&mut self) {
         // Value-discarded statements: every non-tail entry of a function body
         // (`body.0`; the tail `body.1` is the return value) and of every inner
@@ -35428,6 +35433,8 @@ impl<'src> Analyzer<'src> {
             };
             let message = if self.call_is_must_use(*call_id) {
                 "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string()
+            } else if let Some(message) = self.dropped_builder(*call_id) {
+                message
             } else if self.discarded_pipe(statement_id, &pipe_traits) {
                 // F60 (R-d door (a)): a pipe NODE is must-use by its type, so a
                 // dropped one warns whichever function built it — a std
@@ -35449,6 +35456,71 @@ impl<'src> Analyzer<'src> {
             let source = self.source_of_id(statement_id).unwrap_or(SourceId(0));
             self.warning_sources.push(source);
         }
+    }
+
+    /// E356: the warning for a discarded BUILDER call — a method whose
+    /// receiver is `own self` and whose result is the receiver's own type
+    /// (`fun on_close(own self, fn: || void): Dialog`), called as the bare
+    /// statement `statement_id`. The method took the value, built a changed
+    /// one and answered it; the statement drops the answer, and the binding
+    /// the method was called on still holds the value from before, so the
+    /// change is silently lost. `None` for any other call. The shape is the
+    /// callee's DECLARATION — its return type is its receiver's — so a builder
+    /// declared by a trait (`fun tag(own self): Self`) and reached through a
+    /// bound answers the same way as its impl.
+    fn dropped_builder(&self, call_id: Id) -> Option<String> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let function = self.functions.get(member_id)?;
+        let receiver_parameter = function
+            .parameters
+            .first()
+            .and_then(|parameter_id| self.parameters.get(parameter_id))?;
+        if receiver_parameter.name != "self" || receiver_parameter.convention != Convention::Own {
+            return None;
+        }
+        let declared_return = function.return_type_id?;
+        if !self.same_type_structure(declared_return, receiver_parameter.type_id, 0) {
+            return None;
+        }
+        let receiver = *function_call.argument_ids.first()?;
+        let built = self
+            .resolved_type_id_of(receiver)
+            .unwrap_or(declared_return);
+        let method = self.callable_name(*member_id)?;
+        let type_label = self.pretty_print_type(&built.get_type(self), &HashMap::default());
+        let head = format!(
+            "`{method}` takes `own self` and answers the `{type_label}` it built, which this \
+             statement drops"
+        );
+        // The binding the call was made on, when it is one: the value it still
+        // holds is the one from before, and the fix rebinds it.
+        let binding = match self.expr_id_to_expr_map.get(&receiver) {
+            Some(Expr::Local(binding_id)) => match self.variables.get(binding_id) {
+                Some(variable) => Some((variable.name, variable.mutable)),
+                None => self
+                    .parameters
+                    .get(binding_id)
+                    .map(|parameter| (parameter.name, parameter.mutable)),
+            },
+            _ => None,
+        }
+        // `self` cannot be rebound by `let`.
+        .filter(|(name, _)| *name != "self");
+        Some(match binding {
+            Some((name, true)) => format!(
+                "{head} — `{name}` still holds the value from before; assign the result: \
+                 `{name} = {name}.{method}(…)`"
+            ),
+            Some((name, false)) => format!(
+                "{head} — `{name}` still holds the value from before; bind the result: \
+                 `let {name} = {name}.{method}(…)`"
+            ),
+            None => format!("{head}; bind the result, or `let _ = …` to discard it"),
+        })
     }
 
     /// std's pipe traits (F60): `std::reactive`'s `Pipe` and `std::reactive::delta`'s
