@@ -3342,12 +3342,15 @@ main();
 /// `place` resolved to `Slot`'s bodyless requirement, and the build died with
 /// an `internal:` error anchored in std's `open_row_before`. The pin is that
 /// the `<span>` the body builds is actually PLACED, between its two static
-/// siblings.
+/// siblings. B677 door 2: `hold`'s `body` answers a `Slot`, so it takes the
+/// owner at the call (`context owner_scope`, implied), and the field that
+/// keeps it is typed with the clause.
 const B369_INFERRED_CONSTRUCTOR: &str = r#"import std::io::print;
+import std::reactive::owner_scope;
 import std::web::ui::{ Region, Slot, View, mount_root, view };
 
 struct Holder<C: Slot> {
-	body: || C,
+	body: (|| C) context owner_scope,
 }
 
 impl Holder<type C: Slot> with Slot {
