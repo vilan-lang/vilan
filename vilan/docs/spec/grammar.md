@@ -153,6 +153,13 @@ shape — `[` then a name — leads a head; `export *;` takes none. The
 marker is written once: a second `export` on one declaration is refused
 (B492).
 
+So is each attribute but `[hint(..)]`, which a declaration may carry more
+than once: a repeat is an **error** at the repeat, read as if it were not
+written, so nothing else is reported for it — `` `[deprecated]` is written twice over
+`f`; keep one ``. A repeated `[derive(..)]` is read with the lists merged,
+and the error spells the merge: `[derive(PartialEq)]` ⏎ `[derive(Json)]` ⏎
+`struct Pair` — `` merge them, `[derive(PartialEq, Json)]` `` (E355).
+
 A `#` before a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
@@ -987,6 +994,12 @@ Two consequences of the tier split are normative:
 - `const` captures **weakly**: everything to the end of the expression
   (up to the enclosing bracket or comma) folds; parenthesize to narrow
   (§9).
+
+A struct literal names **every** field. There is no update form: a tuple
+spreads (`(0, ..pair, 9)`), but `Point { x = 1, ..origin() }` is refused at
+the `..`, the literal read without its tail, so the fields the tail was to
+fill are not reported missing as well (B657). Bind the base and assign the
+fields that change: `mut p = origin(); p.x = 1;`.
 
 A closure's body is one expression (commonly a block). `||` in operand
 position always begins a zero-parameter closure; logical-or is only

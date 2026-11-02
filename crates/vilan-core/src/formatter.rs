@@ -7198,6 +7198,19 @@ impl<'src> Printer<'src> {
         matches!(&subject.0, Node::Call(_, _, arguments) if !arguments.0.is_empty())
     }
 
+    /// Whether the chain's subject is a struct or list literal (E354): a
+    /// receiver that breaks one field or element per line where it stands,
+    /// with the chain's postfixes after its closing bracket.
+    fn has_literal_subject(expr: &Spanned<Node<'src>>) -> bool {
+        let (subject, spine) = Self::postfix_spine(expr);
+        !spine.is_empty()
+            && match &subject.0 {
+                Node::StructInitializer(_, _, _, fields, _) => !fields.0.is_empty(),
+                Node::List(elements) => !elements.is_empty(),
+                _ => false,
+            }
+    }
+
     /// Whether a spine step is a `.name(…)` call link — the unit the split form
     /// gives its own line. Every other postfix (`.field`, `[i]`, `?`, `!`) glues
     /// to the segment printed before it.
@@ -7398,8 +7411,12 @@ impl<'src> Printer<'src> {
         // a `?`/`!` subject through the plain operand rule.
         match &spine[0].0 {
             // E314: a call subject whose own line runs out breaks its arguments
-            // one per line; the links then follow on lines of their own.
-            Node::MemberAccessor(_, _) | Node::Index(_, _) if Self::has_call_subject(expr) => {
+            // one per line; the links then follow on lines of their own. A
+            // struct or list literal subject breaks one field or element per
+            // line the same way (E354).
+            Node::MemberAccessor(_, _) | Node::Index(_, _)
+                if Self::has_call_subject(expr) || Self::has_literal_subject(expr) =>
+            {
                 if self.subject_needs_split(subject) {
                     self.split = Split::Tail;
                 }
@@ -8949,6 +8966,38 @@ impl<'src> Printer<'src> {
             self.print_split_chain(expr);
             return;
         }
+        // E354: a chain whose RECEIVER is a struct or list literal —
+        // `Body { .. }.size()`, `[a, b].len()`. The recursive arm below prints
+        // the receiver with the permission dropped, so the literal stayed one
+        // line at any width. Measured like the rest: the inline form first,
+        // and only if its first line is still over budget does the receiver
+        // break as it breaks standing alone, one field (or element) per line,
+        // with the postfixes glued after its closing brace. A chain the doors
+        // above split (two links, or one whose last argument is a closure)
+        // never reaches here.
+        if split != Split::Off && Self::has_literal_subject(expr) {
+            let (subject, spine) = Self::postfix_spine(expr);
+            let start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_inline_chain(expr, &spine, split);
+            if !self.first_line_over_budget(start) {
+                return;
+            }
+            self.out.truncate(start);
+            self.cursor = comment_cursor;
+            self.split = Split::Tail;
+            self.print_postfix_subject(subject);
+            for (at, step) in spine.iter().enumerate() {
+                self.split = if at + 1 == spine.len() {
+                    split
+                } else {
+                    Split::Off
+                };
+                self.print_postfix_suffix(step);
+            }
+            self.split = Split::Off;
+            return;
+        }
         match &expr.0 {
             Node::Number(whole, fraction, suffix) => {
                 self.out.push_str(whole);
@@ -9449,7 +9498,7 @@ impl<'src> Printer<'src> {
                 self.print_argument_spans(argument_spans);
                 self.out.push(')');
             }
-            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
+            Node::StructInitializer(namespace, name, generic_arguments, fields, _) => {
                 // The path as written (B190) — the namespace spine, then the
                 // name. The printer BAILS on a form it does not know, falling
                 // the whole file back to its source silently, so a qualified
@@ -20339,5 +20388,161 @@ mod trailing_comment_anchor {
             "fun one(): i32 { 7 } // one-line fn\n",
             "fun one(): i32 {\n\t7\n} // one-line fn\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod literal_receiver_layout {
+    //! E354: a chain whose RECEIVER is a struct or list literal —
+    //! `Body { .. }.size()` — was printed with the receiver's split permission
+    //! dropped, so the literal stayed on one line at any width (kolt's
+    //! 161-column `body = MessageBody { .. }.to_json(),`). Over budget, the
+    //! receiver now breaks as it breaks standing alone, one field or element
+    //! per line, with the postfixes after its closing bracket; as a statement's
+    //! value, inside another literal's field and as a `then`/`else` arm. Every
+    //! case runs through `assert_construct`: token round trip, the canonical
+    //! form, idempotence (`fmt(fmt(x)) == fmt(x)`), the canonical form's own
+    //! round trip.
+    use super::bailing_constructs::assert_construct;
+
+    /// The item's repro, its 110-column statement inline.
+    const REPRO: &str = concat!(
+        "fun main() {\n",
+        "\tlet shown = \"a block of code, long enough to push the line past the budget\";\n",
+        "\tlet blocks = Body { version = 1, blocks = [Inner { kind = \"code\", content = ",
+        "shown.to_uppercase() }] }.size();\n",
+        "\tprint(blocks);\n",
+        "}\n",
+    );
+
+    #[test]
+    fn the_repro_breaks_its_receiver_one_field_per_line() {
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet shown = \"a block of code, long enough to push the line past the budget\";\n",
+            "\tlet blocks = Body {\n",
+            "\t\tversion = 1,\n",
+            "\t\tblocks = [Inner { kind = \"code\", content = shown.to_uppercase() }],\n",
+            "\t}.size();\n",
+            "\tprint(blocks);\n",
+            "}\n",
+        );
+        assert_construct(REPRO, expected);
+    }
+
+    #[test]
+    fn a_receiver_under_the_budget_stays_inline() {
+        let source = "fun main() {\n\tlet short = Body { version = 1, blocks = [] }.size();\n}\n";
+        assert_construct(source, source);
+    }
+
+    #[test]
+    fn a_receiver_in_another_literals_field_breaks_inside_it() {
+        // kolt's `file_page.vl` shape.
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet message = Message { id = 1, body = MessageBody { version = body_version, ",
+            "blocks = [BodyBlock { kind = \"code\", content = shown }] }.to_json() };\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet message = Message {\n",
+            "\t\tid = 1,\n",
+            "\t\tbody = MessageBody {\n",
+            "\t\t\tversion = body_version,\n",
+            "\t\t\tblocks = [BodyBlock { kind = \"code\", content = shown }],\n",
+            "\t\t}.to_json(),\n",
+            "\t};\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    #[test]
+    fn a_receiver_as_a_then_arm_breaks_on_the_arms_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet chosen = flag then Body { version = 1, blocks = [Inner { kind = \"code\", ",
+            "content = shown.to_uppercase() }] }.size() else 0;\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet chosen = flag\n",
+            "\t\tthen Body {\n",
+            "\t\t\tversion = 1,\n",
+            "\t\t\tblocks = [Inner { kind = \"code\", content = shown.to_uppercase() }],\n",
+            "\t\t}.size()\n",
+            "\t\telse 0;\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    #[test]
+    fn a_list_receiver_breaks_one_element_per_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet counted = [\"a block of code, long enough\", \"to push the line past the budget\", ",
+            "\"of one hundred columns\"].len();\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet counted = [\n",
+            "\t\t\"a block of code, long enough\",\n",
+            "\t\t\"to push the line past the budget\",\n",
+            "\t\t\"of one hundred columns\",\n",
+            "\t].len();\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// Two links: the chain splits one link per line, as it did, and the
+    /// receiver that still runs its own line out breaks first — the shape a
+    /// call receiver takes (E314).
+    #[test]
+    fn a_two_link_chain_breaks_its_receiver_then_its_links() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet two = Body { version = 1, blocks = [Inner { kind = \"code\", content = ",
+            "shown.to_uppercase() }] }.to_text().len();\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet two = Body {\n",
+            "\t\tversion = 1,\n",
+            "\t\tblocks = [Inner { kind = \"code\", content = shown.to_uppercase() }],\n",
+            "\t}\n",
+            "\t\t.to_text()\n",
+            "\t\t.len();\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// A chain whose receiver is a CALL is the one-link door's (E314),
+    /// unchanged.
+    #[test]
+    fn a_chain_whose_receiver_is_a_call_is_unchanged() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet called = make(1, \"a block of code, long enough to push the line past the budget, ",
+            "the call's own\").size();\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet called = make(\n",
+            "\t\t1,\n",
+            "\t\t\"a block of code, long enough to push the line past the budget, the call's own\",\n",
+            "\t)\n",
+            "\t\t.size();\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
     }
 }

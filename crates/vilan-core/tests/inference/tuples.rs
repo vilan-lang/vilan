@@ -8921,3 +8921,74 @@ fn b660_lists_calls_and_labelled_tuples_keep_their_trailing_commas() {
     // A one-entry slip is a group with a stray comma: the comma alone.
     assert_fails_once_with("fun main() {\n\tlet one = (1,);\n}\n", NO_TRAILING_COMMA);
 }
+
+// --- B657: a struct literal has no `..base` update form ----------------------
+//
+// Tuples spread (`(0, ..pair, 9)`), which makes `Point { x = 1, ..origin() }`
+// look plausible; the language has no struct update. The minimal form read
+// "unclosed `{` in struct initializer" on a brace that is closed, and kolt's
+// six-closure hook record "`Hooks` expects 6 fields, but got 0" (five were
+// written) plus "expected `,`" inside a closure. The `..` is refused where it
+// stands, the literal is read without the tail, and the fields the tail was
+// to fill are not reported missing again.
+
+const NO_UPDATE_FORM: &str = "a struct literal names every field; there is no `..base` update \
+     form: bind the base and assign the fields that change (`mut p = origin(); p.x = 1;`)";
+
+#[test]
+fn b657_the_items_update_tail_is_one_refusal_at_its_dots() {
+    let source = "struct Point { x: i32, y: i32, z: i32 }\n\n\
+         fun origin(): Point { Point { x = 0, y = 0, z = 0 } }\n\n\
+         fun main() {\n\tlet moved = Point {\n\t\tx = 1,\n\t\t..origin()\n\t};\n\tprint(moved.x);\n}\n";
+    let dots = source.find("..origin").expect("the tail");
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(NO_UPDATE_FORM.to_string(), dots..dots + 2)],
+    );
+}
+
+#[test]
+fn b657_a_six_closure_record_with_an_update_tail_is_one_refusal() {
+    // kolt's shape: a hook record whose host overrides five of six closures.
+    let source = "struct Hooks {\n\ton_key: |str| bool,\n\ton_paste: |str| bool,\n\ton_focus: || void,\n\
+         \ton_blur: || void,\n\tlink_decoration: |str| str,\n\ton_change: |str| void,\n}\n\n\
+         impl Hooks {\n\tfun none(): Hooks {\n\t\tHooks {\n\t\t\ton_key = |_| false,\n\t\t\ton_paste = |_| false,\n\
+         \t\t\ton_focus = || {},\n\t\t\ton_blur = || {},\n\t\t\tlink_decoration = |text| text,\n\
+         \t\t\ton_change = |_| {},\n\t\t}\n\t}\n}\n\n\
+         fun main() {\n\tlet hooks = Hooks {\n\t\ton_key = |key| key == \"Enter\",\n\
+         \t\ton_paste = |text| text.len() > 0,\n\t\ton_focus = || {},\n\t\ton_blur = || {},\n\
+         \t\tlink_decoration = |text| \"<\" + text + \">\",\n\t\t..Hooks::none()\n\t};\n\
+         \tprint((hooks.on_key)(\"Enter\"));\n}\n";
+    let dots = source.find("..Hooks").expect("the tail");
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(NO_UPDATE_FORM.to_string(), dots..dots + 2)],
+    );
+}
+
+#[test]
+fn b657_a_field_the_literal_names_wrongly_is_still_reported_beside_the_tail() {
+    // The tail excuses only the fields it would have filled: a field the
+    // struct does not declare is its own error.
+    let source = "struct Point { x: i32, y: i32 }\n\n\
+         fun main() {\n\tlet p = Point { x = 1, w = 2, ..Point { x = 0, y = 0 } };\n\tprint(p.x);\n}\n";
+    let messages: Vec<String> = failure_diagnostics(source)
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            NO_UPDATE_FORM.to_string(),
+            "struct 'Point' has no field 'w'".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn b657_a_tuple_spread_is_still_accepted() {
+    assert_compiles_and_runs(
+        "fun main() {\n\tlet pair = (1, 2);\n\tlet wide = (0, ..pair, 9);\n\tprint(wide.3);\n}\n",
+        "9\n",
+    );
+}

@@ -246,6 +246,16 @@ pub enum ParseErrorReason {
     BareClosureTypeParameter { written: String },
     /// B655: a statement in an `impl` body that is not a member.
     NonMemberInImpl(NonMember),
+    /// E355: an attribute written again over the same declaration. `name` is
+    /// the attribute, `item` the declaration as the message names it, and
+    /// `merged` — for `[derive]` only — the one attribute every copy's list
+    /// merges into. The parse went on as if the repeat were not written (a
+    /// `[derive]`'s lists merged).
+    RepeatedAttribute {
+        name: String,
+        item: String,
+        merged: Option<String>,
+    },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -1808,6 +1818,12 @@ const MULTILINE_ATTRIBUTE_ARGUMENT: &str = "an attribute argument here is a one-
 const A_TUPLE_TAKES_NO_TRAILING_COMMA: &str = "a tuple takes no trailing comma; remove the \
      `,` before `)`";
 
+/// B657: `..base` in a struct literal. Curated (B6): the rule, that the
+/// update form does not exist, and the spelling that does what it meant.
+const A_STRUCT_LITERAL_HAS_NO_UPDATE_FORM: &str = "a struct literal names every field; there is \
+     no `..base` update form: bind the base and assign the fields that change (`mut p = \
+     origin(); p.x = 1;`)";
+
 /// B663: a struct literal heading a `match` subject. Curated (B6): the rule
 /// and its two ways out.
 const A_STRUCT_LITERAL_IS_NO_MATCH_SUBJECT: &str = "a struct literal can't be a `match` subject \
@@ -2009,6 +2025,12 @@ pub fn render(error: &ParseError) -> String {
         ),
         ParseErrorReason::Escape { kind, written } => escape_rule(*kind, written),
         ParseErrorReason::NonMemberInImpl(kind) => non_member_rule(*kind),
+        ParseErrorReason::RepeatedAttribute { name, item, merged } => match merged {
+            Some(merged) => {
+                format!("`[{name}]` is written twice over {item}: merge them, `{merged}`")
+            }
+            None => format!("`[{name}]` is written twice over {item}; keep one"),
+        },
         ParseErrorReason::LetElse { suggestion } => match suggestion {
             Some((respelled, name)) => format!(
                 "a `let` takes no guard: the let-else form is the `is` test alone, \
@@ -2135,14 +2157,14 @@ pub fn parse_preserving_groups(source: &str) -> (Option<Spanned<NodeList<'_>>>, 
 
 fn parse_with(source: &str, preserve_paren_groups: bool) -> ParsedWithWarnings<'_> {
     let (mut tokens, lex_errors) = lexing::tokenize(source);
-    let token_count = tokens.len();
 
     let mut parser = Parser::new(&mut tokens, source, preserve_paren_groups);
     let root = parser.parse_program();
     let mut then_form_errors = Vec::new();
     refuse_then_forms_read_as_values(&root, &mut then_form_errors);
     debug_assert_eq!(
-        parser.position, token_count,
+        parser.position,
+        parser.tokens.len(),
         "the statement/item synchronizer consumes the whole token stream: an \
          unparseable statement is reported and skipped past, never left over",
     );
@@ -2243,8 +2265,10 @@ struct Parser<'a, 'src> {
     /// The token stream, in SOURCE order but for one rewrite: an attribute run
     /// written ahead of `export` is rotated behind the marker as the statement
     /// is reached ([`Parser::lead_export_past_its_attributes`], B445), which is
-    /// why the parser holds it mutably. Every token keeps its own span.
-    tokens: &'a mut [Spanned<Token<'src>>],
+    /// why the parser holds it mutably — and as a `Vec`, because a REPEATED
+    /// attribute is taken off it (E355, [`Parser::drop_repeated_attributes`]).
+    /// Every token keeps its own span.
+    tokens: &'a mut Vec<Spanned<Token<'src>>>,
     position: usize,
     /// The source the tokens index into — read only to place the **gap anchor** of
     /// a missing statement terminator on the last CHARACTER of the preceding token
@@ -3105,7 +3129,7 @@ fn assignment_reachable(tokens: &[Spanned<Token<'_>>]) -> Vec<bool> {
 
 impl<'a, 'src> Parser<'a, 'src> {
     fn new(
-        tokens: &'a mut [Spanned<Token<'src>>],
+        tokens: &'a mut Vec<Spanned<Token<'src>>>,
         source: &'src str,
         preserve_paren_groups: bool,
     ) -> Self {
@@ -4751,6 +4775,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         {
             return;
         }
+        self.drop_repeated_attributes(start);
         let Some(MarkerRun {
             units,
             word,
@@ -4885,6 +4910,160 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else if out_of_rank {
             self.record_rewrite(run_span, ParseErrorReason::AttributeOrder { canonical });
         }
+    }
+
+    /// E355: an attribute written AGAIN over the declaration whose head starts
+    /// at `start` — `[derive(PartialEq)] [derive(PartialEq)] struct Pair` —
+    /// is refused by name at each repeat
+    /// ([`ParseErrorReason::RepeatedAttribute`]) and taken off the token
+    /// stream, so the head is read with the copy written first and nothing
+    /// cascades: no production declines the head, and the attributes are
+    /// never read as a list-literal statement (its "cannot find `derive`").
+    /// A repeated `[derive]` is MERGED instead: the first copy's list gains
+    /// the names only the repeats wrote, so a type that asked for `Json` in
+    /// the second copy still has it; a repeat that adds no name is a copy,
+    /// and the steer is to keep one.
+    ///
+    /// `[hint(..)]` is the one attribute a head takes more than once (E227),
+    /// and is left as written.
+    fn drop_repeated_attributes(&mut self, start: usize) {
+        let Some(MarkerRun { units, word_at, .. }) = marker_run_at(self.tokens, start) else {
+            return;
+        };
+        let mut attributes: Vec<(&'src str, std::ops::Range<usize>)> = units
+            .iter()
+            .filter_map(|unit| match unit.kind {
+                MarkerUnitKind::Attribute { name, .. } if name != "hint" => {
+                    Some((name, unit.tokens.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // The copy written FIRST is the one kept, whatever order an earlier
+        // rotation left the stream in.
+        attributes.sort_by_key(|(_, tokens)| self.token_span(tokens.start).start);
+        let mut repeats: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+        for (index, (name, tokens)) in attributes.iter().enumerate() {
+            if let Some(first) = attributes[..index]
+                .iter()
+                .position(|(seen, _)| seen == name)
+            {
+                repeats.push((first, tokens.clone()));
+            }
+        }
+        if repeats.is_empty() {
+            return;
+        }
+        let item = match self.tokens.get(word_at + 1) {
+            Some((Token::Ident(name), _)) => format!("`{name}`"),
+            _ => match declaration_word(self.tokens.get(word_at).map(|(token, _)| token)) {
+                Some(word) => format!("this `{word}`"),
+                None => "this declaration".to_string(),
+            },
+        };
+        // Each kept `[derive]`'s merged list: its own names, then each name
+        // only a repeat wrote, in the order written.
+        let mut merges: Vec<(std::ops::Range<usize>, usize, Vec<Spanned<&'src str>>)> = Vec::new();
+        for (first, repeat) in &repeats {
+            let (name, kept) = &attributes[*first];
+            if *name != "derive" {
+                continue;
+            }
+            let Some(added) = self.derive_names(repeat.clone()) else {
+                continue;
+            };
+            let entry = match merges.iter().position(|(range, ..)| range == kept) {
+                Some(entry) => entry,
+                None => {
+                    let Some(own) = self.derive_names(kept.clone()) else {
+                        continue;
+                    };
+                    merges.push((kept.clone(), own.len(), own));
+                    merges.len() - 1
+                }
+            };
+            for name in added {
+                if !merges[entry].2.iter().any(|(seen, _)| *seen == name.0) {
+                    merges[entry].2.push(name);
+                }
+            }
+        }
+        for (first, repeat) in &repeats {
+            let (name, kept) = &attributes[*first];
+            // A repeat that adds no name is only a copy: keep one.
+            let merged = merges
+                .iter()
+                .find(|(range, own, names)| range == kept && names.len() > *own)
+                .map(|(_, _, names)| {
+                    let names: Vec<&str> = names.iter().map(|(name, _)| *name).collect();
+                    format!("[derive({})]", names.join(", "))
+                });
+            let span = Span::from(
+                self.token_span(repeat.start).start..self.token_span(repeat.end - 1).end,
+            );
+            self.record_rewrite(
+                span,
+                ParseErrorReason::RepeatedAttribute {
+                    name: (*name).to_string(),
+                    item: item.clone(),
+                    merged,
+                },
+            );
+        }
+        // Rewrite back to front, so each range still indexes the stream as
+        // scanned: every repeat removed, every kept `[derive]` respelled with
+        // its merged list.
+        let mut edits: Vec<(std::ops::Range<usize>, Vec<Spanned<Token<'src>>>)> = repeats
+            .into_iter()
+            .map(|(_, repeat)| (repeat, Vec::new()))
+            .collect();
+        for (kept, own, names) in merges {
+            if names.len() == own {
+                continue;
+            }
+            let open = self.tokens[kept.start..kept.start + 3].to_vec();
+            let close = self.tokens[kept.end - 2..kept.end].to_vec();
+            let mut respelled = open;
+            for (index, (name, span)) in names.iter().enumerate() {
+                if index > 0 {
+                    respelled.push((Token::Ctrl(','), Span::from(span.start..span.start)));
+                }
+                respelled.push((Token::Ident(name), *span));
+            }
+            respelled.extend(close);
+            edits.push((kept, respelled));
+        }
+        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        for (range, tokens) in edits {
+            self.tokens.splice(range, tokens);
+        }
+        self.assignment_reachable = assignment_reachable(self.tokens);
+    }
+
+    /// The names of the plain `[derive(A, B)]` whose tokens are `range`, each
+    /// with its span; `None` for any other spelling, which is read as written.
+    fn derive_names(&self, range: std::ops::Range<usize>) -> Option<Vec<Spanned<&'src str>>> {
+        let tokens = &self.tokens[range];
+        let [
+            (Token::Ctrl('['), _),
+            (Token::Ident("derive"), _),
+            (Token::Ctrl('('), _),
+            inner @ ..,
+            (Token::Ctrl(')'), _),
+            (Token::Ctrl(']'), _),
+        ] = tokens
+        else {
+            return None;
+        };
+        let mut names = Vec::new();
+        for (index, (token, span)) in inner.iter().enumerate() {
+            match token {
+                Token::Ident(name) if index % 2 == 0 => names.push((*name, *span)),
+                Token::Ctrl(',') if index % 2 == 1 => {}
+                _ => return None,
+            }
+        }
+        Some(names)
     }
 
     /// B520: `fn`/`function`/`func`/`def` at the ITEM HEAD at the cursor —
@@ -6436,17 +6615,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             // fields, site 3 of 10). A `{ ... }` that cannot even be balanced makes
             // the whole initializer decline, so a bare name falls through to the
             // atom — matching the oracle.
+            let mut update = false;
             let fields = match parser.attempt(|parser| {
                 let fields_start = parser.position;
                 parser.expect_ctrl('{')?;
-                let fields = parser.comma_list(Self::parse_struct_initializer_field, |parser| {
-                    parser.peek_is_ctrl('}')
-                })?;
+                let entries = parser.comma_list(
+                    |parser| {
+                        if parser.parse_refused_update_base()? {
+                            update = true;
+                            return Some(None);
+                        }
+                        parser.parse_struct_initializer_field().map(Some)
+                    },
+                    |parser| parser.peek_is_ctrl('}'),
+                )?;
                 parser.expect_ctrl('}')?;
+                let fields = entries.into_iter().flatten().collect();
                 Some((fields, parser.span_from(fields_start)))
             }) {
                 Some(clean) => clean,
                 None => {
+                    update = false;
                     let span = parser.recover_delimited(
                         "struct initializer",
                         '{',
@@ -6462,10 +6651,36 @@ impl<'a, 'src> Parser<'a, 'src> {
                     (name, name_span),
                     generic_arguments.map(Box::new),
                     Box::new(fields),
+                    update,
                 ),
                 parser.span_from(start),
             ))
         })
+    }
+
+    /// B657: `..base` where a struct-initializer field begins — the update
+    /// form, which the language does not have (a tuple spreads, a struct
+    /// literal names every field). Refused AT the dots
+    /// ([`A_STRUCT_LITERAL_HAS_NO_UPDATE_FORM`]) and read past, base and all,
+    /// so the literal is read without it: `Some(true)`. `Some(false)` when
+    /// no `..` begins here; `None` when the base itself does not parse, which
+    /// fails the field list as any broken field does.
+    fn parse_refused_update_base(&mut self) -> Option<bool> {
+        if !(self.peek_is_ctrl('.') && self.peek_at_is_ctrl(1, '.')) {
+            return Some(false);
+        }
+        let start = self.position;
+        self.bump();
+        self.bump();
+        let dots = self.span_from(start);
+        self.parse_expression()?;
+        self.errors.push(ParseError {
+            span: dots,
+            reason: ParseErrorReason::Rule(A_STRUCT_LITERAL_HAS_NO_UPDATE_FORM),
+            context: Vec::new(),
+            hint: None,
+        });
+        Some(true)
     }
 
     /// `name` or `name = value` — one struct-initializer field.
@@ -12644,7 +12859,7 @@ mod tests {
         // In expression position the same head with a brace IS a struct literal.
         assert!(matches!(
             expr("Foo { x = 1 }").0,
-            Node::StructInitializer(_, ("Foo", _), _, _)
+            Node::StructInitializer(_, ("Foo", _), _, _, false)
         ));
         // A parenthesised struct literal is admitted even in a condition.
         assert!(matches!(

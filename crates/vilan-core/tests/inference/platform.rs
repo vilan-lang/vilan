@@ -11162,6 +11162,93 @@ fn b536_an_attribute_order_refusal_rides_the_analysis() {
     );
 }
 
+// --- E355: an attribute written twice over one item -------------------------
+//
+// A second `[derive(PartialEq)]` over a struct (an edit re-adding one already
+// there) failed the head, which then re-read as list-literal statements:
+// "cannot find 'derive'" and "cannot find 'PartialEq'" per copy, with import
+// steers, and "expected `;`" — none naming the cause. The repeat is refused by
+// name at itself and taken off the head, which is read with the first copy (a
+// `[derive]`'s lists merged), so nothing cascades.
+
+/// The one diagnostic `source` fails with, and the span of `spanning` in it.
+fn the_only_failure(source: &str, spanning: &str, message: &str) {
+    let start = source.find(spanning).expect("the spanned text");
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(message.to_string(), start..start + spanning.len())],
+    );
+}
+
+#[test]
+fn e355_the_items_repeated_derive_is_one_refusal_at_the_second() {
+    let source = "[derive(PartialEq)]\n[derive(PartialEq)]\nstruct Pair {\n\tleft: i32,\n\tright: i32,\n}\n\n\
+         fun main() {\n\tprint(Pair { left = 1, right = 2 } == Pair { left = 1, right = 2 });\n}\n";
+    let second = source
+        .rfind("[derive(PartialEq)]")
+        .expect("the second copy");
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(
+            "`[derive]` is written twice over `Pair`; keep one".to_string(),
+            second..second + "[derive(PartialEq)]".len(),
+        )],
+    );
+}
+
+#[test]
+fn e355_a_repeated_derive_between_other_items_is_one_refusal() {
+    // kolt's shape: the struct between other items, where the cascade was
+    // four "cannot find" errors and a missing `;`.
+    let source = "import std::io::print;\n\nenum Mode {\n\tPlain,\n\tRich,\n}\n\n\
+         [derive(PartialEq)]\n[derive(PartialEq)]\nstruct Selection {\n\tanchor: i32,\n\tfocus: i32,\n}\n\n\
+         impl Selection {\n\tfun collapsed(self): bool {\n\t\tself.anchor == self.focus\n\t}\n}\n\n\
+         fun mode(): Mode {\n\tMode::Plain\n}\n\n\
+         fun main() {\n\tlet at = Selection { anchor = 1, focus = 1 };\n\tprint(at == at);\n\
+         \tprint(at.collapsed());\n\tlet _ = mode();\n}\n";
+    let second = source
+        .rfind("[derive(PartialEq)]")
+        .expect("the second copy");
+    assert_eq!(
+        failure_diagnostics(source),
+        vec![(
+            "`[derive]` is written twice over `Selection`; keep one".to_string(),
+            second..second + "[derive(PartialEq)]".len(),
+        )],
+    );
+}
+
+#[test]
+fn e355_a_repeated_derive_naming_more_is_steered_to_the_merge_and_read_merged() {
+    // `to_json` resolves: the item is read with both lists, so the steer is
+    // the one diagnostic.
+    the_only_failure(
+        "import std::json::Json;\n\n[derive(PartialEq)]\n[derive(Json, PartialEq)]\nstruct Pair {\n\tleft: i32,\n}\n\n\
+         fun main() {\n\tlet pair = Pair { left = 1 };\n\tprint(pair == pair);\n\tprint(pair.to_json());\n}\n",
+        "[derive(Json, PartialEq)]",
+        "`[derive]` is written twice over `Pair`: merge them, `[derive(PartialEq, Json)]`",
+    );
+}
+
+#[test]
+fn e355_a_repeated_deprecated_is_refused_and_the_item_keeps_the_first() {
+    the_only_failure(
+        "[deprecated(\"use two\")]\n[must_use]\n[deprecated(\"use three\")]\nfun one(): i32 {\n\t1\n}\n\n\
+         fun main() {\n\tprint(1);\n}\n",
+        "[deprecated(\"use three\")]",
+        "`[deprecated]` is written twice over `one`; keep one",
+    );
+}
+
+#[test]
+fn e355_a_valid_attribute_stack_is_unchanged() {
+    assert_compiles_and_runs(
+        "[derive(PartialEq)]\n[deprecated(\"use Pair2\")]\nstruct Pair {\n\tleft: i32,\n}\n\n\
+         fun main() {\n\tprint(Pair { left = 1 } == Pair { left = 1 });\n}\n",
+        "true\n",
+    );
+}
+
 // --- B654: a triple-quoted string is `[extern(..)]`'s host expression ---------
 //
 // A host binding longer than a line had no spelling: the attribute's
