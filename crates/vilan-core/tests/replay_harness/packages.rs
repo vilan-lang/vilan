@@ -351,15 +351,16 @@ pub struct Edit {
 pub const CLASSES_MAIN: &str = "import pkg::views::render;\nimport pkg::cycle_a::ring;\nimport pkg::impls;\nimport pkg::user::use_it;\nimport pkg::side::side_value;\nimport pkg::ext;\nimport pkg::reader::shouted;\nimport pkg::runner::run_read;\nimport pkg::bag::fill;\nimport pkg::a_spoil::spoil;\nimport pkg::painter::painted;\nimport pkg::shiner::shone;\nimport pkg::bar_eq;\nimport pkg::bar_user::bars_match;\nimport pkg::data_user::{ banner, smaller };\n\nfun main() {\n\tprint(render());\n\tprint(ring(1));\n\tprint(use_it());\n\tprint(side_value());\n\tprint(shouted());\n\tprint(run_read());\n\tfill();\n\tspoil();\n\tprint(painted());\n\tprint(shone());\n\tprint(bars_match());\n\tprint(banner());\n\tprint(smaller());\n}\n";
 
 // S1's hazards, each a module the PREFIX holds and a module the hot set holds:
-// an inherent impl on a prefix type, written in a module the caller never
-// imports (`ext` / `reader`, the impl guard's case); a context whose value type
+// an inherent impl on a prefix type, written in another module (`ext` /
+// `reader` — since B688 the caller must import from `ext`, so it is no longer
+// the impl guard's case: the trait impl `impls` / `user` is); a context whose value type
 // only a hot module's `run` grounds (`ctx` / `runner`, the early-commitment
 // guard's case); and a module binding two modules push into, the hot one
 // first in load order (`bag` / `a_spoil`, which side of a conflict is blamed).
 pub const CLASSES_EXT: &str =
     "import pkg::shapes::Foo;\n\nimpl Foo {\n\tfun shout(self): str {\n\t\t\"HI\"\n\t}\n}\n";
 
-pub const CLASSES_READER: &str = "import pkg::shapes::Foo;\n\nexport fun shouted(): str {\n\tlet foo = Foo { n = 2 };\n\tfoo.shout()\n}\n";
+pub const CLASSES_READER: &str = "import pkg::ext;\nimport pkg::shapes::Foo;\n\nexport fun shouted(): str {\n\tlet foo = Foo { n = 2 };\n\tfoo.shout()\n}\n";
 
 pub const CLASSES_CTX: &str = "import std::context::Context;\n\nexport let mood = Context::new();\n\nexport fun read_mood(): i32 {\n\tmood.get() + 1\n}\n";
 
@@ -548,7 +549,7 @@ pub const CLASS_EDITS: &[Edit] = &[
         replacements: &[("\tring(n + 1)", "\tring(n + 2)")],
     },
     Edit {
-        label: "an inherent impl the prefix calls, edited in a module it never imports",
+        label: "an inherent impl the prefix calls, edited in the module it imports it from",
         file: "ext.vl",
         seed: None,
         replacements: &[("\t\t\"HI\"", "\t\t\"HEY\"")],

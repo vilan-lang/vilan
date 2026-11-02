@@ -64568,8 +64568,10 @@ impl<'src> Analyzer<'src> {
         // "`import a::b;` admits every impl declared in `a`'s file and in
         // every file on the path to it": `import std::reactive::store::Store;`
         // reaches `store.vl`, whose blocks extend `Store`, though `Store`
-        // itself is declared in `store_core.vl`. An `only` statement declines
-        // the path's impls, so it reaches no further than the names it binds.
+        // itself is declared in `store_core.vl`. An `only` statement reaches
+        // its path too: whether the file ADMITS what it reached is B318's
+        // question, and its refusal ("imports that module `only`") is the one
+        // that names the mistake.
         if self
             .import_impl_restrictions
             .iter()
@@ -64579,9 +64581,6 @@ impl<'src> Analyzer<'src> {
                 self.statement_path_index(|source| reached.contains_key(&source));
             let source_of_path = source_of_path_index(&canonical_sources);
             for row in &self.import_impl_restrictions {
-                if row.only.is_some() {
-                    continue;
-                }
                 let Some(files) = reached.get_mut(&row.source) else {
                     continue;
                 };

@@ -1751,8 +1751,12 @@ fn the_differential_sees_a_prefix_served_unvalidated() {
     );
 }
 
-/// S1's plant: the impl guard dropped. A hot module's inherent impl on a
-/// prefix type is then invisible to the prefix caller that uses it.
+/// S1's plant: the impl guard dropped. A hot module's impl on a prefix type is
+/// then invisible to the prefix caller that uses it — a TRAIT impl in a module
+/// the caller never imports (`impls.vl`'s `Greet` for `Foo`, which `user.vl`
+/// calls). Since B688 an INHERENT impl's module must be reached by its caller,
+/// so editing it puts the caller in the hot set and this plant no longer
+/// touches the `ext`/`reader` step.
 #[test]
 fn the_differential_sees_a_hot_impl_the_prefix_needed() {
     let _switch = SWITCH_LOCK
@@ -1762,7 +1766,7 @@ fn the_differential_sees_a_hot_impl_the_prefix_needed() {
     assert!(
         divergences
             .iter()
-            .any(|divergence| divergence.contains("inherent impl the prefix calls")),
+            .any(|divergence| divergence.contains("an impl in a module the caller never imports")),
         "the impl-guard plant must turn the hot impl edit red; it found: {divergences:#?}"
     );
 }
