@@ -153,6 +153,13 @@ shape — `[` then a name — leads a head; `export *;` takes none. The
 marker is written once: a second `export` on one declaration is refused
 (B492).
 
+So is each attribute but `[hint(..)]`, which a declaration may carry more
+than once: a repeat is an **error** at the repeat, read as if it were not
+written, so nothing else is reported for it — `` `[deprecated]` is written twice over
+`f`; keep one ``. A repeated `[derive(..)]` is read with the lists merged,
+and the error spells the merge: `[derive(PartialEq)]` ⏎ `[derive(Json)]` ⏎
+`struct Pair` — `` merge them, `[derive(PartialEq, Json)]` `` (E355).
+
 A `#` before a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
