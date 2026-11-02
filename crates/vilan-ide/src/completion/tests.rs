@@ -356,7 +356,7 @@ fn a149_s4_a_field_named_like_a_handle_internal_types_as_the_projection() {
     // a `Store<str>`. The live receiver walk must not stop at the HANDLE's
     // internal `path` on the way: that offered the path's members and none of
     // the handle's (`on_change`). The path was a `List<StoreStep>` (`iter`); it
-    // is a `StorePath` since M186 (`steps`).
+    // is a `Shared<StorePathStep>` since M186 (`downgrade`).
     let source = format!(
         "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.address.path.¦\n}}\n"
     );
@@ -372,8 +372,8 @@ fn a149_s4_a_field_named_like_a_handle_internal_types_as_the_projection() {
         labels(&items)
     );
     assert!(
-        !items.iter().any(|item| item.label == "steps"),
-        "a store path's is not: {:?}",
+        !items.iter().any(|item| item.label == "downgrade"),
+        "a store path's cell's is not: {:?}",
         labels(&items)
     );
 }

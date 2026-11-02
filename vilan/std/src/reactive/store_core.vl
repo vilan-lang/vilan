@@ -49,67 +49,54 @@ export enum StoreStep {
 	Key(Hash),
 }
 
-/// A handle's path (M186): the steps from the root, SHARED — a projection allocates
-/// one step pointing at its parent's path, and copying a handle copies one pointer.
-/// Read as a list (`steps`) only where the slot tree is walked: a subscription, an
+/// One step of a handle's path (M186), and the path above it: a handle's `path`
+/// (and a `StoreSome`'s `gate`) is a `Shared<StorePathStep>`, its innermost step,
+/// so a projection allocates one step pointing at its parent's and copying a
+/// handle copies one pointer. Never written once made: two handles share it, and
+/// a projection made below either points at it. A store's ROOT path is a SENTINEL
+/// step at depth 0 whose `step` is never read (it holds `Field(0)`). Read as a list
+/// (`store_path_steps`) only where the slot tree is walked: a subscription, an
 /// identity, a write. Exported because it is the handles' field type (the reach
 /// rule); nothing outside the store builds one.
-export struct StorePath {
-	[internal("the innermost step; reach the path through `steps`")] end: Option<Shared<StorePathStep>>,
-}
-
-/// One step of a `StorePath`, and the path above it. Never written once made: two
-/// handles share it, and a projection made below either points at it.
 export struct StorePathStep {
-	[internal("a store path's step; reach it through `StorePath::steps`")] step: StoreStep,
-	[internal("a store path's parent; reach it through `StorePath::steps`")] above: StorePath,
-	/// How many steps from the root, this one included.
-	[internal("a store path's length; reach it through `StorePath::len`")] depth: usize,
+	[internal("a store path's step; reach it through `store_path_steps`")] step: StoreStep,
+	[internal("a store path's parent; reach it through `store_path_steps`")] above: Option<Shared<StorePathStep>>,
+	/// How many steps from the root, this one included; `0` at the root's sentinel.
+	[internal("a store path's length; reach it through `store_path_steps`")] depth: usize,
 }
 
-export impl StorePath {
-	/// The root's path: no steps.
-	[internal("a store's root path (M186)")]
-	fun root(): StorePath {
-		StorePath { end = None }
-	}
-
-	/// The path one `step` below this one: one allocation, sharing this path.
-	[internal("a store's step down (M186)")]
-	fun child(self, step: StoreStep): StorePath {
-		let depth = self.len() + 1;
-		StorePath { end = Some(Shared::new(StorePathStep { step, above = self, depth })) }
-	}
-
-	/// How many steps the path has: `0` at the root.
-	[internal("a store path's length (M186)")]
-	fun len(self): usize {
-		match self.end {
-			None => 0,
-			Some(let held) => held.read().depth,
-		}
-	}
-
-	/// The steps from the root down — one list, made for a walk of the slot tree,
-	/// an identity's key or the wire log.
-	[internal("a store path, materialized for the slot tree (M186)")]
-	fun steps(self): List<StoreStep> {
-		mut steps: List<StoreStep> = [];
-		push_steps(self, &mut steps);
-		steps
-	}
+/// A store's root path: the sentinel step, depth 0, whose `step` is never read.
+fun path_root(): Shared<StorePathStep> {
+	Shared::new(StorePathStep { step = StoreStep::Field(0), above = None, depth = 0 })
 }
 
-/// Push `path`'s steps onto `into`, root first: up to the root, then each step on
-/// the way back down — the list in order with no reverse and no placeholder.
-fun push_steps(path: StorePath, into: &mut List<StoreStep>) {
-	match path.end {
+/// The path one `step` below `path`: one allocation, sharing `path`.
+fun path_child(path: Shared<StorePathStep>, step: StoreStep): Shared<StorePathStep> {
+	let depth = path.read().depth + 1;
+	Shared::new(StorePathStep { step, above = Some(path), depth })
+}
+
+/// The steps of `path` from the root down — one list, made for a walk of the slot
+/// tree, an identity's key or the wire log.
+[internal("a store path, materialized for the slot tree (M186)")]
+export fun store_path_steps(path: Shared<StorePathStep>): List<StoreStep> {
+	mut steps: List<StoreStep> = [];
+	push_steps(path, &mut steps);
+	steps
+}
+
+/// Push `path`'s steps onto `into`, root first: up to the root's sentinel, which
+/// pushes nothing, then each step on the way back down — the list in order with no
+/// reverse and no placeholder.
+fun push_steps(path: Shared<StorePathStep>, into: &mut List<StoreStep>) {
+	if path.read().depth == 0 {
+		ret;
+	}
+	match path.read().above {
+		Some(let above) => push_steps(above, into),
 		None => {},
-		Some(let held) => {
-			push_steps(held.read().above, into);
-			into.push(held.read().step);
-		},
 	}
+	into.push(path.read().step);
 }
 
 /// What a write did to a collection, as the collection's open FEEDS are told it
@@ -193,8 +180,8 @@ fun empty_node(): Shared<StoreNode> {
 /// other store. A tracked read of a handle keeps one edge across runs by it. The
 /// key is the hash of the path's STEPS, so a projection remade from a copied handle
 /// asks under the same key (M186: the path is shared, the steps are equal).
-fun identity_at(root: Shared<StoreNode>, path: StorePath): i32 {
-	identity_of(root, path.steps())
+fun identity_at(root: Shared<StoreNode>, path: Shared<StorePathStep>): i32 {
+	identity_of(root, store_path_steps(path))
 }
 
 /// `identity_at` for a path already read as a list.
@@ -391,8 +378,8 @@ export fun store_switch(
 
 /// The path of variant `index`'s flag under the enum at `path`: the discriminant's
 /// child `index`.
-fun flag_path(path: StorePath, index: usize): StorePath {
-	path.child(StoreStep::Field(0)).child(StoreStep::Field(index))
+fun flag_path(path: Shared<StorePathStep>, index: usize): Shared<StorePathStep> {
+	path_child(path_child(path, StoreStep::Field(0)), StoreStep::Field(index))
 }
 
 /// The child of `node` one `step` below, made (a field's list grown to it, a key's
@@ -535,10 +522,10 @@ fun counted(root: Shared<StoreNode>, path: List<StoreStep>, slot: StoreSlot, han
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun watch_at(
 	root: Shared<StoreNode>,
-	path: StorePath,
+	path: Shared<StorePathStep>,
 	subscriber: Subscriber,
 ): Subscription {
-	let steps = path.steps();
+	let steps = store_path_steps(path);
 	let slot = slot_at(root, steps);
 	let handle = slot.signal.on_settle(subscriber);
 	counted(root, steps, slot, handle);
@@ -600,8 +587,12 @@ export fun store_wire_detach(root: Shared<StoreNode>, cursor: DeltaCursor) {
 /// closure the slot keeps holds only the handle's READ — never the slot tree, which
 /// holds the slot: a handle captured there would be a loop through every node on
 /// the path (A132's, one level down; `HashMapEntry::attach_observer` is the model).
-fun observe_at(root: Shared<StoreNode>, path: StorePath, observer: || void): Subscription {
-	observe_steps(root, path.steps(), observer)
+fun observe_at(
+	root: Shared<StoreNode>,
+	path: Shared<StorePathStep>,
+	observer: || void,
+): Subscription {
+	observe_steps(root, store_path_steps(path), observer)
 }
 
 /// `observe_at` for a path already read as a list.
@@ -660,14 +651,14 @@ fun prune_empty(chain: List<Shared<StoreNode>>, path: List<StoreStep>) {
 
 /// Stand `feed` on the node at `path`, made with the nodes on the way down.
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
-export fun attach_feed(root: Shared<StoreNode>, path: StorePath, feed: StoreFeed) {
-	node_made(root, path.steps()).write().feeds.push(feed);
+export fun attach_feed(root: Shared<StoreNode>, path: Shared<StorePathStep>, feed: StoreFeed) {
+	node_made(root, store_path_steps(path)).write().feeds.push(feed);
 }
 
 /// Take the feed `id` off the node at `path`, and drop every node it left empty.
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
-export fun detach_feed(root: Shared<StoreNode>, at: StorePath, id: i32) {
-	let path = at.steps();
+export fun detach_feed(root: Shared<StoreNode>, at: Shared<StorePathStep>, id: i32) {
+	let path = store_path_steps(at);
 	let chain = node_chain(root, path);
 	if chain.len() != path.len() + 1 {
 		ret;
@@ -708,12 +699,12 @@ struct Lent {
 /// a dead variant diffs nothing, lands nothing, wakes nothing, and answers `false`.
 fun write_at<T: Storable>(
 	root: Shared<StoreNode>,
-	at: StorePath,
+	at: Shared<StorePathStep>,
 	lend: |(|&T| void)| void,
 	modify: |(|&mut T| void)| void,
 	value: T,
 ): bool {
-	let path = at.steps();
+	let path = store_path_steps(at);
 	let found = spine(root, &path);
 	let need = !found.ancestors.is_empty() || !found.touches.is_empty();
 	let node = found.node;
@@ -764,8 +755,8 @@ fun write_at<T: Storable>(
 /// Wake the slot at `path` and every ancestor's, comparing nothing — `notify()`'s
 /// body, the escape hatch for a change the store cannot see. No feed records
 /// anything: nothing it can name happened.
-fun notify_at(root: Shared<StoreNode>, at: StorePath) {
-	let path = at.steps();
+fun notify_at(root: Shared<StoreNode>, at: Shared<StorePathStep>) {
+	let path = store_path_steps(at);
 	let found = spine(root, &path);
 	mut woken = StoreWoken { slots = found.ancestors, feeds = [] };
 	store_wake_me(found.node, true, &mut woken);
@@ -911,7 +902,7 @@ export impl Option<type P: Storable> with Storable {
 [hint(Signal<T>)]
 export struct Store<T> {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
-	[internal("the store's path; reach it through the handle")] path: StorePath,
+	[internal("the store's path; reach it through the handle")] path: Shared<StorePathStep>,
 	[internal("the in-place read; reach it through `get`")] lend: |(|&T| void)| void,
 	[internal("the in-place write; reach it through `set`")] modify: |(|&mut T| void)| void,
 }
@@ -923,10 +914,10 @@ export struct Store<T> {
 [hint(Source<Option<P>>)]
 export struct StoreSome<P> {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
-	[internal("the store's path; reach it through the handle")] path: StorePath,
+	[internal("the store's path; reach it through the handle")] path: Shared<StorePathStep>,
 	[internal("the in-place read; reach it through `get`")] lend: |(|&P| void)| void,
 	[internal("the in-place write; reach it through `patch`")] modify: |(|&mut P| void)| void,
-	[internal("the variant flag this handle is live behind; reach it through `live`")] gate: StorePath,
+	[internal("the variant flag this handle is live behind; reach it through `live`")] gate: Shared<StorePathStep>,
 }
 
 /// An enum's DISCRIMINANT, as one variant asks it: `presence.is_online()`. A
@@ -937,7 +928,7 @@ export struct StoreSome<P> {
 [hint(Source<bool>)]
 export struct StoreFlag {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
-	[internal("the store's path; reach it through the handle")] path: StorePath,
+	[internal("the store's path; reach it through the handle")] path: Shared<StorePathStep>,
 	[internal("the read; reach it through `get`")] read: || bool,
 }
 
@@ -948,7 +939,7 @@ export impl Store<type T> {
 		let cell = Shared::new(value);
 		Store<T> {
 			root = empty_node(),
-			path = StorePath::root(),
+			path = path_root(),
 			lend = |f: |&T| void| f(&cell.write()),
 			modify = |f: |&mut T| void| f(&mut cell.write()),
 		}
@@ -980,7 +971,7 @@ export impl Store<type T> {
 		let modify = self.modify;
 		Store<F> {
 			root = self.root,
-			path = self.path.child(step),
+			path = path_child(self.path, step),
 			lend = |f: |&F| void| lend(|held: &T| read(held, f)),
 			modify = |f: |&mut F| void| modify(|held: &mut T| write(held, f)),
 		}
@@ -999,7 +990,7 @@ export impl Store<type T> {
 		let modify = self.modify;
 		StoreSome<P> {
 			root = self.root,
-			path = self.path.child(StoreStep::Field(index)),
+			path = path_child(self.path, StoreStep::Field(index)),
 			lend = |f: |&P| void| lend(|held: &T| read(held, f)),
 			modify = |f: |&mut P| void| modify(|held: &mut T| write(held, f)),
 			gate = flag_path(self.path, index),
@@ -1050,7 +1041,7 @@ export impl StoreSome<type P> {
 		let modify = self.modify;
 		StoreSome<F> {
 			root = self.root,
-			path = self.path.child(step),
+			path = path_child(self.path, step),
 			lend = |f: |&F| void| lend(|held: &P| read(held, f)),
 			modify = |f: |&mut F| void| modify(|held: &mut P| write(held, f)),
 			gate = self.gate,
@@ -1069,7 +1060,7 @@ export impl StoreSome<type P> {
 		let modify = self.modify;
 		StoreSome<V> {
 			root = self.root,
-			path = self.path.child(StoreStep::Field(index)),
+			path = path_child(self.path, StoreStep::Field(index)),
 			lend = |f: |&V| void| lend(|held: &P| read(held, f)),
 			modify = |f: |&mut V| void| modify(|held: &mut P| write(held, f)),
 			gate = flag_path(self.path, index),

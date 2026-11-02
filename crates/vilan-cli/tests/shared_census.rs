@@ -145,7 +145,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive/store_core.vl",
-        6,
+        7,
         "E: a store's cells, all minted by the store and reached through every \
          copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
          (`Store::new`), each node of its slot tree, and a slot's subscription \
@@ -156,10 +156,11 @@ const CENSUS: &[(&str, usize, &str)] = &[
          under a key and read by every write's diff; +1 at M172 (Order 55): the \
          root's identity table (`ids`), a cell as `keyed` is, because binding \
          the map copied every identity minted once per boundary a mirror named; \
-         +1 at M186: a handle path's step (`StorePath::child`), never written \
-         once made and shared by every copy of the handle and every projection \
-         made below it, so a projection allocates one step rather than copying \
-         its parent's path list. A collection flow's feed keeps its state in `mut` bindings its \
+         +2 at M186: a handle path's step (`path_child`) and a store's root \
+         path sentinel (`path_root`, one per `Store::new`), never written once \
+         made and shared by every copy of the handle and every projection made \
+         below it, so a projection allocates one step rather than copying its \
+         parent's path list. A collection flow's feed keeps its state in `mut` bindings its \
          closures capture, so `store.vl` itself mints none",
     ),
     (
@@ -363,7 +364,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 250,
+        total, 251,
         "the total number of `Shared` construction sites in std changed"
     );
 

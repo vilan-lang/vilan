@@ -2557,10 +2557,10 @@ fn b693_the_assumed_handles_read_lends_and_only_the_keeper_copies() {
         keeper.contains("__clone(payload)"),
         "the keeper, built before it is attached, is the copy:\n{assume}"
     );
-    // What follows the attach is the detach and the handle; the handle's only
-    // copy is of its PATH (a shared `StorePath`, M186), never of what it reads.
+    // What follows the attach is the detach and the handle, which copies
+    // nothing: not what it reads, and not its path (a shared pointer since M186).
     assert!(
-        !handle.replace("__clone(self[1])", "").contains("__clone"),
+        !handle.contains("__clone"),
         "the assumed handle copies on a read:\n{assume}"
     );
 }
@@ -2825,16 +2825,15 @@ fn b693_assuming_a_dead_variant_is_refused() {
 /// parent's path LIST three times over — the receiver, `child_path`'s push, the
 /// struct literal — and a `StoreSome` its gate list beside it: 74 `__clone` calls
 /// a read, 7,400 for the hundred. A projection now allocates one step pointing at
-/// its parent's path, and a handle copy copies that pointer (a `StorePath` is a
-/// one-field struct over an `Option`, four calls that copy no step): 29 a read,
-/// the title's own copy included.
+/// its parent's path, and a handle copy copies that pointer, which is no copy at
+/// all: what is left is the title's own.
 #[test]
 fn m186_a_read_below_a_handle_copies_no_path_list() {
     for count in [10, 1000] {
         let copies = copies_per_print(&B693_PHASES.replace("{count}", &count.to_string()));
         assert_eq!(copies.len(), 6, "six phases print: {copies:?}");
         assert_eq!(
-            copies[2], 2900,
+            copies[2], 100,
             "a hundred reads five steps below the handle at {count} records: {copies:?}"
         );
     }
@@ -2903,9 +2902,10 @@ main();
 "#;
 
 /// §4.2: a read's copies are LINEAR in its depth, the same for every step —
-/// depth 5 costs depth 3 plus exactly two steps. With the path a list, each
-/// step copied a list as long as the depth so far, and the steps cost more the
-/// deeper they went.
+/// depth 5 costs depth 3 plus exactly two steps — and a step now copies
+/// nothing, so the three cost the same: the leaf's own. With the path a list,
+/// each step copied a list as long as the depth so far, and the steps cost more
+/// the deeper they went.
 #[test]
 fn m186_a_reads_copies_grow_by_one_constant_per_step() {
     let copies = copies_per_print(M186_DEPTHS);
@@ -2913,7 +2913,7 @@ fn m186_a_reads_copies_grow_by_one_constant_per_step() {
     let (three, four, five) = (copies[1], copies[2], copies[3]);
     assert_eq!(
         (three, four, five),
-        (1300, 1700, 2100),
+        (200, 200, 200),
         "a hundred reads at depths 3, 4 and 5: {copies:?}"
     );
     assert_eq!(

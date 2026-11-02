@@ -7284,7 +7284,7 @@ fun main() {
 fn m186_a_write_five_steps_down_is_patched_at_its_path_root_first() {
     // The key slot's patch names `[1, 1, 0]` below `rooms/0` — the `Some`
     // payload, its `topic`, the topic's `title` — and the topic grant's `[1]`:
-    // the write log's path read root first. Red with `StorePath::steps` read
+    // the write log's path read root first. Red with `store_path_steps` read
     // leaf first: no slot holds the reversed path, and nothing is sent.
     let stdout = run_program("mirror_deep_path", MIRROR_DEEP_PATH);
     let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
