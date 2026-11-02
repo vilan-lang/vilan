@@ -421,3 +421,17 @@ class = "reference"
 ratio = 1.01
 reason = "B693: std::reactive::store_core's StoreSome::assume stands a keeper feed on its variant's flag (defer_to_owner, store_switch's flag touches), which every program reaching the store core analyzes; measured x1.0005 of next's std (f9fcc6ce) under the lane's build on the lane's box, where next's own std already stood at x1.0099 of the v0.53.0 ceiling"
 item = "B693"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.01
+reason = "A179: std::rpc's dial honours the ambient CancelSignal (dial_attempt, the abort listener, DialFailure::Cancelled) and gained dial_within + two RpcError arms, which every program reaching std::rpc analyzes; CI's perf job read x1.0155 of the ceiling at the merge 79a620f9 where the limit stood at x1.0150 (A178's bump already on the row)"
+item = "A179"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.01
+reason = "A179: std::rpc's dial honours the ambient CancelSignal (dial_attempt, the abort listener, DialFailure::Cancelled) and gained dial_within + two RpcError arms, which every program reaching std::rpc analyzes; CI's perf job read x1.0096 of the ceiling at the merge 79a620f9 where the limit stood at x1.0050"
+item = "A179"
