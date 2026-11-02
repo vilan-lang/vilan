@@ -545,7 +545,7 @@ struct HistoryEntry { path: str, state: str, popped: bool }
 fun current_entry(): SignalCell<HistoryEntry>   // live; popped = back/forward reached it
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
-fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
+fun percent_decode(text: str): str    // std::url's, re-exported: total (a bad escape decodes to itself)
 fun parse_query(query: str): HashMap<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
 
 struct PathParts { segments: List<str>, query: HashMap<str, str>, fragment: Option<str> }

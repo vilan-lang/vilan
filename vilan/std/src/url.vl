@@ -1,0 +1,27 @@
+// `std::url` — percent-encoding on every platform (tracker M181,
+// proposal/percent-encoding.md).
+//
+// The pair a program writing or reading URLs needs: `percent_encode` builds a path
+// segment, a query value or a `Content-Disposition` filename, and `percent_decode`
+// reads one back without ever failing. Platform-neutral: the JS backend binds the
+// host's `encodeURIComponent` / `decodeURIComponent` (made total), and the native
+// one `vilan-rt`'s hand-written twins, which the native differential holds to the
+// same bytes.
+
+/// Percent-encodes `text` with `encodeURIComponent`'s set: every byte of its UTF-8
+/// encoding becomes `%XX` (upper-case hex) except the unreserved
+/// `A-Z a-z 0-9 - _ . ! ~ * ' ( )`. So `"a b/c"` is `"a%20b%2Fc"` and `"é"` is
+/// `"%C3%A9"` — safe as one path segment or one query value.
+[extern("__percent_encode")]
+export external fun percent_encode(text: str): str;
+
+/// Decodes percent-escapes: `"hello%20world"` is `"hello world"`,
+/// `"caf%C3%A9"` is `"café"`.
+///
+/// TOTAL: it never fails. A malformed escape (`%zz`, a lone `%`) is not an escape
+/// and stays as written, and a run of escapes whose bytes are not UTF-8 (`%FF`,
+/// `%41%FF`) decodes to itself, byte for byte. A URL is text a stranger chose, so a
+/// decoder that can fail is a request that a link can take down — and the useful
+/// answer for a piece that is not an escape sequence is the piece.
+[extern("__percent_decode")]
+export external fun percent_decode(text: str): str;

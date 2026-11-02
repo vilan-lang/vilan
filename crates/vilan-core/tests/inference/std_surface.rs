@@ -8971,3 +8971,126 @@ fn m185_the_codec_is_emitted_only_when_reached() {
         "naming `Fit` is not reaching the codec"
     );
 }
+
+// --- M181: `std::url`, percent-encoding on every platform ----------------------
+//
+// proposal/percent-encoding.md §4. The node side here; the native twin is held
+// to the same bytes by `native_differential::m181_*`.
+
+fn m181_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::url::{{ percent_decode, percent_encode }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn m181_the_encoder_keeps_exactly_the_unreserved_set() {
+    // Every unreserved character survives; every other printable ASCII
+    // character is escaped, upper-case hex; UTF-8 is escaped byte by byte.
+    assert_compiles_and_runs(
+        &m181_program(
+            r##"
+            print(percent_encode("ABCXYZabcxyz0123456789-_.!~*'()"));
+            print(percent_encode(" "));
+            print(percent_encode("/"));
+            print(percent_encode("é"));
+            print(percent_encode("😀"));
+            print(percent_encode("#$%&+,:;=?@[]\"<>\\^`{|}"));
+            print(i"[{percent_encode("")}]");
+            "##,
+        ),
+        "ABCXYZabcxyz0123456789-_.!~*'()\n%20\n%2F\n%C3%A9\n%F0%9F%98%80\n\
+         %23%24%25%26%2B%2C%3A%3B%3D%3F%40%5B%5D%22%3C%3E%5C%5E%60%7B%7C%7D\n[]\n",
+    );
+}
+
+#[test]
+fn m181_the_encoder_is_total_over_a_lone_surrogate() {
+    // A JS string can hold half of a surrogate pair (`substring` counts UTF-16
+    // units there), on which `encodeURIComponent` itself throws: the helper
+    // answers U+FFFD's escape instead.
+    assert_compiles_and_runs(
+        &m181_program(
+            r#"
+            let face = "😀";
+            print(percent_encode(face.substring(0, 1)));
+            print(percent_encode(i"a{face.substring(1, 2)}b"));
+            "#,
+        ),
+        "%EF%BF%BD\na%EF%BF%BDb\n",
+    );
+}
+
+#[test]
+fn m181_the_decoder_decodes_every_escape_run() {
+    assert_compiles_and_runs(
+        &m181_program(
+            r#"
+            print(percent_decode("hello%20world"));
+            print(percent_decode("caf%C3%A9"));
+            print(percent_decode("caf%c3%a9"));
+            print(percent_decode("%F0%9F%98%80!"));
+            print(percent_decode("a%2Fb%3Fc%3Dd"));
+            "#,
+        ),
+        "hello world\ncafé\ncafé\n😀!\na/b?c=d\n",
+    );
+}
+
+#[test]
+fn m181_the_decoder_is_total_each_malformed_shape_decodes_to_itself() {
+    // A lone `%`, a truncated escape, a non-hex escape, a byte that is not
+    // UTF-8, a run that is not UTF-8 as a whole (truncated, overlong, an
+    // encoded surrogate, past U+10FFFF) — each answers itself, and the good
+    // run beside a bad one still decodes.
+    assert_compiles_and_runs(
+        &m181_program(
+            r#"
+            for text in ["%", "100%", "%2", "%G1", "%zz", "%FF", "%41%FF", "%C3", "%C0%80", "%ED%A0%80", "%F4%90%80%80", "%C3x%A9"] {
+                print(percent_decode(text) == text);
+            }
+            print(percent_decode("%zz%20"));
+            print(percent_decode("%41%FF %41"));
+            print(i"[{percent_decode("")}]");
+            "#,
+        ),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n%zz \n%41%FF A\n[]\n",
+    );
+}
+
+#[test]
+fn m181_decoding_inverts_encoding() {
+    assert_compiles_and_runs(
+        &m181_program(
+            r#"
+            for text in ["", "a b/c?d=e&f", "é😀", "100%", "%41", "%FF", "~*'()"] {
+                print(percent_decode(percent_encode(text)) == text);
+            }
+            "#,
+        ),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn m181_std_url_compiles_for_the_browser_and_the_router_re_exports_the_decoder() {
+    // Platform-neutral: a browser program imports it as a node one does, and
+    // `std::web::router::percent_decode` is the same function.
+    assert_compiles_browser(
+        r#"
+        import std::io::print;
+        import std::url::{ percent_decode, percent_encode };
+        import std::web::router;
+        fun main() {
+            print(percent_encode("a b"));
+            print(percent_decode("a%20b") == router::percent_decode("a%20b"));
+        }
+        "#,
+    );
+}
