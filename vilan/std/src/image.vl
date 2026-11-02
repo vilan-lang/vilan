@@ -16,6 +16,7 @@
 [platform("@process")] mod self;
 
 import pkg::bytes::Bytes;
+import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 
@@ -72,7 +73,7 @@ external fun image_height(image: Image): usize;
 external fun image_rgba(image: Image): Bytes;
 
 [extern("__image_resize")]
-external fun image_resize(image: Image, width: usize, height: usize, fit: i32): Image;
+external fun image_resize(image: Image, width: usize, height: usize, fit: i32): Result<Image, str>;
 
 [extern("__image_crop")]
 external fun image_crop(image: Image, x: usize, y: usize, width: usize, height: usize): Image;
@@ -148,8 +149,18 @@ export impl Image {
 	/// keeps the aspect inside the box, rounding to whole pixels and never below
 	/// one a side; `Cover` fills the box and crops the overflow centred; `Fill`
 	/// stretches. A zero side of the box counts as one pixel.
+	///
+	/// PANICS when the result would exceed 50,000,000 pixels (`a 100000 x 100000
+	/// result exceeds the 50,000,000-pixel limit`) — decode's default limit. The
+	/// box is your program's choice, not the upload's, so it is a bug to fix
+	/// rather than an `Err` to handle; it is the RESULT that counts, so a
+	/// `Contain` into a huge box that comes out small is fine.
+	[track_caller]
 	fun resized(self, width: usize, height: usize, fit: Fit): Image {
-		image_resize(self, width, height, fit_code(fit))
+		match image_resize(self, width, height, fit_code(fit)) {
+			Ok(let resized) => resized,
+			Err(let reason) => panic(reason),
+		}
 	}
 
 	/// The `width` x `height` window at (`x`, `y`), clamped to the picture: a

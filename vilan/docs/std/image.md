@@ -23,7 +23,7 @@ impl Image {
 	fun height(self): usize
 	fun rgba(self): Bytes                                     // a copy, row-major RGBA
 
-	fun resized(self, width: usize, height: usize, fit: Fit): Image
+	fun resized(self, width: usize, height: usize, fit: Fit): Image  // panics past 50,000,000 px
 	fun cropped(self, x: usize, y: usize, width: usize, height: usize): Image
 	fun encode(self, format: Format, quality: i32): Result<Bytes, str>
 }
@@ -63,6 +63,12 @@ Scaling is Lanczos3 — a downscale averages every source pixel it covers, so
 a 4,000-pixel photo shown at 300 does not shimmer — and upscaling is allowed.
 A picture with transparency is scaled with its colours weighted by their
 alpha, so a fully transparent pixel's colour never bleeds into an edge.
+`resized` PANICS when its result would exceed 50,000,000 pixels — `a 100000
+x 100000 result exceeds the 50,000,000-pixel limit` — the same ceiling
+`decode` puts on an upload. The box is your program's choice rather than the
+upload's, so an oversized one is a bug to fix, not an `Err` to handle; the
+RESULT is what counts, so a `Contain` into a huge box that comes out small
+is fine.
 
 `cropped(x, y, width, height)` CLAMPS rather than refuses: a window reaching
 past an edge stops at it, and one starting past an edge is empty.
@@ -107,7 +113,9 @@ Both backends run the **same codec**: the `vilan-image` crate, over Rust's
 debug build); on node, the compiler writes the same code, compiled to
 WebAssembly, into the bundle — about 800 KB of it, and only into a program
 that decodes, scales, crops or encodes. A program that never does carries
-none of it. One implementation is why the two backends answer the same
+none of it. (The web playground's compiler leaves the codec out to stay small, so in
+its server mode such a program is refused with a sentence saying so; build
+it with the `vilan` CLI.) One implementation is why the two backends answer the same
 pixels and the same error sentences for the same input. The codec's crates
 are MIT- and Apache-2.0-licensed; the toolchain's `THIRD-PARTY-NOTICES.txt`
 lists them, and a program that ships the codec ships them too.

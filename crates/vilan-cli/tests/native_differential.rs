@@ -14907,6 +14907,34 @@ fn m185_image_is_identical_on_both_backends() {
     }
 }
 
+/// M185: a `resized` result over the 50,000,000-pixel limit panics, naming
+/// both sizes, at the CALLER's site (`resized` is `[track_caller]`), on both
+/// backends — while a `Contain` into a box far past the limit whose result is
+/// small (4 x 3 into 100,000 x 1 is 1 x 1) is fine.
+#[test]
+fn m185_a_resize_past_the_pixel_limit_panics_at_its_caller_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_image_resize_cap.vl";
+    let source = include_str!("native/image_resize_cap.vl");
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    let location = site_of(file, source, "resized(100000, 100000", "resized");
+    let expected = format!(
+        "panicked at {location}: a 100000 x 100000 result exceeds the 50,000,000-pixel limit"
+    );
+    let native = run_on(&staged, Some("rust"), file);
+    assert_eq!(native.stdout, "1 x 1\n");
+    assert_eq!(native.code, Some(1), "{}", native.stderr);
+    assert_eq!(native.stderr, format!("{expected}\n"));
+    let javascript = run_on(&staged, None, file);
+    assert_eq!(javascript.stdout, "1 x 1\n");
+    assert_eq!(javascript.code, Some(1), "{}", javascript.stderr);
+    assert!(
+        javascript.stderr.lines().any(|line| line == expected),
+        "node's stderr lacks {expected:?}:\n{}",
+        javascript.stderr
+    );
+}
+
 /// M185: every package the generated manifest optimizes for an image program
 /// is in the graph `vilan-image` resolves to — read off this workspace's
 /// lockfile, which pins the same `image` the generated project resolves. A name

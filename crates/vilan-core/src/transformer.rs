@@ -1231,17 +1231,8 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
     // through the one lazily instantiated module, and the module's bytes are
     // `__image_wasm` — the big one, so it is emitted only here, never for a
     // program that reads a picture's width and nothing else.
-    if helpers.iter().any(|helper| {
-        matches!(
-            *helper,
-            "__image_decode"
-                | "__image_sniff"
-                | "__image_from_rgba"
-                | "__image_resize"
-                | "__image_crop"
-                | "__image_encode"
-        )
-    }) && !helpers.contains(&"__image_runtime")
+    if helpers.iter().any(|helper| reaches_image_codec(helper))
+        && !helpers.contains(&"__image_runtime")
     {
         helpers.push("__image_runtime");
         added = true;
@@ -1258,6 +1249,51 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
     if added {
         helpers.sort();
     }
+}
+
+/// M185: the `std::image` helpers that drive the wasm codec (and so need
+/// `__image_runtime` and its `__image_wasm`) — every one but the three reads a
+/// JS `Image` answers itself.
+fn reaches_image_codec(helper: &str) -> bool {
+    matches!(
+        helper,
+        "__image_decode"
+            | "__image_sniff"
+            | "__image_from_rgba"
+            | "__image_resize"
+            | "__image_crop"
+            | "__image_encode"
+    )
+}
+
+/// `std::image`'s codec as the one JS statement `__image_wasm` is — written by
+/// `build.rs` from the committed blob under the `image-codec` feature.
+#[cfg(feature = "image-codec")]
+const IMAGE_WASM: &str = include_str!(concat!(env!("OUT_DIR"), "/image_wasm.js"));
+
+/// Without the feature there is no blob, and nothing can emit this: assembly
+/// refuses a program that reaches the codec first ([`image_codec_refusal`]).
+#[cfg(not(feature = "image-codec"))]
+const IMAGE_WASM: &str = "";
+
+/// The refusal a compiler built without `image-codec` (the playground's, the
+/// editor's) answers for a program that reaches `std::image`'s codec — never a
+/// bundle whose codec is missing. `None` when the program does not reach it,
+/// or when this compiler carries the codec.
+fn image_codec_refusal(helpers: &BTreeSet<&'static str>) -> Option<Error> {
+    if cfg!(feature = "image-codec") || !helpers.iter().any(|helper| reaches_image_codec(helper)) {
+        return None;
+    }
+    Some(Error {
+        trace: Vec::new(),
+        note: None,
+        span: Span::default(),
+        msg: "this program decodes, scales, crops or encodes a picture through `std::image`, \
+              and this build of the compiler does not carry the image codec: it was built \
+              without vilan-core's `image-codec` feature (the web playground's compiler leaves \
+              it out to stay small). Build and run the program with the `vilan` CLI"
+            .to_string(),
+    })
 }
 
 /// The `__`-named free externs whose implementations live in the helper table:
@@ -2259,7 +2295,7 @@ fn helper_source(name: &str) -> &'static str {
         // statement from the committed `crates/vilan-image-wasm/vilan_image.wasm`).
         // Emitted only beside `__image_runtime`, so a program that never
         // reaches the codec carries none of it.
-        "__image_wasm" => include_str!(concat!(env!("OUT_DIR"), "/image_wasm.js")),
+        "__image_wasm" => IMAGE_WASM,
         // The module, instantiated on FIRST use and kept (`std::image` is
         // `@process`: node, deno and bun all compile a module this size
         // synchronously), and the protocol `vilan-image-wasm`'s crate header
@@ -2333,8 +2369,7 @@ fn helper_source(name: &str) -> &'static str {
             "function __image_resize(image, width, height, fit) {\n\
              \treturn __image_runtime((exports) => {\n\
              \t\t__image_load(exports, image);\n\
-             \t\texports.image_resize(width, height, fit);\n\
-             \t\treturn __image_take(exports);\n\
+             \t\treturn exports.image_resize(width, height, fit) === 0 ? [ 0, __image_take(exports) ] : __image_refusal(exports);\n\
              \t});\n\
              }"
         }
@@ -4643,6 +4678,12 @@ impl<'src> Transformer<'src> {
                 format!("import {{ {} }} from \"{}\";", names, module)
             })
             .collect::<Vec<_>>();
+        // M185: a compiler without the image codec refuses a program that
+        // needs it, rather than emitting a bundle with no codec in it. Here,
+        // where the helper set is final: every emission is done.
+        if let Some(error) = image_codec_refusal(&self.used_helpers) {
+            return Err(error);
+        }
         let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
         close_helper_dependencies(&mut helpers);
 
@@ -4652,7 +4693,8 @@ impl<'src> Transformer<'src> {
         //
         // Everything this function can REFUSE has already been decided above —
         // the missing `main` at the top, then B55's body-less emission, B68's
-        // unresolved `drop` sink and B176's unrendered concatenation — and this
+        // unresolved `drop` sink, B176's unrendered concatenation and M185's
+        // missing image codec — and this
         // pass returns `()`, so there is nothing left here for a `check` to
         // learn. It is also 5.8% of a cold check's instructions (backlog M34),
         // which is why a caller that is going to drop the text says so rather

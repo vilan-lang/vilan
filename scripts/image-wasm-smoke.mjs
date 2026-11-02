@@ -54,7 +54,7 @@ if (refusal !== "2 x 2 exceeds the 3-pixel limit") fail("the refusal read " + JS
 
 // Scale to one pixel, encode, and decode what came out.
 exports.image_decode(put(png), png.length, 50000000);
-exports.image_resize(1, 1, 2);
+if (exports.image_resize(1, 1, 2) !== 0) fail("the resize refused: " + new TextDecoder().decode(output()));
 if (exports.image_width() !== 1 || exports.image_height() !== 1) fail("the resize is not 1 x 1");
 if (exports.image_encode(0, 0) !== 0) fail("encode refused: " + new TextDecoder().decode(output()));
 const encoded = output();

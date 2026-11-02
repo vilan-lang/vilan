@@ -58,6 +58,14 @@ use image::{
 /// 12-megapixel phone photo decodes, a 60,000 x 60,000 "picture" does not.
 pub const DEFAULT_MAX_PIXELS: u64 = 50_000_000;
 
+/// The largest picture [`Image::resized`] answers: `decode`'s default limit.
+/// The box is the PROGRAM's choice rather than the upload's, so exceeding it is
+/// a refusal the program cannot recover from in any useful way — the vilan
+/// surface turns it into a panic naming both sizes — and it keeps a box like
+/// 100,000 x 100,000 from asking for 40 GB (a trap on wasm32, an abort
+/// natively).
+pub const MAX_RESIZED_PIXELS: u64 = DEFAULT_MAX_PIXELS;
+
 /// The four formats `decode` reads. `encode` writes the first three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -252,27 +260,37 @@ impl Image {
     /// aspect, centred, and scales that window to exactly the box; `Fill`
     /// stretches. A zero side of the box is taken as one pixel. An EMPTY picture
     /// (a zero side of its own) has nothing to sample and is answered as it is.
-    pub fn resized(&self, width: u64, height: u64, fit: Fit) -> Image {
+    ///
+    /// A RESULT larger than [`MAX_RESIZED_PIXELS`] is refused — `a 100000 x
+    /// 100000 result exceeds the 50,000,000-pixel limit` — before anything is
+    /// allocated. It is the result that is measured, so a `Contain` into a
+    /// huge box that comes out small is fine.
+    pub fn resized(&self, width: u64, height: u64, fit: Fit) -> Result<Image, String> {
         let (source_width, source_height) = (self.width(), self.height());
         if source_width == 0 || source_height == 0 {
-            return self.clone();
+            return Ok(self.clone());
         }
-        let box_width = clamp_side(width);
-        let box_height = clamp_side(height);
-        match fit {
-            Fit::Fill => Image {
-                buffer: resample(&self.buffer, box_width, box_height),
+        let box_width = width.max(1);
+        let box_height = height.max(1);
+        let (result_width, result_height) = match fit {
+            Fit::Fill | Fit::Cover => (box_width, box_height),
+            Fit::Contain => contain_size(source_width, source_height, box_width, box_height),
+        };
+        if u128::from(result_width) * u128::from(result_height) > u128::from(MAX_RESIZED_PIXELS) {
+            return Err(format!(
+                "a {result_width} x {result_height} result exceeds the {}-pixel limit",
+                grouped(MAX_RESIZED_PIXELS)
+            ));
+        }
+        // Within the limit, every side fits a `u32`.
+        let (result_width, result_height) = (result_width as u32, result_height as u32);
+        Ok(match fit {
+            Fit::Fill | Fit::Contain => Image {
+                buffer: resample(&self.buffer, result_width, result_height),
             },
-            Fit::Contain => {
-                let (target_width, target_height) =
-                    contain_size(source_width, source_height, box_width, box_height);
-                Image {
-                    buffer: resample(&self.buffer, target_width, target_height),
-                }
-            }
             Fit::Cover => {
                 let (x, y, window_width, window_height) =
-                    cover_window(source_width, source_height, box_width, box_height);
+                    cover_window(source_width, source_height, result_width, result_height);
                 let window = self.cropped(
                     u64::from(x),
                     u64::from(y),
@@ -280,10 +298,10 @@ impl Image {
                     u64::from(window_height),
                 );
                 Image {
-                    buffer: resample(&window.buffer, box_width, box_height),
+                    buffer: resample(&window.buffer, result_width, result_height),
                 }
             }
-        }
+        })
     }
 
     /// The `width` x `height` window at (`x`, `y`), clamped to the picture:
@@ -355,12 +373,6 @@ fn grouped(n: u64) -> String {
     out
 }
 
-/// A box side as a pixel count: at least one, and at most what a picture can
-/// hold.
-fn clamp_side(side: u64) -> u32 {
-    side.clamp(1, u64::from(u32::MAX)) as u32
-}
-
 /// `Contain`'s size: the source scaled by the smaller of the two box ratios,
 /// the bound side exactly the box's and the other rounded to the nearest
 /// pixel (half away from zero), never below one. Integer arithmetic, so the
@@ -368,18 +380,20 @@ fn clamp_side(side: u64) -> u32 {
 fn contain_size(
     source_width: u32,
     source_height: u32,
-    box_width: u32,
-    box_height: u32,
-) -> (u32, u32) {
-    let (sw, sh) = (u64::from(source_width), u64::from(source_height));
-    let (bw, bh) = (u64::from(box_width), u64::from(box_height));
+    box_width: u64,
+    box_height: u64,
+) -> (u64, u64) {
+    // u128: a box side is any `u64` the program asked for, and the products
+    // below must not wrap before the limit gets to refuse them.
+    let (sw, sh) = (u128::from(source_width), u128::from(source_height));
+    let (bw, bh) = (u128::from(box_width), u128::from(box_height));
     // The width binds when bw / sw <= bh / sh.
     if bw * sh <= bh * sw {
         let height = (2 * sh * bw + sw) / (2 * sw);
-        (box_width, height.clamp(1, bh) as u32)
+        (box_width, height.clamp(1, bh) as u64)
     } else {
         let width = (2 * sw * bh + sh) / (2 * sh);
-        (width.clamp(1, bw) as u32, box_height)
+        (width.clamp(1, bw) as u64, box_height)
     }
 }
 

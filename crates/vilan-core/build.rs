@@ -28,7 +28,11 @@ fn main() {
         "cargo:rustc-env=VILAN_CORE_BUILD_ID={}",
         build_id(&manifest_dir)
     );
-    embed_image_wasm(&manifest_dir);
+    // Only for the `image-codec` feature (see Cargo.toml): a compiler built
+    // without it carries no blob and refuses the programs that would need it.
+    if std::env::var_os("CARGO_FEATURE_IMAGE_CODEC").is_some() {
+        embed_image_wasm(&manifest_dir);
+    }
 }
 
 /// M185 (proposal/image.md §2.3): `std::image`'s codec, the COMMITTED wasm32

@@ -11,8 +11,8 @@
 //! 2. `image_decode(pointer, len, max_pixels)` or `image_load(width, height,
 //!    pointer, len)` — each CONSUMES the buffer — fills the slot, answering 0,
 //!    or 1 with the sentence in the output;
-//! 3. `image_resize`/`image_crop` replace the slot; `image_encode` fills the
-//!    output;
+//! 3. `image_resize` (0, or 1 with a refusal) and `image_crop` replace the
+//!    slot; `image_encode` fills the output;
 //! 4. `image_width`/`image_height`/`image_pixels`/`image_pixels_len` and
 //!    `image_output`/`image_output_len` are read, and the JS side COPIES the
 //!    bytes out into a `Uint8Array` of its own.
@@ -174,12 +174,15 @@ pub extern "C" fn image_pixels_len() -> usize {
     with_slot(|image| image.pixels().len())
 }
 
-/// Replaces the slot with itself scaled (`fit` is the seam's `Fit` code).
+/// Replaces the slot with itself scaled (`fit` is the seam's `Fit` code): 0,
+/// or 1 with the refusal (a result over the pixel limit) and the slot as it
+/// was.
 #[unsafe(no_mangle)]
-pub extern "C" fn image_resize(width: f64, height: f64, fit: i32) {
+pub extern "C" fn image_resize(width: f64, height: f64, fit: i32) -> i32 {
     let fit = Fit::from_code(fit).expect("the helper passes a `Fit` code");
-    let resized = with_slot(|image| image.resized(count(width), count(height), fit));
-    replace_slot(resized);
+    status(with_slot(|image| {
+        image.resized(count(width), count(height), fit)
+    }))
 }
 
 /// Replaces the slot with a window of itself, clamped.

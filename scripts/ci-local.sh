@@ -161,6 +161,19 @@ leg_wasm() {
     wasm-bindgen --target web --out-dir target/wasm-pkg \
         target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
     ls -l target/wasm-pkg/vilan_wasm_bg.wasm
+    # M185: the playground's compiler is built WITHOUT vilan-core's
+    # `image-codec` feature, so it must not carry `std::image`'s ~780 KB codec
+    # blob — whose base64 begins with these 64 characters wherever it is
+    # embedded. And without the feature a program that reaches the codec is
+    # refused by name, which the workspace suite (always built WITH it) cannot
+    # see, so that pin runs here.
+    blob_head=$(head -c 48 crates/vilan-image-wasm/vilan_image.wasm | base64 | tr -d '\n')
+    if grep -qaF "$blob_head" target/wasm-pkg/vilan_wasm_bg.wasm; then
+        printf '%s\n' "the playground's compiler carries the image codec blob: something" \
+            "enabled vilan-core's \`image-codec\` feature in vilan-wasm's graph" >&2
+        return 1
+    fi
+    cargo test -p vilan-core --no-default-features --test image_codec_feature
     # And RUN it (N134): v0.41.0 shipped a compiler that built, bound, and
     # trapped on every compile. The smoke is the page's four claims under node.
     node scripts/wasm-smoke.mjs target/wasm-pkg

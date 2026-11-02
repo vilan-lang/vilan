@@ -50,9 +50,12 @@ if [ -z "$pinned" ]; then
     printf 'build-image-wasm: no channel in rust-toolchain.toml\n' >&2
     exit 1
 fi
-# Idempotent: a no-op where the pinned toolchain and its wasm32 target are
-# already installed (this machine, a warm CI cache), the install where not.
-if command -v rustup > /dev/null 2>&1; then
+# The pinned toolchain's wasm32 target, installed only when it is MISSING — a
+# warm machine or CI cache asks rustup one question and prints nothing (an
+# unconditional `rustup toolchain install` syncs the channel and logs it).
+if command -v rustup > /dev/null 2>&1 &&
+    ! rustup target list --installed --toolchain "$pinned" 2> /dev/null |
+    grep -qx wasm32-unknown-unknown; then
     rustup toolchain install "$pinned" --profile minimal --no-self-update \
         --target wasm32-unknown-unknown > /dev/null
 fi

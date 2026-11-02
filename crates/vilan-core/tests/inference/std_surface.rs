@@ -8912,6 +8912,31 @@ fn m185_every_fit_and_a_clamped_crop_answer_their_sizes() {
 }
 
 #[test]
+fn m185_a_resize_past_the_pixel_limit_panics_naming_both_sizes() {
+    // The result, not the box, is measured: the `Contain` into a 100,000 x 1
+    // box is 1 x 1 and fine; the `Fill` is 10,000,000,000 pixels and panics.
+    let (stdout, stderr, code) = compile_and_run_status(&m185_program(
+        r#"
+        match Image::from_rgba(4, 3, Bytes::alloc(48)) {
+            Ok(let picture) => {
+                let small = picture.resized(100000, 1, Fit::Contain);
+                print(i"{small.width()} x {small.height()}");
+                let huge = picture.resized(100000, 100000, Fit::Fill);
+                print(huge.width());
+            },
+            Err(let reason) => print(reason),
+        }
+        "#,
+    ));
+    assert_eq!(stdout, "1 x 1\n");
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("a 100000 x 100000 result exceeds the 50,000,000-pixel limit"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn m185_std_image_is_refused_on_the_browser_leg() {
     // `@process`, like `std::db`: the browser has `createImageBitmap` and a
     // canvas, and nothing of this module is emitted into a browser bundle.

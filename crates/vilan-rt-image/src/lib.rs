@@ -57,11 +57,16 @@ impl Image {
         Bytes::from_vec(self.0.pixels().to_vec())
     }
 
-    /// `__image_resize(image, width, height, fit)`.
-    pub fn resized(&self, width: usize, height: usize, fit: i32) -> Image {
+    /// `__image_resize(image, width, height, fit)` — `Err` for a result over
+    /// the core's pixel limit, which `image.vl`'s `resized` turns into a panic
+    /// at its caller.
+    pub fn resized(&self, width: usize, height: usize, fit: i32) -> Result<Image, Str> {
         let fit = Fit::from_code(fit)
             .unwrap_or_else(|| panic_with(&format!("{fit} is not a `std::image::Fit` code")));
-        Image::new(self.0.resized(width as u64, height as u64, fit))
+        self.0
+            .resized(width as u64, height as u64, fit)
+            .map(Image::new)
+            .map_err(|error| str_new(&error))
     }
 
     /// `__image_crop(image, x, y, width, height)`.
@@ -175,7 +180,14 @@ mod tests {
             image.encode(Format::Gif.code(), 80).unwrap_err().as_ref(),
             "GIF cannot be encoded"
         );
-        let filled = image.resized(1, 1, Fit::Fill.code());
+        let filled = image.resized(1, 1, Fit::Fill.code()).unwrap();
+        assert_eq!(
+            image
+                .resized(100_000, 100_000, Fit::Fill.code())
+                .unwrap_err()
+                .as_ref(),
+            "a 100000 x 100000 result exceeds the 50,000,000-pixel limit"
+        );
         assert_eq!((filled.width(), filled.height()), (1, 1));
         let cropped = image.cropped(1, 0, 5, 5);
         assert_eq!((cropped.width(), cropped.height()), (1, 2));

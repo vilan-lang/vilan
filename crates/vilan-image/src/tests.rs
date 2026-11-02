@@ -388,20 +388,20 @@ fn from_rgba_round_trips_exactly() {
 #[test]
 fn contain_keeps_the_aspect_inside_the_box() {
     let picture = gradient(400, 300);
-    let contained = picture.resized(100, 100, Fit::Contain);
+    let contained = picture.resized(100, 100, Fit::Contain).unwrap();
     assert_eq!((contained.width(), contained.height()), (100, 75));
-    let tall = gradient(300, 400).resized(100, 100, Fit::Contain);
+    let tall = gradient(300, 400).resized(100, 100, Fit::Contain).unwrap();
     assert_eq!((tall.width(), tall.height()), (75, 100));
     // The bound side rounds to the nearest pixel: 3 x 2 into 4 wide is 2.67.
-    let rounded = gradient(3, 2).resized(4, 100, Fit::Contain);
+    let rounded = gradient(3, 2).resized(4, 100, Fit::Contain).unwrap();
     assert_eq!((rounded.width(), rounded.height()), (4, 3));
 }
 
 #[test]
 fn contain_never_rounds_a_side_below_one_pixel() {
-    let strip = gradient(1000, 1).resized(10, 10, Fit::Contain);
+    let strip = gradient(1000, 1).resized(10, 10, Fit::Contain).unwrap();
     assert_eq!((strip.width(), strip.height()), (10, 1));
-    let column = gradient(1, 1000).resized(10, 10, Fit::Contain);
+    let column = gradient(1, 1000).resized(10, 10, Fit::Contain).unwrap();
     assert_eq!((column.width(), column.height()), (1, 10));
 }
 
@@ -409,10 +409,10 @@ fn contain_never_rounds_a_side_below_one_pixel() {
 fn cover_and_fill_answer_exactly_the_box() {
     let picture = gradient(400, 300);
     for fit in [Fit::Cover, Fit::Fill] {
-        let resized = picture.resized(64, 64, fit);
+        let resized = picture.resized(64, 64, fit).unwrap();
         assert_eq!((resized.width(), resized.height()), (64, 64), "{fit:?}");
     }
-    let upscaled = gradient(4, 4).resized(9, 5, Fit::Fill);
+    let upscaled = gradient(4, 4).resized(9, 5, Fit::Fill).unwrap();
     assert_eq!((upscaled.width(), upscaled.height()), (9, 5));
 }
 
@@ -425,7 +425,7 @@ fn cover_crops_the_overflow_centred() {
         1 => [0, 255, 0, 255],
         _ => [0, 0, 255, 255],
     });
-    let covered = bands.resized(5, 5, Fit::Cover);
+    let covered = bands.resized(5, 5, Fit::Cover).unwrap();
     assert!(
         covered
             .pixels()
@@ -442,7 +442,7 @@ fn cover_crops_the_overflow_centred() {
         1 => [0, 0, 255, 255],
         _ => [255, 0, 0, 255],
     });
-    let covered = rows.resized(5, 5, Fit::Cover);
+    let covered = rows.resized(5, 5, Fit::Cover).unwrap();
     assert!(
         covered
             .pixels()
@@ -466,7 +466,7 @@ fn the_cover_window_centres_and_rounds() {
 #[test]
 fn fill_stretches_and_a_flat_colour_stays_flat() {
     let flat = painted(7, 3, |_, _| [10, 200, 30, 255]);
-    let stretched = flat.resized(20, 2, Fit::Fill);
+    let stretched = flat.resized(20, 2, Fit::Fill).unwrap();
     assert!(
         stretched
             .pixels()
@@ -475,16 +475,16 @@ fn fill_stretches_and_a_flat_colour_stays_flat() {
             .iter()
             .all(|pixel| *pixel == [10, 200, 30, 255])
     );
-    let shrunk = flat.resized(1, 1, Fit::Fill);
+    let shrunk = flat.resized(1, 1, Fit::Fill).unwrap();
     assert_eq!(shrunk.pixels(), &[10, 200, 30, 255]);
 }
 
 #[test]
 fn a_resize_to_its_own_size_is_the_picture() {
     let picture = gradient(12, 9);
-    assert_eq!(picture.resized(12, 9, Fit::Fill), picture);
-    assert_eq!(picture.resized(12, 9, Fit::Contain), picture);
-    assert_eq!(picture.resized(12, 9, Fit::Cover), picture);
+    assert_eq!(picture.resized(12, 9, Fit::Fill).unwrap(), picture);
+    assert_eq!(picture.resized(12, 9, Fit::Contain).unwrap(), picture);
+    assert_eq!(picture.resized(12, 9, Fit::Cover).unwrap(), picture);
 }
 
 #[test]
@@ -498,7 +498,7 @@ fn a_downscale_averages_rather_than_point_samples() {
             [0, 0, 0, 255]
         }
     });
-    let halved = checker.resized(16, 16, Fit::Fill);
+    let halved = checker.resized(16, 16, Fit::Fill).unwrap();
     for value in halved
         .pixels()
         .as_chunks::<4>()
@@ -522,7 +522,7 @@ fn transparent_colour_does_not_bleed_into_an_opaque_edge() {
             [255, 0, 0, 0]
         }
     });
-    let resized = half.resized(5, 2, Fit::Fill);
+    let resized = half.resized(5, 2, Fit::Fill).unwrap();
     for pixel in resized.pixels().as_chunks::<4>().0.iter() {
         if pixel[3] > 0 {
             assert_eq!(&pixel[..3], &[255, 255, 255], "{pixel:?}");
@@ -535,10 +535,10 @@ fn transparent_colour_does_not_bleed_into_an_opaque_edge() {
 #[test]
 fn a_zero_side_of_the_box_is_one_pixel_and_an_empty_picture_stays_empty() {
     let picture = gradient(8, 8);
-    let squeezed = picture.resized(0, 4, Fit::Fill);
+    let squeezed = picture.resized(0, 4, Fit::Fill).unwrap();
     assert_eq!((squeezed.width(), squeezed.height()), (1, 4));
     let empty = Image::from_rgba(0, 3, vec![]).unwrap();
-    assert_eq!(empty.resized(10, 10, Fit::Cover), empty);
+    assert_eq!(empty.resized(10, 10, Fit::Cover).unwrap(), empty);
 }
 
 #[test]
@@ -662,4 +662,45 @@ fn thousands_group_by_commas() {
     assert_eq!(grouped(1000), "1,000");
     assert_eq!(grouped(50_000_000), "50,000,000");
     assert_eq!(grouped(123_456_789_012), "123,456,789,012");
+}
+
+#[test]
+fn a_result_over_the_limit_is_refused_naming_both_sizes() {
+    let picture = gradient(4, 3);
+    assert_eq!(
+        picture.resized(100_000, 100_000, Fit::Fill),
+        Err("a 100000 x 100000 result exceeds the 50,000,000-pixel limit".to_string())
+    );
+    assert_eq!(
+        picture.resized(100_000, 100_000, Fit::Cover),
+        Err("a 100000 x 100000 result exceeds the 50,000,000-pixel limit".to_string())
+    );
+    // `Contain` measures what it would answer, not the box: 4 x 3 into a
+    // 100,000 square is 100,000 x 75,000.
+    assert_eq!(
+        picture.resized(100_000, 100_000, Fit::Contain),
+        Err("a 100000 x 75000 result exceeds the 50,000,000-pixel limit".to_string())
+    );
+    // A box side past `u32` is reported as asked, not wrapped or clamped.
+    assert_eq!(
+        picture.resized(u64::MAX, 1, Fit::Fill),
+        Err(format!(
+            "a {} x 1 result exceeds the 50,000,000-pixel limit",
+            u64::MAX
+        ))
+    );
+}
+
+#[test]
+fn the_limit_is_on_the_result_so_a_huge_box_can_still_contain_a_strip() {
+    // 1 x 10,000 into a 100,000 square: Contain answers 10 x 100,000 =
+    // 1,000,000 pixels, inside the limit though the box is far past it.
+    let strip = gradient(1, 10_000);
+    let contained = strip.resized(100_000, 100_000, Fit::Contain).unwrap();
+    assert_eq!((contained.width(), contained.height()), (10, 100_000));
+    // One pixel past the limit is refused (and nothing is allocated for it).
+    assert_eq!(
+        gradient(1, 1).resized(10_000, 5_001, Fit::Fill),
+        Err("a 10000 x 5001 result exceeds the 50,000,000-pixel limit".to_string())
+    );
 }
