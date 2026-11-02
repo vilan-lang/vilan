@@ -1,0 +1,32 @@
+# `std::image`'s codec core as a WebAssembly module, for the JS backend's node
+# programs (tracker M185; proposal/image.md §2.3).
+#
+# A `cdylib` over a plain C ABI — no wasm-bindgen, so no CLI version to keep in
+# step with a crate version — exporting `vilan-image` and nothing of its own
+# beyond the copying in and out. Its artifact is COMMITTED as
+# `vilan_image.wasm` beside this manifest (§6 Q1): `scripts/build-image-wasm.sh`
+# rebuilds it with the pinned toolchain and the `image-wasm` profile (root
+# Cargo.toml), `vilan-core`'s build script carries it into the compiler as
+# base64, and the JS emitter writes it into a program's bundle only when the
+# program reaches `std::image`. CI's `wasm` leg builds it fresh, runs a decode
+# under node, and byte-compares the fresh build against the committed blob.
+#
+# A workspace member like every crate here (fmt, clippy and the release bump
+# reach it); on the host it builds as an ordinary dynamic library nothing loads.
+[package]
+name = "vilan-image-wasm"
+version = "0.53.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "vilan's std::image codec core built for wasm32, for programs on node."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vilan-image = { path = "../vilan-image" }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

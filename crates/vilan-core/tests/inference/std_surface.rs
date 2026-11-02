@@ -8729,3 +8729,245 @@ fn a173_s2_the_keys_handle_is_a_resource() {
         "a closure cannot capture the resource `keys`",
     );
 }
+
+// --- M185: `std::image` (proposal/image.md) -----------------------------------
+//
+// The surface on node: the program runs through the wasm build of
+// `vilan-image` the compiler carries (`__image_wasm`). The codec's own
+// behaviour is pinned by `vilan-image`'s unit tests on the host and the two
+// backends against each other by `native_differential`'s
+// `m185_image_is_identical_on_both_backends`; these pin the vilan surface, the
+// JS seam's encodings (`Result` as `[0, value]`/`[1, sentence]`, `Option` from
+// the sniff code, `Format`/`Fit` as integers) and where the helper is emitted.
+
+/// A 2 x 2 RGBA PNG (red, green / blue, half-transparent white), base64url.
+const M185_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR42mP4z8DwHwyBNAg0AABJSQl4nFEXkgAAAABJRU5ErkJggg";
+
+fn m185_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::base64::decode_url;
+        import std::bytes::Bytes;
+        import std::image::{{ Fit, Format, Image }};
+        import std::io::{{ panic, print }};
+        import std::option::Option::{{ None, Some }};
+        import std::result::Result::{{ Err, Ok }};
+        fun png(): Bytes {{
+            match decode_url("{M185_PNG}") {{
+                Some(let bytes) => bytes,
+                None => panic("base64url"),
+            }}
+        }}
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn m185_a_png_decodes_resizes_and_reads_back_on_node() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::decode(png()) {
+                Ok(let picture) => {
+                    print(i"{picture.width()} x {picture.height()}");
+                    print(picture.rgba().to_hex());
+                    let one = picture.resized(1, 1, Fit::Fill);
+                    print(i"{one.width()} x {one.height()} {one.rgba().to_hex()}");
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "2 x 2\nff0000ff00ff00ff0000ffffffffff80\n1 x 1 6d6d6ddf\n",
+    );
+}
+
+#[test]
+fn m185_sniff_answers_the_format_or_none() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            print(match Image::sniff(png()) {
+                Some(Format::Png) => "png",
+                Some(_) => "another",
+                None => "none",
+            });
+            print(Image::sniff(Bytes::alloc(8)).is_none());
+            "#,
+        ),
+        "png\ntrue\n",
+    );
+}
+
+#[test]
+fn m185_the_refusals_are_errs_carrying_their_sentences() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::decode_within(png(), 3) {
+                Ok(_) => print("admitted"),
+                Err(let reason) => print(reason),
+            }
+            match Image::decode(Bytes::alloc(4)) {
+                Ok(_) => print("decoded"),
+                Err(let reason) => print(reason),
+            }
+            match Image::from_rgba(2, 2, Bytes::alloc(15)) {
+                Ok(_) => print("built"),
+                Err(let reason) => print(reason),
+            }
+            match Image::decode(png()) {
+                Ok(let picture) => match picture.encode(Format::Gif, 80) {
+                    Ok(_) => print("encoded a GIF"),
+                    Err(let reason) => print(reason),
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "2 x 2 exceeds the 3-pixel limit\nnot a PNG, JPEG, WebP or GIF\n\
+         15 bytes are not 2 x 2 RGBA pixels (16 bytes)\nGIF cannot be encoded\n",
+    );
+}
+
+#[test]
+fn m185_from_rgba_encode_and_decode_round_trip_exactly() {
+    // `rgba` -> `from_rgba` is exact, and so is PNG and WebP through the codec;
+    // `rgba()` hands out a copy, and `from_rgba` took one.
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            let pixels = Bytes::alloc(8);
+            pixels.set(0, 10);
+            pixels.set(7, 200);
+            match Image::from_rgba(2, 1, pixels) {
+                Ok(let picture) => {
+                    pixels.set(0, 99);
+                    let copy = picture.rgba();
+                    copy.set(7, 1);
+                    print(picture.rgba().to_hex());
+                    for format in [Format::Png, Format::Webp] {
+                        match picture.encode(format, 0) {
+                            Ok(let bytes) => match Image::decode(bytes) {
+                                Ok(let back) => print(back.rgba().to_hex()),
+                                Err(let reason) => print(reason),
+                            },
+                            Err(let reason) => print(reason),
+                        }
+                    }
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "0a000000000000c8\n0a000000000000c8\n0a000000000000c8\n",
+    );
+}
+
+#[test]
+fn m185_every_fit_and_a_clamped_crop_answer_their_sizes() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::from_rgba(4, 2, Bytes::alloc(32)) {
+                Ok(let picture) => {
+                    for fit in [Fit::Contain, Fit::Cover, Fit::Fill] {
+                        let resized = picture.resized(3, 3, fit);
+                        print(i"{resized.width()} x {resized.height()}");
+                    }
+                    let window = picture.cropped(3, 1, 10, 10);
+                    print(i"{window.width()} x {window.height()}");
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "3 x 2\n3 x 3\n3 x 3\n1 x 1\n",
+    );
+}
+
+#[test]
+fn m185_a_resize_past_the_pixel_limit_panics_naming_both_sizes() {
+    // The result, not the box, is measured: the `Contain` into a 100,000 x 1
+    // box is 1 x 1 and fine; the `Fill` is 10,000,000,000 pixels and panics.
+    let (stdout, stderr, code) = compile_and_run_status(&m185_program(
+        r#"
+        match Image::from_rgba(4, 3, Bytes::alloc(48)) {
+            Ok(let picture) => {
+                let small = picture.resized(100000, 1, Fit::Contain);
+                print(i"{small.width()} x {small.height()}");
+                let huge = picture.resized(100000, 100000, Fit::Fill);
+                print(huge.width());
+            },
+            Err(let reason) => print(reason),
+        }
+        "#,
+    ));
+    assert_eq!(stdout, "1 x 1\n");
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("a 100000 x 100000 result exceeds the 50,000,000-pixel limit"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn m185_std_image_is_refused_on_the_browser_leg() {
+    // `@process`, like `std::db`: the browser has `createImageBitmap` and a
+    // canvas, and nothing of this module is emitted into a browser bundle.
+    assert_fails_browser_with(
+        r#"
+        import std::bytes::Bytes;
+        import std::image::Image;
+        fun main() {
+            let _ = Image::decode(Bytes::alloc(4));
+        }
+        "#,
+        "requires the `@process` platform its file declares and cannot run on `browser`",
+    );
+}
+
+#[test]
+fn m185_the_codec_is_emitted_only_when_reached() {
+    // The blob is ~800 KB of base64: a program that reaches the codec carries
+    // it ONCE, and one that does not — including one that imports the module
+    // and never calls into it — carries none of it.
+    let reached = compile(&m185_program(
+        r#"
+        let _ = Image::decode(png());
+        let _ = Image::sniff(png());
+        "#,
+    ))
+    .expect("compiles");
+    assert_eq!(reached.matches("const __image_wasm = \"").count(), 1);
+    assert_eq!(reached.matches("function __image_runtime(").count(), 1);
+    let plain = compile(
+        r#"
+        import std::io::print;
+        fun main() { print("no pictures"); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        !plain.contains("__image"),
+        "a plain program carries no image helper"
+    );
+    let imported = compile(
+        r#"
+        import std::image::Fit;
+        import std::io::print;
+        fun main() {
+            let fit = Fit::Cover;
+            print(match fit { Fit::Cover => "cover", _ => "other" });
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        !imported.contains("__image_wasm"),
+        "naming `Fit` is not reaching the codec"
+    );
+}

@@ -40,6 +40,17 @@ const WORKSPACE_CRATES: &[&str] = &[
     "vilan-rt",
 ];
 
+/// Packages `Cargo.lock` records that NO build of this workspace compiles, so
+/// cargo-about — which walks the resolved, feature-activated graph — rightly
+/// leaves them out of the notices. Each entry names the crate that locks it and
+/// why nothing activates it; anything else missing is still a failure.
+const LOCKED_BUT_NEVER_BUILT: &[(&str, &str)] = &[(
+    "zlib-rs",
+    "M185: `flate2`'s optional zlib-rs backend, locked beside its default \
+     `miniz_oxide` one; `png` (through `vilan-image`) uses the default and no \
+     crate here enables the `zlib-rs` feature",
+)];
+
 #[test]
 fn every_locked_dependency_appears_in_the_notices() {
     let root = repo_root();
@@ -63,7 +74,11 @@ fn every_locked_dependency_appears_in_the_notices() {
         else {
             continue;
         };
-        if WORKSPACE_CRATES.contains(&name) {
+        if WORKSPACE_CRATES.contains(&name)
+            || LOCKED_BUT_NEVER_BUILT
+                .iter()
+                .any(|(never_built, _)| *never_built == name)
+        {
             continue;
         }
         // The notices list crates as `name version` in their `Covers:` lines;

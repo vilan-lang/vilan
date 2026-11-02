@@ -1,0 +1,28 @@
+# `std::image` on the native backend (tracker M185; proposal/image.md §2).
+#
+# SEPARATE from `vilan-rt`, for the reason `vilan-rt-sqlite` is: `vilan-rt`
+# takes no crates.io dependencies (Order 37's R8), and decoding PNG, JPEG, WebP
+# and GIF is the `image` crate's work. So the codec lives in `vilan-image` (the
+# core both backends run — on node it is the same source built for wasm32), this
+# crate is the thin glue between it and `vilan-rt`'s `Bytes`, and the cargo
+# project `vilan build --backend rust` writes names it ONLY when the program
+# reaches `std::image`. A program that does not pays nothing: not a build, not a
+# lockfile entry.
+#
+# Both crates materialize BESIDE `vilan-rt` in the runtime cache (F19), which is
+# what lets the path dependency below resolve outside this repository too.
+[package]
+name = "vilan-rt-image"
+version = "0.53.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The image half of the runtime for programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+vilan-rt = { path = "../vilan-rt" }
+vilan-image = { path = "../vilan-image" }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

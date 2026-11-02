@@ -1,0 +1,17 @@
+// M185: `resized` refuses a RESULT over 50,000,000 pixels with a panic naming
+// both sizes, at its caller's site (`[track_caller]`), on both backends — the
+// box is the program's choice, so it is a bug rather than an `Err`.
+import std::bytes::Bytes;
+import std::image::{ Fit, Image };
+import std::io::panic;
+
+fun main() {
+	let picture = match Image::from_rgba(4, 3, Bytes::alloc(48)) {
+		Ok(let picture) => picture,
+		Err(let reason) => panic(reason),
+	};
+	let contained = picture.resized(100000, 1, Fit::Contain);
+	print(i"{contained.width()} x {contained.height()}");
+	let huge = picture.resized(100000, 100000, Fit::Fill);
+	print(i"unreachable {huge.width()}");
+}

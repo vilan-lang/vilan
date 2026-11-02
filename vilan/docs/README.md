@@ -116,6 +116,7 @@ the collections, the traits, the codecs, the process modules — sits at
 | [browser](std/browser.md) | `std::web::dom`, `std::web::ui`, `std::web::router`, `std::web::storage` |
 | [dev / HMR](std/dev.md) | `std::web::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
 | [process](std/process.md) | db, http, fs, build, `web::document`, process, `rpc::server`, watch |
+| [images](std/image.md) | `std::image`: decode, resize, crop, encode (process) |
 | [misc](std/misc.md) | io, task, `js::promise`, context, crypto, jwt, `web::asset` |
 
 ### Specification

@@ -9,7 +9,10 @@ name = "vilan-lsp"
 path = "src/main.rs"
 
 [dependencies]
-vilan-core = { path = "../vilan-core" }
+# Without `image-codec` (M185): this compiler never emits a node program
+# that needs `std::image`'s ~780 KB codec blob, so it does not carry one
+# (vilan-core's Cargo.toml says why; such a program is refused by name).
+vilan-core = { path = "../vilan-core", default-features = false }
 # The completion engine, the line index, and the navigation primitives hover
 # and definition read — shared with the playground (K9,
 # proposal/playground-completion.md §3).

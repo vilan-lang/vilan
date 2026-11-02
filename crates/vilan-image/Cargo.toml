@@ -1,0 +1,27 @@
+# `std::image`'s codec core (tracker M185; proposal/image.md §2): decode,
+# resize, crop and encode over the `image` crate, with no vilan types in it.
+#
+# ONE implementation reaching both backends, which is what keeps their output
+# close: natively through `vilan-rt-image` (a satellite of `vilan-rt`, linked
+# only by a program that reaches `std::image`), on node as the SAME source built
+# for wasm32 (`vilan-image-wasm`, whose committed blob the JS emitter carries).
+# So every pin on codec behaviour is a unit test here, run on the host.
+#
+# `image` with its default features OFF: the four formats std reads (PNG, JPEG,
+# WebP, GIF), all pure Rust (`png`, `zune-jpeg`, `image-webp`, `gif`), and no
+# `rayon` - a wasm32 build has no threads to give it, and a native server's
+# avatar resize is one picture at a time.
+[package]
+name = "vilan-image"
+version = "0.53.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The image codec core behind vilan's std::image, on both backends."
+publish = false
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true
