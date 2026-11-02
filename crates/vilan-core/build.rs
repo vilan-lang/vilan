@@ -28,6 +28,60 @@ fn main() {
         "cargo:rustc-env=VILAN_CORE_BUILD_ID={}",
         build_id(&manifest_dir)
     );
+    embed_image_wasm(&manifest_dir);
+}
+
+/// M185 (proposal/image.md §2.3): `std::image`'s codec, the COMMITTED wasm32
+/// build of `vilan-image` (`crates/vilan-image-wasm/vilan_image.wasm`, rebuilt by
+/// `scripts/build-image-wasm.sh`), written into `$OUT_DIR/image_wasm.js` as the
+/// one statement the JS emitter's `__image_wasm` helper is —
+/// `const __image_wasm = "<base64>";` — and included by `helper_source`.
+///
+/// `rerun-if-changed` names the blob and nothing else of the image crates: the
+/// blob is the input, and a `vilan-image` source edit reaches this crate only
+/// through a rebuilt (and recommitted) blob, which CI's `wasm` leg holds to the
+/// source. The blob is not part of [`build_id`]: no on-disk cache that id keys
+/// holds emitted helper text.
+fn embed_image_wasm(manifest_dir: &Path) {
+    let blob = manifest_dir.join("../vilan-image-wasm/vilan_image.wasm");
+    println!("cargo:rerun-if-changed={}", blob.display());
+    let bytes = fs::read(&blob).unwrap_or_else(|error| {
+        panic!(
+            "vilan-core build: cannot read {} ({error}) — is this a complete checkout? \
+             `scripts/build-image-wasm.sh` rebuilds it",
+            blob.display()
+        )
+    });
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets it"));
+    let statement = format!("const __image_wasm = \"{}\";", base64(&bytes));
+    fs::write(out_dir.join("image_wasm.js"), statement).expect("write image_wasm.js");
+}
+
+/// Standard base64 (RFC 4648 §4, padded) — what node's `Buffer.from(text,
+/// "base64")` and `atob` both read. Written out rather than taken from a crate:
+/// it is twenty lines and the build script's only other dependency is SHA-256.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let first = group[0];
+        let second = group.get(1).copied().unwrap_or(0);
+        let third = group.get(2).copied().unwrap_or(0);
+        let word = u32::from(first) << 16 | u32::from(second) << 8 | u32::from(third);
+        out.push(ALPHABET[(word >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(word >> 12) as usize & 63] as char);
+        out.push(if group.len() > 1 {
+            ALPHABET[(word >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if group.len() > 2 {
+            ALPHABET[word as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// The id of the crate at `manifest_dir`: sixteen lowercase hex digits. Public so

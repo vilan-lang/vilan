@@ -411,6 +411,13 @@ jobs:
           node-version: 24
       - name: The compiler compiles
         run: node scripts/wasm-smoke.mjs pkg
+      # M185: the compiler being released CARRIES `std::image`'s codec as a
+      # committed wasm blob, and a tag can be pushed from a commit CI never
+      # saw — so the blob is rebuilt with the pinned toolchain, smoked under
+      # node, and held to the commit here too, as `scripts/ci-local.sh wasm`
+      # does.
+      - name: The image codec is the committed one
+        run: scripts/build-image-wasm.sh --check
       # Shipped gzipped: it halves what the visitor downloads, and it sidesteps
       # the two things GitHub Pages will not let the site control — the `.wasm`
       # Content-Type and whether Pages compresses it. The page inflates through

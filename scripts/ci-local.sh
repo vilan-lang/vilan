@@ -164,6 +164,13 @@ leg_wasm() {
     # And RUN it (N134): v0.41.0 shipped a compiler that built, bound, and
     # trapped on every compile. The smoke is the page's four claims under node.
     node scripts/wasm-smoke.mjs target/wasm-pkg
+    # M185: `std::image`'s codec, the OTHER wasm32 artifact — committed, and
+    # carried into every node program that reaches the module. Built fresh with
+    # the PINNED toolchain (the script sets it, whatever this job's
+    # `RUSTUP_TOOLCHAIN` says), run under node (a 2x2 PNG decoded, scaled and
+    # re-encoded), and byte-compared against the committed blob, so a
+    # `vilan-image` change without the rebuilt blob is red here.
+    scripts/build-image-wasm.sh --check
 }
 
 # The instruction budgets (M105 S3, `proposal/performance-gates.md` §3's T2).

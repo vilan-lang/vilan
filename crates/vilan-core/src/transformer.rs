@@ -1227,6 +1227,29 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__stdin_pump");
         added = true;
     }
+    // M185: every `std::image` helper that reaches the codec drives it
+    // through the one lazily instantiated module, and the module's bytes are
+    // `__image_wasm` — the big one, so it is emitted only here, never for a
+    // program that reads a picture's width and nothing else.
+    if helpers.iter().any(|helper| {
+        matches!(
+            *helper,
+            "__image_decode"
+                | "__image_sniff"
+                | "__image_from_rgba"
+                | "__image_resize"
+                | "__image_crop"
+                | "__image_encode"
+        )
+    }) && !helpers.contains(&"__image_runtime")
+    {
+        helpers.push("__image_runtime");
+        added = true;
+    }
+    if helpers.contains(&"__image_runtime") && !helpers.contains(&"__image_wasm") {
+        helpers.push("__image_wasm");
+        added = true;
+    }
     // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
     if helpers.contains(&"__dbg_stack") && !helpers.contains(&"__dbg") {
         helpers.push("__dbg");
@@ -1302,6 +1325,15 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__trace_line",
         "__trace_task",
         "__trace_run",
+        "__image_decode",
+        "__image_sniff",
+        "__image_from_rgba",
+        "__image_width",
+        "__image_height",
+        "__image_rgba",
+        "__image_resize",
+        "__image_crop",
+        "__image_encode",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -2221,6 +2253,108 @@ fn helper_source(name: &str) -> &'static str {
         // `require("fs")` inside the emitted ES module (`.mjs` since B86b,
         // v0.33.0), and its own `catch` turned the `ReferenceError` into ""
         // for every call.
+        // M185 (proposal/image.md §2): `std::image` on node is `vilan-image` —
+        // the codec core the native backend links — built for wasm32 and
+        // carried here as base64 (`vilan-core`'s build script writes this
+        // statement from the committed `crates/vilan-image-wasm/vilan_image.wasm`).
+        // Emitted only beside `__image_runtime`, so a program that never
+        // reaches the codec carries none of it.
+        "__image_wasm" => include_str!(concat!(env!("OUT_DIR"), "/image_wasm.js")),
+        // The module, instantiated on FIRST use and kept (`std::image` is
+        // `@process`: node, deno and bun all compile a module this size
+        // synchronously), and the protocol `vilan-image-wasm`'s crate header
+        // describes: bytes are written into a buffer the module allocates and
+        // CONSUMES, one scratch picture lives in it between the calls of one
+        // helper, and every result is COPIED out into a `Uint8Array` of the
+        // program's own — so wasm memory holds nothing a vilan value points at,
+        // and nothing leaks. A JS `Image` is `{ width, height, pixels }`.
+        //
+        // A trap inside the module (an allocation past wasm32's 4 GiB, a
+        // codec bug) can leave its scratch state mid-update, so the instance
+        // is dropped and the next call instantiates a fresh one; the trap
+        // itself travels on as the throw it is, as a native panic would.
+        // Refusals the surface types as `Result` arrive as status 1 with the
+        // sentence in the module's output, and leave as `[ 1, sentence ]`.
+        "__image_runtime" => {
+            "let __image_exports;\n\
+             function __image_runtime(body) {\n\
+             \tif (__image_exports === undefined) {\n\
+             \t\tconst bytes = typeof Buffer === \"function\" ? Buffer.from(__image_wasm, \"base64\") : Uint8Array.from(atob(__image_wasm), (c) => c.charCodeAt(0));\n\
+             \t\t__image_exports = new WebAssembly.Instance(new WebAssembly.Module(bytes), {}).exports;\n\
+             \t}\n\
+             \tconst exports = __image_exports;\n\
+             \ttry {\n\
+             \t\treturn body(exports);\n\
+             \t} catch (error) {\n\
+             \t\t__image_exports = undefined;\n\
+             \t\tthrow error;\n\
+             \t}\n\
+             }\n\
+             function __image_put(exports, bytes) {\n\
+             \tconst pointer = exports.image_alloc(bytes.length);\n\
+             \tnew Uint8Array(exports.memory.buffer, pointer, bytes.length).set(bytes);\n\
+             \treturn pointer;\n\
+             }\n\
+             function __image_load(exports, image) {\n\
+             \texports.image_load(image.width, image.height, __image_put(exports, image.pixels), image.pixels.length);\n\
+             }\n\
+             function __image_take(exports) {\n\
+             \tconst pixels = new Uint8Array(exports.memory.buffer, exports.image_pixels(), exports.image_pixels_len()).slice();\n\
+             \treturn { width: exports.image_width(), height: exports.image_height(), pixels };\n\
+             }\n\
+             function __image_output(exports) {\n\
+             \treturn new Uint8Array(exports.memory.buffer, exports.image_output(), exports.image_output_len()).slice();\n\
+             }\n\
+             function __image_refusal(exports) {\n\
+             \treturn [ 1, new TextDecoder().decode(__image_output(exports)) ];\n\
+             }"
+        }
+        "__image_decode" => {
+            "function __image_decode(bytes, limit) {\n\
+             \treturn __image_runtime((exports) => exports.image_decode(__image_put(exports, bytes), bytes.length, limit) === 0 ? [ 0, __image_take(exports) ] : __image_refusal(exports));\n\
+             }"
+        }
+        "__image_sniff" => {
+            "function __image_sniff(bytes) {\n\
+             \treturn __image_runtime((exports) => exports.image_sniff(__image_put(exports, bytes), bytes.length));\n\
+             }"
+        }
+        "__image_from_rgba" => {
+            "function __image_from_rgba(width, height, pixels) {\n\
+             \treturn __image_runtime((exports) => exports.image_load(width, height, __image_put(exports, pixels), pixels.length) === 0 ? [ 0, __image_take(exports) ] : __image_refusal(exports));\n\
+             }"
+        }
+        // The three reads touch no codec: the JS `Image` holds its own size
+        // and its own copy of the pixels, and `rgba` hands out a copy of that.
+        "__image_width" => "function __image_width(image) {\n\treturn image.width;\n}",
+        "__image_height" => "function __image_height(image) {\n\treturn image.height;\n}",
+        "__image_rgba" => "function __image_rgba(image) {\n\treturn image.pixels.slice();\n}",
+        "__image_resize" => {
+            "function __image_resize(image, width, height, fit) {\n\
+             \treturn __image_runtime((exports) => {\n\
+             \t\t__image_load(exports, image);\n\
+             \t\texports.image_resize(width, height, fit);\n\
+             \t\treturn __image_take(exports);\n\
+             \t});\n\
+             }"
+        }
+        "__image_crop" => {
+            "function __image_crop(image, x, y, width, height) {\n\
+             \treturn __image_runtime((exports) => {\n\
+             \t\t__image_load(exports, image);\n\
+             \t\texports.image_crop(x, y, width, height);\n\
+             \t\treturn __image_take(exports);\n\
+             \t});\n\
+             }"
+        }
+        "__image_encode" => {
+            "function __image_encode(image, format, quality) {\n\
+             \treturn __image_runtime((exports) => {\n\
+             \t\t__image_load(exports, image);\n\
+             \t\treturn exports.image_encode(format, quality) === 0 ? [ 0, __image_output(exports) ] : __image_refusal(exports);\n\
+             \t});\n\
+             }"
+        }
         "__stdin_pump" => {
             "const __vilan_stdin = { buffer: Buffer.alloc(0), ended: false, carriage: false, started: false, waiters: [] };\n\
              function __stdin_start() {\n\
