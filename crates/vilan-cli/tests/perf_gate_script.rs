@@ -1680,8 +1680,14 @@ sys.exit(perf_gate.main())
     };
     let state = verdicts.join("e121-state.json");
     // CPU x1.30 on noise, instructions x1.003: green, judged on instructions, CPU beside; it advances.
-    let base_json = harness("base.json", &[(400, Some(1_000_000)), (420, Some(1_000_000))]);
-    let noisy = harness("noisy.json", &[(530, Some(1_003_000)), (540, Some(1_003_000))]);
+    let base_json = harness(
+        "base.json",
+        &[(400, Some(1_000_000)), (420, Some(1_000_000))],
+    );
+    let noisy = harness(
+        "noisy.json",
+        &[(530, Some(1_003_000)), (540, Some(1_003_000))],
+    );
     let (ok, text) = seal("1111111111", &base_json, &noisy);
     assert!(ok, "a CPU-noise row went red:\n{text}");
     assert!(
@@ -1693,7 +1699,10 @@ sys.exit(perf_gate.main())
     let advanced = fs::read_to_string(&state).expect("a green seal writes the state");
     assert!(advanced.contains("\"green_seals\": 5"), "{advanced}");
     // Instructions x1.20: RED, and the state is NOT advanced.
-    let heavier = harness("heavier.json", &[(400, Some(1_200_000)), (410, Some(1_200_000))]);
+    let heavier = harness(
+        "heavier.json",
+        &[(400, Some(1_200_000)), (410, Some(1_200_000))],
+    );
     let (ok, text) = seal("2222222222", &base_json, &heavier);
     assert!(
         !ok && text.contains("LSP leaf keystroke: instructions edit-to-idle x1.200"),
@@ -1753,5 +1762,8 @@ sys.exit(perf_gate.main())
             verdicts.to_str().expect("utf-8"),
         ],
     );
-    assert!(!ok && text.contains("no [[e121]] row is named no such row"), "{text}");
+    assert!(
+        !ok && text.contains("no [[e121]] row is named no such row"),
+        "{text}"
+    );
 }
