@@ -100,8 +100,27 @@ fn the_repo_map_names_no_crate_the_workspace_does_not_build() {
 #[test]
 fn the_repo_maps_count_word_matches_the_number_of_members() {
     const WORDS: &[&str] = &[
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-        "eleven", "twelve",
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
     ];
     let members = workspace_members();
     let word = WORDS
