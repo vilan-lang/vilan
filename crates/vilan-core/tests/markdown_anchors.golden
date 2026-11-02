@@ -489,6 +489,7 @@ std/rpc.md h2 keyed-cells-keyedcellk-t
 std/rpc.md h2 errors
 std/rpc.md h3 the-post-mountrpc-legs-statuses
 std/rpc.md h2 connection-state
+std/rpc.md h2 cancelling-a-dial-and-a-deadline
 std/rpc.md h2 transports
 std/rpc.md h2 server-plumbing-stdrpcserver-process-layer
 std/rpc.md h2 envelope--codec-layer

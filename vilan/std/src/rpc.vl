@@ -68,7 +68,8 @@ import pkg::reactive::{
 };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, fresh_identity };
-import pkg::task::{ CancelSignal, Task, ambient_signal };
+import pkg::task::{ CancelSignal, Task, ambient_nursery, ambient_signal, nursery };
+import pkg::time::Timer;
 import pkg::wire::{ Codec, Delta, Deserializer, Frame, Keyed, Serializer, Wire };
 
 // === Transport: request/response ============================================
@@ -989,9 +990,9 @@ export enum DialFailure {
 	/// amount of backoff improves a credential.
 	Refused(str),
 	/// The caller gave up (A179): the dial's nursery was cancelled — by a
-	/// `Task::race` that something else won, or the app — before the socket opened.
-	/// The half-open socket is closed and nothing is left running; there is nothing
-	/// to report, it is what the caller asked for.
+	/// `Task::race` that something else won, `dial_within`'s deadline, or the app —
+	/// before the socket opened. The half-open socket is closed and nothing is left
+	/// running; there is nothing to report, it is what the caller asked for.
 	Cancelled,
 }
 
@@ -1490,6 +1491,11 @@ export enum RpcError {
 	/// right thing, retrying immediately is not, and re-authenticating is beside
 	/// the point.
 	Unavailable,
+	/// `dial_within`'s deadline ran out before the dial answered (A179): a
+	/// judgement about TIME — "not reachable in the time you gave it; retry later,
+	/// and say so". The dial was cancelled, so no socket it would have opened later
+	/// is left running.
+	Timeout,
 	/// The dial was cancelled before it opened (A179): its nursery was cancelled —
 	/// a race something else won, or the app. About the CALLER's intent, so there
 	/// is nothing to report.
@@ -1712,6 +1718,10 @@ fun status_of_outcome(outcome: RpcOutcome): i32 {
 			// fault.
 			RpcError::Transport(let _reason) => 500,
 			RpcError::Cancelled => 500,
+			// A179's deadline arm. Never produced by the server's own machinery;
+			// a handler answering it says ITS dial upstream ran out of time,
+			// which is HTTP's gateway timeout.
+			RpcError::Timeout => 504,
 		},
 	}
 }
@@ -6523,6 +6533,51 @@ fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, 
 		} else {
 			RpcError::Transport(i"refused by the server ({status})")
 		},
+	})
+}
+
+/// Run `dial` with a deadline (A179, proposal/dial-cancel.md §2.2): its answer,
+/// or `Err(RpcError::Timeout)` when `ms` milliseconds pass first.
+///
+///     match dial_within(4000, || KoltClient::connect_with(url, codec, protocols)) {
+///         Ok(let client) => run(client),
+///         Err(RpcError::Timeout) => show("Can't reach Kolt"),
+///         Err(let other) => show(other.debug()),
+///     }
+///
+/// It wraps ANY dial — a generated `connect`/`connect_with`, `dial_socket`
+/// mapped to `RpcError`, a hand-written one — because it is the race idiom
+/// (`std::task`) in one place: a `nursery` whose body races the dial against a
+/// `Timer`. When the timer wins, the nursery is cancelled, and the std dial
+/// honours that (a half-open socket is closed, an abort during the backoff ends
+/// the dial), so no socket the dial would have opened later is left running. When
+/// the dial wins, only the TIMER is called off: the nursery is not cancelled, so
+/// nothing the connection set up inside it (a closure that captured its signal)
+/// is torn down. The nursery joins the loser before this returns, which is what
+/// makes "nothing left running" a guarantee — and why a hand-written dial that
+/// ignores cancellation (no std IO, no `ambient_signal()`) holds the answer until
+/// it settles.
+export fun dial_within<T>(
+	ms: i32,
+	dial: (async || Result<T, RpcError>) context ambient_nursery,
+): Result<T, RpcError> {
+	nursery(|n| {
+		let deadline = Timer::after(ms);
+		let dialled: Task<Option<Result<T, RpcError>>> = async Some(dial());
+		let timed: Task<Option<Result<T, RpcError>>> = async {
+			deadline.wait();
+			None
+		};
+		match Task::race([dialled, timed]) {
+			Some(let answer) => {
+				deadline.cancel();
+				answer
+			},
+			None => {
+				n.cancel();
+				Err(RpcError::Timeout)
+			},
+		}
 	})
 }
 

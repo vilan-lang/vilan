@@ -93,8 +93,9 @@ of the results by spawning the `settle_all` itself:
 `nursery(body)` joins every task spawned in the body's dynamic extent:
 the body's value passes through, the first-observed failure re-raises
 with its spawn origin, and everything else is absorbed. `cancel()`
-aborts the nursery's signal; `sleep` and `fetch` carry the ambient
-signal automatically, so in-flight IO in the extent rejects promptly,
+aborts the nursery's signal; `sleep`, `fetch` and the rpc dial
+(`connect`, `connect_socket`, [`dial_within`](rpc.md#cancelling-a-dial-and-a-deadline))
+carry the ambient signal automatically, so in-flight IO in the extent rejects promptly,
 and those rejections absorb as cancellation echoes. `Task::race` +
 `cancel()` is the race idiom: first settled wins, the losers' IO stops.
 Spec: [§7.7](../spec/execution.md). `ambient_signal()` bridges host
