@@ -29741,6 +29741,129 @@ impl<'src> Analyzer<'src> {
     /// may be handed to a callee, and over-approximating there refuses a
     /// program rather than miscompiling one.
     fn compute_retaining_positions(&self) -> HashMap<Id, BTreeSet<u32>> {
+        let summaries = self.compute_retaining_positions_by_propagation();
+        // E340: the propagation below must answer exactly what the round-based
+        // fixpoint it replaced answers; a debug build checks it on every program
+        // that asks (the C16 pins among them).
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            summaries,
+            self.compute_retaining_positions_by_rounds(),
+            "E340: C16's retaining summary by propagation disagrees with the rounds"
+        );
+        summaries
+    }
+
+    /// E340 (Order 56): [`Self::compute_retaining_positions`] in ONE sweep. The
+    /// rounds re-swept every expression of the program until nothing grew, and
+    /// each round cloned every bodied callee's set per call; here the sweep
+    /// records the unconditional facts (a return, a field, a collection, an
+    /// assignment, a callee that keeps everything) and, per call to a bodied
+    /// callee, the edges `(callee, position) -> (caller function, parameter
+    /// position)` its arguments' place roots name, and a worklist closes the
+    /// facts over the edges. The rounds' rule is the same: a callee's kept
+    /// position keeps the caller parameter its argument roots at.
+    fn compute_retaining_positions_by_propagation(&self) -> HashMap<Id, BTreeSet<u32>> {
+        let mut summaries: HashMap<Id, BTreeSet<u32>> = HashMap::default();
+        let mut queue: Vec<(Id, u32)> = Vec::new();
+        let mut edges: HashMap<(Id, u32), Vec<(Id, u32)>> = HashMap::default();
+        let keep = |value_id: Id,
+                    summaries: &mut HashMap<Id, BTreeSet<u32>>,
+                    queue: &mut Vec<(Id, u32)>| {
+            if let Some((function_id, position)) = self.retained_parameter_of(value_id)
+                && summaries.entry(function_id).or_default().insert(position)
+            {
+                queue.push((function_id, position));
+            }
+        };
+        for (_, value_id) in &self.return_sites {
+            keep(*value_id, &mut summaries, &mut queue);
+        }
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::StructInitializer(_, fields) => {
+                    for value_id in fields.values() {
+                        keep(*value_id, &mut summaries, &mut queue);
+                    }
+                }
+                Expr::List(ids) | Expr::Tuple(ids) => {
+                    for value_id in ids {
+                        keep(*value_id, &mut summaries, &mut queue);
+                    }
+                }
+                Expr::FunctionReturn(Some(value_id)) | Expr::Assignment(_, value_id) => {
+                    keep(*value_id, &mut summaries, &mut queue);
+                }
+                Expr::Call(call_expr_id) => {
+                    let Some(function_call) = self.function_calls.get(call_expr_id) else {
+                        continue;
+                    };
+                    let bodied_callee = match self
+                        .expr_id_to_expr_map
+                        .get(&function_call.subject_id)
+                    {
+                        Some(Expr::Local(callee_id))
+                            if !self.call_is_variant_constructor(*call_expr_id) =>
+                        {
+                            if self
+                                .functions
+                                .get(callee_id)
+                                .is_some_and(|function| function.has_body)
+                            {
+                                Some(*callee_id)
+                            } else {
+                                // A callee with no readable body keeps the
+                                // positions of its declared arity.
+                                let kept = self
+                                    .callee_retaining_positions(*callee_id, &HashMap::default());
+                                for position in kept {
+                                    if let Some(argument_id) =
+                                        function_call.argument_ids.get(position as usize)
+                                    {
+                                        keep(*argument_id, &mut summaries, &mut queue);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        // A variant constructor stores every argument; an
+                        // unresolvable subject is answered the safe way.
+                        _ => None,
+                    };
+                    for (position, argument_id) in function_call.argument_ids.iter().enumerate() {
+                        match bodied_callee {
+                            Some(callee_id) => {
+                                if let Some(target) = self.retained_parameter_of(*argument_id) {
+                                    edges
+                                        .entry((callee_id, position as u32))
+                                        .or_default()
+                                        .push(target);
+                                }
+                            }
+                            None => keep(*argument_id, &mut summaries, &mut queue),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        while let Some(kept) = queue.pop() {
+            let Some(targets) = edges.get(&kept) else {
+                continue;
+            };
+            for (function_id, position) in targets {
+                if summaries.entry(*function_id).or_default().insert(*position) {
+                    queue.push((*function_id, *position));
+                }
+            }
+        }
+        summaries
+    }
+
+    /// The round-based fixpoint [`Self::compute_retaining_positions_by_propagation`]
+    /// replaced (C16, Order 37), kept for the debug build's equality check.
+    #[cfg(debug_assertions)]
+    fn compute_retaining_positions_by_rounds(&self) -> HashMap<Id, BTreeSet<u32>> {
         let mut summaries: HashMap<Id, BTreeSet<u32>> = HashMap::default();
         // Every return position of every bodied function — the tail and each
         // value-carrying `ret`, the same set the seam walk above reads.
@@ -29803,29 +29926,30 @@ impl<'src> Analyzer<'src> {
 
     /// Records `value_id`'s place root as a retained parameter position, if it
     /// is one. Answers whether the set grew, which is the fixpoint's condition.
+    #[cfg(debug_assertions)]
     fn note_retained_parameter(
         &self,
         value_id: Id,
         summaries: &mut HashMap<Id, BTreeSet<u32>>,
     ) -> bool {
-        let Some(root) = self.place_root(value_id) else {
+        let Some((function_id, position)) = self.retained_parameter_of(value_id) else {
             return false;
         };
-        let Some(parameter) = self.parameters.get(&root) else {
-            return false;
-        };
-        let function_id = parameter.function_id;
-        let Some(position) = self
+        summaries.entry(function_id).or_default().insert(position)
+    }
+
+    /// The `(function, parameter position)` `value_id`'s place roots at, if
+    /// its root is a parameter — what C16's summary records as kept.
+    fn retained_parameter_of(&self, value_id: Id) -> Option<(Id, u32)> {
+        let root = self.place_root(value_id)?;
+        let function_id = self.parameters.get(&root)?.function_id;
+        let position = self
             .functions
-            .get(&function_id)
-            .and_then(|function| function.parameters.iter().position(|id| *id == root))
-        else {
-            return false;
-        };
-        summaries
-            .entry(function_id)
-            .or_default()
-            .insert(position as u32)
+            .get(&function_id)?
+            .parameters
+            .iter()
+            .position(|id| *id == root)?;
+        Some((function_id, position as u32))
     }
 
     /// Whether an expression escapes a view when placed in a return / field /
