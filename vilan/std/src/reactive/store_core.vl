@@ -23,6 +23,7 @@ import pkg::reactive::{
 	Subscription,
 	also_releasing,
 	batch,
+	defer_to_owner,
 	observe,
 };
 import pkg::shared::{ Shared, fresh_identity };
@@ -290,6 +291,11 @@ export fun store_wake_all(node: Option<Shared<StoreNode>>, woken: &mut StoreWoke
 /// moved wake, and a third variant's does not, since its answer did not change
 /// (Q7). Every live slot under either payload wakes too, each having gone between
 /// `Some` and `None`. Answers `true`, the diff's verdict.
+///
+/// The two flags' FEEDS are told too (B693): a feed on a flag is an assumed
+/// handle's keeper (`StoreSome::assume`), which must read the payload before the
+/// write that ends its variant lands. No inner write's spine passes a flag, so this
+/// is the one place a keeper is told anything.
 [internal("the derive's variant switch (A142 S7)")]
 export fun store_switch(
 	node: Option<Shared<StoreNode>>,
@@ -299,10 +305,14 @@ export fun store_switch(
 ): bool {
 	let flags = store_kid(node, 0);
 	store_wake_me(flags, true, woken);
-	store_wake_me(store_kid(flags, from), true, woken);
+	let left = store_kid(flags, from);
+	store_wake_me(left, true, woken);
+	store_touch(left, StoreTouch::Whole, woken);
 	store_wake_all(store_kid(node, from), woken);
 	if to != from {
-		store_wake_me(store_kid(flags, to), true, woken);
+		let arrived = store_kid(flags, to);
+		store_wake_me(arrived, true, woken);
+		store_touch(arrived, StoreTouch::Whole, woken);
 		store_wake_all(store_kid(node, to), woken);
 	}
 	true
@@ -1031,34 +1041,61 @@ export impl StoreSome<type P> {
 
 	/// This handle as a `Store<P>`, for a body that only runs while the variant is
 	/// live — `when_live`'s body (§2.6). Reads and writes go through the variant as
-	/// before. Should a reader run in the turn that ENDS the variant, before the
-	/// body is released — a derivation settles ahead of the effect that tears the
-	/// body down — it reads the LAST payload a read through the live variant saw
-	/// (B526, mirrored-store.md Q11: a message edited and then deleted repaints
-	/// nothing older than its edit), and a write then lands nowhere. Refuses a
-	/// variant that is not live now.
+	/// before, in place: a read copies nothing it does not return. Should a reader
+	/// run in the turn that ENDS the variant, before the body is released — a
+	/// derivation settles ahead of the effect that tears the body down — it reads
+	/// the payload as it stood when the variant ended (B526, mirrored-store.md Q11:
+	/// a message edited and then deleted repaints its edit, never the text the body
+	/// was built over), and a write then lands nowhere. Refuses a variant that is
+	/// not live now.
+	///
+	/// The fallback is taken by a KEEPER (B693): a feed on the variant's flag, which
+	/// copies the payload once, in the write that ends the variant, before it
+	/// lands. It goes with the ambient owner (the body's, under `when_live`);
+	/// outside every owner it stands for the store's life (`register_with_owner`'s
+	/// rule).
 	fun assume(self): Store<P> {
-		// The fallback is refreshed by every read that reaches the live payload, so
-		// it is the last value anyone read — every subscriber's wake is such a
-		// read. A binding the closure captures, not a cell (spec §6.9, M93's rule).
-		mut last = self.get();
-		if last.is_none() {
+		let lend = self.lend;
+		mut reached = false;
+		lend(|_payload: &P| {
+			reached = true;
+		});
+		if !reached {
 			panic("`StoreSome::assume` on a variant that is not live");
 		}
-		let lend = self.lend;
+		// The payload as it stood when the variant ended — copied by the keeper's
+		// `before` in the write that ends it, never on a read. A flag's feeds are
+		// told only when its variant comes or goes (`store_switch`, or an outer
+		// variant's `store_wake_all`), never by a write inside the payload, whose
+		// spine passes no flag. A binding the closures capture, not a cell (spec
+		// §6.9, M93's rule).
+		mut last: Option<P> = None;
+		let keeper = StoreFeed {
+			id = fresh_identity(),
+			touch = |_touch: StoreTouch| {},
+			before = || lend(|payload: &P| {
+				last = Some(*payload);
+			}),
+			after = || {},
+		};
+		let root = self.root;
+		let gate = self.gate;
+		attach_feed(root, gate, keeper);
+		defer_to_owner(|| detach_feed(root, gate, keeper.id));
 		Store<P> {
 			root = self.root,
 			path = self.path,
 			lend = |f: |&P| void| {
-				mut reached = false;
+				mut live = false;
 				lend(|payload: &P| {
-					reached = true;
-					last = Some(*payload);
-					f(&payload);
+					live = true;
+					f(payload);
 				});
-				if !reached {
-					match last {
-						Some(let held) => f(&held),
+				if !live {
+					// Matched through `&` (the B689 form): natively the fallback is
+					// read where it is, not copied to destructure it.
+					match &last {
+						Some(let held) => f(held),
 						None => {},
 					}
 				}

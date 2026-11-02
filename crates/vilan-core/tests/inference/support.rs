@@ -1113,6 +1113,29 @@ pub fn emitted_bodies_containing(js: &str, needle: &str) -> usize {
     count
 }
 
+/// The body of the emitted `function {name}(` — through its matching brace.
+/// The instrument a CODEGEN-SHAPE pin reads one function through (B689, B693).
+pub fn emitted_function<'js>(js: &'js str, name: &str) -> &'js str {
+    let head = format!("function {name}(");
+    let start = js
+        .find(&head)
+        .unwrap_or_else(|| panic!("no `{head}` in the output:\n{js}"));
+    let mut depth = 0usize;
+    for (offset, character) in js[start..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &js[start..start + offset + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{head}` never closes")
+}
+
 /// The `(kind, line)` view of what a program's const evaluation emitted — what
 /// a pin about an asset's CONTENT reads. [`collected_keyed_assets`] is the same
 /// run with each contribution's sort key kept (build-hooks.md §5.3), and

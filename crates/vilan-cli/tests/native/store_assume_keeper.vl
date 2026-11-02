@@ -1,0 +1,112 @@
+// B693 (proposal/store-assume-keeper.md §4.5): an assumed handle's fallback is
+// kept by a feed on its variant's flag, which copies the payload once, in the
+// write that ends the variant — on both backends. Every row of §2.2's table: the
+// enum's own handle, `Option` -> `None`, a key removed under `at(id).some()` (by
+// `set(None)` and by `remove`), a whole-state write that replaces the enum, and
+// an outer variant ending above the handle. Each payload is patched through
+// ANOTHER handle before its end and never read through the assumed one, so each
+// line reads the payload as it stood when its variant ended. Then the keeper's
+// life (the feed census) and a variant that comes back.
+import std::hash_map::HashMap;
+import std::io::print;
+import std::reactive::store::{ Storable, Store, store_census, store_feed_census };
+import std::reactive::{ Owner, Source, run_with_owner };
+
+[derive(PartialEq, Storable)]
+struct Device {
+	name: str,
+}
+
+[derive(PartialEq, Storable)]
+enum Presence {
+	Offline,
+	Online(Device),
+}
+
+[derive(PartialEq, Storable)]
+struct Record {
+	title: str,
+	notes: List<str>,
+}
+
+[derive(Storable)]
+struct State {
+	presence: Presence,
+	records: HashMap<i32, Record>,
+}
+
+fun state(name: str): State {
+	mut records: HashMap<i32, Record> = HashMap::new();
+	records.insert(1, Record { title = "first", notes = ["a"] });
+	records.insert(2, Record { title = "second", notes = [] });
+	State { presence = Presence::Online(Device { name }), records }
+}
+
+fun census<T>(store: Store<T>): str {
+	let (_slots, nodes) = store_census(store);
+	i"nodes={nodes} feeds={store_feed_census(store)}"
+}
+
+fun main() {
+	// The enum's own handle.
+	let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+	let device = presence.online().assume();
+	let _renamed = presence.online().name().patch("phone");
+	presence.set(Presence::Offline);
+	print(i"enum: {device.name().get()}");
+
+	// `Option` -> `None`.
+	let slot: Store<Option<Record>> = Store::new(Some(Record { title = "draft", notes = ["x"] }));
+	let record = slot.some().assume();
+	let _edited = slot.some().title().patch("edited");
+	slot.set(None);
+	print(i"option: {record.title().get()} {record.notes().get().len()}");
+
+	// A key removed under `at(id).some()`, by `set(None)` and by `remove`.
+	let keyed = Store::new(state("laptop"));
+	let first = keyed.records().at(1).some().assume();
+	let second = keyed.records().at(2).some().assume();
+	let _first = keyed.records().at(1).some().title().patch("first, edited");
+	let _second = keyed.records().at(2).some().title().patch("second, edited");
+	keyed.records().at(1).set(None);
+	keyed.records().remove(2);
+	print(i"key: {first.title().get()} / {second.title().get()} / {keyed.records().len()}");
+
+	// A whole-state write that replaces the enum.
+	let whole = Store::new(state("laptop"));
+	let inner = whole.presence().online().assume();
+	let _tablet = whole.presence().online().name().patch("tablet");
+	whole.set(State { presence = Presence::Offline, records = HashMap::new() });
+	print(i"whole: {inner.name().get()}");
+
+	// An outer variant ending above the handle.
+	let outer: Store<Option<State>> = Store::new(Some(state("laptop")));
+	let deep = outer.some().presence().online().assume();
+	let deep_record = outer.some().records().at(1).some().assume();
+	let _desktop = outer.some().presence().online().name().patch("desktop");
+	let _noted = outer.some().records().at(1).some().title().patch("first, noted");
+	outer.set(None);
+	print(i"outer: {deep.name().get()} / {deep_record.title().get()}");
+
+	// After the end a write lands nowhere; a new `Some` is read live.
+	let again: Store<Option<Record>> = Store::new(Some(Record { title = "one", notes = [] }));
+	let held = again.some().assume();
+	again.set(None);
+	held.title().set("ghost");
+	print(i"dead: {held.title().get()} none={again.get().is_none()}");
+	again.set(Some(Record { title = "two", notes = [] }));
+	let _three = again.some().title().patch("three");
+	print(i"again: {held.title().get()}");
+
+	// The keeper's life: one per `assume()` under an owner, gone with it.
+	let counted = Store::new(Presence::Online(Device { name = "laptop" }));
+	print(i"before: {census(counted)}");
+	let body = Owner::new();
+	run_with_owner(body, || {
+		let _one = counted.online().assume();
+		let _two = counted.online().assume();
+	});
+	print(i"held: {census(counted)}");
+	body.dispose();
+	print(i"disposed: {census(counted)}");
+}

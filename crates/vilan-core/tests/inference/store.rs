@@ -2369,11 +2369,13 @@ fun main() {
 main();
 "#;
 
-/// The rule-1 copies (`__clone` calls, recursion included) each phase of
-/// [`M172_HOLDS`] makes at `count` keys, in the order the phases print.
-fn m172_copies_per_phase(count: usize) -> Vec<usize> {
-    let js = compile(&M172_HOLDS.replace("{count}", &count.to_string()))
-        .unwrap_or_else(|errors| panic!("M172's program must compile: {errors:#?}"));
+/// The copies (`__clone` calls, recursion included) a compiled `source` makes
+/// between one `print` and the next — the first entry counts from the start —
+/// in the order its lines print: the instrument for a pin about how a cost
+/// SCALES, read as a count rather than a clock (M172, B693).
+fn copies_per_print(source: &str) -> Vec<usize> {
+    let js =
+        compile(source).unwrap_or_else(|errors| panic!("the program must compile: {errors:#?}"));
     let helper = "function __clone(value) {";
     assert!(
         js.contains(helper),
@@ -2389,7 +2391,7 @@ fn m172_copies_per_phase(count: usize) -> Vec<usize> {
         )
     );
     let stdout =
-        run_js(&counted).unwrap_or_else(|errors| panic!("M172's program must run: {errors:#?}"));
+        run_js(&counted).unwrap_or_else(|errors| panic!("the program must run: {errors:#?}"));
     let mut seen = 0;
     let mut copies = Vec::new();
     for line in stdout.lines() {
@@ -2400,7 +2402,14 @@ fn m172_copies_per_phase(count: usize) -> Vec<usize> {
         copies.push(total - seen);
         seen = total;
     }
-    assert_eq!(copies.len(), 4, "four phases print:\n{stdout}");
+    copies
+}
+
+/// The rule-1 copies each phase of [`M172_HOLDS`] makes at `count` keys, in the
+/// order the phases print.
+fn m172_copies_per_phase(count: usize) -> Vec<usize> {
+    let copies = copies_per_print(&M172_HOLDS.replace("{count}", &count.to_string()));
+    assert_eq!(copies.len(), 4, "four phases print: {copies:?}");
     copies
 }
 
@@ -2440,5 +2449,370 @@ fn m172_a_mirrors_holds_and_releases_cost_their_own_entries_not_the_table() {
         ratio(3),
         small[3],
         large[3]
+    );
+}
+
+// ── B693: the assumed handle's fallback is kept by a feed on its flag ───────
+
+/// B693's repro as phases (`store-assume-keeper.md` §1): a `Store<Option<State>>`
+/// of `{count}` records, assumed through `some()` (what `when_live` hands its
+/// body), read a hundred times below the handle, written inside the payload,
+/// ended, and read once more through the fallback. Each phase prints, so
+/// [`copies_per_print`] reads what each one copied.
+const B693_PHASES: &str = r#"
+import std::hash_map::HashMap;
+import std::io::print;
+import std::reactive::store::Store;
+
+[derive(PartialEq, Storable)]
+struct Record {
+    title: str,
+    notes: List<str>,
+}
+
+[derive(Storable)]
+struct State {
+    records: HashMap<i32, Record>,
+}
+
+fun main() {
+    mut records: HashMap<i32, Record> = HashMap::new();
+    mut index = 0;
+    for index < {count} {
+        records.insert(index, Record { title = "a title", notes = ["one note", "another note"] });
+        index += 1;
+    }
+    let store: Store<Option<State>> = Store::new(Some(State { records }));
+    print("built");
+    let live = store.some().assume();
+    print("assumed");
+    mut read = 0;
+    for read < 100 {
+        let _title = live.records().at(1).some().title().get();
+        read += 1;
+    }
+    print("read");
+    let _renamed = live.records().at(1).some().title().patch("renamed");
+    print("written inside");
+    store.set(None);
+    print("ended");
+    print(live.records().at(1).some().title().get().unwrap_or("?"));
+}
+
+main();
+"#;
+
+/// §4.3 and §4.4, read as COPIES: assuming the handle, a hundred reads below it,
+/// a write inside its payload and a read through its fallback each copy the
+/// same at 1,000 records as at 10 — the read lends in place, and the keeper on
+/// the variant's flag is on no inner write's spine — while the write that ENDS
+/// the variant copies the whole payload, once (the keeper's `before`). Before
+/// the fix, every read copied the payload: the hundred reads made ~100 copies of
+/// the state, and `assume()` one more.
+#[test]
+fn b693_an_assumed_handle_copies_its_payload_once_at_the_end_never_on_a_read() {
+    let phases = |count: usize| {
+        let copies = copies_per_print(&B693_PHASES.replace("{count}", &count.to_string()));
+        assert_eq!(copies.len(), 6, "six phases print: {copies:?}");
+        copies
+    };
+    let small = phases(10);
+    let large = phases(1000);
+    for (phase, name) in [
+        (1, "assume()"),
+        (2, "the reads"),
+        (3, "the write inside the payload"),
+        (5, "the fallback read"),
+    ] {
+        assert_eq!(
+            large[phase], small[phase],
+            "{name} copies with the payload's size (10 records: {small:?}, 1,000: {large:?})"
+        );
+    }
+    // The one copy, at the end: a hundred times the records, about a hundred
+    // times the copies (the diff's own walk of the ended payload is beside it).
+    assert!(
+        large[4] >= 50 * small[4].max(1) && large[4] < 20 * 1000,
+        "the end copies the payload once (10 records: {small:?}, 1,000: {large:?})"
+    );
+}
+
+/// §4.2, the CODEGEN SHAPE (the B689 form): the handle `assume()` returns lends
+/// in place — its read copies nothing — and the payload is copied in one place
+/// in the function, the keeper's `before`, which runs ahead of the write that
+/// ends the variant.
+#[test]
+fn b693_the_assumed_handles_read_lends_and_only_the_keeper_copies() {
+    let js = compile(&B693_PHASES.replace("{count}", "10")).expect("the B693 repro compiles");
+    let assume = emitted_function(&js, "assume");
+    assert_eq!(
+        assume.matches("__clone(payload)").count(),
+        1,
+        "one copy of the payload in `assume`, the keeper's:\n{assume}"
+    );
+    let (keeper, handle) = assume
+        .split_once("attach_feed(")
+        .unwrap_or_else(|| panic!("`assume` stands its keeper on the flag:\n{assume}"));
+    assert!(
+        keeper.contains("__clone(payload)"),
+        "the keeper, built before it is attached, is the copy:\n{assume}"
+    );
+    // What follows the attach is the detach and the handle; the handle's only
+    // copy is of its PATH (a list of steps), never of what it reads.
+    assert!(
+        !handle.replace("__clone(self[1])", "").contains("__clone"),
+        "the assumed handle copies on a read:\n{assume}"
+    );
+}
+
+/// §4.3, the keeper's LIFE (`store_feed_census`): `assume()` under an owner
+/// stands one feed, a second `assume()` under it a second, and the owner's
+/// dispose takes both off and prunes the nodes they made; inside an effect each
+/// RUN's `assume()` replaces the last run's; outside any owner the keeper stands
+/// for the store's life, the variant's end included (§6 Q1, `register_with_owner`'s
+/// rule).
+#[test]
+fn b693_the_keeper_stands_while_its_owner_does() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Source, run_with_owner };
+        import std::reactive::store::{ Storable, Store, store_census, store_feed_census };
+
+        [derive(PartialEq, Storable)]
+        struct Device {
+            name: str,
+        }
+
+        [derive(PartialEq, Storable)]
+        enum Presence {
+            Offline,
+            Online(Device),
+        }
+
+        fun census<T>(store: Store<T>): str {
+            let (_slots, nodes) = store_census(store);
+            i"nodes={nodes} feeds={store_feed_census(store)}"
+        }
+
+        fun main() {
+            let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+            print(i"before: {census(presence)}");
+            let body = Owner::new();
+            run_with_owner(body, || {
+                let _device = presence.online().assume();
+            });
+            print(i"one: {census(presence)}");
+            run_with_owner(body, || {
+                let _device = presence.online().assume();
+            });
+            print(i"two: {census(presence)}");
+            body.dispose();
+            print(i"disposed: {census(presence)}");
+            let runs = Owner::new();
+            run_with_owner(runs, || {
+                presence.online().name().effect(|_name| {
+                    let _device = presence.online().assume();
+                });
+            });
+            let _renamed = presence.online().name().patch("phone");
+            presence.set(Presence::Online(Device { name = "tablet" }));
+            print(i"effect: {store_feed_census(presence)}");
+            runs.dispose();
+            print(i"effect disposed: {census(presence)}");
+            let _outside = presence.online().assume();
+            print(i"outside: {store_feed_census(presence)}");
+            presence.set(Presence::Offline);
+            print(i"ended: {store_feed_census(presence)}");
+        }
+
+        main();
+        "#,
+        "before: nodes=1 feeds=0\n\
+         one: nodes=3 feeds=1\n\
+         two: nodes=3 feeds=2\n\
+         disposed: nodes=1 feeds=0\n\
+         effect: 1\n\
+         effect disposed: nodes=1 feeds=0\n\
+         outside: 1\n\
+         ended: 1\n",
+    );
+}
+
+/// The types §2.2's rows end variants of: an enum with a payload, a record a
+/// map keys, and a state holding both.
+const B693_ENDS: &str = r#"
+import std::hash_map::HashMap;
+import std::io::print;
+import std::reactive::Source;
+import std::reactive::store::{ Storable, Store };
+
+[derive(PartialEq, Storable)]
+struct Device {
+    name: str,
+}
+
+[derive(PartialEq, Storable)]
+enum Presence {
+    Offline,
+    Online(Device),
+}
+
+[derive(PartialEq, Storable)]
+struct Record {
+    title: str,
+    notes: List<str>,
+}
+
+[derive(Storable)]
+struct State {
+    presence: Presence,
+    records: HashMap<i32, Record>,
+}
+
+fun state(name: str): State {
+    mut records: HashMap<i32, Record> = HashMap::new();
+    records.insert(1, Record { title = "first", notes = ["a"] });
+    records.insert(2, Record { title = "second", notes = [] });
+    State { presence = Presence::Online(Device { name }), records }
+}
+"#;
+
+/// One row of §2.2's table on JS (§4.5; the native half is
+/// `native_differential`'s `b693_*`). Each payload is patched through ANOTHER
+/// handle and never read through the assumed one before its end, so the row
+/// reads the payload as it stood when its variant ended — the old rule (the
+/// last value a read through the handle saw) answered what it was assumed at.
+fn assert_ends(body: &str, expected: &str) {
+    assert_compiles_and_runs(
+        &format!("{B693_ENDS}\nfun main() {{\n{body}\n}}\n\nmain();\n"),
+        expected,
+    );
+}
+
+#[test]
+fn b693_the_enums_own_handle_ending_its_variant_leaves_the_payload_as_it_stood() {
+    assert_ends(
+        r#"
+        let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+        let device = presence.online().assume();
+        let _renamed = presence.online().name().patch("phone");
+        presence.set(Presence::Offline);
+        print(device.name().get());
+        "#,
+        "phone\n",
+    );
+}
+
+#[test]
+fn b693_an_option_set_to_none_leaves_the_payload_as_it_stood() {
+    assert_ends(
+        r#"
+        let slot: Store<Option<Record>> = Store::new(Some(Record { title = "draft", notes = [] }));
+        let record = slot.some().assume();
+        let _edited = slot.some().title().patch("edited");
+        slot.set(None);
+        print(record.title().get());
+        "#,
+        "edited\n",
+    );
+}
+
+#[test]
+fn b693_a_key_set_to_none_under_the_handle_leaves_its_value_as_it_stood() {
+    assert_ends(
+        r#"
+        let keyed = Store::new(state("laptop"));
+        let first = keyed.records().at(1).some().assume();
+        let _edited = keyed.records().at(1).some().title().patch("first, edited");
+        keyed.records().at(1).set(None);
+        print(i"{first.title().get()} / {keyed.records().len()}");
+        "#,
+        "first, edited / 1\n",
+    );
+}
+
+#[test]
+fn b693_a_key_removed_under_the_handle_leaves_its_value_as_it_stood() {
+    assert_ends(
+        r#"
+        let keyed = Store::new(state("laptop"));
+        let second = keyed.records().at(2).some().assume();
+        let _edited = keyed.records().at(2).some().title().patch("second, edited");
+        keyed.records().remove(2);
+        print(i"{second.title().get()} / {keyed.records().len()}");
+        "#,
+        "second, edited / 1\n",
+    );
+}
+
+#[test]
+fn b693_a_whole_state_write_replacing_the_enum_leaves_the_payload_as_it_stood() {
+    assert_ends(
+        r#"
+        let whole = Store::new(state("laptop"));
+        let inner = whole.presence().online().assume();
+        let _tablet = whole.presence().online().name().patch("tablet");
+        whole.set(State { presence = Presence::Offline, records = HashMap::new() });
+        print(inner.name().get());
+        "#,
+        "tablet\n",
+    );
+}
+
+#[test]
+fn b693_an_outer_variant_ending_leaves_every_inner_payload_as_it_stood() {
+    // The keeper on an INNER flag is told by the outer `store_switch`'s
+    // `store_wake_all` of the payload subtree — the enum's and the key's alike.
+    assert_ends(
+        r#"
+        let outer: Store<Option<State>> = Store::new(Some(state("laptop")));
+        let deep = outer.some().presence().online().assume();
+        let deep_record = outer.some().records().at(1).some().assume();
+        let _desktop = outer.some().presence().online().name().patch("desktop");
+        let _noted = outer.some().records().at(1).some().title().patch("first, noted");
+        outer.set(None);
+        print(i"{deep.name().get()} / {deep_record.title().get()}");
+        "#,
+        "desktop / first, noted\n",
+    );
+}
+
+#[test]
+fn b693_after_the_end_a_write_lands_nowhere_and_a_new_payload_is_read_live() {
+    // §4.6: the fallback answers while the variant is dead, and a write through
+    // it lands nowhere; once a new `Some` arrives the lend reaches again, so the
+    // handle reads the NEW payload (and its patches), not the stale fallback.
+    assert_ends(
+        r#"
+        let again: Store<Option<Record>> = Store::new(Some(Record { title = "one", notes = [] }));
+        let held = again.some().assume();
+        again.set(None);
+        held.title().set("ghost");
+        print(i"dead: {held.title().get()} none={again.get().is_none()}");
+        again.set(Some(Record { title = "two", notes = [] }));
+        print(i"again: {held.title().get()}");
+        let _three = again.some().title().patch("three");
+        print(i"live: {held.title().get()}");
+        "#,
+        "dead: one none=true\nagain: two\nlive: three\n",
+    );
+}
+
+/// §4.6: assuming a variant that is not live is still refused.
+#[test]
+fn b693_assuming_a_dead_variant_is_refused() {
+    assert_run_panics(
+        r#"
+        import std::reactive::store::Store;
+
+        fun main() {
+            let slot: Store<Option<str>> = Store::new(None);
+            let _held = slot.some().assume();
+        }
+
+        main();
+        "#,
+        "`StoreSome::assume` on a variant that is not live",
     );
 }

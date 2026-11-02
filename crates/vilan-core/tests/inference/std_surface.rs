@@ -885,28 +885,6 @@ fn b689_insert_keeps_copies_of_what_it_is_given() {
     );
 }
 
-/// The body of the emitted `function {name}(` — through its matching brace.
-fn emitted_function<'js>(js: &'js str, name: &str) -> &'js str {
-    let head = format!("function {name}(");
-    let start = js
-        .find(&head)
-        .unwrap_or_else(|| panic!("no `{head}` in the output:\n{js}"));
-    let mut depth = 0usize;
-    for (offset, character) in js[start..].char_indices() {
-        match character {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &js[start..start + offset + 1];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("`{head}` never closes")
-}
-
 /// §4.5, the CODEGEN SHAPE of B689's repro: the store's keyed step lends the
 /// map's slot — `at`'s two closures call `peek`/`modify`, which hand the slot
 /// to `__map_lend`/`__map_lend_mut`, and NONE of the four clones anything. A
