@@ -311,7 +311,10 @@ impl Client {
         let mut seen = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "the client did not finish; saw {seen:?}");
+            assert!(
+                !remaining.is_zero(),
+                "the client did not finish; saw {seen:?}"
+            );
             match self.lines.recv_timeout(remaining) {
                 Ok(line) => seen.push(line),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -321,7 +324,10 @@ impl Client {
             }
         }
         let status = self.child.wait().expect("reap the client");
-        assert!(status.success(), "the client failed ({status}); saw {seen:?}");
+        assert!(
+            status.success(),
+            "the client failed ({status}); saw {seen:?}"
+        );
         seen
     }
 }
