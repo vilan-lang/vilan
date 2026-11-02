@@ -786,12 +786,12 @@ function on_teardown(cleanup) {
 function ensure_wired($b) {
 	if (!(wired.v)) {
 		wired.v = true;
-		set(entry_signal, [ __router_path(), __router_state(), false ], $b, "std/src/web/router.vl:101:16");
-		set2(path_signal, __router_path(), $b, "std/src/web/router.vl:106:15");
+		set(entry_signal, [ __router_path(), __router_state(), false ], $b, "std/src/web/router.vl:95:16");
+		set2(path_signal, __router_path(), $b, "std/src/web/router.vl:100:15");
 		__dom_window().addEventListener("popstate", () => {
 			return turn([ 1 ], ($s) => {
-				set(entry_signal, [ __router_path(), __router_state(), true ], [ 0, $s ], "std/src/web/router.vl:108:17");
-				set2(path_signal, __router_path(), [ 0, $s ], "std/src/web/router.vl:113:16");
+				set(entry_signal, [ __router_path(), __router_state(), true ], [ 0, $s ], "std/src/web/router.vl:102:17");
+				set2(path_signal, __router_path(), [ 0, $s ], "std/src/web/router.vl:107:16");
 				return;
 			});
 		});
@@ -807,8 +807,8 @@ function navigate(path, $br) {
 function navigate_with(path, state, $bs) {
 	ensure_wired($bs);
 	history.pushState(state, "", path);
-	set(entry_signal, [ path, state, false ], $bs, "std/src/web/router.vl:178:15");
-	set2(path_signal, path, $bs, "std/src/web/router.vl:179:14");
+	set(entry_signal, [ path, state, false ], $bs, "std/src/web/router.vl:172:15");
+	set2(path_signal, path, $bs, "std/src/web/router.vl:173:14");
 }
 function segments(path) {
 	let parts = [  ];
@@ -1789,8 +1789,8 @@ const waking = __shared_new([ 1 ]);
 const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
 const run_nurseries_allocated_count = __shared_new(0);
-const path_signal = new4("", "std/src/web/router.vl:83:48");
-const entry_signal = new4([ "", "", false ], "std/src/web/router.vl:85:58");
+const path_signal = new4("", "std/src/web/router.vl:77:48");
+const entry_signal = new4([ "", "", false ], "std/src/web/router.vl:79:58");
 const wired = __shared_new(false);
 const chunk_pending_signal = new4(false, "std/src/browser/web/ui.vl:602:58");
 const chunk_error_signal = new4([ 1 ], "std/src/browser/web/ui.vl:607:63");
