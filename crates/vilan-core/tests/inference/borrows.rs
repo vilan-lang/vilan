@@ -7473,6 +7473,87 @@ fn the_storing_callee_refusal_follows_a_chain_of_callees() {
     );
 }
 
+/// The analysis of `source` on a large-stack worker, with C16's retaining
+/// fixpoint count from that thread's census (E340) and the diagnostics.
+fn retaining_fixpoints_of(source: &str) -> (u64, Vec<String>) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            (
+                vilan_core::incremental::census().retaining_fixpoints,
+                errors.into_iter().map(|error| error.msg).collect(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the analysis")
+}
+
+#[test]
+fn the_retaining_fixpoint_runs_only_for_a_call_that_hands_on_a_capturing_closure() {
+    // E340 (Order 56): C16's fixpoint is whole-program, and it ran whenever ANY
+    // closure captured a view - on kolt two of ~5,900 do, so every editor
+    // keystroke paid ~400 ms for a question no live call asked. It runs now on
+    // the first call that hands a view-capturing closure to an ordinary callee
+    // (`stored_view_capturing_arguments`' only question), so a capturing
+    // closure that is called in place costs nothing...
+    let (runs, errors) = retaining_fixpoints_of(
+        r#"
+        import std::io::print;
+        fun read(v: &mut i32): i32 { let g = || *v; g() }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        runs, 0,
+        "a capturing closure called in place ran the fixpoint"
+    );
+    // ...a view-capturing closure handed to a callee asks it once, and the
+    // callee that only calls it still compiles...
+    let (runs, errors) = retaining_fixpoints_of(
+        r#"
+        import std::io::print;
+        fun twice(g: || i32): i32 { g() + g() }
+        fun read(v: &mut i32): i32 { twice(|| *v) + twice(|| *v + 1) }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        runs, 1,
+        "the fixpoint runs once per analysis, on its first question"
+    );
+    // ...and the storing callee is still refused through it.
+    let (runs, errors) = retaining_fixpoints_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun make(v: &mut i32): Holder { keep(|| *v) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+    );
+    assert_eq!(runs, 1);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`keep` keeps what it is handed past the call")),
+        "{errors:?}"
+    );
+}
+
 #[test]
 fn a_callee_that_puts_the_closure_in_a_collection_keeps_it() {
     // A collection is a store like a field is: the list outlives the call.

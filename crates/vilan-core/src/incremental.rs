@@ -622,6 +622,11 @@ pub struct Census {
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
+    /// E340 (Order 56): C16's retaining fixpoint runs this analysis ran — 1
+    /// when a live call hands a view-capturing closure to an ordinary callee,
+    /// else 0 (it used to run whenever any closure of the program captured a
+    /// view).
+    pub retaining_fixpoints: u64,
     /// B635's instrument ([`set_verify_graph_replays`]): the cold calls a
     /// REPLAYED post-rewrite graph names differently from the graph built
     /// whole over the same tree — 0 by construction, counted only while the
@@ -755,6 +760,7 @@ thread_local! {
             r11_instances_scanned: 0,
             r11_records_filed: 0,
             hover_rows_restored: 0,
+            retaining_fixpoints: 0,
             graph_replay_mismatches: 0,
             async_keys_served: 0,
             async_keys_rewalked: 0,
@@ -1136,7 +1142,7 @@ pub fn report(program: &Program) {
              live-entities={} move-rows-live={} r11-rows-live={} instances-served={} \
              instances-scanned={} instance-records-filed={} async-seeded={}/{} \
              async-records-filed={} async-record-bytes={} hover-rows-restored={} \
-             prefix-world={} prefix-layered={} prefix-hits={} \
+             retaining-fixpoints={} prefix-world={} prefix-layered={} prefix-hits={} \
              prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
              prefix-checks={} prefix-checks-written={} tier-oracle={} \
              post-seam={}",
@@ -1176,6 +1182,7 @@ pub fn report(program: &Program) {
             census.async_records_filed,
             census.async_record_bytes,
             census.hover_rows_restored,
+            census.retaining_fixpoints,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
             census.prefix_hits,

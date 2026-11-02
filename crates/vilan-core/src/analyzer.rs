@@ -29408,6 +29408,13 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .filter(|closure_id| self.closure_captures_view_param(*closure_id))
             .collect();
+        if crate::phase_pass_split_enabled() {
+            crate::phase_pass_mark(&format!(
+                "check_view_escape: closures capturing a view ({} of {})",
+                capturing.len(),
+                self.closures.len()
+            ));
+        }
         // Variant constructors that *are* a function's `Some(&mut self.x)` return
         // (including each branch of a conditional `if live { Some(..) } else { None
         // }`): the wrapped view projects a parameter, so the pair is a sanctioned
@@ -29420,6 +29427,7 @@ impl<'src> Analyzer<'src> {
             .flat_map(|function_id| self.wrapped_view_return_calls(function_id))
             .chain(self.transient_wrapped_view_calls())
             .collect();
+        crate::phase_pass_mark("check_view_escape: sanctioned wrapped calls");
         // A CLOSURE's `ret` never enters `return_sites` (its rets take part
         // in the closure's own return inference, `ret-checking.md` rule 4)
         // and gets no exemption at all — a closure may not declare `borrows`,
@@ -29435,14 +29443,16 @@ impl<'src> Analyzer<'src> {
             .map(|(_, value_id)| *value_id)
             .collect();
         // C16 (Order 37, R7): which parameter positions a callee KEEPS past the
-        // call. Computed only when some closure captures a view — for every
-        // other program the set below is asked nothing, so the fixpoint is not
-        // run at all and the check costs what it always cost.
-        let retaining = if capturing.is_empty() {
-            HashMap::default()
-        } else {
-            self.compute_retaining_positions()
-        };
+        // call — a whole-program fixpoint over every expression. E340 (Order
+        // 56): computed on the FIRST live call that hands a view-capturing
+        // closure to an ordinary callee, the only question it answers
+        // (`stored_view_capturing_arguments` asks nothing else of it). It was
+        // computed whenever any closure of the program captured a view: on
+        // kolt@2684c70 two of ~5,900 do, so every keystroke paid the fixpoint
+        // (~330-520 ms CPU, 85 % of the pass) although no live call asked it.
+        // The answer is the same map whenever it is computed (the program does
+        // not change during the walk), so the diagnostics cannot move.
+        let mut retaining: Option<HashMap<Id, BTreeSet<u32>>> = None;
         let mut escapes: Vec<Id> = Vec::new();
         // C16's own list: the argument id and the callee that keeps it, which is
         // the whole diagnosis and the reason this escape gets its own sentence.
@@ -29496,9 +29506,20 @@ impl<'src> Analyzer<'src> {
                 // back a closure reading a view of its own dead local. Memory-
                 // safe on JS only because the host boxes the place and traces
                 // it; on the emit-Rust backend (F1) it is a freed slot.
-                Expr::Call(call_id) if !capturing.is_empty() => {
+                Expr::Call(call_id)
+                    if !capturing.is_empty()
+                        && self.call_hands_on_a_capturing_closure(*call_id, &capturing) =>
+                {
+                    let retaining = retaining.get_or_insert_with(|| {
+                        if !crate::macros::in_macro_world() {
+                            crate::incremental::update_census(|census| {
+                                census.retaining_fixpoints += 1;
+                            });
+                        }
+                        self.compute_retaining_positions()
+                    });
                     stored_escapes.extend(
-                        self.stored_view_capturing_arguments(*call_id, &capturing, &retaining),
+                        self.stored_view_capturing_arguments(*call_id, &capturing, retaining),
                     );
                 }
                 _ => {}
@@ -29590,6 +29611,27 @@ impl<'src> Analyzer<'src> {
                 expr_id,
             );
         }
+    }
+
+    /// E340: whether `call_id` is an ordinary call (not a variant constructor)
+    /// with a view-capturing closure among its arguments — the calls
+    /// [`Self::stored_view_capturing_arguments`] can answer anything for, and
+    /// so the only ones that need C16's retaining fixpoint.
+    fn call_hands_on_a_capturing_closure(&self, call_id: Id, capturing: &HashSet<Id>) -> bool {
+        if self.call_is_variant_constructor(call_id) {
+            return false;
+        }
+        self.function_calls
+            .get(&call_id)
+            .is_some_and(|function_call| {
+                function_call.argument_ids.iter().any(|argument_id| {
+                    matches!(
+                        self.expr_id_to_expr_map.get(argument_id),
+                        Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
+                            if capturing.contains(closure_id)
+                    )
+                })
+            })
     }
 
     /// C16: the arguments of `call_id` that are view-capturing closures handed
