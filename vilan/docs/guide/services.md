@@ -261,13 +261,15 @@ check is still what decides who may act.
 
 - On the client they return `Result<T, RpcError>` and are implicitly
   awaited, like any async call.
-- `RpcError` tells you what went wrong, in six variants:
+- `RpcError` tells you what went wrong, in eight variants:
   `Transport(str)` (couldn't reach the server), `Decode(str)`,
   `Remote(str)` (the handler failed), `Contract(str)` (the connect-time
   check below refused a drifted server), `Unauthorized` (the credential
-  will not open this connection) and `Unavailable` (the server is up and
+  will not open this connection), `Unavailable` (the server is up and
   refusing for now — retry later, and re-authenticating is beside the
-  point). Errors are values. Look at them and decide.
+  point), `Timeout` (`dial_within`'s deadline ran out) and `Cancelled`
+  (the dial's nursery was cancelled before it opened). Errors are values.
+  Look at them and decide.
 - At connect time, both sides compare a hash of the service's shape. If
   a stale client meets a redeployed server, the connect fails cleanly —
   as `Contract(reason)` — instead of calls corrupting halfway. This is

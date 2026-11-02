@@ -540,7 +540,7 @@ per disconnect, through `drop_session`.
 fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff); offers `vilan-rpc`
 fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str>
 fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure>
-enum DialFailure { Unreachable(str), Refused(str) }   // Refused carries "401"/"403"/"503"
+enum DialFailure { Unreachable(str), Refused(str), Cancelled }   // Refused carries "401"/"403"/"503"
 impl SocketDuplex {
 	fun transport(self): SocketTransport
 }
