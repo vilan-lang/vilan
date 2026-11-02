@@ -1,0 +1,105 @@
+// M185: `std::image` prints the same pixels on both backends — one codec core
+// (`vilan-image`), linked natively through `vilan-rt-image` and run on node as
+// its wasm32 build. Decode, sniff, the pixel limit, every `Fit`, crop
+// clamping, encode -> decode per format, and the refusals, each printed.
+import std::base64::decode_url;
+import std::bytes::Bytes;
+import std::image::{ Fit, Format, Image };
+import std::io::panic;
+import std::range::Range;
+
+// A 2 x 2 RGBA PNG: red, green / blue, half-transparent white.
+let two_by_two = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR42mP4z8DwHwyBNAg0AABJSQl4nFEXkgAAAABJRU5ErkJggg";
+
+fun shown(label: str, picture: Image) {
+	print(i"{label} {picture.width()}x{picture.height()} {picture.rgba().to_hex()}");
+}
+
+fun format_name(format: Option<Format>): str {
+	match format {
+		Some(Format::Png) => "png",
+		Some(Format::Jpeg) => "jpeg",
+		Some(Format::Webp) => "webp",
+		Some(Format::Gif) => "gif",
+		None => "none",
+	}
+}
+
+/// A `width` x `height` gradient, opaque.
+fun gradient(width: usize, height: usize): Image {
+	let pixels = Bytes::alloc(width * height * 4);
+	for y in Range::new(0, height.as_i32()) {
+		for x in Range::new(0, width.as_i32()) {
+			let at = (y.as_usize() * width + x.as_usize()) * 4;
+			pixels.set(at, x * 30);
+			pixels.set(at + 1, y * 40);
+			pixels.set(at + 2, 200 - x * 10);
+			pixels.set(at + 3, 255);
+		}
+	}
+	match Image::from_rgba(width, height, pixels) {
+		Ok(let picture) => picture,
+		Err(let reason) => panic(reason),
+	}
+}
+
+fun round_trip(label: str, picture: Image, format: Format, quality: i32) {
+	match picture.encode(format, quality) {
+		Ok(let bytes) => match Image::decode(bytes) {
+			Ok(let back) => {
+				print(i"{label} {format_name(Image::sniff(bytes))} {bytes.len()} bytes");
+				shown(label, back);
+			},
+			Err(let reason) => print(i"{label} decode refused: {reason}"),
+		},
+		Err(let reason) => print(i"{label} refused: {reason}"),
+	}
+}
+
+fun main() {
+	let png = match decode_url(two_by_two) {
+		Some(let bytes) => bytes,
+		None => panic("the fixture is base64url"),
+	};
+	print(format_name(Image::sniff(png)));
+	print(format_name(Image::sniff(Bytes::alloc(16))));
+
+	let picture = match Image::decode(png) {
+		Ok(let picture) => picture,
+		Err(let reason) => panic(reason),
+	};
+	shown("decoded", picture);
+	match Image::decode_within(png, 3) {
+		Ok(_) => print("the limit admitted 4 pixels"),
+		Err(let reason) => print(reason),
+	}
+	match Image::decode(Bytes::alloc(16)) {
+		Ok(_) => print("zeros decoded"),
+		Err(let reason) => print(reason),
+	}
+
+	shown("fill 1x1", picture.resized(1, 1, Fit::Fill));
+	shown("fill 5x3", picture.resized(5, 3, Fit::Fill));
+
+	let wide = gradient(8, 6);
+	shown("contain", wide.resized(4, 4, Fit::Contain));
+	shown("cover", wide.resized(3, 3, Fit::Cover));
+	shown("zero side", wide.resized(0, 2, Fit::Fill));
+	shown("crop", wide.cropped(6, 4, 10, 10));
+	shown("crop outside", wide.cropped(9, 0, 2, 2));
+
+	// `rgba()` is a copy: writing it leaves the picture as it was.
+	let copy = picture.rgba();
+	copy.set(0, 7);
+	print(i"{copy.get(0)} {picture.rgba().get(0)}");
+
+	round_trip("png", picture, Format::Png, 0);
+	round_trip("webp", picture, Format::Webp, 0);
+	round_trip("jpeg", wide, Format::Jpeg, 90);
+	round_trip("gif", picture, Format::Gif, 80);
+
+	match Image::from_rgba(2, 2, Bytes::alloc(15)) {
+		Ok(_) => print("15 bytes made a picture"),
+		Err(let reason) => print(reason),
+	}
+}

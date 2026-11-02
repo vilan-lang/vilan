@@ -6421,8 +6421,10 @@ fn the_crypto_surface_answers_nodes_bytes_on_both_backends() {
     assert!(plain.status.success());
     let manifest = manifest_of("bool");
     assert!(
-        !manifest.contains("vilan-rt-crypto") && !manifest.contains("vilan-rt-sqlite"),
-        "a program that reaches neither names neither:\n{manifest}"
+        !manifest.contains("vilan-rt-crypto")
+            && !manifest.contains("vilan-rt-sqlite")
+            && !manifest.contains("vilan-rt-image"),
+        "a program that reaches none names none (M185: the image crate included):\n{manifest}"
     );
 }
 
@@ -14829,6 +14831,131 @@ fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
                 "false\n",
             ),
             "{backend:?}"
+        );
+    }
+}
+
+/// M185: `std::image` prints the same pixels on both backends — the point of
+/// running ONE codec core (`vilan-image`) natively through `vilan-rt-image` and
+/// on node as its wasm32 build. Decode and sniff, the pixel limit's sentence,
+/// every `Fit` (an upscale, a downscale, `Contain`'s rounding, `Cover`'s centred
+/// window, a zero side), crop clamping, `rgba()` as a copy, an encode -> decode
+/// round trip per format with its byte count (JPEG too: the encoder is integer
+/// arithmetic, so even the lossy bytes agree), and the refusals. And the
+/// manifest of the program names the image crate — the reach recorded.
+#[test]
+fn m185_image_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_image.vl";
+    std::fs::write(staged.join(file), include_str!("native/image.vl"))
+        .expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "node and native print different pixels"
+    );
+    assert_eq!(
+        outputs[0],
+        concat!(
+            "png\n",
+            "none\n",
+            "decoded 2x2 ff0000ff00ff00ff0000ffffffffff80\n",
+            "2 x 2 exceeds the 3-pixel limit\n",
+            "not a PNG, JPEG, WebP or GIF\n",
+            "fill 1x1 1x1 6d6d6ddf\n",
+            "fill 5x3 5x3 ff0000fcff1800ff878700ff0af700ff00ff00ff8c008cff7d117df96d6d6ddf5ae25ac549ff49b30000ffff000afff34e4effb8ffd2ff7dffffff53\n",
+            "contain 4x3 0f13c3ff4913b0ff89139affc31387ff0f64c3ff4964b0ff89649affc36487ff0fb5c3ff49b5b0ff89b59affc3b587ff\n",
+            "cover 3x3 2d13b9ff6913a5ffa51391ff2d64b9ff6964a5ffa56491ff2db5b9ff69b5a5ffa5b591ff\n",
+            "zero side 1x2 692aa5ff699ea5ff\n",
+            "crop 2x2 b4a08cffd2a082ffb4c88cffd2c882ff\n",
+            "crop outside 0x2 \n",
+            "7 255\n",
+            "png png 86 bytes\n",
+            "png 2x2 ff0000ff00ff00ff0000ffffffffff80\n",
+            "webp webp 202 bytes\n",
+            "webp 2x2 ff0000ff00ff00ff0000ffffffffff80\n",
+            "jpeg jpeg 657 bytes\n",
+            "jpeg 8x6 0200c5ff1e00c0ff3c00b4ff5b00a7ff7800a0ff970096ffb70088ffd10082ff0327c6ff1d28c0ff3e27b3ff5b26a8ff7928a1ff972795ffb72588ffd12883ff0051c4ff1a53beff3b52b0ff5951a6ff77529fff945194ffb45086ffce5381ff0378c8ff1c7ac2ff3d79b7ff5a78aaff787aa3ff967998ffb6778affd17985ff009dc6ff1ba0c1ff3a9eb5ff599da8ff77a0a2ff959f97ffb49e89ffcfa084ff06c8caff20c9c4ff40c9b9ff5fc7acff7cc9a5ff9ac89affb9c78cffd4c987ff\n",
+            "gif refused: GIF cannot be encoded\n",
+            "15 bytes are not 2 x 2 RGBA pixels (16 bytes)\n",
+        )
+    );
+    let manifest = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_image")
+            .join("Cargo.toml"),
+    )
+    .expect("read the generated manifest");
+    assert!(
+        manifest.contains("vilan-rt-image")
+            && !manifest.contains("vilan-rt-sqlite")
+            && !manifest.contains("vilan-rt-crypto"),
+        "a program reaching `std::image` names the image crate, and only it:\n{manifest}"
+    );
+    for package in vilan_rust::IMAGE_OPTIMIZED_PACKAGES {
+        assert!(
+            manifest.contains(&format!("[profile.dev.package.{package}]\nopt-level = 3")),
+            "the codec's `{package}` is optimized in the dev profile:\n{manifest}"
+        );
+    }
+}
+
+/// M185: every package the generated manifest optimizes for an image program
+/// is in the graph `vilan-image` resolves to — read off this workspace's
+/// lockfile, which pins the same `image` the generated project resolves. A name
+/// outside the graph would make cargo warn "profile package spec … did not
+/// match any packages" in every image build.
+#[test]
+fn m185_the_optimized_image_packages_are_the_codecs_own_graph() {
+    let lock =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"))
+            .expect("read Cargo.lock");
+    // name -> the names it depends on (a `dependencies` entry may carry a
+    // version after a space when two versions of one crate are locked).
+    let mut graph: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for package in lock.split("[[package]]").skip(1) {
+        let name = package
+            .lines()
+            .find_map(|line| line.strip_prefix("name = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("a locked package has a name")
+            .to_string();
+        let dependencies: Vec<String> = package
+            .split_once("dependencies = [")
+            .map(|(_, rest)| rest.split(']').next().unwrap_or(""))
+            .unwrap_or("")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('"'))
+            .map(|entry| {
+                entry
+                    .trim_end_matches(['"', ','])
+                    .split(' ')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        graph.entry(name).or_default().extend(dependencies);
+    }
+    let mut reached = std::collections::BTreeSet::new();
+    let mut pending = vec!["vilan-image".to_string()];
+    while let Some(name) = pending.pop() {
+        if reached.insert(name.clone()) {
+            pending.extend(graph.get(&name).cloned().unwrap_or_default());
+        }
+    }
+    for package in vilan_rust::IMAGE_OPTIMIZED_PACKAGES {
+        assert!(
+            reached.contains(*package),
+            "`{package}` is optimized for image programs but is not in vilan-image's graph: \
+             {reached:?}"
         );
     }
 }

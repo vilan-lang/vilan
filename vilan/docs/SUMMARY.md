@@ -54,6 +54,7 @@
 - [Debugging](std/debug.md)
 - [Dev / HMR](std/dev.md)
 - [Process modules](std/process.md)
+- [Images](std/image.md)
 - [Misc](std/misc.md)
 
 # The specification

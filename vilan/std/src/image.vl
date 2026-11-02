@@ -1,0 +1,167 @@
+// `std::image` — decode, resize, crop and encode pictures (tracker M185;
+// proposal/image.md): PNG, JPEG, WebP and GIF in, PNG, JPEG and WebP out.
+//
+// ONE implementation on both backends: the `vilan-image` crate, over Rust's
+// `image` crate. A native program links it through `vilan-rt-image`; a node
+// program runs the same source built for wasm32, which the compiler carries and
+// writes into the bundle ONLY when the program reaches this module. So the two
+// backends decode a picture to the same pixels and scale it the same way.
+//
+// A server concern, like `std::db`: the browser has `createImageBitmap` and a
+// canvas, and nothing here is emitted into a browser leg.
+//
+// Synchronous: a 12-megapixel JPEG costs a few hundred milliseconds of the event
+// loop on node (wasm, no SIMD) and a fraction of that natively.
+
+[platform("@process")] mod self;
+
+import pkg::bytes::Bytes;
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
+
+/// A decoded picture: `width` x `height` pixels, RGBA, 8 bits each. A VALUE —
+/// every operation answers a new picture and none changes this one, so a copy
+/// is as good as the original; there is nothing to close.
+export external struct Image;
+
+/// The four formats `decode` reads; `encode` writes the first three.
+export enum Format {
+	Png,
+	Jpeg,
+	Webp,
+	Gif,
+}
+
+/// How `resized` maps a picture onto its box.
+export enum Fit {
+	/// Keep the aspect, inside the box: the result may be smaller on one side.
+	Contain,
+	/// Keep the aspect, filling the box: the overflow is cropped, centred.
+	Cover,
+	/// Stretch to exactly the box.
+	Fill,
+}
+
+// The seam. `Format` and `Fit` cross it as small integers — ONE table, kept by
+// `vilan-image`'s crate header too (crates/vilan-image/src/lib.rs):
+//
+//   code  Format  Fit
+//   0     Png     Contain
+//   1     Jpeg    Cover
+//   2     Webp    Fill
+//   3     Gif
+//
+// and `__image_sniff` answers -1 for bytes that are none of the four.
+
+[extern("__image_decode")]
+external fun image_decode(bytes: Bytes, max_pixels: usize): Result<Image, str>;
+
+[extern("__image_sniff")]
+external fun image_sniff(bytes: Bytes): i32;
+
+[extern("__image_from_rgba")]
+external fun image_from_rgba(width: usize, height: usize, pixels: Bytes): Result<Image, str>;
+
+[extern("__image_width")]
+external fun image_width(image: Image): usize;
+
+[extern("__image_height")]
+external fun image_height(image: Image): usize;
+
+[extern("__image_rgba")]
+external fun image_rgba(image: Image): Bytes;
+
+[extern("__image_resize")]
+external fun image_resize(image: Image, width: usize, height: usize, fit: i32): Image;
+
+[extern("__image_crop")]
+external fun image_crop(image: Image, x: usize, y: usize, width: usize, height: usize): Image;
+
+[extern("__image_encode")]
+external fun image_encode(image: Image, format: i32, quality: i32): Result<Bytes, str>;
+
+fun format_code(format: Format): i32 {
+	match format {
+		Format::Png => 0,
+		Format::Jpeg => 1,
+		Format::Webp => 2,
+		Format::Gif => 3,
+	}
+}
+
+fun fit_code(fit: Fit): i32 {
+	match fit {
+		Fit::Contain => 0,
+		Fit::Cover => 1,
+		Fit::Fill => 2,
+	}
+}
+
+export impl Image {
+	/// Decode PNG, JPEG, WebP or GIF (its first frame), the format sniffed from
+	/// the bytes, the picture's EXIF orientation applied — so a phone photo comes
+	/// out upright, and `width` and `height` are its upright size. Refuses a
+	/// picture larger than 50,000,000 pixels from its header, before decoding
+	/// it: `decode_within(bytes, 50000000)`.
+	fun decode(bytes: Bytes): Result<Image, str> {
+		image_decode(bytes, 50000000)
+	}
+
+	/// `decode` with your own pixel limit. The header's size is checked against
+	/// it BEFORE anything is allocated — an upload can claim 60,000 x 60,000.
+	fun decode_within(bytes: Bytes, max_pixels: usize): Result<Image, str> {
+		image_decode(bytes, max_pixels)
+	}
+
+	/// The format `decode` would read `bytes` as, from their first bytes alone
+	/// (`None` for anything else). The bytes are not decoded.
+	fun sniff(bytes: Bytes): Option<Format> {
+		match image_sniff(bytes) {
+			0 => Some(Format::Png),
+			1 => Some(Format::Jpeg),
+			2 => Some(Format::Webp),
+			3 => Some(Format::Gif),
+			_ => None,
+		}
+	}
+
+	/// A picture from raw RGBA pixels, `width * height * 4` bytes, row-major;
+	/// any other length is refused. The bytes are copied.
+	fun from_rgba(width: usize, height: usize, pixels: Bytes): Result<Image, str> {
+		image_from_rgba(width, height, pixels)
+	}
+
+	fun width(self): usize {
+		image_width(self)
+	}
+
+	fun height(self): usize {
+		image_height(self)
+	}
+
+	/// The pixels, RGBA row-major — a copy: writing it changes nothing here.
+	fun rgba(self): Bytes {
+		image_rgba(self)
+	}
+
+	/// Scaled to fit `width` x `height` (Lanczos3; upscaling allowed). `Contain`
+	/// keeps the aspect inside the box, rounding to whole pixels and never below
+	/// one a side; `Cover` fills the box and crops the overflow centred; `Fill`
+	/// stretches. A zero side of the box counts as one pixel.
+	fun resized(self, width: usize, height: usize, fit: Fit): Image {
+		image_resize(self, width, height, fit_code(fit))
+	}
+
+	/// The `width` x `height` window at (`x`, `y`), clamped to the picture: a
+	/// window past an edge stops at it, one starting past it is empty.
+	fun cropped(self, x: usize, y: usize, width: usize, height: usize): Image {
+		image_crop(self, x, y, width, height)
+	}
+
+	/// Encode as `format`. `quality` (1-100, clamped) is JPEG's; PNG and WebP
+	/// are lossless and ignore it. JPEG has no alpha, so transparency is
+	/// flattened onto white. `Gif` is decode-only and refused here.
+	fun encode(self, format: Format, quality: i32): Result<Bytes, str> {
+		image_encode(self, format_code(format), quality)
+	}
+}
