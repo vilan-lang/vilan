@@ -1818,6 +1818,12 @@ const MULTILINE_ATTRIBUTE_ARGUMENT: &str = "an attribute argument here is a one-
 const A_TUPLE_TAKES_NO_TRAILING_COMMA: &str = "a tuple takes no trailing comma; remove the \
      `,` before `)`";
 
+/// B657: `..base` in a struct literal. Curated (B6): the rule, that the
+/// update form does not exist, and the spelling that does what it meant.
+const A_STRUCT_LITERAL_HAS_NO_UPDATE_FORM: &str = "a struct literal names every field; there is \
+     no `..base` update form: bind the base and assign the fields that change (`mut p = \
+     origin(); p.x = 1;`)";
+
 /// B663: a struct literal heading a `match` subject. Curated (B6): the rule
 /// and its two ways out.
 const A_STRUCT_LITERAL_IS_NO_MATCH_SUBJECT: &str = "a struct literal can't be a `match` subject \
@@ -6609,17 +6615,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             // fields, site 3 of 10). A `{ ... }` that cannot even be balanced makes
             // the whole initializer decline, so a bare name falls through to the
             // atom — matching the oracle.
+            let mut update = false;
             let fields = match parser.attempt(|parser| {
                 let fields_start = parser.position;
                 parser.expect_ctrl('{')?;
-                let fields = parser.comma_list(Self::parse_struct_initializer_field, |parser| {
-                    parser.peek_is_ctrl('}')
-                })?;
+                let entries = parser.comma_list(
+                    |parser| {
+                        if parser.parse_refused_update_base()? {
+                            update = true;
+                            return Some(None);
+                        }
+                        parser.parse_struct_initializer_field().map(Some)
+                    },
+                    |parser| parser.peek_is_ctrl('}'),
+                )?;
                 parser.expect_ctrl('}')?;
+                let fields = entries.into_iter().flatten().collect();
                 Some((fields, parser.span_from(fields_start)))
             }) {
                 Some(clean) => clean,
                 None => {
+                    update = false;
                     let span = parser.recover_delimited(
                         "struct initializer",
                         '{',
@@ -6635,10 +6651,36 @@ impl<'a, 'src> Parser<'a, 'src> {
                     (name, name_span),
                     generic_arguments.map(Box::new),
                     Box::new(fields),
+                    update,
                 ),
                 parser.span_from(start),
             ))
         })
+    }
+
+    /// B657: `..base` where a struct-initializer field begins — the update
+    /// form, which the language does not have (a tuple spreads, a struct
+    /// literal names every field). Refused AT the dots
+    /// ([`A_STRUCT_LITERAL_HAS_NO_UPDATE_FORM`]) and read past, base and all,
+    /// so the literal is read without it: `Some(true)`. `Some(false)` when
+    /// no `..` begins here; `None` when the base itself does not parse, which
+    /// fails the field list as any broken field does.
+    fn parse_refused_update_base(&mut self) -> Option<bool> {
+        if !(self.peek_is_ctrl('.') && self.peek_at_is_ctrl(1, '.')) {
+            return Some(false);
+        }
+        let start = self.position;
+        self.bump();
+        self.bump();
+        let dots = self.span_from(start);
+        self.parse_expression()?;
+        self.errors.push(ParseError {
+            span: dots,
+            reason: ParseErrorReason::Rule(A_STRUCT_LITERAL_HAS_NO_UPDATE_FORM),
+            context: Vec::new(),
+            hint: None,
+        });
+        Some(true)
     }
 
     /// `name` or `name = value` — one struct-initializer field.
@@ -12817,7 +12859,7 @@ mod tests {
         // In expression position the same head with a brace IS a struct literal.
         assert!(matches!(
             expr("Foo { x = 1 }").0,
-            Node::StructInitializer(_, ("Foo", _), _, _)
+            Node::StructInitializer(_, ("Foo", _), _, _, false)
         ));
         // A parenthesised struct literal is admitted even in a condition.
         assert!(matches!(

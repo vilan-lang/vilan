@@ -788,3 +788,4 @@ row	flagship	key
 NEW	-	this program decodes, scales, crops or encodes a picture through `std::image`, and this build of the compiler does not carry the image codec
 NEW	-	`[{name}]` is written twice over {item}: merge them, `{merged}`
 NEW	-	`[{name}]` is written twice over {item}; keep one
+NEW	-	a struct literal names every field; there is no `..base` update form: bind the base and assign the fields that change (`mut p = origin(); p.x = 1;`)

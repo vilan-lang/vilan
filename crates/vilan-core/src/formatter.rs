@@ -9449,7 +9449,7 @@ impl<'src> Printer<'src> {
                 self.print_argument_spans(argument_spans);
                 self.out.push(')');
             }
-            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
+            Node::StructInitializer(namespace, name, generic_arguments, fields, _) => {
                 // The path as written (B190) — the namespace spine, then the
                 // name. The printer BAILS on a form it does not know, falling
                 // the whole file back to its source silently, so a qualified

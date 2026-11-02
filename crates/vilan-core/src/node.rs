@@ -1086,11 +1086,17 @@ pub enum Node<'src> {
     // source order (`shapes::deep::Ring` gives `["shapes", "deep"]`) and empty
     // for the bare spelling; the name carries its own span, since with a
     // prefix in front of it the literal's start is no longer where it begins.
+    // B657: the last element says a `..base` update tail was written —
+    // refused by the parser (there is no update form) and read without it,
+    // so the analysis does not also report the fields it would have filled.
+    // A `bool`, not the tail's span: it rides the variant's padding, where an
+    // `Option<Span>` widened every `Node` past `node_size`'s ceiling.
     StructInitializer(
         Vec<&'src str>,
         Spanned<&'src str>,
         Option<Box<GenericArguments<'src>>>,
         Box<Spanned<Vec<Spanned<StructInitializerField<'src>>>>>,
+        bool,
     ),
     Trait(
         Spanned<&'src str>,
@@ -1501,7 +1507,7 @@ impl<'src> Node<'src> {
                     }
                 }
             }
-            Node::StructInitializer(_, _, generic_arguments, fields) => {
+            Node::StructInitializer(_, _, generic_arguments, fields, _) => {
                 for argument in generic_arguments.iter().flat_map(|arguments| &arguments.0) {
                     visit(argument);
                 }

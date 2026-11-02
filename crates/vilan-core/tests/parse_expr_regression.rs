@@ -294,7 +294,7 @@ const SNAP_IS_BIND_TUPLE: &str = "(Is((Accessor(\"x\"), 14..15), (Variant([\"Som
 const SNAP_COND_BIT_EQ: &str = "(Binary(Eq, (Binary(BitAnd, (Accessor(\"flag\"), 3..7), (Accessor(\"mask\"), 10..14)), 3..14), (Number(\"0\", None, None), 18..19)), 3..19)";
 const SNAP_COND_SHL_GT: &str = "(Binary(Gt, (Binary(Shl, (Accessor(\"a\"), 3..4), (Number(\"2\", None, None), 8..9)), 3..9), (Accessor(\"b\"), 12..13)), 3..13)";
 const SNAP_COND_IS_OR: &str = "(Binary(Or, (Is((Accessor(\"a\"), 3..4), (Variant([\"None\"], None), 8..12)), 3..12), (Is((Accessor(\"b\"), 16..17), (Variant([\"None\"], None), 21..25)), 16..25)), 3..25)";
-const SNAP_COND_PAREN_STRUCT: &str = "(StructInitializer([], (\"Foo\", 4..7), None, ([((\"x\", Some((Number(\"1\", None, None), 14..15))), 10..15)], 8..17)), 4..17)";
+const SNAP_COND_PAREN_STRUCT: &str = "(StructInitializer([], (\"Foo\", 4..7), None, ([((\"x\", Some((Number(\"1\", None, None), 14..15))), 10..15)], 8..17), false), 4..17)";
 
 // ---------------------------------------------------------------------------
 // 4. Located decliner messages — the shapes whose WORDING is the contract

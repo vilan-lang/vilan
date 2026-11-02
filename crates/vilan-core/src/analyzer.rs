@@ -3527,6 +3527,9 @@ pub struct StructInitializerConstraint<'src> {
     /// itself is what's wrong, not the value assigned to it).
     pub fields: Vec<(&'src str, Id, Span, Span)>,
     pub fields_span: Span,
+    /// B657: a `..base` update tail was written, and refused by the parser —
+    /// so the fields it would have filled are not reported missing again.
+    pub update_refused: bool,
 }
 
 /// A constraint that a variable's type must unify with its
@@ -3879,6 +3882,7 @@ impl<'src> StructInitializerConstraint<'src> {
         generic_argument_ids: Vec<TypeId>,
         e_fields: Vec<(&'src str, Id, Span, Span)>,
         fields_span: Span,
+        update_refused: bool,
     ) -> Self {
         Self {
             initializer_id,
@@ -3892,6 +3896,7 @@ impl<'src> StructInitializerConstraint<'src> {
             generic_parameter_constraint_ids: Vec::new(),
             fields: e_fields,
             fields_span,
+            update_refused,
         }
     }
 
@@ -42693,7 +42698,8 @@ impl<'src> Analyzer<'src> {
         scope_id: Id,
         id: Id,
     ) -> Option<Expr<'src>> {
-        let Node::StructInitializer(namespace, name, generic_arguments, fields) = &node.0 else {
+        let Node::StructInitializer(namespace, name, generic_arguments, fields, update) = &node.0
+        else {
             unreachable!("only the `Node::StructInitializer` arm walks here")
         };
         let generic_argument_ids = generic_arguments
@@ -42747,6 +42753,7 @@ impl<'src> Analyzer<'src> {
                 generic_argument_ids,
                 e_fields,
                 fields.1,
+                *update,
             ),
         ));
         None
@@ -67511,7 +67518,14 @@ impl<'src> Analyzer<'src> {
         if self.refuse_repeated_field(constraint) {
             return Resolution::Failed;
         }
-        if constraint.fields.len() != struct_fields.len() {
+        // B657: the parser refused a `..base` tail — the one diagnostic this
+        // literal gets for it. The fields it was written to fill are missing
+        // because of it, so they are not reported again, and the literal is
+        // still read as the struct it names (its given fields checked), so
+        // nothing that uses it cascades.
+        let missing_for_the_refused_update =
+            constraint.update_refused && constraint.fields.len() < struct_fields.len();
+        if constraint.fields.len() != struct_fields.len() && !missing_for_the_refused_update {
             let (msg, span) = self.struct_field_count_message(
                 constraint.struct_name,
                 &struct_fields,
