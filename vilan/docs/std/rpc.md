@@ -295,6 +295,8 @@ enum RpcError {
 	Contract(str),    // connect-time shape mismatch (old client vs new server)
 	Unauthorized,     // 401/403 at the handshake: not with this credential
 	Unavailable,      // 503 at the handshake: not now — the app's own refusal
+	Timeout,          // `dial_within`'s deadline ran out: retry later, and say so
+	Cancelled,        // the dial's nursery was cancelled before it opened
 }
 ```
 
@@ -318,6 +320,8 @@ disagree**:
 | `Failure(Remote(..))` — a handler failed | **500** |
 | a `Service::factory` service on this leg | **501**, as an envelope |
 | `Failure(Unavailable)` | **503** |
+| `Failure(Timeout)` — a handler's own upstream dial ran out of time | **504** |
+| `Failure(Transport(..))` or `Failure(Cancelled)` — client-side readings a server never produces | **500** |
 | a non-POST on `{mount}rpc` | **405**, `Allow: POST` |
 
 An application error is a **200**: `Result<Token, str>`'s `Err` arm is a value
@@ -406,6 +410,55 @@ client.transport.on_reconnect(|| title.repush());
 Keep a hook short — it runs inside the reconnect loop's own extent, so a long
 round-trip inside one holds the reconnect open behind it.
 
+## Cancelling a dial, and a deadline
+
+```vilan,fragment
+fun dial_within<T>(ms: i32, dial: async || Result<T, RpcError>): Result<T, RpcError>
+```
+
+A dial (`connect`, `connect_with`, `connect_socket`, `dial_socket`) honours
+the cancel signal of the nursery it runs in. Cancelled before the socket
+opens, it closes the half-open socket and answers `Err(RpcError::Cancelled)`
+(`connect_socket`'s `Err` is the sentence `"the dial was cancelled"`); an
+abort during the backoff between attempts ends it the same way, rather than
+counting as one more failed attempt. An abort that lands after the socket
+opened is not the dial's business: the connection is returned as before and
+stays the caller's — it is not torn down with the nursery, and neither is its
+reconnect loop. So the `std::task` race idiom bounds a dial, and
+`dial_within` is that idiom in one call: `Err(RpcError::Timeout)` when `ms`
+pass first, with the dial cancelled, so no socket it would have opened later
+is left running.
+
+```vilan,norun
+import std::io::print;
+import std::result::Result::{ Err, Ok };
+import std::rpc::{ RpcError, SocketDuplex, dial_socket, dial_within };
+
+fun open(url: str): Result<SocketDuplex, RpcError> {
+	dial_socket(url, []).map_err(|failure| RpcError::Transport(failure.message()))
+}
+
+fun main() {
+	match dial_within(4000, || open("ws://localhost:4000/")) {
+		Ok(let _socket) => print("connected"),
+		Err(RpcError::Timeout) => print("Can't reach the server"),
+		Err(let other) => print(other.debug()),
+	}
+}
+```
+
+It wraps any dial — a generated client's is
+`dial_within(4000, || KoltClient::connect_with(url, codec, protocols))`. The
+two errors are two answers to two questions: `Timeout` is about time (show
+it, retry later), `Cancelled` about the caller's own intent (there is nothing
+to report). When the dial wins, only the deadline's timer is called off, never
+the nursery, so nothing the connection set up is cancelled with it. The
+nursery joins the losing dial before `dial_within` returns, which is what makes
+"nothing left running" a guarantee — and why a hand-written dial that ignores
+cancellation (no std IO, no `ambient_signal()`) holds the answer until it
+settles. On the native backend `dial_within` runs over any dial; the WebSocket
+dial itself is JS-only there today.
+
 ## Transports
 
 ```vilan,fragment
@@ -487,7 +540,7 @@ per disconnect, through `drop_session`.
 fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff); offers `vilan-rpc`
 fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str>
 fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure>
-enum DialFailure { Unreachable(str), Refused(str) }   // Refused carries "401"/"403"/"503"
+enum DialFailure { Unreachable(str), Refused(str), Cancelled }   // Refused carries "401"/"403"/"503"
 impl SocketDuplex {
 	fun transport(self): SocketTransport
 }

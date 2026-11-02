@@ -11910,6 +11910,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.reaches_term = true;
                 Ok(Some("vilan_rt_term::leave()".to_string()))
             }
+            // M181: `std::url`'s percent-encoding pair, hand-written in
+            // `vilan_rt::url` to JavaScript's rules (the JS backend's
+            // `__percent_encode`/`__percent_decode` helpers).
+            (None, "__percent_encode", _) => Ok(Some(format!(
+                "vilan_rt::url::percent_encode(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ))),
+            (None, "__percent_decode", _) => Ok(Some(format!(
+                "vilan_rt::url::percent_decode(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ))),
             // A173 S1 / E?5: `prompt`'s unterminated, flushed write.
             (None, "__stdout_write", _) => Ok(Some(format!(
                 "vilan_rt::process::stdout_write(&{})",

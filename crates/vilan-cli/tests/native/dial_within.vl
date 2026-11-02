@@ -1,0 +1,43 @@
+// A179: `std::rpc::dial_within` over hand-written dials answers the same on
+// both backends — the native backend has no WebSocket client, but the deadline
+// is std code over `nursery`, `Timer` and `Task::race`, which it runs. And the
+// two new `RpcError` arms print, `Debug`-render, compare and encode as the
+// others do.
+import std::result::Result::{ self, Err, Ok };
+import std::rpc::{ RpcError, dial_within };
+import std::time::sleep;
+
+/// A dial that answers `value` after `ms`.
+fun answers(ms: i32, value: i32): Result<i32, RpcError> {
+	sleep(ms);
+	Ok(value)
+}
+
+/// A dial that refuses after `ms`.
+fun refuses(ms: i32): Result<i32, RpcError> {
+	sleep(ms);
+	Err(RpcError::Unavailable)
+}
+
+fun shown(label: str, answer: Result<i32, RpcError>) {
+	match answer {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => print(i"{label} err {error.debug()}"),
+	}
+}
+
+fun main() {
+	// The dial beats the deadline: its answer, Ok or Err.
+	shown("wins", dial_within(5000, || answers(1, 7)));
+	shown("refused", dial_within(5000, || refuses(1)));
+	// The deadline beats the dial: `Timeout`, and the dial's own wait is
+	// cancelled — the nursery joins it, so a dial left running for its minute
+	// would hold this line back by that minute.
+	shown("hung", dial_within(20, || answers(60000, 1)));
+	// A deadline already past still lets nothing through but the timer.
+	shown("past", dial_within(0 - 5, || answers(60000, 2)));
+
+	for error in [RpcError::Timeout, RpcError::Cancelled, RpcError::Unavailable] {
+		print(i"{error.debug()} {error == RpcError::Timeout} {error.to_json()}");
+	}
+}

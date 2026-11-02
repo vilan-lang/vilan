@@ -392,6 +392,7 @@ std/encoding.md h3 backed-enums-on-the-wire
 std/encoding.md h2 bytes
 std/encoding.md h2 binary-codec-stdbinary
 std/encoding.md h2 base64-stdbase64
+std/encoding.md h2 percent-encoding-stdurl
 std/image.md h1 images
 std/image.md h2 avatars-one-upload-three-sizes
 std/image.md h2 what-decode-does-for-you
@@ -488,6 +489,7 @@ std/rpc.md h2 keyed-cells-keyedcellk-t
 std/rpc.md h2 errors
 std/rpc.md h3 the-post-mountrpc-legs-statuses
 std/rpc.md h2 connection-state
+std/rpc.md h2 cancelling-a-dial-and-a-deadline
 std/rpc.md h2 transports
 std/rpc.md h2 server-plumbing-stdrpcserver-process-layer
 std/rpc.md h2 envelope--codec-layer

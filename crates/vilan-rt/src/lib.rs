@@ -45,6 +45,7 @@ pub mod json;
 pub mod process;
 pub mod show;
 pub mod time;
+pub mod url;
 
 // ---------------------------------------------------------------- strings ---
 

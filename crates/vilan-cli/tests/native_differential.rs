@@ -15009,6 +15009,100 @@ fn m185_the_optimized_image_packages_are_the_codecs_own_graph() {
     }
 }
 
+/// M181: `std::url`'s percent-encoding pair answers the same bytes on both
+/// backends — `encodeURIComponent` and the total decoder (the host's
+/// `decodeURIComponent` per run of escapes) on node, `vilan_rt::url`'s
+/// hand-written twins natively. The table (`native/url.vl`) is the design's
+/// (`proposal/percent-encoding.md` §3): ASCII, spaces, the unreserved and the
+/// reserved sets, multi-byte UTF-8, a lone `%`, a truncated `%2`, `%G1`, `%FF`
+/// alone, runs that are not UTF-8 as a whole (truncated, overlong, a
+/// surrogate, past U+10FFFF), lower-case hex, and the empty string — and every
+/// input round-trips.
+#[test]
+fn m181_percent_encoding_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_url.vl";
+    std::fs::write(staged.join(file), include_str!("native/url.vl"))
+        .expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "node and native encode or decode differently"
+    );
+    assert_eq!(
+        outputs[0],
+        concat!(
+            "[] encode=[] decode=[]\n",
+            "[plain-ASCII_text.0123] encode=[plain-ASCII_text.0123] decode=[plain-ASCII_text.0123]\n",
+            "[two words] encode=[two%20words] decode=[two words]\n",
+            "[unreserved !~*'()] encode=[unreserved%20!~*'()] decode=[unreserved !~*'()]\n",
+            "[reserved ;/?:@&=+$,#[]%\"<>\\^`{|}] encode=[reserved%20%3B%2F%3F%3A%40%26%3D%2B%24%2C%23%5B%5D%25%22%3C%3E%5C%5E%60%7B%7C%7D] decode=[reserved ;/?:@&=+$,#[]%\"<>\\^`{|}]\n",
+            "[café] encode=[caf%C3%A9] decode=[café]\n",
+            "[日本語] encode=[%E6%97%A5%E6%9C%AC%E8%AA%9E] decode=[日本語]\n",
+            "[emoji 😀] encode=[emoji%20%F0%9F%98%80] decode=[emoji 😀]\n",
+            "[hello%20world] encode=[hello%2520world] decode=[hello world]\n",
+            "[caf%C3%A9] encode=[caf%25C3%25A9] decode=[café]\n",
+            "[caf%c3%a9] encode=[caf%25c3%25a9] decode=[café]\n",
+            "[%F0%9F%98%80] encode=[%25F0%259F%2598%2580] decode=[😀]\n",
+            "[100%] encode=[100%25] decode=[100%]\n",
+            "[%] encode=[%25] decode=[%]\n",
+            "[%2] encode=[%252] decode=[%2]\n",
+            "[%G1] encode=[%25G1] decode=[%G1]\n",
+            "[%zz%20] encode=[%25zz%2520] decode=[%zz ]\n",
+            "[%FF] encode=[%25FF] decode=[%FF]\n",
+            "[%41%FF] encode=[%2541%25FF] decode=[%41%FF]\n",
+            "[%41%FF then %41] encode=[%2541%25FF%20then%20%2541] decode=[%41%FF then A]\n",
+            "[%C3] encode=[%25C3] decode=[%C3]\n",
+            "[%C3x%A9] encode=[%25C3x%25A9] decode=[%C3x%A9]\n",
+            "[%C0%80] encode=[%25C0%2580] decode=[%C0%80]\n",
+            "[%ED%A0%80] encode=[%25ED%25A0%2580] decode=[%ED%A0%80]\n",
+            "[%F4%90%80%80] encode=[%25F4%2590%2580%2580] decode=[%F4%90%80%80]\n",
+            "[a%2Fb%3Fc%3Dd] encode=[a%252Fb%253Fc%253Dd] decode=[a/b?c=d]\n",
+            "round trips 26 of 26\n",
+        )
+    );
+}
+
+/// A179: `std::rpc::dial_within` answers the same on both backends over
+/// hand-written dials (`native/dial_within.vl`) — a dial that wins with `Ok`
+/// and one that wins with its own `Err`, a deadline that beats a minute-long
+/// dial (the nursery cancels it, and joins it, so a dial left running would
+/// hold the line back by that minute), a deadline already past — and the two
+/// new `RpcError` arms `Debug`-render, compare and encode as the others. The
+/// WebSocket dial itself is JS-only (the native backend refuses `WebSocket`),
+/// which `dial_cancel.rs` pins on node.
+#[test]
+fn a179_dial_within_answers_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_dial_within.vl";
+    std::fs::write(staged.join(file), include_str!("native/dial_within.vl"))
+        .expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "node and native answer differently");
+    assert_eq!(
+        outputs[0],
+        concat!(
+            "wins ok 7\n",
+            "refused err RpcError::Unavailable\n",
+            "hung err RpcError::Timeout\n",
+            "past err RpcError::Timeout\n",
+            "RpcError::Timeout true \"Timeout\"\n",
+            "RpcError::Cancelled false \"Cancelled\"\n",
+            "RpcError::Unavailable false \"Unavailable\"\n",
+        )
+    );
+}
+
 /// M169: `List::position` and `Iterator::position` answer the index of the
 /// first element a predicate holds for — over a struct's field, which
 /// `index_of` (equality on the whole element) cannot ask — or `None`, and stop

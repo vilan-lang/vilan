@@ -108,7 +108,7 @@ the collections, the traits, the codecs, the process modules — sits at
 | [traits](std/traits.md) | compare, default, the operator traits, Try/Lift |
 | [cells](std/cells.md) | Shared, Arena/Handle |
 | [time](std/time.md) | Instant, Duration, timers |
-| [encoding](std/encoding.md) | json, wire, binary, bytes, base64 |
+| [encoding](std/encoding.md) | json, wire, binary, bytes, base64, url (percent-encoding) |
 | [net](std/net.md) | fetch, ws |
 | [reactive](std/reactive.md) | the full `std::reactive` API |
 | [style](std/style.md) | the full `std::web::style` API |

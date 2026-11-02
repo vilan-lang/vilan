@@ -1346,6 +1346,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__router_url",
         "__router_state",
         "__module_dir",
+        "__percent_encode",
+        "__dial_on_abort",
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1786,18 +1788,54 @@ fn helper_source(name: &str) -> &'static str {
         "__router_url" => {
             "function __router_url() {\n\treturn location.pathname + location.search + location.hash;\n}"
         }
-        // `router::percent_decode`: `decodeURIComponent`, made TOTAL. The host
-        // function throws a `URIError` on a malformed escape (`%zz`, a lone
-        // `%`), and a URL is attacker-supplied text — a router that crashes on
-        // one is a denial of service, so an undecodable piece decodes to
-        // itself.
+        // `std::rpc`'s dial listening on its cancel signal (A179): run the
+        // handler once on abort — at once when the signal already fired, the
+        // way `__sleep` checks first — and hand back the means to take the
+        // listener off again, so an abort after the dial settled reaches
+        // nothing of the dial's and a long-lived signal does not keep one
+        // listener per attempt.
+        "__dial_on_abort" => {
+            "function __dial_on_abort(signal, handler) {\n\
+             \tif (signal.aborted) {\n\
+             \t\thandler();\n\
+             \t\treturn { detach() {} };\n\
+             \t}\n\
+             \tconst listener = () => handler();\n\
+             \tsignal.addEventListener(\"abort\", listener, { once: true });\n\
+             \treturn { detach() { signal.removeEventListener(\"abort\", listener); } };\n\
+             }"
+        }
+        // `std::url::percent_encode` (M181): `encodeURIComponent`, made
+        // TOTAL. The host function throws a `URIError` on a lone surrogate, which
+        // a JS string can hold and a native (UTF-8) `str` cannot; the retry
+        // encodes each one as U+FFFD (`%EF%BF%BD`), the replacement character,
+        // rather than failing. The fast path is the host call alone.
+        "__percent_encode" => {
+            "function __percent_encode(text) {\n\
+             \ttry {\n\
+             \t\treturn encodeURIComponent(text);\n\
+             \t} catch {\n\
+             \t\treturn encodeURIComponent(text.replace(/[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]/g, \"\\uFFFD\"));\n\
+             \t}\n\
+             }"
+        }
+        // `std::url::percent_decode` (M181; `std::web::router` re-exports
+        // it): `decodeURIComponent`, made TOTAL. The host function throws a
+        // `URIError` on a malformed escape (`%zz`, a lone `%`) or on escapes
+        // that are not UTF-8, and a URL is attacker-supplied text — a router
+        // that crashes on one is a denial of service. So the host function is
+        // applied to each MAXIMAL RUN of `%XX` escapes, and a run it refuses
+        // stays as written; text that is no escape never reaches it.
+        // `vilan_rt::url::percent_decode` is the native twin, rule for rule.
         "__percent_decode" => {
             "function __percent_decode(text) {\n\
-             \ttry {\n\
-             \t\treturn decodeURIComponent(text);\n\
-             \t} catch {\n\
-             \t\treturn text;\n\
-             \t}\n\
+             \treturn text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {\n\
+             \t\ttry {\n\
+             \t\t\treturn decodeURIComponent(run);\n\
+             \t\t} catch {\n\
+             \t\t\treturn run;\n\
+             \t\t}\n\
+             \t});\n\
              }"
         }
         // HMR activity guard (std::web::dev, `hmr.md` §4/§5): true only when a `run
