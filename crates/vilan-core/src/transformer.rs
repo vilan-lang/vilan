@@ -1347,6 +1347,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__router_state",
         "__module_dir",
         "__percent_encode",
+        "__dial_on_abort",
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1786,6 +1787,23 @@ fn helper_source(name: &str) -> &'static str {
         // for the rest.
         "__router_url" => {
             "function __router_url() {\n\treturn location.pathname + location.search + location.hash;\n}"
+        }
+        // `std::rpc`'s dial listening on its cancel signal (A179): run the
+        // handler once on abort — at once when the signal already fired, the
+        // way `__sleep` checks first — and hand back the means to take the
+        // listener off again, so an abort after the dial settled reaches
+        // nothing of the dial's and a long-lived signal does not keep one
+        // listener per attempt.
+        "__dial_on_abort" => {
+            "function __dial_on_abort(signal, handler) {\n\
+             \tif (signal.aborted) {\n\
+             \t\thandler();\n\
+             \t\treturn { detach() {} };\n\
+             \t}\n\
+             \tconst listener = () => handler();\n\
+             \tsignal.addEventListener(\"abort\", listener, { once: true });\n\
+             \treturn { detach() { signal.removeEventListener(\"abort\", listener); } };\n\
+             }"
         }
         // `std::url::percent_encode` (M181): `encodeURIComponent`, made
         // TOTAL. The host function throws a `URIError` on a lone surrogate, which
