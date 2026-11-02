@@ -15068,6 +15068,41 @@ fn m181_percent_encoding_is_identical_on_both_backends() {
     );
 }
 
+/// A179: `std::rpc::dial_within` answers the same on both backends over
+/// hand-written dials (`native/dial_within.vl`) — a dial that wins with `Ok`
+/// and one that wins with its own `Err`, a deadline that beats a minute-long
+/// dial (the nursery cancels it, and joins it, so a dial left running would
+/// hold the line back by that minute), a deadline already past — and the two
+/// new `RpcError` arms `Debug`-render, compare and encode as the others. The
+/// WebSocket dial itself is JS-only (the native backend refuses `WebSocket`),
+/// which `dial_cancel.rs` pins on node.
+#[test]
+fn a179_dial_within_answers_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_dial_within.vl";
+    std::fs::write(staged.join(file), include_str!("native/dial_within.vl"))
+        .expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "node and native answer differently");
+    assert_eq!(
+        outputs[0],
+        concat!(
+            "wins ok 7\n",
+            "refused err RpcError::Unavailable\n",
+            "hung err RpcError::Timeout\n",
+            "past err RpcError::Timeout\n",
+            "RpcError::Timeout true \"Timeout\"\n",
+            "RpcError::Cancelled false \"Cancelled\"\n",
+            "RpcError::Unavailable false \"Unavailable\"\n",
+        )
+    );
+}
+
 /// M169: `List::position` and `Iterator::position` answer the index of the
 /// first element a predicate holds for — over a struct's field, which
 /// `index_of` (equality on the whole element) cannot ask — or `None`, and stop
