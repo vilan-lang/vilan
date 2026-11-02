@@ -428,7 +428,11 @@ is the current directory. Formatting is conservative and a fixed point:
   budget breaks one entry per line, with a trailing comma after every one
   — the last included, so adding an entry is a one-line diff. One that
   fits stays inline *without* a trailing comma, so the comma marks a
-  split and nothing else.
+  split and nothing else. A literal that is a method's receiver breaks
+  the same way, the call riding its closing bracket — `Body {` ⏎ fields ⏎
+  `}.size()` — wherever it stands: a statement's value, another literal's
+  field, a `then`/`else` arm. Two links or more still split one link per
+  line, below the receiver's `}`.
 - A struct literal's field written long where the shorthand says the same
   thing — `A { x = x }` — is printed as the shorthand `A { x }`. The two are
   one construct with two spellings, and the formatter picks one; a field whose
