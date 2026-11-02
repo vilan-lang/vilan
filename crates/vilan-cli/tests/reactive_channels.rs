@@ -7219,3 +7219,87 @@ fn a169_the_server_acknowledges_an_unsubscribe_with_gone_and_the_client_forgets_
         "the acknowledged unsubscribe went differently:\n{stdout}"
     );
 }
+
+/// M186 (store-path-sharing.md §4.5): a handle's path is a shared chain of steps,
+/// read as a list where the write log records it — ROOT FIRST, as the forward
+/// reads it. A write five steps down (a field, a key, a variant, a field, a field)
+/// is patched at its path relative to the slot that holds it: below the root's
+/// grant's key slot, and below a grant four steps down.
+const MIRROR_DEEP_PATH: &str = r##"import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::reactive::store::{ Storable, Store };
+import std::rpc::{ Dispatcher, DuplexTransport, RpcRequest, duplex_pair, encode_request, local_rpc, register_session };
+import std::rpc::mirror::{ reply_store, reply_store_some };
+import std::wire::{ Frame, Wire };
+
+[derive(Storable, Wire)]
+struct Topic {
+	title: str,
+	by: str,
+}
+
+[derive(Storable, Wire)]
+struct Room {
+	name: str,
+	topic: Topic,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	rooms: HashMap<u53, Room>,
+}
+
+fun text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun main() {
+	let codec = json_codec();
+	mut rooms: HashMap<u53, Room> = HashMap::new();
+	rooms.insert(0, Room { name = "general", topic = Topic { title = "hello", by = "bob" } });
+	let global = Store::new(Global { rooms });
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, codec);
+	client_end.on_frame(|frame| print(i"down {text(frame)}"));
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global))
+		.on("topic", |request: RpcRequest| reply_store_some(request, global.rooms().at(0).some().topic()));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	print(i"reply {text((local.handler)(encode_request(codec, "global", [])))}");
+	client_end.send(Frame::Text("{\"Subscribe\":[0,[[0,-1,[0,0]]]]}"));
+	print("-- five steps down, under the key's slot");
+	let _title = global.rooms().at(0).some().topic().title().patch("first");
+	print(i"reply {text((local.handler)(encode_request(codec, "topic", [])))}");
+	print("-- five steps down, under the key's slot and the topic's grant");
+	let _by = global.rooms().at(0).some().topic().by().patch("amy");
+	print("done");
+}
+"##;
+
+#[test]
+fn m186_a_write_five_steps_down_is_patched_at_its_path_root_first() {
+    // The key slot's patch names `[1, 1, 0]` below `rooms/0` — the `Some`
+    // payload, its `topic`, the topic's `title` — and the topic grant's `[1]`:
+    // the write log's path read root first. Red with `StorePath::steps` read
+    // leaf first: no slot holds the reversed path, and nothing is sent.
+    let stdout = run_program("mirror_deep_path", MIRROR_DEEP_PATH);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "reply {\"Success\":[0,-1,{\"rooms\":[]}]}",
+            "down {\"Patch\":[0,[{\"Seed\":[0,{\"name\":\"general\",\"topic\":{\"title\":\"hello\",\"by\":\"bob\"}}]}]]}",
+            "-- five steps down, under the key's slot",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,1,0],\"first\"]}]]}",
+            "reply {\"Success\":[0,-2,{\"title\":\"first\",\"by\":\"bob\"}]}",
+            "-- five steps down, under the key's slot and the topic's grant",
+            "down {\"Patch\":[0,[{\"Set\":[0,[1,1,1],\"amy\"]},{\"Set\":[-2,[1],\"amy\"]}]]}",
+            "done",
+        ],
+        "the deep write's frames went differently:\n{stdout}"
+    );
+}

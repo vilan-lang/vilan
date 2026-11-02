@@ -1,0 +1,111 @@
+// M186 (proposal/store-path-sharing.md §4.6): a store handle's path is a shared
+// chain of steps — a projection allocates one step pointing at its parent's path,
+// and a handle copy copies that pointer — on both backends. Handles five steps
+// down under keys and fields (a field, a key, the `Some` payload, a field, a
+// field), made fresh and from copied handles, subscribe, write and prune exactly
+// as before: each write wakes the readers whose value moved, the readers made
+// from a copy share the slots of the readers made fresh, and disposing the owner
+// leaves the root's one node.
+import std::hash_map::HashMap;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::delta::SequenceCell;
+import std::reactive::store::{ Storable, Store, store_census, store_feed_census };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::shared::Shared;
+
+[derive(PartialEq, Storable)]
+struct Topic {
+	title: str,
+	by: str,
+}
+
+[derive(PartialEq, Storable)]
+struct Room {
+	name: str,
+	topic: Topic,
+	tags: List<str>,
+}
+
+[derive(Storable)]
+struct Global {
+	rooms: HashMap<i32, Room>,
+	motd: str,
+}
+
+fun room(name: str, title: str): Room {
+	Room { name, topic = Topic { title, by = "bob" }, tags = [] }
+}
+
+fun census<T>(store: Store<T>): str {
+	let (slots, nodes) = store_census(store);
+	i"slots={slots} nodes={nodes} feeds={store_feed_census(store)}"
+}
+
+/// How many times each reader woke, in a fixed order, then cleared.
+fun woke(counts: Shared<List<i32>>): str {
+	let held = counts.read();
+	mut cleared: List<i32> = [];
+	mut out = "";
+	for count in held {
+		out = out + i" {count}";
+		cleared.push(0);
+	}
+	counts.write() = cleared;
+	out
+}
+
+fun bump(counts: Shared<List<i32>>, at: usize) {
+	mut held = counts.read();
+	held[at] = held[at] + 1;
+	counts.write() = held;
+}
+
+fun main() {
+	mut rooms: HashMap<i32, Room> = HashMap::new();
+	rooms.insert(1, room("general", "hello"));
+	rooms.insert(2, room("random", "anything"));
+	let store = Store::new(Global { rooms, motd = "welcome" });
+	print(i"before: {census(store)}");
+
+	// Readers: title1, by1 (from a copied handle), key1, title2, tags1 (from a copy
+	// of a copy), the root.
+	let counts: Shared<List<i32>> = Shared::new([0, 0, 0, 0, 0, 0]);
+	let first = store.rooms().at(1).some();
+	let copy = first;
+	let again = copy;
+	let owner = Owner::new();
+	run_with_owner(owner, || {
+		store.rooms().at(1).some().topic().title().effect_on_change(|_title| bump(counts, 0));
+		copy.topic().by().effect_on_change(|_by| bump(counts, 1));
+		store.rooms().at(1).effect_on_change(|_room| bump(counts, 2));
+		store.rooms().at(2).some().topic().title().effect_on_change(|_title| bump(counts, 3));
+		again.tags().effect_on_change(|_tags| bump(counts, 4));
+		store.effect_on_change(|_global| bump(counts, 5));
+	});
+	print(i"subscribed: {census(store)}");
+	print(i"woke at subscribe:{woke(counts)}");
+
+	let _title = store.rooms().at(1).some().topic().title().patch("deep");
+	print(i"title 1 written:{woke(counts)}");
+	let _by = again.topic().by().patch("amy");
+	print(i"by 1 written through a copy:{woke(counts)}");
+	let _same = first.topic().by().patch("amy");
+	print(i"by 1 written the same:{woke(counts)}");
+	let _other = store.rooms().at(2).some().topic().title().patch("elsewhere");
+	print(i"title 2 written:{woke(counts)}");
+	copy.tags().push("pinned");
+	print(i"tags 1 pushed:{woke(counts)}");
+	store.motd().set("bye");
+	print(i"motd written:{woke(counts)}");
+	store.rooms().at(1).some().topic().notify();
+	print(i"topic 1 notified:{woke(counts)}");
+	store.rooms().at(1).set(Some(room("general", "reset")));
+	print(i"room 1 replaced:{woke(counts)}");
+
+	print(i"values: {first.topic().title().get().unwrap_or("-")} {copy.topic().by().get().unwrap_or("-")} {store.rooms().at(2).some().topic().title().get().unwrap_or("-")} {again.tags().get().map(|tags| tags.len()).unwrap_or(0)}");
+	print(i"one path, one identity: {first.topic().title().identity() == again.topic().title().identity()} {first.topic().title().identity() == store.rooms().at(2).some().topic().title().identity()}");
+
+	owner.dispose();
+	print(i"disposed: {census(store)}");
+}

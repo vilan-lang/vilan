@@ -333,7 +333,7 @@ export fun reply_store<T: StoreWire>(request: RpcRequest, handle: Store<T>): Rpc
 		Some(let session) => {
 			let lend = handle.lend;
 			let mirror = mirror_channel(session, handle.root);
-			let base = mirror.grant(handle.path, walkers(lend));
+			let base = mirror.grant(handle.path.steps(), walkers(lend));
 			let channel = mirror.channel;
 			RpcOutcome::Success(|mut serializer: Serializer| {
 				serializer.begin_list(3);
@@ -365,7 +365,7 @@ export fun reply_store_some<P: StoreWire>(request: RpcRequest, handle: StoreSome
 		Some(let session) => {
 			let lend = handle.lend;
 			let mirror = mirror_channel(session, handle.root);
-			let base = mirror.grant(handle.path, walkers(lend));
+			let base = mirror.grant(handle.path.steps(), walkers(lend));
 			let channel = mirror.channel;
 			RpcOutcome::Success(|mut serializer: Serializer| {
 				serializer.begin_list(3);

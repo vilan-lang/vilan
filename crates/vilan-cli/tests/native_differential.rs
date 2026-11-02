@@ -15142,3 +15142,22 @@ fn a178_length_arithmetic_is_identical_on_both_backends() {
         );
     }
 }
+
+/// M186 (store-path-sharing.md §4.6): a store handle's path is a shared chain
+/// of steps on both backends — handles five steps down, made fresh and from
+/// copied handles, subscribe, write, notify and prune alike, and a path's
+/// identity is its steps'.
+#[test]
+fn m186_a_shared_store_path_subscribes_writes_and_prunes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_path_sharing.vl"),
+        include_str!("native/store_path_sharing.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_path_sharing.vl"),
+        Verdict::Identical,
+        "a shared store path must subscribe, write and prune alike on both backends"
+    );
+}

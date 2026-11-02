@@ -1,11 +1,11 @@
 // `std::image` — decode, resize, crop and encode pictures (tracker M185;
 // proposal/image.md): PNG, JPEG, WebP and GIF in, PNG, JPEG and WebP out.
 //
-// ONE implementation on both backends: the `vilan-image` crate, over Rust's
-// `image` crate. A native program links it through `vilan-rt-image`; a node
-// program runs the same source built for wasm32, which the compiler carries and
-// writes into the bundle ONLY when the program reaches this module. So the two
-// backends decode a picture to the same pixels and scale it the same way.
+// ONE implementation on both backends: the `vilan-image` crate, over Rust's `image`
+// crate. A native program links it through `vilan-rt-image`; a node program runs
+// the same source built for wasm32, which the compiler carries and writes into the
+// bundle ONLY when the program reaches this module. So the two backends decode a
+// picture to the same pixels and scale it the same way.
 //
 // A server concern, like `std::db`: the browser has `createImageBitmap` and a
 // canvas, and nothing here is emitted into a browser leg.
@@ -20,9 +20,9 @@ import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 
-/// A decoded picture: `width` x `height` pixels, RGBA, 8 bits each. A VALUE —
-/// every operation answers a new picture and none changes this one, so a copy
-/// is as good as the original; there is nothing to close.
+/// A decoded picture: `width` x `height` pixels, RGBA, 8 bits each. A VALUE — every
+/// operation answers a new picture and none changes this one, so a copy is as good
+/// as the original; there is nothing to close.
 export external struct Image;
 
 /// The four formats `decode` reads; `encode` writes the first three.
@@ -108,8 +108,8 @@ export impl Image {
 		image_decode(bytes, 50000000)
 	}
 
-	/// `decode` with your own pixel limit. The header's size is checked against
-	/// it BEFORE anything is allocated — an upload can claim 60,000 x 60,000.
+	/// `decode` with your own pixel limit. The header's size is checked against it
+	/// BEFORE anything is allocated — an upload can claim 60,000 x 60,000.
 	fun decode_within(bytes: Bytes, max_pixels: usize): Result<Image, str> {
 		image_decode(bytes, max_pixels)
 	}
@@ -169,9 +169,9 @@ export impl Image {
 		image_crop(self, x, y, width, height)
 	}
 
-	/// Encode as `format`. `quality` (1-100, clamped) is JPEG's; PNG and WebP
-	/// are lossless and ignore it. JPEG has no alpha, so transparency is
-	/// flattened onto white. `Gif` is decode-only and refused here.
+	/// Encode as `format`. `quality` (1-100, clamped) is JPEG's; PNG and WebP are
+	/// lossless and ignore it. JPEG has no alpha, so transparency is flattened onto
+	/// white. `Gif` is decode-only and refused here.
 	fun encode(self, format: Format, quality: i32): Result<Bytes, str> {
 		image_encode(self, format_code(format), quality)
 	}

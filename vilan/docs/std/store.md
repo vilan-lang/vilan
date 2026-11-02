@@ -107,12 +107,12 @@ projections, so its store reads no fields this way. The handle's own fields
 are std's `[internal]` machinery and are not members outside std, so a field
 of `T` named `path` or `root` reads `T`'s field.
 
-A handle is data: copying it allocates nothing, and it has no owner. It is a
-`Source<T>`, so every pipe, effect and binding takes one (`city.derive(..)`,
-`<p>{city}</p>`), and a `Signal<T>`, so anything that writes a signal writes it
-(`set_with`, `optimistic`, `bind_value`). Every handle to one path of one store
-has one `identity()`, so a body that `track()`s a handle on every run keeps one
-edge on it.
+A handle is data: copying it allocates nothing, a projection allocates one step
+of its path, and it has no owner. It is a `Source<T>`, so every pipe, effect
+and binding takes one (`city.derive(..)`, `<p>{city}</p>`), and a `Signal<T>`,
+so anything that writes a signal writes it (`set_with`, `optimistic`,
+`bind_value`). Every handle to one path of one store has one `identity()`, so
+a body that `track()`s a handle on every run keeps one edge on it.
 
 ## What a write wakes
 
