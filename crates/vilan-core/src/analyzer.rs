@@ -702,6 +702,19 @@ impl TupleBoundRequirement {
 /// publishes it as the diagnostic's `code`.
 pub const TRAIT_SCOPE_CODE: &str = "trait-scope/not-imported";
 
+/// What brings a member a user file calls into that file's scope
+/// ([`Analyzer::check_trait_method_scope`]).
+#[derive(Clone, Copy)]
+enum ScopedMember {
+    /// A trait's member (B515): the trait, which the file must reach.
+    Trait(Id),
+    /// B688: an inherent member of an EXTENSION block — an `impl` written in
+    /// a module other than its subject's own (`std::display`'s
+    /// `impl List<type T: Display> { fun join }`): the block's index into
+    /// `implementations`, whose file the caller must reach.
+    Extension(usize),
+}
+
 /// The fixed head of B535's refusal after its member and trait names, which
 /// recognizes it.
 const TRAIT_SCOPE_MARK: &str = "and this file does not import `";
@@ -5650,6 +5663,11 @@ pub struct Analyzer<'src> {
     /// [`Program::declared_function_contexts`].
     prepped_function_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
     declared_function_contexts: HashMap<Id, Vec<Id>>,
+    /// B677 door 2: each `fun` parameter whose declared type is a closure
+    /// type, with that type's id — the candidates for the implied
+    /// `context owner_scope` [`Analyzer::resolve_context_clauses`] gives one
+    /// answering a view, once the names its result spells have resolved.
+    prepped_view_parameters: Vec<(Id, TypeId)>,
     function_context_clause_spans: HashMap<Id, Span>,
     /// Where a `context` clause would be inserted on each function, by
     /// function id (E148) — the parser's [`crate::node::Func::signature_end`].
@@ -8279,6 +8297,7 @@ impl<'src> Analyzer<'src> {
             prepped_number_literals: Vec::new(),
             negated_number_literals: HashMap::default(),
             parameter_contexts: HashMap::default(),
+            prepped_view_parameters: Vec::new(),
             prepped_type_context_clauses: Vec::new(),
             prepped_function_context_clauses: Vec::new(),
             declared_function_contexts: HashMap::default(),
@@ -25665,6 +25684,116 @@ impl<'src> Analyzer<'src> {
                 self.parameter_contexts.insert(owner, context_ids);
             }
         }
+        self.imply_owner_scope_on_view_parameters();
+    }
+
+    /// B677 door 2 (`closure-owner.md` §4, RULED 2026-11-02): a `fun`'s
+    /// closure parameter whose declared result is a view — std's `View`, or a
+    /// `Slot` (the trait the UI places) — carries `context owner_scope` by
+    /// default, and `sync` with it. A view is built where it is SHOWN: a
+    /// builder that captured the owner it was made under registered every
+    /// effect and store hold of what it built there, and nothing released them
+    /// when the body that called it went (kolt's `with_org`, `when_loaded`, the
+    /// picker's `probes`: 12 s to close a menu after 30 hovers).
+    ///
+    /// The clause is written into the parameter's TYPE, exactly where a written
+    /// one lands (B309), so `clause_of_type`, the landing rules, the carrier
+    /// classes and the hidden-parameter threading read it as written, and the
+    /// type prints it wherever it prints. A written clause naming other
+    /// contexts keeps them after the implied one (`context (owner_scope,
+    /// page_focus)`, the order kolt's patch note writes); one already naming
+    /// `owner_scope` adds nothing. An `async`-marked parameter is left as
+    /// written: the implied `sync` would contradict it. No opt-out is spelled
+    /// until a caller wants the creation owner (§5 Q3).
+    fn imply_owner_scope_on_view_parameters(&mut self) {
+        let candidates = std::mem::take(&mut self.prepped_view_parameters);
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(owner_scope) = self.std_owner_scope_context() else {
+            return;
+        };
+        for (parameter_id, type_id) in candidates {
+            if self.async_values.contains(&parameter_id) || self.is_external_parameter(parameter_id)
+            {
+                continue;
+            }
+            let Some(Type::Closure(parameters, result, contexts, modes)) =
+                self.type_id_to_type_map.get(&type_id).cloned()
+            else {
+                continue;
+            };
+            if !self.answers_a_view(result) {
+                continue;
+            }
+            self.sync_values.insert(parameter_id);
+            if contexts.contains(&owner_scope) {
+                continue;
+            }
+            let mut implied = Vec::with_capacity(contexts.len() + 1);
+            implied.push(owner_scope);
+            implied.extend(contexts);
+            self.write_type_slot(
+                type_id,
+                Type::Closure(parameters, result, implied.clone(), modes),
+            );
+            self.parameter_contexts.insert(parameter_id, implied);
+        }
+    }
+
+    /// Whether the parameter is an `external` function's — a host function
+    /// threads no hidden argument.
+    fn is_external_parameter(&self, parameter_id: Id) -> bool {
+        self.parameters
+            .get(&parameter_id)
+            .is_some_and(|parameter| self.external_functions.contains_key(&parameter.function_id))
+    }
+
+    /// B677 door 2: whether a closure answering `result` builds a view —
+    /// std's `View`, or a value of std's `Slot` trait (a bare `Slot`, a binder
+    /// bounded by it, a `dyn Slot`).
+    fn answers_a_view(&self, result: TypeId) -> bool {
+        let declared_in_std = |id: Id| {
+            self.source_of_id(id)
+                .is_some_and(|source| self.std_sources.contains(&source))
+        };
+        let is_slot = |trait_id: Id| {
+            self.traits
+                .get(&trait_id)
+                .is_some_and(|trait_| trait_.name == "Slot" && declared_in_std(trait_.id))
+        };
+        match self.type_id_to_type_map.get(&result) {
+            Some(Type::Struct(id, _)) => self
+                .structs
+                .get(id)
+                .is_some_and(|struct_| struct_.name == "View" && declared_in_std(struct_.id)),
+            Some(Type::Trait(id, _) | Type::Dyn(id, _)) => is_slot(*id),
+            Some(Type::Generic(constraint)) => self
+                .generic_bound_traits(*constraint)
+                .into_iter()
+                .any(|(trait_id, _)| is_slot(trait_id)),
+            _ => false,
+        }
+    }
+
+    /// std's `owner_scope` context — `std::reactive`'s module binding, the
+    /// ambient owner — when the program loaded it.
+    fn std_owner_scope_context(&self) -> Option<Id> {
+        let std_scope = self
+            .module_id_by_name
+            .get("std")
+            .and_then(|std_id| self.modules.get(std_id))
+            .and_then(|module| self.scopes.get(&module.body.1))?;
+        let reactive = std_scope
+            .name_to_id_map
+            .get("reactive")
+            .and_then(|id| self.modules.get(id))
+            .and_then(|module| self.scopes.get(&module.body.1))?;
+        let binding = *reactive.name_to_id_map.get("owner_scope")?;
+        Some(match self.expr_id_to_expr_map.get(&binding) {
+            Some(Expr::Local(inner)) => *inner,
+            _ => binding,
+        })
     }
 
     /// A `context` clause rendered as it is written — ` context owner_scope`,
@@ -35560,6 +35689,11 @@ impl<'src> Analyzer<'src> {
         );
     }
 
+    ///
+    /// E356: a BUILDER's dropped result warns the same way, unmarked — a method
+    /// taking `own self` and answering a value of the receiver's own type,
+    /// called as a statement, built a new value and dropped it, while the
+    /// receiver binding still holds the one from before ([`Self::dropped_builder`]).
     fn check_must_use(&mut self) {
         // Value-discarded statements: every non-tail entry of a function body
         // (`body.0`; the tail `body.1` is the return value) and of every inner
@@ -35586,6 +35720,8 @@ impl<'src> Analyzer<'src> {
             };
             let message = if self.call_is_must_use(*call_id) {
                 "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string()
+            } else if let Some(message) = self.dropped_builder(*call_id) {
+                message
             } else if self.discarded_pipe(statement_id, &pipe_traits) {
                 // F60 (R-d door (a)): a pipe NODE is must-use by its type, so a
                 // dropped one warns whichever function built it — a std
@@ -35607,6 +35743,71 @@ impl<'src> Analyzer<'src> {
             let source = self.source_of_id(statement_id).unwrap_or(SourceId(0));
             self.warning_sources.push(source);
         }
+    }
+
+    /// E356: the warning for a discarded BUILDER call — a method whose
+    /// receiver is `own self` and whose result is the receiver's own type
+    /// (`fun on_close(own self, fn: || void): Dialog`), called as the bare
+    /// statement `statement_id`. The method took the value, built a changed
+    /// one and answered it; the statement drops the answer, and the binding
+    /// the method was called on still holds the value from before, so the
+    /// change is silently lost. `None` for any other call. The shape is the
+    /// callee's DECLARATION — its return type is its receiver's — so a builder
+    /// declared by a trait (`fun tag(own self): Self`) and reached through a
+    /// bound answers the same way as its impl.
+    fn dropped_builder(&self, call_id: Id) -> Option<String> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let function = self.functions.get(member_id)?;
+        let receiver_parameter = function
+            .parameters
+            .first()
+            .and_then(|parameter_id| self.parameters.get(parameter_id))?;
+        if receiver_parameter.name != "self" || receiver_parameter.convention != Convention::Own {
+            return None;
+        }
+        let declared_return = function.return_type_id?;
+        if !self.same_type_structure(declared_return, receiver_parameter.type_id, 0) {
+            return None;
+        }
+        let receiver = *function_call.argument_ids.first()?;
+        let built = self
+            .resolved_type_id_of(receiver)
+            .unwrap_or(declared_return);
+        let method = self.callable_name(*member_id)?;
+        let type_label = self.pretty_print_type(&built.get_type(self), &HashMap::default());
+        let head = format!(
+            "`{method}` takes `own self` and answers the `{type_label}` it built, which this \
+             statement drops"
+        );
+        // The binding the call was made on, when it is one: the value it still
+        // holds is the one from before, and the fix rebinds it.
+        let binding = match self.expr_id_to_expr_map.get(&receiver) {
+            Some(Expr::Local(binding_id)) => match self.variables.get(binding_id) {
+                Some(variable) => Some((variable.name, variable.mutable)),
+                None => self
+                    .parameters
+                    .get(binding_id)
+                    .map(|parameter| (parameter.name, parameter.mutable)),
+            },
+            _ => None,
+        }
+        // `self` cannot be rebound by `let`.
+        .filter(|(name, _)| *name != "self");
+        Some(match binding {
+            Some((name, true)) => format!(
+                "{head} — `{name}` still holds the value from before; assign the result: \
+                 `{name} = {name}.{method}(…)`"
+            ),
+            Some((name, false)) => format!(
+                "{head} — `{name}` still holds the value from before; bind the result: \
+                 `let {name} = {name}.{method}(…)`"
+            ),
+            None => format!("{head}; bind the result, or `let _ = …` to discard it"),
+        })
     }
 
     /// std's pipe traits (F60): `std::reactive`'s `Pipe` and `std::reactive::delta`'s
@@ -38497,6 +38698,29 @@ impl<'src> Analyzer<'src> {
             || self.impl_subject_admits(&impl_type, &selector_type, &HashMap::default())
     }
 
+    /// What [`statement_sources`] reads: each import path segment's definition
+    /// by `(file, span)` — for the files `wanted` admits — and every source's
+    /// canonical path.
+    fn statement_path_index(
+        &self,
+        wanted: impl Fn(SourceId) -> bool,
+    ) -> (HashMap<(SourceId, Span), Id>, Vec<PathBuf>) {
+        let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
+        for (source, span, definition, _) in &self.type_references {
+            if let Some(definition) = definition
+                && wanted(*source)
+            {
+                references.entry((*source, *span)).or_insert(*definition);
+            }
+        }
+        let canonical_sources = self
+            .source_paths
+            .iter()
+            .map(crate::util::canonical_path)
+            .collect();
+        (references, canonical_sources)
+    }
+
     /// B401 — the admission map the method lookups read DURING the fixpoint
     /// ([`LookupAdmission`]), from the rows the import walk banked. The same
     /// statements, the same files per statement (`statement_sources`, shared
@@ -38521,26 +38745,11 @@ impl<'src> Analyzer<'src> {
         // The statement walk below reads these only for a RESTRICTING file's
         // statements; a program whose only departure from the estate is a
         // hidden block (a curated module) skips the index and the paths.
-        let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
-        let mut canonical_sources: Vec<PathBuf> = Vec::new();
-        if !restricting.is_empty() {
-            for (source, span, definition, _) in &self.type_references {
-                if let Some(definition) = definition {
-                    references.entry((*source, *span)).or_insert(*definition);
-                }
-            }
-            canonical_sources = self
-                .source_paths
-                .iter()
-                .map(crate::util::canonical_path)
-                .collect();
-        }
-        let mut source_of_path: HashMap<&Path, SourceId> = HashMap::default();
-        for (position, path) in canonical_sources.iter().enumerate() {
-            source_of_path
-                .entry(path.as_path())
-                .or_insert(SourceId(position as u32));
-        }
+        let (references, canonical_sources) = match restricting.is_empty() {
+            true => (HashMap::default(), Vec::new()),
+            false => self.statement_path_index(|_| true),
+        };
+        let source_of_path = source_of_path_index(&canonical_sources);
         let mut admitted: HashMap<(SourceId, SourceId), HashMap<Id, Option<Vec<String>>>> =
             HashMap::default();
         let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
@@ -44785,6 +44994,13 @@ impl<'src> Analyzer<'src> {
         // shape produced before the clause moved into the type.
         if let Some(names) = clause {
             self.record_type_context_clause(type_id, names, type_scope_id, Some(parameter_id));
+        }
+        // B677 door 2: a `fun`'s closure-typed parameter may answer a view,
+        // which only the resolved result type says.
+        if implicit_generic_owner.is_some()
+            && declared_type.is_some_and(|node| clause_target_is_a_closure(&node.0))
+        {
+            self.prepped_view_parameters.push((parameter_id, type_id));
         }
         // A tuple binder is not referenceable by name; `_` keeps it positional.
         let name = match pattern {
@@ -64383,20 +64599,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// B515: a TRAIT's method called on a concrete receiver in a file that
-    /// reaches neither the trait nor the block providing it. An `impl` registers
-    /// when its file LOADS, and loading is program-wide, so `42.to_string()`
-    /// compiled in any file once some loaded module (`std::markdown`) imported
-    /// `std::display` — and a wasm steer test depended on which std modules a
-    /// layer loads. B318's rule is that a trait method needs its trait in
-    /// scope: the file imports the trait, or a name from the trait's module or
-    /// the block's module, or the prelude binds one, or the file declares it.
-    ///
-    /// R-g door (b): a WARNING for one release, refused in v0.45.0.
-    ///
-    /// Calls through a bound are not asked — the bound wrote the trait's name —
-    /// nor are calls in std, in a frozen file or a dependency, nor generated
-    /// code (its source is no user file).
     /// The file whose attribute generated `id`, when a derive or another macro
     /// expansion minted it ([`Self::derived_origins`]).
     fn derived_origin_file(&self, id: Id) -> Option<SourceId> {
@@ -64511,6 +64713,57 @@ impl<'src> Analyzer<'src> {
                 if let Some(declared) = declared {
                     files.insert(declared);
                 }
+            }
+        }
+        // B688: and every file an import statement of the file resolved into,
+        // WHEREVER it is written — an import inside a function body binds in
+        // that body's scope, which the module scope above never sees (std's
+        // macro bodies import `macro_std` that way, and a function-local
+        // `import std::display::Display;` was refused as no import at all),
+        // and a selector-only statement (`import a::{ (impl T) };`) binds no
+        // name. M76's edge list records both.
+        for (importer, target) in &self.import_targets {
+            let Some(files) = reached.get_mut(importer) else {
+                continue;
+            };
+            let declared = match self.expr_id_to_expr_map.get(target) {
+                Some(Expr::Module(module_id)) => self
+                    .modules
+                    .get(module_id)
+                    .and_then(|module| self.scope_file(module.body.1)),
+                _ => self.source_of_id(*target),
+            };
+            if let Some(declared) = declared {
+                files.insert(declared);
+            }
+        }
+        // B688: and every file on an import statement's PATH — B318 §3.2's
+        // "`import a::b;` admits every impl declared in `a`'s file and in
+        // every file on the path to it": `import std::reactive::store::Store;`
+        // reaches `store.vl`, whose blocks extend `Store`, though `Store`
+        // itself is declared in `store_core.vl`. An `only` statement reaches
+        // its path too: whether the file ADMITS what it reached is B318's
+        // question, and its refusal ("imports that module `only`") is the one
+        // that names the mistake.
+        if self
+            .import_impl_restrictions
+            .iter()
+            .any(|row| reached.contains_key(&row.source))
+        {
+            let (references, canonical_sources) =
+                self.statement_path_index(|source| reached.contains_key(&source));
+            let source_of_path = source_of_path_index(&canonical_sources);
+            for row in &self.import_impl_restrictions {
+                let Some(files) = reached.get_mut(&row.source) else {
+                    continue;
+                };
+                files.extend(statement_sources(
+                    |id| self.source_of_id(id),
+                    &canonical_sources,
+                    &references,
+                    &source_of_path,
+                    row,
+                ));
             }
         }
         reached
@@ -64726,12 +64979,203 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// B688: the files an impl block's SUBJECT calls home — the file declaring
+    /// its nominal head (`List`'s `list.vl`) and those declaring the nominal
+    /// types among its arguments (`impl RemoteStore<AccountState>`, which
+    /// `[derive(Store)]` writes beside `AccountState`, is that type's own
+    /// surface, as Rust's orphan rule reads a local argument); for a blanket
+    /// (`impl type F: Flow<T>`) and a trait object, the files declaring its
+    /// bound traits. Empty for a subject with no declaration of its own: a
+    /// tuple, an array, a closure, an unbounded binder.
+    fn impl_subject_home_files(&self, subject: TypeId) -> Vec<SourceId> {
+        let mut homes = Vec::new();
+        match subject.get_type(self) {
+            Type::Generic(constraint) => {
+                for (trait_id, _) in self.generic_bound_traits(constraint) {
+                    if let Some(trait_) = self.traits.get(&trait_id) {
+                        homes.extend(self.declaring_file(trait_.id));
+                    }
+                }
+            }
+            Type::Trait(id, _) | Type::Dyn(id, _) => {
+                if let Some(trait_) = self.traits.get(&id) {
+                    homes.extend(self.declaring_file(trait_.id));
+                }
+            }
+            _ => self.collect_nominal_home_files(subject, &mut homes),
+        }
+        homes
+    }
+
+    /// The declaring files of every nominal type `type_id` writes, its head
+    /// and its arguments at any depth ([`Self::impl_subject_home_files`]).
+    fn collect_nominal_home_files(&self, type_id: TypeId, homes: &mut Vec<SourceId>) {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return;
+        };
+        let (declaration, arguments) = match type_id.get_type(self) {
+            Type::Struct(id, arguments) => {
+                (self.structs.get(&id).map(|struct_| struct_.id), arguments)
+            }
+            Type::Enum(id, arguments) => (self.enums.get(&id).map(|enum_| enum_.id), arguments),
+            Type::Tuple(items, _) => (None, items),
+            Type::Array(item, _) => (None, vec![item]),
+            _ => return,
+        };
+        if let Some(file) = declaration.and_then(|id| self.declaring_file(id))
+            && !homes.contains(&file)
+        {
+            homes.push(file);
+        }
+        for argument in arguments {
+            self.collect_nominal_home_files(argument, homes);
+        }
+    }
+
+    /// The file whose text declares `id` — a generated declaration's is the
+    /// file whose attribute generated it (B354).
+    fn declaring_file(&self, id: Id) -> Option<SourceId> {
+        self.derived_origin_file(id)
+            .or_else(|| self.source_of_id(id))
+    }
+
+    /// B688: the file of the block `implementations[index]` when it is an
+    /// EXTENSION — written in a file that is not its subject's home
+    /// ([`Self::impl_subject_home_files`]); `None` for a block in its
+    /// subject's own module, whose inherent members are the type's own and
+    /// resolve wherever a value of the type does. A derived block's file is
+    /// its attribute's (B354).
+    fn extension_block_file(&self, index: usize) -> Option<SourceId> {
+        let implementation = &self.implementations[index];
+        let block_file = self
+            .derived_origin_file(implementation.impl_id)
+            .unwrap_or(implementation.source);
+        let homes = self.impl_subject_home_files(implementation.subject);
+        (!homes.contains(&block_file)).then_some(block_file)
+    }
+
+    /// B688: the files of the std modules every program loads
+    /// ([`ALWAYS_LOADED_STD`]). Their blocks arrive in every build whatever
+    /// any file imports, so no file's surface can depend on the rest of the
+    /// build through them: `compare.vl`'s `impl List<type T: PartialEq>`
+    /// (`contains`, `index_of`) is `List`'s as surely as `list.vl`'s own block
+    /// is, and lives apart only to keep `list.vl` off `compare`'s imports.
+    fn always_loaded_std_files(&self) -> HashSet<SourceId> {
+        let paths = self.module_import_paths();
+        self.modules
+            .values()
+            .filter(|module| {
+                paths.get(&module.id).is_some_and(|path| {
+                    path.strip_prefix("std::")
+                        .is_some_and(|module_path| ALWAYS_LOADED_STD.contains(&module_path))
+                })
+            })
+            .filter_map(|module| self.scope_file(module.body.1))
+            .filter(|file| self.std_sources.contains(file))
+            .collect()
+    }
+
+    /// B688: the module an extension block is written in, as an import path
+    /// (`std::display`), and the import statement that brings it in scope —
+    /// std's steer index's choice (the trait the block names, as the "no
+    /// method" steer quotes it), else a trait of the block's bounds the module
+    /// declares, else the module's first declaration, else the module whole.
+    fn extension_block_import(&mut self, index: usize, member_name: &str) -> (String, String) {
+        let (subject, impl_id, source, written_in) = {
+            let implementation = &self.implementations[index];
+            (
+                implementation.subject,
+                implementation.impl_id,
+                implementation.source,
+                implementation.module_scope,
+            )
+        };
+        // A derived block's scope is the expansion's; its module is the one
+        // whose file holds the attribute.
+        let derived_from = self.derived_origin_file(impl_id);
+        let block_file = derived_from.unwrap_or(source);
+        let paths = self.module_import_paths();
+        let module = self.modules.values().find(|module| match derived_from {
+            Some(file) => self.scope_file(module.body.1) == Some(file),
+            None => module.body.1 == written_in,
+        });
+        let module_scope = module.map(|module| module.body.1);
+        let module_path = module
+            .and_then(|module| paths.get(&module.id).cloned())
+            .unwrap_or_default();
+        self.build_std_indexes_if_needed();
+        let head = self.type_head_name(subject);
+        let std_steer = head.and_then(|head| {
+            self.std_trait_method_index
+                .as_ref()?
+                .get(&(head.to_string(), member_name.to_string()))
+                .filter(|(_, module)| format!("std::{module}") == module_path)
+                .map(|(importable, _)| importable.clone())
+        });
+        let declared_here = |id: Id| self.declaring_file(id) == Some(block_file);
+        let mut binders = Vec::new();
+        self.collect_subject_binders(subject, &mut binders);
+        if let Type::Generic(constraint) = subject.get_type(self) {
+            binders.push(constraint);
+        }
+        let bound_trait = binders
+            .iter()
+            .flat_map(|binder| self.generic_bound_traits(*binder))
+            .filter_map(|(trait_id, _)| self.traits.get(&trait_id))
+            .find(|trait_| declared_here(trait_.id))
+            .map(|trait_| trait_.name.to_string());
+        let first_declaration = module_scope
+            .and_then(|scope_id| self.scopes.get(&scope_id))
+            .and_then(|scope| {
+                scope
+                    .declaration_order
+                    .iter()
+                    .find(|(_, id)| self.exported_entities.contains_key(id))
+                    .or_else(|| scope.declaration_order.first())
+                    .map(|(name, _)| name.to_string())
+            });
+        let import = match std_steer.or(bound_trait).or(first_declaration) {
+            Some(name) => format!("import {module_path}::{name};"),
+            None => format!("import {module_path};"),
+        };
+        (module_path, import)
+    }
+
+    /// B515: a TRAIT's method called on a concrete receiver in a file that
+    /// reaches neither the trait nor the block providing it. An `impl` registers
+    /// when its file LOADS, and loading is program-wide, so `42.to_string()`
+    /// compiled in any file once some loaded module (`std::markdown`) imported
+    /// `std::display` — and a wasm steer test depended on which std modules a
+    /// layer loads. B318's rule is that a trait method needs its trait in
+    /// scope: the file imports the trait, or a name from the trait's module or
+    /// the block's module, or the prelude binds one, or the file declares it.
+    ///
+    /// R-g door (b): a WARNING for one release, refused in v0.45.0.
+    ///
+    /// B688: the same holds for an INHERENT member of an EXTENSION block — an
+    /// `impl` written outside its subject's module ([`ScopedMember`]), which
+    /// is a trait with no name: `std::display`'s `impl List<type T: Display>
+    /// { fun join }` resolved `list.join(", ")` in a file that imports nothing
+    /// from `std::display` whenever ANOTHER file of the build did (its block
+    /// was loaded), and was refused in a build of that file alone (it was
+    /// not). The file reaches the block's file — by a name it binds, by an
+    /// import statement anywhere in it whose path runs through that file
+    /// (a selector-only one included), or by the prelude. A block in its
+    /// subject's own module (or a module of one of its argument types) is the
+    /// type's own surface and is never asked, nor is a block of a std module
+    /// every program loads, nor one the ENTRY writes (B553: no file can import
+    /// the entry, and the entry's blocks serve every module of its build).
+    ///
+    /// Calls through a bound are not asked — the bound wrote the trait's name —
+    /// nor are calls in std, in a frozen file or a dependency, nor generated
+    /// code (its source is no user file).
     fn check_trait_method_scope(&mut self, global_scope_id: Id) {
         let reached = self.trait_reach_by_file(global_scope_id, None);
         if reached.is_empty() {
             return;
         }
-        let mut sites: Vec<(SourceId, Span, Id, &'src str, Id)> = Vec::new();
+        let always_loaded = self.always_loaded_std_files();
+        let mut sites: Vec<(SourceId, Span, ScopedMember, &'src str, Id)> = Vec::new();
         let calls: Vec<(Id, Id, Id)> = self
             .function_calls
             .iter()
@@ -64753,18 +65197,30 @@ impl<'src> Analyzer<'src> {
             let Some(files) = reached.get(&source) else {
                 continue;
             };
-            // The trait the member is, and the files that would bring it in
-            // scope: the trait's own, the impl clause's trait's, the block's.
+            // What the member is, and the files that would bring it in scope:
+            // for a trait's, the trait's own, the impl clause's trait's, the
+            // block's; for an extension block's, the block's.
             let mut providing: Vec<SourceId> = Vec::new();
-            let trait_id = match self.implementation_by_declaration.get(member_id) {
-                Some(_) => {
-                    let Some((trait_id, files)) = self.impl_member_providing_files(*member_id)
-                    else {
-                        continue;
-                    };
-                    providing = files;
-                    trait_id
-                }
+            let scoped = match self.implementation_by_declaration.get(member_id).copied() {
+                Some(index) => match self.impl_member_providing_files(*member_id) {
+                    Some((trait_id, files)) => {
+                        providing = files;
+                        ScopedMember::Trait(trait_id)
+                    }
+                    None => {
+                        // B553: a block the ENTRY writes serves every module
+                        // (no file can import the entry); the entry is in
+                        // every build of itself.
+                        let Some(block_file) = self
+                            .extension_block_file(index)
+                            .filter(|file| !always_loaded.contains(file) && *file != SourceId(0))
+                        else {
+                            continue;
+                        };
+                        providing.push(block_file);
+                        ScopedMember::Extension(index)
+                    }
+                },
                 None => match self.trait_by_declaration.get(member_id) {
                     // A default reached on a concrete receiver (Gap E's
                     // re-dispatch); through a bound the bound named the trait.
@@ -64774,16 +65230,21 @@ impl<'src> Analyzer<'src> {
                             Some(GenericDispatch::OnType(..))
                         ) =>
                     {
-                        *trait_id
+                        ScopedMember::Trait(*trait_id)
                     }
                     _ => continue,
                 },
             };
-            let Some(trait_) = self.traits.get(&trait_id) else {
-                continue;
-            };
-            if let Some(trait_source) = self.source_of_id(trait_.id) {
-                providing.push(trait_source);
+            match scoped {
+                ScopedMember::Trait(trait_id) => {
+                    let Some(trait_) = self.traits.get(&trait_id) else {
+                        continue;
+                    };
+                    if let Some(trait_source) = self.source_of_id(trait_.id) {
+                        providing.push(trait_source);
+                    }
+                }
+                ScopedMember::Extension(_) => {}
             }
             // Generated code is not the author's spelling: a derive's body
             // calls what its own expansion needs.
@@ -64806,56 +65267,76 @@ impl<'src> Analyzer<'src> {
                         .unwrap_or(&&EMPTY_SPAN)
                 });
             let member_name = self.callable_name(*member_id).unwrap_or("this method");
-            sites.push((source, span, trait_id, member_name, *call_id));
+            sites.push((source, span, scoped, member_name, *call_id));
         }
         // The calls are visited in the table's order, not the file's — sorted so
         // `vilan check` prints them stably, and one per site (an entry world
         // per package entry resolves a shared file's calls once each).
         sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
-        sites.dedup_by_key(|(source, span, trait_id, ..)| (*source, *span, *trait_id));
+        sites.dedup_by_key(|(source, span, ..)| (*source, *span));
         if !sites.is_empty() {
             self.build_std_indexes_if_needed();
         }
-        for (_, span, trait_id, member_name, call_id) in sites {
-            let trait_name = self.traits.get(&trait_id).map_or("", |trait_| trait_.name);
-            // A std trait's import is spelled from std's own index — its
-            // module path whole (`std::reactive::delta::CollPipe`), where the
-            // flat lookup knew only top-level modules and spelled a nested
-            // one `pkg::delta::CollPipe`, which no user file can write.
-            let std_module = self
-                .traits
-                .get(&trait_id)
-                .and_then(|trait_| self.source_of_id(trait_.id))
-                .filter(|source| self.std_sources.contains(source))
-                .and_then(|_| {
-                    self.std_export_index
-                        .as_ref()
-                        .and_then(|index| index.get(trait_name))
-                        .cloned()
-                });
-            let import = match (std_module, self.import_path_of(trait_id)) {
-                (Some(module), _) => format!("import std::{module}::{trait_name};"),
-                (None, Some(path)) => format!("import {path};"),
-                (None, None) => format!("import {trait_name};"),
+        for (_, span, scoped, member_name, call_id) in sites {
+            let msg = match scoped {
+                ScopedMember::Trait(trait_id) => self.trait_scope_message(trait_id, member_name),
+                ScopedMember::Extension(index) => {
+                    let (module_path, import) = self.extension_block_import(index, member_name);
+                    let subject = self.impl_subject_label(self.implementations[index].subject);
+                    format!(
+                        "`{member_name}` comes from the `impl {subject}` block in \
+                         `{module_path}`, which extends a type declared elsewhere, and this file \
+                         does not import `{module_path}` or a name from it: such a block's \
+                         methods resolve only in a file that imports from its module. Import it \
+                         (`{import}`)"
+                    )
+                }
             };
             // B535 (v0.45.0, R-c): the refusal B515's one-release warning
             // announced. Its fix data is the message's own import statement
             // (`trait_scope_import`), under the stable code
-            // `TRAIT_SCOPE_CODE`.
+            // `TRAIT_SCOPE_CODE` — B688's extension-block refusal shares both.
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
                     note: None,
                     span,
-                    msg: format!(
-                        "`{member_name}` is `{trait_name}`'s, and this file does not import \
-                         `{trait_name}`: a trait's methods resolve only in a file that imports \
-                         the trait. Import it (`{import}`)"
-                    ),
+                    msg,
                 },
                 call_id,
             );
         }
+    }
+
+    /// B535's refusal for a trait's member called where the file does not
+    /// import the trait.
+    fn trait_scope_message(&self, trait_id: Id, member_name: &str) -> String {
+        let trait_name = self.traits.get(&trait_id).map_or("", |trait_| trait_.name);
+        // A std trait's import is spelled from std's own index — its
+        // module path whole (`std::reactive::delta::CollPipe`), where the
+        // flat lookup knew only top-level modules and spelled a nested
+        // one `pkg::delta::CollPipe`, which no user file can write.
+        let std_module = self
+            .traits
+            .get(&trait_id)
+            .and_then(|trait_| self.source_of_id(trait_.id))
+            .filter(|source| self.std_sources.contains(source))
+            .and_then(|_| {
+                self.std_export_index
+                    .as_ref()
+                    .and_then(|index| index.get(trait_name))
+                    .cloned()
+            });
+        let import = match (std_module, self.import_path_of(trait_id)) {
+            (Some(module), _) => format!("import std::{module}::{trait_name};"),
+            (None, Some(path)) => format!("import {path};"),
+            (None, None) => format!("import {trait_name};"),
+        };
+        format!(
+            "`{member_name}` is `{trait_name}`'s, and this file does not import \
+             `{trait_name}`: a trait's methods resolve only in a file that imports \
+             the trait. Import it (`{import}`)"
+        )
     }
 
     /// A155: one element whose class is written twice in one chain — an element
@@ -93755,6 +94236,18 @@ pub fn check_call_site_admission(program: &mut Program) {
     for (error, source) in violations {
         program.push_diagnostic(error, source);
     }
+}
+
+/// Each canonical source path's [`SourceId`], the first source winning — the
+/// index [`statement_sources`] climbs a module's ancestors by.
+fn source_of_path_index(canonical_sources: &[PathBuf]) -> HashMap<&Path, SourceId> {
+    let mut source_of_path: HashMap<&Path, SourceId> = HashMap::default();
+    for (position, path) in canonical_sources.iter().enumerate() {
+        source_of_path
+            .entry(path.as_path())
+            .or_insert(SourceId(position as u32));
+    }
+    source_of_path
 }
 
 /// The FILES one `import` statement's walk loaded — every path segment's own

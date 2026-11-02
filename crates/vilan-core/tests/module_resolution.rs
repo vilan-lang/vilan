@@ -1307,11 +1307,14 @@ fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     // is the first to load `std::reactive::store` (the entry imports none of it
     // here, as kolt's does not), and the output named `store_core` to step
     // around it. B547's std side reverted the step: red on a compiler without
-    // B547's fix.
+    // B547's fix. The entry's import of `Store` comes AFTER the model's, so the
+    // model still loads the module first; it is there because `at` is
+    // `store.vl`'s extension of `Store` (B688: the calling file must reach it).
     let entry = concat!(
         "import std::io::print;\n",
         "import std::reactive::{ Owner, Signal, Source, run_with_owner };\n",
         "import pkg::model::board;\n",
+        "import std::reactive::store::Store;\n",
         "fun main() {\n",
         "    let store = board();\n",
         "    let owner = Owner::new();\n",

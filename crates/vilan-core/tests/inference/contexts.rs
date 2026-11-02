@@ -285,6 +285,8 @@ fn b677_the_parameter_typed_with_the_clause_runs_under_the_owner_at_the_call() {
 
 #[test]
 fn b677_the_literal_wrap_of_a_plain_closure_parameter_is_warned() {
+    // Door 2's control too: a `|| void` provider is outside the implied
+    // clause (views only), so it still captures at creation.
     // The accepted-but-wrong form: `|| provide()` at `run_with_owner`. The
     // warning sits on the call and names the parameter, the body and the
     // clause that fixes it. The program still runs (and still never prints
@@ -298,64 +300,6 @@ fn b677_the_literal_wrap_of_a_plain_closure_parameter_is_warned() {
         "`provide` is a closure parameter called inside `run_with_owner`'s body, which establishes an owner: what it builds belongs to the owner it was made under, not this one, and is released with that owner; type it `(sync || void) context owner_scope` so it takes the owner at the call",
     );
     assert_compiles_and_runs(&source, "+a\ndisposed\n");
-}
-
-#[test]
-fn b677_a_plain_closure_parameter_called_in_each_owner_body_kind_is_warned() {
-    // The item's update: `swap`, `when` and `each` bodies establish an owner
-    // per instantiation, and a plain `|…| View` parameter called inside one
-    // builds under the owner it was made with (kolt's submenu `probes`, its
-    // `with_org`/`when_loaded` wrappers). One warning per call, at the call.
-    let source = r#"
-import std::reactive::{ Signal, SignalCell };
-import std::web::ui::{ View, each, swap, when };
-
-fun page(
-    show: SignalCell<bool>,
-    items: SignalCell<List<i32>>,
-    probe: |i32| View,
-    banner: || View,
-): View {
-    <div>
-        {swap(show, |on| probe(if on { 1 } else { 0 }))}
-        {when(show, || banner())}
-        {each(items, |item| item, |item| probe(item))}
-    </div>
-}
-
-fun main() {}
-main();
-"#;
-    let warnings = warning_diagnostics_with_std_on(source, std_spec(), Platform::Browser);
-    let spans: Vec<&str> = warnings
-        .iter()
-        .filter(|(message, _)| message.contains("is a closure parameter called inside"))
-        .map(|(_, range)| &source[range.clone()])
-        .collect();
-    assert_eq!(
-        spans,
-        vec!["probe(if on { 1 } else { 0 })", "banner()", "probe(item)"],
-        "one warning per call, at the call: {warnings:#?}"
-    );
-    assert!(
-        warnings.iter().any(
-            |(message, _)| message.contains("called inside `swap`'s body")
-                && message.contains("type it `(sync |i32| View) context owner_scope`")
-        ),
-        "the swap warning names the body and the fix: {warnings:#?}"
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|(message, _)| message.contains("called inside `when`'s body")),
-        "the when warning names its body: {warnings:#?}"
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|(message, _)| message.contains("called inside `each`'s body")),
-        "the each warning names its body: {warnings:#?}"
-    );
 }
 
 #[test]
@@ -393,20 +337,69 @@ main();
     );
 }
 
+// --- B677 door 2: a closure parameter answering a view takes the call owner --
+//
+// `closure-owner.md` §4, RULED 2026-11-02: a `fun`'s closure parameter whose
+// result is `View` (or a `Slot`) carries `context owner_scope` by default, and
+// `sync` with it — the clause is implied into the parameter's TYPE, so it
+// lands, threads and prints as a written one does.
+
+/// B677's three-owner program with a VIEW provider: `register` defers `-a` to
+/// the ambient owner and answers a view.
+const B677_VIEW_OWNERS: &str = r#"
+import std::io::print;
+import std::reactive::{ Owner, get_owner, owner_scope, run_with_owner };
+import std::web::ui::{ View, view };
+
+fun register(name: str): View {
+    print(i"+{name}");
+    get_owner().defer(|| print(i"-{name}"));
+    view("div")
+}
+
+fun while_on(provide: {provide}) {
+    let owner = Owner::new();
+    let _shown = run_with_owner(owner, provide);
+    owner.dispose();
+    print("disposed");
+}
+
+fun main() {
+    let root = Owner::new();
+    run_with_owner(root, || {
+        while_on(|| register("a"));
+    });
+}
+main();
+"#;
+
 #[test]
-fn b677_a_view_parameter_called_in_a_literal_nested_in_an_owner_body_is_warned() {
-    // kolt's `page: (|str| View) context page_focus` (panels.vl): a clause for
-    // another context injects that one and still CAPTURES the owner, and the
-    // call sits inside a literal handed to a helper inside the `swap` — the
-    // nested literal captures the swap's owner, `page` builds the page under
-    // the owner it was made with (the app root), and nothing releases it on
-    // navigation. Warned at the call, naming the owner body. A `|K| void`
-    // callback an event handler fires inside the body is not the body's own
-    // work and is not warned.
+fn b677_door_2_a_view_parameter_takes_the_owner_at_the_call_without_the_clause() {
+    // Door 1 refused `run_with_owner(owner, provide)` for a plain `|| View`
+    // and named the clause; the clause is now implied, so the parameter
+    // forwards as written and what it builds belongs to `while_on`'s owner:
+    // `-a` prints when that owner is disposed.
+    assert_compiles_and_runs(
+        &B677_VIEW_OWNERS.replace("{provide}", "|| View"),
+        "+a\n-a\ndisposed\n",
+    );
+    // The written clause is accepted and adds nothing.
+    assert_compiles_and_runs(
+        &B677_VIEW_OWNERS.replace("{provide}", "(sync || View) context owner_scope"),
+        "+a\n-a\ndisposed\n",
+    );
+}
+
+#[test]
+fn b677_door_2_a_view_parameter_in_owner_bodies_is_not_warned() {
+    // Door 1's View half is gone with its cause: `probe` and `banner` take the
+    // owner of the `swap`/`when`/`each` body that calls them, nested literal
+    // or not, and a clause naming another context keeps it after the implied
+    // one (kolt's `page: (|str| View) context page_focus`).
     let source = r#"
 import std::context::Context;
 import std::reactive::{ Signal, SignalCell };
-import std::web::ui::{ View, swap };
+import std::web::ui::{ View, each, swap, when };
 
 let focus: Context<str> = Context::new();
 
@@ -414,17 +407,19 @@ fun framed(body: (|| View) context focus): View {
     focus.run("page", || body())
 }
 
-fun area(
+fun page(
+    show: SignalCell<bool>,
+    items: SignalCell<List<i32>>,
     path: SignalCell<str>,
-    page: (|str| View) context focus,
-    choose: |str| void,
+    probe: |i32| View,
+    banner: || View,
+    shown: (|str| View) context focus,
 ): View {
     <div>
-        {swap(path, |now|
-            <div>
-                {framed(|| page(now))}
-                <button on:click(|_event| choose(now))>"pick"</button>
-            </div>)}
+        {swap(show, |on| probe(if on { 1 } else { 0 }))}
+        {when(show, || banner())}
+        {each(items, |item| item, |item| probe(item))}
+        {swap(path, |now| <div>{framed(|| shown(now))}</div>)}
     </div>
 }
 
@@ -432,20 +427,49 @@ fun main() {}
 main();
 "#;
     let warnings = warning_diagnostics_with_std_on(source, std_spec(), Platform::Browser);
-    let spans: Vec<&str> = warnings
-        .iter()
-        .filter(|(message, _)| message.contains("is a closure parameter called inside"))
-        .map(|(_, range)| &source[range.clone()])
-        .collect();
-    assert_eq!(
-        spans,
-        vec!["page(now)"],
-        "the nested view call is warned and the handler's callback is not: {warnings:#?}"
-    );
     assert!(
-        warnings.iter().any(|(message, _)| message
-            .contains("`page` is a closure parameter called inside `swap`'s body")
-            && message.contains("type it `(sync |str| View) context owner_scope`")),
-        "the warning names the owner body and the fix: {warnings:#?}"
+        !warnings
+            .iter()
+            .any(|(message, _)| message.contains("is a closure parameter called inside")),
+        "no B677 warning: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b677_door_2_a_stored_view_parameter_needs_a_field_typed_with_the_clause() {
+    // The implied clause makes the parameter an INJECTED closure, with §8.5's
+    // restrictions: a plain `|| View` field cannot hold it, and the refusal
+    // prints the implied clause the way a written one prints. A field typed
+    // with the clause holds it.
+    let plain = r#"
+import std::reactive::owner_scope;
+import std::web::ui::{ View, view };
+
+struct Held {
+    body: || View,
+}
+
+fun keep(body: || View): Held {
+    Held { body }
+}
+
+fun main() {
+    let held = keep(|| view("div"));
+}
+main();
+"#;
+    assert_fails_with(
+        plain,
+        "an injected (`context`-typed) closure can only be called, forwarded to a position with the same `context` clause, or passed to `run`",
+    );
+    assert_compiles(&plain.replace(
+        "    body: || View,\n",
+        "    body: (|| View) context owner_scope,\n",
+    ));
+    // A diagnostic that prints the parameter's type prints the implied clause
+    // exactly as a written one prints (it is in the type).
+    assert_fails_with(
+        "import std::web::ui::{ View, view };\n\nfun keep(body: || View): i32 {\n    let n: i32 = body;\n    n\n}\n\nfun main() {\n    print(keep(|| view(\"div\")));\n}\nmain();\n",
+        "Expected i32, but got (|| View) context owner_scope instead.",
     );
 }

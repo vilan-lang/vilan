@@ -298,12 +298,31 @@ accepted but is the trap: the literal is injected, `provide` is not, so
 what `provide` registers belongs to the owner `while_on`'s caller was
 made with, and disposing `owner` takes nothing back. The checker warns
 when such a parameter — one whose type carries no `owner_scope`, answering
-a `View` or nothing — is called inside a body that establishes an owner
+nothing — is called directly by a body that establishes an owner
 (`swap`, `when`, `each`, `run_with_owner`, an overlay's `attach`, a
-clause-typed field): "`probes` is a closure parameter called inside
-`swap`'s body, which establishes an owner … type it
-`(sync |…| View) context owner_scope` so it takes the owner at the call".
-The clause on the parameter is the fix in every case.
+clause-typed field): "`provide` is a closure parameter called inside
+`run_with_owner`'s body, which establishes an owner … type it
+`(sync || void) context owner_scope` so it takes the owner at the call".
+The clause on the parameter is the fix.
+
+**A closure parameter answering a view takes the owner at the call.** A
+`fun`'s parameter whose closure type answers `View` — or a `Slot`, the
+trait the UI places — carries `context owner_scope` by default, and the
+`sync` marker with it: `fun with_org(body: |Org| View): View` declares
+`body: (sync |Org| View) context owner_scope`, so everything `body` builds
+— every effect, every store hold — belongs to the body that calls it and
+is released with that body, which is where a view is shown. The implied
+clause is part of the parameter's type like a written one: it threads,
+lands and is restricted exactly as §8.5 says above (a literal argument is
+injected; the parameter can be called, forwarded or passed to `run`, and
+storing it in a field needs a field typed with the clause), and a type
+printed in a diagnostic shows it. Writing it anyway is accepted and adds
+nothing; a clause naming another context keeps it after the implied one
+(`(|str| View) context page_focus` is `context (owner_scope,
+page_focus)`). An `async`-marked parameter, and an `external` function's,
+keep what they wrote. A closure answering anything else — `void`, a
+value — keeps capturing at creation: an event handler's registrations
+belong to the component that armed it.
 
 ## 8.6 Declared requirements: the `context` clause on a `fun`
 

@@ -71,6 +71,7 @@
 // (`MapOp`, `SetOp`, `SeqOp`), not handed a copy to diff. Each flow started from a
 // handle keeps its own op log at the collection's node, recorded only while it is
 // open — a per-subscription FEED, as a slot is per path.
+import pkg::compare::PartialEq;
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
