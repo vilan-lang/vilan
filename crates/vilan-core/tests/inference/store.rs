@@ -2557,10 +2557,10 @@ fn b693_the_assumed_handles_read_lends_and_only_the_keeper_copies() {
         keeper.contains("__clone(payload)"),
         "the keeper, built before it is attached, is the copy:\n{assume}"
     );
-    // What follows the attach is the detach and the handle; the handle's only
-    // copy is of its PATH (a list of steps), never of what it reads.
+    // What follows the attach is the detach and the handle, which copies
+    // nothing: not what it reads, and not its path (a shared pointer since M186).
     assert!(
-        !handle.replace("__clone(self[1])", "").contains("__clone"),
+        !handle.contains("__clone"),
         "the assumed handle copies on a read:\n{assume}"
     );
 }
@@ -2814,5 +2814,159 @@ fn b693_assuming_a_dead_variant_is_refused() {
         main();
         "#,
         "`StoreSome::assume` on a variant that is not live",
+    );
+}
+
+// ── M186: a handle's path is shared, not copied ─────────────────────────────
+
+/// §4.1, read as COPIES: the hundred reads of [`B693_PHASES`] (five projections
+/// below the assumed handle, then `get`) copy the same number of times at 10 and
+/// at 1,000 records, and that number is pinned. Each projection used to copy its
+/// parent's path LIST three times over — the receiver, `child_path`'s push, the
+/// struct literal — and a `StoreSome` its gate list beside it: 74 `__clone` calls
+/// a read, 7,400 for the hundred. A projection now allocates one step pointing at
+/// its parent's path, and a handle copy copies that pointer, which is no copy at
+/// all: what is left is the title's own.
+#[test]
+fn m186_a_read_below_a_handle_copies_no_path_list() {
+    for count in [10, 1000] {
+        let copies = copies_per_print(&B693_PHASES.replace("{count}", &count.to_string()));
+        assert_eq!(copies.len(), 6, "six phases print: {copies:?}");
+        assert_eq!(
+            copies[2], 100,
+            "a hundred reads five steps below the handle at {count} records: {copies:?}"
+        );
+    }
+}
+
+/// Fields `{depth}` deep under a root — every level a struct with a leaf `n` and
+/// the next level — read a hundred times at depths 3, 4 and 5.
+const M186_DEPTHS: &str = r#"
+import std::io::print;
+import std::reactive::store::Store;
+
+[derive(PartialEq, Storable)]
+struct L5 {
+    n: i32,
+}
+
+[derive(PartialEq, Storable)]
+struct L4 {
+    n: i32,
+    next: L5,
+}
+
+[derive(PartialEq, Storable)]
+struct L3 {
+    n: i32,
+    next: L4,
+}
+
+[derive(PartialEq, Storable)]
+struct L2 {
+    n: i32,
+    next: L3,
+}
+
+[derive(PartialEq, Storable)]
+struct L1 {
+    n: i32,
+    next: L2,
+}
+
+fun main() {
+    let store = Store::new(L1 { n = 1, next = L2 { n = 2, next = L3 { n = 3, next = L4 { n = 4, next = L5 { n = 5 } } } } });
+    print("built");
+    mut total = 0;
+    mut read = 0;
+    for read < 100 {
+        total += store.next().next().n().get();
+        read += 1;
+    }
+    print(i"depth 3: {total}");
+    read = 0;
+    for read < 100 {
+        total += store.next().next().next().n().get();
+        read += 1;
+    }
+    print(i"depth 4: {total}");
+    read = 0;
+    for read < 100 {
+        total += store.next().next().next().next().n().get();
+        read += 1;
+    }
+    print(i"depth 5: {total}");
+}
+
+main();
+"#;
+
+/// §4.2: a read's copies are LINEAR in its depth, the same for every step —
+/// depth 5 costs depth 3 plus exactly two steps — and a step now copies
+/// nothing, so the three cost the same: the leaf's own. With the path a list,
+/// each step copied a list as long as the depth so far, and the steps cost more
+/// the deeper they went.
+#[test]
+fn m186_a_reads_copies_grow_by_one_constant_per_step() {
+    let copies = copies_per_print(M186_DEPTHS);
+    assert_eq!(copies.len(), 4, "four phases print: {copies:?}");
+    let (three, four, five) = (copies[1], copies[2], copies[3]);
+    assert_eq!(
+        (three, four, five),
+        (200, 200, 200),
+        "a hundred reads at depths 3, 4 and 5: {copies:?}"
+    );
+    assert_eq!(
+        five - four,
+        four - three,
+        "each step below a handle costs the same: {copies:?}"
+    );
+}
+
+/// §4.3: a path's IDENTITY survives its sharing (A146). One number for a deep
+/// path through a field, a key and a variant however its handle was made — the
+/// projection made twice, made from a copied handle, made below an assumed one —
+/// and another for a sibling key, a sibling field and the variant's flag.
+#[test]
+fn m186_a_shared_paths_identity_is_the_identity_of_its_steps() {
+    assert_compiles_and_runs(
+        r#"
+        import std::hash_map::HashMap;
+        import std::io::print;
+        import std::reactive::Source;
+        import std::reactive::store::Store;
+
+        [derive(PartialEq, Storable)]
+        struct Record {
+            title: str,
+            notes: List<str>,
+        }
+
+        [derive(Storable)]
+        struct State {
+            records: HashMap<i32, Record>,
+        }
+
+        fun main() {
+            mut records: HashMap<i32, Record> = HashMap::new();
+            records.insert(1, Record { title = "one", notes = [] });
+            records.insert(2, Record { title = "two", notes = [] });
+            let store: Store<Option<State>> = Store::new(Some(State { records }));
+            let title = store.some().records().at(1).some().title();
+            let keyed = store.some().records().at(1);
+            let copy = keyed;
+            print(title.identity() == store.some().records().at(1).some().title().identity());
+            print(title.identity() == copy.some().title().identity());
+            print(title.identity() == store.some().assume().records().at(1).some().title().identity());
+            print(title.identity() == store.some().records().at(2).some().title().identity());
+            print(title.identity() == store.some().records().at(1).some().notes().identity());
+            print(copy.identity() == keyed.identity());
+            print(copy.is_some().identity() == keyed.identity());
+            print(copy.is_some().identity() == store.some().records().at(1).is_some().identity());
+        }
+
+        main();
+        "#,
+        "true\ntrue\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\n",
     );
 }

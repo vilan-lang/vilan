@@ -16,7 +16,9 @@
 // lives in ONE `Shared`, in place; a projection is another `Store` cut from its
 // parent, and its `set` writes back through the root. It is a `Source<T>` and a
 // `Signal<T>`, so every pipe, effect and binding takes one unchanged. Copying a
-// handle allocates nothing.
+// handle allocates nothing: its path is SHARED, a chain of steps (`StorePathStep`)
+// in which a projection allocates one step pointing at its parent's, read as a list
+// only where the slot tree is walked (M186, `proposal/store-path-sharing.md`).
 //
 // **Slots (§2.2, Q12).** A slot is one path's subscriber list: a notification-only
 // cell. It is made by the FIRST subscription at its path, together with the nodes
@@ -94,6 +96,7 @@ import pkg::reactive::delta::{
 import pkg::reactive::store_core::{
 	Spine,
 	StoreFlag,
+	StorePathStep,
 	attach_feed,
 	deliver,
 	detach_feed,
@@ -103,6 +106,7 @@ import pkg::reactive::store_core::{
 	spine,
 	store_identity_at,
 	store_keyed,
+	store_path_steps,
 	store_touch,
 	touch_spine,
 	watch_at,
@@ -128,6 +132,7 @@ export import pkg::reactive::store_core::{
 	StoreFlag,
 	StoreLeaf,
 	StoreNode,
+	StorePathStep,
 	StoreSlot,
 	StoreSome,
 	StoreStep,
@@ -404,13 +409,14 @@ export impl List<type T: Storable + StoreKey> with Storable {
 /// nothing, or the same elements back) wakes nothing.
 fun splice_at<T: Storable + StoreKey>(
 	root: Shared<StoreNode>,
-	path: List<StoreStep>,
+	place: Shared<StorePathStep>,
 	lend: |(|&List<T>| void)| void,
 	modify: |(|&mut List<T>| void)| void,
 	at: usize,
 	removed: usize,
 	inserted: List<T>,
 ) {
+	let path = store_path_steps(place);
 	let found = spine(root, &path);
 	let node = found.node;
 	mut woken = StoreWoken { slots = [], feeds = [] };
@@ -1675,10 +1681,13 @@ export fun mirror_boundary<T: StoreWire + Storable>(
 	path: List<MirrorStep>,
 	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
+	// The place is read as a list once, for the identity and the boundary both:
+	// relative paths from the wire are applied under it.
+	let place = store_path_steps(local.path);
 	MirrorBoundary {
 		path,
-		identity = store_identity_at(local.root, local.path),
-		place = local.path,
+		identity = store_identity_at(local.root, place),
+		place,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			mut copy = local.get();
@@ -1893,8 +1902,11 @@ export struct RemoteStoreKeys<K> {
 }
 
 /// The key-set handle under `at`, a map's or a set's place on the wire.
-fun remote_keys<K: Hashable + Wire>(place: List<StoreStep>, at: MirrorAt): RemoteStoreKeys<K> {
-	mut keyset = place;
+fun remote_keys<K: Hashable + Wire>(
+	place: Shared<StorePathStep>,
+	at: MirrorAt,
+): RemoteStoreKeys<K> {
+	mut keyset = store_path_steps(place);
 	keyset.push(StoreStep::Field(KEY_SET));
 	let keys: SignalCell<List<K>> = SignalCell::new([]);
 	RemoteStoreKeys {
@@ -2004,10 +2016,13 @@ export fun mirror_boundary_some<P: StoreWire + Storable>(
 	path: List<MirrorStep>,
 	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
+	// The place is read as a list once, for the identity and the boundary both:
+	// relative paths from the wire are applied under it.
+	let place = store_path_steps(local.path);
 	MirrorBoundary {
 		path,
-		identity = store_identity_at(local.root, local.path),
-		place = local.path,
+		identity = store_identity_at(local.root, place),
+		place,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			match local.get() {

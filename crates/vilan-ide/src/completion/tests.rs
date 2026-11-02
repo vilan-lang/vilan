@@ -354,8 +354,9 @@ fn a149_s4_a_field_syntax_read_hovers_as_its_projections_handle() {
 fn a149_s4_a_field_named_like_a_handle_internal_types_as_the_projection() {
     // `store.address.path.` — `Address`'s `path`, read through field syntax, is
     // a `Store<str>`. The live receiver walk must not stop at the HANDLE's
-    // internal `path` (a `List<StoreStep>`) on the way: that offered a list's
-    // members (`iter`) and none of the handle's (`on_change`).
+    // internal `path` on the way: that offered the path's members and none of
+    // the handle's (`on_change`). The path was a `List<StoreStep>` (`iter`); it
+    // is a `Shared<StorePathStep>` since M186 (`downgrade`).
     let source = format!(
         "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.address.path.¦\n}}\n"
     );
@@ -368,6 +369,11 @@ fn a149_s4_a_field_named_like_a_handle_internal_types_as_the_projection() {
     assert!(
         !items.iter().any(|item| item.label == "iter"),
         "a list's is not: {:?}",
+        labels(&items)
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "downgrade"),
+        "a store path's cell's is not: {:?}",
         labels(&items)
     );
 }
