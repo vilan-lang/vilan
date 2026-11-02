@@ -228,53 +228,6 @@ small = 160
 large = 320
 max_ratio = 2.3
 
-[[e121]]
-scenario = "leaf keystroke"
-metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 3
-blocking = true
-mandate = true
-
-[[e121]]
-scenario = "shared.vl keystroke"
-metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 6
-blocking = true
-
-[[e121]]
-scenario = "model.vl keystroke"
-metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 5
-blocking = true
-series = "Order 52 (N174): the keystroke edit is unchanged; the Find References probe moved from `fun messages(self)` (gone from model.vl) to `fun global()`, the mirrored store reader, so that probe starts a new series."
-
-[[e121]]
-scenario = "model.vl keystroke, importers open"
-metric = "cpu_ms"
-target_ms = 500
-green_seals = 2
-blocking = true
-
-[[e121]]
-scenario = "css keystroke"
-metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 0
-blocking = false
-mandate = true
-
-[[e121]]
-scenario = "parse break"
-metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 0
-blocking = false
-mandate = true
-series = "Order 52 (N174): re-anchored from `let messages = channel.messages();` (gone with the mirrored-store exhibit, kolt@dee494ab) to `channel_name.adopt(channel.current_name());` in the same channel.vl - a statement over a `g.channels()` boundary; the break and its repair are the same shape, the figures start a new series."
-
 [[bump]]
 subject = "example:browser"
 class = "reference"
@@ -435,3 +388,54 @@ class = "ci"
 ratio = 1.01
 reason = "A179: std::rpc's dial honours the ambient CancelSignal (dial_attempt, the abort listener, DialFailure::Cancelled) and gained dial_within + two RpcError arms, which every program reaching std::rpc analyzes; CI's perf job read x1.0096 of the ceiling at the merge 79a620f9 where the limit stood at x1.0050"
 item = "A179"
+
+[[e121]]
+scenario = "leaf keystroke"
+metric = "diagnostics_cpu_ms"
+target_ms = 500
+green_seals = 0
+blocking = false
+mandate = true
+series = "Order 56 (N186): the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
+
+[[e121]]
+scenario = "shared.vl keystroke"
+metric = "diagnostics_cpu_ms"
+target_ms = 500
+green_seals = 0
+blocking = false
+series = "Order 56 (N186): the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
+
+[[e121]]
+scenario = "model.vl keystroke"
+metric = "diagnostics_cpu_ms"
+target_ms = 500
+green_seals = 0
+blocking = false
+series = "Order 56 (N186): re-anchored in the same method body, `Channel::create` - the keystroke is at `get_client().get_safe()!.create_channel(org, name)` (the org parameter arrived with organizations, kolt@38a7ac9), hover on `create_channel(org, name)`, and the Find References probe moved from `fun global()` (gone) to `fun ids(talk` (`Channel::ids`, the mirrored store's key-set reader, used in four files none open); the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
+
+[[e121]]
+scenario = "model.vl keystroke, importers open"
+metric = "cpu_ms"
+target_ms = 500
+green_seals = 0
+blocking = false
+series = "Order 56 (N186): the model.vl keystroke's new anchor (`create_channel(org, name)` in `Channel::create`) with client.vl, channel.vl and views.vl open beside it as before; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
+
+[[e121]]
+scenario = "css keystroke"
+metric = "diagnostics_cpu_ms"
+target_ms = 500
+green_seals = 0
+blocking = false
+mandate = true
+series = "Order 56 (N186): the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
+
+[[e121]]
+scenario = "parse break"
+metric = "diagnostics_cpu_ms"
+target_ms = 500
+green_seals = 0
+blocking = false
+mandate = true
+series = "Order 56 (N186): re-anchored from `channel_name.adopt(channel.current_name());` (gone from channel.vl with organizations, kolt@38a7ac9) to `let name = Channel { id }.current_name(g.talk());` in the same channel.vl (the hover card's channel arm) - a statement over the `talk.channels().at(id)` boundary, the `(` opened before it as before; the repair row (`parse repair`) is the undo of the same edit; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."

@@ -155,19 +155,23 @@ SCENARIOS = [
     {
         # The owner's case: an edit to the client MODEL re-analyses the whole
         # client world — module reuse is all-or-nothing per world (0/82).
+        # N186 (Order 56): the same keystroke in `Channel::create`'s body, which
+        # took the organization when kolt@38a7ac9 (organizations) arrived:
+        # `create_channel(name)` became `create_channel(org, name)` - a NEW
+        # series from Order 56 on, on kolt@2684c70.
         "name": "model.vl keystroke",
         "file": "src/model.vl",
-        "edit": ("\t\tget_client().get_safe()!.create_channel(name)", 2),
+        "edit": ("\t\tget_client().get_safe()!.create_channel(org, name)", 2),
         "text": " ",
-        "hover": ("create_channel(name)", 3),
+        "hover": ("create_channel(org, name)", 3),
         "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
         # M104's hybrid: model.vl open ALONE answers Find References from its
-        # entry's world, built on demand after an edit — `global()` (the mirrored
-        # store's reader) is used in `sidebar.vl` and `views.vl`, which are not
-        # open. N174: the anchor was `fun messages(self)` until the mirrored-store
-        # exhibit (A153 S5, kolt@dee494ab) moved it out of model.vl - the
-        # References figures of this row are a NEW series from Order 52 on.
-        "references": ("fun global()", 5),
+        # entry's world, built on demand after an edit. N186: the probe is
+        # `Channel::ids` (the mirrored store's key-set reader), used in
+        # `channel.vl`, `documents.vl`, `file_page.vl` and `tasks.vl`, none open;
+        # `fun global()` left model.vl with organizations (N174 had moved the
+        # probe there from `fun messages(self)` in Order 52).
+        "references": ("fun ids(talk", 5),
     },
     {
         # The same edit with the files that import the model OPEN beside it,
@@ -176,9 +180,9 @@ SCENARIOS = [
         "name": "model.vl keystroke, importers open",
         "file": "src/model.vl",
         "also_open": ["src/client.vl", "src/channel.vl", "src/views.vl"],
-        "edit": ("\t\tget_client().get_safe()!.create_channel(name)", 2),
+        "edit": ("\t\tget_client().get_safe()!.create_channel(org, name)", 2),
         "text": " ",
-        "hover": ("create_channel(name)", 3),
+        "hover": ("create_channel(org, name)", 3),
         "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
     },
     {
@@ -195,13 +199,19 @@ SCENARIOS = [
         # (A153 S5, kolt@dee494ab) rewrote channel.vl; `channel.current_name()` reads
         # `g.channels().at(self.id).some().name()` (model.vl) - a NEW series from
         # Order 52 on (the shape is the same: a break in a leaf file, then its repair).
+        # N186 (Order 56): `channel_name.adopt(..)` left channel.vl with organizations
+        # (kolt@38a7ac9); the statement is now the hover card's
+        # `let name = Channel { id }.current_name(g.talk());` - `current_name` reads
+        # `talk.channels().at(self.id).some().name()` (model.vl), the same boundary
+        # shape, and the break opens a `(` before the statement as before. A NEW
+        # series from Order 56 on, on kolt@2684c70.
         "name": "parse break",
         "file": "src/channel.vl",
-        "edit": ("\t\t\tchannel_name.adopt(channel.current_name());", 3),
+        "edit": ("\t\t\tlet name = Channel { id }.current_name(g.talk());", 3),
         "text": "(",
         "repair": "parse repair",
-        "hover": ("channel.current_name());", 10),
-        "completion": ("channel.current_name());", len("channel.")),
+        "hover": ("Channel { id }.current_name(g.talk());", len("Channel { id }.") + 2),
+        "completion": ("Channel { id }.current_name(g.talk());", len("Channel { id }.")),
     },
 ]
 
@@ -232,8 +242,8 @@ SESSION = [
     {
         "file": "src/model.vl",
         "anchor": (
-            "\tfun create(name: str): Result<u53, RpcError> {",
-            len("\tfun create(name: str): Result<u53, RpcError> {"),
+            "\tfun create(org: str, name: str): Result<Result<u53, str>, RpcError> {",
+            len("\tfun create(org: str, name: str): Result<Result<u53, str>, RpcError> {"),
         ),
         "keystrokes": list(" let z=3; "),
     },
