@@ -414,3 +414,10 @@ class = "ci"
 ratio = 1.01
 reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0071 of next's std (7911d954) under the lane's build on the lane's box"
 item = "B689"
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.01
+reason = "B693: std::reactive::store_core's StoreSome::assume stands a keeper feed on its variant's flag (defer_to_owner, store_switch's flag touches), which every program reaching the store core analyzes; measured x1.0005 of next's std (f9fcc6ce) under the lane's build on the lane's box, where next's own std already stood at x1.0099 of the v0.53.0 ceiling"
+item = "B693"

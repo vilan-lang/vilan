@@ -10869,6 +10869,27 @@ fn b689_hash_map_lends_in_place_on_both_backends() {
     );
 }
 
+/// B693 (store-assume-keeper.md §4.5): an assumed handle's fallback is kept by
+/// a feed on its variant's flag and read in place on both backends — every way
+/// a variant ends (the enum's own handle, `Option` → `None`, a key removed by
+/// `set(None)` and by `remove`, a whole-state write, an outer variant) leaves
+/// the payload as it stood, a write after the end lands nowhere, a new `Some` is
+/// read live, and the keeper stands while its owner does.
+#[test]
+fn b693_an_assumed_handle_keeps_the_payload_at_its_end_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_assume_keeper.vl"),
+        include_str!("native/store_assume_keeper.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_assume_keeper.vl"),
+        Verdict::Identical,
+        "an assumed handle must keep its payload alike on both backends"
+    );
+}
+
 /// F65 (native-45 STOPPED it as the analyzer's; solver-b-45 fixed the record):
 /// a generic function whose return is inferred, called at two instantiations,
 /// emitted ONE instantiation's return type for every instance. `wrap<T>(x: T):
