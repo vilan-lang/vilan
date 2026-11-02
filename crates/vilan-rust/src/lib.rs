@@ -146,6 +146,11 @@ pub struct OptionalCrates {
     /// `process::keys()`'s terminal mode — `vilan-rt-term` (`libc` /
     /// `windows-sys`; A173 S2). Reached by `keys()` and `Keys`'s `Drop`.
     pub term: bool,
+    /// `std::image` — `vilan-rt-image` (M185), the glue over `vilan-image`,
+    /// the codec core on the `image` crate. The core is a path dependency of
+    /// the glue and sits beside it in the cache too, so it is not named here:
+    /// the manifest names the crate the PROGRAM depends on.
+    pub image: bool,
 }
 
 impl OptionalCrates {
@@ -163,6 +168,9 @@ impl OptionalCrates {
         }
         if self.term {
             names.push("vilan-rt-term");
+        }
+        if self.image {
+            names.push("vilan-rt-image");
         }
         names
     }
@@ -534,6 +542,11 @@ struct Emitter<'a, 'src> {
     /// `vilan-rt-term` (A173 S2) for raw mode. Set where `__term_enter` and
     /// `__term_leave` are lowered — the two doors the terminal mode has.
     reaches_term: bool,
+    /// Whether this program reaches `std::image` and so links
+    /// `vilan-rt-image` (M185). Set where one of the nine `__image_*` host
+    /// helpers is lowered and where `std::image::Image` is rendered — every
+    /// reach passes through one or the other.
+    reaches_image: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -769,6 +782,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_crypto: false,
             reaches_signal: false,
             reaches_term: false,
+            reaches_image: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -860,6 +874,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 crypto: self.reaches_crypto,
                 signal: self.reaches_signal,
                 term: self.reaches_term,
+                image: self.reaches_image,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -3165,6 +3180,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ if self.node_buffer_struct(id) => {
                 self.reaches_crypto = true;
                 Ok("vilan_rt_crypto::NodeBuffer".to_string())
+            }
+            // M185: `std::image::Image`, recognized by the helper that reads
+            // it (see [`Emitter::image_struct`]) — `Image` is too common a
+            // name for the name to be evidence.
+            _ if self.image_struct(id) => {
+                self.reaches_image = true;
+                Ok("vilan_rt_image::Image".to_string())
             }
             _ => {
                 let what = format!("the host type `{name}`");
@@ -11562,7 +11584,121 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(rendered) = self.db_host_binding(name, binding, argument_ids, depth)? {
             return Ok(Some(rendered));
         }
+        if let Some(rendered) = self.image_host_binding(binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
         self.crypto_host_binding(target, name, binding, argument_ids, depth)
+    }
+
+    /// M185: `std::image`'s nine host helpers, each one call into
+    /// `vilan-rt-image` — the glue over `vilan-image`, the codec core the JS
+    /// backend runs as wasm — and each RECORDS the reach, so the generated
+    /// manifest names the crate.
+    ///
+    /// Keyed on the host symbol alone: every one is a `__image_`-prefixed name
+    /// only `std::image` declares (as [`Emitter::crypto_host_binding`]'s
+    /// helpers are). A picture or a byte buffer the runtime only READS is
+    /// passed by reference ([`Emitter::place_argument`]), so rule 1 owes no
+    /// copy for it; the counts are `usize` on both sides, and `Format` and
+    /// `Fit` arrive as the `i32` codes `image.vl` maps them to.
+    fn image_host_binding(
+        &mut self,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(ExternBinding::Function {
+            module: None,
+            symbol,
+        }) = binding
+        else {
+            return Ok(None);
+        };
+        let rendered = match *symbol {
+            "__image_decode" => format!(
+                "vilan_rt_image::decode(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            "__image_sniff" => format!(
+                "vilan_rt_image::sniff(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            "__image_from_rgba" => format!(
+                "vilan_rt_image::from_rgba({}, {}, &{})",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 2, depth)?
+            ),
+            "__image_width" => {
+                format!("({}).width()", self.place_argument(argument_ids, 0, depth)?)
+            }
+            "__image_height" => {
+                format!(
+                    "({}).height()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
+            "__image_rgba" => format!("({}).rgba()", self.place_argument(argument_ids, 0, depth)?),
+            "__image_resize" => format!(
+                "({}).resized({}, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
+            ),
+            "__image_crop" => format!(
+                "({}).cropped({}, {}, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?,
+                self.value_argument(argument_ids, 4, depth)?
+            ),
+            "__image_encode" => format!(
+                "({}).encode({}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            _ => return Ok(None),
+        };
+        self.reaches_image = true;
+        Ok(Some(rendered))
+    }
+
+    /// Whether an `external struct` is `std::image::Image` — decided by the
+    /// helper that READS it: the declared first parameter of a
+    /// `[extern("__image_width")]`. `Image` is a name a program may well give
+    /// a host class of its own (a DOM `HTMLImageElement`, say), so the name is
+    /// never read; [`Emitter::node_buffer_struct`] is the same rule.
+    fn image_struct(&self, struct_id: Id) -> bool {
+        if !self
+            .program
+            .structs
+            .get(&struct_id)
+            .is_some_and(|declaration| declaration.external)
+        {
+            return false;
+        }
+        self.program.external_functions.values().any(|external| {
+            matches!(
+                external.extern_binding,
+                Some(ExternBinding::Function {
+                    module: None,
+                    symbol: "__image_width",
+                })
+            ) && external
+                .parameters
+                .first()
+                .and_then(|first| self.program.parameters.get(first))
+                .is_some_and(|parameter| {
+                    matches!(
+                        self.resolve(parameter.type_id),
+                        Some(Type::Struct(id, _)) if *id == struct_id
+                    )
+                })
+        })
     }
 
     /// F40 (RULED (a)): the bindings `vilan-rt-crypto` answers — OS
@@ -16605,6 +16741,24 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
     }
 }
 
+/// The packages a program reaching `std::image` builds at `opt-level = 3` in the
+/// dev profile (M185; see [`cargo_manifest`]): the core with its resampler, and
+/// the `image` crate's decoders, encoders and inflaters — every one in the
+/// graph `vilan-image` resolves to (a name outside it would be a cargo warning
+/// in every image build, which `cargo_manifest_names_only_packages_the_codec_graph_has`
+/// keeps from happening).
+pub const IMAGE_OPTIMIZED_PACKAGES: &[&str] = &[
+    "vilan-image",
+    "image",
+    "png",
+    "fdeflate",
+    "miniz_oxide",
+    "zune-jpeg",
+    "image-webp",
+    "gif",
+    "weezl",
+];
+
 /// The `Cargo.toml` of the project the backend writes, pointing at the runtime
 /// crate by path. `edition 2024` matches the workspace's own.
 pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) -> String {
@@ -16636,6 +16790,20 @@ pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) 
     } else {
         ""
     };
+    // M185, crypto's reason again: an unoptimized decoder and resampler are
+    // ten to fifty times slower (a 12-megapixel JPEG goes from a tenth of a
+    // second to several), so the codec core and the codec crates whose loops
+    // a decode, a resize and an encode spend their time in are optimized in
+    // the dev profile — named one by one, because `"*"` would optimize
+    // `vilan-rt` as well and cost every image program a slow runtime build.
+    let image_profile = if optional.image {
+        IMAGE_OPTIMIZED_PACKAGES
+            .iter()
+            .map(|package| format!("\n[profile.dev.package.{package}]\nopt-level = 3\n"))
+            .collect::<String>()
+    } else {
+        String::new()
+    };
     format!(
         "[package]\n\
          name = \"{name}\"\n\
@@ -16653,6 +16821,7 @@ pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) 
          [profile.release]\n\
          panic = \"unwind\"\n\
          {crypto_profile}\
+         {image_profile}\
          \n\
          [workspace]\n"
     )

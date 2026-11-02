@@ -164,6 +164,20 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         manifest_static: "RT_TERM_MANIFEST",
         item: "A173 S2",
     },
+    // M185: `std::image`'s glue, and the codec core it reaches by a path
+    // dependency (`../vilan-image`) — the one optional crate with a sibling
+    // dependency of its own, which is why the core materializes here too
+    // though no generated manifest names it.
+    OptionalCrate {
+        directory: "vilan-rt-image",
+        manifest_static: "RT_IMAGE_MANIFEST",
+        item: "M185",
+    },
+    OptionalCrate {
+        directory: "vilan-image",
+        manifest_static: "IMAGE_CORE_MANIFEST",
+        item: "M185",
+    },
 ];
 
 /// The `Cargo.toml` a materialized optional crate carries — [`runtime_manifest`]'s
