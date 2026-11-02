@@ -1071,24 +1071,19 @@ fn clause_carried_by(
 /// whose type carries no `owner_scope` — called inside a closure literal that
 /// lands at a position establishing the ambient owner (`swap`, `when`, `each`,
 /// `run_with_owner`, an overlay's `attach`, a field or binding typed with the
-/// clause) builds under the owner it was MADE with, not the body's: what it
+/// clause) runs under the owner it was MADE with, not the body's: what it
 /// registers outlives the body's owner and is released with the caller's. In
-/// kolt a submenu's `probes: |…| View` built a store hold per listed name under
-/// the parent menu, piling up a set per opening (30 hovers: 12 s to close,
-/// through M172), and page actions provided "while a page has focus" were never
-/// withdrawn.
+/// kolt, page actions provided "while a page has focus" were never withdrawn.
 ///
-/// A parameter answering a `View` is warned wherever it is called inside the
-/// body — a literal nested in the body (an event handler, a body handed to a
-/// helper whose clause names another context) captures the body's owner and
-/// builds the view under the parameter's creation owner all the same (kolt's
-/// `page: (|str| View) context page_focus`, called inside `focused_page`'s body
-/// inside a `swap`). A parameter answering nothing (`void`: it is called for
-/// what it does — a provider, an effect) is warned only when the body calls it
-/// directly: the `|| provide()` wrap at `run_with_owner`; a `|K| void` callback
-/// an event handler fires is the app's own business. A parameter whose clause
-/// carries `owner_scope` is the fixed form; a call through a binding or a field
-/// is not a parameter's. User code only (C3a's domain: std's
+/// A parameter answering nothing (`void`: it is called for what it does — a
+/// provider, an effect) is warned when the body calls it directly: the
+/// `|| provide()` wrap at `run_with_owner`; a `|K| void` callback an event
+/// handler fires inside the body is the app's own business. A parameter
+/// answering a VIEW is not asked: door 2 (`closure-owner.md` §4) gives it
+/// `context owner_scope` by default, so it takes the owner at the call
+/// (`Analyzer::imply_owner_scope_on_view_parameters`). A parameter whose clause
+/// carries `owner_scope` is the fixed form; a call through a binding or a
+/// field is not a parameter's. User code only (C3a's domain: std's
 /// `MaybeSignal::bind` reacts through a plain `|T| void` by design).
 fn warn_plain_closure_parameters_under_owner_bodies(
     program: &Program,
@@ -1111,7 +1106,7 @@ fn warn_plain_closure_parameters_under_owner_bodies(
     };
     // The owner-establishing bodies: each literal landing at a clause carrying
     // `owner_scope`, with the body's name and whether the landing is `sync`.
-    let mut owner_bodies: HashMap<Id, (String, bool)> = HashMap::default();
+    let mut owner_bodies: Vec<(Id, (String, bool))> = Vec::new();
     for &(value, destination, destination_type) in landing_sites {
         let Some(Expr::Closure(closure_id)) = program.entity_map.get(&value) else {
             continue;
@@ -1122,7 +1117,10 @@ fn warn_plain_closure_parameters_under_owner_bodies(
                 destination_type.and_then(|type_id| clause_of_type(program, type_id))
             }
         };
-        if !clause.is_some_and(establishes_owner) {
+        if !clause.is_some_and(establishes_owner)
+            || library_spanned(*closure_id)
+            || owner_bodies.iter().any(|(body, _)| body == closure_id)
+        {
             continue;
         }
         let named = match destination {
@@ -1137,35 +1135,10 @@ fn warn_plain_closure_parameters_under_owner_bodies(
             ),
             Carrier::Field(..) | Carrier::Return(_) => ("this body".to_string(), false),
         };
-        owner_bodies.entry(*closure_id).or_insert(named);
-    }
-    if owner_bodies.is_empty() {
-        return;
+        owner_bodies.push((*closure_id, named));
     }
     let mut warned: HashSet<Id> = HashSet::default();
-    for node in graph.nodes() {
-        let Node::Closure(closure_id) = *node else {
-            continue;
-        };
-        if library_spanned(closure_id) {
-            continue;
-        }
-        // The nearest owner-establishing body this literal sits in, itself
-        // included: every literal nested in a body captures the body's owner.
-        let mut current = closure_id;
-        let body = loop {
-            if let Some(found) = owner_bodies.get(&current) {
-                break Some((current, found));
-            }
-            match graph.closure_parent_of(current) {
-                Some(parent) if program.closures.contains_key(&parent) => current = parent,
-                _ => break None,
-            }
-        };
-        let Some((body_id, (body, sync))) = body else {
-            continue;
-        };
-        let direct = body_id == closure_id;
+    for (closure_id, (body, sync)) in owner_bodies {
         for call in graph.calls_of(closure_id) {
             let Some(function_call) = program.function_calls.get(&call.call_id) else {
                 continue;
@@ -1182,20 +1155,15 @@ fn warn_plain_closure_parameters_under_owner_bodies(
             else {
                 continue;
             };
-            if establishes_owner(contexts) {
-                continue;
-            }
-            let builds = match builds_under_the_owner(program, *result) {
-                Some(Builds::View) => true,
-                Some(Builds::Effects) => direct,
-                None => false,
-            };
-            if !builds || !warned.insert(call.call_id) {
+            if establishes_owner(contexts)
+                || !matches!(program.type_id_to_type_map.get(result), Some(Type::Void))
+                || !warned.insert(call.call_id)
+            {
                 continue;
             }
             let name = parameter.name;
             let closure = crate::printer::type_text(program, parameter.type_id, &|type_id| type_id);
-            let sync = if *sync { "sync " } else { "" };
+            let sync = if sync { "sync " } else { "" };
             warnings.push(anchored(
                 program,
                 call.call_id,
@@ -1204,28 +1172,6 @@ fn warn_plain_closure_parameters_under_owner_bodies(
                 ),
             ));
         }
-    }
-}
-
-/// What a closure answering `result` builds under the ambient owner.
-enum Builds {
-    /// A `View`: built wherever the closure is called.
-    View,
-    /// Nothing (`void`): an effect, a provider — called for what it does.
-    Effects,
-}
-
-/// What a closure answering `result` is called for, under the ambient owner —
-/// `None` for a closure answering a value, which builds nothing there.
-fn builds_under_the_owner(program: &Program, result: TypeId) -> Option<Builds> {
-    match program.type_id_to_type_map.get(&result) {
-        Some(Type::Void) => Some(Builds::Effects),
-        Some(Type::Struct(id, _)) => program
-            .structs
-            .get(id)
-            .filter(|declaration| declaration.name == "View")
-            .map(|_| Builds::View),
-        _ => None,
     }
 }
 

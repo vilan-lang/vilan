@@ -5658,6 +5658,11 @@ pub struct Analyzer<'src> {
     /// [`Program::declared_function_contexts`].
     prepped_function_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
     declared_function_contexts: HashMap<Id, Vec<Id>>,
+    /// B677 door 2: each `fun` parameter whose declared type is a closure
+    /// type, with that type's id — the candidates for the implied
+    /// `context owner_scope` [`Analyzer::resolve_context_clauses`] gives one
+    /// answering a view, once the names its result spells have resolved.
+    prepped_view_parameters: Vec<(Id, TypeId)>,
     function_context_clause_spans: HashMap<Id, Span>,
     /// Where a `context` clause would be inserted on each function, by
     /// function id (E148) — the parser's [`crate::node::Func::signature_end`].
@@ -8287,6 +8292,7 @@ impl<'src> Analyzer<'src> {
             prepped_number_literals: Vec::new(),
             negated_number_literals: HashMap::default(),
             parameter_contexts: HashMap::default(),
+            prepped_view_parameters: Vec::new(),
             prepped_type_context_clauses: Vec::new(),
             prepped_function_context_clauses: Vec::new(),
             declared_function_contexts: HashMap::default(),
@@ -25673,6 +25679,116 @@ impl<'src> Analyzer<'src> {
                 self.parameter_contexts.insert(owner, context_ids);
             }
         }
+        self.imply_owner_scope_on_view_parameters();
+    }
+
+    /// B677 door 2 (`closure-owner.md` §4, RULED 2026-11-02): a `fun`'s
+    /// closure parameter whose declared result is a view — std's `View`, or a
+    /// `Slot` (the trait the UI places) — carries `context owner_scope` by
+    /// default, and `sync` with it. A view is built where it is SHOWN: a
+    /// builder that captured the owner it was made under registered every
+    /// effect and store hold of what it built there, and nothing released them
+    /// when the body that called it went (kolt's `with_org`, `when_loaded`, the
+    /// picker's `probes`: 12 s to close a menu after 30 hovers).
+    ///
+    /// The clause is written into the parameter's TYPE, exactly where a written
+    /// one lands (B309), so `clause_of_type`, the landing rules, the carrier
+    /// classes and the hidden-parameter threading read it as written, and the
+    /// type prints it wherever it prints. A written clause naming other
+    /// contexts keeps them after the implied one (`context (owner_scope,
+    /// page_focus)`, the order kolt's patch note writes); one already naming
+    /// `owner_scope` adds nothing. An `async`-marked parameter is left as
+    /// written: the implied `sync` would contradict it. No opt-out is spelled
+    /// until a caller wants the creation owner (§5 Q3).
+    fn imply_owner_scope_on_view_parameters(&mut self) {
+        let candidates = std::mem::take(&mut self.prepped_view_parameters);
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(owner_scope) = self.std_owner_scope_context() else {
+            return;
+        };
+        for (parameter_id, type_id) in candidates {
+            if self.async_values.contains(&parameter_id) || self.is_external_parameter(parameter_id)
+            {
+                continue;
+            }
+            let Some(Type::Closure(parameters, result, contexts, modes)) =
+                self.type_id_to_type_map.get(&type_id).cloned()
+            else {
+                continue;
+            };
+            if !self.answers_a_view(result) {
+                continue;
+            }
+            self.sync_values.insert(parameter_id);
+            if contexts.contains(&owner_scope) {
+                continue;
+            }
+            let mut implied = Vec::with_capacity(contexts.len() + 1);
+            implied.push(owner_scope);
+            implied.extend(contexts);
+            self.write_type_slot(
+                type_id,
+                Type::Closure(parameters, result, implied.clone(), modes),
+            );
+            self.parameter_contexts.insert(parameter_id, implied);
+        }
+    }
+
+    /// Whether the parameter is an `external` function's — a host function
+    /// threads no hidden argument.
+    fn is_external_parameter(&self, parameter_id: Id) -> bool {
+        self.parameters
+            .get(&parameter_id)
+            .is_some_and(|parameter| self.external_functions.contains_key(&parameter.function_id))
+    }
+
+    /// B677 door 2: whether a closure answering `result` builds a view —
+    /// std's `View`, or a value of std's `Slot` trait (a bare `Slot`, a binder
+    /// bounded by it, a `dyn Slot`).
+    fn answers_a_view(&self, result: TypeId) -> bool {
+        let declared_in_std = |id: Id| {
+            self.source_of_id(id)
+                .is_some_and(|source| self.std_sources.contains(&source))
+        };
+        let is_slot = |trait_id: Id| {
+            self.traits
+                .get(&trait_id)
+                .is_some_and(|trait_| trait_.name == "Slot" && declared_in_std(trait_.id))
+        };
+        match self.type_id_to_type_map.get(&result) {
+            Some(Type::Struct(id, _)) => self
+                .structs
+                .get(id)
+                .is_some_and(|struct_| struct_.name == "View" && declared_in_std(struct_.id)),
+            Some(Type::Trait(id, _) | Type::Dyn(id, _)) => is_slot(*id),
+            Some(Type::Generic(constraint)) => self
+                .generic_bound_traits(*constraint)
+                .into_iter()
+                .any(|(trait_id, _)| is_slot(trait_id)),
+            _ => false,
+        }
+    }
+
+    /// std's `owner_scope` context — `std::reactive`'s module binding, the
+    /// ambient owner — when the program loaded it.
+    fn std_owner_scope_context(&self) -> Option<Id> {
+        let std_scope = self
+            .module_id_by_name
+            .get("std")
+            .and_then(|std_id| self.modules.get(std_id))
+            .and_then(|module| self.scopes.get(&module.body.1))?;
+        let reactive = std_scope
+            .name_to_id_map
+            .get("reactive")
+            .and_then(|id| self.modules.get(id))
+            .and_then(|module| self.scopes.get(&module.body.1))?;
+        let binding = *reactive.name_to_id_map.get("owner_scope")?;
+        Some(match self.expr_id_to_expr_map.get(&binding) {
+            Some(Expr::Local(inner)) => *inner,
+            _ => binding,
+        })
     }
 
     /// A `context` clause rendered as it is written — ` context owner_scope`,
@@ -44705,6 +44821,13 @@ impl<'src> Analyzer<'src> {
         // shape produced before the clause moved into the type.
         if let Some(names) = clause {
             self.record_type_context_clause(type_id, names, type_scope_id, Some(parameter_id));
+        }
+        // B677 door 2: a `fun`'s closure-typed parameter may answer a view,
+        // which only the resolved result type says.
+        if implicit_generic_owner.is_some()
+            && declared_type.is_some_and(|node| clause_target_is_a_closure(&node.0))
+        {
+            self.prepped_view_parameters.push((parameter_id, type_id));
         }
         // A tuple binder is not referenceable by name; `_` keeps it positional.
         let name = match pattern {
