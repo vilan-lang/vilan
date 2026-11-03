@@ -523,3 +523,38 @@ class = "ci"
 ratio = 1.01
 reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0162 of the ceiling at next c1cfaedf where the limit stood at x1.0140"
 item = "B691"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0082 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0086 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0073 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0073 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "M191 (lane std-56): HashMap and HashSet over the one-table NativeMap<K, V> - the map helpers' new names and layout, slot/get_or_insert and the pending-mark table - which every program reaching std's maps analyzes; CI read x1.0280 of the ceiling at next cbcddd34 where the limit stood at x1.0272 (http-56's M176 row on the same subject is a separate, measured cause)"
+item = "M191"

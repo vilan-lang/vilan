@@ -10939,6 +10939,57 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     "vilan_rt::http::read_body(({request}).clone(), ({response}).clone(), {limit})"
                 )));
             }
+            // M176: the body as a stream — a future per piece, retained handles
+            // as `__http_read_body`'s.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_body_next",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let response = self.place_argument(argument_ids, 1, depth)?;
+                let limit = self.value_argument(argument_ids, 2, depth)?;
+                let size = self.value_argument(argument_ids, 3, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::body_next(({request}).clone(), ({response}).clone(), {limit}, \
+                     {size})"
+                )));
+            }
+            // M176: the one-way-of-reading claim, and the refusal `std::http`
+            // answers a fault with (M177's malformed form too).
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_claim_body",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let how = self.place_argument(argument_ids, 1, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::claim_body(&({request}), &{how})"
+                )));
+            }
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_refuse",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let response = self.place_argument(argument_ids, 1, depth)?;
+                let status = self.value_argument(argument_ids, 2, depth)?;
+                let message = self.place_argument(argument_ids, 3, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::refuse(&({request}), &({response}), {status}, &{message})"
+                )));
+            }
+            // M177: the multipart delimiter search.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_find",
+            } => {
+                let haystack = self.place_argument(argument_ids, 0, depth)?;
+                let needle = self.place_argument(argument_ids, 1, depth)?;
+                let from = self.value_argument(argument_ids, 2, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::find_bytes(&({haystack}), &({needle}), {from})"
+                )));
+            }
             ExternBinding::Function {
                 module: None,
                 symbol: "__http_body_left_unread",
