@@ -26,6 +26,10 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**E358: `scripts/lsp-latency.py` keeps every edit sample's own phase lines - one `[vilan phase] lsp-context` line per analysis the server ran, and the core's `hot-set` line - counts the sample's analyses from them, and lists under the table every sample over 1.5x its row's median instructions, or with more analyses than its median, WITH those lines, so an outlier names its cause.** A `parse repair` sample on the N186 exhibit read 50.2 G instructions against the row's 17.4 G median and nothing recorded said what ran. The JSON carries the lines (`phase`) per sample; the analysis count was read from the whole stderr file's running total and is now the sample's own window. Pins: `perf_gate_script::e358_the_lsp_harness_names_an_outliers_analyses`. Tracker E358.
+---
+
+<!-- family: tooling -->
 **E357: why a file formatted alone re-fills no comment its tree re-fills, said and pinned — a project changes two things about `vilan fmt`, its `[fmt]` keys (`wrap_comments`, `comment_width`) and its `generated` root, and nothing else.** A copy of std's `image.vl` in a scratch directory reflowed nothing while `vilan fmt` in std re-filled 13 lines: std's `vilan.toml` opts into `wrap_comments`, and a lone file has no manifest above it, so it takes the default (off, E205/E215's opt-in, ruled per package). That is the design, not a skipped pass, so nothing in the formatter changed; what was missing was the sentence and the pin. Measured over the estate: every kolt file formatted alone matches the same file formatted in kolt's tree (its manifest has no `[fmt]`; the one difference is `src/lucide/lib.vl`, a `generated` product the tree skips), and std alone matches std in its tree on the committed sources. Docs: appendix/cli.md (`vilan fmt`, what a project changes). Pins: `fmt_wrap_comments::e357_*` (a lone file, a file under a manifest without `[fmt]` and one under a manifest with a prelude and a default entry all byte-identical; alone, opted in, and alone with the opted-in manifest beside it - the fill only where the manifest asks). Tracker E357.
 ---
 
