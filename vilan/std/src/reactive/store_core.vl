@@ -23,8 +23,8 @@ import pkg::reactive::{
 	Subscription,
 	also_releasing,
 	batch,
-	defer_to_owner,
 	observe,
+	on_cleanup,
 };
 import pkg::shared::{ Shared, fresh_identity };
 
@@ -1114,11 +1114,13 @@ export impl StoreSome<type P> {
 	/// was built over), and a write then lands nowhere. Refuses a variant that is
 	/// not live now.
 	///
-	/// The fallback is taken by a KEEPER (B693): a feed on the variant's flag, which
-	/// copies the payload once, in the write that ends the variant, before it
-	/// lands. It goes with the ambient owner (the body's, under `when_live`);
-	/// outside every owner it stands for the store's life (`register_with_owner`'s
-	/// rule).
+	/// The fallback is taken by a KEEPER (B693): a feed on the variant's flag,
+	/// which copies the payload once, in the write that ends the variant, before it
+	/// lands. It goes with the ambient owner — the body's, under `when_live` —
+	/// through `on_cleanup`, so an owner is REQUIRED (B696): outside every owner
+	/// the keeper would stand for the store's life, and the call is refused at
+	/// compile time (`owner_scope` read without an enclosing `run`), as
+	/// `on_cleanup`'s is.
 	fun assume(self): Store<P> {
 		let lend = self.lend;
 		mut reached = false;
@@ -1146,7 +1148,7 @@ export impl StoreSome<type P> {
 		let root = self.root;
 		let gate = self.gate;
 		attach_feed(root, gate, keeper);
-		defer_to_owner(|| detach_feed(root, gate, keeper.id));
+		on_cleanup(|| detach_feed(root, gate, keeper.id));
 		Store<P> {
 			root = self.root,
 			path = self.path,

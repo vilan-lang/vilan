@@ -268,7 +268,12 @@ fun main() {
 
 A payload variant's handle also has `live()`, its discriminant as a `StoreFlag`,
 and `assume()`, the payload as a `Store<P>` for code that only runs while the
-variant is live.
+variant is live. `assume()` needs an owner — it stands a keeper on the variant
+that goes with the ambient owner, as an `on_cleanup` does — so a call outside
+every owner is refused at compile time ("context `owner_scope` is read here,
+but this code can be reached without an enclosing `run`"); `when_live` calls it
+inside its body's owner, and code of your own wraps it in `run_with_owner` or
+`comp`.
 
 ### when_live — rebuild only on the variant
 

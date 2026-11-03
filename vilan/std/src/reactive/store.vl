@@ -1778,7 +1778,8 @@ export impl RemoteStoreSome<type P> {
 	}
 
 	/// This handle as a plain `RemoteStore<P>`, for a body that runs only while the
-	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526).
+	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526);
+	/// an owner is required, as there (B696).
 	fun assume(self): RemoteStore<P> {
 		RemoteStore { local = self.local.assume(), at = self.at }
 	}
