@@ -112,7 +112,12 @@ the trait's member, every implementation of it takes the hidden parameter
 whether or not it writes the attribute, and every call naming the member
 passes a location — a static call, a call through a generic bound and a call
 through a `dyn` object's table alike. An implementation that marks a member
-its trait does not declare tracking is refused. std's `panic`, `assert`, `unwrap`,
+its trait does not declare tracking is refused, and so is the attribute on a
+trait member the compiler calls with no argument list to pass a site through:
+an operator's member (`add`, `eq`, `lt`, … — an operator resolves its trait by
+name, so a program's own `trait Add` is one), a `to_string` answering `str`
+(a concatenation or an i-string hole renders a bounded operand through it),
+`Drop::drop` and `Try`'s members. std's `panic`, `assert`, `unwrap`,
 `unwrap_err`, `expect`, `expect_err` and `List::remove`/`insert` are
 tracking, and so is every subscript: `xs[i]` out of bounds reports the
 subscript's own site.

@@ -7462,6 +7462,36 @@ fn operator_symbol(op: BinaryOp) -> &'static str {
     }
 }
 
+/// Every `(trait name, member name, spelling)` an overloaded operator calls —
+/// [`operator_trait_method`] over each operator, for a reader that asks the
+/// other way round (B646's guard: such a member is called with no argument
+/// list, so it cannot take its caller's location).
+pub(crate) fn operator_members() -> impl Iterator<Item = (&'static str, &'static str, &'static str)>
+{
+    [
+        BinaryOp::Add,
+        BinaryOp::Sub,
+        BinaryOp::Mul,
+        BinaryOp::Div,
+        BinaryOp::Rem,
+        BinaryOp::Shl,
+        BinaryOp::Shr,
+        BinaryOp::BitAnd,
+        BinaryOp::BitXor,
+        BinaryOp::BitOr,
+        BinaryOp::Eq,
+        BinaryOp::Lt,
+        BinaryOp::Gt,
+        BinaryOp::LtEq,
+        BinaryOp::GtEq,
+    ]
+    .into_iter()
+    .filter_map(|op| {
+        operator_trait_method(op)
+            .map(|(trait_name, member)| (trait_name, member, operator_symbol(op)))
+    })
+}
+
 /// The `(trait name, method name)` an arithmetic operator dispatches to, e.g.
 /// `+` -> `("Add", "add")`. Returns `None` for comparison/logical operators,
 /// which are not overloadable.
