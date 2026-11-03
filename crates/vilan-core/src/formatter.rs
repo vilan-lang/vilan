@@ -13,10 +13,10 @@ use std::borrow::Cow;
 use std::cell::Cell;
 
 use crate::node::{
-    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
-    GenericArguments, GenericParameters, If, IfSpelling, ImplSelector, ImportBranch,
-    ImportModifier, ImportTail, ItemLabels, Node, NodeIfBranch, NodeList, Pattern,
-    StructInitializerField,
+    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, EVERY_IMPL_SUBJECT, ExportScope, Exposure,
+    ExternBinding, Func, GLOB_IMPORT_LEAF, GenericArguments, GenericParameters, If, IfSpelling,
+    ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels, Node, NodeIfBranch,
+    NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -675,9 +675,57 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
 /// TRAIT` when the selector names its block by the trait (B455). The token
 /// path keys on the same run of tokens, so the two keys agree.
 fn selector_written_text<'src>(selector: &ImplSelector<'src>) -> Cow<'src, str> {
+    let subject = canonical_selector_subject(selector);
     match &selector.trait_text {
-        Some(trait_text) => Cow::Owned(format!("{} with {trait_text}", selector.subject_text)),
-        None => selector.subject_text.clone(),
+        Some(trait_text) => Cow::Owned(format!("{subject} with {trait_text}")),
+        None => subject,
+    }
+}
+
+/// The subject a selector PRINTS: its text, except the retired whole-subject
+/// `_`, which prints as `*` (A181, RULED 2026-11-03 — `(impl _)` is read as
+/// `(impl *)` for one release and `vilan fmt` rewrites it). `_` inside a type
+/// (`(impl List<_>)`) is a hole and prints as written.
+fn canonical_selector_subject<'src>(selector: &ImplSelector<'src>) -> Cow<'src, str> {
+    match selector.writes_the_retired_whole_subject() {
+        true => Cow::Borrowed(EVERY_IMPL_SUBJECT),
+        false => selector.subject_text.clone(),
+    }
+}
+
+/// The token twin of [`canonical_selector_subject`]: a subject run whose
+/// WHOLE type is `_` — alone, or before the ` with TRAIT` the run carries —
+/// becomes `*`, so the safety net reduces the source and its reprint to the
+/// same tokens.
+fn canonical_selector_tokens(subject: &mut [Token<'_>]) {
+    let whole = matches!(
+        subject,
+        [Token::Ident(ANONYMOUS_TYPE_BINDER)]
+            | [
+                Token::Ident(ANONYMOUS_TYPE_BINDER),
+                Token::Ident("with"),
+                ..
+            ]
+    );
+    if whole {
+        subject[0] = Token::Op(EVERY_IMPL_SUBJECT);
+    }
+}
+
+/// A181: the branch a `::` continuation leads to, seen through a one-member
+/// brace set holding a lone selector — `a::{ (impl T) }` IS `a::(impl T)`, the
+/// one-selector spelling, exactly as `a::{ b }` is `a::b`. Only a CONTINUATION
+/// collapses: a selector has no spelling at a statement's head, where there is
+/// no module for it to select from (the parser refuses one there).
+fn selector_continuation<'branch, 'src>(
+    child: &'branch TokenBranch<'src>,
+) -> &'branch TokenBranch<'src> {
+    match child {
+        TokenBranch::Set(branches) => match branches.as_slice() {
+            [only @ TokenBranch::Selector(..)] => only,
+            _ => child,
+        },
+        _ => child,
     }
 }
 
@@ -731,9 +779,10 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
             },
             Box::new(BranchKey::End),
         ),
-        TokenBranch::Path(name, Some(child), _) => {
-            BranchKey::Path((*name).to_string(), Box::new(branch_key(child)))
-        }
+        TokenBranch::Path(name, Some(child), _) => BranchKey::Path(
+            (*name).to_string(),
+            Box::new(branch_key(selector_continuation(child))),
+        ),
         // The marker sorts with the name it marks — `#hidden` lands beside
         // `hidden` rather than in a block of its own — and still keys apart,
         // because the `#` is in the rendered name.
@@ -781,7 +830,7 @@ fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey 
                 other => RootRank::Dependency(other.to_string()),
             };
             let rest = match child {
-                Some(child) => branch_key(child),
+                Some(child) => branch_key(selector_continuation(child)),
                 None => BranchKey::End,
             };
             (root, rest)
@@ -861,14 +910,23 @@ fn parse_token_branch<'src>(
     // B318: the reach marker wraps whatever follows it, exactly as it does in
     // the real grammar.
     if tokens.get(index) == Some(&Token::Hash) {
-        let (inner, next) = parse_token_branch(tokens, index + 1)?;
+        // `#(impl T)` — the marker on a SELECTOR (B318 S4), which the path
+        // production reads past the `#` exactly as the parser does.
+        let (inner, next) = parse_token_selector(tokens, index + 1)
+            .or_else(|| parse_token_branch(tokens, index + 1))?;
         return Some((TokenBranch::Reach(Box::new(inner)), next));
+    }
+    // A182: `m::*`, the glob leaf — a leaf spelled with the set operator.
+    if tokens.get(index) == Some(&Token::Op(GLOB_IMPORT_LEAF)) {
+        return Some((TokenBranch::Path(GLOB_IMPORT_LEAF, None, None), index + 1));
     }
     if let Some(name) = token_name(tokens, index) {
         let mut next = index + 1;
         let mut alias = None;
         let continuation = if tokens.get(next) == Some(&Token::Op("::")) {
-            let (child, after) = parse_token_branch(tokens, next + 1)?;
+            // A181: `a::(impl T)`, the one-selector set without its braces.
+            let (child, after) = parse_token_selector(tokens, next + 1)
+                .or_else(|| parse_token_branch(tokens, next + 1))?;
             next = after;
             Some(Box::new(child))
         } else {
@@ -910,7 +968,8 @@ fn parse_token_branch<'src>(
             let mut after = next + 1;
             let mut alias = None;
             let continuation = if tokens.get(after) == Some(&Token::Op("::")) {
-                let (child, past) = parse_token_branch(tokens, after + 1)?;
+                let (child, past) = parse_token_selector(tokens, after + 1)
+                    .or_else(|| parse_token_branch(tokens, after + 1))?;
                 after = past;
                 Some(Box::new(child))
             } else {
@@ -990,6 +1049,7 @@ fn parse_token_selector<'src>(
             next += 1;
         }
     }
+    canonical_selector_tokens(&mut subject);
     let key = selector_key_text(&subject.iter().map(Token::to_string).collect::<String>());
     Some((TokenBranch::Selector(key, subject, members), next))
 }
@@ -1035,10 +1095,13 @@ fn parse_import_statement<'src>(
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
     match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, child, alias) => {
-            out.push(Token::Ident(name));
+            out.push(match *name {
+                GLOB_IMPORT_LEAF => Token::Op(GLOB_IMPORT_LEAF),
+                name => Token::Ident(name),
+            });
             if let Some(child) = child {
                 out.push(Token::Op("::"));
-                emit_branch_tokens(child, out);
+                emit_branch_tokens(selector_continuation(child), out);
             }
             if let Some(alias) = alias {
                 out.push(Token::Ident("as"));
@@ -5808,7 +5871,7 @@ impl<'src> Printer<'src> {
                     ImportTail::Continue(child) => {
                         self.out.push_str("::");
                         self.split = split;
-                        self.print_import_branch(child, sort);
+                        self.print_import_branch(self.lone_selector_of(child), sort);
                     }
                     // `import a::b as b;` renames `b` to `b` — it binds
                     // exactly what the plain import binds, so the plain import
@@ -5829,7 +5892,7 @@ impl<'src> Printer<'src> {
             // step with the first.
             ImportBranch::Selector(selector) => {
                 self.out.push_str("(impl ");
-                self.out.push_str(&selector.subject_text);
+                self.out.push_str(&canonical_selector_subject(selector));
                 if let Some(trait_text) = &selector.trait_text {
                     self.out.push_str(" with ");
                     self.out.push_str(trait_text);
@@ -5875,9 +5938,11 @@ impl<'src> Printer<'src> {
                 // `Option`), and a comment inside them, which is anchored to the
                 // set's split form. `emit_branch_tokens` mirrors this collapse so
                 // the safety net reduces both spellings to the same tokens.
-                // A selector has no unbraced spelling at all — the parser
-                // refuses `import a::(impl T);` — so a one-member set holding
-                // one keeps its braces, the way a lone `self` does.
+                // A lone selector collapses one level up, where the `::` that
+                // leads to it is printed ([`Self::lone_selector_of`]): it has an
+                // unbraced spelling only after a module path (A181), so a set
+                // reaching here still holding one is a statement's head, which
+                // keeps its braces.
                 if let [only] = order.as_slice()
                     && !inside_comment
                     && !matches!(only, ImportBranch::Path("self", ..))
@@ -5903,6 +5968,31 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" }");
                 }
             }
+        }
+    }
+
+    /// A181: what a `::` continuation prints — the selector itself when the
+    /// continuation is a one-member set holding a lone selector (`a::{ (impl
+    /// T) }` IS `a::(impl T)`, the one-selector spelling, as `a::{ b }` is
+    /// `a::b`), else the continuation as it is. A comment inside the braces
+    /// keeps them, as it does for any one-member set: it is anchored to the
+    /// split form. [`selector_continuation`] is the token side's twin.
+    fn lone_selector_of<'branch>(
+        &self,
+        child: &'branch ImportBranch<'src>,
+    ) -> &'branch ImportBranch<'src> {
+        let ImportBranch::Set(branches) = child else {
+            return child;
+        };
+        let [only @ ImportBranch::Selector(selector)] = branches.as_slice() else {
+            return child;
+        };
+        let inside_comment = self
+            .import_set_extent(&[selector.span])
+            .is_some_and(|extent| self.comment_outside_elements(extent, &[selector.span]));
+        match inside_comment {
+            true => child,
+            false => only,
         }
     }
 
@@ -15312,16 +15402,72 @@ mod import_sorting {
         );
     }
 
-    // A selector has no unbraced spelling — `import a::(impl T);` is refused —
-    // so a one-member set holding one keeps its braces where a one-member set
-    // holding a NAME collapses (kolt.local 005).
+    // A181: a one-member set holding a selector collapses to the BARE form —
+    // `a::{ (impl T) }` IS `a::(impl T)`, the one-selector spelling, exactly as
+    // a one-member set holding a NAME collapses (kolt.local 005) — so braces
+    // appear only with two or more members. The bare form is canonical already
+    // and reprints as written; nested under a set member it collapses too; a
+    // reach-marked selector does as it did; a comment inside the braces keeps
+    // them (it is anchored to the split form).
     #[test]
-    fn a_one_member_set_holding_a_selector_keeps_its_braces() {
+    fn a_one_member_set_holding_a_selector_takes_the_bare_form() {
         assert_sorts(
             "import pkg::a::{ (impl Style) };\n",
-            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::(impl Style);\n",
+        );
+        assert_sorts(
+            "import pkg::a::(impl Style);\n",
+            "import pkg::a::(impl Style);\n",
         );
         assert_sorts("import pkg::a::{ Style };\n", "import pkg::a::Style;\n");
+        assert_sorts(
+            "import pkg::{ a::{ (impl Style) }, b };\n",
+            "import pkg::{ a::(impl Style), b };\n",
+        );
+        assert_sorts(
+            "import pkg::a::{ #(impl Style) };\n",
+            "import pkg::a::#(impl Style);\n",
+        );
+        assert_sorts(
+            "import pkg::a::{ (impl Style), (impl Theme) };\n",
+            "import pkg::a::{ (impl Style), (impl Theme) };\n",
+        );
+    }
+
+    // A182 (Q8): the glob re-export reprints as written and sorts with its
+    // path; the safety net reads its `*` as the leaf it is.
+    #[test]
+    fn a_glob_reexport_round_trips_and_sorts() {
+        assert_sorts(
+            "export import std::web::prelude::*;\n",
+            "export import std::web::prelude::*;\n",
+        );
+        assert_sorts(
+            "export import pkg::a::(impl Thing);\nexport import std::web::prelude::*;\n",
+            "export import std::web::prelude::*;\nexport import pkg::a::(impl Thing);\n",
+        );
+    }
+
+    // A181: the bare form with a member tail, and with the absolute subject the
+    // quick fix writes (E359), parses and prints as written (`assert_sorts`
+    // holds the reprint idempotent and un-bailed), and the two spellings of one
+    // import sort to one place.
+    #[test]
+    fn the_bare_selector_form_round_trips_and_is_idempotent() {
+        for source in [
+            "import pkg::a::(impl Style)::ghost;\n",
+            "import pkg::a::(impl Style)::{ ghost, solid };\n",
+            "import pkg::app_overlay::(impl pkg::lib::overlay::Overlay);\n",
+            "import pkg::a::(impl (pkg::d::T, std::e::U));\n",
+            "import pkg::a::(impl *);\n",
+            "import pkg::a::(impl Box with One);\n",
+        ] {
+            assert_sorts(source, source);
+        }
+        assert_sorts(
+            "import pkg::b::Thing;\nimport pkg::a::{ (impl Style)::{ ghost } };\n",
+            "import pkg::a::(impl Style)::ghost;\nimport pkg::b::Thing;\n",
+        );
     }
 
     // A selector's METHOD set sorts like any other, and a lone member takes the
@@ -15330,11 +15476,11 @@ mod import_sorting {
     fn selector_members_sort_and_a_lone_member_unbraces() {
         assert_sorts(
             "import pkg::a::{ (impl List<i32>)::{ last, first } };\n",
-            "import pkg::a::{ (impl List<i32>)::{ first, last } };\n",
+            "import pkg::a::(impl List<i32>)::{ first, last };\n",
         );
         assert_sorts(
             "import pkg::a::{ (impl List<i32>)::{ first } };\n",
-            "import pkg::a::{ (impl List<i32>)::first };\n",
+            "import pkg::a::(impl List<i32>)::first;\n",
         );
     }
 
@@ -15350,18 +15496,55 @@ mod import_sorting {
     }
 
     // The placeholder round-trips in every position B318 gives it: an argument
-    // (`List<_>`), a nested one, an independent pair, and the whole-module
-    // `(impl _)`.
+    // (`List<_>`), a nested one, an independent pair — and the whole-module
+    // selector is `(impl *)` (A181, RULED 2026-11-03), which round-trips too.
     #[test]
     fn the_selector_placeholder_round_trips() {
         for source in [
-            "import pkg::a::{ (impl _) };\n",
-            "import pkg::a::{ (impl List<_>) };\n",
-            "import pkg::a::{ (impl List<Option<_>>) };\n",
-            "import pkg::a::{ (impl Map<_, _>) };\n",
+            "import pkg::a::{ Thing, (impl *) };\n",
+            "import pkg::a::(impl List<_>);\n",
+            "import pkg::a::(impl List<Option<_>>);\n",
+            "import pkg::a::(impl Map<_, _>);\n",
+            "import pkg::a::(impl * with Display);\n",
         ] {
             assert_sorts(source, source);
         }
+    }
+
+    // A181: `(impl _)` WHOLE is the retired spelling of `(impl *)` and fmt
+    // rewrites it — alone, with a `with` trait, beside names, bare or marked.
+    // `_` INSIDE a type is a hole and stays (`(impl List<_>)`).
+    #[test]
+    fn the_retired_whole_selector_is_rewritten_to_the_star() {
+        for (source, expected) in [
+            (
+                "import pkg::a::{ (impl _) };\n",
+                "import pkg::a::(impl *);\n",
+            ),
+            (
+                "import std::display::{ Display, (impl _) };\n",
+                "import std::display::{ Display, (impl *) };\n",
+            ),
+            (
+                "import pkg::a::{ (impl _ with Display) };\n",
+                "import pkg::a::(impl * with Display);\n",
+            ),
+            (
+                "import pkg::b::{ #(impl _) };\n",
+                "import pkg::b::#(impl *);\n",
+            ),
+            (
+                "import pkg::a::{ (impl List<_>) };\n",
+                "import pkg::a::(impl List<_>);\n",
+            ),
+        ] {
+            assert_sorts(source, expected);
+        }
+        // The safety net reads the two spellings as one import.
+        assert_eq!(
+            normalize(raw_tokens("import pkg::a::{ (impl _) };\n")),
+            normalize(raw_tokens("import pkg::a::(impl *);\n")),
+        );
     }
 
     // B455: `with TRAIT` names the block by its trait and round-trips with a
@@ -15370,9 +15553,9 @@ mod import_sorting {
     #[test]
     fn a_selector_naming_its_trait_round_trips_and_sorts() {
         for source in [
-            "import pkg::a::{ (impl Box with One) };\n",
-            "import pkg::a::{ (impl Box with One)::describe };\n",
-            "import pkg::a::{ (impl Box<_> with Feed<i32>) };\n",
+            "import pkg::a::(impl Box with One);\n",
+            "import pkg::a::(impl Box with One)::describe;\n",
+            "import pkg::a::(impl Box<_> with Feed<i32>);\n",
         ] {
             assert_sorts(source, source);
         }
@@ -15889,13 +16072,13 @@ mod organize {
     fn an_emptied_statement_rescued_by_one_subject_becomes_a_selector() {
         assert_eq!(
             organize_selecting("import pkg::a::b;\n", &["b"], &[("a", "Style")]),
-            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::(impl Style);\n",
         );
         // A brace set's common prefix is the path before it, so a set whose
         // members all died rewrites the same way.
         assert_eq!(
             organize_selecting("import pkg::a::{ b, c };\n", &["b", "c"], &[("a", "Style")]),
-            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::(impl Style);\n",
         );
     }
 
@@ -15914,7 +16097,7 @@ mod organize {
         );
         assert_eq!(
             organize("import pkg::a::{ Thing, (impl Thing) };\n", &["Thing"]),
-            "import pkg::a::{ (impl Thing) };\n",
+            "import pkg::a::(impl Thing);\n",
         );
         // Every element dead: the statement goes, and the module rescue is a
         // second question it was not offered here.

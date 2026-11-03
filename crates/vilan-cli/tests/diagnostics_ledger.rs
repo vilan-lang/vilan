@@ -476,8 +476,8 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/vilan-core/src/parsing.rs",
-        "IMPL_SELECTOR_IS_A_BRACE_ELEMENT",
-        "an `impl` selector is a brace-set ELEMENT, because it selects",
+        "IMPL_SELECTOR_FOLLOWS_A_MODULE",
+        "an `impl` selector takes implementations out of a",
     ),
     (
         "crates/vilan-core/src/parsing.rs",

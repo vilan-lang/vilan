@@ -59,10 +59,10 @@ use crate::lexing;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, ComprehensionBinding, Convention,
     CssBody, CssDeclaration, CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem,
-    EnumVariant, ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
-    GenericParameters, If, IfSpelling, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, Reactivity,
-    ServiceAttr, StructField, TupleBound,
+    EnumVariant, ExportScope, Exposure, ExternBinding, Func, GLOB_IMPORT_LEAF, GenericArguments,
+    GenericParameter, GenericParameters, If, IfSpelling, ImplSelector, ImportBranch,
+    ImportModifier, ImportTail, ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList,
+    Parameter, Pattern, Reactivity, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -115,7 +115,8 @@ fn collect_selector_binders(node: &Spanned<Node<'_>>, into: &mut Vec<Span>) {
                 collect_selector_binders(bound, into);
             }
         }
-        Node::AccessorWithGenerics(_, arguments) => {
+        // A181: a qualified head's arguments too (`(impl std::list::List<_>)`).
+        Node::AccessorWithGenerics(_, arguments) | Node::StaticAccessor(_, _, Some(arguments)) => {
             for argument in &arguments.0 {
                 collect_selector_binders(argument, into);
             }
@@ -1362,27 +1363,30 @@ fn is_foreign_arrow(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
     }
 }
 
-/// The rule an impl selector written OUTSIDE a brace set breaks (B318 S3,
-/// `proposal/visibility.md` §2.5). Curated (diagnostics-standard.md B6): the
-/// prohibition explains itself and names the sanctioned spelling.
+/// The rule an impl selector written with no MODULE before it breaks (B318
+/// S3; A181 made the one-selector set's bare form legal, `import-foundation.md`
+/// §2 row 10). Curated (diagnostics-standard.md B6): the prohibition explains
+/// itself and names the sanctioned spelling.
 ///
-/// The selector is a brace-set ELEMENT and nothing else — it binds no name, so
-/// it has no leaf position to occupy, and `import a::(impl T);` would read as a
-/// statement whose whole payload is a filter. Without this the `(` falls
-/// through both halves of the path grammar and the statement reports at column
-/// one, which is the failure mode §2.5 says a build of this slice must not
-/// reproduce.
-const IMPL_SELECTOR_IS_A_BRACE_ELEMENT: &str = "an `impl` selector is a brace-set ELEMENT, because it selects \
-     implementations rather than binding a name: write `import a::{ (impl T) };`, and put any names \
-     it travels with in the same set — `import a::{ Thing, (impl Thing) };`";
+/// A selector is a projection OF a module — `a::(impl T)` takes `a`'s blocks
+/// whose subject is `T` — so it stands after a module path, bare
+/// (`import a::(impl T);`, the one-selector spelling, as `import a::b;` is the
+/// one-name spelling of `import a::{ b };`) or inside a brace set beside the
+/// names it travels with. At the head of a statement there is no module for it
+/// to select from. Without this the `(` falls through both halves of the path
+/// grammar and the statement reports at column one, which is the failure mode
+/// `visibility.md` §2.5 says a build of the selector must not reproduce.
+const IMPL_SELECTOR_FOLLOWS_A_MODULE: &str = "an `impl` selector takes implementations out of a \
+     MODULE, so a module path comes before it: write `import a::(impl T);`, and put any names it \
+     travels with in a set beside it — `import a::{ Thing, (impl Thing) };`";
 
 /// The shape an `(impl …)` selector must have (B318 S3). Curated
 /// (diagnostics-standard.md B6): stated at the token the selector stopped on,
 /// so a typo inside one reports where it is rather than at the `import`
 /// keyword (`proposal/visibility.md` §2.5's first pinned grammar fact).
 const IMPL_SELECTOR_SHAPE: &str = "an `impl` selector is `(impl TYPE)`, optionally followed by \
-     `::name` or `::{ a, b }`: `import a::{ (impl List<i32>)::{ first, last } };`. `_` stands for any \
-     type in an argument position (`(impl List<_>)`), and `(impl _)` selects every implementation the \
+     `::name` or `::{ a, b }`: `import a::(impl List<i32>)::{ first, last };`. `_` stands for any \
+     type in an argument position (`(impl List<_>)`), and `(impl *)` selects every implementation the \
      module declares";
 
 /// The rule a binder written inside a selector breaks (B318, RULED
@@ -10821,9 +10825,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.expect(&Token::Import)?;
         // B320: one statement's record, never the previous statement's.
         self.import_path_failure = None;
+        self.refuse_a_selector_with_no_module();
         let path = self.parse_namespace_path()?;
         let modifier = self.parse_import_modifier();
         Some((Node::Import(path, modifier), self.span_from(start)))
+    }
+
+    /// [`IMPL_SELECTOR_FOLLOWS_A_MODULE`]: a selector — marked or not, `#(impl
+    /// T)` is the same element — written where an `import`'s path begins,
+    /// refused where it is written rather than at column one
+    /// (`visibility.md` §2.5). The statement still parses.
+    fn refuse_a_selector_with_no_module(&mut self) {
+        if self.at_impl_selector() || self.at_reach_marked_impl_selector() {
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(IMPL_SELECTOR_FOLLOWS_A_MODULE),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
     }
 
     /// The trailing `only` of an `import` statement (B318 §2.4), or
@@ -11109,18 +11129,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(path) = self.attempt(Self::parse_namespace_single_path) {
             return Some(path);
         }
-        // A selector OUTSIDE a set: refused where it is written rather than at
-        // column one, and then parsed anyway so the rest of the statement is
-        // still read (`visibility.md` §2.5). Marked or not — `#(impl T)` is the
-        // same element and earns the same rule.
-        if self.at_impl_selector() || self.at_reach_marked_impl_selector() {
-            let span = self.here_span();
-            self.errors.push(ParseError {
-                span,
-                reason: ParseErrorReason::Rule(IMPL_SELECTOR_IS_A_BRACE_ELEMENT),
-                context: Vec::new(),
-                hint: None,
-            });
+        // A selector at the HEAD of a statement — the one place this
+        // production can meet one, since a `::` continuation reads its own
+        // ([`Parser::parse_namespace_single_path`]) and a set its elements.
+        // Parsed so the rest of the statement is still read; `import` has
+        // already refused it where it is written
+        // ([`Parser::refuse_a_selector_with_no_module`]), and `use` refuses
+        // every selector it holds.
+        if self.at_impl_selector() {
             return self.parse_namespace_set_element();
         }
         let branch = self.parse_namespace_set();
@@ -11170,9 +11186,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         let start = self.position;
         self.expect_ctrl('(')?;
         self.expect(&Token::Impl)?;
-        let subject = match self.parse_type() {
-            Some(subject) => subject,
-            None => return Some(self.selector_refusal(start, None, Vec::new())),
+        // A181 (RULED 2026-11-03): `(impl *)` — every block the module
+        // declares. `*` is EVERYTHING, a set (`export *;`, `::*`), where `_`
+        // is a hole inside a type, and it stands only as the WHOLE subject:
+        // `List<*>` is not a type. It elaborates to the anonymous binder over
+        // the whole subject — a hole that unifies with every block, which is
+        // what selecting all of them is — and its text stays `*`, so the
+        // formatter reprints what was written.
+        let subject = if self.peek_is_op("*") {
+            let span = self.here_span();
+            self.bump();
+            (
+                Node::TypeBinder((ANONYMOUS_TYPE_BINDER, span), Vec::new(), None),
+                span,
+            )
+        } else {
+            match self.parse_type() {
+                Some(subject) => subject,
+                None => return Some(self.selector_refusal(start, None, Vec::new())),
+            }
         };
         self.refuse_selector_binders(&subject);
         let subject_text = self.text_of(subject.1);
@@ -11370,7 +11402,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         let name_span = self.span_from(start);
         if self.eat_op("::") {
             self.refuse_a_path_crossing_a_line()?;
-            let continuation = Box::new(self.parse_namespace_path()?);
+            // A181 (`import-foundation.md` §2 row 10): `a::(impl T)` is the
+            // one-selector set without its braces, exactly as `a::b` is the
+            // one-name set — `import a::(impl T);`, `import a::(impl T)::first;`.
+            let continuation = Box::new(if self.at_impl_selector() {
+                self.parse_impl_selector()?
+            } else if self.peek_is_op("*") {
+                // A182 (Q8): `m::*`, the glob leaf — every export of `m`.
+                let star = self.here_span();
+                self.bump();
+                ImportBranch::Path(GLOB_IMPORT_LEAF, star, ImportTail::Leaf)
+            } else {
+                self.parse_namespace_path()?
+            });
             return Some(ImportBranch::Path(
                 name,
                 name_span,
@@ -15321,12 +15365,12 @@ mod tests {
         // B318 S3 landed in the same order (visibility-b-35), so the SELECTOR
         // shapes parse clean now — they are pinned as grammar in
         // `inference/modules.rs`; the two forms still outside the grammar
-        // (`::*` is Order 36's, `!` is no marker) keep this rule.
+        // (`*` as a set element, `!` is no marker) keep this rule.
         for source in [
             "import a::{ (impl Thing) };\n",
             "import a::{ (impl List<i32>)::{ first, last } };\n",
             "import a::{ (impl List<_>) };\n",
-            "import a::{ (impl _) };\n",
+            "import a::{ (impl *) };\n",
         ] {
             let (_tree, errors) = parse(source);
             assert!(
@@ -15335,7 +15379,9 @@ mod tests {
             );
         }
         for (source, stopped) in [
-            ("import pkg::a::m::*;\n", "*"),
+            // A182: `m::*` is a glob leaf now (the analyzer refuses it outside
+            // an `export import`); a `*` where a set ELEMENT stands is not.
+            ("import pkg::a::{ * };\n", "*"),
             ("import a::{ !hidden };\n", "!"),
         ] {
             let (_tree, errors) = parse(source);
@@ -15362,6 +15408,112 @@ mod tests {
             rendered_errors("use a::{ !hidden };\n"),
             vec![IMPORT_PATH_IS_NAMES_AND_SETS.to_string()]
         );
+    }
+
+    /// A181 (RULED 2026-11-03, `import-foundation.md` §2 rows 9–10): the bare
+    /// one-selector form `a::(impl T)` / `a::(impl T)::first` parses as the
+    /// path continuing into the selector — the tree a braced one-member set
+    /// would give, less the set — and `(impl *)` is the whole-module selector:
+    /// the anonymous binder over the whole subject, its text the `*` written.
+    /// `_` there still PARSES (the analyzer steers it, one release), and `*`
+    /// is not a type anywhere else (`List<*>`).
+    #[test]
+    fn a181_the_bare_selector_form_and_the_star_parse() {
+        fn lone_selector<'tree, 'src>(
+            tree: &'tree NodeList<'src>,
+        ) -> (&'tree str, &'tree ImplSelector<'src>) {
+            let Some((
+                Node::Import(ImportBranch::Path(module, _, ImportTail::Continue(next)), _),
+                _,
+            )) = tree.first()
+            else {
+                panic!("an import: {tree:?}");
+            };
+            let ImportBranch::Path(leaf, _, ImportTail::Continue(selector)) = next.as_ref() else {
+                panic!("a two-segment path: {next:?}");
+            };
+            let ImportBranch::Selector(selector) = selector.as_ref() else {
+                panic!("the bare selector continues the path: {selector:?}");
+            };
+            assert_eq!((*module, *leaf), ("pkg", "a"));
+            (selector.subject_text.as_ref(), selector)
+        }
+        for (source, subject, members) in [
+            ("import pkg::a::(impl Thing);\n", "Thing", &[][..]),
+            (
+                "import pkg::a::(impl Thing)::first;\n",
+                "Thing",
+                &["first"][..],
+            ),
+            (
+                "import pkg::a::(impl List<_>)::{ first, last };\n",
+                "List<_>",
+                &["first", "last"][..],
+            ),
+            (
+                "import pkg::a::(impl pkg::lib::overlay::Overlay);\n",
+                "pkg::lib::overlay::Overlay",
+                &[][..],
+            ),
+            ("import pkg::a::(impl *);\n", "*", &[][..]),
+            (
+                "import pkg::a::(impl *)::describe;\n",
+                "*",
+                &["describe"][..],
+            ),
+            ("import pkg::a::(impl * with Display);\n", "*", &[][..]),
+        ] {
+            let (tree, errors) = parse(source);
+            assert!(errors.is_empty(), "{source:?}: {errors:?}");
+            let (text, selector) = lone_selector(&tree.as_ref().expect("a tree").0);
+            assert_eq!(text, subject, "{source:?}");
+            let names: Vec<&str> = selector.members.iter().map(|(name, _)| *name).collect();
+            assert_eq!(names, members, "{source:?}");
+            if subject == "*" {
+                assert!(
+                    matches!(
+                        selector.subject.as_deref(),
+                        Some((Node::TypeBinder((ANONYMOUS_TYPE_BINDER, _), bounds, None), _))
+                            if bounds.is_empty()
+                    ),
+                    "`*` is the anonymous binder over the whole subject: {:?}",
+                    selector.subject
+                );
+                assert!(!selector.writes_the_retired_whole_subject());
+            }
+        }
+        // `(impl _)` is grammar still: the analyzer reads it as `(impl *)` with
+        // a steer for one release.
+        let (tree, errors) = parse("import pkg::a::{ Thing, (impl _) };\n");
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut selectors = Vec::new();
+        if let Some((Node::Import(branch, _), _)) = tree.as_ref().and_then(|tree| tree.0.first()) {
+            collect_branch_selectors(branch, &mut selectors);
+        }
+        assert_eq!(selectors.len(), 1);
+        // A reach-marked selector takes the bare form too.
+        assert!(parse("import pkg::a::#(impl Thing);\n").1.is_empty());
+        // `*` is a set, not a type: inside one it is no type at all.
+        assert!(!parse("import pkg::a::(impl List<*>);\n").1.is_empty());
+    }
+
+    /// A181: the one place a selector is still refused is the HEAD of an
+    /// `import` — with no module before it there is nothing to select from —
+    /// marked or not, at the selector, with the rule naming the bare form.
+    #[test]
+    fn a181_a_selector_with_no_module_is_refused_at_the_selector() {
+        for source in ["import (impl Thing);\n", "import #(impl Thing);\n"] {
+            let (_tree, errors) = parse(source);
+            assert_eq!(
+                errors.iter().map(render).collect::<Vec<_>>(),
+                vec![IMPL_SELECTOR_FOLLOWS_A_MODULE.to_string()],
+                "{source:?}"
+            );
+            assert_eq!(
+                &source[errors[0].span.into_range()],
+                if source.contains('#') { "#" } else { "(" }
+            );
+        }
     }
 
     #[test]

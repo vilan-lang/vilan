@@ -4530,7 +4530,7 @@ impl<'src> Transformer<'src> {
                      `{here}` does not admit it: a generic body resolves under the file it was \
                      DECLARED in, not the file that instantiated it, so widening the import at \
                      the CALLER does not reach it. Widen `{here}`'s own import of \
-                     `{declaring}` — `(impl _)` admits every implementation it declares"
+                     `{declaring}` — `(impl *)` admits every implementation it declares"
                 ),
             };
             // E185: and PLACED — through the one anchoring rule every
