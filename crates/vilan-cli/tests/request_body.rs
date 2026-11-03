@@ -1278,3 +1278,405 @@ fn m176_a_body_read_as_a_stream_on_both_backends() {
         ),
     ]);
 }
+
+// ----------------------------------------------------------- the form ---
+
+/// M177's program: `multipart/form-data` read off the stream. `/form-<size>`
+/// describes every part — its name, filename and type, and its bytes digested
+/// as `/hash` digests a body, read with `next(<size>)` — and `/form-skip`
+/// passes the part named `file` over unread. A mounted rpc service shows its
+/// POST leg still refusing a form.
+const FORM_SERVER: &str = r#"import std::io::print;
+import std::bytes::Bytes;
+import std::crypto::sha256;
+import std::http::{ Multipart, PartReader, Request, Response, Server };
+import std::json::json_codec;
+import std::rpc::server::Service;
+import std::shared::Shared;
+
+[service(CounterClient)]
+struct Counter {
+	count: Shared<i32>,
+}
+
+impl Counter {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.write() = self.count.read() + by;
+		self.count.read()
+	}
+}
+
+fun digest(reader: PartReader, size: usize): str {
+	let block_size = 262144usize;
+	let block = Bytes::alloc(block_size);
+	mut filled = 0usize;
+	mut total = 0usize;
+	mut digests = Bytes::alloc(0);
+	for {
+		let wanted = if block_size - filled < size { block_size - filled } else { size };
+		let piece = match reader.next(wanted) {
+			Some(let piece) => piece,
+			None => jump break,
+		};
+		block.copy_into(piece, filled);
+		filled = filled + piece.len();
+		total = total + piece.len();
+		if filled == block_size {
+			digests = Bytes::concat(digests, sha256(block));
+			filled = 0;
+		}
+	}
+	if filled > 0 {
+		digests = Bytes::concat(digests, sha256(block.slice(0, filled)));
+	}
+	i"len={total} sha={sha256(digests).to_hex()}"
+}
+
+fun describe(request: Request, size: usize, skip: str): Response {
+	let form = Multipart::of(request.max_body_bytes(100 * 1024 * 1024));
+	mut lines = "";
+	for {
+		let part = match form.next_part() {
+			Some(let part) => part,
+			None => jump break,
+		};
+		let file = match part.filename {
+			Some(let name) => i" filename={name}",
+			None => "",
+		};
+		let content = if part.name == skip { "skipped" } else { digest(part.reader, size) };
+		lines = lines + i"[{part.name}{file} type={part.content_type}] {content}\n";
+	}
+	Response::builder().body(lines).build()
+}
+
+fun main() {
+	let counter = Counter { count = Shared::new(0) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).at("/svc/"))
+		.on_request(|request| {
+			let path = request.path();
+			if path == "/form-65536" {
+				ret describe(request, 65536, "");
+			}
+			if path == "/form-4096" {
+				ret describe(request, 4096, "");
+			}
+			if path == "/form-7" {
+				ret describe(request, 7, "");
+			}
+			if path == "/form-1" {
+				ret describe(request, 1, "");
+			}
+			if path == "/form-skip" {
+				ret describe(request, 65536, "file");
+			}
+			Response::builder().code(404).body("no route").build()
+		})
+		.on_start(|server| ANNOUNCE)
+		.build()
+		.start();
+}
+"#;
+
+fn form_server() -> String {
+    FORM_SERVER.replace("ANNOUNCE", ANNOUNCE_PORT)
+}
+
+const BOUNDARY: &str = "----vilanBoundary7MA4YWxkTrZu0gW";
+
+fn form_type() -> String {
+    format!("multipart/form-data; boundary={BOUNDARY}")
+}
+
+/// A form body: a preamble, each part's head lines and bytes, the closing
+/// delimiter and an epilogue — the two a parser must skip.
+fn form_body(parts: &[(&[&str], &[u8])]) -> Vec<u8> {
+    let mut body = b"a preamble the form skips\r\n".to_vec();
+    for (headers, data) in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        for header in *headers {
+            body.extend_from_slice(header.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\nan epilogue").as_bytes());
+    body
+}
+
+/// POSTs `body` as `content_type` to `path` from a second thread while this one
+/// reads the response.
+fn posted_form(port: u16, path: &str, content_type: &str, body: Vec<u8>) -> Result<String, String> {
+    let mut stream = connect(port)?;
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| format!("send the head: {error}"))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|error| format!("a second handle on the socket: {error}"))?;
+    let sender = std::thread::spawn(move || {
+        for piece in body.chunks(64 * 1024) {
+            if writer.write_all(piece).is_err() {
+                return;
+            }
+        }
+    });
+    let response = read_response(&mut stream);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    sender.join().expect("the sending thread");
+    response
+}
+
+const TITLE_HEADERS: &[&str] = &["Content-Disposition: form-data; name=\"title\""];
+const FILE_HEADERS: &[&str] = &[
+    "Content-Disposition: form-data; name=\"file\"; filename=\"a;b \\\"q\\\".bin\"",
+    "Content-Type: application/octet-stream",
+];
+const TITLE: &[u8] = b"hello, form";
+
+/// `/form-..`'s description of the title-and-file form.
+fn described(file: &[u8], skipped: bool) -> String {
+    let file_content = if skipped {
+        "skipped".to_string()
+    } else {
+        block_digest(file)
+    };
+    format!(
+        "[title type=text/plain] {}\n[file filename=a;b \"q\".bin type=application/octet-stream] \
+         {file_content}\n",
+        block_digest(TITLE)
+    )
+}
+
+/// M177's measurement: a two-part form whose file part is 10 MiB, read at
+/// 64 KiB pieces, grows the server's peak resident set by what the stream
+/// holds — the bounds and their reasons are M176's (measured past a 200 KiB
+/// warm-up form: natively 80 kB, on node 21-27 MB of collector lag, where a
+/// 10 MiB body read whole costs 10.1 MB and 22 MB).
+fn a_10_mib_file_part_is_read_at_a_bounded_cost(
+    built: &Built,
+    backend: Backend,
+) -> Result<(), String> {
+    let mut server = built.spawn(backend);
+    let port = server.port();
+    let outcome = (|| {
+        let warm = varied_bytes(200 * 1024);
+        let response = posted_form(
+            port,
+            "/form-65536",
+            &form_type(),
+            form_body(&[(TITLE_HEADERS, TITLE), (FILE_HEADERS, &warm)]),
+        )?;
+        expect_body(&response, &described(&warm, false))?;
+        let before = peak_rss_kb(server.id());
+        let file = varied_bytes(10 * MIB);
+        let response = posted_form(
+            port,
+            "/form-65536",
+            &form_type(),
+            form_body(&[(TITLE_HEADERS, TITLE), (FILE_HEADERS, &file)]),
+        )?;
+        expect_status(&response, "HTTP/1.1 200 OK")?;
+        expect_body(&response, &described(&file, false))?;
+        let (Some(before), Some(after)) = (before, peak_rss_kb(server.id())) else {
+            return Ok(());
+        };
+        let grown = after - before;
+        let bound = match backend {
+            Backend::Native => 8 * 1024,
+            Backend::Node => 48 * 1024,
+        };
+        eprintln!("{backend:?}: a form with a 10 MiB file part grew the peak by {grown} kB");
+        if grown > bound {
+            return Err(format!(
+                "a form with a 10 MiB file part grew the server's peak by {grown} kB (bound \
+                 {bound} kB)"
+            ));
+        }
+        Ok(())
+    })();
+    server.stop();
+    outcome
+}
+
+#[test]
+fn m177_a_10_mib_file_part_is_read_at_a_bounded_cost_on_both_backends() {
+    let built = Built::new("request_body_form_cost", &form_server());
+    let mut failures = Vec::new();
+    for backend in [Backend::Node, Backend::Native] {
+        if let Err(failure) = a_10_mib_file_part_is_read_at_a_bounded_cost(&built, backend) {
+            failures.push(format!("{backend:?}: {failure}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// A delimiter split across the body's pieces is found whole: the file part
+/// read at `next(1)`, `next(7)` and `next(4096)` — each read of the part takes
+/// the body that size at a time once what the head's read brought in is used
+/// up, so the closing delimiter arrives across many piece edges — and at
+/// 64 KiB, all to the same bytes. The file is 200 KiB, past the 64 KiB the
+/// head's read takes, and 1 byte off a multiple of 7 and of 4096.
+fn a_delimiter_split_across_pieces_is_found(port: u16, _backend: Backend) -> Result<(), String> {
+    let file = varied_bytes(200 * 1024 + 4093);
+    let body = form_body(&[(TITLE_HEADERS, TITLE), (FILE_HEADERS, &file)]);
+    for path in ["/form-1", "/form-7", "/form-4096", "/form-65536"] {
+        let response = posted_form(port, path, &form_type(), body.clone())?;
+        expect_status(&response, "HTTP/1.1 200 OK")
+            .and_then(|()| expect_body(&response, &described(&file, false)))
+            .map_err(|failure| format!("{path}: {failure}"))?;
+    }
+    Ok(())
+}
+
+/// A part passed over unread is drained by the next `next_part`, which finds
+/// the part after it: here a third field after the skipped file.
+fn a_part_skipped_unread_is_drained(port: u16, _backend: Backend) -> Result<(), String> {
+    let file = varied_bytes(300 * 1024);
+    let after_headers: &[&str] = &["Content-Disposition: form-data; name=\"after\""];
+    let body = form_body(&[
+        (TITLE_HEADERS, TITLE),
+        (FILE_HEADERS, &file),
+        (after_headers, b"the last field"),
+    ]);
+    let response = posted_form(port, "/form-skip", &form_type(), body)?;
+    expect_status(&response, "HTTP/1.1 200 OK")?;
+    expect_body(
+        &response,
+        &format!(
+            "{}[after type=text/plain] {}\n",
+            described(&file, true),
+            block_digest(b"the last field")
+        ),
+    )
+}
+
+/// A malformed form is refused `400` with the defect named.
+fn a_malformed_form_is_refused_with_its_defect(port: u16, _backend: Backend) -> Result<(), String> {
+    let file = varied_bytes(1000);
+    let good = form_body(&[(TITLE_HEADERS, TITLE), (FILE_HEADERS, &file)]);
+    let no_colon = form_body(&[
+        (TITLE_HEADERS, TITLE),
+        (
+            &[
+                "Content-Disposition: form-data; name=\"file\"",
+                "Content-Type application/octet-stream",
+            ],
+            &file,
+        ),
+    ]);
+    let mut padded_wrong = b"\r\n".to_vec();
+    padded_wrong.extend_from_slice(format!("--{BOUNDARY}xyz\r\n").as_bytes());
+    padded_wrong.extend_from_slice(&good);
+    let cases: [(&str, String, Vec<u8>, String); 6] = [
+        (
+            "no boundary",
+            "multipart/form-data".to_string(),
+            good.clone(),
+            "the multipart/form-data request names no boundary in its Content-Type \
+             (`multipart/form-data`)"
+                .to_string(),
+        ),
+        (
+            "not a form",
+            "application/json".to_string(),
+            good.clone(),
+            "the request body is not multipart/form-data (its Content-Type is \
+             `application/json`)"
+                .to_string(),
+        ),
+        (
+            "a missing terminator",
+            form_type(),
+            good[..good.len() - 40].to_vec(),
+            format!(
+                "malformed multipart/form-data: the body ended before the closing \
+                 `--{BOUNDARY}--` delimiter"
+            ),
+        ),
+        (
+            "a header without a colon",
+            form_type(),
+            no_colon,
+            "malformed multipart/form-data: a part header has no colon: `Content-Type \
+             application/octet-stream`"
+                .to_string(),
+        ),
+        (
+            "a delimiter line with text after the boundary",
+            form_type(),
+            padded_wrong,
+            format!(
+                "malformed multipart/form-data: a delimiter line carries `xyz` after \
+                 `--{BOUNDARY}`, where only `--` or the line end may follow"
+            ),
+        ),
+        (
+            "no delimiter at all",
+            form_type(),
+            b"just some text".to_vec(),
+            format!("malformed multipart/form-data: the body has no `--{BOUNDARY}` delimiter"),
+        ),
+    ];
+    for (label, content_type, body, message) in cases {
+        let response = posted_form(port, "/form-65536", &content_type, body)?;
+        expect_status(&response, "HTTP/1.1 400 Bad Request")
+            .and_then(|()| expect_body(&response, &message))
+            .map_err(|failure| format!("{label}: {failure}"))?;
+    }
+    Ok(())
+}
+
+/// The rpc POST leg still refuses a form (its CSRF gate, `docs/std/rpc.md`): a
+/// `multipart/form-data` frame is a cross-site form's, answered `400` before
+/// the codec sees it.
+fn the_rpc_post_leg_still_refuses_a_form(port: u16, _backend: Backend) -> Result<(), String> {
+    let response = posted_form(
+        port,
+        "/svc/rpc",
+        &form_type(),
+        form_body(&[(TITLE_HEADERS, b"{\"method\":\"add\",\"args\":[1]}")]),
+    )?;
+    expect_status(&response, "HTTP/1.1 400 Bad Request")?;
+    if !body_of(&response).starts_with("an rpc frame is posted as ") {
+        return Err(format!(
+            "expected the content-type gate's refusal, got:\n{response}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn m177_a_multipart_form_read_part_by_part_on_both_backends() {
+    let built = Built::new("request_body_form", &form_server());
+    built.check(&[
+        (
+            "a delimiter split across pieces is found",
+            a_delimiter_split_across_pieces_is_found,
+        ),
+        (
+            "a part skipped unread is drained",
+            a_part_skipped_unread_is_drained,
+        ),
+        (
+            "a malformed form is refused with its defect",
+            a_malformed_form_is_refused_with_its_defect,
+        ),
+        (
+            "the rpc POST leg still refuses a form",
+            the_rpc_post_leg_still_refuses_a_form,
+        ),
+    ]);
+}

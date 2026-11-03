@@ -113,6 +113,19 @@ impl Request {
 impl BodyReader {
 	async fun next(self, size: usize): Option<Bytes>   // at most `size` bytes; None at the end
 }
+
+// multipart/form-data, read part by part off the stream
+impl Multipart {
+	fun of(request: Request): Multipart              // 400 unless a form with a boundary
+	async fun next_part(self): Option<Part>           // skips what was left of the last part
+}
+// Part { name: str, filename: Option<str>, content_type: str, headers: List<(str, str)>, reader: PartReader }
+impl Part {
+	fun header(self, name: str): Option<str>
+}
+impl PartReader {
+	async fun next(self, size: usize): Option<Bytes>   // None at the part's end
+}
 impl Response {
 	fun builder(): ResponseBuilder
 }
@@ -255,6 +268,57 @@ after `body_stream()`, or the other way round, is a fault in the handler.
 It is answered `500 Internal Server Error` with a sentence naming both
 calls, the same sentence goes to the server's stderr, and the handler ends
 there. A second `body_stream()` is a second reader of the one stream.
+
+**Reading a form.** A browser's file upload is `multipart/form-data`:
+the fields and files of a form, one after the other in one body, each with
+a small head of its own. `Multipart::of(request)` reads such a body part by
+part off the stream — `next_part()` answers the next `Part` with its
+`name`, its `filename` (`Some` for a file input), its `content_type`
+(`text/plain` when the part did not say) and its bytes through
+`part.reader`, whose `next(size)` ends at the part's end exactly as the
+body's does:
+
+```vilan,norun
+import std::http::{ Multipart, Request, Response, Server };
+
+fun upload(request: Request): Response {
+	let form = Multipart::of(request.max_body_bytes(100 * 1024 * 1024));
+	mut stored = 0usize;
+	for {
+		let part = match form.next_part() {
+			Some(let part) => part,
+			None => jump break,
+		};
+		if part.filename.is_none() {
+			jump continue;   // a plain field: skipped unread
+		}
+		for {
+			let piece = match part.reader.next(65536) {
+				Some(let piece) => piece,
+				None => jump break,
+			};
+			stored = stored + piece.len();   // write it where the file goes
+		}
+	}
+	Response::builder().body(i"stored {stored} bytes").build()
+}
+
+fun main() {
+	Server::builder().port(3000).on_request(|request| upload(request)).build().start();
+}
+```
+
+Only a window on the stream is held, so a 10 MiB file costs what one
+`next` asks for. A part left unread is skipped by the next `next_part`.
+The cap is the request's, over the whole form, and the body is the
+stream's, so the one-way rule applies: `bytes()` on the same request is
+refused. A malformed form is answered `400 Bad Request` with the defect
+named, and the handler ends there: a `Content-Type` that is not
+`multipart/form-data` or names no `boundary` (at `of`), a delimiter line
+with something after the boundary, a part header without a colon, a part
+head over 64 KiB, and a body that ends before the closing `--boundary--`.
+A mounted rpc service still refuses a form on its POST leg (its CSRF gate,
+see std::rpc::server).
 
 Measured on Linux, one 64 MiB upload hashed from the stream grows the
 native server's peak memory by under a mebibyte, where reading 25 MiB whole

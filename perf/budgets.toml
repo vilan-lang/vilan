@@ -481,3 +481,31 @@ class = "ci"
 ratio = 1.01
 reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list, which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; the row sat EXACTLY at its limit after the five-lane merge and flipped on run-to-run noise of 0.03 % (CI read x1.0150 of the ceiling at next be85965f, limit x1.0150)"
 item = "M186"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0082 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0086 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0073 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0073 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
+item = "M176"

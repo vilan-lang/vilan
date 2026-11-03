@@ -55,6 +55,14 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "F (blocked: `Reader::next` awaits, so no `&mut self`)",
     ),
     (
+        "http.vl",
+        6,
+        "E: a form's window on the body stream (M177: buffer, cursor, edge, \
+         delimited, stage, part), minted by `Multipart::of` and read by every \
+         `PartReader` it hands out — and forced besides, as `fs::Reader.cursor` \
+         is: `next_part` and `PartReader::next` await the body",
+    ),
+    (
         "memo.vl",
         1,
         "E: the memo cache outlives every maker's scope",
@@ -364,7 +372,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 251,
+        total, 257,
         "the total number of `Shared` construction sites in std changed"
     );
 
