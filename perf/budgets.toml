@@ -481,3 +481,45 @@ class = "ci"
 ratio = 1.01
 reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list, which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; the row sat EXACTLY at its limit after the five-lane merge and flipped on run-to-run noise of 0.03 % (CI read x1.0150 of the ceiling at next be85965f, limit x1.0150)"
 item = "M186"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): std's `str::debug` and `__substring` grew (E346's one-pass escaper, B695's code-point floor - every program compiling std analyzes them), an enum with a payload is copied at every value seam (B691), and the leaf-admission rule (A182); CI read x1.0289 of the ceiling at next c1cfaedf where the limit stood at x1.0221"
+item = "B691"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.015
+reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0424 of the ceiling at next c1cfaedf where the limit stood at x1.0323 - 1.015 rather than 1.01 because 1.01 would leave a 0.02 % margin on a row that has flipped on noise before"
+item = "B691"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0277 of the ceiling at next c1cfaedf where the limit stood at x1.0221"
+item = "B691"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0285 of the ceiling at next c1cfaedf where the limit stood at x1.0221"
+item = "B691"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0287 of the ceiling at next c1cfaedf where the limit stood at x1.0272"
+item = "B691"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0162 of the ceiling at next c1cfaedf where the limit stood at x1.0140"
+item = "B691"

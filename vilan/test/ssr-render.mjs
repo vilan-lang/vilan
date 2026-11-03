@@ -42,7 +42,7 @@ function advance(self, carried) {
 	let $n = null;
 	if (!(is_disposed(self))) {
 		const held = self[0].v;
-		self[0].v = [ self[1] + 1, no_cleanups, false, carried ];
+		self[0].v = [ self[1] + 1, no_cleanups, false, __clone(carried) ];
 		const $e = held[3];
 		let $f = null;
 		if ($e[0] === 0) {
