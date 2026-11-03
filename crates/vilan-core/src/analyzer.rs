@@ -25687,6 +25687,57 @@ impl<'src> Analyzer<'src> {
         self.imply_owner_scope_on_view_parameters();
     }
 
+    /// E360: the refusal at `head::member` where `head` names a function. The
+    /// usual way to write it is the import of a function that shares its
+    /// module's name (`import pkg::editor::editor;`), so when the function
+    /// was declared in another module the message names both imports that
+    /// would make the path's intent work. The module's own name cannot be the
+    /// second: with `import pkg::editor::{ self, editor }` the head still
+    /// resolves to the function, so the steer renames the module.
+    fn refuse_a_path_through_a_function(&mut self, access_id: Id, function_id: Id, member: &str) {
+        let Some(name) = self
+            .functions
+            .get(&function_id)
+            .map(|function| function.name)
+        else {
+            return;
+        };
+        let declared_elsewhere = self.source_of_id(function_id) != self.source_of_id(access_id);
+        let module_path = self
+            .source_of_id(function_id)
+            .filter(|_| declared_elsewhere)
+            .and_then(|source| {
+                let module_id = self
+                    .modules
+                    .values()
+                    .find(|module| self.source_of_id(module.id) == Some(source))?
+                    .id;
+                self.module_import_paths().remove(&module_id)
+            });
+        let mut msg = format!(
+            "`{name}` is a function, not a module: `{name}::{member}` looks `{member}` up in \
+             `{name}`, and a function has no members"
+        );
+        if let Some(path) = module_path {
+            msg.push_str(&format!(
+                "; `{name}` here is the function imported from `{path}` — import `{member}` too \
+                 (`import {path}::{{ {name}, {member} }}`), or import the module under a name \
+                 of its own (`import {path}::{{ self as {name}_module, {name} }}`, then \
+                 `{name}_module::{member}(..)`)"
+            ));
+        }
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&access_id).unwrap_or(&&EMPTY_SPAN),
+                msg,
+            },
+            access_id,
+        );
+        self.expr_id_to_expr_map.insert(access_id, Expr::Error);
+    }
+
     /// B677 door 2 (`closure-owner.md` §4, RULED 2026-11-02): a `fun`'s
     /// closure parameter whose declared result is a view — std's `View`, or a
     /// `Slot` (the trait the UI places) — carries `context owner_scope` by
@@ -71812,6 +71863,15 @@ impl<'src> Analyzer<'src> {
                             }
                         }
                     }
+                }
+                // E360: a path through a FUNCTION — `editor::reader(..)` with
+                // the function `editor` imported and the module of the same
+                // name not. Nothing answered here, so the access stayed
+                // unresolved and only its cascade printed ("could not be
+                // resolved", at the enclosing call and binding), never the
+                // cause.
+                Type::Function(function_id) => {
+                    self.refuse_a_path_through_a_function(id, function_id, member_name);
                 }
                 _ => {}
             }
