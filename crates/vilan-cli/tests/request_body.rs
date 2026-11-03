@@ -921,6 +921,8 @@ fn m179_a_handler_panic_answers_500_reports_once_and_the_server_goes_on_on_both_
         failures.len(),
         failures.join("\n\n")
     );
+}
+
 // ------------------------------------------------------------ the stream ---
 
 /// M176's program: the body read as a STREAM. `/hash` hashes it as it arrives —
