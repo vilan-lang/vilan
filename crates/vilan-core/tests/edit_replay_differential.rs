@@ -637,52 +637,143 @@ fn p6a_a_package_impl_a_std_question_reaches_is_decided_by_the_rule() {
     );
 }
 
-/// **N179: a program the std prefix is not ATTEMPTED for says why.** The
-/// reuse gate in front of the attempt is syntactic — an entry whose text says
-/// `macro` may define one, which would register into the world's registry —
-/// so a program that only MENTIONS the word (the corpus's `crypto`, `db`,
-/// `file`, `watch` say it in a comment) takes the canonical path. The census
-/// read `prefix-world 0 prefix-refusal -` for it, neither served nor why; it
-/// names the gate now (`macro-text`), without counting a refusal of the
-/// prefix, and the analysis answers what the clean one does. A program the
-/// gate passes is served, with no reason.
+/// **N179: a program the std prefix is not ATTEMPTED for says why** - and
+/// **N183: the gate reads the program's TREE.** The reuse gate in front of the
+/// attempt refuses an entry that DEFINES a macro (a `macro fun`, a `macro { .. }`
+/// block), whose definitions would register into the world's registry; the
+/// census names it (`defines-a-macro`), without counting a refusal of the
+/// prefix. It used to read the entry's TEXT, so a program that only MENTIONS the
+/// word - the corpus's `crypto`, `db`, `file` and `watch` say it in a comment -
+/// was refused too (`macro-text`); a comment or a string now passes, and is
+/// served with no reason, as a program that never says it is.
 #[test]
-fn n179_a_program_the_prefix_is_not_attempted_for_names_the_gate() {
+fn n183_the_prefix_gate_refuses_a_macro_definition_and_not_the_word() {
     let _switch = SWITCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     set_plant(None);
     vilan_core::analyzer::base_cache_clear();
-    let mentions = Package::write(
-        "prefix_macro_text",
+    let defines = Package::write(
+        "prefix_macro_defined",
         NODE,
         &[(
             "main.vl",
-            "// No macro is defined here; the word is enough for the gate.\n\
+            "macro fun constants(arguments: Arguments): Source {\n\
+             \timport macro_std::source;\n\
+             \timport macro_std::meta::{ Arguments, Source };\n\n\
+             \tsource(\"fun zero(): i32 { 0 }\")\n}\n\n\
+             macro constants(zero);\n\n\
+             fun main() {\n\tprint(zero());\n}\n",
+        )],
+    );
+    let commented = Package::write(
+        "prefix_macro_commented",
+        NODE,
+        &[(
+            "main.vl",
+            "// No macro is defined here; the word alone is not a definition.\n\
              fun main() {\n\tprint(\"ok\");\n}\n",
         )],
+    );
+    let quoted = Package::write(
+        "prefix_macro_quoted",
+        NODE,
+        &[("main.vl", "fun main() {\n\tprint(\"macro fun\");\n}\n")],
     );
     let plain = Package::write(
         "prefix_plain_text",
         NODE,
         &[("main.vl", "fun main() {\n\tprint(\"ok\");\n}\n")],
     );
-    let not_taken = observe_over_the_prefix(&mentions);
-    let taken = observe_over_the_prefix(&plain);
-    mentions.remove();
-    plain.remove();
+    let not_taken = observe_over_the_prefix(&defines);
+    let served: Vec<(&str, Observation)> = [
+        ("a comment", &commented),
+        ("a string", &quoted),
+        ("no mention", &plain),
+    ]
+    .into_iter()
+    .map(|(label, package)| (label, observe_over_the_prefix(package)))
+    .collect();
+    for package in [defines, commented, quoted, plain] {
+        package.remove();
+    }
     vilan_core::analyzer::base_cache_clear();
     assert!(
         !not_taken.census.prefix_world
-            && not_taken.census.prefix_refusal == Some("macro-text")
+            && not_taken.census.prefix_refusal == Some("defines-a-macro")
             && not_taken.census.prefix_refusals == 0,
         "the gate in front of the prefix is named, and is not a refusal of it: {:?}",
         not_taken.census
     );
+    for (label, taken) in served {
+        assert!(
+            taken.census.prefix_world && taken.census.prefix_refusal.is_none(),
+            "a program whose only `macro` is in {label} is served with no reason: {:?}",
+            taken.census
+        );
+    }
+}
+
+/// **N183, the hot set's half.** A hot module that DEFINES a macro refuses the
+/// hot-set world (`defines-a-macro`: its definitions would register into the
+/// registry the stored world carries); one whose comment only says the word is
+/// served it - the per-module test read the TEXT too.
+#[test]
+fn n183_a_hot_module_that_mentions_macro_is_served_the_hot_set_world() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let main = "import pkg::helper::value;\n\nfun main() {\n\tprint(value());\n}\n";
+    let commented = Package::write(
+        "hot_macro_commented",
+        NODE,
+        &[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                "// a macro could stamp this out; none does.\nexport fun value(): i32 {\n\t1\n}\n",
+            ),
+        ],
+    );
+    let defines = Package::write(
+        "hot_macro_defined",
+        NODE,
+        &[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                "macro fun constants(arguments: Arguments): Source {\n\
+                 \timport macro_std::source;\n\
+                 \timport macro_std::meta::{ Arguments, Source };\n\n\
+                 \tsource(\"fun zero(): i32 { 0 }\")\n}\n\n\
+                 export fun value(): i32 {\n\t1\n}\n",
+            ),
+        ],
+    );
+    let observe_hot = |package: &Package| {
+        let seeds = vec![package.directory.join("helper.vl")];
+        let incremental = observe(package, seeds.clone(), Leg::Incremental);
+        let clean = observe(package, seeds, Leg::Clean);
+        assert_eq!(
+            incremental.rendering, clean.rendering,
+            "the hot-set analysis answers what the clean one does"
+        );
+        incremental.census
+    };
+    let served = observe_hot(&commented);
+    let refused = observe_hot(&defines);
+    commented.remove();
+    defines.remove();
+    vilan_core::analyzer::base_cache_clear();
     assert!(
-        taken.census.prefix_world && taken.census.prefix_refusal.is_none(),
-        "a program the gate passes is served with no reason: {:?}",
-        taken.census
+        served.hot_world && served.hot_refusal.is_none(),
+        "a hot module whose only `macro` is a comment's is served: {served:?}"
+    );
+    assert!(
+        !refused.hot_world && refused.hot_refusal == Some("defines-a-macro"),
+        "a hot module that defines a macro refuses the hot-set world: {refused:?}"
     );
 }
 

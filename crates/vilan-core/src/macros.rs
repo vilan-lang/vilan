@@ -655,6 +655,20 @@ pub(crate) fn block_entry_name(ordinal: usize) -> String {
     format!("__macro_block_{ordinal}")
 }
 
+/// Whether a file DEFINES macros - what [`register_file`] would act on: a
+/// `macro fun` at any depth (inline `mod`s included), or a `macro { .. }` block,
+/// legal or not. Read off the parsed tree, so a comment or a string that says
+/// `macro` is no definition (N183: the base cache's bypass for a macro-defining
+/// entry, and the hot set's for a macro-defining module, read the TEXT and
+/// refused four corpus programs whose comments said the word).
+pub(crate) fn defines_macros(nodes: &NodeList) -> bool {
+    if !macro_funs(nodes).is_empty() {
+        return true;
+    }
+    let (blocks, illegal) = macro_blocks(nodes);
+    !blocks.is_empty() || !illegal.is_empty()
+}
+
 /// Registers a file's `macro fun`s: checks their bodies' hermeticity, compiles
 /// the file's macro world (cached by blanked content), and binds each macro
 /// name. Diagnostics carry spans into THIS file (the caller attributes them).

@@ -86807,7 +86807,7 @@ fn package_reach(
             continue;
         };
         // The entry's own bypass test (`base_cacheable`), applied per module.
-        if loaded.text.contains("macro") {
+        if crate::macros::defines_macros(&loaded.ast.0) {
             reach.macro_text.insert(name);
         }
         let mut depends_on: Vec<&'static str> = collect_module_paths(&loaded.ast.0, "pkg")
@@ -87618,8 +87618,11 @@ fn analyze_inner<'src>(
         // region registers NOTHING (`macro_registry`'s `in_macro_world` early
         // return), so a world's blanked entry — whose surviving macro bodies
         // are full of the substring `macro_std` — contributes no rows, and
-        // the syntactic test would only be reading its own tail.
-        && (crate::macros::in_macro_world() || !entry_source.contains("macro"));
+        // the test would only be reading its own tail. N183: the test reads
+        // the parsed tree (`defines_macros`: a `macro fun` or a `macro { .. }`
+        // block), where it read the TEXT, so a comment or a string saying
+        // `macro` refused the entry the cache and the std prefix.
+        && (crate::macros::in_macro_world() || !crate::macros::defines_macros(&nodes.0));
     // Overlays need no bypass (S3d): every load AND every per-hit validation
     // reads through `read_source`, which consults the overlay first — so a
     // world built from overlay-served std (the wasm playground's boot) hits
@@ -87704,7 +87707,7 @@ fn analyze_inner<'src>(
         && !crate::macros::in_macro_world();
     // N179: a program the prefix is asked for and NOT attempted says why, so
     // the census reads every program by name (`prefix-world 0 prefix-refusal
-    // macro-text`) rather than `-`. A refusal of an attempt (the hot shapes'
+    // defines-a-macro`) rather than `-`. A refusal of an attempt (the hot shapes'
     // guards, `refused-before`) has already said so; these are the gates in
     // front of the attempt — the reuse gate's own reasons, and the shapes a
     // rebuild narrows to.
@@ -87722,9 +87725,9 @@ fn analyze_inner<'src>(
         } else if entry_is_inside_std {
             Some("inside-std")
         } else if !base_cacheable {
-            // The entry's text says `macro` (the reuse gate is syntactic: a
-            // macro-DEFINING entry registers into the world's registry).
-            Some("macro-text")
+            // The entry defines a macro (N183: read off its tree), and a
+            // macro-DEFINING entry registers into the world's registry.
+            Some("defines-a-macro")
         } else {
             None
         };
