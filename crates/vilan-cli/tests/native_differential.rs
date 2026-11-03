@@ -10871,6 +10871,29 @@ fn b689_hash_map_lends_in_place_on_both_backends() {
     );
 }
 
+/// B690: a module binding read ONLY inside a body an operator reaches — a
+/// comparison through `PartialOrd`'s inherited default, `==`/`!=` and `+`
+/// through the impl's own members, an operator on a bounded generic and on
+/// `self` inside a trait default, a concatenation rendering a bounded operand,
+/// and a module initializer whose operator reads a LATER binding. The JS
+/// emitter declared none of them (the call graph held no edge at an operator)
+/// and the first use threw `ReferenceError`; natively every binding is
+/// emitted. `inference::traits`' `b690_*` pins hold the JS values per channel.
+#[test]
+fn b690_an_operator_reads_a_module_binding_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_operator_reads_a_module_binding.vl"),
+        include_str!("native/operator_reads_a_module_binding.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_operator_reads_a_module_binding.vl"),
+        Verdict::Identical,
+        "a module binding an operator's impl reads must be declared on both backends"
+    );
+}
+
 /// B693 (store-assume-keeper.md §4.5): an assumed handle's fallback is kept by
 /// a feed on its variant's flag and read in place on both backends — every way
 /// a variant ends (the enum's own handle, `Option` → `None`, a key removed by
