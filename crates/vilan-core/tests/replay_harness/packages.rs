@@ -1574,6 +1574,63 @@ pub const R11_FIXTURES: &[Fixture] = &[Fixture {
     dependencies: &[],
 }];
 
+// --- M188: C16's retaining summary over restored and served rows ---------------
+//
+// A hot leaf whose `read` hands a view-capturing closure to a callee: in the
+// base text `twice` (a COLD module's, it only calls the closure), so the
+// leaf compiles and the summary it asks reads the module's restored rows. The
+// edits hand the closure to `pass` instead — the leaf's own function, written
+// BELOW the edited one, so its item is served and its rows come back re-based
+// — which hands it on to the cold module's storing `keep`; to `keep` itself;
+// and make the cold `twice` store what it is handed. Each must be refused
+// naming the callee, and each refusal reads rows the keystroke did not walk.
+// The cold module's `thrice` hands three closures to calls: M189's capture
+// scan asks them on the analysis that walks the module, and not on a
+// keystroke that serves it.
+
+pub const RETAIN_MAIN: &str = "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
+
+pub const RETAIN_HOLDER: &str = "export struct Holder {\n\tf: || i32,\n}\n\nexport fun keep(g: || i32): Holder {\n\tHolder { f = g }\n}\n\nexport fun twice(g: || i32): i32 {\n\tg() + g()\n}\n\nexport fun thrice(): i32 {\n\ttwice(|| 1) + twice(|| 2) + twice(|| 3)\n}\n";
+
+pub const RETAIN_VIEWS: &str = "import pkg::holder::{ Holder, keep, twice };\n\nexport fun render(): i32 {\n\tmut n = 3;\n\tread(&mut n)\n}\n\nfun read(v: &mut i32): i32 {\n\ttwice(|| *v)\n}\n\nfun pass(g: || i32): Holder {\n\tkeep(g)\n}\n";
+
+pub const RETAIN_FIXTURES: &[Fixture] = &[Fixture {
+    name: "retain_rows",
+    platform: NODE,
+    files: &[
+        ("main.vl", RETAIN_MAIN),
+        ("holder.vl", RETAIN_HOLDER),
+        ("views.vl", RETAIN_VIEWS),
+    ],
+    edits: &[
+        Edit {
+            label: "a capturing closure handed to the leaf's served `pass`, which hands it to the cold `keep` (M188)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[(
+                "\ttwice(|| *v)\n}",
+                "\tlet held = pass(|| *v);\n\tlet padding = \"a statement longer than the callee it pushes down, so a served row left at its old offset names another body\";\n\tpadding.len().as_i32()\n}",
+            )],
+        },
+        Edit {
+            label: "a capturing closure handed to the cold module's storing `keep` (M188)",
+            file: "views.vl",
+            seed: None,
+            replacements: &[("\ttwice(|| *v)\n}", "\tlet held = keep(|| *v);\n\t1\n}")],
+        },
+        Edit {
+            label: "the cold `twice` made to store what it is handed: the leaf's call must be refused (M188)",
+            file: "holder.vl",
+            seed: Some("views.vl"),
+            replacements: &[(
+                "\tg() + g()\n",
+                "\tlet held = Holder { f = g };\n\tg() + g()\n",
+            )],
+        },
+    ],
+    dependencies: &[],
+}];
+
 // --- R11 door B: instance records served, validated and refused (incr-54b, Order 54) -------
 //
 // A COLD module `shapes.vl` holds the generics the hot leaf instantiates at

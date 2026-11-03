@@ -480,6 +480,12 @@ pub enum Plant {
     /// passes, a value a hot module assigns into a cold binding) then leaves
     /// the key's recorded verdict, its discoveries and its decision in place.
     AsyncRecordUnguarded,
+    /// M188 (Order 56): C16's retaining summary folded from the LIVE rows
+    /// alone — a reused module's or served item's restored rows dropped while
+    /// its regions stay out of the family's live lane. A live call handing a
+    /// view-capturing closure to a callee whose storing body is restored then
+    /// reads the callee as keeping nothing, and the refusal goes.
+    RetainRowsUnrestored,
 }
 
 impl Plant {
@@ -501,6 +507,7 @@ impl Plant {
             Plant::LiveRangeWalksServed => 15,
             Plant::R11RecordUnguarded => 16,
             Plant::AsyncRecordUnguarded => 17,
+            Plant::RetainRowsUnrestored => 18,
         }
     }
 }
@@ -622,11 +629,22 @@ pub struct Census {
     /// M148: the hover rows this analysis RESTORED from its records (E206,
     /// E237, E240, E241 — `analyzer/hover_records.rs`) instead of rendering.
     pub hover_rows_restored: u64,
-    /// E340 (Order 56): C16's retaining fixpoint runs this analysis ran — 1
-    /// when a live call hands a view-capturing closure to an ordinary callee,
-    /// else 0 (it used to run whenever any closure of the program captured a
-    /// view).
-    pub retaining_fixpoints: u64,
+    /// M188 (Order 56): the callees whose C16 retaining summary this analysis
+    /// computed (`analyzer/retain_tables.rs`) — the asked callee and the
+    /// callees its rows reach, never the whole program; 0 unless a live call
+    /// hands a view-capturing closure to a bodied callee (E340 made the
+    /// question lazy; it used to be a whole-program fixpoint whenever any
+    /// closure of the program captured a view).
+    pub retaining_summaries: u64,
+    /// M188: the retaining rows this analysis derived by walking the
+    /// family's live lane — a served keystroke reads a fraction of a filing
+    /// one's.
+    pub retain_rows_live: u64,
+    /// M189 (Order 56): the closures `check_view_escape` scanned for a
+    /// captured view — the ones its live positions and calls name, never the
+    /// program's every closure (it used to scan all of them, std's included,
+    /// on every analysis).
+    pub capture_scans: u64,
     /// B635's instrument ([`set_verify_graph_replays`]): the cold calls a
     /// REPLAYED post-rewrite graph names differently from the graph built
     /// whole over the same tree — 0 by construction, counted only while the
@@ -760,7 +778,9 @@ thread_local! {
             r11_instances_scanned: 0,
             r11_records_filed: 0,
             hover_rows_restored: 0,
-            retaining_fixpoints: 0,
+            retaining_summaries: 0,
+            retain_rows_live: 0,
+            capture_scans: 0,
             graph_replay_mismatches: 0,
             async_keys_served: 0,
             async_keys_rewalked: 0,
@@ -1142,8 +1162,8 @@ pub fn report(program: &Program) {
              live-entities={} move-rows-live={} r11-rows-live={} instances-served={} \
              instances-scanned={} instance-records-filed={} async-seeded={}/{} \
              async-records-filed={} async-record-bytes={} hover-rows-restored={} \
-             retaining-fixpoints={} prefix-world={} prefix-layered={} prefix-hits={} \
-             prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
+             retaining-summaries={} retain-rows-live={} capture-scans={} prefix-world={} \
+             prefix-layered={} prefix-hits={} prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
              prefix-checks={} prefix-checks-written={} tier-oracle={} \
              post-seam={}",
             census.base_hits,
@@ -1182,7 +1202,9 @@ pub fn report(program: &Program) {
             census.async_records_filed,
             census.async_record_bytes,
             census.hover_rows_restored,
-            census.retaining_fixpoints,
+            census.retaining_summaries,
+            census.retain_rows_live,
+            census.capture_scans,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
             census.prefix_hits,

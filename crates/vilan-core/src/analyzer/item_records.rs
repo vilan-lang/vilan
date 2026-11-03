@@ -152,6 +152,12 @@ impl RestoredTables {
         {
             self.r11.extend(&tables.r11.rebased(rebase, shift, source));
         }
+        if tables
+            .families
+            .contains(super::row_families::RowFamily::Retain)
+        {
+            self.retain.extend(&tables.retain.rebased(rebase));
+        }
         if tables.hover_recorded {
             self.hover
                 .extend(&tables.hover.rebased(rebase, shift, source));
@@ -1321,6 +1327,7 @@ impl<'src> Analyzer<'src> {
                         && tables.lazy.fits(&own)
                         && tables.hmr.fits(&own)
                         && tables.r11.fits(&own)
+                        && tables.retain.fits(&own)
                         && tables.resource_slots.is_empty()
                         && tables
                             .stage_hints

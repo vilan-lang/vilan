@@ -211,14 +211,15 @@ fn replay_the_classes() -> Replayed {
         }
         package.remove();
     }
-    // B635's cold wraps and M138's cold instance record start from a served
-    // analysis of the BASE text too: the world's records are filed over it,
-    // and each keystroke replays them. Before the effect classes, which the
+    // B635's cold wraps, M138's cold instance record and M188's retaining
+    // rows start from a served analysis of the BASE text too: the world's
+    // records are filed over it, and each keystroke replays them. Before the effect classes, which the
     // gate expects last.
     for fixture in B635_FIXTURES
         .iter()
         .chain(ASYNC_RECORD_FIXTURES)
         .chain(S3B_HELD_FIXTURES)
+        .chain(RETAIN_FIXTURES)
     {
         replay_from_the_base_text(fixture, "views.vl", &mut divergences, &mut censuses);
     }
@@ -1321,6 +1322,7 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
         .iter()
         .chain(R11_FIXTURES)
         .chain(R11_RECORD_FIXTURES)
+        .chain(RETAIN_FIXTURES)
         .chain(EFFECT_FIXTURES)
         .chain(B635_FIXTURES)
         .chain(ASYNC_RECORD_FIXTURES)
@@ -1670,6 +1672,124 @@ fn m155_r11_candidate_rows_are_restored_on_a_served_keystroke() {
         served.census.item_records_served > 0,
         "the leaf's generics were served items: {:#?}",
         served.census
+    );
+}
+
+/// **M188**: C16's retaining rows (`analyzer/retain_tables.rs`) are filed
+/// by the leaf's first (seeded) analysis — which asks no summary, the base
+/// text's `twice` call aside — and restored on its keystrokes, so a served
+/// keystroke walks a fraction of the rows the filing one did; the keystroke
+/// that hands the capturing closure to the leaf's served `pass` asks the
+/// summary of `pass` and of the cold `keep` it reaches, from rows it did not
+/// walk, and is refused as the clean analysis is.
+#[test]
+fn m188_retain_rows_are_restored_and_a_served_summary_reads_them() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let fixture = &RETAIN_FIXTURES[0];
+    let mut package = fixture.write();
+    let seed = vec![package.path("views.vl")];
+    let first = observe(&package, seed.clone(), Leg::Incremental);
+    let warm = observe(&package, seed.clone(), Leg::Incremental);
+    let edited = fixture.edits[0].apply(package.text("views.vl"));
+    package.set("views.vl", edited);
+    let served = observe(&package, seed.clone(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        clean
+            .rendering
+            .contains("`pass` keeps what it is handed past the call"),
+        "the fixture's storing-callee refusal: {}",
+        clean.rendering
+    );
+    assert_eq!(
+        served.rendering, clean.rendering,
+        "the served keystroke answers clean"
+    );
+    eprintln!(
+        "M188: retain rows live: first {} warm {} served {}; summaries: first {} warm {} \
+         served {} (items served {})",
+        first.census.retain_rows_live,
+        warm.census.retain_rows_live,
+        served.census.retain_rows_live,
+        first.census.retaining_summaries,
+        warm.census.retaining_summaries,
+        served.census.retaining_summaries,
+        served.census.item_records_served
+    );
+    assert!(
+        first.census.retain_rows_live > 0
+            && warm.census.retain_rows_live * 4 < first.census.retain_rows_live
+            && served.census.retain_rows_live * 4 < first.census.retain_rows_live,
+        "the warm and served keystrokes restore the retaining rows rather than walking them \
+         (first {}, warm {}, served {})",
+        first.census.retain_rows_live,
+        warm.census.retain_rows_live,
+        served.census.retain_rows_live
+    );
+    assert_eq!(
+        (
+            first.census.retaining_summaries,
+            warm.census.retaining_summaries,
+            served.census.retaining_summaries
+        ),
+        (1, 0, 2),
+        "the base text asks `twice` alone (and only while `read` is walked); the edit asks \
+         `pass` and the `keep` it reaches"
+    );
+    assert!(
+        served.census.item_records_served > 0,
+        "the leaf's `pass` was a served item: {:#?}",
+        served.census
+    );
+    // M189: the capture scan asks the closures the pass meets — the first
+    // analysis walks the cold module's `thrice` (three closures handed to
+    // calls) and the leaf's `read`; a keystroke that serves the module and
+    // `pass` asks the edited `read`'s one closure alone.
+    eprintln!(
+        "M189: capture scans: first {} warm {} served {}",
+        first.census.capture_scans, warm.census.capture_scans, served.census.capture_scans
+    );
+    assert_eq!(
+        (
+            first.census.capture_scans,
+            warm.census.capture_scans,
+            served.census.capture_scans
+        ),
+        (4, 0, 1),
+        "a served keystroke scans only the live set's closures"
+    );
+}
+
+/// M188's plant: the retaining summary folded from the LIVE rows alone, the
+/// restored ones dropped while their regions stay out of the lane. The
+/// keystrokes that hand the leaf's capturing closure to a callee whose
+/// storing body is a served item's or a reused module's are then admitted —
+/// the gate must see it.
+#[test]
+fn the_differential_sees_a_retaining_summary_without_its_restored_rows() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::RetainRowsUnrestored);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("served `pass`")),
+        "the unrestored-rows plant must turn the served callee's refusal red; it found: \
+         {divergences:#?}"
+    );
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("cold module's storing `keep`")),
+        "the unrestored-rows plant must turn the cold callee's refusal red; it found: \
+         {divergences:#?}"
     );
 }
 

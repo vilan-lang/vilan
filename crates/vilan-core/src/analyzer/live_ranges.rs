@@ -87,6 +87,43 @@ impl LiveRanges {
         &self.ranges
     }
 
+    /// The live ids that also lie in `within` (sorted, disjoint `[start,
+    /// end)` ranges) — or, with `keep` false, that lie OUTSIDE it.
+    pub(super) fn split_by(&self, within: &[(u32, u32)], keep: bool) -> Self {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        let mut other = within.iter().peekable();
+        for &(start, end) in &self.ranges {
+            let mut cursor = start;
+            while cursor < end {
+                while other
+                    .peek()
+                    .is_some_and(|(_, other_end)| *other_end <= cursor)
+                {
+                    other.next();
+                }
+                let (inside, next) = match other.peek() {
+                    Some(&&(other_start, other_end)) if other_start <= cursor => {
+                        (true, other_end.min(end))
+                    }
+                    Some(&&(other_start, _)) => (false, other_start.min(end)),
+                    None => (false, end),
+                };
+                if inside == keep {
+                    match ranges.last_mut() {
+                        Some((_, last_end)) if *last_end == cursor => *last_end = next,
+                        _ => ranges.push((cursor, next)),
+                    }
+                }
+                cursor = next;
+            }
+        }
+        let count = ranges
+            .iter()
+            .map(|(start, end)| u64::from(end - start))
+            .sum();
+        LiveRanges { ranges, count }
+    }
+
     /// How many ids are live.
     pub(super) fn count(&self) -> u64 {
         self.count
@@ -302,6 +339,25 @@ mod tests {
         assert!(empty.walks(7));
         assert_eq!(empty.ids().count(), 0);
         assert!(!LiveRanges::complement(&[], 0).covers(0));
+    }
+
+    #[test]
+    fn a_split_keeps_the_live_ids_inside_or_outside_the_given_ranges() {
+        let live = LiveRanges::complement(&[(10, 20), (40, 41)], 50);
+        assert_eq!(live.ranges(), &[(0, 10), (20, 40), (41, 50)]);
+        let within = [(5, 25), (30, 35), (38, 45), (60, 70)];
+        let inside = live.split_by(&within, true);
+        assert_eq!(
+            inside.ranges(),
+            &[(5, 10), (20, 25), (30, 35), (38, 40), (41, 45)]
+        );
+        assert_eq!(inside.count(), 5 + 5 + 5 + 2 + 4);
+        let outside = live.split_by(&within, false);
+        assert_eq!(outside.ranges(), &[(0, 5), (25, 30), (35, 38), (45, 50)]);
+        assert_eq!(inside.count() + outside.count(), live.count());
+        assert!(live.split_by(&[], true).ranges().is_empty());
+        assert_eq!(live.split_by(&[], false).ranges(), live.ranges());
+        assert_eq!(live.split_by(&[(0, 50)], true).ranges(), live.ranges());
     }
 
     #[test]
