@@ -9094,3 +9094,126 @@ fn m181_std_url_compiles_for_the_browser_and_the_router_re_exports_the_decoder()
         "#,
     );
 }
+
+// --- B695: a cut inside a surrogate pair rounds to the code point ------------
+//
+// `str` is indexed by UTF-16 code unit (`len()` says so), and a bound between
+// the two halves of a pair answered HALF a character on JS — a string the
+// native backend cannot hold. RULED: the bound moves back to the pair's start on
+// both backends (strings.md, "A cut inside a surrogate pair"). One pin per
+// operation; the native half is `native_differential`'s
+// `b695_a_cut_inside_a_surrogate_pair_is_identical_on_both_backends`.
+
+#[test]
+fn b695_substring_floors_a_bound_inside_a_pair() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet face = \"😀\";
+\tprint(face.substring(0, 1).len());
+\tprint(face.substring(1, 2) == face);
+\tprint(face.substring(0, 2) == face);
+\tprint(\"a😀b\".substring(2, 4));
+\tprint(\"a😀b\".substring(0, 2));
+}
+",
+        "0\ntrue\ntrue\n😀b\na\n",
+    );
+}
+
+#[test]
+fn b695_a_cut_at_every_position_recombines() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet text = \"a😀b😀\";
+\tmut cut = 0;
+\tmut whole = true;
+\tfor cut <= text.len() {
+\t\twhole = whole && text.substring(0, cut) + text.substring(cut, text.len()) == text;
+\t\tcut += 1;
+\t}
+\tprint(whole);
+}
+",
+        "true\n",
+    );
+}
+
+#[test]
+fn b695_a_unit_walker_reads_the_whole_character_at_its_second_half() {
+    // kolt's markdown and search walkers take `substring(i, i + 1)` per unit:
+    // the first half answers "", the second the character.
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet text = \"x😀\";
+\tmut index = 0;
+\tmut out = \"\";
+\tfor index < text.len() {
+\t\tlet piece = text.substring(index, index + 1);
+\t\tout = out + i\"[{piece}]\";
+\t\tindex += 1;
+\t}
+\tprint(out);
+}
+",
+        "[x][][😀]\n",
+    );
+}
+
+#[test]
+fn b695_code_at_reads_either_half_as_a_number() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tprint(\"😀\".code_at(0));
+\tprint(\"😀\".code_at(1));
+}
+",
+        "55357\n56832\n",
+    );
+}
+
+#[test]
+fn b695_index_of_answers_a_code_point_boundary() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet text = \"a😀b😀\";
+\tprint(text.index_of(\"😀\").unwrap_or(99));
+\tprint(text.last_index_of(\"😀\").unwrap_or(99));
+\tprint(text.index_of(\"b\").unwrap_or(99));
+\tlet at = text.index_of(\"b\").unwrap_or(0);
+\tprint(text.substring(at, text.len()));
+}
+",
+        "1\n4\n3\nb😀\n",
+    );
+}
+
+#[test]
+fn b695_an_empty_pattern_splits_and_replaces_between_characters() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet empty = \"\";
+\tprint(\"a😀b\".split(\"\").len());
+\tprint(\"a😀b\".split(empty).len());
+\tprint(\"a😀b\".replace(empty, \"-\"));
+\tprint(empty.replace(empty, \"-\"));
+\tprint(\"a😀b\".replace(\"😀\", \"-\"));
+\tprint(\"a,b\".split(\",\").len());
+}
+",
+        "3\n3\n-a-😀-b-\n-\na-b\n2\n",
+    );
+}
+
+#[test]
+fn b695_a_literal_pattern_keeps_the_host_method() {
+    let js = compile("fun main() {\n\tprint(\"a,b\".split(\",\").len());\n\tprint(\"ab\".replace(\"a\", \"c\"));\n}\n")
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(
+        js.contains(".split(\",\")") && js.contains(".replaceAll(\"a\", \"c\")"),
+        "{js}"
+    );
+    assert!(
+        !js.contains("__str_split") && !js.contains("__str_replace"),
+        "{js}"
+    );
+}

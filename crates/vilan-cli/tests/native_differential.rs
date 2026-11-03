@@ -10916,6 +10916,28 @@ fn b691_an_enum_is_a_value_at_every_seam_on_both_backends() {
     );
 }
 
+/// B695: a cut inside a surrogate pair rounds to the code point on BOTH
+/// backends — `substring` at every position across `"a😀b"`, `code_at` of each
+/// half, `split("")`, `replace("", ..)` — where JS answered half a pair and the
+/// native substring counted characters, not UTF-16 units, so every index past
+/// a non-BMP character was off by one. `index_of` is not here: the native
+/// backend refuses its host binding (S1b), and its answers are code-point
+/// boundaries by construction (`inference::std_surface::b695_*`).
+#[test]
+fn b695_a_cut_inside_a_surrogate_pair_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_surrogate_cuts.vl"),
+        include_str!("native/surrogate_cuts.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_surrogate_cuts.vl"),
+        Verdict::Identical,
+        "a cut inside a surrogate pair must answer alike on both backends"
+    );
+}
+
 /// B693 (store-assume-keeper.md §4.5): an assumed handle's fallback is kept by
 /// a feed on its variant's flag and read in place on both backends — every way
 /// a variant ends (the enum's own handle, `Option` → `None`, a key removed by

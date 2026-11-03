@@ -140,6 +140,48 @@ error: substring end -1 is negative — the range must satisfy
 Empty ranges are legal, so the natural boundary cases all work:
 `substring(0, 0)`, `substring(len(), len())`, and `substring(0, len())`.
 
+### A cut inside a surrogate pair
+
+Every index into a `str` counts **UTF-16 code units** — `len()`, `substring`,
+`code_at`, and the answers of `index_of` and `last_index_of` alike — so a
+character outside the Basic Multilingual Plane (`😀`, most emoji, many CJK
+extension characters) is two units, a *surrogate pair*. A bound can therefore
+fall *between* the two halves of one character, and half a character is not text:
+the native backend cannot hold it at all.
+
+The rule, the same on both backends: **a bound inside a pair moves back to the
+start of that character.**
+
+- `substring(start, end)` checks the range first (`0 <= start <= end <=
+  len()`, as above), then floors each bound: `"😀".substring(0, 1)` is `""`,
+  `"😀".substring(1, 2)` is `"😀"`, and `"a😀b".substring(2, 4)` is `"😀b"`.
+  Flooring keeps the property a cut must have — `s.substring(0, k) +
+  s.substring(k, s.len())` is `s` at every `k` — so a scanner that steps one
+  unit at a time and appends `substring(i, i + 1)` rebuilds its text exactly
+  (the first half answers `""`, the second the whole character).
+- `code_at(index)` answers the code UNIT at `index` — either half of a pair, as
+  a number (`"😀".code_at(1)` is `56832`). A number is representable on both
+  backends, so it is not rounded.
+- `index_of` / `last_index_of` answer where a needle STARTS, and a needle is
+  text, so the answer is always a character boundary.
+- `split("")` and `replace("", to)` cut between **characters**, not units:
+  `"a😀b".split("")` is three pieces and `"a😀b".replace("", "-")` is
+  `"-a-😀-b-"`.
+
+So no `str` operation answers half a character on either backend, and a
+truncation written `text.substring(0, max)` stays within `max` units, one fewer
+when the cut would have split a pair.
+
+```vilan
+fun main() {
+	let face = "😀";
+	print(face.len());                                  // 2
+	print(face.substring(0, 1).is_empty());             // true — floored to 0
+	print(face.substring(1, 2) == face);                // true
+	print("a😀b".split("").len());                       // 3
+}
+```
+
 ### Cutting a known affix
 
 Reaching for `substring` to drop a leading or trailing marker is what invited

@@ -32,8 +32,11 @@ async function __pbkdf2_sha512(password, salt, iterations, bits) {
 	return new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations, hash: "SHA-512" }, imported, bits));
 }
 function __substring(text, start, end) {
-	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);
+	if (0 <= start && start <= end && end <= text.length) return text.substring(__code_point_floor(text, start), __code_point_floor(text, end));
 	throw "substring out of range: the length is " + text.length + " but the range is " + start + ".." + end + " — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end";
+}
+function __code_point_floor(text, at) {
+	return at > 0 && (text.charCodeAt(at) & 0xFC00) === 0xDC00 && (text.charCodeAt(at - 1) & 0xFC00) === 0xD800 ? at - 1 : at;
 }
 function __try_parse_json(text) {
 	try {
