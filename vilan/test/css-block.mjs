@@ -26,8 +26,8 @@ function __nmap_insert(table, hash, key, value) {
 }
 function __nmap_keys(table) {
 	const out = [];
-	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[0]));
-	return out;
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);
+	return out.map(__clone);
 }
 function __nmap_remove(table, hash) {
 	__nmap_settle(table);
@@ -42,8 +42,8 @@ function __nmap_settle(table) {
 }
 function __nmap_values(table) {
 	const out = [];
-	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[1][1]));
-	return out;
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function __panic(message, location) {
 	const error = new Error(message);

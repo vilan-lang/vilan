@@ -1,7 +1,3 @@
-function __at(list, index, location) {
-	if (index >= 0 && index < list.length) return list[index];
-	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
-}
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
@@ -10,6 +6,9 @@ function __clone(value) {
 }
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
+}
+function __list_pop(list) {
+	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
 function __nmap_get(table, hash) {
 	const entry = table[0].get(hash);
@@ -31,8 +30,8 @@ function __nmap_insert(table, hash, key, value) {
 }
 function __nmap_keys(table) {
 	const out = [];
-	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[0]));
-	return out;
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);
+	return out.map(__clone);
 }
 function __nmap_len(table) {
 	const hash = table[1];
@@ -55,15 +54,8 @@ function __nmap_settle(table) {
 }
 function __nmap_values(table) {
 	const out = [];
-	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[1][1]));
-	return out;
-}
-function __panic(message, location) {
-	const error = new Error(message);
-	error.name = "panicked at " + location;
-	Object.defineProperty(error, "location", { value: location });
-	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
-	return error;
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function hash(self) {
 	return __hash(self);
@@ -123,14 +115,43 @@ function keys(self) {
 function values(self) {
 	return __nmap_values(self[0]);
 }
+function is_empty2(self) {
+	return self.length === 0;
+}
 function entries(self) {
-	const keys2 = __nmap_keys(self[0]);
-	const values2 = __nmap_values(self[0]);
+	let keys2 = __nmap_keys(self[0]);
+	let values2 = __nmap_values(self[0]);
+	let backwards = [  ];
+	while (!(is_empty2(keys2))) {
+		const $f = __list_pop(keys2);
+		let $g = null;
+		if ($f[0] === 0) {
+			const key2 = $f[1];
+			const $h = __list_pop(values2);
+			let $i = null;
+			if ($h[0] === 0) {
+				const value2 = $h[1];
+				$i = backwards.push([ key2, value2 ]);
+			} else {
+				$i = undefined;
+			}
+			$g = $i;
+		} else {
+			$g = undefined;
+		}
+		$g;
+	}
 	let result = [  ];
-	let index = 0;
-	while (index < keys2.length) {
-		result.push([ __clone(__at(keys2, index, "std/src/hash_map.vl:125:17")), __clone(__at(values2, index, "std/src/hash_map.vl:125:30")) ]);
-		index = index + 1;
+	while (!(is_empty2(backwards))) {
+		const $j = __list_pop(backwards);
+		let $k = null;
+		if ($j[0] === 0) {
+			const pair = $j[1];
+			$k = result.push(pair);
+		} else {
+			$k = undefined;
+		}
+		$k;
 	}
 	return result;
 }

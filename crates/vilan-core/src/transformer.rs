@@ -2981,15 +2981,15 @@ fn helper_source(name: &str) -> &'static str {
         "__nmap_keys" => {
             "function __nmap_keys(table) {\n\
              \tconst out = [];\n\
-             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[0]));\n\
-             \treturn out;\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);\n\
+             \treturn out.map(__clone);\n\
              }"
         }
         "__nmap_values" => {
             "function __nmap_values(table) {\n\
              \tconst out = [];\n\
-             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[1][1]));\n\
-             \treturn out;\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);\n\
+             \treturn out.map(__clone);\n\
              }"
         }
         // `Map.keys()`/`Map.values(): List<_>` — a fresh array snapshot (cloned, so

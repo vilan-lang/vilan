@@ -117,13 +117,27 @@ impl HashMap<type K: Hashable, type V> {
 	/// `for entry in map.entries() { entry.0; entry.1 }`. The two snapshots share
 	/// the table's one insertion order, so they pair up by position.
 	fun entries(self): List<(K, V)> {
-		let keys = self.table.keys();
-		let values = self.table.values();
+		// Popped, not indexed, so each key and value MOVES into its pair: the two
+		// snapshots are copies already, and reading `keys[index]` into a tuple
+		// would copy each again.
+		mut keys = self.table.keys();
+		mut values = self.table.values();
+		mut backwards: List<(K, V)> = [];
+		for !keys.is_empty() {
+			match keys.pop() {
+				Some(let key) => match values.pop() {
+					Some(let value) => backwards.push((key, value)),
+					None => {},
+				},
+				None => {},
+			}
+		}
 		mut result: List<(K, V)> = [];
-		mut index: usize = 0;
-		for index < keys.len() {
-			result.push((keys[index], values[index]));
-			index += 1;
+		for !backwards.is_empty() {
+			match backwards.pop() {
+				Some(let pair) => result.push(pair),
+				None => {},
+			}
 		}
 		result
 	}

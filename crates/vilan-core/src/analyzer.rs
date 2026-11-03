@@ -76489,7 +76489,7 @@ pub enum Intrinsic {
     // `hashes() / keys() / values()` -> snapshots in insertion order,
     // tombstones skipped (`keys`/`values` cloned). There is no `entries` row: a
     // `(K, V)` pair's JS layout splices a tuple key or value into it, which only
-    // the vilan side knows, so `HashMap::entries` zips `keys` and `values`.
+    // the vilan side knows, so `HashMap::entries` pairs `keys` and `values`.
     KeyedHashes,
     KeyedKeys,
     KeyedValues,

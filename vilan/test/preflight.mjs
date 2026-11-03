@@ -6,8 +6,8 @@ function __clone(value) {
 }
 function __nmap_values(table) {
 	const out = [];
-	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[1][1]));
-	return out;
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function class_list(self) {
 	let out = "";
