@@ -467,3 +467,17 @@ class = "ci"
 ratio = 1.01
 reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list (path_root/path_child/store_path_steps, the entry points materializing it), which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; CI's perf job read x1.0187 of the ceiling at next 24f99565 (the five-lane merge) where the limit stood at x1.0171"
 item = "M186"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list, which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; the row sat EXACTLY at its limit after the five-lane merge and flipped on run-to-run noise of 0.03 % (CI read x1.0171 of the ceiling at next be85965f, limit x1.0171)"
+item = "M186"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.01
+reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list, which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; the row sat EXACTLY at its limit after the five-lane merge and flipped on run-to-run noise of 0.03 % (CI read x1.0150 of the ceiling at next be85965f, limit x1.0150)"
+item = "M186"
