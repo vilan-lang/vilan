@@ -25,6 +25,10 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**E341: a signal that ends a `vilan run --watch` session - `SIGTERM`, `SIGHUP`, or a `SIGINT` sent to the watcher alone - reaches the round's program: the session forwards it, waits up to five seconds for the program to end (killing it past that), reaps it, and then exits 130, where it exited 130 at once and left the program running and holding its port.** E335's forwarding covered the plain run only. A watch round's child is now registered with the same signal pipeline, in a second mode (a plain run forwards and keeps waiting; a watch session forwards, settles the child and ends), under the registry's lock as the plain run's is, so a signal landing mid-spawn is handled once the child exists; a child is taken off the registry before it is reaped, so a restart round's `kill` + `wait` leaves nothing for a late signal to find. A terminal's `Ctrl-C` is not delivered twice (the child already has it), but the session now waits for the child before it exits. Windows is unchanged (the Job object takes the round's tree when the session dies). Pins: `watch_lifecycle::e341_a_signal_that_ends_a_watch_session_ends_its_rounds_program` (each of the three signals; plant-proven: an unregistered round's program outlives the session). Tracker E341.
+---
+
 <!-- family: tooling -->
 **E358: `scripts/lsp-latency.py` keeps every edit sample's own phase lines - one `[vilan phase] lsp-context` line per analysis the server ran, and the core's `hot-set` line - counts the sample's analyses from them, and lists under the table every sample over 1.5x its row's median instructions, or with more analyses than its median, WITH those lines, so an outlier names its cause.** A `parse repair` sample on the N186 exhibit read 50.2 G instructions against the row's 17.4 G median and nothing recorded said what ran. The JSON carries the lines (`phase`) per sample; the analysis count was read from the whole stderr file's running total and is now the sample's own window. Pins: `perf_gate_script::e358_the_lsp_harness_names_an_outliers_analyses`. Tracker E358.
 ---
