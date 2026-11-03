@@ -2730,6 +2730,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\telse if (character === \"\\t\") out += \"\\\\t\";\n\
              \t\telse if (character === \"\\r\") out += \"\\\\r\";\n\
              \t\telse if (character === \"\\0\") out += \"\\\\0\";\n\
+             \t\telse if (character < \" \" || character === \"\\x7f\") out += \"\\\\u{\" + character.charCodeAt(0).toString(16) + \"}\";\n\
              \t\telse out += character;\n\
              \t}\n\
              \treturn out + \"\\\"\";\n\

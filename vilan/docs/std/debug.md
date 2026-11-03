@@ -22,7 +22,7 @@ generates for each type a `dbg` reaches, the same on both backends:
 | a struct | `Point { x = 1, y = 2 }`, a field-less one by its name |
 | an enum variant | `Shape::Circle(1.5)`, `Shape::Empty`; `Some(5)`, `None`, `Ok(1)`, `Err("no")` |
 | a tuple, a list | `(1, "two", 3.0)`, `[1, 2, 3]` |
-| a string | `"a \"quoted\" line\n"` |
+| a string | `"a \"quoted\" line\n"`; every other control character as `\u{..}` (`"\u{1b}[1m"`), so none reaches the terminal raw |
 | a float, an integer | `3.0`, `0.25`, `1e+21`, `-0.0`; `7`, `-3` |
 | a closure | `<closure |i32, i32| i32>` |
 | a `HashMap`, a `HashSet` | `HashMap { "ada" => 36 }`, `HashSet { "a", "b" }`, in insertion order |

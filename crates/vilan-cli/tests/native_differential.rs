@@ -12717,6 +12717,25 @@ fn e275_written_and_derived_debug_print_the_same_on_both_backends() {
     );
 }
 
+/// E346: `.debug()` and `dbg` escape every control character - the rest of C0
+/// and DEL as `\u{..}` - the same bytes on both backends (`vilan_rt::show`
+/// natively, `__dbg_str` and std's `str::debug` on node).
+#[test]
+fn e346_debug_escapes_every_control_character_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_controls.vl",
+        "import std::debug::Debug;\n\
+         import std::io::print;\n\n\
+         fun main() {\n\
+         \tlet text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\";\n\
+         \tprint(text.debug());\n\
+         \tdbg(text);\n\
+         }\n",
+        "\"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\"\n",
+        "[native_probe_dbg_controls.vl:7:2] text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\"\n",
+    );
+}
+
 /// E277: a broken list or set of scalars (numbers, strings, a field-less
 /// enum) fills its lines to 80 columns, nested ones two spaces deeper, while a
 /// list of structs or options keeps one entry per line — the same bytes on

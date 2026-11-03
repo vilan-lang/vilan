@@ -604,6 +604,32 @@ fn e275_the_derive_spells_variants_qualified_and_agrees_with_dbg() {
     );
 }
 
+/// E346: a debug spelling escapes EVERY control character - the rest of C0 and
+/// DEL as `\u{..}` (`\u{1b}` for ESC, `\u{7}` for BEL), beside the six short
+/// escapes it always had - in `.debug()` and in `dbg` alike, so a value holding
+/// pasted terminal output prints what it holds instead of acting on the
+/// terminal. B652's `\b`, `\f` and `\v` are among the controls, spelled
+/// `\u{8}`, `\u{c}` and `\u{b}` (Rust's Debug spells them the same way).
+#[test]
+fn e346_debug_escapes_every_control_character() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "fun main() {\n",
+            "\tlet text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\b\\f\\v\\u{1f}\\n\\t\\r\\0\\\"\\\\é\";\n",
+            "\tprint(text.debug());\n",
+            "\tdbg(text);\n",
+            "\tprint(\"plain\".debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "\"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{8}\\u{c}\\u{b}\\u{1f}\\n\\t\\r\\0\\\"\\\\é\"\n",
+            "\"plain\"\n",
+        ),
+        "[test.vl:5:2] text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{8}\\u{c}\\u{b}\\u{1f}\\n\\t\\r\\0\\\"\\\\é\"\n",
+    );
+}
+
 /// E275 (3): `.debug()` stays opt-in — a type without a derived or written
 /// impl has no `debug` method (`dbg` is the path that needs none) — and a
 /// program's own enum named `Option` prints qualified, as any enum of its own

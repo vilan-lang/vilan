@@ -64,6 +64,7 @@ function __dbg_str(text) {
 		else if (character === "\t") out += "\\t";
 		else if (character === "\r") out += "\\r";
 		else if (character === "\0") out += "\\0";
+		else if (character < " " || character === "\x7f") out += "\\u{" + character.charCodeAt(0).toString(16) + "}";
 		else out += character;
 	}
 	return out + "\"";

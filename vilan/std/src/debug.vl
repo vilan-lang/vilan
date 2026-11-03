@@ -15,17 +15,48 @@ trait Debug {
 }
 
 impl str with Debug {
-	/// Quoted, with `\\`, `\"`, `\n`, `\t`, `\r` and `\0` escaped: the `dbg`
-	/// printer's spelling (E275).
+	/// Quoted, with `\\`, `\"`, `\n`, `\t`, `\r` and `\0` escaped and every other
+	/// control character - the rest of C0, and DEL - written `\u{..}` (`\u{1b}`
+	/// for ESC), as vilan source writes it (B652): the `dbg` printer's spelling
+	/// (E275, E346). A debug spelling shows the value rather than acting on it, so
+	/// no control character reaches the terminal raw.
 	fun debug(self): str {
-		let escaped = self
-			.replace("\\", "\\\\")
-			.replace("\"", "\\\"")
-			.replace("\n", "\\n")
-			.replace("\t", "\\t")
-			.replace("\r", "\\r")
-			.replace("\0", "\\0");
-		"\"" + escaped + "\""
+		let digits = "0123456789abcdef";
+		let length = self.len();
+		mut out = "\"";
+		mut start = 0;
+		mut index = 0;
+		for index < length {
+			let unit = self.code_at(index);
+			if unit < 32 || unit == 34 || unit == 92 || unit == 127 {
+				let low = (unit % 16).as_usize();
+				let high = (unit / 16).as_usize();
+				let escaped = if unit == 92 {
+					"\\\\"
+				} else if unit == 34 {
+					"\\\""
+				} else if unit == 10 {
+					"\\n"
+				} else if unit == 9 {
+					"\\t"
+				} else if unit == 13 {
+					"\\r"
+				} else if unit == 0 {
+					"\\0"
+				} else if high == 0 {
+					"\\u\{" + digits.substring(low, low + 1) + "}"
+				} else {
+					"\\u\{"
+						+ digits.substring(high, high + 1)
+						+ digits.substring(low, low + 1)
+						+ "}"
+				};
+				out = out + self.substring(start, index) + escaped;
+				start = index + 1;
+			}
+			index = index + 1;
+		}
+		out + self.substring(start, length) + "\""
 	}
 }
 
