@@ -74,7 +74,7 @@ path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
                    | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
 set-element = path-branch | impl-selector ;
-impl-selector = "(" "impl" type [ "with" type ] ")"
+impl-selector = "(" "impl" ( type [ "with" type ] | "*" ) ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
@@ -181,9 +181,10 @@ it, because a `use` never brought an implementation along.
 An `impl-selector` is a brace-set ELEMENT that binds no name: it says
 which of the module's `impl` blocks this file admits, and its optional
 `::` tail names the members it takes (§4.3). `_` stands for any type at
-an argument position (`(impl List<_>)`) and `(impl _)` selects every
-implementation the module declares; a selector writes no `type X` binders
-and takes no `as`. `with TRAIT` names the block by the trait it implements,
+an argument position (`(impl List<_>)`, a hole) and `(impl *)` selects
+every implementation the module declares (a set; `(impl _)`, the earlier
+spelling, is read as `(impl *)` with a steer); a selector writes no
+`type X` binders and takes no `as`. `with TRAIT` names the block by the trait it implements,
 as its declaration does — `(impl Box with One)` takes `impl Box with One`
 and no other `Box` block — which is how a block with no declarations of its
 own (all defaults, or a marker) is named; the trait resolves in the
