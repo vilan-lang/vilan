@@ -558,3 +558,52 @@ class = "ci"
 ratio = 1.01
 reason = "M191 (lane std-56): HashMap and HashSet over the one-table NativeMap<K, V> - the map helpers' new names and layout, slot/get_or_insert and the pending-mark table - which every program reaching std's maps analyzes; CI read x1.0280 of the ceiling at next cbcddd34 where the limit stood at x1.0272 (http-56's M176 row on the same subject is a separate, measured cause)"
 item = "M191"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.015
+reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0408 of the ceiling at next 67111085 where the limit stood at x1.0323 - 1.015 rather than 1.01 because 1.01 would leave a 0.2 % margin"
+item = "M187"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0384 of the ceiling at next 67111085 where the limit stood at x1.0355"
+item = "M187"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0537 of the ceiling at next 67111085 where the limit stood at x1.0478"
+item = "M187"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0390 of the ceiling at next 67111085 where the limit stood at x1.0323"
+item = "M187"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0418 of the ceiling at next 67111085 where the limit stood at x1.0396"
+item = "M187"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0395 of the ceiling at next 67111085 where the limit stood at x1.0323"
+item = "M187"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0283 of the ceiling at next 67111085 where the limit stood at x1.0242"
+item = "M187"
