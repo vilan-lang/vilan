@@ -902,7 +902,16 @@ impl<'src> Analyzer<'src> {
                         .get(&position)
                         .filter(|(receiver_enum, _)| *receiver_enum == enum_id)
                         .and_then(|(_, arguments)| {
-                            label_from(enum_id, arguments, variant_index, true)
+                            label_from(enum_id, arguments, variant_index, true).or_else(|| {
+                                // E342: a parameter only the receiver's own
+                                // payload binds (`T` of `Ok(5).map_err(..)`).
+                                self.receiver_payload_label(
+                                    enum_id,
+                                    variant_index,
+                                    arguments,
+                                    position,
+                                )
+                            })
                         })
                 });
             if let Some(label) = label {
@@ -932,6 +941,82 @@ impl<'src> Analyzer<'src> {
             }
         }
         labels.into_iter().collect()
+    }
+
+    /// E342: the label of a receiver that is a generic enum's VARIANT CALL
+    /// (`Ok(5)` of `Ok(5).map_err(..)`) when the member call's substitution
+    /// leaves some of the enum's parameters open - `map_err` binds `E` and `F`,
+    /// and `T` only the receiver's own payload binds. Each open parameter is
+    /// read off the payload argument written in the slot the variant declares
+    /// AS that parameter: the argument's recorded type, or a literal's own
+    /// (`"six"` is `str`, `5` an `i32` - nothing expects otherwise, the
+    /// parameter being open - `1.5` an `f64`, a suffix its type). Anything else
+    /// - a payload slot that only CONTAINS an open parameter, an argument with
+    /// no type to read - leaves the label untabled: a hole says nothing.
+    fn receiver_payload_label(
+        &self,
+        enum_id: Id,
+        variant_index: usize,
+        arguments: &[TypeId],
+        call_id: Id,
+    ) -> Option<String> {
+        let enum_ = self.enums.get(&enum_id)?;
+        let variant = enum_.variants.get(variant_index)?;
+        let call = self.function_calls.get(&call_id)?;
+        let parameters = &enum_.generic_parameter_constraint_ids;
+        if arguments.len() != parameters.len() {
+            return None;
+        }
+        let empty = SubstitutionContext::default();
+        // The argument written where the variant declares `parameter`.
+        let payload_of = |parameter: &TypeId| -> Option<Id> {
+            variant
+                .data_type_ids
+                .iter()
+                .zip(&call.argument_ids)
+                .find(|(slot, _)| {
+                    matches!(slot.borrow_type(self), Type::Generic(declared) if declared == parameter)
+                })
+                .map(|(_, argument)| *argument)
+        };
+        let mut spelled = Vec::with_capacity(arguments.len());
+        for (argument, parameter) in arguments.iter().zip(parameters) {
+            if self.type_is_ground(*argument) {
+                spelled.push(self.pretty_print_type(argument.borrow_type(self), &empty));
+                continue;
+            }
+            let payload = payload_of(parameter)?;
+            let reading = match self.type_id_of_expr(payload) {
+                Some(recorded) if self.type_is_ground(recorded) => {
+                    self.pretty_print_type(recorded.borrow_type(self), &empty)
+                }
+                _ => literal_type_name(self.expr_id_to_expr_map.get(&payload)?)?.to_string(),
+            };
+            spelled.push(reading);
+        }
+        let substitution = applied_substitution(parameters, arguments);
+        let mut payload = Vec::with_capacity(variant.data_type_ids.len());
+        for slot in &variant.data_type_ids {
+            let direct = parameters.iter().position(|parameter| {
+                matches!(slot.borrow_type(self), Type::Generic(declared) if declared == parameter)
+            });
+            match direct {
+                Some(index) => payload.push(spelled[index].clone()),
+                // A slot that only CONTAINS a parameter (`List<T>`) reads
+                // through the substitution, which holds the open one unbound:
+                // no reading unless the slot names no parameter at all.
+                None if self.type_is_ground(*slot) => {
+                    payload.push(self.pretty_print_type(slot.borrow_type(self), &substitution));
+                }
+                None => return None,
+            }
+        }
+        let base = self.pretty_print_type(&Type::Enum(enum_id, Vec::new()), &empty);
+        let mut label = format!("{base}<{}>::{}", spelled.join(", "), variant.name);
+        if !payload.is_empty() {
+            label.push_str(&format!("({})", payload.join(", ")));
+        }
+        (!label.contains("Unknown") && !label.contains('?')).then_some(label)
     }
 
     /// E316: the BOUND an implicit generic parameter stands for, where a
@@ -1497,4 +1582,27 @@ fn definition_block(head: &str, members: &[String]) -> String {
     }
     out.push_str("\n}");
     out
+}
+
+/// E342: the type a literal has where nothing expects one - its suffix, else a
+/// fraction's `f64` or an integer's `i32` (the analyzer's own defaults for a
+/// numeric literal), `str` for a string and `bool` for a boolean. `None` for
+/// any other expression.
+fn literal_type_name(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::String(_) | Expr::MultilineString(_) => Some("str"),
+        Expr::Bool(_) => Some("bool"),
+        Expr::Number(_, fraction, suffix) => match *suffix {
+            Some("f" | "f64") => Some("f64"),
+            Some("n") => Some("BigInt"),
+            Some(other) => [
+                "u32", "i32", "f32", "i8", "u8", "i16", "u16", "i53", "u53", "usize",
+            ]
+            .into_iter()
+            .find(|name| *name == other),
+            None if fraction.is_some() => Some("f64"),
+            None => Some("i32"),
+        },
+        _ => None,
+    }
 }

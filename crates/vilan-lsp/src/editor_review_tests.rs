@@ -2136,6 +2136,47 @@ fn e333_a_variant_in_a_container_or_as_a_receiver_hovers_with_its_instantiation(
     });
 }
 
+/// E342: a receiver variant whose method binds only SOME of the enum's
+/// parameters in the call's substitution - `Ok(5).map_err(..)` has its `F` and
+/// `E` but not `T`, which only the receiver's own payload binds - hovered
+/// bare; the label's hole is filled from the variant call's payload argument
+/// types, each where the declared payload slot IS that parameter.
+#[test]
+fn e342_a_receiver_variant_takes_the_parameters_its_payload_binds() {
+    on_big_stack(|| {
+        let client = "fun main() {\n\
+             \tlet _ = Ok(5).map_err(|code: str| code);\n\
+             \tlet _ = Err(\"six\").map(|value: i32| value + 1);\n\
+             \tlet _ = Ok(1.5).map_err(|code: bool| code);\n\
+             \tlet _ = Ok(Some(2)).map_err(|code: bool| code);\n\
+             \tlet _ = Some(\"x\").map(|text: str| text.len());\n}\n";
+        let package = Package::new("e342", &[("client.vl", client)]);
+        let document = package.world();
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let first_line = |needle: &str| {
+            let hover = document
+                .hover(at(client, needle, 0))
+                .unwrap_or_else(|| panic!("{needle:?} hovers"));
+            hover.lines().nth(1).unwrap_or_default().to_string()
+        };
+        // `T` from the payload, `E` from the substitution.
+        assert_eq!(first_line("Ok(5)"), "Result<i32, str>::Ok(i32)");
+        // The other way round: `E` from the payload.
+        assert_eq!(first_line("Err(\"six\")"), "Result<i32, str>::Err(str)");
+        // A float literal's own type.
+        assert_eq!(first_line("Ok(1.5)"), "Result<f64, bool>::Ok(f64)");
+        // A payload with no type to read (a variant call, itself open) leaves
+        // the hole - the label says nothing rather than something wrong.
+        assert_eq!(first_line("Ok(Some(2))"), "Result::Ok");
+        // One parameter, bound both ways: unchanged.
+        assert_eq!(first_line("Some(\"x\")"), "Option<str>::Some(str)");
+    });
+}
+
 /// E322: an element's links are told from the reader's by the desugar's own
 /// marks (`element_head_links`, B620) and its scaffolding, not by scanning the
 /// text for a `>` and a `.`: `title(<b />)` ends in a `>` and the head link
