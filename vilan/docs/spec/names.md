@@ -154,10 +154,13 @@ importing module's scope:
   brace-set element that binds no name and admits exactly the `impl`
   blocks of the module whose subject unifies with the written type. A set
   naming one means "these implementations only", so `only` is for
-  statements without a selector. `_` is the placeholder — `(impl List<_>)`
-  admits every `List` block whatever its element, and `(impl _)` admits
-  every block the module declares — and no `type X` binders are written in
-  a selector. `import std::list::{ (impl List<i32>)::first };` takes ONE
+  statements without a selector. Two symbols, two meanings: **`_` is
+  unspecified** — a hole, here an element left open, so `(impl List<_>)`
+  admits every `List` block whatever its element (types §5.4); **`*` is
+  everything** — a set, so `(impl *)` admits every block the module
+  declares, as `export *;` exports every item. `(impl _)`, the spelling
+  before v0.54.0, is read as `(impl *)` with a steer, and `List<*>` is not
+  a type. No `type X` binders are written in a selector. `import std::list::{ (impl List<i32>)::first };` takes ONE
   member into the type's namespace for this file, and
   `::{ first, last }` takes several; a selector takes no `as`, because a
   method is called by name on a receiver. The subject resolves in the
@@ -178,6 +181,64 @@ Platform gating is not checked at the import: a module outside the
 current platform's layers (e.g. `std::web::ui` in a Node build) still loads,
 so its items type-check. The error is reported where platform-colored
 code becomes **reachable** from the build's entry (§11).
+
+### 4.3.1 What an import means — the elaboration
+
+Every import form above is sugar over three things, and this table is
+the normative definition of each (the design record is
+[`import-foundation.md`](https://github.com/vilan-lang/proposals/blob/main/proposal/import-foundation.md)):
+
+- a **root value**, written `(import X)` — `X` is `pkg`, `std` or a
+  dependency's manifest name — which evaluates to the package's module
+  tree. A root is reached by evaluation, never by lookup: nothing in any
+  scope is named `pkg`, which is what §4.2's reservation means. A bare
+  root head anywhere a path stands (`pkg::m::S`) reads as
+  `(import pkg)::m::S`;
+- **projections** — `::name` on a module is its item or submodule (never
+  both, §4.2), on a type its namespace member (§4.6); `::(impl T)` on a
+  module is the set of its `impl` blocks whose subject unifies with `T`
+  (`with Tr` narrows to the blocks implementing `Tr`), `::name` on that
+  set the members so named, and `::*` every member of the set (or every
+  export of a module). `::{ a, b }` is two projections of one value;
+- **`use P`** — the metalanguage's binding form, not a keyword of the
+  surface: a module, item or type member is bound under its leaf name (or
+  the `as` name), and a set of blocks or members is **admitted** — its
+  members join this file's method namespace for their subjects (§4.6).
+  `export use P` publishes the result too.
+
+The statement `import P;` is `use P′;` with `P′` the path under the
+bare-head rule. The forms, each as it elaborates (`a` a root-headed
+module path):
+
+| spelling | elaborates to |
+|---|---|
+| `import a::b;` | `use a::b; use a::b::(impl *)::*;` — the leaf bound and the LEAF module's blocks admitted (a leaf that is an item of `a` admits `a`'s). Today the blocks of every module on the path are admitted too (§4.1, §4.6) — the one implicit term the surface never wrote; it retires with A182, after which a directory body's blocks arrive only through an import that names it or a prelude |
+| `import a::b as c;` | `use a::b as c; use a::b::(impl *)::*;` |
+| `import a::{ b, c as d, self };` | `use a::b; use a::c as d; use a; use a::(impl *)::*;` — one `use` per member; `self` is the namespace the set sits in |
+| `import a::b only;` | `use a::b;` — no admission term |
+| `import a::{ (impl T) };` | `use a::(impl T)::*;` — these blocks and no other of `a`'s: a selector set IS the statement's admission term, written out |
+| `import a::{ (impl T with Tr) };` | `use a::(impl T with Tr)::*;` |
+| `import a::{ (impl T)::first };` | `use a::(impl T)::first;` |
+| `import a::{ (impl T)::{ first, last } };` | `use a::(impl T)::first; use a::(impl T)::last;` |
+| `import a::{ (impl *) };` | `use a::(impl *)::*;` — the plain form's admission term, written out |
+| `import a::(impl T);` | the one-selector set without braces, as `a::b` is the one-name set without braces (A181; `vilan fmt` writes it so) |
+| `import a::{ (impl pkg::x::T) };` | `use a::(impl (import pkg)::x::T)::*;` — the subject is a type path, whose head may be a root (A181) |
+| `import a::{ #hidden };` | `use #a::hidden;` — the reach marker rides on the projection (§4.8) |
+| `export *;` | `export use self::*;` |
+| `export import a::b;` | `export use a::b;` |
+| `export import a::{ (impl T) };` | `export use a::(impl T)::*;` — a re-exported admission: importers of this module, and every file of a package whose prelude it is, admit the blocks (A182) |
+| the package prelude (§4.7) | `use P::*;` for the prelude module's exports, before every file's first statement, as the weakest rung (§4.4) |
+| `mod self;` | the implicit `use (import pkg)::<this file's path> as self;` made explicit, as the host of the file's attributes (§4.1) |
+| `import pkg::m;` then `m::x` | `use (import pkg)::m; use (import pkg)::m::(impl *)::*;` then the binding `m` projected: a path whose head is a NAME in scope resolves the head by §4.4's ladder and projects from there |
+| `pkg::m::S` written inline, `(import pkg)::m::S` | the bare and the explicit root head, in any position (not yet built: today refused as "`pkg` is a namespace, not a value") |
+| `self::x`, `super::x` | `(import pkg)::<this file's module>::x` and `(import pkg)::<its parent>::x` — two implicit, location-derived, reserved bindings every file begins with; `super` is one level (not yet built: today `self` and `super` are ordinary alias names) |
+| `use T::{ a, b };` (§3.2's `use` statement) | `use T::a; use T::b;` with `T` a name in scope — the one surface statement whose head is not a root |
+
+An inline path admits nothing: it is explicit at its site for what it
+NAMES — an item, a member named by path — and a bare method call on a
+receiver resolves only through what the file's import statements and its
+prelude admit (`visibility.md` §3.2; the ruling the design record asks
+for, recommended this way).
 
 ## 4.4 Scopes and shadowing
 
