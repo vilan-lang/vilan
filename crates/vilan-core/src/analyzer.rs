@@ -31,6 +31,7 @@ mod liveness;
 mod move_tables;
 mod r11_candidates;
 mod r11_records;
+mod retain_tables;
 mod row_families;
 mod written_types;
 
@@ -4353,6 +4354,15 @@ pub struct Analyzer<'src> {
     /// files no move rows); and the fold, read by R11 and the drop plan.
     move_rows_live: move_tables::MoveRows,
     move_rows_filed: bool,
+    /// M188: the live lane's retaining rows (`retain_tables.rs`) and whether
+    /// this analysis walked them (an asked summary, or a seeded analysis —
+    /// [`Self::retain_rows_eager`]).
+    retain_rows_live: retain_tables::RetainRows,
+    retain_rows_filed: bool,
+    /// M188: whether `check_view_escape` walks the retaining rows' live lane
+    /// even when no call asks a summary — a SEEDED analysis's records must
+    /// carry the family for the keystroke that first asks.
+    retain_rows_eager: bool,
     /// M155: the live lane's R11 candidate rows, and whether this analysis
     /// derived them (it met an instantiation).
     r11_rows_live: r11_candidates::CandidateRows,
@@ -8044,6 +8054,9 @@ impl<'src> Analyzer<'src> {
             partial_move_roots: HashMap::default(),
             move_rows_live: move_tables::MoveRows::default(),
             move_rows_filed: false,
+            retain_rows_live: retain_tables::RetainRows::default(),
+            retain_rows_filed: false,
+            retain_rows_eager: false,
             r11_rows_live: r11_candidates::CandidateRows::default(),
             r11_rows_filed: false,
             r11_records_served: None,
@@ -29577,16 +29590,20 @@ impl<'src> Analyzer<'src> {
             .map(|(_, value_id)| *value_id)
             .collect();
         // C16 (Order 37, R7): which parameter positions a callee KEEPS past the
-        // call — a whole-program fixpoint over every expression. E340 (Order
-        // 56): computed on the FIRST live call that hands a view-capturing
-        // closure to an ordinary callee, the only question it answers
-        // (`stored_view_capturing_arguments` asks nothing else of it). It was
-        // computed whenever any closure of the program captured a view: on
-        // kolt@2684c70 two of ~5,900 do, so every keystroke paid the fixpoint
-        // (~330-520 ms CPU, 85 % of the pass) although no live call asked it.
-        // The answer is the same map whenever it is computed (the program does
-        // not change during the walk), so the diagnostics cannot move.
-        let mut retaining: Option<HashMap<Id, BTreeSet<u32>>> = None;
+        // call. E340 (Order 56) asked it only of a live call handing a
+        // view-capturing closure to an ordinary callee; M188 answers it for
+        // THAT callee alone, over the rows of the bodies it reaches
+        // (`retain_tables.rs`) — the rows are walked for the family's live
+        // lane on the first ask and folded into an index by function, and
+        // each asked callee's summary closes over the callees its own rows
+        // name. The whole-program sweep E340 still ran on that first ask
+        // (~50 ms of a kolt css keystroke) is gone.
+        let mut retain: Option<(retain_tables::RetainIndex, HashMap<Id, BTreeSet<u32>>)> = None;
+        let mut retain_live: Option<retain_tables::RetainRows> = None;
+        // The round-based fixpoint the summaries must agree with, on a debug
+        // build (the C16 pins among the programs that ask).
+        #[cfg(debug_assertions)]
+        let mut rounds: Option<HashMap<Id, BTreeSet<u32>>> = None;
         let mut escapes: Vec<Id> = Vec::new();
         // C16's own list: the argument id and the callee that keeps it, which is
         // the whole diagnosis and the reason this escape gets its own sentence.
@@ -29644,16 +29661,41 @@ impl<'src> Analyzer<'src> {
                     if !capturing.is_empty()
                         && self.call_hands_on_a_capturing_closure(*call_id, &capturing) =>
                 {
-                    let retaining = retaining.get_or_insert_with(|| {
-                        if !crate::macros::in_macro_world() {
-                            crate::incremental::update_census(|census| {
-                                census.retaining_fixpoints += 1;
+                    let Some((callee_id, name)) = self.named_ordinary_callee(*call_id) else {
+                        continue;
+                    };
+                    let bodied = self
+                        .functions
+                        .get(&callee_id)
+                        .is_some_and(|function| function.has_body);
+                    let keeps = if bodied {
+                        let (index, memo) = retain.get_or_insert_with(|| {
+                            let live = self.live_retain_rows();
+                            let index = self.fold_retain(&live);
+                            retain_live = Some(live);
+                            (index, HashMap::default())
+                        });
+                        let summary = self.retaining_summary(index, memo, callee_id);
+                        #[cfg(debug_assertions)]
+                        if !crate::incremental::planted(
+                            crate::incremental::Plant::RetainRowsUnrestored,
+                        ) {
+                            let rounds = rounds.get_or_insert_with(|| {
+                                self.compute_retaining_positions_by_rounds()
                             });
+                            assert_eq!(
+                                summary,
+                                rounds.get(&callee_id).cloned().unwrap_or_default(),
+                                "M188: the retaining summary of `{name}` over the rows disagrees \
+                                 with the whole-program rounds"
+                            );
                         }
-                        self.compute_retaining_positions()
-                    });
+                        summary
+                    } else {
+                        self.callee_retaining_positions(callee_id, &HashMap::default())
+                    };
                     stored_escapes.extend(
-                        self.stored_view_capturing_arguments(*call_id, &capturing, retaining),
+                        self.stored_view_capturing_arguments(*call_id, &capturing, &keeps, name),
                     );
                 }
                 _ => {}
@@ -29745,6 +29787,21 @@ impl<'src> Analyzer<'src> {
                 expr_id,
             );
         }
+        // M188: the rows this analysis walked are filed with its record. A
+        // SEEDED analysis (the editor's) walks them even when no call asked,
+        // so the world's records carry the family before the keystroke that
+        // first needs it; an unseeded one that asked nothing walks nothing.
+        if retain_live.is_none() && self.retain_rows_eager {
+            retain_live = Some(self.live_retain_rows());
+        }
+        if let Some(live) = retain_live {
+            if !crate::macros::in_macro_world() {
+                let walked = live.len() as u64;
+                crate::incremental::update_census(|census| census.retain_rows_live += walked);
+            }
+            self.retain_rows_live = live;
+            self.retain_rows_filed = true;
+        }
     }
 
     /// E340: whether `call_id` is an ordinary call (not a variant constructor)
@@ -29768,33 +29825,38 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// C16: the callee of an ordinary call (not a variant constructor) whose
+    /// subject names a declared function or an `external` one, with its name
+    /// — the calls whose closure arguments the storing-callee refusal can
+    /// speak about. A variant constructor is not asked here: the arm above
+    /// already refuses every escaping argument of one, and asking twice would
+    /// report the same closure under two sentences.
+    fn named_ordinary_callee(&self, call_id: Id) -> Option<(Id, &'src str)> {
+        if self.call_is_variant_constructor(call_id) {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        Some((*callee_id, self.callee_name(*callee_id)?))
+    }
+
     /// C16: the arguments of `call_id` that are view-capturing closures handed
-    /// to a parameter position the callee KEEPS — each paired with the callee's
-    /// name, which is what the refusal has to say to be actionable.
-    ///
-    /// A variant constructor is not asked here: the arm above already refuses
-    /// every escaping argument of one, and asking twice would report the same
-    /// closure under two sentences.
+    /// to a parameter position the callee KEEPS (`keeps`) — each paired with
+    /// the callee's name, which is what the refusal has to say to be
+    /// actionable.
     fn stored_view_capturing_arguments(
         &self,
         call_id: Id,
         capturing: &HashSet<Id>,
-        retaining: &HashMap<Id, BTreeSet<u32>>,
+        keeps: &BTreeSet<u32>,
+        name: &str,
     ) -> Vec<(Id, String)> {
-        if self.call_is_variant_constructor(call_id) {
-            return Vec::new();
-        }
         let Some(function_call) = self.function_calls.get(&call_id) else {
             return Vec::new();
         };
-        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
-        else {
-            return Vec::new();
-        };
-        let Some(name) = self.callee_name(*callee_id) else {
-            return Vec::new();
-        };
-        let keeps = self.callee_retaining_positions(*callee_id, retaining);
         function_call
             .argument_ids
             .iter()
@@ -29857,145 +29919,24 @@ impl<'src> Analyzer<'src> {
         (0..arity as u32).collect()
     }
 
-    /// C16's interprocedural summary: per function, the parameter positions
-    /// whose value is KEPT past the call — stored in a struct field, put in a
-    /// collection or an enum payload, assigned to a place, handed back as the
-    /// return value, or passed on to a callee that keeps it.
-    ///
-    /// The shape is `infer_bumps`'s (a monotone fixpoint over parameter
-    /// positions), and the walk is a GLOBAL sweep rather than a per-function
-    /// recursion: a parameter id is unique to its function, so an escaping
-    /// position anywhere in the program names the function it belongs to
-    /// without an expression-to-function map. The set only grows, so it
-    /// terminates.
+    /// C16's interprocedural summary over the WHOLE program, by rounds: per
+    /// function, the parameter positions whose value is KEPT past the call —
+    /// stored in a struct field, put in a collection or an enum payload,
+    /// assigned to a place, handed back as the return value, or passed on to
+    /// a callee that keeps it. The shape is `infer_bumps`'s (a monotone
+    /// fixpoint over parameter positions), the walk a global sweep: a
+    /// parameter id is unique to its function, so an escaping position
+    /// anywhere names the function it belongs to.
     ///
     /// Deliberately an OVER-approximation at the edges (an assignment counts
     /// whatever its target, a callee with no readable body keeps everything):
     /// the only question it ever decides is whether a view-capturing closure
     /// may be handed to a callee, and over-approximating there refuses a
     /// program rather than miscompiling one.
-    fn compute_retaining_positions(&self) -> HashMap<Id, BTreeSet<u32>> {
-        let summaries = self.compute_retaining_positions_by_propagation();
-        // E340: the propagation below must answer exactly what the round-based
-        // fixpoint it replaced answers; a debug build checks it on every program
-        // that asks (the C16 pins among them).
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            summaries,
-            self.compute_retaining_positions_by_rounds(),
-            "E340: C16's retaining summary by propagation disagrees with the rounds"
-        );
-        summaries
-    }
-
-    /// E340 (Order 56): [`Self::compute_retaining_positions`] in ONE sweep. The
-    /// rounds re-swept every expression of the program until nothing grew, and
-    /// each round cloned every bodied callee's set per call; here the sweep
-    /// records the unconditional facts (a return, a field, a collection, an
-    /// assignment, a callee that keeps everything) and, per call to a bodied
-    /// callee, the edges `(callee, position) -> (caller function, parameter
-    /// position)` its arguments' place roots name, and a worklist closes the
-    /// facts over the edges. The rounds' rule is the same: a callee's kept
-    /// position keeps the caller parameter its argument roots at.
-    fn compute_retaining_positions_by_propagation(&self) -> HashMap<Id, BTreeSet<u32>> {
-        let mut summaries: HashMap<Id, BTreeSet<u32>> = HashMap::default();
-        let mut queue: Vec<(Id, u32)> = Vec::new();
-        let mut edges: HashMap<(Id, u32), Vec<(Id, u32)>> = HashMap::default();
-        let keep = |value_id: Id,
-                    summaries: &mut HashMap<Id, BTreeSet<u32>>,
-                    queue: &mut Vec<(Id, u32)>| {
-            if let Some((function_id, position)) = self.retained_parameter_of(value_id)
-                && summaries.entry(function_id).or_default().insert(position)
-            {
-                queue.push((function_id, position));
-            }
-        };
-        for (_, value_id) in &self.return_sites {
-            keep(*value_id, &mut summaries, &mut queue);
-        }
-        for expr in self.expr_id_to_expr_map.values() {
-            match expr {
-                Expr::StructInitializer(_, fields) => {
-                    for value_id in fields.values() {
-                        keep(*value_id, &mut summaries, &mut queue);
-                    }
-                }
-                Expr::List(ids) | Expr::Tuple(ids) => {
-                    for value_id in ids {
-                        keep(*value_id, &mut summaries, &mut queue);
-                    }
-                }
-                Expr::FunctionReturn(Some(value_id)) | Expr::Assignment(_, value_id) => {
-                    keep(*value_id, &mut summaries, &mut queue);
-                }
-                Expr::Call(call_expr_id) => {
-                    let Some(function_call) = self.function_calls.get(call_expr_id) else {
-                        continue;
-                    };
-                    let bodied_callee = match self
-                        .expr_id_to_expr_map
-                        .get(&function_call.subject_id)
-                    {
-                        Some(Expr::Local(callee_id))
-                            if !self.call_is_variant_constructor(*call_expr_id) =>
-                        {
-                            if self
-                                .functions
-                                .get(callee_id)
-                                .is_some_and(|function| function.has_body)
-                            {
-                                Some(*callee_id)
-                            } else {
-                                // A callee with no readable body keeps the
-                                // positions of its declared arity.
-                                let kept = self
-                                    .callee_retaining_positions(*callee_id, &HashMap::default());
-                                for position in kept {
-                                    if let Some(argument_id) =
-                                        function_call.argument_ids.get(position as usize)
-                                    {
-                                        keep(*argument_id, &mut summaries, &mut queue);
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        // A variant constructor stores every argument; an
-                        // unresolvable subject is answered the safe way.
-                        _ => None,
-                    };
-                    for (position, argument_id) in function_call.argument_ids.iter().enumerate() {
-                        match bodied_callee {
-                            Some(callee_id) => {
-                                if let Some(target) = self.retained_parameter_of(*argument_id) {
-                                    edges
-                                        .entry((callee_id, position as u32))
-                                        .or_default()
-                                        .push(target);
-                                }
-                            }
-                            None => keep(*argument_id, &mut summaries, &mut queue),
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        while let Some(kept) = queue.pop() {
-            let Some(targets) = edges.get(&kept) else {
-                continue;
-            };
-            for (function_id, position) in targets {
-                if summaries.entry(*function_id).or_default().insert(*position) {
-                    queue.push((*function_id, *position));
-                }
-            }
-        }
-        summaries
-    }
-
-    /// The round-based fixpoint [`Self::compute_retaining_positions_by_propagation`]
-    /// replaced (C16, Order 37), kept for the debug build's equality check.
+    ///
+    /// The analysis answers per asked callee over the rows of the bodies it
+    /// reaches (M188, `retain_tables.rs`); this is the definition those
+    /// summaries must equal, which a debug build checks on every ask.
     #[cfg(debug_assertions)]
     fn compute_retaining_positions_by_rounds(&self) -> HashMap<Id, BTreeSet<u32>> {
         let mut summaries: HashMap<Id, BTreeSet<u32>> = HashMap::default();
@@ -83098,6 +83039,9 @@ struct ModuleTables {
     /// M155: the module's R11 lexical candidates (`r11_candidates.rs`),
     /// filed only by a seeded analysis that built R11's indexes.
     r11: r11_candidates::CandidateRows,
+    /// M188: the module's retaining rows (`retain_tables.rs`), filed only by
+    /// an analysis that walked them.
+    retain: retain_tables::RetainRows,
     families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
@@ -83230,6 +83174,7 @@ impl ModuleTables {
             + self.lazy.bytes()
             + self.hmr.bytes()
             + self.r11.bytes()
+            + self.retain.bytes()
             + self.hover.bytes()
     }
 }
@@ -83293,6 +83238,8 @@ struct RestoredTables {
     hmr: lazy_tables::HmrRows,
     /// M155: the restored R11 candidate rows.
     r11: r11_candidates::CandidateRows,
+    /// M188: the restored retaining rows.
+    retain: retain_tables::RetainRows,
     family_ranges: row_families::FamilyRanges,
     /// M148: the restored hover rows, the entity ranges of the modules and
     /// items whose record carried them, and the restored MODULES as sources
@@ -83335,6 +83282,7 @@ impl Default for RestoredTables {
             lazy: lazy_tables::LazyRows::default(),
             hmr: lazy_tables::HmrRows::default(),
             r11: r11_candidates::CandidateRows::default(),
+            retain: retain_tables::RetainRows::default(),
             family_ranges: row_families::FamilyRanges::default(),
             hover: hover_records::RecordedHoverRows::default(),
             hover_ranges: Vec::new(),
@@ -83389,6 +83337,9 @@ impl RestoredTables {
         }
         if tables.families.contains(row_families::RowFamily::R11) {
             self.r11.extend(&tables.r11);
+        }
+        if tables.families.contains(row_families::RowFamily::Retain) {
+            self.retain.extend(&tables.retain);
         }
         if tables.hover_recorded {
             self.hover.extend(&tables.hover);
@@ -90975,6 +90926,9 @@ fn analyze_over_world<'src>(
     // The push is a write into the binding's window because the element slot
     // is minted at its owner (`element_slot_of`), so the dirty closure carries
     // the pusher's edit to the owner's record.
+    // M188: a seeded analysis files C16's retaining rows whether or not a
+    // call asks a summary (`retain_tables.rs`).
+    analyzer.retain_rows_eager = !workspace.hot_seeds.is_empty();
     analyzer.enable_item_records(
         !entry_is_module
             && checks_key.is_some()
@@ -92393,8 +92347,18 @@ fn analyze_over_world<'src>(
                 .hmr_rows_live
                 .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M188: the retaining rows likewise.
+        analyzer
+            .retain_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .retain_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
         let families = row_families::FamilySet::default()
             .with(row_families::RowFamily::Moves, analyzer.move_rows_filed)
+            .with(row_families::RowFamily::Retain, analyzer.retain_rows_filed)
             .with(row_families::RowFamily::Lazy, analyzer.lazy_rows_filed)
             .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed)
             .with(row_families::RowFamily::R11, r11_filed);

@@ -7473,9 +7473,10 @@ fn the_storing_callee_refusal_follows_a_chain_of_callees() {
     );
 }
 
-/// The analysis of `source` on a large-stack worker, with C16's retaining
-/// fixpoint count from that thread's census (E340) and the diagnostics.
-fn retaining_fixpoints_of(source: &str) -> (u64, Vec<String>) {
+/// The analysis of `source` on a large-stack worker, with the number of
+/// callees whose C16 retaining summary that thread's census counted (E340,
+/// M188) and the diagnostics.
+fn retaining_summaries_of(source: &str) -> (u64, Vec<String>) {
     let source = source.to_string();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -7490,7 +7491,7 @@ fn retaining_fixpoints_of(source: &str) -> (u64, Vec<String>) {
                 &Workspace::default(),
             );
             (
-                vilan_core::incremental::census().retaining_fixpoints,
+                vilan_core::incremental::census().retaining_summaries,
                 errors.into_iter().map(|error| error.msg).collect(),
             )
         })
@@ -7500,14 +7501,14 @@ fn retaining_fixpoints_of(source: &str) -> (u64, Vec<String>) {
 }
 
 #[test]
-fn the_retaining_fixpoint_runs_only_for_a_call_that_hands_on_a_capturing_closure() {
-    // E340 (Order 56): C16's fixpoint is whole-program, and it ran whenever ANY
-    // closure captured a view - on kolt two of ~5,900 do, so every editor
-    // keystroke paid ~400 ms for a question no live call asked. It runs now on
-    // the first call that hands a view-capturing closure to an ordinary callee
-    // (`stored_view_capturing_arguments`' only question), so a capturing
-    // closure that is called in place costs nothing...
-    let (runs, errors) = retaining_fixpoints_of(
+fn the_retaining_summary_is_computed_only_for_a_call_that_hands_on_a_capturing_closure() {
+    // E340 (Order 56): C16's summary was a whole-program fixpoint, and it ran
+    // whenever ANY closure captured a view - on kolt two of ~5,900 do, so
+    // every editor keystroke paid ~400 ms for a question no live call asked.
+    // It is asked now only by a call that hands a view-capturing closure to
+    // an ordinary callee (`stored_view_capturing_arguments`' only question),
+    // so a capturing closure that is called in place costs nothing...
+    let (summaries, errors) = retaining_summaries_of(
         r#"
         import std::io::print;
         fun read(v: &mut i32): i32 { let g = || *v; g() }
@@ -7516,12 +7517,13 @@ fn the_retaining_fixpoint_runs_only_for_a_call_that_hands_on_a_capturing_closure
     );
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(
-        runs, 0,
-        "a capturing closure called in place ran the fixpoint"
+        summaries, 0,
+        "a capturing closure called in place computed a summary"
     );
-    // ...a view-capturing closure handed to a callee asks it once, and the
-    // callee that only calls it still compiles...
-    let (runs, errors) = retaining_fixpoints_of(
+    // ...a view-capturing closure handed to a callee asks for THAT callee's
+    // summary once (M188: the second call is a lookup), and the callee that
+    // only calls it still compiles...
+    let (summaries, errors) = retaining_summaries_of(
         r#"
         import std::io::print;
         fun twice(g: || i32): i32 { g() + g() }
@@ -7531,11 +7533,11 @@ fn the_retaining_fixpoint_runs_only_for_a_call_that_hands_on_a_capturing_closure
     );
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(
-        runs, 1,
-        "the fixpoint runs once per analysis, on its first question"
+        summaries, 1,
+        "one callee asked, one summary, computed once per analysis"
     );
     // ...and the storing callee is still refused through it.
-    let (runs, errors) = retaining_fixpoints_of(
+    let (summaries, errors) = retaining_summaries_of(
         r#"
         import std::io::print;
         struct Holder { f: || i32 }
@@ -7545,13 +7547,65 @@ fn the_retaining_fixpoint_runs_only_for_a_call_that_hands_on_a_capturing_closure
         fun main() { let h = outer(); print((h.f)()); }
         "#,
     );
-    assert_eq!(runs, 1);
+    assert_eq!(summaries, 1);
     assert!(
         errors
             .iter()
             .any(|error| error.contains("`keep` keeps what it is handed past the call")),
         "{errors:?}"
     );
+}
+
+#[test]
+fn the_retaining_summary_closes_over_the_asked_callees_reach_only() {
+    // M188 (Order 56): the summary of an asked callee reads the rows of the
+    // bodies it reaches - `pass` hands its parameter to `keep`, so both are
+    // summarized - and of no other: `store` and `relay` keep what they are
+    // handed (and `relay` names `store`), but nothing the asked callee
+    // reaches calls either, so neither is summarized.
+    let (summaries, errors) = retaining_summaries_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun pass(g: || i32): Holder { keep(g) }
+        fun store(g: || i32): Holder { Holder { f = g } }
+        fun relay(g: || i32): Holder { store(g) }
+        fun make(v: &mut i32): Holder { pass(|| *v) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); print((relay(|| 1).f)()); }
+        "#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pass` keeps what it is handed past the call")),
+        "{errors:?}"
+    );
+    assert_eq!(
+        summaries, 2,
+        "the asked callee and the one callee its rows reach, nothing else"
+    );
+    // A cycle among the reached callees closes too: `ping` and `pong` hand
+    // the closure to each other and `pong` stores it, so `ping` keeps it.
+    let (summaries, errors) = retaining_summaries_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun ping(g: || i32, n: i32): Holder { if n > 0 { pong(g, n - 1) } else { Holder { f = || 0 } } }
+        fun pong(g: || i32, n: i32): Holder { if n > 0 { ping(g, n - 1) } else { Holder { f = g } } }
+        fun make(v: &mut i32): Holder { ping(|| *v, 2) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`ping` keeps what it is handed past the call")),
+        "{errors:?}"
+    );
+    assert_eq!(summaries, 2, "the cycle's two members");
 }
 
 #[test]
