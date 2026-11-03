@@ -70,11 +70,12 @@ instead the block's **trailing expression** and supplies the block's value
 ```text
 import  = "import" path-branch [ "only" ] ;   (* impls-free, §4.3 *)
 use     = "use"    path-branch ;
-path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
+path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set
+                                   | [ "#" ] impl-selector )   (* bare, §4.3 *)
                    | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
-set-element = path-branch | impl-selector ;
-impl-selector = "(" "impl" ( type [ "with" type ] | "*" ) ")"
+set-element = path-branch | [ "#" ] impl-selector ;
+impl-selector = "(" "impl" ( type | "*" ) [ "with" type ] ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
@@ -178,9 +179,14 @@ says the statement brings its names and no implementations (§4.3). Like
 as the modifier only where the whole path has ended — and a `use` refuses
 it, because a `use` never brought an implementation along.
 
-An `impl-selector` is a brace-set ELEMENT that binds no name: it says
-which of the module's `impl` blocks this file admits, and its optional
-`::` tail names the members it takes (§4.3). `_` stands for any type at
+An `impl-selector` binds no name: it says which of the module's `impl`
+blocks this file admits, and its optional `::` tail names the members it
+takes (§4.3). It follows a module path — bare, `import a::(impl T);`, the
+one-selector spelling exactly as `import a::b;` is the one-name spelling
+of `import a::{ b };`, or as an element of a set beside the names it
+travels with — and `vilan fmt` writes a one-member set holding one in the
+bare form, so braces appear only with two or more members. At the head of
+a statement, with no module before it, a selector is refused. `_` stands for any type at
 an argument position (`(impl List<_>)`, a hole) and `(impl *)` selects
 every implementation the module declares (a set; `(impl _)`, the earlier
 spelling, is read as `(impl *)` with a steer); a selector writes no
@@ -190,7 +196,10 @@ and no other `Box` block — which is how a block with no declarations of its
 own (all defaults, or a marker) is named; the trait resolves in the
 importing file's scope, as the subject does. The subject is the ordinary `type` production, and it
 resolves in the IMPORTING file's scope, so `impl S` reaches an alias that
-file bound and `impl item::Struct` is the qualified spelling.
+file bound and `impl item::Struct` is the qualified spelling; a path in it
+may also begin at a ROOT — `pkg`, `std`, a dependency — anywhere a path
+stands in the type (`(impl (pkg::d::T, std::e::U))`, `(impl
+List<pkg::d::T>)`), resolved as an import path's first segment is.
 
 A `::` path may **not cross a line break**: the segment after a `::`
 must begin on the same line the `::` is on. Without the rule `a::` at the

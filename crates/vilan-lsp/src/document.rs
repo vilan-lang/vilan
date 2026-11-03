@@ -7301,7 +7301,7 @@ impl Document {
                 // prints — instead of the whole-module form.
                 let rewritten = match rescue {
                     vilan_core::formatter::ModuleRescue::Selector(subject) => {
-                        format!("{}::{{ (impl {subject}) }};", head.join(" "))
+                        format!("{}::(impl {subject});", head.join(" "))
                     }
                     _ => format!("{};", head.join(" ")),
                 };
@@ -21492,6 +21492,22 @@ pub(crate) mod tests {
             }),
             "a braced member set is one more member of the same block"
         );
+        // A181: the bare one-selector form is the same two positions.
+        assert_eq!(
+            at_end("import pkg::ext::(impl "),
+            Some(SelectorPosition::Subject {
+                module: vec!["pkg", "ext"]
+            }),
+            "the bare form's subject"
+        );
+        assert_eq!(
+            at_end("import pkg::ext::(impl Boxed<i32>)::"),
+            Some(SelectorPosition::Member {
+                module: vec!["pkg", "ext"],
+                subject: "Boxed<i32>"
+            }),
+            "the bare form's members"
+        );
         // A closed selector is not a completion position of its own, and
         // neither is a line that holds no selector at all.
         assert_eq!(at_end("import pkg::ext::{ (impl Boxed), "), None);
@@ -22650,7 +22666,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             organized(&document).expect("the emptied statement offers an edit"),
-            "import pkg::a::{ (impl i32) };\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            "import pkg::a::(impl i32);\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
         );
         // The fade stays where it was: `b` IS unused, and E114's contract is
         // that the mark and the fix describe the same statement. Its TEXT is
@@ -22690,7 +22706,7 @@ pub(crate) mod tests {
             vec![(
                 "b".to_string(),
                 "unused; the module's impls are in use — Organize Imports rewrites this \
-                 to `import pkg::a::{ (impl i32) };`"
+                 to `import pkg::a::(impl i32);`"
                     .to_string()
             )],
         );
@@ -22800,7 +22816,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             organized(&document).expect("the emptied statement offers an edit"),
-            "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\n\n\
+            "import pkg::a::Widget;\nimport pkg::a::(impl Widget);\n\n\
              fun main(): i32 {\n\tWidget::make().bump()\n}\n",
         );
         // The fade is unchanged: `b` IS unused, which is E114's contract.
@@ -22812,7 +22828,7 @@ pub(crate) mod tests {
         let (after_dir, after) = analyze_workspace(&[
             (
                 "main.vl",
-                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\n\n\
+                "import pkg::a::Widget;\nimport pkg::a::(impl Widget);\n\n\
                  fun main(): i32 {\n\tWidget::make().bump()\n}\n",
             ),
             ("a.vl", SELECTOR_HELPER),
@@ -22912,7 +22928,7 @@ pub(crate) mod tests {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\nimport pkg::b::widget;\n\n\
+                "import pkg::a::Widget;\nimport pkg::a::(impl Widget);\nimport pkg::b::widget;\n\n\
                  fun main(): i32 {\n\twidget().bump()\n}\n",
             ),
             (

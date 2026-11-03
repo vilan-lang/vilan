@@ -563,7 +563,9 @@ pub enum ImportBranch<'src> {
 
 /// One `(impl TYPE)` / `(impl TYPE)::name` / `(impl TYPE)::{ a, b }` selector
 /// (B318, RULED 2026-09-12: the selector is PARENTHESIZED, `_` is its
-/// placeholder, and no binders are written in one).
+/// placeholder, and no binders are written in one; A181, RULED 2026-11-03:
+/// `(impl *)` selects every block, and `a::(impl T)` is the one-selector set
+/// without its braces).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct ImplSelector<'src> {
@@ -572,6 +574,9 @@ pub struct ImplSelector<'src> {
     /// the qualified spelling. `_` at any argument position is B294's anonymous
     /// binder, which is exactly the placeholder the selector wants: a hole that
     /// unifies with whatever the block admits.
+    ///
+    /// `(impl *)` — every block — is the anonymous binder over the WHOLE
+    /// subject, spanned on the `*`: a hole every block's subject unifies with.
     ///
     /// `None` only on a selector the ORGANIZER synthesized for E168's rewrite,
     /// which is printed and never walked.
@@ -596,6 +601,22 @@ pub struct ImplSelector<'src> {
     /// The whole `(impl …)` element's span, where a refusal naming the selector
     /// is spanned.
     pub span: Span,
+}
+
+/// The whole-subject spelling of the selector that takes every block a module
+/// declares — `(impl *)` (A181, RULED 2026-11-03: `*` is EVERYTHING, a set,
+/// where `_` is a hole inside a type).
+pub const EVERY_IMPL_SUBJECT: &str = "*";
+
+impl ImplSelector<'_> {
+    /// Whether the subject is `_` written WHOLE — `(impl _)`, the retired
+    /// spelling of `(impl *)` (A181; `import-foundation.md` §10 Q6: read as
+    /// `(impl *)` with an error carrying the fix for one release, refused
+    /// after it). `_` inside a type (`(impl List<_>)`) is the hole it always
+    /// was and is not this.
+    pub fn writes_the_retired_whole_subject(&self) -> bool {
+        self.subject_text.trim() == ANONYMOUS_TYPE_BINDER
+    }
 }
 
 /// The trailing modifier on an `import` statement (B318 §2.4, RULED).

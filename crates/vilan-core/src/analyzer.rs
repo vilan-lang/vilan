@@ -697,6 +697,16 @@ impl TupleBoundRequirement {
     }
 }
 
+/// A181 (RULED 2026-11-03): the steer at `(impl _)`, the retired spelling of
+/// the whole-module selector (`import-foundation.md` §5, §10 Q6). `_` is
+/// UNSPECIFIED — a hole — and `*` is EVERYTHING, a set; a selector taking
+/// every block names a set. Read as `(impl *)` for v0.54.0 and refused from
+/// v0.55.0 (the refusal replaces this sentence then).
+const RETIRED_WHOLE_SELECTOR: &str = "a selector that takes every block is written `(impl *)`: \
+     `*` is EVERYTHING, a set (`export *;`, `::*`), and `_` is a hole inside a type (`(impl \
+     List<_>)`). `(impl _)` is read as `(impl *)` in this release and refused in the next; `vilan \
+     fmt` rewrites it";
+
 /// B535's stable code: a trait's method called in a file that does not import
 /// the trait ([`Analyzer::check_trait_method_scope`]'s refusal). The editor
 /// publishes it as the diagnostic's `code`.
@@ -6128,6 +6138,20 @@ pub struct Analyzer<'src> {
     // check must not read it as an under-supply. Marked, like the trait
     // positions above, so the default stays the checked one.
     path_head_type_ids: HashSet<TypeId>,
+    // A181 (`import-foundation.md` §7): the scopes an `(impl …)` selector's
+    // subject (and its `with` trait) is walked in. A path HEAD written there may
+    // be a ROOT — `pkg`, `std`, a dependency — which the type drain resolves
+    // as an import statement's first segment does (`resolve_import_root`), at
+    // every position of the subject type: the subject is a type path, and a
+    // type path's head may be a root (row 11 of the elaboration table). Only
+    // here: an inline root anywhere else is the later inline-roots slice.
+    selector_subject_scopes: HashSet<Id>,
+    // A181: the type slots holding a namespace a ROOT-headed type path reached
+    // (`pkg`, `pkg::lib`, `pkg::lib::overlay`) — so the next segment descends
+    // as an import path does, a module's directory children included
+    // (`member_or_submodule`), rather than as an expression's qualified path,
+    // which asks the module scope alone.
+    root_path_type_ids: HashSet<TypeId>,
     // The annotation type ids of `let` bindings, keyed to the binding they
     // annotate. B161: a trait written HERE — and only here among the value
     // positions — is a CHECKED CONSTRAINT on the binding's inferred type
@@ -7884,7 +7908,7 @@ pub struct ImportImplSelector {
     pub text: String,
     /// The subject's type. `_` anywhere in it is an anonymous binder, which is
     /// exactly a hole: the admission test unifies in BOTH directions, so
-    /// `(impl List<_>)` reaches a concrete `impl List<i32>` and `(impl _)`
+    /// `(impl List<_>)` reaches a concrete `impl List<i32>` and `(impl *)`
     /// reaches every block.
     pub subject: TypeId,
     /// `(impl Box with One)` — the trait the selected block implements (B455,
@@ -8396,6 +8420,8 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             bound_position_type_ids: HashSet::default(),
             path_head_type_ids: HashSet::default(),
+            selector_subject_scopes: HashSet::default(),
+            root_path_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
             written_nominal_bound_sites: Vec::new(),
             binding_trait_constraints: Vec::new(),
@@ -40129,6 +40155,16 @@ impl<'src> Analyzer<'src> {
                     self.register_subject_binders(argument, scope_id);
                 }
             }
+            // A181: a QUALIFIED head's arguments bind too — `(impl
+            // std::list::List<_>)`, the spelling E359's quick fix writes, and
+            // `(impl list::List<_>)` after `import std::list;`. The head names
+            // a type through a module, so its declared bounds are not looked
+            // up here; a binder takes the bounds it writes.
+            Node::StaticAccessor(_, _, Some(generic_arguments)) => {
+                for argument in &generic_arguments.0 {
+                    self.register_subject_binders(argument, scope_id);
+                }
+            }
             Node::Tuple(items) => {
                 for item in items {
                     self.register_subject_binders(item, scope_id);
@@ -42861,6 +42897,9 @@ impl<'src> Analyzer<'src> {
                 path_spans.push(*segment_span);
             }
             path_spans.push(leaf_span);
+            if let Some((alias, alias_span)) = alias {
+                self.refuse_a_reserved_alias(alias, alias_span);
+            }
             self.prepped_imports.push((
                 path,
                 name,
@@ -54138,6 +54177,26 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// A183 §4 (`import-foundation.md` §10 Q3, RULED): `self` names the
+    /// file's own module and `super` its parent — implicit, location-derived
+    /// bindings every file begins with — so an import cannot bind either
+    /// name. Refused at the alias; the import still binds under it, so the
+    /// one mistake is the one report.
+    fn refuse_a_reserved_alias(&mut self, alias: &str, alias_span: Span) {
+        if !matches!(alias, "self" | "super") {
+            return;
+        }
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: alias_span,
+            msg: format!(
+                "`{alias}` is reserved: `self` names this file's own module and `super` its \
+                 parent, and neither can be rebound by an import — choose another alias"
+            ),
+        });
+    }
+
     fn bank_import_restriction(
         &mut self,
         branch: &'src ImportBranch<'src>,
@@ -54157,6 +54216,22 @@ impl<'src> Analyzer<'src> {
             // the selector's, and nothing outside it may see them.
             let selector_scope = self.create_scope(Some(scope_id));
             let selector_scope_id = self.push_scope(selector_scope);
+            // A181: a root head in the subject (or the `with` trait) resolves
+            // from the root, at whatever position of the type it stands.
+            self.selector_subject_scopes.insert(selector_scope_id);
+            // A181 (RULED 2026-11-03, `import-foundation.md` §10 Q6): `(impl
+            // _)` is the retired spelling of `(impl *)`. READ as `(impl *)` —
+            // the anonymous binder over the whole subject is what both
+            // spellings elaborate to — with an error carrying the fix for one
+            // release; `vilan fmt` rewrites it.
+            if selector.writes_the_retired_whole_subject() {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: subject.1,
+                    msg: RETIRED_WHOLE_SELECTOR.to_string(),
+                });
+            }
             self.register_subject_binders(subject, selector_scope_id);
             let subject_type_id = self.walk_type_node(subject, selector_scope_id);
             // A statement whose brace set holds ONLY selectors has no name
@@ -70068,6 +70143,23 @@ impl<'src> Analyzer<'src> {
             let resolved = self
                 .try_get_type_id_by_name(name, scope_id)
                 .or_else(|| self.try_get_expr_id_by_name(name, scope_id));
+            // A181 (`import-foundation.md` §7): the HEAD of a type path in an
+            // `(impl …)` selector's subject may be a ROOT — `pkg`, `std`, a
+            // dependency's name — and resolves as an import statement's first
+            // segment does, relative to the importing file's package. Asked
+            // only when the name binds nothing in the file's scope, so the
+            // module-qualified rule (`(impl overlay::Overlay)` after `import
+            // pkg::lib::overlay;`) is unchanged: a root is reached by
+            // evaluation, never by lookup, and no binding can be one.
+            if resolved.is_none()
+                && self.path_head_type_ids.contains(&type_id)
+                && self.selector_subject_scopes.contains(&scope_id)
+                && let Some(root_id) = self.resolve_import_root(name, source_id)
+            {
+                self.root_path_type_ids.insert(type_id);
+                self.write_type_slot(type_id, Type::Module(root_id));
+                continue;
+            }
             match resolved {
                 // array-lengths.md §6 (S4): a length position naming a VALUE
                 // binding is a named length — resolved here, before the
@@ -70900,7 +70992,28 @@ impl<'src> Analyzer<'src> {
                     let module = self.modules.get(&module_id).unwrap();
                     let module_scope_id = module.body.1;
                     let module_name = module.name;
-                    match self.member_in_namespace(member_name, module_scope_id) {
+                    // A181: a ROOT-headed path descends as an import path does
+                    // — a module's directory children answer after its own
+                    // items (`member_or_submodule`, A65) — where a path headed
+                    // by a NAME in scope asks the module scope alone.
+                    let root_headed = self.root_path_type_ids.contains(&subject_type_id);
+                    let member = match root_headed {
+                        true => {
+                            self.member_or_submodule(member_name, module_scope_id, Some(module_id))
+                        }
+                        false => self.member_in_namespace(member_name, module_scope_id),
+                    };
+                    if root_headed
+                        && member.is_some_and(|member_id| {
+                            matches!(
+                                self.expr_id_to_expr_map.get(&member_id),
+                                Some(Expr::Module(_))
+                            )
+                        })
+                    {
+                        self.root_path_type_ids.insert(type_id);
+                    }
+                    match member {
                         // A member that is not a TYPE ends the search here
                         // (B172). The unqualified twin above may skip a value
                         // binding and keep walking outward; a path cannot —
@@ -93297,7 +93410,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
 /// Backward — `subject_applies(selector, impl_subject)` — is the placeholder's:
 /// `(impl List<_>)` is itself a pattern with a hole, so it reaches a concrete
 /// `impl List<i32>` that the forward test refuses (a constructor-headed subject
-/// does not match a hole), and `(impl _)` reaches every block there is. One
+/// does not match a hole), and `(impl *)` reaches every block there is. One
 /// predicate, both readings, and no new type machinery.
 pub fn build_impl_admission(program: &mut Program) {
     let statements = std::mem::take(&mut program.import_impl_restrictions);
@@ -93573,7 +93686,7 @@ pub fn build_impl_admission(program: &mut Program) {
                     format!(
                         "no `impl` this statement carries has a subject `{subject}` admits, so \
                          the selector admits nothing. The modules it walks are {modules}; \
-                         `(impl _)` admits every block they declare"
+                         `(impl *)` admits every block they declare"
                     )
                 };
                 selector_misses.push((row.source, selector.span, claim));
@@ -94213,7 +94326,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         };
         let fix = match selector_of.get(&(source, implementation.source)) {
             Some(_) => format!(
-                "widen the selector, or add one that names this block — `(impl _)` admits every \
+                "widen the selector, or add one that names this block — `(impl *)` admits every \
                  implementation `{module}` declares"
             ),
             None => "drop the `only`, or name the block in a selector".to_string(),

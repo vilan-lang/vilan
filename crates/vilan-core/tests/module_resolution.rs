@@ -6848,17 +6848,17 @@ fn b318_the_placeholder_selector_serves_every_argument() {
     );
 }
 
-/// `(impl _)` is the whole-module impls-only form: every block the module
+/// `(impl *)` is the whole-module impls-only form: every block the module
 /// declares, and no name — the file still has to import `Boxed` itself.
 #[test]
 fn b318_the_whole_module_selector_admits_every_block() {
     let diagnostics = analyze_boxed(
-        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl *) };\n\n\
          fun main() {\n\tlet _ = Boxed::make(1).tag() + Boxed::make(\"a\").other();\n}\n",
     );
     assert!(
         diagnostics.is_empty(),
-        "`(impl _)` should admit every block: {diagnostics:?}"
+        "`(impl *)` should admit every block: {diagnostics:?}"
     );
 }
 
@@ -7877,16 +7877,16 @@ fn b338_a_selector_that_admits_no_impl_is_a_row_at_the_import() {
     assert!(
         missed.iter().any(|message| message
             .contains("no `impl` this statement carries has a subject `i32` admits")
-            && message.contains("`(impl _)` admits every block they declare")),
+            && message.contains("`(impl *)` admits every block they declare")),
         "a selector admitting nothing should be reported at the import: {missed:?}"
     );
-    // The `(impl _)` control: the whole-module form admits every block the
+    // The `(impl *)` control: the whole-module form admits every block the
     // statement carries, so it never earns this row.
     let control = analyze_boxed(
-        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl *) };\n\n\
          fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
     );
-    assert!(control.is_empty(), "`(impl _)` admits: {control:?}");
+    assert!(control.is_empty(), "`(impl *)` admits: {control:?}");
 }
 
 /// The other shape: the subject reaches a block, and the `::` tail names a
@@ -8570,11 +8570,11 @@ fn transform_derive_admission(thing_selector: &str) -> Result<String, String> {
 /// non-exported `impl` in the program for every derived visitor. That is why
 /// E185's placeholder fired sixteen times at Order 36's sweep merge, and the
 /// refusal's own advice was unfollowable: it said "widen `thing`'s own import
-/// of `w`", and `thing.vl` writing `#(impl _)` changed nothing, because
+/// of `w`", and `thing.vl` writing `#(impl *)` changed nothing, because
 /// `thing.vl`'s set was not the set being consulted.
 #[test]
 fn b354_a_derived_body_resolves_under_the_file_that_carries_the_derive() {
-    let emitted = transform_derive_admission(", #(impl _)")
+    let emitted = transform_derive_admission(", #(impl *)")
         .expect("`thing.vl`'s own reach marker must answer its derived body");
     assert!(
         emitted.contains("function"),
@@ -9240,12 +9240,12 @@ fn b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive() {
 
 /// B367: B318 S4's ADMISSION MISS is reachable. The four-module reproducer —
 /// the trait in `a`, a non-exported `impl` in `b`, a generic body in `c` that
-/// imports only the trait, the entry importing `b` with `#(impl _)` — was once
+/// imports only the trait, the entry importing `b` with `#(impl *)` — was once
 /// reported to compile clean (which would have made the refusal dead code). On
 /// this base it is refused, at `c`, naming the member, the providing module and
 /// the declaring one, as visibility.md §3.5 writes the rule: a generic body
 /// resolves under the file it was DECLARED in, so the entry's marker does not
-/// reach it. `c`'s own `import pkg::b::{ #(impl _) };` — the fix the refusal
+/// reach it. `c`'s own `import pkg::b::{ #(impl *) };` — the fix the refusal
 /// names — admits it.
 #[test]
 fn b367_a_generic_body_resolves_under_its_own_files_admission() {
@@ -9268,7 +9268,7 @@ fn b367_a_generic_body_resolves_under_its_own_files_admission() {
             ),
             (
                 "main.vl".to_string(),
-                "import pkg::b::{ Dog, #(impl _) };\nimport pkg::c::twice;\nfun main() {\n    print(twice(Dog {}));\n}\nmain();\n"
+                "import pkg::b::{ Dog, #(impl *) };\nimport pkg::c::twice;\nfun main() {\n    print(twice(Dog {}));\n}\nmain();\n"
                     .to_string(),
             ),
         ]
@@ -9285,7 +9285,7 @@ fn b367_a_generic_body_resolves_under_its_own_files_admission() {
             && refusal.contains("module `c` does not admit it"),
         "{refusal}"
     );
-    let admitted_files = files("import pkg::b::{ #(impl _) };\n");
+    let admitted_files = files("import pkg::b::{ #(impl *) };\n");
     let admitted: Vec<(&str, &str)> = admitted_files
         .iter()
         .map(|(name, body)| (name.as_str(), body.as_str()))

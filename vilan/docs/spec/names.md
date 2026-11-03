@@ -144,7 +144,10 @@ importing module's scope:
   spelling — go-to-definition on `Document` lands on `Json`, and a rename
   of `Json` rewrites the alias with every other reference to it. The form
   reaches a set member too (`import a::{ b as x, c };`), and a re-export
-  publishes the alias (`export import a::b as c;` publishes `c`).
+  publishes the alias (`export import a::b as c;` publishes `c`). Two
+  names are reserved and no alias may bind them: `self` names the file's
+  own module and `super` its parent (§4.3.1), so `import a::b as self;`
+  is refused.
 
 - `import std::list only;` binds the statement's names and **no
   implementations**. A plain `import` brings every `impl` declared in the
@@ -165,7 +168,12 @@ importing module's scope:
   `::{ first, last }` takes several; a selector takes no `as`, because a
   method is called by name on a receiver. The subject resolves in the
   IMPORTING file's scope: `impl S` after `import item::Struct as S;`
-  reaches `S`, and `impl item::Struct` is the qualified spelling.
+  reaches `S`, and `impl item::Struct` is the qualified spelling. A path
+  in the subject may also begin at a ROOT, at any position of the type —
+  `(impl pkg::lib::overlay::Overlay)`, `(impl (pkg::d::T,
+  std::e::U))`, `(impl List<pkg::d::T>)`, a closure or an array type —
+  and resolves from that root as an import path's first segment does
+  (§4.3.1, row 11), whatever the importing file has imported.
 
 `use path` binds names from an already-visible type's namespace without
 loading (variants, statics) — the same two kinds `import` reaches by
@@ -231,7 +239,7 @@ module path):
 | `mod self;` | the implicit `use (import pkg)::<this file's path> as self;` made explicit, as the host of the file's attributes (§4.1) |
 | `import pkg::m;` then `m::x` | `use (import pkg)::m; use (import pkg)::m::(impl *)::*;` then the binding `m` projected: a path whose head is a NAME in scope resolves the head by §4.4's ladder and projects from there |
 | `pkg::m::S` written inline, `(import pkg)::m::S` | the bare and the explicit root head, in any position (not yet built: today refused as "`pkg` is a namespace, not a value") |
-| `self::x`, `super::x` | `(import pkg)::<this file's module>::x` and `(import pkg)::<its parent>::x` — two implicit, location-derived, reserved bindings every file begins with; `super` is one level (not yet built: today `self` and `super` are ordinary alias names) |
+| `self::x`, `super::x` | `(import pkg)::<this file's module>::x` and `(import pkg)::<its parent>::x` — two implicit, location-derived, reserved bindings every file begins with; `super` is one level (the bindings are not yet built; an import alias spelling either name is refused already) |
 | `use T::{ a, b };` (§3.2's `use` statement) | `use T::a; use T::b;` with `T` a name in scope — the one surface statement whose head is not a root |
 
 An inline path admits nothing: it is explicit at its site for what it

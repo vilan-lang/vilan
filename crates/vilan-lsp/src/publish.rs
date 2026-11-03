@@ -1021,7 +1021,7 @@ mod tests {
         assert_eq!(
             faded[0].message,
             "unused; the module's impls are in use — Organize Imports rewrites this to \
-             `import pkg::a::{ (impl i32) };`",
+             `import pkg::a::(impl i32);`",
         );
         assert_eq!(
             faded[0].range,
