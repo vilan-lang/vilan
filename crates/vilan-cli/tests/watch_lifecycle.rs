@@ -335,3 +335,119 @@ fn inspect_under_watch_reopens_the_inspector_each_round() {
     support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The pids of `pid`'s direct children, read from /proc across every thread of
+/// it - the watch loop spawns its round's program from a worker thread.
+#[cfg(target_os = "linux")]
+fn children_of(pid: u32) -> Vec<i32> {
+    let mut found = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return found;
+    };
+    for task in tasks.flatten() {
+        let text = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+        found.extend(
+            text.split_whitespace()
+                .filter_map(|token| token.parse::<i32>().ok()),
+        );
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// E341: a signal sent to a `vilan run --watch` session ALONE - as a supervisor
+/// or an editor task stops it - reaches the round's program: the session
+/// forwards it, waits for the program to end (killing it past a grace period)
+/// and reaps it, and only then exits 130. Before, `SIGTERM`, `SIGHUP` and a lone
+/// `SIGINT` (one not raised by a terminal for the whole group) ended the
+/// watcher and left the program running, holding its port.
+///
+/// The ordering is the harness's own: the program prints `up` once it is
+/// running, the signal is sent after that line is read, and the program's pid
+/// is checked once the session has EXITED - the session reaps it before it
+/// exits, so a forwarding session leaves nothing alive, not even a zombie.
+#[cfg(target_os = "linux")]
+#[test]
+fn e341_a_signal_that_ends_a_watch_session_ends_its_rounds_program() {
+    for (signal, name) in [
+        (libc::SIGTERM, "TERM"),
+        (libc::SIGHUP, "HUP"),
+        (libc::SIGINT, "INT"),
+    ] {
+        let dir =
+            support::scratch_root().join(format!("vilan_watch_e341_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("vilan.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(
+            dir.join("src/main.vl"),
+            "import std::io::print;\nimport std::time::sleep;\n\nfun main() {\n\tprint(\"up\");\n\tsleep(120000);\n}\n",
+        )
+        .unwrap();
+        let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["run", "--watch", dir.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the watcher");
+        let lines = lines_of(&mut watcher);
+        let mut seen = Vec::new();
+        wait_for_line(&lines, &mut seen, "the round's program to print", |line| {
+            line.trim() == "up"
+        });
+        let children = children_of(watcher.id());
+        let kill_all = |children: &[i32], watcher: &mut std::process::Child| {
+            for child in children {
+                // SAFETY: plain `kill` on pids this test's watcher spawned.
+                unsafe {
+                    libc::kill(*child, libc::SIGKILL);
+                }
+            }
+            let _ = watcher.kill();
+            let _ = watcher.wait();
+        };
+        if children.len() != 1 {
+            kill_all(&children, &mut watcher);
+            panic!("SIG{name}: the watcher has exactly the program as a child, found {children:?}");
+        }
+        let program = children[0];
+        // To the watcher ALONE.
+        // SAFETY: plain `kill` on the watcher this test spawned.
+        unsafe {
+            libc::kill(watcher.id() as i32, signal);
+        }
+        let deadline = Instant::now() + support::WATCH_LIVENESS;
+        let status = loop {
+            if let Some(status) = watcher.try_wait().expect("poll the watcher") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                kill_all(&children, &mut watcher);
+                panic!(
+                    "SIG{name}: the watch session did not exit:\n{}",
+                    seen.join("\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let gone = !alive(program);
+        if !gone {
+            kill_all(&children, &mut watcher);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            gone,
+            "SIG{name}: the round's program {program} outlived the watch session"
+        );
+        assert_eq!(
+            status.code(),
+            Some(130),
+            "SIG{name}: an ended watch session exits 130 ({status:?})"
+        );
+    }
+}

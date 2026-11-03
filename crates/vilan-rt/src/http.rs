@@ -699,6 +699,9 @@ impl Connection {
             match read {
                 Ok(0) => return (progressed, true),
                 Ok(count) => {
+                    if self.declined_body() {
+                        REFUSED_BODY_READ.fetch_add(count, Ordering::Relaxed);
+                    }
                     self.inbox.borrow_mut().extend_from_slice(&chunk[..count]);
                     taken += count;
                     progressed = true;
@@ -714,6 +717,13 @@ impl Connection {
                 Err(_) => return (progressed, true),
             }
         }
+    }
+
+    /// Whether the connection has decided not to read its body — refused it
+    /// over the cap, or lingers with it unread — so any byte it reads now is
+    /// one [`refused_body_census`] counts.
+    fn declined_body(&self) -> bool {
+        matches!(self.body.borrow().state, BodyState::Refused) || self.linger_until.get().is_some()
     }
 
     /// Pushes whatever is queued. Answers `(progressed, the socket is dead)`.
@@ -981,6 +991,18 @@ impl Js for Request {
              not reproduce",
         )
     }
+}
+
+/// What [`refused_body_census`] reads: body bytes taken off connections after
+/// they declined the body.
+static REFUSED_BODY_READ: AtomicUsize = AtomicUsize::new(0);
+
+/// `__http_refused_body_census()` — how many body bytes this process's server
+/// read off its connections after deciding not to read them (B687; `std::http`'s
+/// `refused_body_census`). Zero is M164's contract: a declined body stays in the
+/// kernel. An instrument — it counts, it decides nothing.
+pub fn refused_body_census() -> usize {
+    REFUSED_BODY_READ.load(Ordering::Relaxed)
 }
 
 /// `__http_read_body(request, response, limit)` — the request's body, read on

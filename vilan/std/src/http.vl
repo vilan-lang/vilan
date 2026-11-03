@@ -148,6 +148,20 @@ async external fun read_body(node: NodeRequest, reply: NodeResponse, limit: usiz
 [extern("__http_body_left_unread")]
 external fun body_left_unread(node: NodeRequest, limit: usize): bool;
 
+/// How many request-body bytes this process's server has taken off its
+/// connections after deciding not to read them — a body refused over its cap
+/// (`413`), or one left unread past it — since it started. Zero is M164's
+/// contract: a declined body stays in the kernel, so its writer stalls. The
+/// body-cap pins read this rather than how much a client got out, which measures
+/// the two kernels' socket buffers and not the server (B687).
+[internal("an instrument for the body-cap pins (B687); it counts, it decides nothing")]
+export fun refused_body_census(): usize {
+	refused_body_read()
+}
+
+[extern("__http_refused_body_census")]
+external fun refused_body_read(): usize;
+
 /// Runs one request's answer. A CANCELLATION ends it quietly — the body was
 /// refused (`read_body`'s `413` is already on the wire) or the client went away,
 /// so the request is over and nobody is waiting for it; every other failure

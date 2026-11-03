@@ -11922,6 +11922,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.place_argument(argument_ids, 0, depth)?
             ))),
             // A173 S1 / E?5: `prompt`'s unterminated, flushed write.
+            // B687: `std::http`'s declined-body instrument.
+            (None, "__http_refused_body_census", _) => {
+                Ok(Some("vilan_rt::http::refused_body_census()".to_string()))
+            }
             (None, "__stdout_write", _) => Ok(Some(format!(
                 "vilan_rt::process::stdout_write(&{})",
                 self.place_argument(argument_ids, 0, depth)?

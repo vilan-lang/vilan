@@ -202,3 +202,92 @@ fn each_key_takes_its_own_nearest_declaration() {
     assert_eq!(read(&dir, "wrapped/src/main.vl"), WRAPPED_AT_84);
     assert_eq!(read(&dir, "kept/src/main.vl"), LONG_COMMENT);
 }
+
+// --- E357: what a project changes about `fmt` -------------------------------
+// A file copied out of its tree for a census reflowed nothing, while the same
+// file in std's tree reflowed 13 lines. The reason is the manifest: std's
+// `vilan.toml` opts into `[fmt] wrap_comments`, and a lone file has no manifest
+// above it, so it takes the default — off. These pin that the `[fmt]` keys are
+// the ONLY thing a project changes about how a file is laid out (`generated`
+// changes WHETHER it is), so a lone file is its tree's census exactly when the
+// tree says nothing under `[fmt]`.
+
+/// A file the printer moves (code laid out to the width) beside a ragged
+/// comment paragraph only the fill would join.
+const UNFORMATTED: &str = "// a short line\n// and a long one that the fill would join to the line above it if it were asked to do so\nfun main() {\n\tlet values = [ 1,2,  3 ];\n  print(values.len());\n}\n";
+
+/// [`UNFORMATTED`] with the code laid out and the comment untouched.
+const LAID_OUT: &str = "// a short line\n// and a long one that the fill would join to the line above it if it were asked to do so\nfun main() {\n\tlet values = [1, 2, 3];\n\tprint(values.len());\n}\n";
+
+/// [`LAID_OUT`] with the paragraph re-filled to 84 columns.
+const LAID_OUT_AND_FILLED: &str = "// a short line and a long one that the fill would join to the line above it if it\n// were asked to do so\nfun main() {\n\tlet values = [1, 2, 3];\n\tprint(values.len());\n}\n";
+
+/// Runs `vilan fmt` on ONE file named by path from inside `dir` — the census
+/// shape, a file formatted where it sits.
+fn vilan_fmt_file(dir: &Path, file: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .arg("fmt")
+        .arg(file)
+        .output()
+        .expect("run vilan fmt")
+}
+
+#[test]
+fn e357_a_lone_file_formats_as_it_does_in_a_tree_that_says_nothing_under_fmt() {
+    // A manifest that declares everything BUT `[fmt]` — a prelude, a default
+    // entry — changes nothing about the layout: the lone file and the file in
+    // either tree come out byte-identical.
+    let lone = tree("e357-lone", &[("main.vl", UNFORMATTED)]);
+    let silent = tree(
+        "e357-silent",
+        &[("vilan.toml", SILENT), ("src/main.vl", UNFORMATTED)],
+    );
+    let busy = tree(
+        "e357-busy",
+        &[
+            (
+                "vilan.toml",
+                "[package]\nname = \"wrapprobe\"\ndefault-entry = \"main\"\nprelude = \"std::web::prelude\"\n",
+            ),
+            ("src/main.vl", UNFORMATTED),
+        ],
+    );
+    for (dir, file) in [
+        (&lone, "main.vl"),
+        (&silent, "src/main.vl"),
+        (&busy, "src/main.vl"),
+    ] {
+        let output = vilan_fmt_file(dir, file);
+        assert!(output.status.success(), "{}: {output:?}", dir.display());
+        assert_eq!(read(dir, file), LAID_OUT, "{}", dir.display());
+    }
+}
+
+#[test]
+fn e357_the_fmt_keys_are_what_a_lone_file_lacks() {
+    // The item's shape: the same file alone and under a manifest that opts in
+    // (std's two keys). The code is laid out identically; the comment
+    // paragraph is re-filled only where the manifest asks — and the lone copy
+    // given the same manifest beside it is the tree's answer again.
+    let lone = tree("e357-lone-opted", &[("main.vl", UNFORMATTED)]);
+    let opted = tree(
+        "e357-opted",
+        &[("vilan.toml", AT_84), ("src/main.vl", UNFORMATTED)],
+    );
+    let lone_with_manifest = tree(
+        "e357-lone-manifest",
+        &[("vilan.toml", AT_84), ("main.vl", UNFORMATTED)],
+    );
+    assert!(vilan_fmt_file(&lone, "main.vl").status.success());
+    assert!(vilan_fmt_file(&opted, "src/main.vl").status.success());
+    assert!(
+        vilan_fmt_file(&lone_with_manifest, "main.vl")
+            .status
+            .success()
+    );
+    assert_eq!(read(&lone, "main.vl"), LAID_OUT);
+    assert_eq!(read(&opted, "src/main.vl"), LAID_OUT_AND_FILLED);
+    assert_eq!(read(&lone_with_manifest, "main.vl"), LAID_OUT_AND_FILLED);
+}

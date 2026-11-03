@@ -20392,6 +20392,110 @@ mod trailing_comment_anchor {
 }
 
 #[cfg(test)]
+mod return_value_layout {
+    //! E347: a call that is the value of a `ret` (`ret f(a, b, c);`) breaks its
+    //! arguments one per line at the width a `let v = f(..);` does - 100
+    //! columns with the `;` stays, 101 breaks - because `ret` hands its value
+    //! the split permission the statement hook armed, with the `;` counted
+    //! (E329). The item's repro spelled it `return`, which is not vilan (the
+    //! parser refuses it with the `ret` steer, and `vilan fmt` DECLINES the
+    //! file, exit 2), so it was left as written; these pin the `ret` shapes.
+    use super::bailing_constructs::assert_construct;
+
+    /// A function whose body is `statement`.
+    fn body(statement: &str) -> String {
+        format!(
+            "fun f(argument_one: i32, argument_two: i32, argument_three: i32): i32 {{\n{statement}}}\n"
+        )
+    }
+
+    /// The call, its last argument a name of `length` characters: `ret` and
+    /// the call are `9 + 68 + length` columns at the body's depth (a tab is
+    /// four), with the `;` one more.
+    fn call(length: usize) -> String {
+        format!(
+            "plain_function_call_with_no_chain_at_all(argument_one, argument_two, {})",
+            last(length)
+        )
+    }
+
+    fn last(length: usize) -> String {
+        format!("argument_{}", "x".repeat(length - "argument_".len()))
+    }
+
+    /// The width of the widest line of `source`, a tab four columns.
+    fn widest(source: &str) -> usize {
+        source
+            .lines()
+            .map(|line| line.replace('\t', "    ").chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_returned_call_at_100_columns_with_its_semicolon_stays() {
+        let source = body(&format!("\tret {};\n", call(21)));
+        assert_eq!(widest(&source), 100);
+        assert_construct(&source, &source);
+    }
+
+    #[test]
+    fn a_returned_call_at_101_columns_with_its_semicolon_breaks() {
+        let source = body(&format!("\tret {};\n", call(22)));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tret plain_function_call_with_no_chain_at_all(\n\t\targument_one,\n\t\targument_two,\n\t\t{},\n\t);\n",
+            last(22)
+        ));
+        assert_construct(&source, &expected);
+    }
+
+    #[test]
+    fn a_returned_call_inside_an_if_breaks_at_its_own_depth() {
+        let source = body(&format!(
+            "\tif argument_one > 0 {{\n\t\tret {};\n\t}}\n\t0\n",
+            call(18)
+        ));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tif argument_one > 0 {{\n\t\tret plain_function_call_with_no_chain_at_all(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{},\n\t\t);\n\t}}\n\t0\n",
+            last(18)
+        ));
+        assert_construct(&source, &expected);
+    }
+
+    #[test]
+    fn a_returned_call_in_a_closure_body_breaks() {
+        let source = body(&format!(
+            "\tlet later = || {{\n\t\tret {};\n\t}};\n\tlater()\n",
+            call(18)
+        ));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tlet later = || {{\n\t\tret plain_function_call_with_no_chain_at_all(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{},\n\t\t);\n\t}};\n\tlater()\n",
+            last(18)
+        ));
+        assert_construct(&source, &expected);
+    }
+
+    #[test]
+    fn an_unterminated_returned_call_counts_no_semicolon() {
+        // A block's tail `ret` written without its `;`: 100 columns stays...
+        let kept = body(&format!("\tret {}\n", call(22)));
+        assert_eq!(widest(&kept), 100);
+        assert_construct(&kept, &kept);
+        // ...and 101 breaks.
+        let source = body(&format!("\tret {}\n", call(23)));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tret plain_function_call_with_no_chain_at_all(\n\t\targument_one,\n\t\targument_two,\n\t\t{},\n\t)\n",
+            last(23)
+        ));
+        assert_construct(&source, &expected);
+    }
+}
+
+#[cfg(test)]
 mod literal_receiver_layout {
     //! E354: a chain whose RECEIVER is a struct or list literal —
     //! `Body { .. }.size()` — was printed with the receiver's split permission

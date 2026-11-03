@@ -10284,7 +10284,7 @@ fn a173_s2_both_backends_decode_the_key_fixture_to_the_same_keys() {
         "21: Key::Char(\"\u{e9}\") | Press { key = Key::Char(\"\u{e9}\"), ctrl = false, alt = false, shift = false }\n",
         "22: Key::Char(\"\u{2713}\") | Press { key = Key::Char(\"\u{2713}\"), ctrl = false, alt = false, shift = false }\n",
         "23: Key::Char(\"\u{1f600}\") | Press { key = Key::Char(\"\u{1f600}\"), ctrl = false, alt = false, shift = false }\n",
-        "24: Key::Paste(\"pa\u{1b}ste\\nX\") | Press { key = Key::Paste(\"pa\u{1b}ste\\nX\"), ctrl = false, alt = false, shift = false }\n",
+        "24: Key::Paste(\"pa\\u{1b}ste\\nX\") | Press { key = Key::Paste(\"pa\\u{1b}ste\\nX\"), ctrl = false, alt = false, shift = false }\n",
         "25: Key::Char(\"?\") | Press { key = Key::Char(\"?\"), ctrl = false, alt = false, shift = false }\n",
         "26: Key::Enter | Press { key = Key::Enter, ctrl = false, alt = false, shift = false }\n",
         "27: Key::Escape | Press { key = Key::Escape, ctrl = false, alt = false, shift = false }\n",
@@ -10417,7 +10417,7 @@ fn a173_s2_the_key_decoder_table_is_the_same_on_both_backends() {
         "ESC O at the end is Alt-O\n",
         "  end: Key::Alt(\"O\") +alt +shift\n",
         "paste with ESC and line endings inside\n",
-        "  chunk 1: Key::Paste(\"a\u{1b}[Bb\\r\\nc\")\n",
+        "  chunk 1: Key::Paste(\"a\\u{1b}[Bb\\r\\nc\")\n",
         "  chunk 1: Key::Char(\"z\")\n",
         "paste never closed\n",
         "  end: Key::Paste(\"abc\")\n",
@@ -12714,6 +12714,25 @@ fn e275_written_and_derived_debug_print_the_same_on_both_backends() {
         include_str!("native/dbg_debug_impls.vl"),
         include_str!("native/dbg_debug_impls.stdout"),
         include_str!("native/dbg_debug_impls.stderr"),
+    );
+}
+
+/// E346: `.debug()` and `dbg` escape every control character - the rest of C0
+/// and DEL as `\u{..}` - the same bytes on both backends (`vilan_rt::show`
+/// natively, `__dbg_str` and std's `str::debug` on node).
+#[test]
+fn e346_debug_escapes_every_control_character_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_controls.vl",
+        "import std::debug::Debug;\n\
+         import std::io::print;\n\n\
+         fun main() {\n\
+         \tlet text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\";\n\
+         \tprint(text.debug());\n\
+         \tdbg(text);\n\
+         }\n",
+        "\"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\"\n",
+        "[native_probe_dbg_controls.vl:7:2] text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\"\n",
     );
 }
 

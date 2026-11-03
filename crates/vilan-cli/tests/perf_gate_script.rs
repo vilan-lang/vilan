@@ -1076,6 +1076,71 @@ fn the_rss_probe_reads_each_fresh_runs_own_peak_not_the_max_over_children() {
     assert_eq!(median, runs[1], "the median is the middle run: {text}");
 }
 
+/// E358: every edit sample keeps the phase lines of its own stderr window —
+/// one `lsp-context` line per analysis the server ran and the `hot-set` line —
+/// and counts its analyses from them, and a sample over 1.5x its row's median
+/// instructions, or with more analyses than its median, is listed under the
+/// table WITH those lines. A `parse repair` sample read 50.2 G against a 17.4 G
+/// median on the N186 exhibit, and nothing recorded said what ran.
+#[cfg(target_os = "linux")]
+#[test]
+fn e358_the_lsp_harness_names_an_outliers_analyses() {
+    let probe = r#"
+import contextlib, importlib.util, io, sys
+spec = importlib.util.spec_from_file_location("latency", sys.argv[1])
+latency = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(latency)
+window = [
+    "[vilan phase] hot-set 1/40 interface-moved 0 global-moved 0 unknown-interfaces 0 hot-world 1",
+    "[vilan phase] lsp-context 1ms lsp-analyze 300ms lsp-index 2ms lsp-landed 3ms lsp-legs 0ms legs 1",
+    "[vilan] something else",
+    "[vilan phase] lsp-context 1ms lsp-analyze 290ms lsp-index 2ms lsp-landed 3ms lsp-legs 0ms legs 1",
+]
+record = latency.phase_record(window)
+print("analyses:", record["analyses"], "kept:", len(record["phase"]))
+def sample(instructions, analyses, tag):
+    return {"instructions": instructions, "analyses": analyses, "phase": [f"[vilan phase] lsp-context {tag}"]}
+rows = {
+    "parse repair": [sample(17.0e9, 1, "a"), sample(17.4e9, 1, "b"), sample(50.2e9, 2, "c"), sample(18.0e9, 1, "d")],
+    "leaf keystroke": [sample(1.0e9, 1, "e"), sample(1.1e9, 2, "f"), sample(1.0e9, 1, "g")],
+    "steady": [sample(2.0e9, 1, "h"), sample(2.1e9, 1, "i"), sample(2.9e9, 1, "j")],
+}
+print("found:", [(name, run) for name, run, _ in latency.outliers(rows)])
+printed = io.StringIO()
+with contextlib.redirect_stdout(printed):
+    latency.print_outliers(rows)
+print(printed.getvalue())
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c"])
+        .arg(probe)
+        .arg(repository_root().join("scripts/lsp-latency.py"))
+        .output()
+        .expect("run the outlier probe");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("analyses: 2 kept: 3"), "{text}");
+    // The heavy sample and the one with an extra analysis; a sample 1.38x its
+    // median with the median's analyses is not one.
+    assert!(
+        text.contains("found: [('parse repair', 3), ('leaf keystroke', 2)]"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- parse repair, run 3: 50.20 G, 2 analyses\n    [vilan phase] lsp-context c"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- leaf keystroke, run 2: 1.10 G, 2 analyses\n    [vilan phase] lsp-context f"
+        ),
+        "{text}"
+    );
+}
+
 /// N150: a hover or completion anchor is resolved in the EDITED buffer —
 /// `measure_edit` asks the keystroke-path requests before the edit is undone —
 /// so the preflight checks it against the text AFTER the scenario's edit too.

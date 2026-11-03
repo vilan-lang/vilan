@@ -25,7 +25,10 @@ default, at a pinned commit — and prints one table row per edit:
     with the load average the way CPU time does on this host; `-` where
     `perf_event_open` is refused (`/proc/sys/kernel/perf_event_paranoid`);
   - the analyses an edit ran, counted from the server's `VILAN_PHASE_TIMING`
-    lines, where the server prints them.
+    lines, where the server prints them; every sample keeps its own phase lines
+    (`lsp-context` per analysis, the `hot-set` line), and a sample over 1.5x
+    its row's median instructions, or with more analyses than its median, is
+    listed under the table with them, so an outlier names its cause (E358).
 
 CPU time, not wall, is the figure to compare: a machine running other work
 stretches wall time and leaves CPU time alone (E121's measurement rule — and
@@ -438,18 +441,6 @@ class Server:
         except OSError:
             return []
 
-    def analyses_logged(self):
-        """How many analyses the server has reported on stderr so far
-        (`VILAN_PHASE_TIMING`'s `lsp-context` lines), or `None` before it
-        has printed one."""
-        self.stderr.flush()
-        try:
-            text = Path(self.stderr.name).read_text(errors="replace")
-        except OSError:
-            return None
-        count = text.count("lsp-context")
-        return count if count else None
-
     def notify(self, method, params):
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
@@ -668,12 +659,67 @@ class Document:
         return wall
 
 
+# E358: the phase lines a sample keeps — one `lsp-context` line per analysis the
+# server ran (its legs and costs) and the core's `hot-set` line (what the
+# analysis re-walked, and why a prefix or hot world was refused) — so an outlier
+# names its cause instead of being one more number in a median.
+SAMPLE_PHASES = ("[vilan phase] lsp-context", "[vilan phase] hot-set")
+
+
+def phase_record(lines):
+    """What a sample's stderr window says about the analyses it ran: their
+    count (`lsp-context` lines) and the phase lines themselves, in order."""
+    kept = [line.strip() for line in lines if line.startswith(SAMPLE_PHASES)]
+    return {
+        "analyses": sum(1 for line in kept if line.startswith(SAMPLE_PHASES[0])),
+        "phase": kept,
+    }
+
+
+def outliers(rows, ratio=1.5):
+    """E358: every sample whose instructions exceed `ratio` x its row's median, or
+    that ran more analyses than the row's median — `(row, run, sample)`, the
+    run counted from 1."""
+    found = []
+    for name, samples in rows.items():
+        instructions = median([sample.get("instructions") for sample in samples])
+        analyses = median([sample.get("analyses") for sample in samples])
+        for run, sample in enumerate(samples, start=1):
+            heavy = (
+                sample.get("instructions") is not None
+                and instructions == instructions
+                and sample["instructions"] > ratio * instructions
+            )
+            extra = (
+                sample.get("analyses") is not None
+                and analyses == analyses
+                and sample["analyses"] > analyses
+            )
+            if heavy or extra:
+                found.append((name, run, sample))
+    return found
+
+
+def print_outliers(rows):
+    found = outliers(rows)
+    if not found:
+        return
+    print()
+    print("Outliers (E358): instructions over 1.5x the row's median, or more analyses than its median.")
+    for name, run, sample in found:
+        instructions = sample.get("instructions")
+        shown = "-" if instructions is None else f"{instructions / 1e9:.2f} G"
+        print(f"- {name}, run {run}: {shown}, {sample.get('analyses')} analyses")
+        for line in sample.get("phase", []):
+            print(f"    {line}")
+
+
 def measure_edit(server, document, scenario, apply):
     """Apply one edit and measure it: the keystroke-path requests first, then
     diagnostics, then idle, then the settled requests."""
     cpu_before = cpu_ms(server.pid)
     instructions_before = server.instructions.read()
-    analyses_before = server.analyses_logged()
+    mark = server.stderr_mark()
     started = time.perf_counter()
     apply()
     keystroke = {kind: document.ask(kind, scenario) * 1000 for kind in KEYSTROKE_REQUESTS}
@@ -685,7 +731,7 @@ def measure_edit(server, document, scenario, apply):
     last = server.last_publish(document.uri, started)
     cpu_after = cpu_ms(server.pid)
     instructions_after = server.instructions.read()
-    analyses_after = server.analyses_logged()
+    record = phase_record(server.stderr_since(mark))
     settled = {}
     for kind in KEYSTROKE_REQUESTS:
         before = live_threads_ns(server.pid)
@@ -710,9 +756,10 @@ def measure_edit(server, document, scenario, apply):
             if instructions_before is not None and instructions_after is not None
             else None
         ),
-        "analyses": (
-            analyses_after - (analyses_before or 0) if analyses_after is not None else None
-        ),
+        # None where the server prints no phase lines (VILAN_PHASE_TIMING unset
+        # by the caller's environment, or a server that predates the line).
+        "analyses": record["analyses"] if record["phase"] else None,
+        "phase": record["phase"],
         "all_published_ms": (everything[0] - started) * 1000 if everything else None,
         "all_published_cpu_ms": everything[3] - cpu_before if everything else None,
         "files_republished": len({entry[1] for entry in caused}),
@@ -1249,6 +1296,7 @@ def main():
         f"{os.cpu_count()} cores"
     )
     print_table(cold_rows, rows, header)
+    print_outliers(rows)
     if skipped:
         print()
         print("SKIPPED (anchors missing in this source; not measured): " + ", ".join(skipped))

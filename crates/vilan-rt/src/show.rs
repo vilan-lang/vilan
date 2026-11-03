@@ -232,7 +232,8 @@ pub fn shared<T: Clone>(cell: &crate::Shared<T>, show: impl Fn(&T) -> Doc) -> Do
 }
 
 /// A string as vilan writes it: quoted, with `\\`, `\"`, `\n`, `\t`, `\r`
-/// and `\0` escaped.
+/// and `\0` escaped, and every other control character - the rest of C0, and
+/// DEL - as `\u{..}` (E346: `\u{1b}`, never a live ESC).
 pub fn string(text: &str) -> Doc {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
@@ -244,6 +245,9 @@ pub fn string(text: &str) -> Doc {
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
             '\0' => out.push_str("\\0"),
+            control if control < ' ' || control == '\u{7f}' => {
+                out.push_str(&format!("\\u{{{:x}}}", u32::from(control)));
+            }
             other => out.push(other),
         }
     }
@@ -275,6 +279,19 @@ pub fn integer(value: impl std::fmt::Display) -> Doc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E346: every control character is escaped - the six short forms, the rest
+    /// of C0 and DEL as `\u{..}` - and nothing else is touched.
+    #[test]
+    fn a_string_escapes_every_control_character() {
+        let Doc::Text(text) = string("a\u{1b}[1m\u{7}\u{7f}\u{1f}\u{8}\n\t\r\0\"\\é") else {
+            panic!("a string is one text");
+        };
+        assert_eq!(
+            text,
+            "\"a\\u{1b}[1m\\u{7}\\u{7f}\\u{1f}\\u{8}\\n\\t\\r\\0\\\"\\\\é\""
+        );
+    }
 
     fn point(x: i32, y: i32) -> Doc {
         Doc::group(
