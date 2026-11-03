@@ -607,3 +607,73 @@ class = "ci"
 ratio = 1.01
 reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0283 of the ceiling at next 67111085 where the limit stood at x1.0242"
 item = "M187"
+
+[[bump]]
+subject = "example:browser"
+class = "reference"
+ratio = 1.02
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0415 of the ceiling where the limit stood at x1.0272"
+item = "M187"
+
+[[bump]]
+subject = "example:fullstack"
+class = "reference"
+ratio = 1.025
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0370 of the ceiling where the limit stood at x1.0201"
+item = "M187"
+
+[[bump]]
+subject = "example:router"
+class = "reference"
+ratio = 1.03
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0526 of the ceiling where the limit stood at x1.0272"
+item = "M187"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "reference"
+ratio = 1.02
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0391 of the ceiling where the limit stood at x1.0272"
+item = "M187"
+
+[[bump]]
+subject = "example:ssr"
+class = "reference"
+ratio = 1.025
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0435 of the ceiling where the limit stood at x1.0241"
+item = "M187"
+
+[[bump]]
+subject = "example:canvas"
+class = "reference"
+ratio = 1.02
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0405 of the ceiling where the limit stood at x1.0272"
+item = "M187"
+
+[[bump]]
+subject = "example:rpc"
+class = "reference"
+ratio = 1.01
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0145 of the ceiling where the limit stood at x1.0100"
+item = "M187"
+
+[[bump]]
+subject = "example:todo"
+class = "reference"
+ratio = 1.025
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0415 of the ceiling where the limit stood at x1.0221"
+item = "M187"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "reference"
+ratio = 1.03
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0453 of the ceiling where the limit stood at x1.0221"
+item = "M187"
+
+[[bump]]
+subject = "genapp:46"
+class = "reference"
+ratio = 1.025
+reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0304 of the ceiling where the limit stood at x1.0100"
+item = "M187"
