@@ -939,6 +939,82 @@ fn b526_the_server_twins_when_live_serves_the_payload_as_it_stands() {
     );
 }
 
+/// B694: the server twin's one-shot owners — `when`/`when_live`, `swap`, `each`
+/// (and `each_values`), `each_by` and `when_some` — are disposed once their body
+/// has placed its view, since the render is the body's whole life: a body's
+/// `on_cleanup` runs right after its row is placed, and `when_live`'s keeper
+/// leaves the store (0 feeds after the render; 1 for the process's life
+/// before). The rendered HTML is unchanged.
+#[test]
+fn b694_the_server_twin_disposes_each_bodys_owner_once_it_is_placed() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, on_cleanup };
+        import std::reactive::store::{ Storable, Store, store_feed_census };
+        import std::web::ui::{ View, each, each_by, render, swap, view, when, when_live, when_some };
+
+        [derive(PartialEq, Storable)]
+        struct Device {
+            name: str,
+        }
+
+        [derive(PartialEq, Storable)]
+        enum Presence {
+            Offline,
+            Online(Device),
+        }
+
+        fun main() {
+            let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+            let shown = Signal::new(true);
+            let pick = Signal::new(1);
+            let rows = SignalCell::new([1, 2]);
+            let maybe: Signal<Option<str>> = Signal::new(Some("x"));
+            let page = view("main")
+                .child(when_live(presence.online(), |device| {
+                    on_cleanup(|| print("when_live released"));
+                    view("p").bind_text(device.name())
+                }))
+                .child(when(shown, || {
+                    on_cleanup(|| print("when released"));
+                    view("b")
+                }))
+                .child(swap(pick, |n| {
+                    on_cleanup(|| print(i"swap {n} released"));
+                    view("i")
+                }))
+                .child(each(rows, |n| n, |n| {
+                    on_cleanup(|| print(i"each {n} released"));
+                    view("li")
+                }))
+                .child(each_by(rows, |n| n, |_cell| {
+                    on_cleanup(|| print("each_by row released"));
+                    view("li")
+                }))
+                .child(when_some(maybe, |cell| {
+                    on_cleanup(|| print("when_some released"));
+                    view("em").bind_text(cell)
+                }));
+            print(render(page));
+            print(i"feeds after the render: {store_feed_census(presence)}");
+        }
+
+        main();
+        "#,
+        "when_live released\n\
+         when released\n\
+         swap 1 released\n\
+         each 1 released\n\
+         each 2 released\n\
+         each_by row released\n\
+         each_by row released\n\
+         when_some released\n\
+         <main><p>laptop</p><b></b><i></i><li></li><li></li><li></li><li></li><em>x</em></main>\n\
+         feeds after the render: 0\n",
+    );
+}
+
 // ── A146: a store handle names its state ────────────────────────────────────
 
 #[test]
