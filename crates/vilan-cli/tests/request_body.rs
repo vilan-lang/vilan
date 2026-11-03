@@ -300,7 +300,7 @@ fn chunked_head(path: &str) -> String {
 /// The cap's program: no `max_body_bytes` anywhere, so every request is under
 /// the 1 MiB default — the echo route, and a mounted rpc service's POST leg.
 const CAP_SERVER: &str = r#"import std::io::print;
-import std::http::{ Request, Response, Server };
+import std::http::{ Request, Response, Server, refused_body_census };
 import std::json::json_codec;
 import std::rpc::server::Service;
 import std::shared::Shared;
@@ -331,6 +331,9 @@ fun main() {
 		.on_request(|request| {
 			if request.path() == "/auth" {
 				ret Response::builder().code(401).body("sign in").build();
+			}
+			if request.path() == "/census" {
+				ret Response::builder().body(i"refused_read={refused_body_census()}").build();
 			}
 			if request.path() == "/twice" {
 				let first = request.bytes();
@@ -367,14 +370,33 @@ fn declared_over_the_default_is_refused_before_the_body(
     expect_body(&response, DEFAULT_REFUSAL)
 }
 
+/// How many body bytes the server has read off connections after declining
+/// their bodies (`std::http::refused_body_census`): zero is the contract.
+fn refused_body_read(port: u16) -> Result<usize, String> {
+    let response = exchange(
+        port,
+        "GET /census HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        b"",
+    )?;
+    expect_status(&response, "HTTP/1.1 200 OK")?;
+    body_of(&response)
+        .strip_prefix("refused_read=")
+        .and_then(|count| count.parse().ok())
+        .ok_or_else(|| format!("the census answered:\n{response}"))
+}
+
 /// The writer of a refused body STALLS: after the `413` the server reads none
-/// of it, so the client gets out only what the two kernels' socket buffers hold
-/// — then the server closes and the write fails. The body is 64 MiB because a
-/// loopback socket's buffers hold several MiB (the client's send buffer grows to
-/// `tcp_wmem`'s 4 MiB), so a 2 MiB body could sit wholly in them with the
-/// server reading nothing — which the head-only exchange above already proves.
+/// of it. The proof is the SERVER's count of the body bytes it read after the
+/// refusal (B687): zero. How much the client got out before its write failed is
+/// the two kernels' socket buffers — 26.7, 56 and all 64 MiB on three windows
+/// runs under node — so it is reported and never judged. The secondary check
+/// has no figure: the connection ENDS, the write failing or the server's end of
+/// it read. The body is 64 MiB so that a server that DID read it is caught
+/// reading: a 2 MiB body could sit wholly in the buffers with the server
+/// reading nothing — which the head-only exchange above already proves.
 fn the_writer_of_a_refused_body_stalls(port: u16, _backend: Backend) -> Result<(), String> {
     let total = 64 * MIB;
+    let before = refused_body_read(port)?;
     let mut stream = connect(port)?;
     stream
         .write_all(post_head_keep_alive("/echo", total).as_bytes())
@@ -398,10 +420,23 @@ fn the_writer_of_a_refused_body_stalls(port: u16, _backend: Backend) -> Result<(
             Ok(count) => written += count,
         }
     };
-    if !failed || written >= 16 * MIB {
+    // A write that never failed: the kernels took the whole body. The
+    // connection must still end — read to the server's FIN or reset.
+    let ended = failed || read_response(&mut stream).is_ok();
+    // Counted after the connection ended, so every byte the server could still
+    // take off it is in the figure.
+    let after = refused_body_read(port)?;
+    if after != before {
         return Err(format!(
-            "the writer got {written} of {total} bytes out (failed: {failed}): the server read \
-             the body"
+            "the server read {} body bytes after its refusal (the writer got {written} of {total} \
+             out, failed: {failed})",
+            after - before
+        ));
+    }
+    if !ended {
+        return Err(format!(
+            "the refused connection never ended: the writer got all {total} bytes out and no \
+             close followed within the liveness bound"
         ));
     }
     Ok(())

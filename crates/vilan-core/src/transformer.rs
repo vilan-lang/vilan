@@ -1336,6 +1336,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__http_read_body",
         "__http_body_left_unread",
         "__http_respond",
+        "__http_refused_body_census",
         "__session_get",
         "__dom_window",
         "__dom_active_element",
@@ -1686,12 +1687,37 @@ fn helper_source(name: &str) -> &'static str {
         // already dumped keeps the socket paused, so the client's writes stall.
         // `_dumped` is node's own flag; were it renamed, node would read and
         // discard again, which is slower and still correct.
+        //
+        // B687: the socket stops reading HERE, at the decision, not at the
+        // answer's flush — between the two, `_dumped` keeps node's parser from
+        // ever pausing it, so a client already writing was read until the
+        // flush. And it STAYS stopped: node's http server restarts a socket
+        // from two places (`IncomingMessage._read` resumes it, and the socket's
+        // own `_read` starts its handle), so both are made inert for the half
+        // second the socket has left. What it reads after the decision anyway
+        // is counted (`globalThis.__vilan_refused_body`, read by
+        // `__http_refused_body_census`): an instrument, deciding nothing.
         "__http_linger" => {
             "function __http_linger(request) {\n\
              \tconst socket = request.socket;\n\
              \tif (!socket || socket.__vilan_linger) return;\n\
              \tsocket.__vilan_linger = true;\n\
              \trequest._dumped = true;\n\
+             \tconst census = (globalThis.__vilan_refused_body ??= { read: 0, open: new Map() });\n\
+             \tcensus.open.set(socket, socket.bytesRead);\n\
+             \tsocket.once(\"close\", () => {\n\
+             \t\tcensus.read += socket.bytesRead - census.open.get(socket);\n\
+             \t\tcensus.open.delete(socket);\n\
+             \t});\n\
+             \tsocket.pause();\n\
+             \tif (socket._handle && socket._handle.reading) {\n\
+             \t\tsocket._handle.reading = false;\n\
+             \t\tsocket._handle.readStop();\n\
+             \t}\n\
+             \tsocket.resume = function () {\n\
+             \t\treturn this;\n\
+             \t};\n\
+             \tsocket._read = function () {};\n\
              \tsocket.destroySoon = function () {\n\
              \t\tthis.pause();\n\
              \t\tthis.end();\n\
@@ -1711,6 +1737,18 @@ fn helper_source(name: &str) -> &'static str {
              \t} catch (error) {\n\
              \t\tif (!error || error.name !== \"AbortError\") throw error;\n\
              \t}\n\
+             }"
+        }
+        // B687: how many body bytes the server took off its sockets after it
+        // decided not to read them (`__http_linger` counts) — the open sockets
+        // read live, so the figure is exact at the call. Zero is the contract.
+        "__http_refused_body_census" => {
+            "function __http_refused_body_census() {\n\
+             \tconst census = globalThis.__vilan_refused_body;\n\
+             \tif (!census) return 0;\n\
+             \tlet read = census.read;\n\
+             \tfor (const [socket, start] of census.open) read += socket.bytesRead - start;\n\
+             \treturn read;\n\
              }"
         }
         "__local_get" => {
