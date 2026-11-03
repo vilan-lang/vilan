@@ -285,7 +285,7 @@ fn exif_orientation_six_comes_out_upright() {
     encoder.set_exif_metadata(exif_orientation(6)).unwrap();
     encoder
         .write_image(
-            &flattened_on_white(stored.pixels()),
+            &flattened_on_black(stored.pixels()),
             16,
             24,
             ExtendedColorType::Rgb8,
@@ -329,7 +329,7 @@ fn every_exif_orientation_is_applied() {
             .unwrap();
         encoder
             .write_image(
-                &flattened_on_white(stored.pixels()),
+                &flattened_on_black(stored.pixels()),
                 16,
                 24,
                 ExtendedColorType::Rgb8,
@@ -615,8 +615,10 @@ fn jpeg_round_trips_within_a_tolerance_and_quality_moves_the_size() {
 }
 
 #[test]
-fn jpeg_flattens_transparency_onto_white() {
-    let transparent = painted(16, 16, |_, _| [0, 0, 0, 0]);
+fn jpeg_flattens_transparency_onto_black() {
+    // M190: black, the canvas / sharp / libvips / `image` standard — even a
+    // transparent WHITE pixel comes out black.
+    let transparent = painted(16, 16, |_, _| [255, 255, 255, 0]);
     let decoded = Image::decode(
         &transparent.encode(Format::Jpeg, 95).unwrap(),
         DEFAULT_MAX_PIXELS,
@@ -628,12 +630,12 @@ fn jpeg_flattens_transparency_onto_white() {
             .as_chunks::<4>()
             .0
             .iter()
-            .all(|pixel| pixel[0] >= 250 && pixel[3] == 255)
+            .all(|pixel| pixel[0] <= 5 && pixel[1] <= 5 && pixel[2] <= 5 && pixel[3] == 255)
     );
-    // Half-transparent black is mid grey.
+    // Half-transparent white is mid grey; an opaque pixel is itself.
     assert_eq!(
-        flattened_on_white(&[0, 0, 0, 128, 255, 0, 0, 255]),
-        vec![127, 127, 127, 255, 0, 0]
+        flattened_on_black(&[255, 255, 255, 128, 255, 0, 0, 255]),
+        vec![128, 128, 128, 255, 0, 0]
     );
 }
 

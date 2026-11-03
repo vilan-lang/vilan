@@ -78,13 +78,13 @@ fun main() {
 		Err(let reason) => print(reason),
 	}
 
-	shown("fill 1x1", picture.resized(1, 1, Fit::Fill));
-	shown("fill 5x3", picture.resized(5, 3, Fit::Fill));
+	shown("fill 1x1", picture.resized(1, 1, Fit::Fill).unwrap());
+	shown("fill 5x3", picture.resized(5, 3, Fit::Fill).unwrap());
 
 	let wide = gradient(8, 6);
-	shown("contain", wide.resized(4, 4, Fit::Contain));
-	shown("cover", wide.resized(3, 3, Fit::Cover));
-	shown("zero side", wide.resized(0, 2, Fit::Fill));
+	shown("contain", wide.resized(4, 4, Fit::Contain).unwrap());
+	shown("cover", wide.resized(3, 3, Fit::Cover).unwrap());
+	shown("zero side", wide.resized(0, 2, Fit::Fill).unwrap());
 	shown("crop", wide.cropped(6, 4, 10, 10));
 	shown("crop outside", wide.cropped(9, 0, 2, 2));
 
@@ -96,6 +96,9 @@ fun main() {
 	round_trip("png", picture, Format::Png, 0);
 	round_trip("webp", picture, Format::Webp, 0);
 	round_trip("jpeg", wide, Format::Jpeg, 90);
+	// M190: JPEG flattens transparency onto BLACK — the half-transparent white
+	// pixel comes back mid grey, not white.
+	round_trip("jpeg alpha", picture, Format::Jpeg, 90);
 	round_trip("gif", picture, Format::Gif, 80);
 
 	match Image::from_rgba(2, 2, Bytes::alloc(15)) {

@@ -8830,7 +8830,7 @@ fn m185_a_png_decodes_resizes_and_reads_back_on_node() {
                 Ok(let picture) => {
                     print(i"{picture.width()} x {picture.height()}");
                     print(picture.rgba().to_hex());
-                    let one = picture.resized(1, 1, Fit::Fill);
+                    let one = picture.resized(1, 1, Fit::Fill).unwrap();
                     print(i"{one.width()} x {one.height()} {one.rgba().to_hex()}");
                 },
                 Err(let reason) => print(reason),
@@ -8931,7 +8931,7 @@ fn m185_every_fit_and_a_clamped_crop_answer_their_sizes() {
             match Image::from_rgba(4, 2, Bytes::alloc(32)) {
                 Ok(let picture) => {
                     for fit in [Fit::Contain, Fit::Cover, Fit::Fill] {
-                        let resized = picture.resized(3, 3, fit);
+                        let resized = picture.resized(3, 3, fit).unwrap();
                         print(i"{resized.width()} x {resized.height()}");
                     }
                     let window = picture.cropped(3, 1, 10, 10);
@@ -8946,27 +8946,29 @@ fn m185_every_fit_and_a_clamped_crop_answer_their_sizes() {
 }
 
 #[test]
-fn m185_a_resize_past_the_pixel_limit_panics_naming_both_sizes() {
-    // The result, not the box, is measured: the `Contain` into a 100,000 x 1
-    // box is 1 x 1 and fine; the `Fill` is 10,000,000,000 pixels and panics.
-    let (stdout, stderr, code) = compile_and_run_status(&m185_program(
-        r#"
-        match Image::from_rgba(4, 3, Bytes::alloc(48)) {
-            Ok(let picture) => {
-                let small = picture.resized(100000, 1, Fit::Contain);
-                print(i"{small.width()} x {small.height()}");
-                let huge = picture.resized(100000, 100000, Fit::Fill);
-                print(huge.width());
-            },
-            Err(let reason) => print(reason),
-        }
-        "#,
-    ));
-    assert_eq!(stdout, "1 x 1\n");
-    assert_ne!(code, 0);
-    assert!(
-        stderr.contains("a 100000 x 100000 result exceeds the 50,000,000-pixel limit"),
-        "{stderr}"
+fn m190_a_resize_past_the_pixel_limit_is_an_err_naming_both_sizes() {
+    // M190 (the owner's ruling): an `Err`, as `decode`'s limit is. The result,
+    // not the box, is measured: the `Contain` into a 100,000 x 1 box is 1 x 1
+    // and fine; the `Fill` is 10,000,000,000 pixels and refused.
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::from_rgba(4, 3, Bytes::alloc(48)) {
+                Ok(let picture) => {
+                    match picture.resized(100000, 1, Fit::Contain) {
+                        Ok(let small) => print(i"{small.width()} x {small.height()}"),
+                        Err(let reason) => print(reason),
+                    }
+                    match picture.resized(100000, 100000, Fit::Fill) {
+                        Ok(let huge) => print(huge.width()),
+                        Err(let reason) => print(reason),
+                    }
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "1 x 1\na 100000 x 100000 result exceeds the 50,000,000-pixel limit\n",
     );
 }
 

@@ -14902,6 +14902,10 @@ fn m185_image_is_identical_on_both_backends() {
             "webp 2x2 ff0000ff00ff00ff0000ffffffffff80\n",
             "jpeg jpeg 657 bytes\n",
             "jpeg 8x6 0200c5ff1e00c0ff3c00b4ff5b00a7ff7800a0ff970096ffb70088ffd10082ff0327c6ff1d28c0ff3e27b3ff5b26a8ff7928a1ff972795ffb72588ffd12883ff0051c4ff1a53beff3b52b0ff5951a6ff77529fff945194ffb45086ffce5381ff0378c8ff1c7ac2ff3d79b7ff5a78aaff787aa3ff967998ffb6778affd17985ff009dc6ff1ba0c1ff3a9eb5ff599da8ff77a0a2ff959f97ffb49e89ffcfa084ff06c8caff20c9c4ff40c9b9ff5fc7acff7cc9a5ff9ac89affb9c78cffd4c987ff\n",
+            // M190: transparency flattened onto black — the half-transparent white
+            // pixel comes back grey.
+            "jpeg alpha jpeg 706 bytes\n",
+            "jpeg alpha 2x2 f00400ff04ff00ff0609ffff787f91ff\n",
             "gif refused: GIF cannot be encoded\n",
             "15 bytes are not 2 x 2 RGBA pixels (16 bytes)\n",
         )
@@ -14928,32 +14932,26 @@ fn m185_image_is_identical_on_both_backends() {
     }
 }
 
-/// M185: a `resized` result over the 50,000,000-pixel limit panics, naming
-/// both sizes, at the CALLER's site (`resized` is `[track_caller]`), on both
-/// backends — while a `Contain` into a box far past the limit whose result is
+/// M190: a `resized` result over the 50,000,000-pixel limit is an `Err`
+/// naming both sizes — the owner's ruling, as `decode`'s limit is — on both
+/// backends, while a `Contain` into a box far past the limit whose result is
 /// small (4 x 3 into 100,000 x 1 is 1 x 1) is fine.
 #[test]
-fn m185_a_resize_past_the_pixel_limit_panics_at_its_caller_on_both_backends() {
+fn m190_a_resize_past_the_pixel_limit_is_an_err_on_both_backends() {
     let staged = stage();
     let file = "native_probe_image_resize_cap.vl";
-    let source = include_str!("native/image_resize_cap.vl");
-    std::fs::write(staged.join(file), source).expect("write the probe program");
-    let location = site_of(file, source, "resized(100000, 100000", "resized");
-    let expected = format!(
-        "panicked at {location}: a 100000 x 100000 result exceeds the 50,000,000-pixel limit"
-    );
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/image_resize_cap.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "1 x 1\na 100000 x 100000 result exceeds the 50,000,000-pixel limit\n";
     let native = run_on(&staged, Some("rust"), file);
-    assert_eq!(native.stdout, "1 x 1\n");
-    assert_eq!(native.code, Some(1), "{}", native.stderr);
-    assert_eq!(native.stderr, format!("{expected}\n"));
+    assert_eq!(native.stdout, expected, "{}", native.stderr);
+    assert_eq!(native.code, Some(0), "{}", native.stderr);
     let javascript = run_on(&staged, None, file);
-    assert_eq!(javascript.stdout, "1 x 1\n");
-    assert_eq!(javascript.code, Some(1), "{}", javascript.stderr);
-    assert!(
-        javascript.stderr.lines().any(|line| line == expected),
-        "node's stderr lacks {expected:?}:\n{}",
-        javascript.stderr
-    );
+    assert_eq!(javascript.stdout, expected, "{}", javascript.stderr);
+    assert_eq!(javascript.code, Some(0), "{}", javascript.stderr);
 }
 
 /// M185: every package the generated manifest optimizes for an image program

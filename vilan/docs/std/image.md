@@ -23,7 +23,7 @@ impl Image {
 	fun height(self): usize
 	fun rgba(self): Bytes                                     // a copy, row-major RGBA
 
-	fun resized(self, width: usize, height: usize, fit: Fit): Image  // panics past 50,000,000 px
+	fun resized(self, width: usize, height: usize, fit: Fit): Result<Image, str>  // Err past 50,000,000 px
 	fun cropped(self, x: usize, y: usize, width: usize, height: usize): Image
 	fun encode(self, format: Format, quality: i32): Result<Bytes, str>
 }
@@ -40,7 +40,7 @@ import std::io::print;
 fun keep_avatar(id: str, upload: Bytes): Result<void, str> {
 	let picture = Image::decode(upload)!;    // an Err returns early, carrying the sentence
 	for size in [32usize, 64, 256] {
-		let copy = picture.resized(size, size, Fit::Cover).encode(Format::Webp, 80)!;
+		let copy = picture.resized(size, size, Fit::Cover)!.encode(Format::Webp, 80)!;
 		write_bytes(i"avatars/{id}-{size}.webp", copy);
 	}
 	Ok(void)
@@ -63,12 +63,10 @@ Scaling is Lanczos3 — a downscale averages every source pixel it covers, so
 a 4,000-pixel photo shown at 300 does not shimmer — and upscaling is allowed.
 A picture with transparency is scaled with its colours weighted by their
 alpha, so a fully transparent pixel's colour never bleeds into an edge.
-`resized` PANICS when its result would exceed 50,000,000 pixels — `a 100000
-x 100000 result exceeds the 50,000,000-pixel limit` — the same ceiling
-`decode` puts on an upload. The box is your program's choice rather than the
-upload's, so an oversized one is a bug to fix, not an `Err` to handle; the
-RESULT is what counts, so a `Contain` into a huge box that comes out small
-is fine.
+`resized` answers `Err` when its result would exceed 50,000,000 pixels —
+`a 100000 x 100000 result exceeds the 50,000,000-pixel limit` — the same
+ceiling `decode` puts on an upload, refused the same way. The RESULT is what
+counts, so a `Contain` into a huge box that comes out small is fine.
 
 `cropped(x, y, width, height)` CLAMPS rather than refuses: a window reaching
 past an edge stops at it, and one starting past an edge is empty.
@@ -93,8 +91,9 @@ past an edge stops at it, and one starting past an edge is empty.
 `encode(format, quality)` writes PNG, JPEG or WebP. `quality` (1-100, clamped)
 is JPEG's; PNG and WebP are written **lossless** and ignore it — so a WebP
 avatar is exact, and a photo you want small is a JPEG. JPEG has no alpha
-channel: transparent pixels are flattened onto white. `Format::Gif` is
-decode-only, and `encode` answers `Err("GIF cannot be encoded")`.
+channel: transparent pixels are flattened onto black, as a canvas, sharp and
+libvips flatten them. `Format::Gif` is decode-only, and `encode` answers
+`Err("GIF cannot be encoded")`.
 
 `rgba()` and `from_rgba(width, height, pixels)` are the raw way in and out:
 four bytes a pixel, row by row, and `from_rgba` refuses a buffer that is not

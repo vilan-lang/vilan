@@ -16,7 +16,6 @@
 [platform("@process")] mod self;
 
 import pkg::bytes::Bytes;
-import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 
@@ -150,17 +149,12 @@ export impl Image {
 	/// one a side; `Cover` fills the box and crops the overflow centred; `Fill`
 	/// stretches. A zero side of the box counts as one pixel.
 	///
-	/// PANICS when the result would exceed 50,000,000 pixels (`a 100000 x 100000
-	/// result exceeds the 50,000,000-pixel limit`) — decode's default limit. The
-	/// box is your program's choice, not the upload's, so it is a bug to fix
-	/// rather than an `Err` to handle; it is the RESULT that counts, so a
-	/// `Contain` into a huge box that comes out small is fine.
-	[track_caller]
-	fun resized(self, width: usize, height: usize, fit: Fit): Image {
-		match image_resize(self, width, height, fit_code(fit)) {
-			Ok(let resized) => resized,
-			Err(let reason) => panic(reason),
-		}
+	/// `Err` when the result would exceed 50,000,000 pixels (`a 100000 x 100000
+	/// result exceeds the 50,000,000-pixel limit`) — decode's default limit,
+	/// answered the way `decode` answers it (M190). It is the RESULT that counts,
+	/// so a `Contain` into a huge box that comes out small is fine.
+	fun resized(self, width: usize, height: usize, fit: Fit): Result<Image, str> {
+		image_resize(self, width, height, fit_code(fit))
 	}
 
 	/// The `width` x `height` window at (`x`, `y`), clamped to the picture: a
@@ -171,7 +165,8 @@ export impl Image {
 
 	/// Encode as `format`. `quality` (1-100, clamped) is JPEG's; PNG and WebP are
 	/// lossless and ignore it. JPEG has no alpha, so transparency is flattened onto
-	/// white. `Gif` is decode-only and refused here.
+	/// black (the canvas / sharp / libvips standard). `Gif` is decode-only and
+	/// refused here.
 	fun encode(self, format: Format, quality: i32): Result<Bytes, str> {
 		image_encode(self, format_code(format), quality)
 	}

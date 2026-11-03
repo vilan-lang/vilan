@@ -328,7 +328,9 @@ impl Image {
     /// Encode as `format`. `quality` (1-100, clamped) is JPEG's; PNG and WebP
     /// are lossless and ignore it (proposal/image.md §6 Q2 — `image`'s pure-Rust
     /// WebP encoder is lossless only). JPEG has no alpha channel, so a
-    /// transparent pixel is flattened onto WHITE (§6 Q4). GIF is decode-only.
+    /// transparent pixel is flattened onto BLACK — what a canvas, sharp,
+    /// libvips and the `image` crate itself do (M190, the owner's ruling over
+    /// §6 Q4's white). GIF is decode-only.
     pub fn encode(&self, format: Format, quality: i32) -> Result<Vec<u8>, String> {
         let (width, height) = (self.width(), self.height());
         let mut out = Vec::new();
@@ -343,7 +345,7 @@ impl Image {
                 let quality = quality.clamp(1, 100) as u8;
                 JpegEncoder::new_with_quality(&mut out, quality)
                     .write_image(
-                        &flattened_on_white(self.pixels()),
+                        &flattened_on_black(self.pixels()),
                         width,
                         height,
                         ExtendedColorType::Rgb8,
@@ -418,14 +420,14 @@ fn cover_window(
     }
 }
 
-/// JPEG's input: each RGBA pixel composited over white, `c * a + 255 * (255 -
-/// a)` over 255, rounded.
-fn flattened_on_white(rgba: &[u8]) -> Vec<u8> {
+/// JPEG's input: each RGBA pixel composited over black, `c * a` over 255,
+/// rounded — the colour weighted by its coverage, a transparent pixel black.
+fn flattened_on_black(rgba: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
     for pixel in rgba.as_chunks::<4>().0.iter() {
         let alpha = u32::from(pixel[3]);
         for channel in &pixel[..3] {
-            let composited = (u32::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255;
+            let composited = (u32::from(*channel) * alpha + 127) / 255;
             rgb.push(composited as u8);
         }
     }
