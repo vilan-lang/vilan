@@ -206,15 +206,87 @@ struct Liveness {
     words: HashSet<String>,
     /// Every result string, concatenated with a separator no token can span.
     /// The fallback for a token a split did not isolate — a class glued into
-    /// a larger word by interpolation or `+`. Scanned only for a token the set
-    /// misses, which in practice is none.
+    /// a larger word by interpolation or `+`. Scanned only for the tokens the
+    /// set misses — which on kolt is every staged rule whose class no result
+    /// names (a dead rule), hundreds of them.
     text: String,
 }
 
 impl Liveness {
-    fn names(&self, token: &str) -> bool {
-        self.words.contains(token) || self.text.contains(token)
+    /// Which of `tokens` the build NAMES: a token is named when it is a
+    /// result or a word of one (`words`), or occurs anywhere in a result
+    /// (`text`) — `words.contains(token) || text.contains(token)`, answered
+    /// for every token at once.
+    ///
+    /// E292 (Order 56): asked one token at a time, the substring half scanned
+    /// the whole concatenated text once per token the set missed, and on the
+    /// kolt exhibit's served leaf keystroke that was 0.79 G instructions of
+    /// 10.4 (`asset::staged` from the stylesheet's finaliser: every dead
+    /// rule's class searched for, and not found, across every result). The
+    /// misses are now found in ONE pass over the text per distinct token
+    /// LENGTH (a rolling hash over every window of that length, each hit
+    /// compared byte for byte) — exact, because a UTF-8 token's bytes can
+    /// only match the text's at a character boundary, which is where
+    /// `str::contains` matches.
+    fn named_among<'a>(&self, tokens: impl IntoIterator<Item = &'a str>) -> HashSet<&'a str> {
+        let mut named: HashSet<&'a str> = HashSet::default();
+        let mut missed: BTreeMap<usize, HashMap<u64, Vec<&'a str>>> = BTreeMap::new();
+        for token in tokens {
+            if named.contains(token) {
+                continue;
+            }
+            if self.words.contains(token) {
+                named.insert(token);
+            } else if !token.is_empty() && token.len() <= self.text.len() {
+                let bucket = missed.entry(token.len()).or_default();
+                let candidates = bucket.entry(window_hash(token.as_bytes())).or_default();
+                if !candidates.contains(&token) {
+                    candidates.push(token);
+                }
+            } else if token.is_empty() {
+                // `str::contains("")` is true for every text.
+                named.insert(token);
+            }
+        }
+        let text = self.text.as_bytes();
+        for (length, by_hash) in missed {
+            let mut unfound: usize = by_hash.values().map(Vec::len).sum();
+            // BASE^(length - 1), the leading byte's weight in a window.
+            let lead = (1..length).fold(1u64, |power, _| power.wrapping_mul(WINDOW_BASE));
+            let mut hash = window_hash(&text[..length]);
+            let mut start = 0;
+            loop {
+                if let Some(candidates) = by_hash.get(&hash) {
+                    let window = &text[start..start + length];
+                    for candidate in candidates {
+                        if candidate.as_bytes() == window && named.insert(candidate) {
+                            unfound -= 1;
+                        }
+                    }
+                }
+                if unfound == 0 || start + length == text.len() {
+                    break;
+                }
+                hash = hash
+                    .wrapping_sub(u64::from(text[start]).wrapping_mul(lead))
+                    .wrapping_mul(WINDOW_BASE)
+                    .wrapping_add(u64::from(text[start + length]));
+                start += 1;
+            }
+        }
+        named
     }
+}
+
+/// The rolling hash [`Liveness::named_among`] slides over the text: the
+/// window's bytes as base-[`WINDOW_BASE`] digits, wrapping.
+const WINDOW_BASE: u64 = 1_000_003;
+
+fn window_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0u64, |hash, byte| {
+        hash.wrapping_mul(WINDOW_BASE)
+            .wrapping_add(u64::from(*byte))
+    })
 }
 
 /// One `asset::stage` contribution: the kind it belongs to, the LIVENESS TOKEN
@@ -750,12 +822,21 @@ impl interpreter::AssetReader for ProjectReader {
                     .to_string(),
             );
         };
-        let mut surviving: Vec<(String, String)> = self
-            .staged
-            .borrow()
-            .iter()
-            .filter(|contribution| contribution.kind == kind)
-            .filter(|contribution| contribution.token.is_empty() || live.names(&contribution.token))
+        let staged = self.staged.borrow();
+        let of_kind = || {
+            staged
+                .iter()
+                .filter(|contribution| contribution.kind == kind)
+        };
+        let named = live.named_among(
+            of_kind()
+                .filter(|contribution| !contribution.token.is_empty())
+                .map(|contribution| contribution.token.as_str()),
+        );
+        let mut surviving: Vec<(String, String)> = of_kind()
+            .filter(|contribution| {
+                contribution.token.is_empty() || named.contains(contribution.token.as_str())
+            })
             .map(|contribution| (contribution.token.clone(), contribution.line.clone()))
             .collect();
         surviving.sort_unstable();
@@ -3188,5 +3269,84 @@ impl<'p, 'src> State<'p, 'src> {
             .get(&id)
             .map(|span| **span)
             .unwrap_or((0..0).into())
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    /// The definition [`Liveness::named_among`] answers in one pass per token
+    /// length: a token is named when it is a word or a substring of the text.
+    fn named_one_at_a_time(liveness: &Liveness, token: &str) -> bool {
+        liveness.words.contains(token) || liveness.text.contains(token)
+    }
+
+    fn liveness_of(results: &[&str]) -> Liveness {
+        let mut liveness = Liveness::default();
+        for text in results {
+            for word in text.split_whitespace() {
+                liveness.words.insert(word.to_string());
+            }
+            liveness.words.insert(text.to_string());
+            liveness.text.push_str(text);
+            liveness.text.push('\u{1}');
+        }
+        liveness
+    }
+
+    #[test]
+    fn the_batch_answers_what_the_per_token_search_answers() {
+        let liveness = liveness_of(&[
+            "s1ufvr2 s8myyrk",
+            "card-s4k2p9x-active",
+            "naïve-sé0ü1 tail",
+            "ends-with-s9zzzz9",
+        ]);
+        let tokens = [
+            // words
+            "s1ufvr2",
+            "s8myyrk",
+            "tail",
+            // glued into a larger word: the substring half
+            "s4k2p9x",
+            "-active",
+            "sé0ü1",
+            "ü1",
+            "s9zzzz9",
+            "e",
+            // straddling two results or a word gap: never named
+            "s8myyrkcard",
+            "s1ufvr2 s8myyrk card",
+            "9\u{1}c",
+            // absent, at every length the text holds
+            "s0000000",
+            "zz",
+            "q",
+            "a-token-longer-than-every-result-concatenated-together-twice-over-and-more-still",
+            // repeated
+            "s4k2p9x",
+            "s0000000",
+        ];
+        let named = liveness.named_among(tokens.iter().copied());
+        for token in tokens {
+            assert_eq!(
+                named.contains(token),
+                named_one_at_a_time(&liveness, token),
+                "`{token}` named by the batch and by the per-token search disagree"
+            );
+        }
+        assert!(named.contains("s4k2p9x") && named.contains("s9zzzz9") && named.contains("ü1"));
+        assert!(!named.contains("s0000000") && !named.contains("9\u{1}c"));
+    }
+
+    #[test]
+    fn a_token_at_the_texts_very_start_and_end_is_found() {
+        let liveness = liveness_of(&["abcdef"]);
+        let named = liveness.named_among(["abc", "def\u{1}", "f\u{1}", "abcdef\u{1}", "abcdeg"]);
+        assert!(named.contains("abc") && named.contains("def\u{1}") && named.contains("f\u{1}"));
+        assert!(named.contains("abcdef\u{1}") && !named.contains("abcdeg"));
+        let empty = Liveness::default();
+        assert!(empty.named_among(["a", "abc"]).is_empty());
     }
 }
