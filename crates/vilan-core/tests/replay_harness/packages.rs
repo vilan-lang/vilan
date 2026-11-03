@@ -1609,7 +1609,7 @@ pub const RETAIN_FIXTURES: &[Fixture] = &[Fixture {
             seed: None,
             replacements: &[(
                 "\ttwice(|| *v)\n}",
-                "\tlet held = pass(|| *v);\n\tlet padding = \"a statement longer than the callee it pushes down, so a served row left at its old offset names another body\";\n\tpadding.len() as i32\n}",
+                "\tlet held = pass(|| *v);\n\tlet padding = \"a statement longer than the callee it pushes down, so a served row left at its old offset names another body\";\n\tpadding.len().as_i32()\n}",
             )],
         },
         Edit {
