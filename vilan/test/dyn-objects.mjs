@@ -61,13 +61,15 @@ function __dbg_members(open, items, show, fill) {
 	}
 	return __dbg_group(open, "}", true, entries, fill);
 }
-function __dbg_map(open, keys, values, showKey, showValue) {
-	const stored = Array.from(values.values());
-	const items = Array.from(keys.values(), (key, index) => [ key, stored[index] ]);
+function __dbg_map(open, table, showKey, showValue) {
+	const items = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) items.push([ entry[0], entry[1][1] ]);
 	return __dbg_members(open, items, (entry) => [ __dbg_flat(showKey(entry[0])) + " => ", showValue(entry[1]) ]);
 }
 function __dbg_set(open, table, show, fill) {
-	return __dbg_members(open, Array.from(table.values()), (item) => [ "", show(item) ], fill);
+	const items = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) items.push(entry[0]);
+	return __dbg_members(open, items, (item) => [ "", show(item) ], fill);
 }
 function __dbg_str(text) {
 	let out = "\"";

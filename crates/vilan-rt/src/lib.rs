@@ -1442,10 +1442,10 @@ impl<T: Json + Clone> Json for Lazy<T> {
 /// equivalence for every key type in S1a's scope.
 ///
 /// A slot is `(key, Option<value>)`: the TOMBSTONE a removal leaves sits on
-/// the value (B689, hash-map-lend.md §2), so a present entry's value is a real
-/// `Option<V>` in memory and [`Map::lend`] hands it out as `&Option<V>` without
-/// copying it. An emptied slot's key stays until [`Map::compact`] drops it; the
-/// index never names one.
+/// the value (B689, hash-map-lend.md §2). An emptied slot's key stays until
+/// [`Map::compact`] drops it; the index never names one. This is std's
+/// one-parameter `HashTable<V>` (a `Map<Hash, V>`); `HashMap`/`HashSet` are
+/// over [`NativeMap`], which keeps the original key beside the slot (M191).
 pub struct Map<K, V> {
     index: HashMap<K, usize>,
     entries: Vec<(K, Option<V>)>,
@@ -1486,44 +1486,6 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
             .and_then(|slot| self.entries[*slot].1.as_ref())
     }
 
-    /// `read` called once with the slot under `key` — `&Some(value)` IN PLACE
-    /// while the key is held, `&None` otherwise — answering what `read`
-    /// answers. Nothing is cloned (`NativeMap::lend`, hash-map-lend.md §3.1).
-    pub fn lend<U>(&self, key: &K, read: impl FnOnce(&Option<V>) -> U) -> U {
-        match self.index.get(key) {
-            Some(slot) => read(&self.entries[*slot].1),
-            None => read(&None),
-        }
-    }
-
-    /// `write` called once with a WRITABLE slot under `key`, and the table
-    /// made to reflect it afterwards: a slot left `None` is removed (the key
-    /// gone from `contains_key`, `len` and every walk, compacting as
-    /// [`Map::remove`] does), a slot made `Some` under an absent key is
-    /// inserted LAST, and a present key keeps its place whatever was written.
-    /// Nothing is cloned (`NativeMap::lend_mut`).
-    pub fn lend_mut<U>(&mut self, key: K, write: impl FnOnce(&mut Option<V>) -> U) -> U {
-        match self.index.get(&key).copied() {
-            Some(slot) => {
-                let answer = write(&mut self.entries[slot].1);
-                if self.entries[slot].1.is_none() {
-                    self.index.remove(&key);
-                    self.live -= 1;
-                    self.compact_if_sparse();
-                }
-                answer
-            }
-            None => {
-                let mut fresh = None;
-                let answer = write(&mut fresh);
-                if let Some(value) = fresh {
-                    self.insert(key, value);
-                }
-                answer
-            }
-        }
-    }
-
     pub fn contains_key(&self, key: &K) -> bool {
         self.index.contains_key(key)
     }
@@ -1537,8 +1499,7 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
         }
     }
 
-    /// M91's rule, shared by [`Map::remove`] and [`Map::lend_mut`]'s removal:
-    /// compact once the tombstones outnumber the live entries.
+    /// M91's rule: compact once the tombstones outnumber the live entries.
     fn compact_if_sparse(&mut self) {
         if self.entries.len() - self.live > self.live {
             self.compact();
@@ -1662,6 +1623,296 @@ impl<T: std::hash::Hash + Eq + Clone> Clone for Set<T> {
         Set {
             entries: self.entries.clone(),
         }
+    }
+}
+
+/// `NativeMap<K, V>` — std's `std::js::native_map` table, the ONE table under
+/// `HashMap<K, V>` and `HashSet<T>` (M191, hash-map-lend.md §10): keyed by the
+/// canonical [`Hash`] the vilan side computes (`key.hash()`), and storing the
+/// ORIGINAL key beside an `Option<V>` slot, INSERTION-ordered as a JS `Map` is.
+///
+/// The slot is a real `Option<V>` in memory, so [`NativeMap::lend`] reads it
+/// in place and [`NativeMap::slot`] hands it out as a `&mut Option<V>` — the
+/// view `HashMap::slot` answers. A slot holding `None` is a TOMBSTONE: no
+/// lookup, count or walk sees it. Only `slot` can leave one (a view written
+/// `None`, or a miss never filled), and the table cannot see the view end, so
+/// the slot last lent is PENDING and every write ([`NativeMap::insert`],
+/// [`NativeMap::remove`], [`NativeMap::slot`]) settles it first: still `None`,
+/// its key is deleted (written again, it goes last); `Some`, it stays put. A
+/// table therefore holds at most one tombstone that the index still names.
+///
+/// `live` counts the `Some` slots OTHER than the pending one, whose state is
+/// read when asked ([`NativeMap::len`]), so a count is O(1) with no write.
+pub struct NativeMap<K, V> {
+    index: HashMap<Hash, usize>,
+    entries: Vec<(Hash, K, Option<V>)>,
+    live: usize,
+    pending: Option<usize>,
+}
+
+impl<K, V> Default for NativeMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V> NativeMap<K, V> {
+    pub fn new() -> Self {
+        NativeMap {
+            index: HashMap::new(),
+            entries: Vec::new(),
+            live: 0,
+            pending: None,
+        }
+    }
+
+    /// The pending slot made final: a `Some` joins `live`, a `None` loses its
+    /// key (the index forgets it and M91's rule may compact).
+    fn settle(&mut self) {
+        let Some(slot) = self.pending.take() else {
+            return;
+        };
+        if self.entries[slot].2.is_some() {
+            self.live += 1;
+        } else {
+            self.index.remove(&self.entries[slot].0);
+            self.compact_if_sparse();
+        }
+    }
+
+    /// Stores `value` under `hash`, keeping `key` beside it. A present key
+    /// keeps its ORIGINAL position (first-insertion order, a JS `Map`'s); its
+    /// stored key is replaced with the one given, which hashes the same.
+    pub fn insert(&mut self, hash: Hash, key: K, value: V) {
+        self.settle();
+        match self.index.get(&hash) {
+            Some(slot) => {
+                let entry = &mut self.entries[*slot];
+                entry.1 = key;
+                entry.2 = Some(value);
+            }
+            None => {
+                self.index.insert(hash.clone(), self.entries.len());
+                self.entries.push((hash, key, Some(value)));
+                self.live += 1;
+            }
+        }
+    }
+
+    pub fn get(&self, hash: &Hash) -> Option<&V> {
+        self.index
+            .get(hash)
+            .and_then(|slot| self.entries[*slot].2.as_ref())
+    }
+
+    /// The key held under `hash`, when its slot is `Some`.
+    pub fn key(&self, hash: &Hash) -> Option<&K> {
+        self.index.get(hash).and_then(|slot| {
+            let (_, key, value) = &self.entries[*slot];
+            value.as_ref().map(|_| key)
+        })
+    }
+
+    /// `read` called once with the slot under `hash` — `&Some(value)` IN
+    /// PLACE while the key is held, `&None` otherwise — answering what `read`
+    /// answers. Nothing is cloned (`NativeMap::lend`).
+    pub fn lend<U>(&self, hash: &Hash, read: impl FnOnce(&Option<V>) -> U) -> U {
+        match self.index.get(hash) {
+            Some(slot) => read(&self.entries[*slot].2),
+            None => read(&None),
+        }
+    }
+
+    /// The slot under `hash`, writable in place: a present key's own slot
+    /// (its position kept), or a fresh `None` slot appended LAST under `key`
+    /// for an absent one. The slot is pending until the next write settles it.
+    pub fn slot(&mut self, hash: Hash, key: K) -> &mut Option<V> {
+        self.settle();
+        let slot = match self.index.get(&hash) {
+            Some(slot) => {
+                if self.entries[*slot].2.is_some() {
+                    self.live -= 1;
+                }
+                *slot
+            }
+            None => {
+                let slot = self.entries.len();
+                self.index.insert(hash.clone(), slot);
+                self.entries.push((hash, key, None));
+                slot
+            }
+        };
+        self.pending = Some(slot);
+        &mut self.entries[slot].2
+    }
+
+    pub fn contains_key(&self, hash: &Hash) -> bool {
+        self.get(hash).is_some()
+    }
+
+    pub fn remove(&mut self, hash: &Hash) {
+        self.settle();
+        if let Some(slot) = self.index.remove(hash)
+            && self.entries[slot].2.take().is_some()
+        {
+            self.live -= 1;
+            self.compact_if_sparse();
+        }
+    }
+
+    /// M91's rule: compact once the dead slots outnumber the live entries.
+    /// Only ever reached with nothing pending (both callers settle first).
+    fn compact_if_sparse(&mut self) {
+        if self.entries.len() - self.live > self.live {
+            self.compact();
+        }
+    }
+
+    /// Drops the dead slots, keeping the live ones in INSERTION order (the
+    /// walk's order is the contract) and pointing the index at their new
+    /// places; the storage is released down to twice what is live. [`Map`]'s
+    /// compaction, over the hash each entry carries.
+    fn compact(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        let mut kept = Vec::with_capacity(self.live);
+        for entry in entries {
+            if entry.2.is_none() {
+                continue;
+            }
+            if let Some(slot) = self.index.get_mut(&entry.0) {
+                *slot = kept.len();
+            }
+            kept.push(entry);
+        }
+        self.entries = kept;
+        let floor = self.live.max(8) * 2;
+        self.index.shrink_to(floor);
+    }
+
+    pub fn len(&self) -> usize {
+        self.live
+            + self
+                .pending
+                .is_some_and(|slot| self.entries[slot].2.is_some()) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The held entries in insertion order, tombstones skipped.
+    pub fn iter(&self) -> impl Iterator<Item = (&Hash, &K, &V)> {
+        self.entries
+            .iter()
+            .filter_map(|(hash, key, slot)| slot.as_ref().map(|value| (hash, key, value)))
+    }
+
+    pub fn hashes(&self) -> Vec<Hash> {
+        self.iter().map(|(hash, _, _)| hash.clone()).collect()
+    }
+
+    pub fn keys(&self) -> Vec<K>
+    where
+        K: Clone,
+    {
+        self.iter().map(|(_, key, _)| key.clone()).collect()
+    }
+
+    pub fn values(&self) -> Vec<V>
+    where
+        V: Clone,
+    {
+        self.iter().map(|(_, _, value)| value.clone()).collect()
+    }
+
+    pub fn entries(&self) -> Vec<(K, V)>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.iter()
+            .map(|(_, key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+}
+
+/// A copy carries the pending mark with the slot it names (§10 rule 4).
+impl<K: Clone, V: Clone> Clone for NativeMap<K, V> {
+    fn clone(&self) -> Self {
+        NativeMap {
+            index: self.index.clone(),
+            entries: self.entries.clone(),
+            live: self.live,
+            pending: self.pending,
+        }
+    }
+}
+
+/// Entry-wise in insertion order, and as unreachable from a vilan program as
+/// [`Map`]'s (`PartialEq for Map` below says why): std's own `HashMap` /
+/// `HashSet` equality is the order-insensitive one every `==` reaches.
+impl<K: PartialEq, V: PartialEq> PartialEq for NativeMap<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+/// F136: a map of closures — a handler table, `HashMap<str, |i32| i32>` —
+/// compares as std's `HashMap` equality does (I9: the same keys, ORDER-
+/// INSENSITIVE), each value by reference; keys meet by their canonical hash.
+impl<K, V: ReferenceEq> ReferenceEq for NativeMap<K, V> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self.iter().all(|(hash, _, value)| {
+                other
+                    .get(hash)
+                    .is_some_and(|theirs| value.reference_eq(theirs))
+            })
+    }
+}
+
+/// Node prints the JS layout — a `Map` from each hash to its `[ key, slot ]`
+/// entry, the slot an `Option` array: `Map(1) { 'a' => [ 'a', [ 0, 1 ] ] }`.
+/// The pending slot prints as it stands (a JS `Map` holds it until it is
+/// settled), so this walks every indexed entry, not [`NativeMap::iter`].
+impl<K: Js, V: Js> Js for NativeMap<K, V> {
+    fn js(&self) -> String {
+        let indexed: Vec<&(Hash, K, Option<V>)> = self
+            .entries
+            .iter()
+            .filter(|(hash, _, _)| self.index.contains_key(hash))
+            .collect();
+        let rendered: Vec<NativeMapEntry<'_, K, V>> = indexed
+            .iter()
+            .map(|(_, key, slot)| NativeMapEntry { key, slot })
+            .collect();
+        inspect::map(
+            indexed
+                .iter()
+                .zip(rendered.iter())
+                .map(|((hash, _, _), entry)| (hash as &dyn Js, entry as &dyn Js))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    }
+}
+
+/// One `[ key, slot ]` entry as node prints it inside a `Map`.
+struct NativeMapEntry<'a, K, V> {
+    key: &'a K,
+    slot: &'a Option<V>,
+}
+
+impl<K: Js, V: Js> Js for NativeMapEntry<'_, K, V> {
+    fn js(&self) -> String {
+        js_items(&[self.key as &dyn Js, self.slot as &dyn Js])
+    }
+}
+
+/// `JSON.stringify` of a JS `Map` is `"{}"`, whatever it holds.
+impl<K, V> Json for NativeMap<K, V> {
+    fn json(&self) -> String {
+        "{}".to_string()
     }
 }
 
@@ -2711,94 +2962,119 @@ mod tests {
         assert!(set.entries.entries.len() <= 3);
     }
 
-    /// B689: `lend` reads the stored `Option<V>` IN PLACE — the very slot,
+    fn h(key: i32) -> Hash {
+        canonical_hash(&key)
+    }
+
+    /// M191: `lend` reads the stored `Option<V>` IN PLACE — the very slot,
     /// not a copy — and `&None` for an absent key, calling its reader once.
     #[test]
     fn lend_reads_the_stored_slot_in_place_and_none_when_absent() {
-        let mut map: Map<i32, Vec<i32>> = Map::new();
-        map.insert(1, vec![1, 2, 3]);
-        let stored = map.get(&1).map(|list| list.as_ptr());
-        let lent = map.lend(&1, |slot| slot.as_ref().map(|list| list.as_ptr()));
+        let mut map: NativeMap<i32, Vec<i32>> = NativeMap::new();
+        map.insert(h(1), 1, vec![1, 2, 3]);
+        let stored = map.get(&h(1)).map(|list| list.as_ptr());
+        let lent = map.lend(&h(1), |slot| slot.as_ref().map(|list| list.as_ptr()));
         assert_eq!(lent, stored, "the reader sees the stored list itself");
         let mut calls = 0;
-        let absent = map.lend(&2, |slot| {
+        let absent = map.lend(&h(2), |slot| {
             calls += 1;
             slot.is_none()
         });
         assert!(absent);
         assert_eq!(calls, 1);
-        map.remove(&1);
+        map.remove(&h(1));
         assert!(
-            map.lend(&1, |slot| slot.is_none()),
+            map.lend(&h(1), |slot| slot.is_none()),
             "a removed key reads None"
         );
     }
 
-    /// B689 / M182: `lend_mut` — a write lands in place and the key keeps its
-    /// position; a slot left `None` removes the key (len, contains_key and
-    /// the walk all agree); a slot made `Some` under an absent key goes LAST;
-    /// a `None` left under an absent key inserts nothing.
+    /// M191 (hash-map-lend.md §10): `slot` — a write lands in place and a
+    /// present key keeps its position; a slot left `None` is a tombstone that
+    /// `len`, `contains_key`, `get` and every walk skip at once, and the next
+    /// write deletes its key; a slot under an absent key goes LAST; a `None`
+    /// left under an absent key inserts nothing.
     #[test]
-    fn lend_mut_writes_in_place_inserts_last_and_removes_on_none() {
-        let mut map: Map<i32, Vec<i32>> = Map::new();
-        map.insert(1, vec![10]);
-        map.insert(2, vec![20]);
-        map.insert(3, vec![30]);
-        let answer = map.lend_mut(1, |slot| {
-            if let Some(list) = slot {
-                list.push(11);
-            }
-            "written"
-        });
-        assert_eq!(answer, "written");
+    fn slot_writes_in_place_and_a_none_is_a_tombstone_until_the_next_write() {
+        let mut map: NativeMap<i32, Vec<i32>> = NativeMap::new();
+        map.insert(h(1), 1, vec![10]);
+        map.insert(h(2), 2, vec![20]);
+        map.insert(h(3), 3, vec![30]);
+        if let Some(list) = map.slot(h(1), 1) {
+            list.push(11);
+        }
         assert_eq!(map.keys(), vec![1, 2, 3], "a present key keeps its place");
-        assert_eq!(map.get(&1), Some(&vec![10, 11]));
+        assert_eq!(map.get(&h(1)), Some(&vec![10, 11]));
+        assert_eq!(map.len(), 3);
 
-        map.lend_mut(2, |slot| *slot = None);
-        assert_eq!(map.len(), 2);
-        assert!(!map.contains_key(&2));
+        *map.slot(h(2), 2) = None;
+        assert_eq!(map.len(), 2, "the tombstone is not counted");
+        assert!(!map.contains_key(&h(2)));
+        assert_eq!(map.get(&h(2)), None);
         assert_eq!(map.keys(), vec![1, 3]);
         assert_eq!(map.values(), vec![vec![10, 11], vec![30]]);
+        assert_eq!(map.hashes(), vec![h(1), h(3)]);
 
-        map.lend_mut(4, |slot| {
-            assert!(slot.is_none(), "an absent key lends None");
-            *slot = Some(vec![40]);
-        });
-        map.lend_mut(2, |slot| *slot = Some(vec![22]));
-        assert_eq!(map.keys(), vec![1, 3, 4, 2], "new keys go last");
+        let fresh = map.slot(h(4), 4);
+        assert!(fresh.is_none(), "an absent key lends None");
+        *fresh = Some(vec![40]);
+        *map.slot(h(2), 2) = Some(vec![22]);
+        assert_eq!(map.keys(), vec![1, 3, 4, 2], "new and re-made keys go last");
         assert_eq!(map.len(), 4);
 
-        map.lend_mut(9, |_| {});
+        let _ = map.slot(h(9), 9);
         assert!(
-            !map.contains_key(&9),
+            !map.contains_key(&h(9)),
             "a None under an absent key is no insert"
         );
         assert_eq!(map.len(), 4);
+        map.insert(h(5), 5, vec![50]);
+        assert_eq!(map.keys(), vec![1, 3, 4, 2, 5], "settled: 9 is gone");
 
-        map.lend_mut(3, |slot| *slot = Some(vec![33]));
+        *map.slot(h(3), 3) = Some(vec![33]);
         assert_eq!(
-            map.keys(),
-            vec![1, 3, 4, 2],
+            map.entries(),
+            vec![
+                (1, vec![10, 11]),
+                (3, vec![33]),
+                (4, vec![40]),
+                (2, vec![22]),
+                (5, vec![50]),
+            ],
             "a replaced value keeps its key's place"
         );
-        assert_eq!(map.get(&3), Some(&vec![33]));
+
+        // Emptied and refilled through one view: the key never left.
+        let held = map.slot(h(1), 1);
+        let taken = held.take();
+        *held = taken;
+        map.insert(h(6), 6, vec![60]);
+        assert_eq!(map.keys(), vec![1, 3, 4, 2, 5, 6]);
+
+        // Emptied, then written again by `insert`: removed, so it goes last.
+        let _ = map.slot(h(1), 1).take();
+        assert_eq!(map.len(), 5);
+        map.insert(h(1), 1, vec![100]);
+        assert_eq!(map.keys(), vec![3, 4, 2, 5, 6, 1]);
+        assert_eq!(map.len(), 6);
     }
 
-    /// The tombstone on the value: removals through `remove` AND through
-    /// `lend_mut` count against `live` and trip M91's compaction alike, and
-    /// the walk keeps insertion order through it, the index following.
+    /// The tombstone on the value: removals through `remove` AND through a
+    /// slot left `None` count against `live` and trip M91's compaction alike,
+    /// the walk keeps insertion order through it, and the index follows.
     #[test]
-    fn removals_through_lend_mut_compact_like_remove_and_keep_the_order() {
-        let mut map: Map<i32, i32> = Map::new();
+    fn removals_through_a_slot_compact_like_remove_and_keep_the_order() {
+        let mut map: NativeMap<i32, i32> = NativeMap::new();
         for key in 0..10 {
-            map.insert(key, key);
+            map.insert(h(key), key, key);
         }
         for key in [0, 2, 4] {
-            map.remove(&key);
+            map.remove(&h(key));
         }
         for key in [6, 8] {
-            map.lend_mut(key, |slot| *slot = None);
+            *map.slot(h(key), key) = None;
         }
+        map.remove(&h(99));
         assert_eq!(map.len(), 5);
         assert_eq!(map.live, 5);
         assert!(
@@ -2809,15 +3085,40 @@ mod tests {
         );
         assert_eq!(map.keys(), vec![1, 3, 5, 7, 9]);
         for key in [1, 3, 5, 7, 9] {
-            assert_eq!(map.lend(&key, |slot| *slot), Some(key), "index follows");
+            assert_eq!(map.lend(&h(key), |slot| *slot), Some(key), "index follows");
         }
-        map.lend_mut(1, |slot| *slot = None);
-        map.insert(1, 100);
+        let copy = {
+            *map.slot(h(1), 1) = None;
+            map.clone()
+        };
+        assert_eq!(copy.len(), 4, "a copy carries the pending tombstone");
+        map.insert(h(1), 1, 100);
         assert_eq!(
             map.keys(),
             vec![3, 5, 7, 9, 1],
             "a key removed and re-made goes last"
         );
+        let mut churned: NativeMap<i32, i32> = NativeMap::new();
+        for key in 0..100_000 {
+            *churned.slot(h(key), key) = Some(key);
+            *churned.slot(h(key), key) = None;
+            assert!(
+                churned.entries.len() <= 2 * churned.len() + 2,
+                "{} slots for {} live after emptying {key}",
+                churned.entries.len(),
+                churned.len()
+            );
+        }
+        assert!(churned.is_empty());
+    }
+
+    /// Node's rendering of the JS layout: each hash to its `[ key, slot ]`.
+    #[test]
+    fn a_native_map_prints_its_js_layout() {
+        let mut map: NativeMap<Str, i32> = NativeMap::new();
+        assert_eq!(map.js(), "Map(0) {}");
+        map.insert(canonical_hash(&str_new("a")), str_new("a"), 1);
+        assert_eq!(map.js(), "Map(1) { 'a' => [ 'a', [ 0, 1 ] ] }");
     }
 
     #[test]

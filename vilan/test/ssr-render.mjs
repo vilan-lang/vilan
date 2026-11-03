@@ -4,6 +4,21 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __guarded(body) {
+	try {
+		body();
+		return [ 1 ];
+	} catch (error) {
+		return [ 0, error && error.message ? error.message : String(error) ];
+	}
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
+}
 let __shared_identity_next = 1;
 function __shared_identity(cell) {
 	return cell.__id ??= __shared_identity_next++;
@@ -16,6 +31,62 @@ function reissued(subscriber) {
 }
 function new2() {
 	return [ __shared_new([ 0, no_cleanups, false, [ 1 ] ]), 0 ];
+}
+function is_disposed(self) {
+	return self[0].v[0] !== self[1];
+}
+function dispose(self) {
+	advance(self, [ 1 ]);
+}
+function advance(self, carried) {
+	let $n = null;
+	if (!(is_disposed(self))) {
+		const held = self[0].v;
+		self[0].v = [ self[1] + 1, no_cleanups, false, carried ];
+		const $e = held[3];
+		let $f = null;
+		if ($e[0] === 0) {
+			const nursery = $e[1];
+			if (is_none(carried)) {
+				nursery.cancel();
+			}
+			$f = undefined;
+		} else {
+			$f = undefined;
+		}
+		$f;
+		let $m = null;
+		if (held[2]) {
+			let failure = [ 1 ];
+			for (const cleanup of held[1].v) {
+				const $h = __guarded(cleanup);
+				let $i = null;
+				if ($h[0] === 0) {
+					const message = $h[1];
+					if (is_none(failure)) {
+						failure = [ 0, message ];
+					}
+					$i = undefined;
+				} else {
+					$i = undefined;
+				}
+				$i;
+			}
+			const $k = failure;
+			let $l = null;
+			if ($k[0] === 0) {
+				const message2 = $k[1];
+				$l = (() => {
+					throw __panic(message2, "std/src/reactive.vl:1294:27");
+				})();
+			} else {
+				$l = undefined;
+			}
+			$m = $l;
+		}
+		$n = $m;
+	}
+	return $n;
 }
 function view(tag) {
 	const attributes = __shared_new([  ]);
@@ -63,38 +134,38 @@ function apply(self, parent, name2) {
 	set_attribute(parent[1], name2, self);
 }
 function is_void_element(tag) {
-	const $i = tag;
-	let $j = null;
-	if ($i === "area") {
-		$j = true;
-	} else if ($i === "base") {
-		$j = true;
-	} else if ($i === "br") {
-		$j = true;
-	} else if ($i === "col") {
-		$j = true;
-	} else if ($i === "embed") {
-		$j = true;
-	} else if ($i === "hr") {
-		$j = true;
-	} else if ($i === "img") {
-		$j = true;
-	} else if ($i === "input") {
-		$j = true;
-	} else if ($i === "link") {
-		$j = true;
-	} else if ($i === "meta") {
-		$j = true;
-	} else if ($i === "source") {
-		$j = true;
-	} else if ($i === "track") {
-		$j = true;
-	} else if ($i === "wbr") {
-		$j = true;
+	const $s = tag;
+	let $t = null;
+	if ($s === "area") {
+		$t = true;
+	} else if ($s === "base") {
+		$t = true;
+	} else if ($s === "br") {
+		$t = true;
+	} else if ($s === "col") {
+		$t = true;
+	} else if ($s === "embed") {
+		$t = true;
+	} else if ($s === "hr") {
+		$t = true;
+	} else if ($s === "img") {
+		$t = true;
+	} else if ($s === "input") {
+		$t = true;
+	} else if ($s === "link") {
+		$t = true;
+	} else if ($s === "meta") {
+		$t = true;
+	} else if ($s === "source") {
+		$t = true;
+	} else if ($s === "track") {
+		$t = true;
+	} else if ($s === "wbr") {
+		$t = true;
 	} else {
-		$j = false;
+		$t = false;
 	}
-	return $j;
+	return $t;
 }
 function escape_text(value) {
 	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -116,18 +187,18 @@ function render(view2) {
 	}
 	out = out + escape_text(view2[3].v);
 	for (const child7 of view2[2].v) {
-		const $k = child7;
-		let $l = null;
-		if ($k[0] === 0) {
-			const element = $k[1];
+		const $u = child7;
+		let $v = null;
+		if ($u[0] === 0) {
+			const element = $u[1];
 			out = out + render(element);
-			$l = undefined;
+			$v = undefined;
 		} else {
-			const content = $k[1];
+			const content = $u[1];
 			out = out + escape_text(content);
-			$l = undefined;
+			$v = undefined;
 		}
-		$l;
+		$v;
 	}
 	return out + "</" + view2[0] + ">";
 }
@@ -138,15 +209,15 @@ function app(title2, todos2, page2) {
 	}, (todo, $a) => {
 		return text(view("li"), todo);
 	}));
-	const nav = child2(view("nav"), swap(__clone(page2), (current, $e) => {
-		const $f = current;
-		let $g = null;
-		if ($f[0] === 0) {
-			$g = text(attr(view("a"), "href", "/"), "Home");
+	const nav = child2(view("nav"), swap(__clone(page2), (current, $o) => {
+		const $p = current;
+		let $q = null;
+		if ($p[0] === 0) {
+			$q = text(attr(view("a"), "href", "/"), "Home");
 		} else {
-			$g = text(attr(view("a"), "href", "/about"), "About & friends");
+			$q = text(attr(view("a"), "href", "/about"), "About & friends");
 		}
-		return $g;
+		return $q;
 	}));
 	return child3(child3(child3(attr(view("main"), "id", "app"), heading), list), nav);
 }
@@ -251,6 +322,10 @@ function open_row(self, content) {
 function run_with_owner(owner, body) {
 	return body(owner);
 }
+function is_none(self) {
+	const $g = self;
+	return $g[0] === 1;
+}
 function place_each(parent, source, key, render2) {
 	const region = open(parent);
 	const items = read_rows(source);
@@ -259,6 +334,7 @@ function place_each(parent, source, key, render2) {
 		run_with_owner(owner, ($d) => {
 			return open_row(region, render2(item, $d));
 		});
+		dispose(owner);
 	}
 }
 function place4(self, parent) {
@@ -294,9 +370,10 @@ function place_swap(parent, source, render2) {
 	const region = open(parent);
 	const value = read_once2(source);
 	const owner = new2();
-	run_with_owner(owner, ($h) => {
-		return open_row(region, render2(value, $h));
+	run_with_owner(owner, ($r) => {
+		return open_row(region, render2(value, $r));
 	});
+	dispose(owner);
 }
 function place5(self, parent) {
 	place_swap(parent, __clone(self[0]), self[1]);

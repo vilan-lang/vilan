@@ -641,6 +641,9 @@ export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
 			let region = Region::open(parent);
 			let owner = Owner::new();
 			let _row = run_with_owner(owner, || region.open_row((self.body)()));
+			// B694: a server render is the body's whole life — release what it
+			// registered (a subscription, an `on_cleanup`, a store keeper) now.
+			owner.dispose();
 		}
 	}
 }
@@ -679,13 +682,16 @@ fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 	let value = read_once(source);
 	let owner = Owner::new();
 	let _row = run_with_owner(owner, || region.open_row(render(value)));
+	owner.dispose();
 }
 
 /// `each`'s body, server side — one child per element of the CURRENT list,
 /// in order, no reconciliation. Each row runs under a fresh throwaway `Owner`:
 /// `run_with_owner` establishes the `owner_scope` the injected `render` closure
 /// declares, so this is self-contained — the caller need not establish any
-/// boundary. Nothing a row registers survives, so the owner is discarded.
+/// boundary. The render is the row's whole life, so the owner is DISPOSED once
+/// the row is placed (B694): whatever the row registered — a subscription, an
+/// `on_cleanup`, a store keeper — is released then, not kept for the process.
 /// (`List<T>` is annotated so `get`'s element type resolves — the
 /// two-parameter-generic inference trap.)
 ///
@@ -703,6 +709,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	for item in items {
 		let owner = Owner::new();
 		let _row = run_with_owner(owner, || region.open_row(render(item)));
+		owner.dispose();
 	}
 }
 
@@ -738,6 +745,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 		let cell: SignalCell<T> = SignalCell::new(item);
 		let owner = Owner::new();
 		let _row = run_with_owner(owner, || region.open_row(render(cell)));
+		owner.dispose();
 	}
 }
 
@@ -955,6 +963,7 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 			let cell: SignalCell<T> = SignalCell::new(payload);
 			let owner = Owner::new();
 			let _row = run_with_owner(owner, || region.open_row(render(cell)));
+			owner.dispose();
 		},
 		None => {},
 	}

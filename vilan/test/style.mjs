@@ -11,11 +11,39 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_keys(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);
+	return out.map(__clone);
+}
+function __nmap_remove(table, hash) {
+	__nmap_settle(table);
+	table[0].delete(hash);
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
+}
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function __panic(message, location) {
 	const error = new Error(message);
@@ -31,10 +59,10 @@ function slot_of(key) {
 	const parts = key.split(":");
 	if (parts.length !== 3) {
 		(() => {
-			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:1243:3");
+			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:1305:3");
 		})();
 	}
-	return [ __at(parts, 0, "std/src/web/style.vl:1245:17"), __at(parts, 1, "std/src/web/style.vl:1245:39"), __at(parts, 2, "std/src/web/style.vl:1245:60") ];
+	return [ __at(parts, 0, "std/src/web/style.vl:1307:17"), __at(parts, 1, "std/src/web/style.vl:1307:39"), __at(parts, 2, "std/src/web/style.vl:1307:60") ];
 }
 function family_longhands(property) {
 	const $d = property;
@@ -113,58 +141,54 @@ function add(self, b) {
 	return [ rules ];
 }
 function values(self) {
-	return __map_values(self[1]);
+	return __nmap_values(self[0]);
 }
 function keys(self) {
-	return __map_values(self[0]);
+	return __nmap_keys(self[0]);
 }
 function get(self, key) {
-	return __map_get(self[1], hash(key));
+	return __nmap_get(self[0], hash(key));
 }
 function remove(self, key) {
-	const hash2 = hash(key);
-	self[0].delete(hash2);
-	self[1].delete(hash2);
+	__nmap_remove(self[0], hash(key));
 }
 function insert(self, key, value) {
-	const hash2 = hash(key);
-	self[0].set(hash2, __clone(key));
-	self[1].set(hash2, __clone(value));
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
-const card = [ [ new Map([ [ "::display", "::display" ], [ "::padding", "::padding" ], [ "::background-color", "::background-color" ], [ ":hover:background-color", ":hover:background-color" ] ]), new Map([ [ "::display", [ "sbiovxm", "display:flex" ] ], [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ], [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
-const active = [ [ new Map([ [ "::padding", "::padding" ] ]), new Map([ [ "::padding", [ "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
+const card = [ [ [ new Map([ [ "::display", [ "::display", [ 0, [ "sbiovxm", "display:flex" ] ] ] ], [ "::padding", [ "::padding", [ 0, [ "s1ufvr2", "padding:var(--space-4)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "siolu0w", "background-color:var(--gray-50)" ] ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ 0, [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ] ]), undefined ] ] ];
+const active = [ [ [ new Map([ [ "::padding", [ "::padding", [ 0, [ "s1ufvsw", "padding:var(--space-6)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(card));
 console.log(class_list(add(card, active)));
-const wide = [ [ new Map([ [ "::width", "::width" ] ]), new Map([ [ "::width", [ "s178hckh", "width:37px" ] ] ]) ] ];
+const wide = [ [ [ new Map([ [ "::width", [ "::width", [ 0, [ "s178hckh", "width:37px" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(wide));
-const responsive = [ [ new Map([ [ "640px::padding", "640px::padding" ], [ "1024px::padding", "1024px::padding" ] ]), new Map([ [ "640px::padding", [ "sl8ru5a", "padding:var(--space-2)" ] ], [ "1024px::padding", [ "s4x9b8s", "padding:var(--space-3)" ] ] ]) ] ];
+const responsive = [ [ [ new Map([ [ "640px::padding", [ "640px::padding", [ 0, [ "sl8ru5a", "padding:var(--space-2)" ] ] ] ], [ "1024px::padding", [ "1024px::padding", [ 0, [ "s4x9b8s", "padding:var(--space-3)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(responsive));
 const dark = [ [ "^[data-theme=\"dark\"]" ] ];
-const themed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] hover:background-color", "768px:^[data-theme=\"dark\"] hover:background-color" ], [ ":^[data-theme=\"dark\"]:background-color", ":^[data-theme=\"dark\"]:background-color" ], [ ":^[data-theme=\"dark\"] hover:background-color", ":^[data-theme=\"dark\"] hover:background-color" ] ]), new Map([ [ "768px:^[data-theme=\"dark\"] hover:background-color", [ "sayz5ok", "background-color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"]:background-color", [ "s120e6x3", "background-color:var(--gray-900)" ] ], [ ":^[data-theme=\"dark\"] hover:background-color", [ "ss3fj9l", "background-color:var(--gray-700)" ] ] ]) ] ];
+const themed = [ [ [ new Map([ [ "768px:^[data-theme=\"dark\"] hover:background-color", [ "768px:^[data-theme=\"dark\"] hover:background-color", [ 0, [ "sayz5ok", "background-color:var(--gray-50)" ] ] ] ], [ ":^[data-theme=\"dark\"]:background-color", [ ":^[data-theme=\"dark\"]:background-color", [ 0, [ "s120e6x3", "background-color:var(--gray-900)" ] ] ] ], [ ":^[data-theme=\"dark\"] hover:background-color", [ ":^[data-theme=\"dark\"] hover:background-color", [ 0, [ "ss3fj9l", "background-color:var(--gray-700)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(themed));
-const translucent = [ [ new Map([ [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::color", [ "s1kwp696", "color:rgb(from var(--gray-900) r g b / 0.08)" ] ], [ "::background-color", [ "s12ne3o2", "background-color:rgba(27, 6, 13, 0.9)" ] ] ]) ] ];
+const translucent = [ [ [ new Map([ [ "::color", [ "::color", [ 0, [ "s1kwp696", "color:rgb(from var(--gray-900) r g b / 0.08)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "s12ne3o2", "background-color:rgba(27, 6, 13, 0.9)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(translucent));
-const painted = [ [ new Map([ [ "::background-color", "::background-color" ], [ "::background-image", "::background-image" ], [ ":hover:background-image", ":hover:background-image" ] ]), new Map([ [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ], [ "::background-image", [ "s1fek3dv", "background-image:linear-gradient(90deg, var(--blue-600) 0%, transparent 100%)" ] ], [ ":hover:background-image", [ "s1lsiu5q", "background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)" ] ] ]) ] ];
+const painted = [ [ [ new Map([ [ "::background-color", [ "::background-color", [ 0, [ "siolu0w", "background-color:var(--gray-50)" ] ] ] ], [ "::background-image", [ "::background-image", [ 0, [ "s1fek3dv", "background-image:linear-gradient(90deg, var(--blue-600) 0%, transparent 100%)" ] ] ] ], [ ":hover:background-image", [ ":hover:background-image", [ 0, [ "s1lsiu5q", "background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(painted));
-const framed = [ [ new Map([ [ "::display", "::display" ], [ "::padding-top", "::padding-top" ], [ "::margin-left", "::margin-left" ], [ "::border-top", "::border-top" ] ]), new Map([ [ "::display", [ "s2m9jw6", "display:inline-flex" ] ], [ "::padding-top", [ "stbzxoc", "padding-top:var(--space-2)" ] ], [ "::margin-left", [ "s10oplpw", "margin-left:auto" ] ], [ "::border-top", [ "s1sb4lgm", "border-top:1px solid var(--gray-300)" ] ] ]) ] ];
+const framed = [ [ [ new Map([ [ "::display", [ "::display", [ 0, [ "s2m9jw6", "display:inline-flex" ] ] ] ], [ "::padding-top", [ "::padding-top", [ 0, [ "stbzxoc", "padding-top:var(--space-2)" ] ] ] ], [ "::margin-left", [ "::margin-left", [ 0, [ "s10oplpw", "margin-left:auto" ] ] ] ], [ "::border-top", [ "::border-top", [ 0, [ "s1sb4lgm", "border-top:1px solid var(--gray-300)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(framed));
 console.log("s1mnphwb");
-const zeroed = [ [ new Map([ [ "::inset", "::inset" ], [ "::left", "::left" ], [ "::min-width", "::min-width" ], [ "::max-width", "::max-width" ] ]), new Map([ [ "::inset", [ "s1ucbaf9", "inset:0" ] ], [ "::left", [ "s1ypvw5g", "left:clamp(120px, 30%, 185px)" ] ], [ "::min-width", [ "sitgfdt", "min-width:0" ] ], [ "::max-width", [ "s63dg6q", "max-width:calc(100% - 2rem)" ] ] ]) ] ];
+const zeroed = [ [ [ new Map([ [ "::inset", [ "::inset", [ 0, [ "s1ucbaf9", "inset:0" ] ] ] ], [ "::left", [ "::left", [ 0, [ "s1ypvw5g", "left:clamp(120px, 30%, 185px)" ] ] ] ], [ "::min-width", [ "::min-width", [ 0, [ "sitgfdt", "min-width:0" ] ] ] ], [ "::max-width", [ "::max-width", [ 0, [ "s63dg6q", "max-width:calc(100% - 2rem)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(zeroed));
-const accented = [ [ new Map([ [ "::background-color", "::background-color" ], [ "::border-color", "::border-color" ] ]), new Map([ [ "::background-color", [ "sumjtxl", "background-color:var(--accent)" ] ], [ "::border-color", [ "s1rhkqzm", "border-color:rgb(from var(--accent) r g b / 0.5)" ] ] ]) ] ];
+const accented = [ [ [ new Map([ [ "::background-color", [ "::background-color", [ 0, [ "sumjtxl", "background-color:var(--accent)" ] ] ] ], [ "::border-color", [ "::border-color", [ 0, [ "s1rhkqzm", "border-color:rgb(from var(--accent) r g b / 0.5)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(accented));
-const perceptual = [ [ new Map([ [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::color", [ "s1ouskes", "color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)" ] ], [ "::background-color", [ "s1yxmxe6", "background-color:oklch(0.62 0.19 313)" ] ] ]) ] ];
+const perceptual = [ [ [ new Map([ [ "::color", [ "::color", [ 0, [ "s1ouskes", "color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "s1yxmxe6", "background-color:oklch(0.62 0.19 313)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(perceptual));
-const squared = [ [ new Map([ [ "::width", "::width" ], [ "::height", "::height" ] ]), new Map([ [ "::width", [ "s178h6ec", "width:1rem" ] ], [ "::height", [ "s22ylrq", "height:1rem" ] ] ]) ] ];
+const squared = [ [ [ new Map([ [ "::width", [ "::width", [ 0, [ "s178h6ec", "width:1rem" ] ] ] ], [ "::height", [ "::height", [ 0, [ "s22ylrq", "height:1rem" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(squared));
 console.log("s178h6ec s22zdhz");
 const open = [ [ "[data-open=\"true\"]" ] ];
-const disclosed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color" ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color" ], [ ":[data-open=\"true\"]:display", ":[data-open=\"true\"]:display" ], [ ":[data-open=\"true\"] hover:background-color", ":[data-open=\"true\"] hover:background-color" ] ]), new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ "s1dwvy7w", "color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ "s1jqpl5k", "background-color:var(--gray-800)" ] ], [ ":[data-open=\"true\"]:display", [ "s11vlq4c", "display:flex" ] ], [ ":[data-open=\"true\"] hover:background-color", [ "s1j5l6ea", "background-color:var(--gray-100)" ] ] ]) ] ];
+const disclosed = [ [ [ new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ 0, [ "s1dwvy7w", "color:var(--gray-50)" ] ] ] ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ 0, [ "s1jqpl5k", "background-color:var(--gray-800)" ] ] ] ], [ ":[data-open=\"true\"]:display", [ ":[data-open=\"true\"]:display", [ 0, [ "s11vlq4c", "display:flex" ] ] ] ], [ ":[data-open=\"true\"] hover:background-color", [ ":[data-open=\"true\"] hover:background-color", [ 0, [ "s1j5l6ea", "background-color:var(--gray-100)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(disclosed));
-const gated = [ [ new Map([ [ ":!^[data-theme=\"dark\"]:background-color", ":!^[data-theme=\"dark\"]:background-color" ], [ ":^[data-collapsed]:display", ":^[data-collapsed]:display" ], [ ":[data-selected]:color", ":[data-selected]:color" ], [ ":![disabled] hover:background-color", ":![disabled] hover:background-color" ], [ ":!hover:color", ":!hover:color" ] ]), new Map([ [ ":!^[data-theme=\"dark\"]:background-color", [ "s1jayb7s", "background-color:var(--gray-900)" ] ], [ ":^[data-collapsed]:display", [ "s4ss8fz", "display:none" ] ], [ ":[data-selected]:color", [ "st2ig1a", "color:var(--gray-50)" ] ], [ ":![disabled] hover:background-color", [ "s1pk9f1d", "background-color:var(--gray-100)" ] ], [ ":!hover:color", [ "s6t6iu5", "color:var(--gray-700)" ] ] ]) ] ];
+const gated = [ [ [ new Map([ [ ":!^[data-theme=\"dark\"]:background-color", [ ":!^[data-theme=\"dark\"]:background-color", [ 0, [ "s1jayb7s", "background-color:var(--gray-900)" ] ] ] ], [ ":^[data-collapsed]:display", [ ":^[data-collapsed]:display", [ 0, [ "s4ss8fz", "display:none" ] ] ] ], [ ":[data-selected]:color", [ ":[data-selected]:color", [ 0, [ "st2ig1a", "color:var(--gray-50)" ] ] ] ], [ ":![disabled] hover:background-color", [ ":![disabled] hover:background-color", [ 0, [ "s1pk9f1d", "background-color:var(--gray-100)" ] ] ] ], [ ":!hover:color", [ ":!hover:color", [ 0, [ "s6t6iu5", "color:var(--gray-700)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(gated));
-const stacked = [ [ new Map([ [ "768px:>*:gap", "768px:>*:gap" ], [ ":>*:margin-top", ":>*:margin-top" ], [ ":>*+*:margin-top", ":>*+*:margin-top" ] ]), new Map([ [ "768px:>*:gap", [ "svmscer", "gap:var(--space-2)" ] ], [ ":>*:margin-top", [ "sxzag36", "margin-top:var(--space-2)" ] ], [ ":>*+*:margin-top", [ "skr9oll", "margin-top:var(--space-4)" ] ] ]) ] ];
+const stacked = [ [ [ new Map([ [ "768px:>*:gap", [ "768px:>*:gap", [ 0, [ "svmscer", "gap:var(--space-2)" ] ] ] ], [ ":>*:margin-top", [ ":>*:margin-top", [ 0, [ "sxzag36", "margin-top:var(--space-2)" ] ] ] ], [ ":>*+*:margin-top", [ ":>*+*:margin-top", [ 0, [ "skr9oll", "margin-top:var(--space-4)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(stacked));
-const tiled = [ [ new Map([ [ "::line-height", "::line-height" ], [ "::background-image", "::background-image" ], [ "::background-size", "::background-size" ] ]), new Map([ [ "::line-height", [ "snq90yh", "line-height:24px" ] ], [ "::background-image", [ "s5hidsk", "background-image:url(tile.png)" ] ], [ "::background-size", [ "skugn91", "background-size:120px 120px" ] ] ]) ] ];
+const tiled = [ [ [ new Map([ [ "::line-height", [ "::line-height", [ 0, [ "snq90yh", "line-height:24px" ] ] ] ], [ "::background-image", [ "::background-image", [ 0, [ "s5hidsk", "background-image:url(tile.png)" ] ] ] ], [ "::background-size", [ "::background-size", [ 0, [ "skugn91", "background-size:120px 120px" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(tiled));
 //# sourceMappingURL=style.mjs.map

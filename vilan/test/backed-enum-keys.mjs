@@ -7,8 +7,38 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
+}
+function __nmap_has(table, hash) {
+	if (hash !== table[1]) return table[0].has(hash);
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0;
+}
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_len(table) {
+	const hash = table[1];
+	if (hash !== undefined) {
+		const entry = table[0].get(hash);
+		if (entry !== undefined && entry[1][0] === 1) return table[0].size - 1;
+	}
+	return table[0].size;
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
 }
 function hash(self) {
 	return __hash(self);
@@ -20,17 +50,14 @@ function hash3(self) {
 	return __hash(self);
 }
 function new2() {
-	const keys = new Map();
-	const values = new Map();
-	return [ keys, values ];
+	const table = [ new Map(), undefined ];
+	return [ table ];
 }
 function insert(self, key, value) {
-	const hash4 = hash(key);
-	self[0].set(hash4, __clone(key));
-	self[1].set(hash4, __clone(value));
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
 function get(self, key) {
-	return __map_get(self[1], hash(key));
+	return __nmap_get(self[0], hash(key));
 }
 function unwrap_or(self, fallback) {
 	const $a = self;
@@ -44,29 +71,29 @@ function unwrap_or(self, fallback) {
 	return $b;
 }
 function contains_key(self, key) {
-	return self[1].has(hash(key));
+	return __nmap_has(self[0], hash(key));
 }
 function len(self) {
-	return self[1].size;
+	return __nmap_len(self[0]);
 }
 function new3() {
-	const table = new Map();
+	const table = [ new Map(), undefined ];
 	return [ table ];
 }
 function insert2(self, value) {
-	self[0].set(hash2(value), __clone(value));
+	__nmap_insert(self[0], hash2(value), __clone(value), undefined);
 }
 function contains(self, value) {
-	return self[0].has(hash2(value));
+	return __nmap_has(self[0], hash2(value));
 }
 function len2(self) {
-	return self[0].size;
+	return __nmap_len(self[0]);
 }
 function insert3(self, value) {
-	self[0].set(hash3(value), __clone(value));
+	__nmap_insert(self[0], hash3(value), __clone(value), undefined);
 }
 function contains2(self, value) {
-	return self[0].has(hash3(value));
+	return __nmap_has(self[0], hash3(value));
 }
 let widths = new2();
 insert(widths, "flex-start", 1);

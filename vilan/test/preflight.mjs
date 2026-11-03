@@ -4,8 +4,10 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function class_list(self) {
 	let out = "";
@@ -22,8 +24,8 @@ function class_list(self) {
 	return out;
 }
 function values(self) {
-	return __map_values(self[1]);
+	return __nmap_values(self[0]);
 }
-const card = [ [ new Map([ [ "::display", "::display" ] ]), new Map([ [ "::display", [ "sbiovxm", "display:flex" ] ] ]) ] ];
+const card = [ [ [ new Map([ [ "::display", [ "::display", [ 0, [ "sbiovxm", "display:flex" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(card));
 //# sourceMappingURL=preflight.mjs.map

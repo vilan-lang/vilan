@@ -268,7 +268,12 @@ fun main() {
 
 A payload variant's handle also has `live()`, its discriminant as a `StoreFlag`,
 and `assume()`, the payload as a `Store<P>` for code that only runs while the
-variant is live.
+variant is live. `assume()` needs an owner — it stands a keeper on the variant
+that goes with the ambient owner, as an `on_cleanup` does — so a call outside
+every owner is refused at compile time ("context `owner_scope` is read here,
+but this code can be reached without an enclosing `run`"); `when_live` calls it
+inside its body's owner, and code of your own wraps it in `run_with_owner` or
+`comp`.
 
 ### when_live — rebuild only on the variant
 
@@ -300,7 +305,7 @@ A collection field takes its declared shape — no derive to write:
   nobody else. `at(key).set(None)` removes the key, and `.some()` reaches into
   a present value. `insert(key, value)` and `remove(key)` are the same two
   writes. The step lends the map's slot IN PLACE on both backends
-  (`HashMap::peek` / `modify`): a read of one field through
+  (`HashMap::peek` / `slot`): a read of one field through
   `at(key).some().title()` copies only that field, however large the value it
   sits in, and a write through `at(key)` lands where the value is — no copy out
   and back in.

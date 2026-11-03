@@ -48,55 +48,64 @@ fun census<T>(store: Store<T>): str {
 }
 
 fun main() {
-	// The enum's own handle.
-	let presence = Store::new(Presence::Online(Device { name = "laptop" }));
-	let device = presence.online().assume();
-	let _renamed = presence.online().name().patch("phone");
-	presence.set(Presence::Offline);
-	print(i"enum: {device.name().get()}");
+	// Every row runs under an owner, as `when_live`'s body does — `assume()`
+	// needs one (B696).
+	let rows = Owner::new();
+	run_with_owner(rows, || {
+		// The enum's own handle.
+		let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+		let device = presence.online().assume();
+		let _renamed = presence.online().name().patch("phone");
+		presence.set(Presence::Offline);
+		print(i"enum: {device.name().get()}");
 
-	// `Option` -> `None`.
-	let slot: Store<Option<Record>> = Store::new(Some(Record { title = "draft", notes = ["x"] }));
-	let record = slot.some().assume();
-	let _edited = slot.some().title().patch("edited");
-	slot.set(None);
-	print(i"option: {record.title().get()} {record.notes().get().len()}");
+		// `Option` -> `None`.
+		let slot: Store<Option<Record>> = Store::new(Some(Record {
+			title = "draft",
+			notes = ["x"],
+		}));
+		let record = slot.some().assume();
+		let _edited = slot.some().title().patch("edited");
+		slot.set(None);
+		print(i"option: {record.title().get()} {record.notes().get().len()}");
 
-	// A key removed under `at(id).some()`, by `set(None)` and by `remove`.
-	let keyed = Store::new(state("laptop"));
-	let first = keyed.records().at(1).some().assume();
-	let second = keyed.records().at(2).some().assume();
-	let _first = keyed.records().at(1).some().title().patch("first, edited");
-	let _second = keyed.records().at(2).some().title().patch("second, edited");
-	keyed.records().at(1).set(None);
-	keyed.records().remove(2);
-	print(i"key: {first.title().get()} / {second.title().get()} / {keyed.records().len()}");
+		// A key removed under `at(id).some()`, by `set(None)` and by `remove`.
+		let keyed = Store::new(state("laptop"));
+		let first = keyed.records().at(1).some().assume();
+		let second = keyed.records().at(2).some().assume();
+		let _first = keyed.records().at(1).some().title().patch("first, edited");
+		let _second = keyed.records().at(2).some().title().patch("second, edited");
+		keyed.records().at(1).set(None);
+		keyed.records().remove(2);
+		print(i"key: {first.title().get()} / {second.title().get()} / {keyed.records().len()}");
 
-	// A whole-state write that replaces the enum.
-	let whole = Store::new(state("laptop"));
-	let inner = whole.presence().online().assume();
-	let _tablet = whole.presence().online().name().patch("tablet");
-	whole.set(State { presence = Presence::Offline, records = HashMap::new() });
-	print(i"whole: {inner.name().get()}");
+		// A whole-state write that replaces the enum.
+		let whole = Store::new(state("laptop"));
+		let inner = whole.presence().online().assume();
+		let _tablet = whole.presence().online().name().patch("tablet");
+		whole.set(State { presence = Presence::Offline, records = HashMap::new() });
+		print(i"whole: {inner.name().get()}");
 
-	// An outer variant ending above the handle.
-	let outer: Store<Option<State>> = Store::new(Some(state("laptop")));
-	let deep = outer.some().presence().online().assume();
-	let deep_record = outer.some().records().at(1).some().assume();
-	let _desktop = outer.some().presence().online().name().patch("desktop");
-	let _noted = outer.some().records().at(1).some().title().patch("first, noted");
-	outer.set(None);
-	print(i"outer: {deep.name().get()} / {deep_record.title().get()}");
+		// An outer variant ending above the handle.
+		let outer: Store<Option<State>> = Store::new(Some(state("laptop")));
+		let deep = outer.some().presence().online().assume();
+		let deep_record = outer.some().records().at(1).some().assume();
+		let _desktop = outer.some().presence().online().name().patch("desktop");
+		let _noted = outer.some().records().at(1).some().title().patch("first, noted");
+		outer.set(None);
+		print(i"outer: {deep.name().get()} / {deep_record.title().get()}");
 
-	// After the end a write lands nowhere; a new `Some` is read live.
-	let again: Store<Option<Record>> = Store::new(Some(Record { title = "one", notes = [] }));
-	let held = again.some().assume();
-	again.set(None);
-	held.title().set("ghost");
-	print(i"dead: {held.title().get()} none={again.get().is_none()}");
-	again.set(Some(Record { title = "two", notes = [] }));
-	let _three = again.some().title().patch("three");
-	print(i"again: {held.title().get()}");
+		// After the end a write lands nowhere; a new `Some` is read live.
+		let again: Store<Option<Record>> = Store::new(Some(Record { title = "one", notes = [] }));
+		let held = again.some().assume();
+		again.set(None);
+		held.title().set("ghost");
+		print(i"dead: {held.title().get()} none={again.get().is_none()}");
+		again.set(Some(Record { title = "two", notes = [] }));
+		let _three = again.some().title().patch("three");
+		print(i"again: {held.title().get()}");
+	});
+	rows.dispose();
 
 	// The keeper's life: one per `assume()` under an owner, gone with it.
 	let counted = Store::new(Presence::Online(Device { name = "laptop" }));

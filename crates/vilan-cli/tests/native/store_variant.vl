@@ -72,9 +72,14 @@ fun main() {
 	presence.set(Presence::Online(Device { name = "phone", since = 5 }));
 	print(i"back Online: [{drained()}] name={name.get().unwrap_or("-")}");
 	print(i"patch through the live variant: {name.patch("tablet")} [{drained()}] name={name.get().unwrap_or("-")}");
-	let device: Store<Device> = presence.online().assume();
-	presence.set(Presence::Away("lunch", 30));
-	print(i"to Away: [{drained()}] assumed={device.name().get()}");
+	// `assume()` needs an owner (B696), as `when_live`'s body has one.
+	let assumed = Owner::new();
+	run_with_owner(assumed, || {
+		let device: Store<Device> = presence.online().assume();
+		presence.set(Presence::Away("lunch", 30));
+		print(i"to Away: [{drained()}] assumed={device.name().get()}");
+	});
+	assumed.dispose();
 	let (why, minutes) = presence.away().get().unwrap_or(("-", 0));
 	print(i"away: {why} {minutes} live={presence.away().live().get()}");
 	let _patched = presence.away().patch(("meeting", 60));

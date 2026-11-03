@@ -16,8 +16,25 @@ function __json_kind(value) {
 	if (Array.isArray(value)) return "array";
 	return typeof value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
+}
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
 }
 function __panic(message, location) {
 	const error = new Error(message);
@@ -162,17 +179,14 @@ function format(value) {
 	return to_string(value);
 }
 function new2() {
-	const keys = new Map();
-	const values = new Map();
-	return [ keys, values ];
+	const table = [ new Map(), undefined ];
+	return [ table ];
 }
 function insert(self, key, value) {
-	const hash2 = hash(key);
-	self[0].set(hash2, __clone(key));
-	self[1].set(hash2, __clone(value));
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
 function get(self, key) {
-	return __map_get(self[1], hash(key));
+	return __nmap_get(self[0], hash(key));
 }
 function to_json(self) {
 	let result = "[";

@@ -1,6 +1,6 @@
-// M185: `resized` refuses a RESULT over 50,000,000 pixels with a panic naming
-// both sizes, at its caller's site (`[track_caller]`), on both backends — the
-// box is the program's choice, so it is a bug rather than an `Err`.
+// M190: `resized` refuses a RESULT over 50,000,000 pixels with an `Err` naming
+// both sizes, as `decode` refuses an upload over the limit, on both backends —
+// while a `Contain` into a box far past the limit whose result is small is fine.
 import std::bytes::Bytes;
 import std::image::{ Fit, Image };
 import std::io::panic;
@@ -10,8 +10,12 @@ fun main() {
 		Ok(let picture) => picture,
 		Err(let reason) => panic(reason),
 	};
-	let contained = picture.resized(100000, 1, Fit::Contain);
-	print(i"{contained.width()} x {contained.height()}");
-	let huge = picture.resized(100000, 100000, Fit::Fill);
-	print(i"unreachable {huge.width()}");
+	match picture.resized(100000, 1, Fit::Contain) {
+		Ok(let contained) => print(i"{contained.width()} x {contained.height()}"),
+		Err(let reason) => print(reason),
+	}
+	match picture.resized(100000, 100000, Fit::Fill) {
+		Ok(let huge) => print(i"unreachable {huge.width()}"),
+		Err(let reason) => print(reason),
+	}
 }

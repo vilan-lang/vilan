@@ -37,7 +37,7 @@ import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
 import pkg::iterator::Items;
-import pkg::js::native_map::NativeMap;
+import pkg::js::hash_table::HashTable;
 import pkg::operators::{ Add, Sub };
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::hash_map_cell::{ HashMapCell, HashMapEntry, MapSource, apply_map_ops };
@@ -1484,7 +1484,7 @@ struct ElementCore<T, V> {
 	ids: Shared<List<i32>>,
 	items: Shared<List<T>>,
 	values: Shared<List<V>>,
-	holds: Shared<NativeMap<ElementHold<V>>>,
+	holds: Shared<HashTable<ElementHold<V>>>,
 	/// Slots whose followed flow changed since the last resolve, in arrival order.
 	dirty: Shared<List<i32>>,
 	next_id: Shared<i32>,
@@ -1505,7 +1505,7 @@ fun element_core<T, V>(stage: Owner, run: |T| (ElementRun<V>, Option<Owner>)): E
 	let ids: List<i32> = [];
 	let items: List<T> = [];
 	let values: List<V> = [];
-	let holds: NativeMap<ElementHold<V>> = NativeMap::new();
+	let holds: HashTable<ElementHold<V>> = HashTable::new();
 	let dirty: List<i32> = [];
 	let consumer: Option<Subscriber> = None;
 	ElementCore<T, V> {
@@ -1701,13 +1701,13 @@ fun resolve<T, V>(core: ElementCore<T, V>, ops: List<SeqOp<T>>): List<ElementEve
 	let woke = core.dirty.read();
 	if woke.len() > 0 {
 		core.dirty.write() = [];
-		mut positions: NativeMap<usize> = NativeMap::new();
+		mut positions: HashTable<usize> = HashTable::new();
 		mut index = 0;
 		for id in core.ids.read() {
 			positions.insert(id.hash(), index);
 			index += 1;
 		}
-		mut seen: NativeMap<bool> = NativeMap::new();
+		mut seen: HashTable<bool> = HashTable::new();
 		for id in woke {
 			if seen.contains_key(id.hash()) {
 				jump continue;
@@ -2964,7 +2964,7 @@ struct RankFace {
 	slots: Shared<List<Hash>>,
 	alive: Shared<List<bool>>,
 	/// A LIVE key's slot.
-	slot_of: Shared<NativeMap<usize>>,
+	slot_of: Shared<HashTable<usize>>,
 	tree: Shared<List<i32>>,
 	live: Shared<usize>,
 }
@@ -2973,7 +2973,7 @@ struct RankFace {
 fun rank_face(keys: List<Hash>): RankFace {
 	let slots: List<Hash> = [];
 	let alive: List<bool> = [];
-	let slot_of: NativeMap<usize> = NativeMap::new();
+	let slot_of: HashTable<usize> = HashTable::new();
 	let tree: List<i32> = [0];
 	let face = RankFace {
 		slots = Shared::new(slots),
@@ -2990,7 +2990,7 @@ fun rank_face(keys: List<Hash>): RankFace {
 fun face_rebuild(face: RankFace, keys: List<Hash>) {
 	mut slots: List<Hash> = [];
 	mut alive: List<bool> = [];
-	mut slot_of: NativeMap<usize> = NativeMap::new();
+	mut slot_of: HashTable<usize> = HashTable::new();
 	mut tree: List<i32> = [0];
 	mut at: usize = 0;
 	for key in keys {
@@ -3158,14 +3158,14 @@ struct KeyRow<K, V, U> {
 /// A keyed stage's state: the collection operators' `ElementCore` for the RUNS —
 /// its closure, scratch owner, holds, dirty slots and consumer — with the rows kept
 /// by key rather than by position (the core's own positional lists stay empty). The
-/// rows are a `NativeMap` keyed by the key's hash, which iterates in the upstream
+/// rows are a `HashTable` keyed by the key's hash, which iterates in the upstream
 /// map's order: an overwrite keeps its row's place, a removal drops it, an arrival
 /// appends.
 struct KeyedCore<K: Hashable, V, U> {
 	core: ElementCore<(K, V), U>,
-	rows: Shared<NativeMap<KeyRow<K, V, U>>>,
+	rows: Shared<HashTable<KeyRow<K, V, U>>>,
 	/// A run's slot id → its key's hash, for the followed flows that wake.
-	key_of_slot: Shared<NativeMap<Hash>>,
+	key_of_slot: Shared<HashTable<Hash>>,
 }
 
 /// One key change the keyed core resolved.
@@ -3185,8 +3185,8 @@ fun keyed_core<K: Hashable, V, U>(
 	stage: Owner,
 	run: |(K, V)| (ElementRun<U>, Option<Owner>),
 ): KeyedCore<K, V, U> {
-	let rows: NativeMap<KeyRow<K, V, U>> = NativeMap::new();
-	let key_of_slot: NativeMap<Hash> = NativeMap::new();
+	let rows: HashTable<KeyRow<K, V, U>> = HashTable::new();
+	let key_of_slot: HashTable<Hash> = HashTable::new();
 	KeyedCore<K, V, U> {
 		core = element_core(stage, run),
 		rows = Shared::new(rows),
@@ -3268,7 +3268,7 @@ fun keyed_resolve<K: Hashable, V, U>(
 				for row in keyed_rows(keyed) {
 					keyed_retire(keyed, row);
 				}
-				let emptied: NativeMap<KeyRow<K, V, U>> = NativeMap::new();
+				let emptied: HashTable<KeyRow<K, V, U>> = HashTable::new();
 				keyed.rows.write() = emptied;
 				keyed_seed(keyed, map);
 				events.push(KeyEvent::Reset(keyed_rows(keyed)));
@@ -3280,7 +3280,7 @@ fun keyed_resolve<K: Hashable, V, U>(
 	let woke = keyed.core.dirty.read();
 	if woke.len() > 0 {
 		keyed.core.dirty.write() = [];
-		mut seen: NativeMap<bool> = NativeMap::new();
+		mut seen: HashTable<bool> = HashTable::new();
 		for id in woke {
 			if seen.contains_key(id.hash()) {
 				jump continue;

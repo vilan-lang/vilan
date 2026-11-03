@@ -14535,6 +14535,7 @@ impl<'src> Analyzer<'src> {
             "HashMap",
             "HashSet",
             "NativeMap",
+            "HashTable",
             "Shared",
             "Weak",
             "Context",
@@ -20432,8 +20433,8 @@ impl<'src> Analyzer<'src> {
     /// the instantiation is the only place to say so. When the signature IS
     /// refused, the opposite is true — the caller holds the offending type
     /// itself, was told at the type it wrote, and the body's container is that
-    /// same refusal one layer in. `HashMap<K, V>`'s storage is a `NativeMap<(K,
-    /// V)>` and `HashSet<T>`'s is a `NativeMap<T>`, so with the internal head in
+    /// same refusal one layer in. `HashMap<K, V>`'s storage is a `NativeMap<K,
+    /// V>` and `HashSet<T>`'s is a `NativeMap<T, void>`, so with the internal head in
     /// R10's list (B154) `HashMap<str, Database>` reported at `HashMap` and again at
     /// the `NativeMap` inside `Map::new`'s body — one mistake, two heads.
     ///
@@ -20494,7 +20495,7 @@ impl<'src> Analyzer<'src> {
     /// `covered` — and that there is at least one, so a type that mentions no
     /// parameter at all is never vacuously covered.
     ///
-    /// The "traces to" of E104's stand-down: the body's `NativeMap<(K, V)>` is
+    /// The "traces to" of E104's stand-down: the body's `NativeMap<K, V>` is
     /// the signature's refused `HashMap<K, V>` a layer deeper, while its `List<B>`
     /// under a signature that only refused `HashMap<str, A>` is its own offense.
     fn traces_only_to(&self, type_id: TypeId, covered: &HashSet<TypeId>) -> bool {
@@ -76939,6 +76940,11 @@ pub enum Intrinsic {
     // `Option.replace(&mut self, value): Option<T>` -> a runtime helper that reads
     // the slot, writes `Some(value)` back in place, and returns the old contents.
     OptionReplace,
+    // `Option.some_view(&mut self): &mut T borrows self` (`[internal]`, M191) ->
+    // the `Some` payload as a VIEW: the stored object for an aggregate payload,
+    // the `(slot, 1)` pair for a scalar one; `get_or_insert`'s tail, reached only
+    // once the option is `Some`.
+    OptionSomeView,
     // `Shared::new(value)` -> a `{ v: value }` cell (a JS object, so `__clone`
     // shares it by reference instead of deep-copying — that is what makes a
     // `Shared` co-owned rather than snapshotted).
@@ -76993,21 +76999,14 @@ pub enum Intrinsic {
     SetRemove,
     // `Set.len(): i32` -> native `.size` (property read).
     SetLen,
+    // The `Map*` rows are std's one-parameter `HashTable<V>`
+    // (`std::js::hash_table`): a JS `Map` from a `Hash` to the value itself.
     // `Map::new(): Map<K, V>` -> `new Map()`.
     MapNew,
     // `Map.insert(key, value)` -> native `.set(key, value)`.
     MapInsert,
     // `Map.get(key): Option<V>` -> a runtime helper returning the Option form.
     MapGet,
-    // `Map.lend(key, read): U` -> `read` called once with the slot under `key`
-    // IN PLACE (`[ 0, value ]` aliasing the stored value, or `[ 1 ]`), nothing
-    // cloned (B689, hash-map-lend.md §3.1). Runs user code.
-    MapLend,
-    // `Map.lend_mut(key, write): U` -> `write` called once with a writable
-    // view of the slot, and the table made to reflect it afterwards: `None`
-    // removes the key, `Some` under an absent key inserts it last. Runs user
-    // code and writes its receiver.
-    MapLendMut,
     // `Map.contains_key(key): bool` -> native `.has(key)`.
     MapContainsKey,
     // `Map.remove(key)` -> native `.delete(key)`.
@@ -77018,6 +77017,40 @@ pub enum Intrinsic {
     MapKeys,
     // `Map.values(): List<V>` -> a runtime helper snapshotting the values.
     MapValues,
+    // The `Keyed*` rows are `NativeMap<K, V>` (`std::js::native_map`, M191,
+    // hash-map-lend.md §10), the one table under `HashMap`/`HashSet`: a JS
+    // `Map` from a `Hash` to the entry `[key, slot]`, the slot the `Option`
+    // array itself; a `None` slot is a tombstone every read skips, and the
+    // pending one (the slot last lent) is settled by the next write.
+    // `NativeMap::new()` -> `new Map()`.
+    KeyedNew,
+    // `insert(hash, key, value)` -> a helper settling, then setting the entry
+    // (a present key's entry rewritten in place, keeping its position).
+    KeyedInsert,
+    // `get(hash): Option<V>` -> a copy of the slot.
+    KeyedGet,
+    // `key(hash): Option<K>` -> a copy of the stored key, when held.
+    KeyedKey,
+    // `lend(hash, read): U` -> `read` called once with the slot IN PLACE (or
+    // `[ 1 ]`), nothing cloned. Runs user code.
+    KeyedLend,
+    // `slot(hash, key): &mut Option<V> borrows self` -> the slot itself, a
+    // fresh `None` appended under `key` for an absent hash; marked pending.
+    // Writes its receiver.
+    KeyedSlot,
+    // `contains_key(hash): bool` -> a held, non-`None` slot.
+    KeyedContainsKey,
+    // `remove(hash)` -> a helper settling, then deleting.
+    KeyedRemove,
+    // `len(): usize` -> the size less the pending slot when it is `None`.
+    KeyedLen,
+    // `hashes() / keys() / values()` -> snapshots in insertion order,
+    // tombstones skipped (`keys`/`values` cloned). There is no `entries` row: a
+    // `(K, V)` pair's JS layout splices a tuple key or value into it, which only
+    // the vilan side knows, so `HashMap::entries` pairs `keys` and `values`.
+    KeyedHashes,
+    KeyedKeys,
+    KeyedValues,
     // `JsonValue.field(name): JsonValue` -> native `self[name]` (a dynamic
     // property read on a `JSON.parse` result, for which there is no host fn).
     JsonField,
@@ -90682,8 +90715,8 @@ fn analyze_inner<'src>(
     }
 
     // The raw `std::js::native_map` `NativeMap` struct, if loaded (imported by the
-    // public `HashMap`/`HashSet` wrappers). It carries the map intrinsics; the public
-    // `HashMap`/`HashSet` are ordinary vilan structs over it (I1).
+    // public `HashMap`/`HashSet` wrappers). It carries the keyed-table intrinsics;
+    // the public `HashMap`/`HashSet` are ordinary vilan structs over it (I1, M191).
     let native_map_struct_id = module_scopes
         .get("js::native_map")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
@@ -90692,6 +90725,17 @@ fn analyze_inner<'src>(
         analyzer
             .primitive_struct_ids
             .insert("NativeMap", native_map_struct_id);
+    }
+    // The raw `std::js::hash_table` `HashTable` struct — the one-parameter
+    // `Hash`-keyed table std's reactive machinery keeps — the same way.
+    let hash_table_struct_id = module_scopes
+        .get("js::hash_table")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+        .and_then(|scope| scope.name_to_id_map.get("HashTable").copied());
+    if let Some(hash_table_struct_id) = hash_table_struct_id {
+        analyzer
+            .primitive_struct_ids
+            .insert("HashTable", hash_table_struct_id);
     }
 
     // The `std::shared` `Shared` struct, if `shared.vl` loaded — same treatment.
@@ -91674,7 +91718,7 @@ fn analyze_over_world<'src>(
     // authoritative: `infer_bumps` seeds it and does not re-infer the body. Rows
     // whose module is not loaded resolve to `None` and drop out — the table is
     // inert until a container is actually used (the `try_trait_id` precedent).
-    let bumps_rows: [(Option<Id>, bool); 12] = {
+    let bumps_rows: [(Option<Id>, bool); 14] = {
         // Resolve a method id inside the impl of a resolved container struct
         // (the `intrinsics` table's own pattern), matching the impl subject by
         // nominal id.
@@ -91691,6 +91735,7 @@ fn analyze_over_world<'src>(
         };
         let list_struct = analyzer.primitive_struct_ids.get("List").copied();
         let native_map_struct = analyzer.primitive_struct_ids.get("NativeMap").copied();
+        let hash_table_struct = analyzer.primitive_struct_ids.get("HashTable").copied();
         let map_struct = analyzer.primitive_struct_ids.get("HashMap").copied();
         let set_struct = analyzer.primitive_struct_ids.get("HashSet").copied();
         // `Arena` is reached only by `import std::arena`, so it is not among the
@@ -91711,9 +91756,13 @@ fn analyze_over_world<'src>(
             (container_method(native_map_struct, "insert"), true),
             // `NativeMap::remove` — a hash remove.
             (container_method(native_map_struct, "remove"), true),
-            // `NativeMap::lend_mut` — writes a slot, inserting or removing the
-            // key as the slot comes back (B689): a geometry op like the two above.
-            (container_method(native_map_struct, "lend_mut"), true),
+            // `NativeMap::slot` — lends a slot, appending one for an absent key
+            // and settling the last one lent (M191): a geometry op like the two
+            // above.
+            (container_method(native_map_struct, "slot"), true),
+            // `HashTable::insert` / `remove` — the one-parameter table's.
+            (container_method(hash_table_struct, "insert"), true),
+            (container_method(hash_table_struct, "remove"), true),
             // `Map::insert` — a value-keyed insert over `NativeMap` (§1: Map insert bumps).
             (container_method(map_struct, "insert"), true),
             // `Map::remove` — a value-keyed remove.
@@ -92172,28 +92221,53 @@ fn analyze_over_world<'src>(
             }
         }
     }
-    // The raw `NativeMap` (the JS `Map`) carries the map intrinsics; the public
-    // `HashMap`/`HashSet` are vilan wrappers over it that dispatch `key.hash()` (I1), so
-    // their own methods are ordinary vilan code, not intrinsics.
-    if let Some(native_map_struct_id) = analyzer.primitive_struct_ids.get("NativeMap").copied() {
+    // The raw tables (JS `Map`s) carry the map intrinsics: `HashTable<V>` the
+    // `Map*` rows, `NativeMap<K, V>` the `Keyed*` ones. The public
+    // `HashMap`/`HashSet` are vilan wrappers over `NativeMap` that dispatch
+    // `key.hash()` (I1, M191), so their own methods are ordinary vilan code.
+    let tables = [
+        (
+            analyzer.primitive_struct_ids.get("HashTable").copied(),
+            &[
+                ("new", Intrinsic::MapNew),
+                ("insert", Intrinsic::MapInsert),
+                ("get", Intrinsic::MapGet),
+                ("contains_key", Intrinsic::MapContainsKey),
+                ("remove", Intrinsic::MapRemove),
+                ("len", Intrinsic::MapLen),
+                ("keys", Intrinsic::MapKeys),
+                ("values", Intrinsic::MapValues),
+            ][..],
+        ),
+        (
+            analyzer.primitive_struct_ids.get("NativeMap").copied(),
+            &[
+                ("new", Intrinsic::KeyedNew),
+                ("insert", Intrinsic::KeyedInsert),
+                ("get", Intrinsic::KeyedGet),
+                ("key", Intrinsic::KeyedKey),
+                ("lend", Intrinsic::KeyedLend),
+                ("slot", Intrinsic::KeyedSlot),
+                ("contains_key", Intrinsic::KeyedContainsKey),
+                ("remove", Intrinsic::KeyedRemove),
+                ("len", Intrinsic::KeyedLen),
+                ("hashes", Intrinsic::KeyedHashes),
+                ("keys", Intrinsic::KeyedKeys),
+                ("values", Intrinsic::KeyedValues),
+            ][..],
+        ),
+    ];
+    for (table_struct_id, rows) in tables {
+        let Some(table_struct_id) = table_struct_id else {
+            continue;
+        };
         for implementation in &analyzer.implementations {
-            let subject_is_native_map = matches!(
+            let subject_is_the_table = matches!(
                 analyzer.type_id_to_type_map.get(&implementation.subject),
-                Some(Type::Struct(id, _)) if *id == native_map_struct_id
+                Some(Type::Struct(id, _)) if *id == table_struct_id
             );
-            if subject_is_native_map {
-                for (name, intrinsic) in [
-                    ("new", Intrinsic::MapNew),
-                    ("insert", Intrinsic::MapInsert),
-                    ("get", Intrinsic::MapGet),
-                    ("lend", Intrinsic::MapLend),
-                    ("lend_mut", Intrinsic::MapLendMut),
-                    ("contains_key", Intrinsic::MapContainsKey),
-                    ("remove", Intrinsic::MapRemove),
-                    ("len", Intrinsic::MapLen),
-                    ("keys", Intrinsic::MapKeys),
-                    ("values", Intrinsic::MapValues),
-                ] {
+            if subject_is_the_table {
+                for &(name, intrinsic) in rows {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)
                     {
@@ -92307,6 +92381,7 @@ fn analyze_over_world<'src>(
                 for (name, intrinsic) in [
                     ("take", Intrinsic::OptionTake),
                     ("replace", Intrinsic::OptionReplace),
+                    ("some_view", Intrinsic::OptionSomeView),
                 ] {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)

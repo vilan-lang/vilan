@@ -57,13 +57,15 @@ function __dbg_members(open, items, show, fill) {
 	}
 	return __dbg_group(open, "}", true, entries, fill);
 }
-function __dbg_map(open, keys, values, showKey, showValue) {
-	const stored = Array.from(values.values());
-	const items = Array.from(keys.values(), (key, index) => [ key, stored[index] ]);
+function __dbg_map(open, table, showKey, showValue) {
+	const items = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) items.push([ entry[0], entry[1][1] ]);
 	return __dbg_members(open, items, (entry) => [ __dbg_flat(showKey(entry[0])) + " => ", showValue(entry[1]) ]);
 }
 function __dbg_set(open, table, show, fill) {
-	return __dbg_members(open, Array.from(table.values()), (item) => [ "", show(item) ], fill);
+	const items = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) items.push(entry[0]);
+	return __dbg_members(open, items, (item) => [ "", show(item) ], fill);
 }
 function __dbg_str(text) {
 	let out = "\"";
@@ -118,8 +120,33 @@ function __dbg_layout(document, column, indent) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
+}
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_len(table) {
+	const hash = table[1];
+	if (hash !== undefined) {
+		const entry = table[0].get(hash);
+		if (entry !== undefined && entry[1][0] === 1) return table[0].size - 1;
+	}
+	return table[0].size;
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
 }
 function __panic(message, location) {
 	const error = new Error(message);
@@ -407,11 +434,11 @@ function to_list4(self) {
 	return result;
 }
 function new3() {
-	const table = new Map();
+	const table = [ new Map(), undefined ];
 	return [ table ];
 }
 function insert(self, value) {
-	self[0].set(hash2(value), __clone(value));
+	__nmap_insert(self[0], hash2(value), __clone(value), undefined);
 }
 function to_set(self) {
 	let result = new3();
@@ -421,7 +448,7 @@ function to_set(self) {
 	return result;
 }
 function len(self) {
-	return self[0].size;
+	return __nmap_len(self[0]);
 }
 function next13(self) {
 	const $J = next3(self[0]);
@@ -444,14 +471,11 @@ function to_list5(self) {
 	return result;
 }
 function new4() {
-	const keys = new Map();
-	const values = new Map();
-	return [ keys, values ];
+	const table = [ new Map(), undefined ];
+	return [ table ];
 }
 function insert2(self, key, value) {
-	const hash3 = hash(key);
-	self[0].set(hash3, __clone(key));
-	self[1].set(hash3, __clone(value));
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
 function to_map(self) {
 	let result = new4();
@@ -461,7 +485,7 @@ function to_map(self) {
 	return result;
 }
 function get(self, key) {
-	return __map_get(self[1], hash(key));
+	return __nmap_get(self[0], hash(key));
 }
 function unwrap_or(self, fallback) {
 	const $M = self;

@@ -154,14 +154,14 @@ export import pkg::reactive::store_core::{
 
 /// What `map` holds under the key whose hash is `hash` — one value, copied.
 fun value_at<K: Hashable, V>(map: &HashMap<K, V>, hash: Hash): Option<V> {
-	map.values.get(hash)
+	map.table.get(hash)
 }
 
 /// The `(key, value)` entry `map` holds under the key whose hash is `hash` — both
-/// copied, read off the map's two tables.
+/// copied, read off the map's table.
 fun entry_at<K: Hashable, V>(map: &HashMap<K, V>, hash: Hash): Option<(K, V)> {
-	match map.keys.get(hash) {
-		Some(let key) => match map.values.get(hash) {
+	match map.table.key(hash) {
+		Some(let key) => match map.table.get(hash) {
 			Some(let value) => Some((key, value)),
 			None => None,
 		},
@@ -204,11 +204,11 @@ export impl HashMap<type K: Hashable, type V: Storable> with Storable {
 			}
 		}
 		if fed || (here && !changed) {
-			for hash in self.values.keys() {
+			for hash in self.table.hashes() {
 				if fed || !changed {
 					if store_keyed(node, hash).is_none() {
-						let moved = match self.values.get(hash) {
-							Some(let mine) => match other.values.get(hash) {
+						let moved = match self.table.get(hash) {
+							Some(let mine) => match other.table.get(hash) {
 								Some(let theirs) => differs(&mine, &theirs, woken),
 								None => true,
 							},
@@ -221,9 +221,9 @@ export impl HashMap<type K: Hashable, type V: Storable> with Storable {
 					}
 				}
 			}
-			for hash in other.values.keys() {
+			for hash in other.table.hashes() {
 				if (fed || !changed)
-					&& !self.values.contains_key(hash)
+					&& !self.table.contains_key(hash)
 					&& store_keyed(node, hash).is_none() {
 					changed = true;
 					store_touch(node, StoreTouch::Key(hash), woken);
@@ -259,7 +259,7 @@ export impl HashSet<type T: Hashable> with Storable {
 			}
 		}
 		if fed || (here && !changed) {
-			for hash in self.table.keys() {
+			for hash in self.table.hashes() {
 				if (fed || !changed)
 					&& !other.table.contains_key(hash)
 					&& store_keyed(node, hash).is_none() {
@@ -267,7 +267,7 @@ export impl HashSet<type T: Hashable> with Storable {
 					store_touch(node, StoreTouch::Key(hash), woken);
 				}
 			}
-			for hash in other.table.keys() {
+			for hash in other.table.hashes() {
 				if (fed || !changed)
 					&& !self.table.contains_key(hash)
 					&& store_keyed(node, hash).is_none() {
@@ -588,7 +588,7 @@ fun set_feed<T: Hashable>(lend: |(|&HashSet<T>| void)| void, log: DeltaLog<SetOp
 			olds = [];
 			lend(|set: &HashSet<T>| {
 				for hash in pending.keys {
-					olds.push(set.table.get(hash));
+					olds.push(set.table.key(hash));
 				}
 			});
 		},
@@ -609,7 +609,7 @@ fun set_feed<T: Hashable>(lend: |(|&HashSet<T>| void)| void, log: DeltaLog<SetOp
 								log.record(SetOp::Remove(was));
 							}
 						},
-						None => match set.table.get(keys[index]) {
+						None => match set.table.key(keys[index]) {
 							Some(let now) => log.record(SetOp::Add(now)),
 							None => {},
 						},
@@ -771,14 +771,14 @@ export impl Store<HashMap<type K: Hashable, type V>> {
 	/// another key never wakes it. A `Store<Option<V>>`, so `set(None)` removes the
 	/// key, `.some()` reaches into a present value, and its subscription's slot
 	/// lives as long as its subscriptions do (Q12). The step LENDS the map's slot
-	/// in place (`peek` / `modify`, B689): a read below it copies only the leaf it
-	/// returns, and a write through it lands where the value is.
+	/// in place (`peek` / `slot`, B689 + M191): a read below it copies only the
+	/// leaf it returns, and a write through it lands where the value is.
 	fun at(self, key: K): Store<Option<V>> {
 		self
 			.descend(
 				StoreStep::Key(key.hash()),
 				|held: &HashMap<K, V>, f: |&Option<V>| void| held.peek(key, f),
-				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| held.modify(key, f),
+				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| f(held.slot(key)),
 			)
 	}
 }
@@ -802,7 +802,7 @@ export impl StoreSome<HashMap<type K: Hashable, type V>> {
 			.descend(
 				StoreStep::Key(key.hash()),
 				|held: &HashMap<K, V>, f: |&Option<V>| void| held.peek(key, f),
-				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| held.modify(key, f),
+				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| f(held.slot(key)),
 			)
 	}
 }
@@ -1778,7 +1778,8 @@ export impl RemoteStoreSome<type P> {
 	}
 
 	/// This handle as a plain `RemoteStore<P>`, for a body that runs only while the
-	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526).
+	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526);
+	/// an owner is required, as there (B696).
 	fun assume(self): RemoteStore<P> {
 		RemoteStore { local = self.local.assume(), at = self.at }
 	}

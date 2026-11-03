@@ -80,6 +80,17 @@ impl Built {
     }
 
     fn spawn(&self, backend: Backend) -> Server {
+        Server::spawn(&mut self.command(backend))
+    }
+
+    /// [`Built::spawn`] with the server's stderr written to `log`, for a case
+    /// whose claim is what the server REPORTED (M179).
+    fn spawn_logging(&self, backend: Backend, log: &Path) -> Server {
+        let file = std::fs::File::create(log).expect("create the stderr log");
+        Server::spawn(self.command(backend).stderr(file))
+    }
+
+    fn command(&self, backend: Backend) -> Command {
         let mut command = match backend {
             Backend::Node => {
                 let mut command = Command::new("node");
@@ -89,7 +100,7 @@ impl Built {
             Backend::Native => Command::new(&self.native_binary),
         };
         command.current_dir(&self.staged);
-        Server::spawn(&mut command)
+        command
     }
 
     /// Runs every case against a fresh server per backend and panics with
@@ -822,4 +833,89 @@ fn m164_the_server_a_mount_and_a_route_each_set_the_cap_on_both_backends() {
         ),
         ("the upload route's shape", the_upload_route_shape),
     ]);
+}
+
+// ------------------------------------------------------ a handler panic ---
+
+/// M179's program: `/boom`'s handler panics, every other path answers.
+fn panicking_server() -> String {
+    format!(
+        r#"
+import std::http::{{ Response, Server }};
+import std::io::{{ panic, print }};
+
+fun main() {{
+	Server::builder()
+		.port(0)
+		.on_request(|request| {{
+			if request.path() == "/boom" {{
+				panic("handler blew up");
+			}}
+			Response::builder().body("still here").build()
+		}})
+		.on_start(|server| {ANNOUNCE_PORT})
+		.build()
+		.start();
+}}
+"#
+    )
+}
+
+/// M179: a handler that PANICS is answered `500` with `Connection: close`, the
+/// panic is reported ONCE — the unobserved-task line, `unhandled task error
+/// (spawned in an http request handler): panicked at <site>: <message>`, the
+/// same on both backends — and the server goes on answering. Before, node's
+/// process ended with the panic (the `createServer` callback's promise rejected
+/// unhandled) and the native server reported it and left the response open.
+#[test]
+fn m179_a_handler_panic_answers_500_reports_once_and_the_server_goes_on_on_both_backends() {
+    let built = Built::new("handler_panic", &panicking_server());
+    let get =
+        |path: &str| format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let mut failures = Vec::new();
+    for backend in [Backend::Node, Backend::Native] {
+        let log = built.staged.join(format!("stderr-{backend:?}.log"));
+        let mut server = built.spawn_logging(backend, &log);
+        let port = server.port();
+        let answered = exchange(port, &get("/boom"), b"").and_then(|response| {
+            expect_code(&response, 500)?;
+            expect_header(&response, "Connection: close")?;
+            expect_body(&response, "internal server error")
+        });
+        let served_on = exchange(port, &get("/"), b"").and_then(|response| {
+            expect_status(&response, "HTTP/1.1 200 OK")?;
+            expect_body(&response, "still here")
+        });
+        server.stop();
+        let stderr = std::fs::read_to_string(&log).unwrap_or_default();
+        let reports = stderr
+            .lines()
+            .filter(|line| {
+                line.starts_with(
+                    "unhandled task error (spawned in an http request handler): panicked at ",
+                ) && line.ends_with(": handler blew up")
+            })
+            .count();
+        for (name, outcome) in [
+            ("/boom answers 500", answered),
+            ("/ still answers", served_on),
+        ] {
+            if let Err(failure) = outcome {
+                failures.push(format!(
+                    "{backend:?} / {name}: {failure}\nstderr:\n{stderr}"
+                ));
+            }
+        }
+        if reports != 1 {
+            failures.push(format!(
+                "{backend:?}: the panic is reported once, got {reports} report(s):\n{stderr}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
 }

@@ -142,9 +142,17 @@ named beside it in `style.vl`:
 | `Role::Rem` | `gap`, `padding*`, `margin*`, `width`, `height`, `size`, `min_*`, `max_*`, `top`, `right`, `bottom`, `left`, `inset`, `radius`, `font_size`, `letter_spacing`, `line_height_length` |
 | `Role::Px` | `border`, `border_top`, `border_right`, `border_bottom`, `border_left` (the width) |
 
-Where no property chooses — `raw`, `with_length`, a `css` block's undotted
-declaration (which is `raw`), `piece`, `css_text()` — a `dp` is rem
-(`Length::rendered(role)` writes one in either). Only a `dp` is affected: `px(8)` means CSS px and
+A property written by NAME — `raw`, `with_length`, a `css` block's undotted
+declaration (which is `raw`, its several arguments through `piece_for`) —
+takes the role the name gives it: px for the hairlines (`border` and every
+border width, `outline`, `outline-width`, `outline-offset`, `box-shadow`),
+rem for every other property, a border's radius, colour and style
+included. So a `css` block's `border(dp(1), gray(300));` writes `1px`, the
+same rule as the dotted `.border(dp(1), gray(300))`. `with_length_as(property,
+value, role)` names the role outright (a custom property that holds a
+hairline). Where no property chooses at all — `piece`, `css_text()` — a
+`dp` is rem (`Length::rendered(role)` writes one in either). Only a `dp` is
+affected: `px(8)` means CSS px and
 `rem(0.5)` means rem in every property, and a `dp` composed into a `calc`
 (`dp(8) + space(4)`) is text from then on, written in rem. The numbers are
 exact — `dp(6)` is `0.375rem` — and `dp(0)` is `0rem` (`0px` in a border),
@@ -260,6 +268,7 @@ Escape hatches:
 ```vilan,fragment
 fun raw<V: CssValue>(self, property: str, value: V): Style
 fun with_length(self, property: str, value: Length): Style
+fun with_length_as(self, property: str, value: Length, role: Role): Style
 fun with_color(self, property: str, value: Color): Style
 ```
 
@@ -268,7 +277,8 @@ value, verbatim), a `Length`, or a `Color`. A `Length` or `Color` that is a
 theme token — `space(4)`, `Color::blue(300)` — carries its own `:root`
 declaration onto the stylesheet, so `.raw("padding", space(4))` is never a
 dangling `var()`. `with_length` and `with_color` are `raw` at those two value
-types, kept for the spelling the surface has always had.
+types, kept for the spelling the surface has always had; a `dp` takes the
+role its property's name gives it (above), and `with_length_as` names one.
 
 Pass the value, not its text: `space(4).css_text()` is the string
 `var(--space-4)` with the declaration left behind, and a `str` carries no
@@ -291,8 +301,9 @@ types, for a position that wants the type.
 sheet on the way past — `CssPiece` is `CssValue`'s twin over `str`,
 `Length`, `Color` and the numbers, because a part sits inside text that
 supplies the unit while a whole value must carry its own. A declaration
-with SEVERAL arguments joins them with a space through `piece`
-automatically; write it yourself only where the parts are glued:
+with SEVERAL arguments joins them with a space through `piece_for(property,
+value)`, `piece` with the property's role, automatically; write `piece`
+yourself only where the parts are glued:
 `padding(i"calc({piece(space(4))} + 2px)");`.
 
 ## Conditions

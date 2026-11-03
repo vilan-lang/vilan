@@ -95,9 +95,9 @@ web modules under `std::web::` (`dom`, `ui`, `style`, `router`, `storage`,
 `dev`, `document`, `asset`, and the web prelude `std::web::prelude`), the
 reactive family under `std::reactive::` (`store`, `transient`, `delta`, the
 hash cells), the JS-only modules under `std::js::` (`promise`, `native_map`,
-`null`) and the server half of RPC at `std::rpc::server`. Everything else —
-the collections, the traits, the codecs, the process modules — sits at
-`std::<name>`.
+`hash_table`, `null`) and the server half of RPC at `std::rpc::server`.
+Everything else — the collections, the traits, the codecs, the process
+modules — sits at `std::<name>`.
 
 | Page | Modules |
 |---|---|

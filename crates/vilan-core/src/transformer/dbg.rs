@@ -460,8 +460,7 @@ impl<'src> Transformer<'src> {
             }
             Shape::Map {
                 label,
-                keys: (keys, _),
-                values: (values, _),
+                table: (table, _),
                 key,
                 value: entry_value,
             } => {
@@ -471,8 +470,7 @@ impl<'src> Transformer<'src> {
                     "__dbg_map",
                     vec![
                         text(format!("{label} {{")),
-                        slot(keys),
-                        slot(values),
+                        slot(table),
                         js::Node::Local(key_printer),
                         js::Node::Local(value_printer),
                     ],

@@ -203,12 +203,12 @@ pub enum Layout {
         field: usize,
         value: u32,
     },
-    /// std's `HashMap<K, V>`: the JS `Map`s at fields `keys` and `values`,
-    /// one insertion order, holding the keys and the values (B689).
+    /// std's `HashMap<K, V>`: the table at field `table` (M191) — `[ map,
+    /// pending ]`, the JS `Map` from each hash to its `[ key, slot ]` entry,
+    /// a `None` slot a tombstone to skip.
     Map {
         label: String,
-        keys: usize,
-        values: usize,
+        table: usize,
         key: u32,
         value: u32,
     },
@@ -615,15 +615,14 @@ impl Layout {
             }
             Layout::Map {
                 label: text,
-                keys,
-                values,
+                table,
                 key,
                 value,
             } => {
                 shape(json, "map");
                 label(json, text);
                 json.push_str(&format!(
-                    ",\"keys\":{keys},\"values\":{values},\"key\":{key},\"value\":{value}"
+                    ",\"table\":{table},\"key\":{key},\"value\":{value}"
                 ));
             }
             Layout::Set {

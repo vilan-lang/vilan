@@ -476,14 +476,12 @@ impl<'src> Transformer<'src> {
             },
             Shape::Map {
                 label,
-                keys: (keys, _),
-                values: (values, _),
+                table: (table, _),
                 key,
                 value,
             } => Layout::Map {
                 label,
-                keys,
-                values,
+                table,
                 key: element(self, recorder, key),
                 value: element(self, recorder, value),
             },

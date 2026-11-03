@@ -102,9 +102,11 @@ export impl Length {
 	/// 1/16 rem — measured as a design measurement rather than a CSS unit. It
 	/// carries no unit preference: the property that receives it picks one
 	/// (`Role`), so `padding(dp(8))` writes `0.5rem` and follows the reader's text
-	/// size while `border(dp(1), ..)` writes `1px` and stays a hairline. Anywhere
-	/// no property chooses — `raw`, `piece`, `css_text()` — it is rem. The number
-	/// is exact: `dp(6)` is `0.375rem`, the f64 `6 / 16`.
+	/// size while `border(dp(1), ..)` writes `1px` and stays a hairline. A property
+	/// written by NAME picks by the name (`raw("border", ..)`, a `css` block's
+	/// `border(dp(1), ..)`: px, the hairlines' role); anywhere no property chooses
+	/// — `piece`, `css_text()` — it is rem. The number is exact: `dp(6)` is
+	/// `0.375rem`, the f64 `6 / 16`.
 	fun dp(value: f64): Length {
 		unit_length(value, Unit::Dp)
 	}
@@ -888,6 +890,12 @@ export trait CssValue {
 	/// when the value declares nothing. A single token is a single line; a `Length`
 	/// composed out of several tokens (`space(4) + space(2)`) carries each.
 	fun css_root(self): str;
+
+	/// The value's text in a property whose ROLE is `role` (A178): a `Length`
+	/// writes a `dp` in that role's unit; every other value is its `css_text()`.
+	fun css_text_as(self, role: Role): str {
+		self.css_text()
+	}
 }
 
 /// A complete CSS value, written verbatim. Declares no token.
@@ -902,7 +910,7 @@ export impl str with CssValue {
 }
 
 /// A length — its rendered text (`8px`, `var(--space-4)`), plus the `:root` lines
-/// its tokens need.
+/// its tokens need; in a property with a role, a `dp` in the role's unit.
 export impl Length with CssValue {
 	fun css_text(self): str {
 		length_text(self)
@@ -910,6 +918,10 @@ export impl Length with CssValue {
 
 	fun css_root(self): str {
 		self.root
+	}
+
+	fun css_text_as(self, role: Role): str {
+		self.rendered(role)
 	}
 }
 
@@ -946,6 +958,12 @@ export trait CssPiece {
 
 	/// The `:root` lines declaring this piece's theme tokens, or `""`.
 	fun piece_root(self): str;
+
+	/// The piece's text inside a property whose ROLE is `role` (A178): a `Length`
+	/// writes a `dp` in that role's unit; every other piece is its `piece_text()`.
+	fun piece_text_as(self, role: Role): str {
+		self.piece_text()
+	}
 }
 
 export impl str with CssPiece {
@@ -1016,6 +1034,10 @@ export impl Length with CssPiece {
 	fun piece_root(self): str {
 		self.root
 	}
+
+	fun piece_text_as(self, role: Role): str {
+		self.rendered(role)
+	}
 }
 
 export impl Color with CssPiece {
@@ -1046,6 +1068,46 @@ export fun piece<V: CssPiece>(value: V): str {
 		}
 	}
 	value.piece_text()
+}
+
+/// [`piece`] inside the declaration of `property`: a `dp` takes the property's
+/// ROLE, as a whole value given to `Style::raw` does (A178, the owner's Q4), so a
+/// `css` block's `border(dp(1), Color::gray(300));` writes `1px` — the dotted
+/// `.border(dp(1), ..)`'s hairline — where `piece` alone writes rem. What a
+/// multi-argument `css` declaration lowers its arguments through.
+export fun piece_for<V: CssPiece>(property: str, value: V): str {
+	let root = value.piece_root();
+	if root != "" {
+		for line in root.split("\n") {
+			if line != "" {
+				emit("css", line);
+			}
+		}
+	}
+	value.piece_text_as(property_role(property))
+}
+
+/// The ROLE a property gives a `dp` written into it by NAME (A178 Q4; the table is
+/// proposal/length.md §4's): `Role::Px` for the hairlines — the border widths and
+/// shorthands, `outline`, `outline-width`, `outline-offset`, `box-shadow` — and
+/// `Role::Rem` for everything else, the role-less default. A border property that
+/// takes no width (a radius, a colour, a style, the image, collapse, spacing) is
+/// rem like any other.
+fun property_role(property: str): Role {
+	if property == "outline"
+		|| property == "outline-width"
+		|| property == "outline-offset"
+		|| property == "box-shadow" {
+		ret Role::Px;
+	}
+	let border = property == "border" || property.starts_with("border-");
+	let no_width = property.ends_with("-radius")
+		|| property.ends_with("-color")
+		|| property.ends_with("-style")
+		|| property.starts_with("border-image")
+		|| property == "border-collapse"
+		|| property == "border-spacing";
+	border && !no_width then Role::Px else Role::Rem
 }
 
 /// A CUSTOM PROPERTY read as a whole value — `color(var("--brand-ink"));` (A101
@@ -2129,7 +2191,9 @@ export impl Style {
 	/// The escape hatch: any property, any value, atomic like the rest. The value
 	/// is any `CssValue` — a verbatim `str`, or a `Length`/`Color` whose theme
 	/// token carries its own `:root` line onto the sheet, so
-	/// `.raw("padding", space(4))` is never a dangling `var()`.
+	/// `.raw("padding", space(4))` is never a dangling `var()`. A `dp` takes the
+	/// role the property NAME gives it (A178 Q4): `raw("border-width", dp(1))` is
+	/// `1px`, the border builders' hairline, and `raw("padding", dp(8))` `0.5rem`.
 	fun raw<V: CssValue>(self, property: str, value: V): Style {
 		check_property_name(property);
 		let root = value.css_root();
@@ -2140,12 +2204,12 @@ export impl Style {
 				}
 			}
 		}
-		self.rule("", "", property, property + ":" + value.css_text())
+		self.rule("", "", property, property + ":" + value.css_text_as(property_role(property)))
 	}
 
 	/// An untyped property with a `Length` value. Exactly `raw` at that
-	/// instantiation, kept for the spelling the surface has always had — and so a
-	/// `dp` is written in rem, `Role::Rem`, the role-less default.
+	/// instantiation, kept for the spelling the surface has always had — so a `dp`
+	/// takes the role the property's name gives it.
 	///
 	/// THE ROLE TABLE (proposal/length.md §4) is this file's builders: every
 	/// typed length builder below that writes through `with_length` — `gap`, the
@@ -2158,6 +2222,24 @@ export impl Style {
 	/// that body.)
 	fun with_length(self, property: str, value: Length): Style {
 		self.raw(property, value)
+	}
+
+	/// `with_length` with the ROLE named rather than read off the property: a `dp`
+	/// is written in `role`'s unit whatever the property is called —
+	/// `.with_length_as("--rule", dp(1), Role::Px)` for a custom property that
+	/// holds a hairline. The `:root` lines of the length's tokens go on the sheet,
+	/// as `raw` puts them.
+	fun with_length_as(self, property: str, value: Length, role: Role): Style {
+		check_property_name(property);
+		let root = value.root;
+		if root != "" {
+			for line in root.split("\n") {
+				if line != "" {
+					emit("css", line);
+				}
+			}
+		}
+		self.rule("", "", property, property + ":" + value.rendered(role))
 	}
 
 	/// `with_length`'s twin for colors.

@@ -730,17 +730,23 @@ fn a142_s7_a_payload_store_assumed_reads_the_last_payload_once_the_variant_ends(
         &variant_program(
             r#"
             let presence = Store::new(online("laptop", 1));
-            let device: Store<Device> = presence.online().assume();
-            device.name().set("phone");
-            let held: Presence = presence.get();
-            let now = match held {
-                Presence::Online(let d) => d.name,
-                _ => "-",
-            };
-            print(i"live: {device.name().get()} root={now}");
-            presence.set(Presence::Offline);
-            device.name().set("ghost");
-            print(i"ended: {device.name().get()} online={presence.is_online().get()}");
+            // B696: `assume()` needs an owner — `when_live`'s body's, here one
+            // of the test's own.
+            let body = Owner::new();
+            run_with_owner(body, || {
+                let device: Store<Device> = presence.online().assume();
+                device.name().set("phone");
+                let held: Presence = presence.get();
+                let now = match held {
+                    Presence::Online(let d) => d.name,
+                    _ => "-",
+                };
+                print(i"live: {device.name().get()} root={now}");
+                presence.set(Presence::Offline);
+                device.name().set("ghost");
+                print(i"ended: {device.name().get()} online={presence.is_online().get()}");
+            });
+            body.dispose();
             "#,
         ),
         "live: phone root=phone\nended: phone online=false\n",
@@ -770,16 +776,16 @@ fn b526_an_assumed_handle_holds_the_last_value_its_subscribers_read() {
 
         fun main() {
             let slot: Store<Option<Message>> = Store::new(Some(Message { id = 7, content = "hello" }));
-            let held: Store<Message> = slot.some().assume();
             mut seen: List<str> = [];
             let owner = Owner::new();
             run_with_owner(owner, || {
+                let held: Store<Message> = slot.some().assume();
                 held.content().effect_on_change(|content| seen.push(content));
+                let _patched = slot.some().content().patch("edited");
+                slot.set(None);
+                print(seen.join(" "));
+                print(held.content().get());
             });
-            let _patched = slot.some().content().patch("edited");
-            slot.set(None);
-            print(seen.join(" "));
-            print(held.content().get());
             owner.dispose();
         }
 
@@ -933,6 +939,82 @@ fn b526_the_server_twins_when_live_serves_the_payload_as_it_stands() {
     );
 }
 
+/// B694: the server twin's one-shot owners — `when`/`when_live`, `swap`, `each`
+/// (and `each_values`), `each_by` and `when_some` — are disposed once their body
+/// has placed its view, since the render is the body's whole life: a body's
+/// `on_cleanup` runs right after its row is placed, and `when_live`'s keeper
+/// leaves the store (0 feeds after the render; 1 for the process's life
+/// before). The rendered HTML is unchanged.
+#[test]
+fn b694_the_server_twin_disposes_each_bodys_owner_once_it_is_placed() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, on_cleanup };
+        import std::reactive::store::{ Storable, Store, store_feed_census };
+        import std::web::ui::{ View, each, each_by, render, swap, view, when, when_live, when_some };
+
+        [derive(PartialEq, Storable)]
+        struct Device {
+            name: str,
+        }
+
+        [derive(PartialEq, Storable)]
+        enum Presence {
+            Offline,
+            Online(Device),
+        }
+
+        fun main() {
+            let presence = Store::new(Presence::Online(Device { name = "laptop" }));
+            let shown = Signal::new(true);
+            let pick = Signal::new(1);
+            let rows = SignalCell::new([1, 2]);
+            let maybe: Signal<Option<str>> = Signal::new(Some("x"));
+            let page = view("main")
+                .child(when_live(presence.online(), |device| {
+                    on_cleanup(|| print("when_live released"));
+                    view("p").bind_text(device.name())
+                }))
+                .child(when(shown, || {
+                    on_cleanup(|| print("when released"));
+                    view("b")
+                }))
+                .child(swap(pick, |n| {
+                    on_cleanup(|| print(i"swap {n} released"));
+                    view("i")
+                }))
+                .child(each(rows, |n| n, |n| {
+                    on_cleanup(|| print(i"each {n} released"));
+                    view("li")
+                }))
+                .child(each_by(rows, |n| n, |_cell| {
+                    on_cleanup(|| print("each_by row released"));
+                    view("li")
+                }))
+                .child(when_some(maybe, |cell| {
+                    on_cleanup(|| print("when_some released"));
+                    view("em").bind_text(cell)
+                }));
+            print(render(page));
+            print(i"feeds after the render: {store_feed_census(presence)}");
+        }
+
+        main();
+        "#,
+        "when_live released\n\
+         when released\n\
+         swap 1 released\n\
+         each 1 released\n\
+         each 2 released\n\
+         each_by row released\n\
+         each_by row released\n\
+         when_some released\n\
+         <main><p>laptop</p><b></b><i></i><li></li><li></li><li></li><li></li><em>x</em></main>\n\
+         feeds after the render: 0\n",
+    );
+}
+
 // ── A146: a store handle names its state ────────────────────────────────────
 
 #[test]
@@ -954,7 +1036,10 @@ fn a142_s7_every_handle_to_one_path_of_one_store_shares_an_identity() {
             print(user.identity() == user.identity());
             print(user.nick().is_some().identity() == user.nick().is_some().identity());
             let presence = Store::new(online("laptop", 1));
-            print(presence.online().identity() == presence.online().assume().identity());
+            let body = Owner::new();
+            run_with_owner(body, || {
+                print(presence.online().identity() == presence.online().assume().identity());
+            });
             print(presence.is_online().identity() == presence.is_away().identity());
             "#,
         ),
@@ -2462,6 +2547,7 @@ fn m172_a_mirrors_holds_and_releases_cost_their_own_entries_not_the_table() {
 const B693_PHASES: &str = r#"
 import std::hash_map::HashMap;
 import std::io::print;
+import std::reactive::{ Owner, run_with_owner };
 import std::reactive::store::Store;
 
 [derive(PartialEq, Storable)]
@@ -2483,20 +2569,23 @@ fun main() {
         index += 1;
     }
     let store: Store<Option<State>> = Store::new(Some(State { records }));
+    let body = Owner::new();
     print("built");
-    let live = store.some().assume();
-    print("assumed");
-    mut read = 0;
-    for read < 100 {
-        let _title = live.records().at(1).some().title().get();
-        read += 1;
-    }
-    print("read");
-    let _renamed = live.records().at(1).some().title().patch("renamed");
-    print("written inside");
-    store.set(None);
-    print("ended");
-    print(live.records().at(1).some().title().get().unwrap_or("?"));
+    run_with_owner(body, || {
+        let live = store.some().assume();
+        print("assumed");
+        mut read = 0;
+        for read < 100 {
+            let _title = live.records().at(1).some().title().get();
+            read += 1;
+        }
+        print("read");
+        let _renamed = live.records().at(1).some().title().patch("renamed");
+        print("written inside");
+        store.set(None);
+        print("ended");
+        print(live.records().at(1).some().title().get().unwrap_or("?"));
+    });
 }
 
 main();
@@ -2568,9 +2657,8 @@ fn b693_the_assumed_handles_read_lends_and_only_the_keeper_copies() {
 /// §4.3, the keeper's LIFE (`store_feed_census`): `assume()` under an owner
 /// stands one feed, a second `assume()` under it a second, and the owner's
 /// dispose takes both off and prunes the nodes they made; inside an effect each
-/// RUN's `assume()` replaces the last run's; outside any owner the keeper stands
-/// for the store's life, the variant's end included (§6 Q1, `register_with_owner`'s
-/// rule).
+/// RUN's `assume()` replaces the last run's. (Outside every owner `assume()` is
+/// refused at compile time since B696 — `b696_a_top_level_assume_is_refused`.)
 #[test]
 fn b693_the_keeper_stands_while_its_owner_does() {
     assert_compiles_and_runs(
@@ -2620,10 +2708,6 @@ fn b693_the_keeper_stands_while_its_owner_does() {
             print(i"effect: {store_feed_census(presence)}");
             runs.dispose();
             print(i"effect disposed: {census(presence)}");
-            let _outside = presence.online().assume();
-            print(i"outside: {store_feed_census(presence)}");
-            presence.set(Presence::Offline);
-            print(i"ended: {store_feed_census(presence)}");
         }
 
         main();
@@ -2633,9 +2717,7 @@ fn b693_the_keeper_stands_while_its_owner_does() {
          two: nodes=3 feeds=2\n\
          disposed: nodes=1 feeds=0\n\
          effect: 1\n\
-         effect disposed: nodes=1 feeds=0\n\
-         outside: 1\n\
-         ended: 1\n",
+         effect disposed: nodes=1 feeds=0\n",
     );
 }
 
@@ -2644,7 +2726,7 @@ fn b693_the_keeper_stands_while_its_owner_does() {
 const B693_ENDS: &str = r#"
 import std::hash_map::HashMap;
 import std::io::print;
-import std::reactive::Source;
+import std::reactive::{ Owner, Source, run_with_owner };
 import std::reactive::store::{ Storable, Store };
 
 [derive(PartialEq, Storable)]
@@ -2683,9 +2765,12 @@ fun state(name: str): State {
 /// handle and never read through the assumed one before its end, so the row
 /// reads the payload as it stood when its variant ended — the old rule (the
 /// last value a read through the handle saw) answered what it was assumed at.
+/// The row runs under an owner of its own, as `when_live`'s body does (B696).
 fn assert_ends(body: &str, expected: &str) {
     assert_compiles_and_runs(
-        &format!("{B693_ENDS}\nfun main() {{\n{body}\n}}\n\nmain();\n"),
+        &format!(
+            "{B693_ENDS}\nfun main() {{\nlet body = Owner::new();\nrun_with_owner(body, || {{\n{body}\n}});\nbody.dispose();\n}}\n\nmain();\n"
+        ),
         expected,
     );
 }
@@ -2804,16 +2889,77 @@ fn b693_after_the_end_a_write_lands_nowhere_and_a_new_payload_is_read_live() {
 fn b693_assuming_a_dead_variant_is_refused() {
     assert_run_panics(
         r#"
+        import std::reactive::{ Owner, run_with_owner };
         import std::reactive::store::Store;
 
         fun main() {
             let slot: Store<Option<str>> = Store::new(None);
-            let _held = slot.some().assume();
+            run_with_owner(Owner::new(), || {
+                let _held = slot.some().assume();
+            });
         }
 
         main();
         "#,
         "`StoreSome::assume` on a variant that is not live",
+    );
+}
+
+/// B696 (the owner's Q13: refusing is smarter): `assume()` outside every owner
+/// would stand its keeper for the store's life, so it is refused at compile
+/// time — the context-coverage refusal `on_cleanup` gets, at the call — while
+/// the same call inside an owner's body is clean.
+#[test]
+fn b696_a_top_level_assume_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::store::Store;
+
+        fun main() {
+            let slot: Store<Option<str>> = Store::new(Some("a"));
+            let _held = slot.some().assume();
+        }
+
+        main();
+        "#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    // A helper that assumes is refused at ITS callers, the requirement carried.
+    assert_fails_with(
+        r#"
+        import std::reactive::store::{ Store, StoreSome };
+
+        fun hold(handle: StoreSome<str>): Store<str> {
+            handle.assume()
+        }
+
+        fun main() {
+            let slot: Store<Option<str>> = Store::new(Some("a"));
+            let _held = hold(slot.some());
+        }
+
+        main();
+        "#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, run_with_owner };
+        import std::reactive::store::Store;
+
+        fun main() {
+            let slot: Store<Option<str>> = Store::new(Some("a"));
+            let body = Owner::new();
+            run_with_owner(body, || {
+                print(slot.some().assume().get());
+            });
+            body.dispose();
+        }
+
+        main();
+        "#,
+        "a\n",
     );
 }
 
@@ -2933,7 +3079,7 @@ fn m186_a_shared_paths_identity_is_the_identity_of_its_steps() {
         r#"
         import std::hash_map::HashMap;
         import std::io::print;
-        import std::reactive::Source;
+        import std::reactive::{ Owner, Source, run_with_owner };
         import std::reactive::store::Store;
 
         [derive(PartialEq, Storable)]
@@ -2957,7 +3103,9 @@ fn m186_a_shared_paths_identity_is_the_identity_of_its_steps() {
             let copy = keyed;
             print(title.identity() == store.some().records().at(1).some().title().identity());
             print(title.identity() == copy.some().title().identity());
-            print(title.identity() == store.some().assume().records().at(1).some().title().identity());
+            run_with_owner(Owner::new(), || {
+                print(title.identity() == store.some().assume().records().at(1).some().title().identity());
+            });
             print(title.identity() == store.some().records().at(2).some().title().identity());
             print(title.identity() == store.some().records().at(1).some().notes().identity());
             print(copy.identity() == keyed.identity());

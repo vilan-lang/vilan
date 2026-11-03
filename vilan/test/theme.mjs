@@ -4,8 +4,10 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function class_list(self) {
 	let out = "";
@@ -22,11 +24,11 @@ function class_list(self) {
 	return out;
 }
 function values(self) {
-	return __map_values(self[1]);
+	return __nmap_values(self[0]);
 }
-const card = [ [ new Map([ [ "::padding", "::padding" ], [ "::color", "::color" ], [ "::background-color", "::background-color" ], [ "::border", "::border" ] ]), new Map([ [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ], [ "::color", [ "s8f74a7", "color:var(--color-ink)" ] ], [ "::background-color", [ "s1caphfa", "background-color:var(--color-ground)" ] ], [ "::border", [ "syywdmj", "border:1px solid rgb(from var(--color-ink) r g b / 0.2)" ] ] ]) ] ];
+const card = [ [ [ new Map([ [ "::padding", [ "::padding", [ 0, [ "s1ufvr2", "padding:var(--space-4)" ] ] ] ], [ "::color", [ "::color", [ 0, [ "s8f74a7", "color:var(--color-ink)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "s1caphfa", "background-color:var(--color-ground)" ] ] ] ], [ "::border", [ "::border", [ 0, [ "syywdmj", "border:1px solid rgb(from var(--color-ink) r g b / 0.2)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(card));
 const iron_dark = [ [ "^[data-theme=\"iron-dark\"]" ] ];
-const lifted = [ [ new Map([ [ "::padding", "::padding" ], [ "::color", "::color" ], [ "::background-color", "::background-color" ], [ "::border", "::border" ], [ "::box-shadow", "::box-shadow" ], [ ":^[data-theme=\"iron-dark\"]:box-shadow", ":^[data-theme=\"iron-dark\"]:box-shadow" ], [ ":^[data-theme=\"iron-dark\"] hover:border-color", ":^[data-theme=\"iron-dark\"] hover:border-color" ] ]), new Map([ [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ], [ "::color", [ "s8f74a7", "color:var(--color-ink)" ] ], [ "::background-color", [ "s1caphfa", "background-color:var(--color-ground)" ] ], [ "::border", [ "syywdmj", "border:1px solid rgb(from var(--color-ink) r g b / 0.2)" ] ], [ "::box-shadow", [ "s1qtu9wx", "box-shadow:0 1px 2px rgba(0, 0, 0, 0.08)" ] ], [ ":^[data-theme=\"iron-dark\"]:box-shadow", [ "shy6qhb", "box-shadow:none" ] ], [ ":^[data-theme=\"iron-dark\"] hover:border-color", [ "sl22br5", "border-color:var(--color-ink)" ] ] ]) ] ];
+const lifted = [ [ [ new Map([ [ "::padding", [ "::padding", [ 0, [ "s1ufvr2", "padding:var(--space-4)" ] ] ] ], [ "::color", [ "::color", [ 0, [ "s8f74a7", "color:var(--color-ink)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "s1caphfa", "background-color:var(--color-ground)" ] ] ] ], [ "::border", [ "::border", [ 0, [ "syywdmj", "border:1px solid rgb(from var(--color-ink) r g b / 0.2)" ] ] ] ], [ "::box-shadow", [ "::box-shadow", [ 0, [ "s1qtu9wx", "box-shadow:0 1px 2px rgba(0, 0, 0, 0.08)" ] ] ] ], [ ":^[data-theme=\"iron-dark\"]:box-shadow", [ ":^[data-theme=\"iron-dark\"]:box-shadow", [ 0, [ "shy6qhb", "box-shadow:none" ] ] ] ], [ ":^[data-theme=\"iron-dark\"] hover:border-color", [ ":^[data-theme=\"iron-dark\"] hover:border-color", [ 0, [ "sl22br5", "border-color:var(--color-ink)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(lifted));
 //# sourceMappingURL=theme.mjs.map

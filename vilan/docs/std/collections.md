@@ -251,8 +251,7 @@ impl HashMap<type K: Hashable, type V> {
 	fun insert(&mut self, key: K, value: V)
 	fun get(self, key: K): Option<V>                      // one copy of the held value
 	fun peek<U>(self, key: K, read: |&Option<V>| U): U    // read the slot in place
-	fun modify<U>(&mut self, key: K, write: |&mut Option<V>| U): U   // write the slot in place
-	fun update(&mut self, key: K, lazy missing: V, change: |&mut V| void)   // change in place, `missing` first on a miss
+	fun slot(&mut self, key: K): &mut Option<V> borrows self   // the slot itself, to write in place
 	fun get_or_insert(&mut self, key: K, make: || V): V   // the held value, or make() stored and answered
 	fun contains_key(self, key: K): bool
 	fun remove(&mut self, key: K)
@@ -377,16 +376,16 @@ fun main() {
 value you keep. To read a part of a large value, or to change it, reach the
 slot where it is instead. `peek` hands its reader the slot under `key` as an
 `&Option<V>` — `Some(value)` in place while the key is held, `None` otherwise —
-and copies nothing; what the reader copies out is its own. `modify` hands its
-writer an `&mut Option<V>`, and the map takes on whatever the slot holds when
-the writer returns: leave it `None` and the key is gone; make it `Some` under a
-key the map did not hold and the key is inserted, last; a key that was there
-keeps its place whatever was written. Both answer what their closure answers.
+and copies nothing; what the reader copies out is its own.
 
-`update` is the everyday case of `modify`: change the value under `key` where it
-is, inserting `missing` first when there is none. `missing` is `lazy`, so it is
-evaluated only on a miss, and `change` runs on the fresh value too. Grouping
-rows under their keys is then one push per row, never a copy of the list:
+`slot` answers the slot ITSELF, an `&mut Option<V>` that is the map's own
+storage, so whatever is written through it is the map's: make it `Some` under a
+key the map did not hold and the key is inserted, last; leave it `None` and the
+key is gone; a key that was there keeps its place whatever was written.
+`Option::get_or_insert(value)` fills a `None` with `value` — evaluated only
+then, it is `lazy` — and answers the payload in place, which makes the entry
+idiom one expression: grouping rows under their keys is one push per row, never
+a copy of the list, and counting is one add per word.
 
 ```vilan
 import std::hash_map::HashMap;
@@ -394,19 +393,28 @@ import std::hash_map::HashMap;
 fun main() {
 	mut groups: HashMap<i32, List<i32>> = HashMap::new();
 	for row in [1, 2, 3, 4, 5, 6, 7] {
-		groups.update(row % 3, [], |list| list.push(row));
+		groups.slot(row % 3).get_or_insert([]).push(row);
 	}
 	print(groups.get(1).unwrap_or([]));                    // [1, 4, 7]
 	print(groups.peek(2, |slot| slot.map_or(|list| list.len(), 0usize)));   // 2
-	let gone = groups.modify(0, |slot| {
-		let held = slot.is_some();
-		slot = None;
-		held
-	});
-	print(gone);                                           // true
+	let gone = groups.slot(0).take();                      // removed, and answered
+	print(gone);                                           // Some([3, 6])
 	print(groups.keys());                                  // [1, 2]
+
+	mut counts: HashMap<str, i32> = HashMap::new();
+	for word in ["to", "be", "or", "not", "to", "be"] {
+		counts.slot(word).get_or_insert(0) += 1;
+	}
+	print(counts.get("to"));                               // Some(2)
+	groups.slot(9) = Some([9]);                            // insert, through the slot
+	print(groups.keys());                                  // [1, 2, 9]
 }
 ```
+
+The slot is a VIEW (`borrows self`, spec memory.md §6.5): use it where it is
+made — in one expression, as above, or in a short-lived local the map is not
+touched beside. Holding it across another use of the map, storing it, or
+capturing it in a closure is refused at compile time, as for every view.
 
 ## `HashSet<T>`
 

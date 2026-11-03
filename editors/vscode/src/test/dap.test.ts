@@ -202,7 +202,7 @@ const TYPES = [
     { text: 'Option<i32>', shape: 'enum', variants: [['Some', [0]], ['None', []]] },
     { text: 'List<i32>', shape: 'list', element: 0, fill: true },
     { text: 'str', shape: 'str' },
-    { text: 'HashMap<str, i32>', shape: 'map', label: 'HashMap', keys: 0, values: 1, key: 4, value: 0 },
+    { text: 'HashMap<str, i32>', shape: 'map', label: 'HashMap', table: 0, key: 4, value: 0 },
     { text: 'SignalCell<i32>', shape: 'cell', label: 'SignalCell', field: 0, value: 0 },
     { text: '(i32, (i32, str))', shape: 'tuple', elements: [['', 0, 1], ['', 8, 2]] },
     { text: '(i32, str)', shape: 'tuple', elements: [['', 0, 1], ['', 4, 1]] },
@@ -224,15 +224,14 @@ test('the walker reads each JavaScript representation as its type prints', () =>
     assert.equal(read([1], 2), 'None');
     assert.equal(read([1, 2, 3], 3), '[1, 2, 3]');
     assert.equal(read('a "quoted"\n', 4), '"a \\"quoted\\"\\n"');
-    const keys = new Map<unknown, unknown>([
-        [101, 'ada'],
-        [102, 'alan'],
+    // One table (M191): each hash to `[ key, slot ]`; the pending `None` slot
+    // under 103 is a tombstone the walk skips.
+    const table = new Map<unknown, unknown>([
+        [101, ['ada', [0, 36]]],
+        [103, ['ann', [1]]],
+        [102, ['alan', [0, 41]]],
     ]);
-    const values = new Map<unknown, unknown>([
-        [101, 36],
-        [102, 41],
-    ]);
-    assert.equal(read([keys, values], 5), 'HashMap { "ada" => 36, "alan" => 41 }');
+    assert.equal(read([[table, 103]], 5), 'HashMap { "ada" => 36, "alan" => 41 }');
     assert.equal(read([{ v: 3 }, { v: [] }], 6), 'SignalCell(3)');
     // A tuple stores flat: `(1, (2, "two"))` is `[1, 2, "two"]`.
     assert.equal(read([1, 2, 'two'], 7), '(1, (2, "two"))');

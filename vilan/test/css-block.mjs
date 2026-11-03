@@ -11,11 +11,39 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_keys(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);
+	return out.map(__clone);
+}
+function __nmap_remove(table, hash) {
+	__nmap_settle(table);
+	table[0].delete(hash);
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
+}
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function __panic(message, location) {
 	const error = new Error(message);
@@ -31,10 +59,10 @@ function slot_of(key) {
 	const parts = key.split(":");
 	if (parts.length !== 3) {
 		(() => {
-			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:1243:3");
+			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:1305:3");
 		})();
 	}
-	return [ __at(parts, 0, "std/src/web/style.vl:1245:17"), __at(parts, 1, "std/src/web/style.vl:1245:39"), __at(parts, 2, "std/src/web/style.vl:1245:60") ];
+	return [ __at(parts, 0, "std/src/web/style.vl:1307:17"), __at(parts, 1, "std/src/web/style.vl:1307:39"), __at(parts, 2, "std/src/web/style.vl:1307:60") ];
 }
 function family_longhands(property) {
 	const $d = property;
@@ -113,30 +141,26 @@ function add(self, b) {
 	return [ rules ];
 }
 function values(self) {
-	return __map_values(self[1]);
+	return __nmap_values(self[0]);
 }
 function keys(self) {
-	return __map_values(self[0]);
+	return __nmap_keys(self[0]);
 }
 function get(self, key) {
-	return __map_get(self[1], hash(key));
+	return __nmap_get(self[0], hash(key));
 }
 function remove(self, key) {
-	const hash2 = hash(key);
-	self[0].delete(hash2);
-	self[1].delete(hash2);
+	__nmap_remove(self[0], hash(key));
 }
 function insert(self, key, value) {
-	const hash2 = hash(key);
-	self[0].set(hash2, __clone(key));
-	self[1].set(hash2, __clone(value));
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
-const block = [ [ new Map([ [ "::display", "::display" ], [ "::flex-direction", "::flex-direction" ], [ "::gap", "::gap" ], [ "::padding", "::padding" ], [ "::background-color", "::background-color" ], [ "::border-radius", "::border-radius" ], [ "768px::padding", "768px::padding" ], [ ":hover:background-color", ":hover:background-color" ] ]), new Map([ [ "::display", [ "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
-const chain = [ [ new Map([ [ "::display", "::display" ], [ "::flex-direction", "::flex-direction" ], [ "::gap", "::gap" ], [ "::padding", "::padding" ], [ "::background-color", "::background-color" ], [ "::border-radius", "::border-radius" ], [ "768px::padding", "768px::padding" ], [ ":hover:background-color", ":hover:background-color" ] ]), new Map([ [ "::display", [ "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
+const block = [ [ [ new Map([ [ "::display", [ "::display", [ 0, [ "sbiovxm", "display:flex" ] ] ] ], [ "::flex-direction", [ "::flex-direction", [ 0, [ "s1atdsbb", "flex-direction:column" ] ] ] ], [ "::gap", [ "::gap", [ 0, [ "s8myyrk", "gap:var(--space-4)" ] ] ] ], [ "::padding", [ "::padding", [ 0, [ "s1ufvr2", "padding:var(--space-4)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "siolu0w", "background-color:var(--gray-50)" ] ] ] ], [ "::border-radius", [ "::border-radius", [ 0, [ "s94jklx", "border-radius:8px" ] ] ] ], [ "768px::padding", [ "768px::padding", [ 0, [ "s1wyflm5", "padding:var(--space-6)" ] ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ 0, [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ] ]), undefined ] ] ];
+const chain = [ [ [ new Map([ [ "::display", [ "::display", [ 0, [ "sbiovxm", "display:flex" ] ] ] ], [ "::flex-direction", [ "::flex-direction", [ 0, [ "s1atdsbb", "flex-direction:column" ] ] ] ], [ "::gap", [ "::gap", [ 0, [ "s8myyrk", "gap:var(--space-4)" ] ] ] ], [ "::padding", [ "::padding", [ 0, [ "s1ufvr2", "padding:var(--space-4)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "siolu0w", "background-color:var(--gray-50)" ] ] ] ], [ "::border-radius", [ "::border-radius", [ 0, [ "s94jklx", "border-radius:8px" ] ] ] ], [ "768px::padding", [ "768px::padding", [ 0, [ "s1wyflm5", "padding:var(--space-6)" ] ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ 0, [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(block));
 console.log(class_list(chain));
 console.log("sflnbwj sgdl28p sw0ajwn s9bu6v3 s16sw83c s1e7dqf5 s17s8g64");
 console.log("s1hbuywq s1dwvy7w s3s9k3d scur295 sxzag36 skr9oll");
-const wider = [ [ new Map([ [ "::padding", "::padding" ] ]), new Map([ [ "::padding", [ "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
+const wider = [ [ [ new Map([ [ "::padding", [ "::padding", [ 0, [ "s1ufvsw", "padding:var(--space-6)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(add(block, wider)));
 //# sourceMappingURL=css-block.mjs.map

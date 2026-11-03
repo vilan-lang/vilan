@@ -164,13 +164,15 @@ external fun refused_body_read(): usize;
 
 /// Runs one request's answer. A CANCELLATION ends it quietly — the body was
 /// refused (`read_body`'s `413` is already on the wire) or the client went away,
-/// so the request is over and nobody is waiting for it; every other failure
-/// propagates exactly as it did without this. Node ignores the promise a
-/// `createServer` callback returns, so without it the refusal would be an
-/// unhandled rejection, which ends the process; the native server spawns the
-/// callback as a task, where a cancellation is already quiet.
+/// so the request is over and nobody is waiting for it. Any OTHER failure — a
+/// handler that panics — is reported once, the `unhandled task error (spawned in
+/// an http request handler)` line, and answered `500` with `Connection: close`
+/// when the response has not started (cut off when it has), and the server goes
+/// on serving (M179). Node ignores the promise a `createServer` callback returns,
+/// so without this a panic was an unhandled rejection that ended the process;
+/// natively the spawned task reported it and left the response open.
 [extern("__http_respond")]
-async external fun respond(body: async || void);
+async external fun respond(reply: NodeResponse, body: async || void);
 
 export external struct NodeResponse;
 
@@ -723,7 +725,7 @@ export impl Server {
 			// handler is called indirectly and so can't suspend"), and a
 			// synchronous file read in `std::fs` was justified by that claim for
 			// the length of its life.
-			respond(|| answer(request_handler, body_limits, node_request, node_response));
+			respond(node_response, || answer(request_handler, body_limits, node_request, node_response));
 		});
 		match upgrade_handler {
 			Some(let handler) => node_server.on_upgrade("upgrade", handler),
