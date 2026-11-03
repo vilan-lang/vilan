@@ -26,6 +26,7 @@ written down.
 ## Unreleased
 
 <!-- family: performance -->
+<!-- commit: 886f03fcb9df2b1173f851f9295639513e04d085 -->
 **The editor's served keystroke on kolt reads 7.81 G instructions where it read 9.85 (−20.7 %), css −3.3 %, parse break −7.8 % (lane incr-56, the N186 series on the Order 56 exhibit): the hover rows' `implementors_in_reach` — 1.39 G, 13.4 % of the keystroke, its costliest function — is indexed by trait and memoized across one rendering; the const pass's `asset::staged` liveness check runs one rolling-hash pass per token length where it ran one per token (0.79 G); `check_view_escape`'s retaining summary is computed per callee a live call asks about, over a new class D row family `Retain` filed per module (M188; derived bodies walked only when a summary reaches one), and its capture scan is a lazy per-closure memo inside the pass (M189).** Census counters `retaining-summaries` (was `retaining-fixpoints`), `retain-rows-live`, `capture-scans`; the edit-replay differential observes the Retain index (plant `RetainRowsUnrestored`). Nothing answered changes; the T2 perf gate stays green with no bump. Pins: `edit_replay_differential` (the Retain plant), `inference::borrows` (the summary's answers), the E310 hover pin (plant: one impl per trait kept goes red). Tracker M188, M189, M110.
 ---
 
