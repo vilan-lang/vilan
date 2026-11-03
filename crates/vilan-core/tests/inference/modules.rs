@@ -8254,7 +8254,10 @@ fn b688_a_derived_block_and_a_block_beside_its_argument_type_are_reached() {
 
 /// A program's own extension block: `extra.vl` extends `Thing` (declared in
 /// `thing.vl`). A file that imports `Thing` alone is refused at `bump`, naming
-/// `pkg::extra` and an import from it; importing from `extra` — by a name, or
+/// `pkg::extra` and the selector that admits the block (E359:
+/// `import pkg::extra::(impl pkg::thing::Thing);`, the subject spelled
+/// absolutely — no longer `extra`'s first declaration, which read as an
+/// unrelated import); importing from `extra` — by the fix's own line, by a name, or
 /// by a selector-only statement, or by a statement written inside the
 /// function body — resolves.
 #[test]
@@ -8278,7 +8281,7 @@ fn b688_a_programs_own_extension_block_needs_its_module() {
         refused.diagnostics.iter().any(|(message, _, file)| {
             file.as_deref() == Some("user.vl")
                 && message.contains("`bump` comes from the `impl Thing` block in `pkg::extra`")
-                && message.ends_with("Import it (`import pkg::extra::helper;`)")
+                && message.ends_with("Import it (`import pkg::extra::(impl pkg::thing::Thing);`)")
         }),
         "{:?}",
         refused.diagnostics
@@ -8286,6 +8289,9 @@ fn b688_a_programs_own_extension_block_needs_its_module() {
     for user in [
         "import pkg::thing::Thing;\nimport pkg::extra::helper;\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
         "import pkg::thing::Thing;\nimport pkg::extra::{ (impl Thing) };\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+        // E359: the quick fix's own line, verbatim — a file that imports
+        // nothing from `extra` but the block.
+        "import pkg::thing::Thing;\nimport pkg::extra::(impl pkg::thing::Thing);\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
         "import pkg::thing::Thing;\n\nexport fun run(): i32 {\n\timport pkg::extra::helper;\n\tThing { n = 1 }.bump()\n}\n",
     ] {
         let (_, stdout) = compile_and_run_package(
@@ -8300,6 +8306,69 @@ fn b688_a_programs_own_extension_block_needs_its_module() {
         .unwrap_or_else(|errors| panic!("{user}: {errors:?}"));
         assert_eq!(stdout, "10\n");
     }
+}
+
+/// E359 (A181 Q7): the quick fix for a block in a USER module extending a
+/// STD type — kolt's `pkg::styles` writing `impl Style { fun ghost }` — spells
+/// the selector with std's absolute path, and the editor reads that line back
+/// as the fix; applied verbatim, the file compiles and runs. A generic
+/// subject's binder is the hole `_`, inside the type.
+#[test]
+fn e359_the_quick_fix_spells_the_block_absolutely_and_compiles() {
+    let styles = "import std::web::style::Style;\n\nexport impl Style {\n\tfun ghost(self): Style {\n\t\tself\n\t}\n}\n\n\
+                  export impl List<type T> {\n\tfun second(self): Option<T> {\n\t\tself.get(1)\n\t}\n}\n\n\
+                  export fun unrelated(): i32 {\n\t1\n}\n";
+    let user = |imports: &str| {
+        format!(
+            "import std::web::style::style;\n{imports}\nexport fun run(): i32 {{\n\tlet ghost = style().ghost();\n\t[1, 2].second().unwrap_or(0)\n}}\n"
+        )
+    };
+    // `other.vl` imports `pkg::styles`, so its blocks LOAD in this build —
+    // B688's shape — and `user.vl` leans on that.
+    let other = "import pkg::styles::unrelated;\n\nexport fun one(): i32 {\n\tunrelated()\n}\n";
+    let main = "import pkg::other::one;\nimport pkg::user::run;\n\nfun main() {\n\tprint(run() + one());\n}\nmain();\n";
+    let refused = analyze_package(
+        &[
+            ("styles.vl", styles),
+            ("other.vl", other),
+            ("user.vl", &user("")),
+            ("main.vl", main),
+        ],
+        "main.vl",
+    );
+    let fixes: Vec<&str> = refused
+        .diagnostics
+        .iter()
+        .filter(|(_, _, file)| file.as_deref() == Some("user.vl"))
+        .filter_map(|(message, ..)| vilan_core::analyzer::trait_scope_import(message))
+        .collect();
+    assert_eq!(
+        fixes,
+        [
+            "import pkg::styles::(impl std::web::style::Style);",
+            "import pkg::styles::(impl std::list::List<_>);",
+        ],
+        "{:?}",
+        refused.diagnostics
+    );
+    assert!(
+        refused.diagnostics.iter().any(|(message, ..)| message
+            .starts_with("`ghost` comes from the `impl Style` block in `pkg::styles`")),
+        "the sentence names the block: {:?}",
+        refused.diagnostics
+    );
+    let fixed = user(&format!("{}\n", fixes.join("\n")));
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("styles.vl", styles),
+            ("other.vl", other),
+            ("user.vl", &fixed),
+            ("main.vl", main),
+        ],
+        "main.vl",
+    )
+    .unwrap_or_else(|errors| panic!("{fixed}: {errors:?}"));
+    assert_eq!(stdout, "3\n");
 }
 
 /// B688's reach reads every import statement of the file, wherever it is

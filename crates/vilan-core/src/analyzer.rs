@@ -65151,10 +65151,17 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B688: the module an extension block is written in, as an import path
-    /// (`std::display`), and the import statement that brings it in scope —
-    /// std's steer index's choice (the trait the block names, as the "no
-    /// method" steer quotes it), else a trait of the block's bounds the module
-    /// declares, else the module's first declaration, else the module whole.
+    /// (`std::display`), and the import statement that brings it in scope.
+    ///
+    /// A std block keeps std's steer index's choice — the trait the block
+    /// names, as the "no method" steer quotes it — so a std refusal reads the
+    /// same whether or not the block loaded. Every other block is admitted by
+    /// the statement that says exactly that (E359; A181, `import-foundation.md`
+    /// §10 Q7): the block's module projected to the block's subject, spelled
+    /// absolutely — `import pkg::app_overlay::(impl pkg::lib::overlay::Overlay);`
+    /// — which compiles in a file that imports nothing else from either module.
+    /// The module's first declaration it steered to before read as an import
+    /// unrelated to the call.
     fn extension_block_import(&mut self, index: usize, member_name: &str) -> (String, String) {
         let (subject, impl_id, source, written_in) = {
             let implementation = &self.implementations[index];
@@ -65168,52 +65175,84 @@ impl<'src> Analyzer<'src> {
         // A derived block's scope is the expansion's; its module is the one
         // whose file holds the attribute.
         let derived_from = self.derived_origin_file(impl_id);
-        let block_file = derived_from.unwrap_or(source);
         let paths = self.module_import_paths();
         let module = self.modules.values().find(|module| match derived_from {
             Some(file) => self.scope_file(module.body.1) == Some(file),
             None => module.body.1 == written_in,
         });
-        let module_scope = module.map(|module| module.body.1);
         let module_path = module
             .and_then(|module| paths.get(&module.id).cloned())
             .unwrap_or_default();
-        self.build_std_indexes_if_needed();
-        let head = self.type_head_name(subject);
-        let std_steer = head.and_then(|head| {
-            self.std_trait_method_index
-                .as_ref()?
-                .get(&(head.to_string(), member_name.to_string()))
-                .filter(|(_, module)| format!("std::{module}") == module_path)
-                .map(|(importable, _)| importable.clone())
-        });
-        let declared_here = |id: Id| self.declaring_file(id) == Some(block_file);
-        let mut binders = Vec::new();
-        self.collect_subject_binders(subject, &mut binders);
-        if let Type::Generic(constraint) = subject.get_type(self) {
-            binders.push(constraint);
+        let block_file = derived_from.unwrap_or(source);
+        if self.std_sources.contains(&block_file) {
+            self.build_std_indexes_if_needed();
+            let head = self.type_head_name(subject);
+            if let Some(name) = head.and_then(|head| {
+                self.std_trait_method_index
+                    .as_ref()?
+                    .get(&(head.to_string(), member_name.to_string()))
+                    .filter(|(_, module)| format!("std::{module}") == module_path)
+                    .map(|(importable, _)| importable.clone())
+            }) {
+                return (
+                    module_path.clone(),
+                    format!("import {module_path}::{name};"),
+                );
+            }
         }
-        let bound_trait = binders
-            .iter()
-            .flat_map(|binder| self.generic_bound_traits(*binder))
-            .filter_map(|(trait_id, _)| self.traits.get(&trait_id))
-            .find(|trait_| declared_here(trait_.id))
-            .map(|trait_| trait_.name.to_string());
-        let first_declaration = module_scope
-            .and_then(|scope_id| self.scopes.get(&scope_id))
-            .and_then(|scope| {
-                scope
-                    .declaration_order
-                    .iter()
-                    .find(|(_, id)| self.exported_entities.contains_key(id))
-                    .or_else(|| scope.declaration_order.first())
-                    .map(|(name, _)| name.to_string())
-            });
-        let import = match std_steer.or(bound_trait).or(first_declaration) {
-            Some(name) => format!("import {module_path}::{name};"),
-            None => format!("import {module_path};"),
-        };
+        let subject_text = self.absolute_subject_text(subject, true);
+        let import = format!("import {module_path}::(impl {subject_text});");
         (module_path, import)
+    }
+
+    /// E359: an impl block's SUBJECT as a selector writes it absolutely
+    /// (A181) — every nominal type by the root-headed path of the module that
+    /// declares it (`pkg::lib::overlay::Overlay`, `std::web::style::Style`), a
+    /// binder as the hole `_`, and a subject that is a binder WHOLE as `*`
+    /// (`impl type T` takes every block, `(impl *)`). So the spelling resolves
+    /// whatever the importing file has imported. A shape with no path of its
+    /// own falls back to the type as the reader sees it.
+    fn absolute_subject_text(&self, type_id: TypeId, whole: bool) -> String {
+        let arguments = |arguments: &[TypeId]| match arguments.is_empty() {
+            true => String::new(),
+            false => format!(
+                "<{}>",
+                arguments
+                    .iter()
+                    .map(|argument| self.absolute_subject_text(*argument, false))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        match type_id.get_type(self) {
+            Type::Generic(_) => match whole {
+                true => crate::node::EVERY_IMPL_SUBJECT.to_string(),
+                false => crate::node::ANONYMOUS_TYPE_BINDER.to_string(),
+            },
+            Type::Struct(id, written) | Type::Enum(id, written) | Type::Trait(id, written) => {
+                match self.import_path_of(id) {
+                    Some(path) => format!("{path}{}", arguments(&written)),
+                    None => self.pretty_print_type(&type_id.get_type(self), &HashMap::default()),
+                }
+            }
+            Type::Tuple(elements, labels) if !labels.is_labelled() => format!(
+                "({})",
+                elements
+                    .iter()
+                    .map(|element| self.absolute_subject_text(*element, false))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Type::Array(element, length) => format!(
+                "[{}; {}]",
+                self.absolute_subject_text(element, false),
+                match length.get_type(self) {
+                    Type::Length(length) => length.to_string(),
+                    _ => crate::node::ANONYMOUS_TYPE_BINDER.to_string(),
+                }
+            ),
+            other => self.pretty_print_type(&other, &HashMap::default()),
+        }
     }
 
     /// B515: a TRAIT's method called on a concrete receiver in a file that
