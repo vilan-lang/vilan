@@ -677,3 +677,10 @@ class = "reference"
 ratio = 1.025
 reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0304 of the ceiling where the limit stood at x1.0100"
 item = "M187"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.01
+reason = "Order 56 (http-56 M176/M177 + the std-wide causes the other Order 56 rows carry): std::http's body stream + multipart reach the rpc example through std; the row sat at its limit and flipped on noise (CI read x1.0151 of the ceiling at next 6dbbab39 where the limit stood at x1.0150; x1.0145 at cbcddd34)"
+item = "M176"
