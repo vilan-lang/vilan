@@ -6299,6 +6299,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
         ) || self.is_a_view_call(id)
     }
 
+    /// F154: whether a string `match` subject is a BARE binding this backend
+    /// holds as a reference — a loaned parameter (a method's `self`), a `for e
+    /// in &mut` element, a payload view, a view-holding `let` — so `&*` over it
+    /// would stop at `&Rc<str>`. A subject already copied (rule 1's `.clone()`
+    /// for a binding leg) is a value, and so is every other subject: their
+    /// `&*` is unchanged.
+    fn matches_a_string_through_a_loan(&self, subject: Id, subject_text: &str) -> bool {
+        if subject_text.ends_with(".clone()") {
+            return false;
+        }
+        match self.program.entity_map.get(&subject) {
+            Some(Expr::Parameter(_)) => self.reads_a_loaned_parameter(subject),
+            Some(Expr::Local(binding)) => {
+                self.reads_a_loaned_parameter(subject)
+                    || self.program.for_each_views.contains_key(binding)
+                    || self.program.payload_view_captures.contains_key(binding)
+                    || self.binding_holds_a_view(*binding)
+            }
+            _ => false,
+        }
+    }
+
     /// F128: whether `*operand` reads a binding this backend holds as a
     /// VALUE, not a reference — so the `*` has nothing to cross. A parameter
     /// received by value (a bare one other than `self`, `own`, a closure's
@@ -8891,7 +8913,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => false,
         });
         if matches_a_string {
-            subject_text = format!("&*({subject_text})");
+            subject_text = if self.matches_a_string_through_a_loan(subject, &subject_text) {
+                // F154: a binding held as a LOAN (`self` of a `str`-backed
+                // enum's method is a `&Rc<str>`: its synthesized `value()`,
+                // and any `match self` over its variants) — `&*` stops at
+                // `&Rc<str>`, which no `&str` literal matches (rustc E0308).
+                // `AsRef` reaches the `str` through either form, so a binding
+                // read as a loan that is a value after all still builds.
+                format!("AsRef::<str>::as_ref(&({subject_text}))")
+            } else {
+                format!("&*({subject_text})")
+            };
         }
         let pad = Self::indent(depth);
         let leg_pad = Self::indent(depth + 1);

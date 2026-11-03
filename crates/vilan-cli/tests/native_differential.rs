@@ -14082,6 +14082,48 @@ fn f153_a_for_over_the_key_stream_builds_on_both_backends() {
     }
 }
 
+/// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
+/// and answers what JS answers. The synthesized `value()` (and a hand-written
+/// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where
+/// `&*` stopped short of the `&str` the variants' literals need (rustc E0308).
+/// Read through a method, off a call, a struct field and a list element;
+/// printed, matched after and parsed back; an int-backed `match self` is the
+/// control. The emission pin: the loaned receiver's match reaches the `str`
+/// through `AsRef`, and an owned subject keeps its `&*`.
+#[test]
+fn f154_a_str_backed_value_at_run_time_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_str_backed_value.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/str_backed_value.vl"),
+    )
+    .expect("write the probe program");
+    let expected =
+        "rem\n%\nUnit::Rem\ntrue\nfalse\n1.5%\npx;rem;%;\nmatched rem\ntrue\ntrue\nfalse\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_str_backed_value")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("match AsRef::<str>::as_ref(&(this)) {"),
+        "the loaned receiver reaches its `str`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("match &*(unit_"),
+        "an owned subject keeps its `&*`:\n{emitted}"
+    );
+}
+
 /// native-54's F?1: `Option::take` / `Option::replace` over a receiver that
 /// lives in a CELL natively — a module-level binding (`module_maybe.take()`),
 /// a field of one, a captured binding, a `Shared` view's field
