@@ -609,6 +609,18 @@ would otherwise be re-filled to a width nobody chose the day it opted in. The
 key is read only when `wrap_comments` is on: with the knob off nothing is
 re-laid-out at any width.
 
+**A project changes two things about `vilan fmt`, and nothing else.** Its
+`[fmt]` keys decide whether comments are re-filled and to what width, and its
+`generated` root (below) decides which files are not formatted at all. Every
+other rule — how code is laid out, the import block, the width code is laid
+out to — is the file's own, the same in any tree or in none. So a file
+formatted on its own, with no `vilan.toml` above it, takes the defaults: its
+comments stay as written even where its package would re-fill them. A copy of
+one of std's modules formatted in a scratch directory re-fills nothing that
+`vilan fmt` in std re-fills, because std's manifest opts in. To see what a
+file's tree does to it, format it in its tree, or put its `vilan.toml` beside
+the copy.
+
 **Ten classes are never re-filled**, because re-wrapping them destroys
 something: fenced code blocks; list items (an item is a line, and joining two
 makes one); tables; headings; block quotes; a line with an interior run of two
