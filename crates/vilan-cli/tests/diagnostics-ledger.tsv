@@ -793,3 +793,5 @@ NEW	-	`{member_name}` comes from the `impl {subject}` block in `{module_path}`, 
 NEW	-	`{method}` takes `own self` and answers the `{type_label}` it built, which this statement drops
 NEW	-	a selector that takes every block is written `(impl *)`: `*` is EVERYTHING, a set (`export *;`, `::*`), and `_` is a hole inside a type (`(impl List<_>)`). `(impl _)` is read as `(impl *)` in this release and refused in the next; `vilan fmt` rewrites it
 NEW	-	`{alias}` is reserved: `self` names this file's own module and `super` its parent, and neither can be rebound by an import — choose another alias
+NEW	-	`::*` names every export of a module, and is written only as a RE-EXPORT — `export import m::*;` publishes them from this module, as a package prelude does: import the names this file uses
+NEW	-	`{spelled}::*` re-exports a MODULE's names, and `{spelled}` is not a module: re-export the names it holds one by one

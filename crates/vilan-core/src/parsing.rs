@@ -59,10 +59,10 @@ use crate::lexing;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, ComprehensionBinding, Convention,
     CssBody, CssDeclaration, CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem,
-    EnumVariant, ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
-    GenericParameters, If, IfSpelling, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, Reactivity,
-    ServiceAttr, StructField, TupleBound,
+    EnumVariant, ExportScope, Exposure, ExternBinding, Func, GLOB_IMPORT_LEAF, GenericArguments,
+    GenericParameter, GenericParameters, If, IfSpelling, ImplSelector, ImportBranch,
+    ImportModifier, ImportTail, ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList,
+    Parameter, Pattern, Reactivity, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -11405,9 +11405,15 @@ impl<'a, 'src> Parser<'a, 'src> {
             // A181 (`import-foundation.md` §2 row 10): `a::(impl T)` is the
             // one-selector set without its braces, exactly as `a::b` is the
             // one-name set — `import a::(impl T);`, `import a::(impl T)::first;`.
-            let continuation = Box::new(match self.at_impl_selector() {
-                true => self.parse_impl_selector()?,
-                false => self.parse_namespace_path()?,
+            let continuation = Box::new(if self.at_impl_selector() {
+                self.parse_impl_selector()?
+            } else if self.peek_is_op("*") {
+                // A182 (Q8): `m::*`, the glob leaf — every export of `m`.
+                let star = self.here_span();
+                self.bump();
+                ImportBranch::Path(GLOB_IMPORT_LEAF, star, ImportTail::Leaf)
+            } else {
+                self.parse_namespace_path()?
             });
             return Some(ImportBranch::Path(
                 name,
@@ -15373,7 +15379,9 @@ mod tests {
             );
         }
         for (source, stopped) in [
-            ("import pkg::a::m::*;\n", "*"),
+            // A182: `m::*` is a glob leaf now (the analyzer refuses it outside
+            // an `export import`); a `*` where a set ELEMENT stands is not.
+            ("import pkg::a::{ * };\n", "*"),
             ("import a::{ !hidden };\n", "!"),
         ] {
             let (_tree, errors) = parse(source);

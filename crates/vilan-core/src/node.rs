@@ -603,6 +603,14 @@ pub struct ImplSelector<'src> {
     pub span: Span,
 }
 
+/// The leaf of a GLOB re-export — `export import std::web::prelude::*;` (A182,
+/// `import-foundation.md` §10 Q8): every export of the module the path names,
+/// published as if declared here. It parses as a path leaf spelled `*` (the
+/// set operator, `export *;`'s), so every reader that walks leaves meets it
+/// where a name would stand; the analyzer is what gives it its meaning, and
+/// refuses it outside an `export import`.
+pub const GLOB_IMPORT_LEAF: &str = "*";
+
 /// The whole-subject spelling of the selector that takes every block a module
 /// declares — `(impl *)` (A181, RULED 2026-11-03: `*` is EVERYTHING, a set,
 /// where `_` is a hole inside a type).

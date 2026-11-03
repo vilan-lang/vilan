@@ -707,6 +707,14 @@ const RETIRED_WHOLE_SELECTOR: &str = "a selector that takes every block is writt
      List<_>)`). `(impl _)` is read as `(impl *)` in this release and refused in the next; `vilan \
      fmt` rewrites it";
 
+/// A182 (Q8): the refusal of a glob leaf outside an `export import`. `m::*`
+/// re-publishes every name `m` exports, which is a module's act of publication
+/// (`export import std::web::prelude::*;`, the two-line package prelude); a
+/// plain import of every name would bind names this file never wrote.
+const GLOB_IS_A_REEXPORT: &str = "`::*` names every export of a module, and is written only \
+     as a RE-EXPORT — `export import m::*;` publishes them from this module, as a package \
+     prelude does: import the names this file uses";
+
 /// B535's stable code: a trait's method called in a file that does not import
 /// the trait ([`Analyzer::check_trait_method_scope`]'s refusal). The editor
 /// publishes it as the diagnostic's `code`.
@@ -4954,6 +4962,30 @@ pub struct Analyzer<'src> {
     // sealed, which is after `build()`; recorded unconditionally, beside
     // `import_reaches`, which pays the same push for the same kind of reason.
     import_targets: Vec<(SourceId, Id)>,
+    // A182 (`import-foundation.md` §8): per resolved import leaf, the
+    // statement it belongs to (file, statement span), the LEAF module the
+    // walk stood in when the leaf resolved, and the leaf's target. The files
+    // a statement CARRIES — whose blocks it admits, restricts and reaches —
+    // are that module's and the leaf's own ([`Analyzer::statement_carried`]),
+    // never a parent directory body's.
+    import_leaf_modules: Vec<(SourceId, Span, Id, Id)>,
+    // A182: the module each import path SEGMENT resolved to, by (file, the
+    // segment's span) — how a selector finds the module it selects from when
+    // a sibling leaf's walk, not its own, resolved the path above it
+    // (`import pkg::x::{ y::helper, (impl T) }` walks `x` once).
+    import_segment_modules: HashMap<(SourceId, Span), Id>,
+    // A182 (Q8): the re-exported ADMISSIONS each module scope writes — its
+    // `export import` statements that write a selector — by (file, statement
+    // span). Each travels to every file that imports from the module, and to
+    // every file whose prelude it is.
+    exported_imports_by_scope: HashMap<Id, Vec<(SourceId, Span)>>,
+    // A182: every `export import` statement, by (file, statement span) — where
+    // a glob leaf (`m::*`) may stand.
+    exported_import_spans: HashSet<(SourceId, Span)>,
+    // A182: the prelude module scope each seeded module scope took its
+    // ambient names from (`seed_preludes`), so the prelude's re-exported
+    // admissions reach the files it seeds.
+    prelude_scope_of: HashMap<Id, Id>,
     // M19 T0: whether the entry tail has begun — set once, after
     // `resolve_world` on a miss and after the base-cache lookup on a hit. The
     // world's OWN resolution writes slots constantly and dirties nothing; only
@@ -5236,11 +5268,6 @@ pub struct Analyzer<'src> {
     /// by call anchor. A declared member needs no record; the pass finds its
     /// block by its declarations.
     declined_default_calls: HashMap<Id, (Id, Id, String)>,
-    /// The loaded files' paths by `SourceId`, handed in by the driver before
-    /// each resolve: [`Analyzer::build_lookup_admission`] reads a module's
-    /// ANCESTOR files off them (`ancestor_module_sources`), as the post-build
-    /// pass reads `Program::canonical_sources`.
-    source_paths: Vec<PathBuf>,
     /// E224 (R-j): every `import`/`use` STATEMENT's span, by file — what
     /// `labels::check` reads to tell an import line's own name rows (which are
     /// not uses) from the uses it warns at.
@@ -7013,6 +7040,9 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
                         Some((last, _)) => *last,
                         None => continue,
                     },
+                    // A182: a glob's names are the globbed module's, known
+                    // once it resolves (`resolve_glob_reexport` publishes them).
+                    (None, crate::node::GLOB_IMPORT_LEAF) => continue,
                     (None, leaf) => leaf,
                 };
                 out.push(Importable {
@@ -7871,6 +7901,16 @@ impl LookupAdmission {
     }
 }
 
+/// A182: what one import statement CARRIES ([`Analyzer::statement_carry_index`]).
+#[derive(Debug, Clone, Default)]
+struct StatementCarry {
+    /// The files whose implementations it admits — the leaf modules', and
+    /// each item leaf's own — the importing file left out.
+    files: Vec<SourceId>,
+    /// The leaf modules' scopes, whose re-exported admissions travel with it.
+    module_scopes: Vec<Id>,
+}
+
 /// B318 S3 — one `import` statement's claim on the implementations its walk
 /// carries, banked by the import walk and resolved after `build()` by
 /// [`check_impl_selector_admission`].
@@ -7887,11 +7927,14 @@ pub struct ImportImplRestriction {
     pub source: SourceId,
     /// The statement's span, for a refusal that has nowhere better to sit.
     pub span: Span,
-    /// Every segment span of the statement's path, leaves included. The
-    /// resolution pass reads each one's definition out of `type_references` and
-    /// takes its FILE: those are the files whose implementations this statement
-    /// carried, and therefore the ones it restricts.
-    pub path_spans: Vec<Span>,
+    /// A182: the FILES this statement carries — the leaf module's, for each
+    /// leaf and selector, and each item leaf's own declaring file — whose
+    /// implementations it admits, restricts and reaches. Never a parent
+    /// directory body's (`import-foundation.md` §2 row 1, §8): those arrive
+    /// through a statement that names them, or a prelude. Filled from the
+    /// resolved walk ([`Analyzer::statement_carry_index`]) when the program is
+    /// handed over; the importing file itself is never in it.
+    pub carried: Vec<SourceId>,
     /// `only`'s own span, when the statement carried it.
     pub only: Option<Span>,
     /// The `(impl …)` selectors the statement's brace set wrote.
@@ -7926,6 +7969,10 @@ pub struct ImportImplSelector {
     /// block its module does not `export` contributes nothing to a file that
     /// did not write one; this is that file saying it knows.
     pub reached: bool,
+    /// A182: the span of the path segment the selector stands under — the
+    /// module it selects from (`x` in `pkg::x::(impl T)`), whose files the
+    /// statement carries.
+    pub module_span: Option<Span>,
 }
 
 /// Flattens an `import`/`use` tree into (path, leaf-name, leaf-span, alias)
@@ -8186,6 +8233,11 @@ impl<'src> Analyzer<'src> {
             entry_dirty_sources: HashSet::default(),
             reuse_prefix_len: u32::MAX,
             import_targets: Vec::new(),
+            import_leaf_modules: Vec::new(),
+            import_segment_modules: HashMap::default(),
+            exported_imports_by_scope: HashMap::default(),
+            exported_import_spans: HashSet::default(),
+            prelude_scope_of: HashMap::default(),
             entry_phase: false,
             types_settled: false,
             item_costs: HashMap::default(),
@@ -8237,7 +8289,6 @@ impl<'src> Analyzer<'src> {
             lookup_anchor: None,
             lookup_asker: None,
             declined_default_calls: HashMap::default(),
-            source_paths: Vec::new(),
             import_statement_spans: Vec::new(),
             pending_hints: Vec::new(),
             hint_attributes: HashMap::default(),
@@ -38724,27 +38775,119 @@ impl<'src> Analyzer<'src> {
             || self.impl_subject_admits(&impl_type, &selector_type, &HashMap::default())
     }
 
-    /// What [`statement_sources`] reads: each import path segment's definition
-    /// by `(file, span)` — for the files `wanted` admits — and every source's
-    /// canonical path.
-    fn statement_path_index(
-        &self,
-        wanted: impl Fn(SourceId) -> bool,
-    ) -> (HashMap<(SourceId, Span), Id>, Vec<PathBuf>) {
-        let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
-        for (source, span, definition, _) in &self.type_references {
-            if let Some(definition) = definition
-                && wanted(*source)
+    /// A182 (`import-foundation.md` §2 row 1, §8): what each import statement
+    /// CARRIES, by (file, statement span) — the files whose implementations it
+    /// admits, restricts and reaches, and the modules it stands in. Per leaf
+    /// (and per selector, whose walk resolves the module it selects from): the
+    /// LEAF module's files, and an item leaf's own declaring file. Nothing on
+    /// the path above the leaf: a directory body's blocks arrive through a
+    /// statement that names the directory, or a prelude — the term the
+    /// surface never wrote is gone. The importing file is never carried.
+    fn statement_carry_index(&self) -> HashMap<(SourceId, Span), StatementCarry> {
+        let module_files = self.module_files_by_scope();
+        let mut index: HashMap<(SourceId, Span), StatementCarry> = HashMap::default();
+        for (source, span, module_id, target) in &self.import_leaf_modules {
+            let carry = index.entry((*source, *span)).or_default();
+            let Some(module) = self.modules.get(module_id) else {
+                continue;
+            };
+            let leaf_file = match self.expr_id_to_expr_map.get(target) {
+                Some(Expr::Module(_)) => None,
+                _ => self.declaring_file(*target),
+            };
+            for file in module_files
+                .get(&module.body.1)
+                .into_iter()
+                .flatten()
+                .copied()
+                .chain(leaf_file)
             {
-                references.entry((*source, *span)).or_insert(*definition);
+                if file != *source && !carry.files.contains(&file) {
+                    carry.files.push(file);
+                }
+            }
+            if !carry.module_scopes.contains(&module.body.1) {
+                carry.module_scopes.push(module.body.1);
             }
         }
-        let canonical_sources = self
-            .source_paths
-            .iter()
-            .map(crate::util::canonical_path)
-            .collect();
-        (references, canonical_sources)
+        // A selector carries the module it selects from, found by the path
+        // segment it stands under — whichever leaf's walk resolved it.
+        for row in &self.import_impl_restrictions {
+            for selector in &row.selectors {
+                let Some(module) = selector
+                    .module_span
+                    .and_then(|span| self.import_segment_modules.get(&(row.source, span)))
+                    .and_then(|module_id| self.modules.get(module_id))
+                else {
+                    continue;
+                };
+                let carry = index.entry((row.source, row.span)).or_default();
+                for file in module_files.get(&module.body.1).into_iter().flatten() {
+                    if *file != row.source && !carry.files.contains(file) {
+                        carry.files.push(*file);
+                    }
+                }
+                if !carry.module_scopes.contains(&module.body.1) {
+                    carry.module_scopes.push(module.body.1);
+                }
+            }
+        }
+        index
+    }
+
+    /// A182: each module scope's FILES — the file its declarations were walked
+    /// from, and the file of every `impl` block written in it (a module whose
+    /// file declares nothing but blocks has no declaration to find it by).
+    fn module_files_by_scope(&self) -> HashMap<Id, Vec<SourceId>> {
+        let mut files: HashMap<Id, Vec<SourceId>> = HashMap::default();
+        for module in self.modules.values() {
+            if let Some(file) = self.scope_file(module.body.1) {
+                files.entry(module.body.1).or_default().push(file);
+            }
+        }
+        for implementation in &self.implementations {
+            let entry = files.entry(implementation.module_scope).or_default();
+            if !entry.contains(&implementation.source) {
+                entry.push(implementation.source);
+            }
+        }
+        files
+    }
+
+    /// A182 (Q8, `import-foundation.md` §2 row 15): the files a module's
+    /// RE-EXPORTED admissions carry — every `export import` the module scope
+    /// writes, and theirs in turn — added to `into`. A re-export is "as if
+    /// declared here", so a file that imports from the module, or takes it as
+    /// its prelude, reaches what those statements carry: `export import
+    /// pkg::app_overlay::(impl Overlay);` in a package's prelude module admits
+    /// the overlay blocks to every file of the package, once.
+    fn reexported_admissions(
+        &self,
+        module_scope: Id,
+        carried: &HashMap<(SourceId, Span), StatementCarry>,
+        visited: &mut HashSet<Id>,
+        into: &mut HashSet<SourceId>,
+    ) {
+        if !visited.insert(module_scope) {
+            return;
+        }
+        for statement in self
+            .exported_imports_by_scope
+            .get(&module_scope)
+            .into_iter()
+            .flatten()
+        {
+            let Some(carry) = carried.get(statement) else {
+                continue;
+            };
+            into.extend(carry.files.iter().copied());
+            // The re-exporting module's own file is the statement's source,
+            // which the carry leaves out; an importer of the module reaches it
+            // through the module itself.
+            for scope in &carry.module_scopes {
+                self.reexported_admissions(*scope, carried, visited, into);
+            }
+        }
     }
 
     /// B401 — the admission map the method lookups read DURING the fixpoint
@@ -38768,14 +38911,13 @@ impl<'src> Analyzer<'src> {
             self.lookup_admission = None;
             return;
         }
-        // The statement walk below reads these only for a RESTRICTING file's
+        // The statement walk below reads this only for a RESTRICTING file's
         // statements; a program whose only departure from the estate is a
-        // hidden block (a curated module) skips the index and the paths.
-        let (references, canonical_sources) = match restricting.is_empty() {
-            true => (HashMap::default(), Vec::new()),
-            false => self.statement_path_index(|_| true),
+        // hidden block (a curated module) skips the index.
+        let carried = match restricting.is_empty() {
+            true => HashMap::default(),
+            false => self.statement_carry_index(),
         };
-        let source_of_path = source_of_path_index(&canonical_sources);
         let mut admitted: HashMap<(SourceId, SourceId), HashMap<Id, Option<Vec<String>>>> =
             HashMap::default();
         let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
@@ -38795,13 +38937,10 @@ impl<'src> Analyzer<'src> {
             if !restricting.contains(&row.source) {
                 continue;
             }
-            let sources = statement_sources(
-                |id| self.source_of_id(id),
-                &canonical_sources,
-                &references,
-                &source_of_path,
-                row,
-            );
+            let sources = carried
+                .get(&(row.source, row.span))
+                .map(|carry| carry.files.clone())
+                .unwrap_or_default();
             if row.only.is_none() && row.selectors.is_empty() {
                 for module in sources {
                     unrestricted.insert((row.source, module));
@@ -42784,6 +42923,24 @@ impl<'src> Analyzer<'src> {
                 });
             }
         }
+        // A182 (Q8): a re-exported ADMISSION — an `export import` that
+        // writes a selector (`export import a::(impl T);`) — travels to the
+        // module's importers. A plain re-export publishes NAMES, which reach
+        // a file by its binding them, as they always have; it carries no
+        // admission of its own, or importing anything from a module would
+        // bring every trait it re-exports into scope (B515's rule).
+        if let Node::Import(branch, _) = &inner.0 {
+            self.exported_import_spans
+                .insert((self.current_source_id, inner.1));
+            let mut selectors = Vec::new();
+            collect_impl_selectors(branch, Vec::new(), &mut selectors);
+            if !selectors.is_empty() {
+                self.exported_imports_by_scope
+                    .entry(scope_id)
+                    .or_default()
+                    .push((self.current_source_id, inner.1));
+            }
+        }
         let walked = self.walk_expr_node(inner, scope_id);
         // A transparent wrapper's own entity is not the declaration's
         // (`transparent_declarations`): `[derive(Wire)] export struct
@@ -42900,6 +43057,19 @@ impl<'src> Analyzer<'src> {
             if let Some((alias, alias_span)) = alias {
                 self.refuse_a_reserved_alias(alias, alias_span);
             }
+            if name == crate::node::GLOB_IMPORT_LEAF
+                && !self
+                    .exported_import_spans
+                    .contains(&(self.current_source_id, node.1))
+            {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: leaf_span,
+                    msg: GLOB_IS_A_REEXPORT.to_string(),
+                });
+                continue;
+            }
             self.prepped_imports.push((
                 path,
                 name,
@@ -42912,12 +43082,11 @@ impl<'src> Analyzer<'src> {
             ));
         }
         // B318 S4: a selector's own path is walked too, BINDING
-        // nothing. The walk is what puts the module's segments in
-        // `type_references`, which is where the admission pass reads
-        // the files a statement carried — the one channel that works
-        // the same on every host.
+        // nothing. The walk is what records the module it selects from
+        // (`import_leaf_modules`, A182), which is where the admission
+        // pass reads the files a statement carried.
         self.queue_selector_paths(root_branch, scope_id, node.1, &mut path_spans);
-        self.bank_import_restriction(root_branch, *modifier, scope_id, node.1, path_spans);
+        self.bank_import_restriction(root_branch, *modifier, scope_id, node.1);
         Some(Expr::Void)
     }
 
@@ -54203,12 +54372,12 @@ impl<'src> Analyzer<'src> {
         modifier: ImportModifier,
         scope_id: Id,
         span: Span,
-        mut path_spans: Vec<Span>,
     ) {
         let mut written = Vec::new();
         collect_impl_selectors(branch, Vec::new(), &mut written);
         let mut selectors = Vec::with_capacity(written.len());
         for (path, selector) in written {
+            let module_span = path.last().map(|(_, span)| *span);
             let Some(subject) = selector.subject.as_deref() else {
                 continue;
             };
@@ -54234,14 +54403,6 @@ impl<'src> Analyzer<'src> {
             }
             self.register_subject_binders(subject, selector_scope_id);
             let subject_type_id = self.walk_type_node(subject, selector_scope_id);
-            // A statement whose brace set holds ONLY selectors has no name
-            // leaf, so the loop above recorded none of its segments: the
-            // selector's own path carries them.
-            for (_, segment_span) in &path {
-                if !path_spans.contains(segment_span) {
-                    path_spans.push(*segment_span);
-                }
-            }
             let reached = self
                 .reach_marked_spans
                 .contains(&(self.current_source_id, selector.span));
@@ -54272,6 +54433,7 @@ impl<'src> Analyzer<'src> {
                     .map(|(name, span)| ((*name).to_string(), *span))
                     .collect(),
                 reached,
+                module_span,
             });
         }
         let only = match modifier {
@@ -54281,7 +54443,7 @@ impl<'src> Analyzer<'src> {
         self.import_impl_restrictions.push(ImportImplRestriction {
             source: self.current_source_id,
             span,
-            path_spans,
+            carried: Vec::new(),
             only,
             selectors,
         });
@@ -54366,6 +54528,7 @@ impl<'src> Analyzer<'src> {
             if prelude_scope_id == scope_id {
                 continue;
             }
+            self.prelude_scope_of.insert(scope_id, prelude_scope_id);
             let Some(names) = self.prelude_exports.get(&prelude_scope_id).cloned() else {
                 continue;
             };
@@ -54445,6 +54608,90 @@ impl<'src> Analyzer<'src> {
         self.module_id_by_name.get(root).copied()
     }
 
+    /// A182 (`import-foundation.md` §10 Q8): `export import m::*;` — every
+    /// name `m` publishes, re-published here as if declared here, which is
+    /// what lets a package prelude be two lines (`export import
+    /// std::web::prelude::*;` and the package's admissions). The names are
+    /// the module's importables (`prelude_exports`, read at load), bound once
+    /// every one of them has bound in `m` — `m`'s own re-exports resolve in
+    /// the same fixpoint — and added to THIS module's importables, so a prelude
+    /// that globs publishes what it globbed. A name this module already binds
+    /// keeps its own meaning. The walk refuses the leaf outside an `export
+    /// import` ([`GLOB_IS_A_REEXPORT`]), so only a re-export reaches here.
+    fn resolve_glob_reexport(
+        &mut self,
+        path: &[(&'src str, Span)],
+        scope_id: Id,
+        span: Span,
+        report: bool,
+        source_id: SourceId,
+    ) -> bool {
+        let Some(((leaf, leaf_span), segments)) = path.split_last() else {
+            return true;
+        };
+        let spelled = path
+            .iter()
+            .map(|(segment, _)| *segment)
+            .collect::<Vec<_>>()
+            .join("::");
+        // A side-effect-free walk first, so a module whose own re-exports have
+        // not bound yet is retried without recording the path twice.
+        let module_scope = self.prelude_module_scope(&spelled, source_id);
+        let names: Vec<&'src str> = module_scope
+            .and_then(|module_scope| self.prelude_exports.get(&module_scope).cloned())
+            .unwrap_or_default();
+        let ready = module_scope.is_some_and(|module_scope| {
+            self.scopes.get(&module_scope).is_some_and(|scope| {
+                names
+                    .iter()
+                    .all(|name| scope.name_to_id_map.contains_key(name))
+            })
+        });
+        if !ready && !report {
+            return false;
+        }
+        // The path itself, as any import walks it: its references, its edge
+        // and the module it stands in — and its diagnostics when it misses.
+        if !self.resolve_import(
+            segments, leaf, scope_id, span, report, *leaf_span, source_id, None, false,
+        ) {
+            return false;
+        }
+        let Some(module_scope) = module_scope else {
+            if report {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: *leaf_span,
+                    msg: format!(
+                        "`{spelled}::*` re-exports a MODULE's names, and `{spelled}` is not a \
+                         module: re-export the names it holds one by one"
+                    ),
+                });
+            }
+            return true;
+        };
+        let bindings: Vec<(&'src str, Id)> = match self.scopes.get(&module_scope) {
+            Some(scope) => names
+                .iter()
+                .filter_map(|name| scope.name_to_id_map.get_key_value(name))
+                .map(|(name, id)| (*name, *id))
+                .collect(),
+            None => Vec::new(),
+        };
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        for (name, id) in &bindings {
+            scope.name_to_id_map.entry(name).or_insert(*id);
+        }
+        let published = self.prelude_exports.entry(scope_id).or_default();
+        for (name, _) in bindings {
+            if !published.contains(&name) {
+                published.push(name);
+            }
+        }
+        true
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "one queued import's whole record; the queue's own tuple, spread"
@@ -54461,6 +54708,9 @@ impl<'src> Analyzer<'src> {
         alias: Option<(&'src str, Span)>,
         bind: bool,
     ) -> bool {
+        if name == crate::node::GLOB_IMPORT_LEAF {
+            return self.resolve_glob_reexport(path, scope_id, span, report, source_id);
+        }
         // The segments to walk, each with its source span. A `self` leaf re-binds
         // the namespace it sits in (e.g. `Option::{ self }` binds `Option`);
         // otherwise the leaf is the final segment and binds under its own name.
@@ -54527,6 +54777,13 @@ impl<'src> Analyzer<'src> {
         // registers its top-level modules in its own scope and has no submodule
         // scope, so it starts as `None`.
         let mut namespace_module_id: Option<Id> = None;
+        // A182 (`import-foundation.md` §2 row 1): the LEAF module — the last
+        // module the walk descends into, which a type segment does not
+        // replace (`std::web::style::Length::rem` stands in `style`). A leaf
+        // that is an item stands in its parent; a leaf that is a module is
+        // its own. The root namespace stands in for a path with no module
+        // segment at all.
+        let mut leaf_module_id: Id = module_id;
         // B317/B332: the TYPE the previous segment named — which, after B332,
         // IS the walk's namespace rather than an extra place to look. A type
         // segment REPLACES what the rest of the path resolves against: an enum
@@ -54593,6 +54850,9 @@ impl<'src> Analyzer<'src> {
                     let sub_scope_id = match self.expr_id_to_expr_map.get(&id) {
                         Some(Expr::Module(sub_module_id)) => {
                             namespace_module_id = Some(*sub_module_id);
+                            leaf_module_id = *sub_module_id;
+                            self.import_segment_modules
+                                .insert((source_id, part_span), *sub_module_id);
                             self.modules.get(sub_module_id).map(|module| module.body.1)
                         }
                         Some(Expr::Enum(enum_id)) => {
@@ -54819,6 +55079,11 @@ impl<'src> Analyzer<'src> {
             return false;
         }
         self.import_targets.push((source_id, target_id));
+        // A182: and the module the leaf stands in, by statement — the one
+        // module whose blocks a plain statement carries (row 1's admission
+        // term), with the leaf itself for the file that declares it.
+        self.import_leaf_modules
+            .push((source_id, span, leaf_module_id, target_id));
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {
             self.record_reference(source_id, leaf_span, target_id);
@@ -64749,6 +65014,8 @@ impl<'src> Analyzer<'src> {
             .map(|reach| (reach.source, reach.target))
             .collect();
         let mut reached: HashMap<SourceId, HashSet<SourceId>> = HashMap::default();
+        // A182: each user file's module scope, for its prelude's admissions.
+        let mut module_scope_sources: Vec<(Id, SourceId)> = Vec::new();
         for scope_id in &self.module_scope_ids {
             // The entry walks in the GLOBAL scope; a module's file is the
             // file its own declarations were walked from (a scope is minted
@@ -64767,6 +65034,7 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
+            module_scope_sources.push((*scope_id, source));
             let Some(scope) = self.scopes.get(scope_id) else {
                 continue;
             };
@@ -64812,34 +65080,37 @@ impl<'src> Analyzer<'src> {
                 files.insert(declared);
             }
         }
-        // B688: and every file on an import statement's PATH — B318 §3.2's
-        // "`import a::b;` admits every impl declared in `a`'s file and in
-        // every file on the path to it": `import std::reactive::store::Store;`
-        // reaches `store.vl`, whose blocks extend `Store`, though `Store`
-        // itself is declared in `store_core.vl`. An `only` statement reaches
-        // its path too: whether the file ADMITS what it reached is B318's
-        // question, and its refusal ("imports that module `only`") is the one
-        // that names the mistake.
-        if self
-            .import_impl_restrictions
-            .iter()
-            .any(|row| reached.contains_key(&row.source))
-        {
-            let (references, canonical_sources) =
-                self.statement_path_index(|source| reached.contains_key(&source));
-            let source_of_path = source_of_path_index(&canonical_sources);
-            for row in &self.import_impl_restrictions {
-                let Some(files) = reached.get_mut(&row.source) else {
-                    continue;
-                };
-                files.extend(statement_sources(
-                    |id| self.source_of_id(id),
-                    &canonical_sources,
-                    &references,
-                    &source_of_path,
-                    row,
-                ));
+        // A182 (`import-foundation.md` §8): and every file an import
+        // statement CARRIES — the leaf module's, whatever leaf it names:
+        // `import std::reactive::store::Store;` reaches `store.vl`, whose
+        // blocks extend `Store`, though `Store` itself is declared in
+        // `store_core.vl` — and never a directory body ABOVE the leaf, which
+        // arrives through a statement that names it or a prelude. An `only`
+        // statement carries its leaf too: whether the file ADMITS what it
+        // reached is B318's question, and its refusal ("imports that module
+        // `only`") is the one that names the mistake. Then the admissions the
+        // modules it imports from RE-EXPORT (Q8: `export import a::(impl T);`
+        // is as if declared there), and its prelude's.
+        let carried = self.statement_carry_index();
+        let mut visited_by_file: HashMap<SourceId, HashSet<Id>> = HashMap::default();
+        for ((importer, _), carry) in &carried {
+            let Some(files) = reached.get_mut(importer) else {
+                continue;
+            };
+            files.extend(carry.files.iter().copied());
+            let visited = visited_by_file.entry(*importer).or_default();
+            for scope in &carry.module_scopes {
+                self.reexported_admissions(*scope, &carried, visited, files);
             }
+        }
+        for (scope_id, source) in &module_scope_sources {
+            let (Some(prelude_scope), Some(files)) =
+                (self.prelude_scope_of.get(scope_id), reached.get_mut(source))
+            else {
+                continue;
+            };
+            let visited = visited_by_file.entry(*source).or_default();
+            self.reexported_admissions(*prelude_scope, &carried, visited, files);
         }
         reached
     }
@@ -84699,7 +84970,6 @@ impl World<'static> {
             }
         };
         self.sources.iter_mut().for_each(moved);
-        self.analyzer.source_paths.iter_mut().for_each(moved);
         for (_, path) in &mut self.analyzer.std_module_files {
             moved(path);
         }
@@ -85675,7 +85945,6 @@ fn resolve_package_over_prefix(
 ) {
     let resolve_started = crate::prefix_file::now();
     let analyzer = &mut world.analyzer;
-    analyzer.source_paths = world.sources.clone();
     let filter = match layered {
         Some(layered) => layered.world_key.reach.clone(),
         None => ReachFilter::of(std::iter::once(&nodes.0)),
@@ -90424,7 +90693,6 @@ fn analyze_inner<'src>(
     // keeps the monolithic order: its tiers hold the entry.
     let phase_base_start = crate::PhaseClock::now();
     if !entry_is_module {
-        analyzer.source_paths = sources.clone();
         analyzer.resolve_tiers();
     }
     let tiers_entity_end = (!entry_is_module).then_some(analyzer.entity_id);
@@ -90520,7 +90788,6 @@ fn analyze_inner<'src>(
     let phase_package_start = crate::PhaseClock::now();
     let resolve_deferred = entry_is_open_module || shape.defer_resolve;
     if !entry_is_module && !resolve_deferred {
-        analyzer.source_paths = sources.clone();
         // M121 / B553: what this resolve asks of the impl table is recorded,
         // so the impls walked after it — the entry's, a hot set's — can be
         // tested against it once they have resolved (`impl_reach`).
@@ -90929,10 +91196,6 @@ fn analyze_over_world<'src>(
     // key, so a stored world's value is another call's.
     analyzer.platform = platform;
     analyzer.platform_reason = workspace.platform_reason.clone();
-    // B401: the admission the build's lookups read climbs a module's ANCESTOR
-    // files by path — this call's paths, since a cached world's entry is
-    // another call's (`sources[0]` is re-pointed on the hit path).
-    analyzer.source_paths = sources.clone();
     debug_assert!(
         analyzer.id_windows.source_keys.len() == sources.len(),
         "every source registers its path key ({} keys, {} sources)",
@@ -93035,6 +93298,16 @@ fn analyze_over_world<'src>(
             incremental.window_outside_anchor = outside;
         });
     }
+    // A182: each import statement's carried files, from the resolved walk,
+    // onto the row the post-build admission pass reads — computed while every
+    // table it reads is still the analyzer's.
+    let carried = analyzer.statement_carry_index();
+    for row in &mut analyzer.import_impl_restrictions {
+        row.carried = carried
+            .get(&(row.source, row.span))
+            .map(|carry| carry.files.clone())
+            .unwrap_or_default();
+    }
     Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -93467,35 +93740,6 @@ pub fn build_impl_admission(program: &mut Program) {
     {
         return;
     }
-    // `statement_sources` reads a span's definition out of `type_references`,
-    // which is a flat `Vec` of every reference the program recorded: asked once
-    // per path segment of every import statement, that product is the pass. One
-    // index, built once, answers each of them in a probe.
-    let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
-    for (source, span, definition, _) in &program.type_references {
-        if let Some(definition) = definition {
-            references.entry((*source, *span)).or_insert(*definition);
-        }
-    }
-    // M77: and the SECOND product inside the same pass. `statement_sources`
-    // climbs each resolved segment's ancestor modules
-    // (`ancestor_module_sources`, `names.md` §4.1 — "a child pulls its
-    // parent"), and it found each one with
-    // `canonical_sources.iter().position(..)`: a linear scan of every loaded
-    // file, twice per level, per segment, per statement. M75's indexes took
-    // the collision x file x statement product out of the refusal and left
-    // this one — 60 ms of the large leg, following the whole program's
-    // statement count. One map, built once, answers a level in a probe; the
-    // FIRST index wins, which is what `position` answered.
-    let source_of_path: HashMap<&Path, SourceId> = {
-        let mut index: HashMap<&Path, SourceId> = HashMap::default();
-        for (position, path) in program.canonical_sources.iter().enumerate() {
-            index
-                .entry(path.as_path())
-                .or_insert(SourceId(position as u32));
-        }
-        index
-    };
     // M77: the only sources the collision refusal ever asks `carried` about —
     // `statement_for` looks up `collision.first_source` and
     // `collision.second_source` and nothing else. A row carrying neither is a
@@ -93556,13 +93800,7 @@ pub fn build_impl_admission(program: &mut Program) {
         if !restricting.contains(&row.source) && collisions.is_empty() {
             continue;
         }
-        let sources = statement_sources(
-            |id| program.source_of(id),
-            &program.canonical_sources,
-            &references,
-            &source_of_path,
-            row,
-        );
+        let sources = row.carried.clone();
         if !collisions.is_empty() {
             // M77: only a COLLIDING block's file can be asked for, so only
             // those are kept — and a statement that carried none of them
@@ -94388,120 +94626,6 @@ pub fn check_call_site_admission(program: &mut Program) {
     for (error, source) in violations {
         program.push_diagnostic(error, source);
     }
-}
-
-/// Each canonical source path's [`SourceId`], the first source winning — the
-/// index [`statement_sources`] climbs a module's ancestors by.
-fn source_of_path_index(canonical_sources: &[PathBuf]) -> HashMap<&Path, SourceId> {
-    let mut source_of_path: HashMap<&Path, SourceId> = HashMap::default();
-    for (position, path) in canonical_sources.iter().enumerate() {
-        source_of_path
-            .entry(path.as_path())
-            .or_insert(SourceId(position as u32));
-    }
-    source_of_path
-}
-
-/// The FILES one `import` statement's walk loaded — every path segment's own
-/// declaring file, read out of `type_references`, into which `resolve_import`
-/// wrote one row per segment.
-///
-/// The path's files and not only the leaf's, because that is what a plain
-/// import brings: `names.md` §4.1's "a child pulls its parent" loads every file
-/// on the way, and probe P7's whole point is that an intermediate module's
-/// `impl` arrives with it. `only` declines the lot.
-fn statement_sources(
-    source_of: impl Fn(Id) -> Option<SourceId>,
-    canonical_sources: &[PathBuf],
-    references: &HashMap<(SourceId, Span), Id>,
-    source_of_path: &HashMap<&Path, SourceId>,
-    restriction: &ImportImplRestriction,
-) -> Vec<SourceId> {
-    let mut sources: Vec<SourceId> = Vec::new();
-    for span in &restriction.path_spans {
-        let Some(definition) = references.get(&(restriction.source, *span)).copied() else {
-            continue;
-        };
-        let Some(home) = source_of(definition) else {
-            continue;
-        };
-        if home != restriction.source && !sources.contains(&home) {
-            sources.push(home);
-        }
-        for ancestor in ancestor_module_sources(
-            canonical_sources,
-            source_of_path,
-            home,
-            restriction.path_spans.len(),
-        ) {
-            if ancestor != restriction.source && !sources.contains(&ancestor) {
-                sources.push(ancestor);
-            }
-        }
-    }
-    sources
-}
-
-/// The files of the modules ABOVE `source` on its own path — `x.vl` for
-/// `x/y.vl` — which a plain import of anything under them loads
-/// (`names.md` §4.1, "a child pulls its parent"), and whose implementations
-/// therefore arrive with it (probe P7).
-///
-/// Derived from the FILE rather than from the path segment's entity, which is
-/// not reliable here: a module that has both a file and a directory
-/// (`x.vl` beside `x/`) resolves its segment to the directory NAMESPACE, an
-/// entity minted in the importing file's own id range, so `source_of` on it
-/// answers the importer rather than `x.vl`. The file layout is the loader's own
-/// rule and says the same thing without an entity: a module's file is
-/// `<dir>/<name>.vl` or `<dir>/<name>/lib.vl`, so the module above
-/// `<dir>/<name>.vl` is whichever of `<dir>.vl` / `<dir>/lib.vl` the program
-/// actually loaded.
-///
-/// Bounded by the statement's own segment count: a walk that keeps climbing
-/// would eventually reach a package's entry file, which no import of a module
-/// under it loads.
-fn ancestor_module_sources(
-    canonical_sources: &[PathBuf],
-    source_of_path: &HashMap<&Path, SourceId>,
-    source: SourceId,
-    bound: usize,
-) -> Vec<SourceId> {
-    let mut found = Vec::new();
-    let Some(start) = canonical_sources.get(source.0 as usize) else {
-        return found;
-    };
-    let mut current = start.clone();
-    for _ in 0..bound {
-        let Some(directory) = current.parent() else {
-            break;
-        };
-        let stem = current.file_stem().and_then(|stem| stem.to_str());
-        // `<dir>/lib.vl` IS the module `<dir>`, so the module above it is the
-        // one the PARENT directory names; any other file's module sits inside
-        // its own directory and the module above it is that directory's.
-        let home = if stem == Some("lib") {
-            let Some(above) = directory.parent() else {
-                break;
-            };
-            above.to_path_buf()
-        } else {
-            directory.to_path_buf()
-        };
-        let candidates = [home.with_extension("vl"), home.join("lib.vl")];
-        // M77: a probe per candidate rather than a scan of every loaded file.
-        // The map keeps the FIRST index for a path, which is what `position`
-        // answered when two sources canonicalized the same way.
-        let Some((index, hit)) = candidates.iter().find_map(|candidate| {
-            source_of_path
-                .get(candidate.as_path())
-                .map(|source| (*source, candidate.clone()))
-        }) else {
-            break;
-        };
-        found.push(index);
-        current = hit;
-    }
-    found
 }
 
 /// B455: the trait DEFAULTS a block inherits — each member with a body that a

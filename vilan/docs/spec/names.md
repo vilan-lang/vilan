@@ -52,15 +52,18 @@ above) has nothing to load and costs nothing. Emission is unaffected: it
 follows reachability, so a parent body nothing references contributes no
 output.
 
-**What a parent DOES contribute is its `impl` blocks.** Items are reached
-by a module's own path and nothing below it; implementations are not
-items, and a plain `import pkg::a::b;` admits every block declared along
-the path — `a`'s as well as `a::b`'s. So an extension impl written in a
-directory's body arrives in any file that imports a module beneath it,
-without that file naming `a`, and `a.vl` is the place to put one that
-every child's importer should have. `only` declines them all and an impl
-selector takes the blocks it names (§4.3); a block the declaring module
-does not `export` is not admitted at all (§4.8).
+**A parent's `impl` blocks arrive only when something names it.** A plain
+`import pkg::a::b;` admits the blocks of the module its leaf stands in —
+`b`'s, or `a`'s when `b` is an item of `a` — and never a directory body
+above the leaf (§4.3.1). A block written in `a.vl` reaches a file that
+imports `pkg::a` or a name from it, that selects it (`import
+pkg::a::(impl T);`), or whose package prelude re-exports the admission
+(§4.7) — the prelude is the place for a block every file of a package
+should have. Before v0.54.0 the path's directory bodies were admitted too;
+a file that leaned on that gets B688's refusal, naming the import to add.
+`only` declines a statement's blocks and an impl selector takes the blocks
+it names (§4.3); a block the declaring module does not `export` is not
+admitted at all (§4.8).
 
 ## 4.2 The three namespaces
 
@@ -151,13 +154,18 @@ importing module's scope:
 
 - `import std::list only;` binds the statement's names and **no
   implementations**. A plain `import` brings every `impl` declared in the
-  files on the path to its leaf — that is how an extension impl arrives —
-  and `only` is the spelling that declines them.
-- `import std::list::{ (impl List<i32>) };` is an **impl selector**: a
-  brace-set element that binds no name and admits exactly the `impl`
-  blocks of the module whose subject unifies with the written type. A set
-  naming one means "these implementations only", so `only` is for
-  statements without a selector. Two symbols, two meanings: **`_` is
+  module its leaf stands in — that is how an extension impl arrives — and
+  `only` is the spelling that declines them.
+- `import std::list::(impl List<i32>);` is an **impl selector**: a
+  projection of the module that binds no name and admits exactly the
+  `impl` blocks it declares whose subject unifies with the written type.
+  It is written bare after the module path when it is the statement's
+  one member — as `import a::b;` is the one-name form of `import
+  a::{ b };` — and inside a brace set beside the names it travels with
+  (`import std::list::{ List, (impl List<i32>) };`); `vilan fmt` writes
+  the bare form for a one-member set. A set naming one means "these
+  implementations only", so `only` is for statements without a
+  selector. Two symbols, two meanings: **`_` is
   unspecified** — a hole, here an element left open, so `(impl List<_>)`
   admits every `List` block whatever its element (types §5.4); **`*` is
   everything** — a set, so `(impl *)` admits every block the module
@@ -220,7 +228,7 @@ module path):
 
 | spelling | elaborates to |
 |---|---|
-| `import a::b;` | `use a::b; use a::b::(impl *)::*;` — the leaf bound and the LEAF module's blocks admitted (a leaf that is an item of `a` admits `a`'s). Today the blocks of every module on the path are admitted too (§4.1, §4.6) — the one implicit term the surface never wrote; it retires with A182, after which a directory body's blocks arrive only through an import that names it or a prelude |
+| `import a::b;` | `use a::b; use a::b::(impl *)::*;` — the leaf bound and the LEAF module's blocks admitted (a leaf that is an item of `a` admits `a`'s). A directory body ABOVE the leaf admits nothing through it (§4.1): its blocks arrive through an import that names it, or a prelude. Before v0.54.0 the path's bodies were admitted too — the one term the surface never wrote |
 | `import a::b as c;` | `use a::b as c; use a::b::(impl *)::*;` |
 | `import a::{ b, c as d, self };` | `use a::b; use a::c as d; use a; use a::(impl *)::*;` — one `use` per member; `self` is the namespace the set sits in |
 | `import a::b only;` | `use a::b;` — no admission term |
@@ -234,7 +242,8 @@ module path):
 | `import a::{ #hidden };` | `use #a::hidden;` — the reach marker rides on the projection (§4.8) |
 | `export *;` | `export use self::*;` |
 | `export import a::b;` | `export use a::b;` |
-| `export import a::{ (impl T) };` | `export use a::(impl T)::*;` — a re-exported admission: importers of this module, and every file of a package whose prelude it is, admit the blocks (A182) |
+| `export import a::(impl T);` | `export use a::(impl T)::*;` — a re-exported admission: importers of this module, and every file of a package whose prelude it is, admit the blocks |
+| `export import a::*;` | `export use a::*;` — every name `a` publishes, published here as if declared here; written only as a re-export (a plain `import a::*;` is refused) |
 | the package prelude (§4.7) | `use P::*;` for the prelude module's exports, before every file's first statement, as the weakest rung (§4.4) |
 | `mod self;` | the implicit `use (import pkg)::<this file's path> as self;` made explicit, as the host of the file's attributes (§4.1) |
 | `import pkg::m;` then `m::x` | `use (import pkg)::m; use (import pkg)::m::(impl *)::*;` then the binding `m` projected: a path whose head is a NAME in scope resolves the head by §4.4's ladder and projects from there |
@@ -338,8 +347,9 @@ and `N` as `List<str>` binds `List`'s `T`.
 
 A type has **one namespace per importing file**, and receiver position is
 not part of a name. The namespace is the union of the `impl` blocks that
-file's own import statements admit (§4.3): a plain `import a::b;` admits
-every block declared in `a`'s file and in every file on the path to it,
+file's own import statements admit (§4.3), with the re-exported admissions
+of the modules it imports from and of its prelude (§4.7): a plain `import
+a::b;` admits every block declared in the module its leaf stands in,
 `import a::b only;` admits none, and
 `import a::{ (impl T) }` admits exactly the blocks whose subject unifies
 with `T`. A block's members are what it declares AND the trait defaults it
@@ -496,6 +506,19 @@ declaration or an explicit import of a prelude name wins, silently, with
 no diagnostic (§4.4). A file that declares its own `fun print` gets its
 own; a file that imports `std::io::print` gets that import, and the
 import is simply redundant rather than an error.
+
+**A package's prelude is where it admits its extension blocks once.** A
+prelude module may re-export an admission — `export import
+pkg::app_overlay::(impl Overlay);` — and every file of the package admits
+those blocks with no import of its own (§4.3.1; any importer of a module
+that re-exports an admission takes it the same way). With the glob
+re-export, `export import std::web::prelude::*;`, a package prelude that
+extends std's web set is two lines:
+
+```vilan,fragment
+export import std::web::prelude::*;
+export import pkg::app_overlay::(impl pkg::lib::overlay::Overlay);
+```
 
 **A prelude is per package and never inherited.** A dependency's files
 resolve under the prelude *its* manifest declares — not its consumer's,

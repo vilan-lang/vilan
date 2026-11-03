@@ -71,7 +71,8 @@ instead the block's **trailing expression** and supplies the block's value
 import  = "import" path-branch [ "only" ] ;   (* impls-free, §4.3 *)
 use     = "use"    path-branch ;
 path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set
-                                   | [ "#" ] impl-selector )   (* bare, §4.3 *)
+                                   | [ "#" ] impl-selector     (* bare, §4.3 *)
+                                   | "*" )   (* a glob: `export import` only, §4.7 *)
                    | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
 set-element = path-branch | [ "#" ] impl-selector ;

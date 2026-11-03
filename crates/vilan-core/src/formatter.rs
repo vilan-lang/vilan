@@ -14,9 +14,9 @@ use std::cell::Cell;
 
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, EVERY_IMPL_SUBJECT, ExportScope, Exposure,
-    ExternBinding, Func, GenericArguments, GenericParameters, If, IfSpelling, ImplSelector,
-    ImportBranch, ImportModifier, ImportTail, ItemLabels, Node, NodeIfBranch, NodeList, Pattern,
-    StructInitializerField,
+    ExternBinding, Func, GLOB_IMPORT_LEAF, GenericArguments, GenericParameters, If, IfSpelling,
+    ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels, Node, NodeIfBranch,
+    NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -916,6 +916,10 @@ fn parse_token_branch<'src>(
             .or_else(|| parse_token_branch(tokens, index + 1))?;
         return Some((TokenBranch::Reach(Box::new(inner)), next));
     }
+    // A182: `m::*`, the glob leaf — a leaf spelled with the set operator.
+    if tokens.get(index) == Some(&Token::Op(GLOB_IMPORT_LEAF)) {
+        return Some((TokenBranch::Path(GLOB_IMPORT_LEAF, None, None), index + 1));
+    }
     if let Some(name) = token_name(tokens, index) {
         let mut next = index + 1;
         let mut alias = None;
@@ -1091,7 +1095,10 @@ fn parse_import_statement<'src>(
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
     match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, child, alias) => {
-            out.push(Token::Ident(name));
+            out.push(match *name {
+                GLOB_IMPORT_LEAF => Token::Op(GLOB_IMPORT_LEAF),
+                name => Token::Ident(name),
+            });
             if let Some(child) = child {
                 out.push(Token::Op("::"));
                 emit_branch_tokens(selector_continuation(child), out);
@@ -15424,6 +15431,20 @@ mod import_sorting {
         assert_sorts(
             "import pkg::a::{ (impl Style), (impl Theme) };\n",
             "import pkg::a::{ (impl Style), (impl Theme) };\n",
+        );
+    }
+
+    // A182 (Q8): the glob re-export reprints as written and sorts with its
+    // path; the safety net reads its `*` as the leaf it is.
+    #[test]
+    fn a_glob_reexport_round_trips_and_sorts() {
+        assert_sorts(
+            "export import std::web::prelude::*;\n",
+            "export import std::web::prelude::*;\n",
+        );
+        assert_sorts(
+            "export import pkg::a::(impl Thing);\nexport import std::web::prelude::*;\n",
+            "export import std::web::prelude::*;\nexport import pkg::a::(impl Thing);\n",
         );
     }
 
