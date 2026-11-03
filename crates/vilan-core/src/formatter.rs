@@ -1480,6 +1480,7 @@ pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "rule",
     "raw",
     "with_length",
+    "with_length_as",
     "with_color",
     "with_border",
     "on",

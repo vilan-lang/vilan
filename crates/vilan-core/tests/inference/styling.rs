@@ -9039,8 +9039,9 @@ fn a178_an_explicit_unit_is_never_re_unitized() {
     );
 }
 
-/// Outside any property — `piece`, `raw`, a css block's undotted declaration,
-/// `css_text()` — a `dp` is rem, the role-less default.
+/// Outside any property — `piece`, `css_text()` — a `dp` is rem, the role-less
+/// default; `raw` and a css block's undotted declaration name a rem property
+/// here, so they write rem too (the hairlines are `a178_q4_*`).
 #[test]
 fn a178_a_dp_no_property_chooses_for_renders_rem() {
     let css = style_css(concat!(
@@ -9188,14 +9189,68 @@ fn a178_rendered_writes_a_dp_in_the_roles_unit_and_nothing_else() {
     );
 }
 
-/// `with_length` is `raw` at a `Length`, so an untyped property writes a `dp`
-/// in rem, the role-less default — and still carries a token's line.
+/// `with_length` is `raw` at a `Length`, so a `dp` takes the role its
+/// property NAMES (A178 Q4): `outline-width` is a hairline, px; an untyped
+/// spacing property is rem — and a token still carries its line.
 #[test]
-fn a178_with_length_writes_a_dp_in_rem() {
+fn a178_with_length_takes_the_role_its_property_names() {
     let css = a178_chain_sheet(".with_length(\"outline-width\", Length::dp(2))");
-    assert!(css.contains("{outline-width:0.125rem}"), "{css}");
+    assert!(css.contains("{outline-width:2px}"), "{css}");
+    let css = a178_chain_sheet(".with_length(\"scroll-margin-top\", Length::dp(8))");
+    assert!(css.contains("{scroll-margin-top:0.5rem}"), "{css}");
     let css = a178_chain_sheet(".with_length(\"scroll-margin-top\", space(4))");
     assert!(css.contains("{scroll-margin-top:var(--space-4)}"), "{css}");
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+}
+
+/// A178 Q4 (the owner: a hole and a chain must not disagree on a hairline): a
+/// css block's UNDOTTED `border(dp(1), ..)` writes `1px`, the dotted
+/// `.border(dp(1), ..)`'s — the multi-argument declaration's pieces take the
+/// PROPERTY's role (`piece_for`) — and so does `raw` given a border property by
+/// name; a border property that takes no width, `border-radius`, stays rem.
+#[test]
+fn a178_q4_an_undotted_border_writes_the_dotted_borders_hairline() {
+    let css = style_css(concat!(
+        "let _block = css { border(dp(1), gray(300)); };\n",
+        "let _dotted = css { .border(dp(1), gray(300)); };\n",
+        "fun main() {}\n",
+        "main();\n",
+    ));
+    assert_eq!(
+        css.matches("{border:1px solid var(--gray-300)}").count(),
+        1,
+        "the hole and the chain write ONE rule (the same class): {css}"
+    );
+    assert!(!css.contains("0.0625rem"), "{css}");
+    let css = style_css(concat!(
+        "import std::web::style::{ Length, style };\n",
+        "let _width = const style().raw(\"border-top-width\", Length::dp(1));\n",
+        "let _outline = css { outline(dp(2), \"solid\", gray(500)); outline-offset(dp(-2)); };\n",
+        "let _radius = css { border-radius(dp(4)); };\n",
+        "let _shadow = css { box-shadow(dp(0), dp(1), dp(2), gray(500)); };\n",
+        "fun main() {}\n",
+        "main();\n",
+    ));
+    assert!(css.contains("{border-top-width:1px}"), "{css}");
+    assert!(css.contains("{outline:2px solid var(--gray-500)}"), "{css}");
+    assert!(css.contains("{outline-offset:-2px}"), "{css}");
+    assert!(css.contains("{border-radius:0.25rem}"), "{css}");
+    assert!(
+        css.contains("{box-shadow:0px 1px 2px var(--gray-500)}"),
+        "{css}"
+    );
+}
+
+/// A178 Q5: `with_length_as` names the role outright — a `dp` in `role`'s unit
+/// whatever the property is called — and keeps a token's line on the sheet.
+#[test]
+fn a178_q5_with_length_as_writes_a_dp_in_the_role_it_names() {
+    let css = a178_chain_sheet(".with_length_as(\"--rule\", Length::dp(1), Role::Px)");
+    assert!(css.contains("{--rule:1px}"), "{css}");
+    let css = a178_chain_sheet(".with_length_as(\"border-width\", Length::dp(4), Role::Rem)");
+    assert!(css.contains("{border-width:0.25rem}"), "{css}");
+    let css = a178_chain_sheet(".with_length_as(\"--gutter\", space(4), Role::Px)");
+    assert!(css.contains("{--gutter:var(--space-4)}"), "{css}");
     assert!(css.contains(":root{--space-4:1rem}"), "{css}");
 }
 
