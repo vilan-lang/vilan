@@ -5,9 +5,9 @@
 // `NativeMap<K, V>` (`std::js::native_map`), which keeps the key (M191).
 //
 // The key type is fixed as `Hash` rather than generic — the raw layer only ever
-// takes canonical keys — which keeps this table single-parameter and as cheap
-// as the JS `Map` it is: `new` is `new Map()`, `insert` is `.set`, `get` returns
-// an `Option<V>` (a copy), and `keys`/`values` are cloned `List` snapshots in
+// takes canonical keys — which keeps this table single-parameter and as cheap as
+// the JS `Map` it is: `new` is `new Map()`, `insert` is `.set`, `get` returns an
+// `Option<V>` (a copy), and `keys`/`values` are cloned `List` snapshots in
 // insertion order.
 import pkg::hash::Hash;
 import pkg::option::Option;

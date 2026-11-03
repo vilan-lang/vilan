@@ -1,19 +1,18 @@
 // `NativeMap<K, V>` — the ONE table under the value-keyed `HashMap<K, V>` and
-// `HashSet<T>` (M191, proposal/hash-map-lend.md §10; I1 before it). It is keyed
-// by a canonical `Hash` (a string/primitive JS keys by value), which the public
-// types compute from `key.hash()`, and it stores the ORIGINAL key beside an
-// `Option<V>` slot, so `keys()` answers real `K`s and a slot is a place of its
-// own that `lend` reads and `slot` hands out IN PLACE. Not part of the public
-// surface.
+// `HashSet<T>` (M191, proposal/hash-map-lend.md §10; I1 before it). It is keyed by
+// a canonical `Hash` (a string/primitive JS keys by value), which the public types
+// compute from `key.hash()`, and it stores the ORIGINAL key beside an `Option<V>`
+// slot, so `keys()` answers real `K`s and a slot is a place of its own that `lend`
+// reads and `slot` hands out IN PLACE. Not part of the public surface.
 //
 // A slot holding `None` is a TOMBSTONE that no lookup, count or walk sees. Only
 // `slot` can leave one (a view written `None`, or a miss never filled); the
 // table settles it at its next write (`insert`, `remove`, `slot`): still `None`,
 // the key is gone (written again it goes last); `Some`, it stays where it was.
 //
-// On JS the table is a `Map` from the hash to the entry `[key, slot]`, the slot
-// the `Option` array itself, so a view of it IS the stored object; natively it
-// is `vilan_rt::NativeMap`. Insertion-ordered on both.
+// On JS the table is a `Map` from the hash to the entry `[key, slot]`, the slot the
+// `Option` array itself, so a view of it IS the stored object; natively it is
+// `vilan_rt::NativeMap`. Insertion-ordered on both.
 import pkg::hash::Hash;
 import pkg::option::Option;
 
@@ -42,9 +41,9 @@ impl NativeMap<type K, type V> {
 	external fun lend<U>(self, hash: Hash, read: |&Option<V>| U): U;
 
 	/// The slot under `hash`, writable in place: a present key's own (its place
-	/// kept), or a fresh `None` appended LAST under `key` for an absent one. A
-	/// slot the view leaves `None` is a tombstone until the next write deletes
-	/// its key. `key` is copied in only on a miss.
+	/// kept), or a fresh `None` appended LAST under `key` for an absent one. A slot
+	/// the view leaves `None` is a tombstone until the next write deletes its key.
+	/// `key` is copied in only on a miss.
 	external fun slot(&mut self, hash: Hash, own key: K): &mut Option<V> borrows self;
 
 	external fun contains_key(self, hash: Hash): bool;

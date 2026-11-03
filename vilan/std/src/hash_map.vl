@@ -58,8 +58,8 @@ impl HashMap<type K: Hashable, type V> {
 	///
 	/// A slot left `None` is a removal; one made `Some` under an absent key is
 	/// inserted LAST; a present key keeps its place. The view is second-class
-	/// (`borrows self`): use it in one expression, or a short-lived local the
-	/// map is not touched beside.
+	/// (`borrows self`): use it in one expression, or a short-lived local the map
+	/// is not touched beside.
 	fun slot(&mut self, key: K): &mut Option<V> borrows self {
 		self.table.slot(key.hash(), key)
 	}
@@ -67,8 +67,8 @@ impl HashMap<type K: Hashable, type V> {
 	/// The value stored under `key` — or, when there is none, the one `make`
 	/// builds, INSERTED and then answered (tracker I8: the map's entry idiom, as
 	/// Rust's `entry(key).or_insert_with(make)`; the name says the write, as
-	/// `Shared<Option<T>>::get_or_insert` and `Memo::get_or_insert` do). A copy:
-	/// to change the value where it is, `slot(key).get_or_insert(..)`.
+	/// `Shared<Option<T>>::get_or_insert` and `Memo::get_or_insert` do). A copy: to
+	/// change the value where it is, `slot(key).get_or_insert(..)`.
 	///
 	/// `make` runs only on a miss, and exactly once there, so a maker that costs
 	/// something is paid for once per key. It runs at the call site, so a maker
@@ -114,8 +114,8 @@ impl HashMap<type K: Hashable, type V> {
 	/// A `List` snapshot of `(key, value)` pairs, in insertion order — the paired
 	/// counterpart to `keys()`/`values()`, for walking both together without
 	/// zipping two separate snapshots by hand:
-	/// `for entry in map.entries() { entry.0; entry.1 }`. The two snapshots
-	/// share the table's one insertion order, so they pair up by position.
+	/// `for entry in map.entries() { entry.0; entry.1 }`. The two snapshots share
+	/// the table's one insertion order, so they pair up by position.
 	fun entries(self): List<(K, V)> {
 		let keys = self.table.keys();
 		let values = self.table.values();
