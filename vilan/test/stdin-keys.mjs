@@ -114,8 +114,11 @@ function __stdin_wait(signal, bytes, wait) {
 	});
 }
 function __substring(text, start, end) {
-	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);
+	if (0 <= start && start <= end && end <= text.length) return text.substring(__code_point_floor(text, start), __code_point_floor(text, end));
 	throw "substring out of range: the length is " + text.length + " but the range is " + start + ".." + end + " — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end";
+}
+function __code_point_floor(text, at) {
+	return at > 0 && (text.charCodeAt(at) & 0xFC00) === 0xDC00 && (text.charCodeAt(at - 1) & 0xFC00) === 0xD800 ? at - 1 : at;
 }
 let __vilan_keys = null;
 function __term_enter() {
@@ -176,25 +179,25 @@ function debug(self) {
 		if (unit < 32 || unit === 34 || unit === 92 || unit === 127) {
 			const low = as_usize(unit % 16);
 			const high = as_usize(Math.trunc(unit / 16));
-			let $U = null;
+			let $V = null;
 			if (unit === 92) {
-				$U = "\\\\";
+				$V = "\\\\";
 			} else if (unit === 34) {
-				$U = "\\\"";
+				$V = "\\\"";
 			} else if (unit === 10) {
-				$U = "\\n";
+				$V = "\\n";
 			} else if (unit === 9) {
-				$U = "\\t";
+				$V = "\\t";
 			} else if (unit === 13) {
-				$U = "\\r";
+				$V = "\\r";
 			} else if (unit === 0) {
-				$U = "\\0";
+				$V = "\\0";
 			} else if (high === 0) {
-				$U = "\\u{" + __substring(digits, low, low + 1) + "}";
+				$V = "\\u{" + __substring(digits, low, low + 1) + "}";
 			} else {
-				$U = "\\u{" + __substring(digits, high, high + 1) + __substring(digits, low, low + 1) + "}";
+				$V = "\\u{" + __substring(digits, high, high + 1) + __substring(digits, low, low + 1) + "}";
 			}
-			const escaped = $U;
+			const escaped = $V;
 			out = out + __substring(self, start, index) + escaped;
 			start = index + 1;
 		}
@@ -246,16 +249,16 @@ function keys() {
 	}
 	return [ __shared_new(new2()), opened === 1 ];
 }
-async function next(self, $V) {
-	const $W = await (next_press(self, $V));
-	let $X = null;
-	if ($W[0] === 0) {
-		const press = $W[1];
-		$X = [ 0, key(press) ];
+async function next(self, $W) {
+	const $X = await (next_press(self, $W));
+	let $Y = null;
+	if ($X[0] === 0) {
+		const press = $X[1];
+		$Y = [ 0, key(press) ];
 	} else {
-		$X = [ 1 ];
+		$Y = [ 1 ];
 	}
-	return $X;
+	return $Y;
 }
 async function next_press(self, $a) {
 	while (true) {
@@ -717,11 +720,11 @@ function ambient_signal($I) {
 	return $K;
 }
 function is_none(self) {
-	const $Y = self;
-	return $Y[0] === 1;
+	const $Z = self;
+	return $Z[0] === 1;
 }
-function $Z($aa) {
-	drop($aa);
+function $aa($ab) {
+	drop($ab);
 }
 (async () => {
 	const keys2 = keys();
@@ -743,10 +746,10 @@ function $Z($aa) {
 		console.log("keys: " + count);
 		console.log("next past the end is None: " + is_none(await (next(keys2, [ 1 ]))));
 	} finally {
-		$Z(keys2);
+		$aa(keys2);
 	}
-})().catch(($ab) => {
-	console.error(String($ab));
+})().catch(($ac) => {
+	console.error(String($ac));
 	process.exit(1);
 });
 //# sourceMappingURL=stdin-keys.mjs.map

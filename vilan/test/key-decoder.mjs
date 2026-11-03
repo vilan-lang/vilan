@@ -17,8 +17,11 @@ function __parse_i32(text) {
 	return /^[+-]?[0-9]+$/.test(trimmed) && value >= -2147483648 && value <= 2147483647 ? [ 0, value ] : [ 1 ];
 }
 function __substring(text, start, end) {
-	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);
+	if (0 <= start && start <= end && end <= text.length) return text.substring(__code_point_floor(text, start), __code_point_floor(text, end));
 	throw "substring out of range: the length is " + text.length + " but the range is " + start + ".." + end + " — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end";
+}
+function __code_point_floor(text, at) {
+	return at > 0 && (text.charCodeAt(at) & 0xFC00) === 0xDC00 && (text.charCodeAt(at - 1) & 0xFC00) === 0xD800 ? at - 1 : at;
 }
 function set(self, index, value) {
 	self.fill(value, index, index + 1);
@@ -43,25 +46,25 @@ function debug(self) {
 		if (unit < 32 || unit === 34 || unit === 92 || unit === 127) {
 			const low = as_usize(unit % 16);
 			const high = as_usize(Math.trunc(unit / 16));
-			let $Q = null;
+			let $R = null;
 			if (unit === 92) {
-				$Q = "\\\\";
+				$R = "\\\\";
 			} else if (unit === 34) {
-				$Q = "\\\"";
+				$R = "\\\"";
 			} else if (unit === 10) {
-				$Q = "\\n";
+				$R = "\\n";
 			} else if (unit === 9) {
-				$Q = "\\t";
+				$R = "\\t";
 			} else if (unit === 13) {
-				$Q = "\\r";
+				$R = "\\r";
 			} else if (unit === 0) {
-				$Q = "\\0";
+				$R = "\\0";
 			} else if (high === 0) {
-				$Q = "\\u{" + __substring(digits, low, low + 1) + "}";
+				$R = "\\u{" + __substring(digits, low, low + 1) + "}";
 			} else {
-				$Q = "\\u{" + __substring(digits, high, high + 1) + __substring(digits, low, low + 1) + "}";
+				$R = "\\u{" + __substring(digits, high, high + 1) + __substring(digits, low, low + 1) + "}";
 			}
-			const escaped = $Q;
+			const escaped = $R;
 			out = out + __substring(self, start, index) + escaped;
 			start = index + 1;
 		}
