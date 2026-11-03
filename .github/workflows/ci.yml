@@ -298,6 +298,11 @@ jobs:
       # `target/wasm-pkg` rather than `pkg` because the script runs in a
       # checkout somebody works in, and `target/` is the one directory this
       # repository already ignores.
+      #
+      # The leg also builds `std::image`'s codec (M185) — `vilan-image-wasm`,
+      # whose blob is committed — with the PINNED toolchain
+      # (`scripts/build-image-wasm.sh` installs its wasm32 target when it is
+      # missing), smokes it under node, and byte-compares it with the commit.
       - name: The artifact builds and the bindings generate
         run: scripts/ci-local.sh wasm
 

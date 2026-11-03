@@ -736,6 +736,12 @@ cp "$PROPOSED" CHANGELOG.md
 say "CHANGELOG.md: '## Unreleased' is now '$HEADING', ordered."
 say ""
 run sh scripts/bump-version.sh "$VERSION"
+# The image codec's committed wasm blob (M190: CI's `wasm` leg rebuilds it with
+# the pinned toolchain and byte-compares) carries the crate version, so a bump
+# without a rebuild tags a tree whose blob is NOT what the tree builds - the
+# v0.54.0 cut went red on its own commit that way (N193). Rebuilt here, in the
+# release commit, as `build-image-wasm.sh` itself asks.
+run sh scripts/build-image-wasm.sh
 say ""
 # The release's performance report (M105 S7, performance-gates.md §6.4): the
 # seal's verdict for this commit, rendered beside the release - the T2 table,
@@ -788,7 +794,8 @@ fi
 # the workspace's `members`.
 release_files() {
     printf '%s\n' CHANGELOG.md Cargo.lock crates/*/Cargo.toml \
-        editors/vscode/package.json editors/vscode/package-lock.json
+        editors/vscode/package.json editors/vscode/package-lock.json \
+        crates/vilan-image-wasm/vilan_image.wasm
     if [ -f "perf/report-v${VERSION:-}.md" ]; then
         printf '%s\n' "perf/report-v$VERSION.md" perf/budgets.toml
     fi

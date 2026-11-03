@@ -9,8 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use vilan_embedded::{
-    CONTENT_HASH, FILES, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES, RT_MANIFEST,
-    RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, RT_TERM_MANIFEST, materialize_into,
+    CONTENT_HASH, FILES, IMAGE_CORE_MANIFEST, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES,
+    RT_IMAGE_MANIFEST, RT_MANIFEST, RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, RT_TERM_MANIFEST,
+    materialize_into,
 };
 
 mod scratch;
@@ -166,8 +167,9 @@ fn the_runtime_materializes_completely_and_idempotently() {
     let _ = fs::remove_dir_all(&cache_root);
 }
 
-/// F18 slice 2, F40 and F45: the three OPTIONAL runtime crates ride the runtime's
-/// table and its cache — every source of each is embedded (a collector gap
+/// F18 slice 2, F40, F45, A173 S2 and M185: the OPTIONAL runtime crates (and
+/// the image glue's codec core beside them) ride the runtime's table and its
+/// cache — every source of each is embedded (a collector gap
 /// would materialize a crate that does not build), each materialized manifest
 /// KEEPS its crates.io dependency (the reason it is a crate apart) and drops
 /// the workspace-only lints, and all land BESIDE `vilan-rt` under the one
@@ -182,6 +184,14 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
         ("vilan-rt-signal", RT_SIGNAL_MANIFEST, "ctrlc"),
         // A173 S2: a PLATFORM dependency block is kept like the plain one.
         ("vilan-rt-term", RT_TERM_MANIFEST, "libc"),
+        // M185: the glue keeps its sibling path dependency on the core, and
+        // the core its crates.io one.
+        (
+            "vilan-rt-image",
+            RT_IMAGE_MANIFEST,
+            "vilan-image = { path = \"../vilan-image\" }",
+        ),
+        ("vilan-image", IMAGE_CORE_MANIFEST, "image = { version"),
     ];
     for (directory, manifest, dependency) in optional {
         let mut on_disk = Vec::new();

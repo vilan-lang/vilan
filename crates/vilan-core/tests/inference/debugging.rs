@@ -147,6 +147,43 @@ fn b646_a_for_loop_over_a_tracking_next_is_refused() {
     );
 }
 
+/// B646's guard: `[track_caller]` on a trait member the compiler calls with no
+/// argument list is refused at the declaration — an operator member (resolved
+/// by the trait's NAME, so a program's own `trait Add` is one), and a
+/// `to_string` a concatenation renders a bounded operand through. B690 made the
+/// operator a call edge, and the edge read as a `for` loop's `next` until this
+/// guard owned the case.
+#[test]
+fn b646_tracking_on_an_operator_member_is_refused_at_the_trait() {
+    assert_fails_once_with(
+        "trait Add {\n\t[track_caller]\n\tfun add(self, b: Self): Self;\n}\nstruct Money { cents: i32 }\nimpl Money with Add {\n\tfun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }\n}\nfun main() {\n\tlet total = Money { cents = 1 } + Money { cents = 2 };\n\tprint(total.cents);\n}\n",
+        "`[track_caller]` on `Add`'s `add`, which the compiler calls implicitly — `a + b` calls it — with no argument list to pass a location through; drop the attribute",
+    );
+    assert_fails_once_with(
+        "trait PartialOrd {\n\t[track_caller]\n\tfun lt(self, b: Self): bool;\n}\nfun main() {}\n",
+        "`[track_caller]` on `PartialOrd`'s `lt`, which the compiler calls implicitly — `a < b` calls it",
+    );
+}
+
+#[test]
+fn b646_tracking_on_a_rendering_to_string_is_refused_at_the_trait() {
+    assert_fails_once_with(
+        "trait Shown {\n\t[track_caller]\n\tfun to_string(self): str;\n}\nstruct Money { cents: i32 }\nimpl Money with Shown {\n\tfun to_string(self): str { \"c\" }\n}\nfun show<T: Shown>(value: T): str { \"v=\" + value }\nfun main() {\n\tprint(show(Money { cents = 1 }));\n}\n",
+        "`[track_caller]` on `Shown`'s `to_string`, which the compiler calls implicitly — a concatenation or an i-string hole renders a value bounded by the trait through it",
+    );
+}
+
+/// The guard is about HOW a member is called, not its name alone: a tracking
+/// member of a trait no operator resolves through, and a `to_string` that does
+/// not answer a `str`, still track.
+#[test]
+fn b646_tracking_on_an_explicitly_called_member_still_compiles() {
+    assert_compiles_and_runs(
+        "import std::debug::caller;\ntrait Probe {\n\t[track_caller]\n\tfun add(self): str;\n\t[track_caller]\n\tfun to_string(self): i32;\n}\nstruct P {}\nimpl P with Probe {\n\tfun add(self): str { caller().text() }\n\tfun to_string(self): i32 { 7 }\n}\nfun main() {\n\tprint(P {}.add());\n\tprint(P {}.to_string());\n}\n",
+        "test.vl:14:13\n7\n",
+    );
+}
+
 /// A tracking function taken as a VALUE is refused: a call through the value
 /// cannot know to pass a location, and passing none would print nothing where
 /// the report promises a site.
@@ -601,6 +638,32 @@ fn e275_the_derive_spells_variants_qualified_and_agrees_with_dbg() {
             "  numbers = [1, 2, 3],\n",
             "}\n",
         ),
+    );
+}
+
+/// E346: a debug spelling escapes EVERY control character - the rest of C0 and
+/// DEL as `\u{..}` (`\u{1b}` for ESC, `\u{7}` for BEL), beside the six short
+/// escapes it always had - in `.debug()` and in `dbg` alike, so a value holding
+/// pasted terminal output prints what it holds instead of acting on the
+/// terminal. B652's `\b`, `\f` and `\v` are among the controls, spelled
+/// `\u{8}`, `\u{c}` and `\u{b}` (Rust's Debug spells them the same way).
+#[test]
+fn e346_debug_escapes_every_control_character() {
+    assert_dbg_runs(
+        concat!(
+            "import std::debug::Debug;\n",
+            "fun main() {\n",
+            "\tlet text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\b\\f\\v\\u{1f}\\n\\t\\r\\0\\\"\\\\é\";\n",
+            "\tprint(text.debug());\n",
+            "\tdbg(text);\n",
+            "\tprint(\"plain\".debug());\n",
+            "}\n",
+        ),
+        concat!(
+            "\"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{8}\\u{c}\\u{b}\\u{1f}\\n\\t\\r\\0\\\"\\\\é\"\n",
+            "\"plain\"\n",
+        ),
+        "[test.vl:5:2] text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{8}\\u{c}\\u{b}\\u{1f}\\n\\t\\r\\0\\\"\\\\é\"\n",
     );
 }
 

@@ -1,0 +1,99 @@
+// B691: an enum with a payload is a VALUE at every seam — a binding, an
+// argument, a struct literal's field, a list element, a `*view` read, a return
+// of one, a closure answering `*slot` — so a write through one copy's payload
+// never shows in another. JS shared the `[index, ..data]` array at every one.
+import std::io::print;
+
+struct Holder {
+	items: Option<List<i32>>,
+}
+
+enum Shape {
+	Dot,
+	Circle(i32),
+}
+
+fun show(value: Option<List<i32>>): str {
+	match value {
+		Some(let list) => i"Some({list.len()})",
+		None => "None",
+	}
+}
+
+fun grow(held: &mut Option<List<i32>>) {
+	if &mut *held is Some(let list) {
+		list.push(9);
+	}
+}
+
+fun grown_copy(value: Option<List<i32>>) {
+	mut copy = value;
+	grow(&mut copy);
+}
+
+fun read(view: &Option<List<i32>>): Option<List<i32>> {
+	*view
+}
+
+fun peek<R>(slot: &Option<List<i32>>, f: |&Option<List<i32>>| R): R {
+	f(slot)
+}
+
+fun main() {
+	let a: Option<List<i32>> = Some([1, 2]);
+	mut b = a;
+	grow(&mut b);
+	print(i"binding: a={show(a)} b={show(b)}");
+
+	let c: Option<List<i32>> = Some([1]);
+	grown_copy(c);
+	print(i"argument: c={show(c)}");
+
+	let d: Option<List<i32>> = Some([1]);
+	mut holder = Holder { items = d };
+	grow(&mut holder.items);
+	print(i"field: d={show(d)} holder={show(holder.items)}");
+
+	let e: Option<List<i32>> = Some([1]);
+	mut many = [e];
+	grow(&mut many[0]);
+	print(i"element: e={show(e)} many={show(many[0])}");
+
+	let f: Option<List<i32>> = Some([1]);
+	let view = &f;
+	mut g = *view;
+	grow(&mut g);
+	print(i"deref: f={show(f)} g={show(g)}");
+
+	let h: Option<List<i32>> = Some([1]);
+	mut i = read(&h);
+	grow(&mut i);
+	print(i"return: h={show(h)} i={show(i)}");
+
+	let j: Option<List<i32>> = Some([1]);
+	mut k = peek(&j, |slot| *slot);
+	grow(&mut k);
+	print(i"closure: j={show(j)} k={show(k)}");
+
+	let scalar: Option<i32> = Some(1);
+	mut bumped = scalar;
+	if &mut bumped is Some(let n) {
+		n += 5;
+	}
+	print(i"scalar: {scalar.unwrap_or(0)} {bumped.unwrap_or(0)}");
+
+	let circle = Shape::Circle(2);
+	mut resized = circle;
+	if &mut resized is Shape::Circle(let radius) {
+		radius = 9;
+	}
+	match circle {
+		Shape::Circle(let radius) => print(i"user enum: {radius}"),
+		Shape::Dot => print("dot"),
+	}
+
+	mut points = [Some([1]), None];
+	mut array = points.to_array<2>().unwrap();
+	grow(&mut array[0]);
+	print(i"to_array: {show(points[0])} {show(array[0])}");
+}

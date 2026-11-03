@@ -31,13 +31,14 @@
 // turn produce ONE notification and the consumer drains every op at the settle, so
 // the log is as long as one turn's writes.
 import pkg::compare::PartialEq;
+import pkg::debug::caller;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
 import pkg::iterator::Items;
-import pkg::js::native_map::NativeMap;
+import pkg::js::hash_table::HashTable;
 import pkg::operators::{ Add, Sub };
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::hash_map_cell::{ HashMapCell, HashMapEntry, MapSource, apply_map_ops };
@@ -60,6 +61,7 @@ import pkg::reactive::{
 	fresh_id,
 	observe_flow,
 	owner_scope,
+	place_subscriber,
 	reconcile,
 	register_with_owner,
 	run_element,
@@ -1247,11 +1249,13 @@ export trait CollPipe<T> with CollFlow<T> {
 	/// ops applied to one `ListCell` as they arrive, the collection cached for
 	/// every reader. Owner-tied like `Pipe::memo` (A28); a module binding says
 	/// `.memo_global()`.
+	[track_caller]
 	fun memo(own self): ListMemo<T> {
 		ListMemo<T> { cell = seal_collection(self.open(), true) }
 	}
 
 	/// `.memo()` for a collection that lives as long as the PROGRAM (A130).
+	[track_caller]
 	fun memo_global(own self): ListMemo<T> {
 		ListMemo<T> { cell = seal_collection(self.open(), false) }
 	}
@@ -1270,11 +1274,16 @@ export trait CollPipe<T> with CollFlow<T> {
 /// drain to it, op for op, so the cell's own log says what the pipe said — a
 /// consumer of the sealed source is told the same changes, not a diff of them. A
 /// DERIVATION (A110 door 2): it publishes, so an effect over it reads it settled.
+/// `[track_caller]` (E345), with every seal: under the reactive trace the refresh
+/// names the program's `.memo()`.
+[track_caller]
 fun seal_collection<T>(instance: CollInstance<T>, owned: bool): ListCell<T> {
 	let sealed: ListCell<T> = ListCell<T>::of(fresh_list((instance.snapshot)()));
 	let drain = instance.drain;
 	if owned {
-		let refreshed = (instance.attach)(subscriber_of(|| apply_ops(sealed, drain()), true));
+		let refresh = subscriber_of(|| apply_ops(sealed, drain()), true);
+		place_subscriber(refresh.id, caller());
+		let refreshed = (instance.attach)(refresh);
 		also_releasing(refreshed, instance.release);
 		let _owned = register_with_owner(refreshed);
 	} else {
@@ -1282,7 +1291,9 @@ fun seal_collection<T>(instance: CollInstance<T>, owned: bool): ListCell<T> {
 		// loop a program-lifetime seal holds is the design (`reactive-pipeline.md`
 		// §2.4).
 		let cell_global_refresh = || apply_ops(sealed, drain());
-		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+		let refresh = subscriber_of(cell_global_refresh, true);
+		place_subscriber(refresh.id, caller());
+		let _for_the_program = (instance.attach)(refresh);
 	}
 	sealed
 }
@@ -1484,7 +1495,7 @@ struct ElementCore<T, V> {
 	ids: Shared<List<i32>>,
 	items: Shared<List<T>>,
 	values: Shared<List<V>>,
-	holds: Shared<NativeMap<ElementHold<V>>>,
+	holds: Shared<HashTable<ElementHold<V>>>,
 	/// Slots whose followed flow changed since the last resolve, in arrival order.
 	dirty: Shared<List<i32>>,
 	next_id: Shared<i32>,
@@ -1505,7 +1516,7 @@ fun element_core<T, V>(stage: Owner, run: |T| (ElementRun<V>, Option<Owner>)): E
 	let ids: List<i32> = [];
 	let items: List<T> = [];
 	let values: List<V> = [];
-	let holds: NativeMap<ElementHold<V>> = NativeMap::new();
+	let holds: HashTable<ElementHold<V>> = HashTable::new();
 	let dirty: List<i32> = [];
 	let consumer: Option<Subscriber> = None;
 	ElementCore<T, V> {
@@ -1701,13 +1712,13 @@ fun resolve<T, V>(core: ElementCore<T, V>, ops: List<SeqOp<T>>): List<ElementEve
 	let woke = core.dirty.read();
 	if woke.len() > 0 {
 		core.dirty.write() = [];
-		mut positions: NativeMap<usize> = NativeMap::new();
+		mut positions: HashTable<usize> = HashTable::new();
 		mut index = 0;
 		for id in core.ids.read() {
 			positions.insert(id.hash(), index);
 			index += 1;
 		}
-		mut seen: NativeMap<bool> = NativeMap::new();
+		mut seen: HashTable<bool> = HashTable::new();
 		for id in woke {
 			if seen.contains_key(id.hash()) {
 				jump continue;
@@ -2660,11 +2671,13 @@ export trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
 	/// drain applied to one `HashMapCell` as one batch, so the sealed map's own log
 	/// says what the pipe said and its per-key slots wake for the keys the pipe
 	/// named. Owner-tied, like every seal; a module binding says `.memo_global()`.
+	[track_caller]
 	fun memo(own self): HashMapMemo<K, V> {
 		HashMapMemo<K, V> { cell = seal_map(self.open(), true) }
 	}
 
 	/// `.memo()` for a map that lives as long as the PROGRAM (A130).
+	[track_caller]
 	fun memo_global(own self): HashMapMemo<K, V> {
 		HashMapMemo<K, V> { cell = seal_map(self.open(), false) }
 	}
@@ -2680,18 +2693,23 @@ export trait MapPipe<K: Hashable, V> with MapFlow<K, V> {
 }
 
 /// The seal both map `memo`s share — `seal_collection`'s shape.
+[track_caller]
 fun seal_map<K: Hashable, V>(instance: MapInstance<K, V>, owned: bool): HashMapCell<K, V> {
 	let sealed: HashMapCell<K, V> = HashMapCell::of((instance.snapshot)());
 	let drain = instance.drain;
 	if owned {
-		let refreshed = (instance.attach)(subscriber_of(|| apply_map_ops(sealed, drain()), true));
+		let refresh = subscriber_of(|| apply_map_ops(sealed, drain()), true);
+		place_subscriber(refresh.id, caller());
+		let refreshed = (instance.attach)(refresh);
 		also_releasing(refreshed, instance.release);
 		let _owned = register_with_owner(refreshed);
 	} else {
 		// NAMED for the no-cycle gate, as `seal_collection`'s program-lifetime
 		// refresh is.
 		let cell_global_refresh = || apply_map_ops(sealed, drain());
-		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+		let refresh = subscriber_of(cell_global_refresh, true);
+		place_subscriber(refresh.id, caller());
+		let _for_the_program = (instance.attach)(refresh);
 	}
 	sealed
 }
@@ -2845,11 +2863,13 @@ export impl type S: SetSource<type T> with SetFlow<T> {
 [resource]
 export trait SetPipe<T: Hashable> with SetFlow<T> {
 	/// Seal into a read-only granular set source (owner-tied).
+	[track_caller]
 	fun memo(own self): HashSetMemo<T> {
 		HashSetMemo<T> { cell = seal_set(self.open(), true) }
 	}
 
 	/// `.memo()` for a set that lives as long as the PROGRAM (A130).
+	[track_caller]
 	fun memo_global(own self): HashSetMemo<T> {
 		HashSetMemo<T> { cell = seal_set(self.open(), false) }
 	}
@@ -2864,16 +2884,21 @@ export trait SetPipe<T: Hashable> with SetFlow<T> {
 }
 
 /// The seal both set `memo`s share.
+[track_caller]
 fun seal_set<T: Hashable>(instance: SetInstance<T>, owned: bool): HashSetCell<T> {
 	let sealed: HashSetCell<T> = HashSetCell::of((instance.snapshot)());
 	let drain = instance.drain;
 	if owned {
-		let refreshed = (instance.attach)(subscriber_of(|| apply_set_ops(sealed, drain()), true));
+		let refresh = subscriber_of(|| apply_set_ops(sealed, drain()), true);
+		place_subscriber(refresh.id, caller());
+		let refreshed = (instance.attach)(refresh);
 		also_releasing(refreshed, instance.release);
 		let _owned = register_with_owner(refreshed);
 	} else {
 		let cell_global_refresh = || apply_set_ops(sealed, drain());
-		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+		let refresh = subscriber_of(cell_global_refresh, true);
+		place_subscriber(refresh.id, caller());
+		let _for_the_program = (instance.attach)(refresh);
 	}
 	sealed
 }
@@ -2964,7 +2989,7 @@ struct RankFace {
 	slots: Shared<List<Hash>>,
 	alive: Shared<List<bool>>,
 	/// A LIVE key's slot.
-	slot_of: Shared<NativeMap<usize>>,
+	slot_of: Shared<HashTable<usize>>,
 	tree: Shared<List<i32>>,
 	live: Shared<usize>,
 }
@@ -2973,7 +2998,7 @@ struct RankFace {
 fun rank_face(keys: List<Hash>): RankFace {
 	let slots: List<Hash> = [];
 	let alive: List<bool> = [];
-	let slot_of: NativeMap<usize> = NativeMap::new();
+	let slot_of: HashTable<usize> = HashTable::new();
 	let tree: List<i32> = [0];
 	let face = RankFace {
 		slots = Shared::new(slots),
@@ -2990,7 +3015,7 @@ fun rank_face(keys: List<Hash>): RankFace {
 fun face_rebuild(face: RankFace, keys: List<Hash>) {
 	mut slots: List<Hash> = [];
 	mut alive: List<bool> = [];
-	mut slot_of: NativeMap<usize> = NativeMap::new();
+	mut slot_of: HashTable<usize> = HashTable::new();
 	mut tree: List<i32> = [0];
 	mut at: usize = 0;
 	for key in keys {
@@ -3158,14 +3183,14 @@ struct KeyRow<K, V, U> {
 /// A keyed stage's state: the collection operators' `ElementCore` for the RUNS —
 /// its closure, scratch owner, holds, dirty slots and consumer — with the rows kept
 /// by key rather than by position (the core's own positional lists stay empty). The
-/// rows are a `NativeMap` keyed by the key's hash, which iterates in the upstream
+/// rows are a `HashTable` keyed by the key's hash, which iterates in the upstream
 /// map's order: an overwrite keeps its row's place, a removal drops it, an arrival
 /// appends.
 struct KeyedCore<K: Hashable, V, U> {
 	core: ElementCore<(K, V), U>,
-	rows: Shared<NativeMap<KeyRow<K, V, U>>>,
+	rows: Shared<HashTable<KeyRow<K, V, U>>>,
 	/// A run's slot id → its key's hash, for the followed flows that wake.
-	key_of_slot: Shared<NativeMap<Hash>>,
+	key_of_slot: Shared<HashTable<Hash>>,
 }
 
 /// One key change the keyed core resolved.
@@ -3185,8 +3210,8 @@ fun keyed_core<K: Hashable, V, U>(
 	stage: Owner,
 	run: |(K, V)| (ElementRun<U>, Option<Owner>),
 ): KeyedCore<K, V, U> {
-	let rows: NativeMap<KeyRow<K, V, U>> = NativeMap::new();
-	let key_of_slot: NativeMap<Hash> = NativeMap::new();
+	let rows: HashTable<KeyRow<K, V, U>> = HashTable::new();
+	let key_of_slot: HashTable<Hash> = HashTable::new();
 	KeyedCore<K, V, U> {
 		core = element_core(stage, run),
 		rows = Shared::new(rows),
@@ -3268,7 +3293,7 @@ fun keyed_resolve<K: Hashable, V, U>(
 				for row in keyed_rows(keyed) {
 					keyed_retire(keyed, row);
 				}
-				let emptied: NativeMap<KeyRow<K, V, U>> = NativeMap::new();
+				let emptied: HashTable<KeyRow<K, V, U>> = HashTable::new();
 				keyed.rows.write() = emptied;
 				keyed_seed(keyed, map);
 				events.push(KeyEvent::Reset(keyed_rows(keyed)));
@@ -3280,7 +3305,7 @@ fun keyed_resolve<K: Hashable, V, U>(
 	let woke = keyed.core.dirty.read();
 	if woke.len() > 0 {
 		keyed.core.dirty.write() = [];
-		mut seen: NativeMap<bool> = NativeMap::new();
+		mut seen: HashTable<bool> = HashTable::new();
 		for id in woke {
 			if seen.contains_key(id.hash()) {
 				jump continue;

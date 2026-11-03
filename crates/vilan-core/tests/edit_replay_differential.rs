@@ -211,14 +211,15 @@ fn replay_the_classes() -> Replayed {
         }
         package.remove();
     }
-    // B635's cold wraps and M138's cold instance record start from a served
-    // analysis of the BASE text too: the world's records are filed over it,
-    // and each keystroke replays them. Before the effect classes, which the
+    // B635's cold wraps, M138's cold instance record and M188's retaining
+    // rows start from a served analysis of the BASE text too: the world's
+    // records are filed over it, and each keystroke replays them. Before the effect classes, which the
     // gate expects last.
     for fixture in B635_FIXTURES
         .iter()
         .chain(ASYNC_RECORD_FIXTURES)
         .chain(S3B_HELD_FIXTURES)
+        .chain(RETAIN_FIXTURES)
     {
         replay_from_the_base_text(fixture, "views.vl", &mut divergences, &mut censuses);
     }
@@ -637,52 +638,143 @@ fn p6a_a_package_impl_a_std_question_reaches_is_decided_by_the_rule() {
     );
 }
 
-/// **N179: a program the std prefix is not ATTEMPTED for says why.** The
-/// reuse gate in front of the attempt is syntactic — an entry whose text says
-/// `macro` may define one, which would register into the world's registry —
-/// so a program that only MENTIONS the word (the corpus's `crypto`, `db`,
-/// `file`, `watch` say it in a comment) takes the canonical path. The census
-/// read `prefix-world 0 prefix-refusal -` for it, neither served nor why; it
-/// names the gate now (`macro-text`), without counting a refusal of the
-/// prefix, and the analysis answers what the clean one does. A program the
-/// gate passes is served, with no reason.
+/// **N179: a program the std prefix is not ATTEMPTED for says why** - and
+/// **N183: the gate reads the program's TREE.** The reuse gate in front of the
+/// attempt refuses an entry that DEFINES a macro (a `macro fun`, a `macro { .. }`
+/// block), whose definitions would register into the world's registry; the
+/// census names it (`defines-a-macro`), without counting a refusal of the
+/// prefix. It used to read the entry's TEXT, so a program that only MENTIONS the
+/// word - the corpus's `crypto`, `db`, `file` and `watch` say it in a comment -
+/// was refused too (`macro-text`); a comment or a string now passes, and is
+/// served with no reason, as a program that never says it is.
 #[test]
-fn n179_a_program_the_prefix_is_not_attempted_for_names_the_gate() {
+fn n183_the_prefix_gate_refuses_a_macro_definition_and_not_the_word() {
     let _switch = SWITCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     set_plant(None);
     vilan_core::analyzer::base_cache_clear();
-    let mentions = Package::write(
-        "prefix_macro_text",
+    let defines = Package::write(
+        "prefix_macro_defined",
         NODE,
         &[(
             "main.vl",
-            "// No macro is defined here; the word is enough for the gate.\n\
+            "macro fun constants(arguments: Arguments): Source {\n\
+             \timport macro_std::source;\n\
+             \timport macro_std::meta::{ Arguments, Source };\n\n\
+             \tsource(\"fun zero(): i32 { 0 }\")\n}\n\n\
+             macro constants(zero);\n\n\
+             fun main() {\n\tprint(zero());\n}\n",
+        )],
+    );
+    let commented = Package::write(
+        "prefix_macro_commented",
+        NODE,
+        &[(
+            "main.vl",
+            "// No macro is defined here; the word alone is not a definition.\n\
              fun main() {\n\tprint(\"ok\");\n}\n",
         )],
+    );
+    let quoted = Package::write(
+        "prefix_macro_quoted",
+        NODE,
+        &[("main.vl", "fun main() {\n\tprint(\"macro fun\");\n}\n")],
     );
     let plain = Package::write(
         "prefix_plain_text",
         NODE,
         &[("main.vl", "fun main() {\n\tprint(\"ok\");\n}\n")],
     );
-    let not_taken = observe_over_the_prefix(&mentions);
-    let taken = observe_over_the_prefix(&plain);
-    mentions.remove();
-    plain.remove();
+    let not_taken = observe_over_the_prefix(&defines);
+    let served: Vec<(&str, Observation)> = [
+        ("a comment", &commented),
+        ("a string", &quoted),
+        ("no mention", &plain),
+    ]
+    .into_iter()
+    .map(|(label, package)| (label, observe_over_the_prefix(package)))
+    .collect();
+    for package in [defines, commented, quoted, plain] {
+        package.remove();
+    }
     vilan_core::analyzer::base_cache_clear();
     assert!(
         !not_taken.census.prefix_world
-            && not_taken.census.prefix_refusal == Some("macro-text")
+            && not_taken.census.prefix_refusal == Some("defines-a-macro")
             && not_taken.census.prefix_refusals == 0,
         "the gate in front of the prefix is named, and is not a refusal of it: {:?}",
         not_taken.census
     );
+    for (label, taken) in served {
+        assert!(
+            taken.census.prefix_world && taken.census.prefix_refusal.is_none(),
+            "a program whose only `macro` is in {label} is served with no reason: {:?}",
+            taken.census
+        );
+    }
+}
+
+/// **N183, the hot set's half.** A hot module that DEFINES a macro refuses the
+/// hot-set world (`defines-a-macro`: its definitions would register into the
+/// registry the stored world carries); one whose comment only says the word is
+/// served it - the per-module test read the TEXT too.
+#[test]
+fn n183_a_hot_module_that_mentions_macro_is_served_the_hot_set_world() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let main = "import pkg::helper::value;\n\nfun main() {\n\tprint(value());\n}\n";
+    let commented = Package::write(
+        "hot_macro_commented",
+        NODE,
+        &[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                "// a macro could stamp this out; none does.\nexport fun value(): i32 {\n\t1\n}\n",
+            ),
+        ],
+    );
+    let defines = Package::write(
+        "hot_macro_defined",
+        NODE,
+        &[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                "macro fun constants(arguments: Arguments): Source {\n\
+                 \timport macro_std::source;\n\
+                 \timport macro_std::meta::{ Arguments, Source };\n\n\
+                 \tsource(\"fun zero(): i32 { 0 }\")\n}\n\n\
+                 export fun value(): i32 {\n\t1\n}\n",
+            ),
+        ],
+    );
+    let observe_hot = |package: &Package| {
+        let seeds = vec![package.directory.join("helper.vl")];
+        let incremental = observe(package, seeds.clone(), Leg::Incremental);
+        let clean = observe(package, seeds, Leg::Clean);
+        assert_eq!(
+            incremental.rendering, clean.rendering,
+            "the hot-set analysis answers what the clean one does"
+        );
+        incremental.census
+    };
+    let served = observe_hot(&commented);
+    let refused = observe_hot(&defines);
+    commented.remove();
+    defines.remove();
+    vilan_core::analyzer::base_cache_clear();
     assert!(
-        taken.census.prefix_world && taken.census.prefix_refusal.is_none(),
-        "a program the gate passes is served with no reason: {:?}",
-        taken.census
+        served.hot_world && served.hot_refusal.is_none(),
+        "a hot module whose only `macro` is a comment's is served: {served:?}"
+    );
+    assert!(
+        !refused.hot_world && refused.hot_refusal == Some("defines-a-macro"),
+        "a hot module that defines a macro refuses the hot-set world: {refused:?}"
     );
 }
 
@@ -993,61 +1085,49 @@ fn each_post_pass_package_carries_a_prefix_verdict() {
 /// The corpus programs are not written to be modules and many are not clean
 /// ones: what each means as a module it means identically to both analyses,
 /// which is all the leg asks.
-#[test]
-fn the_corpus_as_modules_answers_what_a_clean_analysis_answers() {
+///
+/// N188: the leg is [`CORPUS_SHARDS`] tests, one per residue of a program's
+/// index in the sorted corpus, so nextest spreads them over its slots and CI's
+/// partitions — one test of every program was 724-900 s under a loaded `-j 6`
+/// (the pool is two workers under nextest, N159) and sat at the 15-minute kill.
+/// Interleaved rather than cut into runs, so an alphabetical cluster of heavy
+/// programs is spread too. Each program's name goes to stderr as it starts: a
+/// shard the runner kills names the program it was in.
+fn the_corpus_as_modules_shard(shard: usize) {
     let _switch = SWITCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     set_plant(None);
-    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
-        .expect("corpus directory")
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension()? == "vl").then_some(path)
-        })
+    let paths: Vec<PathBuf> = corpus_programs()
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| index % CORPUS_SHARDS == shard)
+        .map(|(_, path)| path)
         .collect();
-    paths.sort();
-    assert!(paths.len() > 60, "suspiciously few corpus programs");
+    assert!(!paths.is_empty(), "corpus shard {shard} is empty");
     vilan_core::analyzer::base_cache_clear();
-    let results: Vec<(String, Vec<String>, Vec<Census>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = paths
-            .chunks(paths.len().div_ceil(test_pool::workers(16)).max(1))
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|path| {
-                            let mut source =
-                                std::fs::read_to_string(path).expect("read corpus file");
-                            source.push_str(PROBE_REFUSAL);
-                            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-                            let mut package = Package::write(
-                                &name,
-                                Platform::default(),
-                                &[
-                                    ("main.vl", CORPUS_MAIN),
-                                    ("module.vl", &source),
-                                    ("user.vl", CORPUS_USER),
-                                    ("side.vl", CORPUS_SIDE),
-                                ],
-                            );
-                            let mut divergences = Vec::new();
-                            let mut censuses = Vec::new();
-                            for edit in CORPUS_EDITS {
-                                censuses.extend(replay(&mut package, edit, &mut divergences));
-                            }
-                            package.remove();
-                            (name, divergences, censuses)
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().expect("worker panicked"))
-            .collect()
+    let results: Vec<(String, Vec<String>, Vec<Census>)> = test_pool::map(&paths, 16, |path| {
+        let mut source = std::fs::read_to_string(path).expect("read corpus file");
+        source.push_str(PROBE_REFUSAL);
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        eprintln!("corpus shard {shard}: {name}");
+        let mut package = Package::write(
+            &name,
+            Platform::default(),
+            &[
+                ("main.vl", CORPUS_MAIN),
+                ("module.vl", &source),
+                ("user.vl", CORPUS_USER),
+                ("side.vl", CORPUS_SIDE),
+            ],
+        );
+        let mut divergences = Vec::new();
+        let mut censuses = Vec::new();
+        for edit in CORPUS_EDITS {
+            censuses.extend(replay(&mut package, edit, &mut divergences));
+        }
+        package.remove();
+        (name, divergences, censuses)
     });
     vilan_core::analyzer::base_cache_clear();
     let divergences: Vec<String> = results
@@ -1067,7 +1147,7 @@ fn the_corpus_as_modules_answers_what_a_clean_analysis_answers() {
     // Non-vacuity: the corpus has to have run through the hot-set world, from
     // the cache, often enough to say something about it. Many corpus programs
     // are refused one (an impl on a std type, a use-inferred binding), which is
-    // the guards working; the floor is on the ones that were not.
+    // the guards working; the floor is on the ones that were not, per shard.
     let censuses: Vec<&Census> = results
         .iter()
         .flat_map(|(_, _, censuses)| censuses)
@@ -1078,14 +1158,76 @@ fn the_corpus_as_modules_answers_what_a_clean_analysis_answers() {
         .count();
     let hot_worlds = censuses.iter().filter(|census| census.hot_world).count();
     eprintln!(
-        "{} incremental corpus analyses: {hot_worlds} hot-set worlds, {hot_hits} served from the base cache",
+        "corpus shard {shard}: {} programs, {} incremental analyses: {hot_worlds} hot-set worlds, \
+         {hot_hits} served from the base cache",
+        paths.len(),
         censuses.len()
     );
     assert!(
-        hot_hits >= 20,
-        "only {hot_hits} corpus analyses were hot-set worlds served from the cache — the leg \
-         says too little about S1"
+        hot_hits >= CORPUS_SHARD_HOT_FLOOR,
+        "only {hot_hits} of corpus shard {shard}'s analyses were hot-set worlds served from the \
+         cache — the leg says too little about S1"
     );
+}
+
+/// How many tests the corpus leg is (N188).
+const CORPUS_SHARDS: usize = 12;
+
+/// The least a shard's analyses are hot-set worlds served from the base cache:
+/// every shard met 10-13 (about one a program) when the leg was split, against
+/// 20 for the whole corpus before it.
+const CORPUS_SHARD_HOT_FLOOR: usize = 5;
+
+/// Every corpus program, sorted — the order the shards index.
+fn corpus_programs() -> Vec<PathBuf> {
+    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
+        .expect("corpus directory")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "vl").then_some(path)
+        })
+        .collect();
+    paths.sort();
+    assert!(paths.len() > 60, "suspiciously few corpus programs");
+    paths
+}
+
+/// One `#[test]` per shard; the count is held to [`CORPUS_SHARDS`] below.
+macro_rules! corpus_shards {
+    ($($test:ident = $shard:literal),* $(,)?) => {
+        $(
+            #[test]
+            fn $test() {
+                the_corpus_as_modules_shard($shard);
+            }
+        )*
+        const CORPUS_SHARD_TESTS: &[usize] = &[$($shard),*];
+    };
+}
+
+corpus_shards! {
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_00 = 0,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_01 = 1,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_02 = 2,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_03 = 3,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_04 = 4,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_05 = 5,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_06 = 6,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_07 = 7,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_08 = 8,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_09 = 9,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_10 = 10,
+    the_corpus_as_modules_answers_what_a_clean_analysis_answers_11 = 11,
+}
+
+/// Every residue has its test, once: a shard added to [`CORPUS_SHARDS`] without
+/// its line above would leave a twelfth of the corpus unchecked in silence.
+#[test]
+fn every_corpus_shard_has_its_test() {
+    let mut shards = CORPUS_SHARD_TESTS.to_vec();
+    shards.sort_unstable();
+    assert_eq!(shards, (0..CORPUS_SHARDS).collect::<Vec<_>>());
 }
 
 // --- the planted bugs (Q3's non-vacuity) -----------------------------------------
@@ -1180,6 +1322,7 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
         .iter()
         .chain(R11_FIXTURES)
         .chain(R11_RECORD_FIXTURES)
+        .chain(RETAIN_FIXTURES)
         .chain(EFFECT_FIXTURES)
         .chain(B635_FIXTURES)
         .chain(ASYNC_RECORD_FIXTURES)
@@ -1532,6 +1675,124 @@ fn m155_r11_candidate_rows_are_restored_on_a_served_keystroke() {
     );
 }
 
+/// **M188**: C16's retaining rows (`analyzer/retain_tables.rs`) are filed
+/// by the leaf's first (seeded) analysis — which asks no summary, the base
+/// text's `twice` call aside — and restored on its keystrokes, so a served
+/// keystroke walks a fraction of the rows the filing one did; the keystroke
+/// that hands the capturing closure to the leaf's served `pass` asks the
+/// summary of `pass` and of the cold `keep` it reaches, from rows it did not
+/// walk, and is refused as the clean analysis is.
+#[test]
+fn m188_retain_rows_are_restored_and_a_served_summary_reads_them() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let fixture = &RETAIN_FIXTURES[0];
+    let mut package = fixture.write();
+    let seed = vec![package.path("views.vl")];
+    let first = observe(&package, seed.clone(), Leg::Incremental);
+    let warm = observe(&package, seed.clone(), Leg::Incremental);
+    let edited = fixture.edits[0].apply(package.text("views.vl"));
+    package.set("views.vl", edited);
+    let served = observe(&package, seed.clone(), Leg::Incremental);
+    let clean = observe(&package, Vec::new(), Leg::Clean);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        clean
+            .rendering
+            .contains("`pass` keeps what it is handed past the call"),
+        "the fixture's storing-callee refusal: {}",
+        clean.rendering
+    );
+    assert_eq!(
+        served.rendering, clean.rendering,
+        "the served keystroke answers clean"
+    );
+    eprintln!(
+        "M188: retain rows live: first {} warm {} served {}; summaries: first {} warm {} \
+         served {} (items served {})",
+        first.census.retain_rows_live,
+        warm.census.retain_rows_live,
+        served.census.retain_rows_live,
+        first.census.retaining_summaries,
+        warm.census.retaining_summaries,
+        served.census.retaining_summaries,
+        served.census.item_records_served
+    );
+    assert!(
+        first.census.retain_rows_live > 0
+            && warm.census.retain_rows_live * 4 < first.census.retain_rows_live
+            && served.census.retain_rows_live * 4 < first.census.retain_rows_live,
+        "the warm and served keystrokes restore the retaining rows rather than walking them \
+         (first {}, warm {}, served {})",
+        first.census.retain_rows_live,
+        warm.census.retain_rows_live,
+        served.census.retain_rows_live
+    );
+    assert_eq!(
+        (
+            first.census.retaining_summaries,
+            warm.census.retaining_summaries,
+            served.census.retaining_summaries
+        ),
+        (1, 0, 2),
+        "the base text asks `twice` alone (and only while `read` is walked); the edit asks \
+         `pass` and the `keep` it reaches"
+    );
+    assert!(
+        served.census.item_records_served > 0,
+        "the leaf's `pass` was a served item: {:#?}",
+        served.census
+    );
+    // M189: the capture scan asks the closures the pass meets — the first
+    // analysis walks the cold module's `thrice` (three closures handed to
+    // calls) and the leaf's `read`; a keystroke that serves the module and
+    // `pass` asks the edited `read`'s one closure alone.
+    eprintln!(
+        "M189: capture scans: first {} warm {} served {}",
+        first.census.capture_scans, warm.census.capture_scans, served.census.capture_scans
+    );
+    assert_eq!(
+        (
+            first.census.capture_scans,
+            warm.census.capture_scans,
+            served.census.capture_scans
+        ),
+        (4, 0, 1),
+        "a served keystroke scans only the live set's closures"
+    );
+}
+
+/// M188's plant: the retaining summary folded from the LIVE rows alone, the
+/// restored ones dropped while their regions stay out of the lane. The
+/// keystrokes that hand the leaf's capturing closure to a callee whose
+/// storing body is a served item's or a reused module's are then admitted —
+/// the gate must see it.
+#[test]
+fn the_differential_sees_a_retaining_summary_without_its_restored_rows() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::RetainRowsUnrestored);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("served `pass`")),
+        "the unrestored-rows plant must turn the served callee's refusal red; it found: \
+         {divergences:#?}"
+    );
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("cold module's storing `keep`")),
+        "the unrestored-rows plant must turn the cold callee's refusal red; it found: \
+         {divergences:#?}"
+    );
+}
+
 /// **R11 door B** (incr-54b, Order 54; `analyzer/r11_records.rs`): the first
 /// seeded analysis of the door B fixture files one instance record per
 /// instantiation it scanned (every callee is a cold module's), a warm
@@ -1751,8 +2012,12 @@ fn the_differential_sees_a_prefix_served_unvalidated() {
     );
 }
 
-/// S1's plant: the impl guard dropped. A hot module's inherent impl on a
-/// prefix type is then invisible to the prefix caller that uses it.
+/// S1's plant: the impl guard dropped. A hot module's impl on a prefix type is
+/// then invisible to the prefix caller that uses it — a TRAIT impl in a module
+/// the caller never imports (`impls.vl`'s `Greet` for `Foo`, which `user.vl`
+/// calls). Since B688 an INHERENT impl's module must be reached by its caller,
+/// so editing it puts the caller in the hot set and this plant no longer
+/// touches the `ext`/`reader` step.
 #[test]
 fn the_differential_sees_a_hot_impl_the_prefix_needed() {
     let _switch = SWITCH_LOCK
@@ -1762,7 +2027,7 @@ fn the_differential_sees_a_hot_impl_the_prefix_needed() {
     assert!(
         divergences
             .iter()
-            .any(|divergence| divergence.contains("inherent impl the prefix calls")),
+            .any(|divergence| divergence.contains("an impl in a module the caller never imports")),
         "the impl-guard plant must turn the hot impl edit red; it found: {divergences:#?}"
     );
 }

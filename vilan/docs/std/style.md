@@ -18,6 +18,7 @@ fun style(): Style                 // empty style; chain from here (inside a con
 fun space(step: i32): Length       // spacing scale: space(1) = 0.25rem
 
 impl Length {
+	fun dp(value: f64): Length     // design pixels: 1/16 rem; the PROPERTY picks rem or px
 	fun px(value: f64): Length
 	fun rem(value: f64): Length
 	fun em(value: f64): Length     // relative to the element's own font size
@@ -29,7 +30,17 @@ impl Length {
 	fun var(name: str): Length     // a CSS custom-property reference ("--w")
 	fun calc(expression: str): Length  // "100% - 2rem" — no calc(..) wrapper
 	fun raw(expression: str): Length   // a COMPLETE value, verbatim: "clamp(..)"
+
+	fun root_px(): f64             // 16 — the one constant: 16px = 1rem
+	fun as_rem(self): Length       // px, rem and dp lengths only
+	fun as_px(self): Length
+	fun as_dp(self): Length
+	fun rendered(self, role: Role): str  // a dp in role's unit; anything else as written
 }
+
+enum Unit { Dp, Px, Rem, Em, Pct, Vh, Vw, Text }
+enum Role { Rem, Px }              // the unit a property prefers for a dp
+// + - between lengths, * / by an f64; < <= > >= and == (see "Lengths are data")
 
 impl Color {
 	fun white(): Color
@@ -81,6 +92,71 @@ or `view.style_var` writing it at runtime). Both spell the name with its
 nothing says so until the page is wrong. `.alpha()` composes over it
 through the same relative-colour form, so a variable-backed colour
 translucifies exactly like a ramp token.
+
+### Lengths are data
+
+A `Length` is a number and a `Unit` — `Length::px(8)` is `8` of `Unit::Px`,
+rendered `8px` at the edge — or, for `auto`, the bare `0`, `var`, `calc`,
+`raw` and the `space` tokens, a **text** length (`Unit::Text`) that keeps
+its whole value. So lengths compute:
+
+| Expression | Renders |
+|---|---|
+| `rem(1) + rem(0.5)` | `1.5rem` — one unit stays that unit |
+| `px(8) * 1.5`, `px(8) / 2` | `12px`, `4px` — scaling a unit length scales its number |
+| `dp(8) + dp(4)`, `dp(8) * 1.5` | `dp(12)` — a dp stays a dp, and its property picks the unit |
+| `rem(0.5) + dp(1)`, `px(8) + dp(1)` | `0.5625rem`, `9px` — a dp is 1px at the root size, 1/16 rem, so it bridges the two |
+| `px(8) + rem(0.5)` | `calc(8px + 0.5rem)` — two units are CSS's own answer |
+| `em(1) + pct(50)` | `calc(1em + 50%)` |
+| `space(4) * 2` | `calc(var(--space-4) * 2)` — a token composes through `calc` |
+| `space(4) + px(1)` | `calc(var(--space-4) + 1px)`, and `--space-4` is still declared |
+| `(space(4) + px(1)) * 2` | `calc((var(--space-4) + 1px) * 2)` — a `calc` keeps composing |
+| `zero() + px(3)` | `3px` — the bare `0` is the zero, never `calc(0 + ..)` |
+
+A length built from several tokens declares every one of them on the sheet.
+`auto` is not a quantity and refuses arithmetic, and dividing by zero is
+refused — at build time, since a style is built in a `const`.
+
+`as_rem`, `as_px` and `as_dp` convert between the three units with a fixed
+size, through `Length::root_px()` (16px = 1rem); on an `em`, a `%`, a
+viewport unit or a text length they fail the build, because those have no
+size until layout. Lengths of one unit compare by number, and `px`, `rem`
+and `dp` compare with each other through the same constant; comparing any
+other mix fails the build ("compare lengths in one unit; convert first").
+`==` is structural: `px(16) == rem(1)` is `false`, since they are different
+CSS.
+
+### Design pixels: `dp`
+
+`Length::dp(8)` (`dp(8)` in a hole) is 8 pixels at the root size — 1/16
+rem, the `n / 16` an app would otherwise write at every site — and it has
+**no unit of its own**: the property that receives it picks one. The
+spacing and sizing builders write it in rem, so it follows the reader's
+text size (`padding(dp(8))` is `padding:0.5rem`); the border widths write
+it in px, so a hairline stays one (`border(dp(1), gray(300))` is
+`border:1px solid var(--gray-300)`). That choice is the builder's **role**,
+named beside it in `style.vl`:
+
+| Role | Builders |
+|---|---|
+| `Role::Rem` | `gap`, `padding*`, `margin*`, `width`, `height`, `size`, `min_*`, `max_*`, `top`, `right`, `bottom`, `left`, `inset`, `radius`, `font_size`, `letter_spacing`, `line_height_length` |
+| `Role::Px` | `border`, `border_top`, `border_right`, `border_bottom`, `border_left` (the width) |
+
+A property written by NAME — `raw`, `with_length`, a `css` block's undotted
+declaration (which is `raw`, its several arguments through `piece_for`) —
+takes the role the name gives it: px for the hairlines (`border` and every
+border width, `outline`, `outline-width`, `outline-offset`, `box-shadow`),
+rem for every other property, a border's radius, colour and style
+included. So a `css` block's `border(dp(1), gray(300));` writes `1px`, the
+same rule as the dotted `.border(dp(1), gray(300))`. `with_length_as(property,
+value, role)` names the role outright (a custom property that holds a
+hairline). Where no property chooses at all — `piece`, `css_text()` — a
+`dp` is rem (`Length::rendered(role)` writes one in either). Only a `dp` is
+affected: `px(8)` means CSS px and
+`rem(0.5)` means rem in every property, and a `dp` composed into a `calc`
+(`dp(8) + space(4)`) is text from then on, written in rem. The numbers are
+exact — `dp(6)` is `0.375rem` — and `dp(0)` is `0rem` (`0px` in a border),
+a unit length like any other; the bare `0` is `zero()`.
 
 `calc` wraps and `raw` does not: `Length::calc(e)` is
 `Length::raw("calc(" + e + ")")`. Write `calc` for arithmetic, `raw` for a
@@ -192,6 +268,7 @@ Escape hatches:
 ```vilan,fragment
 fun raw<V: CssValue>(self, property: str, value: V): Style
 fun with_length(self, property: str, value: Length): Style
+fun with_length_as(self, property: str, value: Length, role: Role): Style
 fun with_color(self, property: str, value: Color): Style
 ```
 
@@ -200,9 +277,10 @@ value, verbatim), a `Length`, or a `Color`. A `Length` or `Color` that is a
 theme token — `space(4)`, `Color::blue(300)` — carries its own `:root`
 declaration onto the stylesheet, so `.raw("padding", space(4))` is never a
 dangling `var()`. `with_length` and `with_color` are `raw` at those two value
-types, kept for the spelling the surface has always had.
+types, kept for the spelling the surface has always had; a `dp` takes the
+role its property's name gives it (above), and `with_length_as` names one.
 
-Pass the value, not its text: `space(4).text` is the string
+Pass the value, not its text: `space(4).css_text()` is the string
 `var(--space-4)` with the declaration left behind, and a `str` carries no
 token.
 
@@ -223,8 +301,9 @@ types, for a position that wants the type.
 sheet on the way past — `CssPiece` is `CssValue`'s twin over `str`,
 `Length`, `Color` and the numbers, because a part sits inside text that
 supplies the unit while a whole value must carry its own. A declaration
-with SEVERAL arguments joins them with a space through `piece`
-automatically; write it yourself only where the parts are glued:
+with SEVERAL arguments joins them with a space through `piece_for(property,
+value)`, `piece` with the property's role, automatically; write `piece`
+yourself only where the parts are glued:
 `padding(i"calc({piece(space(4))} + 2px)");`.
 
 ## Conditions

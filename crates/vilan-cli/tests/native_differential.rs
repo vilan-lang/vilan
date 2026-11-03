@@ -6421,8 +6421,10 @@ fn the_crypto_surface_answers_nodes_bytes_on_both_backends() {
     assert!(plain.status.success());
     let manifest = manifest_of("bool");
     assert!(
-        !manifest.contains("vilan-rt-crypto") && !manifest.contains("vilan-rt-sqlite"),
-        "a program that reaches neither names neither:\n{manifest}"
+        !manifest.contains("vilan-rt-crypto")
+            && !manifest.contains("vilan-rt-sqlite")
+            && !manifest.contains("vilan-rt-image"),
+        "a program that reaches none names none (M185: the image crate included):\n{manifest}"
     );
 }
 
@@ -10282,7 +10284,7 @@ fn a173_s2_both_backends_decode_the_key_fixture_to_the_same_keys() {
         "21: Key::Char(\"\u{e9}\") | Press { key = Key::Char(\"\u{e9}\"), ctrl = false, alt = false, shift = false }\n",
         "22: Key::Char(\"\u{2713}\") | Press { key = Key::Char(\"\u{2713}\"), ctrl = false, alt = false, shift = false }\n",
         "23: Key::Char(\"\u{1f600}\") | Press { key = Key::Char(\"\u{1f600}\"), ctrl = false, alt = false, shift = false }\n",
-        "24: Key::Paste(\"pa\u{1b}ste\\nX\") | Press { key = Key::Paste(\"pa\u{1b}ste\\nX\"), ctrl = false, alt = false, shift = false }\n",
+        "24: Key::Paste(\"pa\\u{1b}ste\\nX\") | Press { key = Key::Paste(\"pa\\u{1b}ste\\nX\"), ctrl = false, alt = false, shift = false }\n",
         "25: Key::Char(\"?\") | Press { key = Key::Char(\"?\"), ctrl = false, alt = false, shift = false }\n",
         "26: Key::Enter | Press { key = Key::Enter, ctrl = false, alt = false, shift = false }\n",
         "27: Key::Escape | Press { key = Key::Escape, ctrl = false, alt = false, shift = false }\n",
@@ -10415,7 +10417,7 @@ fn a173_s2_the_key_decoder_table_is_the_same_on_both_backends() {
         "ESC O at the end is Alt-O\n",
         "  end: Key::Alt(\"O\") +alt +shift\n",
         "paste with ESC and line endings inside\n",
-        "  chunk 1: Key::Paste(\"a\u{1b}[Bb\\r\\nc\")\n",
+        "  chunk 1: Key::Paste(\"a\\u{1b}[Bb\\r\\nc\")\n",
         "  chunk 1: Key::Char(\"z\")\n",
         "paste never closed\n",
         "  end: Key::Paste(\"abc\")\n",
@@ -10842,6 +10844,118 @@ fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
         compare(&staged, "native_probe_churned_map_walk.vl"),
         Verdict::Identical,
         "a churned map and set must walk in insertion order on both backends"
+    );
+}
+
+/// B689 / M182 (hash-map-lend.md §4.8): `HashMap::peek`/`modify`/`update`
+/// and the store's keyed step that lends through them answer alike on both
+/// backends — a miss reads `None`, a write through `modify` is what the next
+/// read sees, `None` removes the key everywhere, `Some` under an absent key
+/// goes last while a present key keeps its place, `update` makes `missing`
+/// only on a miss, and a read, a write, an insert and a removal through
+/// `Store<HashMap<K, V>>::at(key)` land in the map. The runtime half (the
+/// value-side tombstone, `lend_mut`'s order and compaction) is `vilan-rt`'s
+/// `lend_mut_writes_in_place_inserts_last_and_removes_on_none`.
+#[test]
+fn b689_hash_map_lends_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_hash_map_lend.vl"),
+        include_str!("native/hash_map_lend.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_hash_map_lend.vl"),
+        Verdict::Identical,
+        "a map read and written in place must answer alike on both backends"
+    );
+}
+
+/// B690: a module binding read ONLY inside a body an operator reaches — a
+/// comparison through `PartialOrd`'s inherited default, `==`/`!=` and `+`
+/// through the impl's own members, an operator on a bounded generic and on
+/// `self` inside a trait default, a concatenation rendering a bounded operand,
+/// and a module initializer whose operator reads a LATER binding. The JS
+/// emitter declared none of them (the call graph held no edge at an operator)
+/// and the first use threw `ReferenceError`; natively every binding is
+/// emitted. `inference::traits`' `b690_*` pins hold the JS values per channel.
+#[test]
+fn b690_an_operator_reads_a_module_binding_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_operator_reads_a_module_binding.vl"),
+        include_str!("native/operator_reads_a_module_binding.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_operator_reads_a_module_binding.vl"),
+        Verdict::Identical,
+        "a module binding an operator's impl reads must be declared on both backends"
+    );
+}
+
+/// B691: an enum with a payload is a value at every seam — a binding, a `mut`
+/// parameter, a struct literal's field, a list element, a `*view` read, a
+/// return of one, a closure answering `*slot`, a scalar payload, a user enum,
+/// and `to_array`'s answer. JS shared the `[index, ..data]` array at each, so a
+/// write through one copy's payload showed in the other; natively each was
+/// its own value. `inference::borrows`' `b691_*` pins hold the JS values per
+/// seam.
+#[test]
+fn b691_an_enum_is_a_value_at_every_seam_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_enum_value_seams.vl"),
+        include_str!("native/enum_value_seams.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_enum_value_seams.vl"),
+        Verdict::Identical,
+        "an enum must copy at every value seam on both backends"
+    );
+}
+
+/// B695: a cut inside a surrogate pair rounds to the code point on BOTH
+/// backends — `substring` at every position across `"a😀b"`, `code_at` of each
+/// half, `split("")`, `replace("", ..)` — where JS answered half a pair and the
+/// native substring counted characters, not UTF-16 units, so every index past
+/// a non-BMP character was off by one. `index_of` is not here: the native
+/// backend refuses its host binding (S1b), and its answers are code-point
+/// boundaries by construction (`inference::std_surface::b695_*`).
+#[test]
+fn b695_a_cut_inside_a_surrogate_pair_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_surrogate_cuts.vl"),
+        include_str!("native/surrogate_cuts.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_surrogate_cuts.vl"),
+        Verdict::Identical,
+        "a cut inside a surrogate pair must answer alike on both backends"
+    );
+}
+
+/// B693 (store-assume-keeper.md §4.5): an assumed handle's fallback is kept by
+/// a feed on its variant's flag and read in place on both backends — every way
+/// a variant ends (the enum's own handle, `Option` → `None`, a key removed by
+/// `set(None)` and by `remove`, a whole-state write, an outer variant) leaves
+/// the payload as it stood, a write after the end lands nowhere, a new `Some` is
+/// read live, and the keeper stands while its owner does.
+#[test]
+fn b693_an_assumed_handle_keeps_the_payload_at_its_end_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_assume_keeper.vl"),
+        include_str!("native/store_assume_keeper.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_assume_keeper.vl"),
+        Verdict::Identical,
+        "an assumed handle must keep its payload alike on both backends"
     );
 }
 
@@ -12334,7 +12448,9 @@ const REACTIVE_TRACE_FILE: &str = "native_probe_reactive_trace.vl";
 /// made by `Signal::new` and written through a bound, a write through a `dyn
 /// Signal` with a subscriber made through a `dyn Source` (B646: the `Signal`
 /// and `Flow` members are `[track_caller]` on the trait, so every one of these
-/// names its place), an `effect`, and the trace off. Native has no host task
+/// names its place), an `effect`, a tracked `derive` and a `switch` (E345: a
+/// derivation names the `.memo()`, `.distinct()`, `derive` or `.switch(..)` that
+/// made it), and the trace off. Native has no host task
 /// to tag a queued wake with (`console.createTask` is the JS backend's): the
 /// lines are the same, only a debugger's async stack differs.
 #[test]
@@ -12374,12 +12490,15 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 ),
             )
         }),
+        // E345: the seal's refresh names its `.memo()`, and so does the cell
+        // it writes.
         ("draining", |file, made, site| {
+            let memo = site(file, "let doubled = count.derive(", "memo");
             (
                 "draining 2\ndraining 8\n".to_string(),
                 format!(
-                    "[reactive] derivation #0 woken by cell #1 (made at {}), set at {}\n\
-                     [reactive] effect #1 at {} woken by cell #3, set by derivation #0\n",
+                    "[reactive] derivation #0 at {memo} woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] effect #1 at {} woken by cell #3 (made at {memo}), set by derivation #0\n",
                     made(file),
                     site(file, "batch(|| count.set(4))", "set"),
                     site(file, "print(i\"draining {value}\")", "sub"),
@@ -12397,15 +12516,50 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 ),
             )
         }),
+        // E345: a stage's relay names the constructor that made the stage.
         ("relay", |file, made, site| {
             (
                 "relay 1\nrelay 6\n".to_string(),
                 format!(
-                    "[reactive] derivation #1 woken by cell #1 (made at {}), set at {}\n\
+                    "[reactive] derivation #1 at {} woken by cell #1 (made at {}), set at {}\n\
                      [reactive] effect #0 at {} woken by derivation #1\n",
+                    site(file, "count.distinct().sub(", "distinct"),
                     made(file),
                     site(file, "count.set(6)", "set"),
                     site(file, "print(i\"relay {value}\")", "sub"),
+                ),
+            )
+        }),
+        // E345: a tracked dependency's edge relay names the `derive` that made
+        // it; the seal's refresh, woken by it, names the `.memo()`.
+        ("tracked", |file, made, site| {
+            let memo = site(file, "derive(|| count.track() * 3)", "memo");
+            (
+                "tracked 3\ntracked 42\n".to_string(),
+                format!(
+                    "[reactive] derivation #1 at {} woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] derivation #0 at {memo} woken by derivation #1\n\
+                     [reactive] effect #2 at {} woken by cell #3 (made at {memo}), set by derivation #0\n",
+                    site(file, "derive(|| count.track() * 3)", "derive"),
+                    made(file),
+                    site(file, "count.set(14)", "set"),
+                    site(file, "print(i\"tracked {value}\")", "sub"),
+                ),
+            )
+        }),
+        // E345: a `switch`'s re-selection names the `.switch(..)`.
+        ("switch", |file, _, site| {
+            let memo = site(file, "flag.switch(", "memo");
+            (
+                "switch 1\nswitch 10\n".to_string(),
+                format!(
+                    "[reactive] derivation #2 at {} woken by cell #3 (made at {}), set at {}\n\
+                     [reactive] derivation #0 at {memo} woken by derivation #2\n\
+                     [reactive] effect #3 at {} woken by cell #4 (made at {memo}), set by derivation #0\n",
+                    site(file, "flag.switch(", "switch"),
+                    site(file, "let flag = SignalCell::new(true)", "new"),
+                    site(file, "flag.set(false)", "set"),
+                    site(file, "print(i\"switch {value}\")", "sub"),
                 ),
             )
         }),
@@ -12667,6 +12821,25 @@ fn e275_written_and_derived_debug_print_the_same_on_both_backends() {
         include_str!("native/dbg_debug_impls.vl"),
         include_str!("native/dbg_debug_impls.stdout"),
         include_str!("native/dbg_debug_impls.stderr"),
+    );
+}
+
+/// E346: `.debug()` and `dbg` escape every control character - the rest of C0
+/// and DEL as `\u{..}` - the same bytes on both backends (`vilan_rt::show`
+/// natively, `__dbg_str` and std's `str::debug` on node).
+#[test]
+fn e346_debug_escapes_every_control_character_on_both_backends() {
+    assert_dbg_lines_on_both_backends(
+        "native_probe_dbg_controls.vl",
+        "import std::debug::Debug;\n\
+         import std::io::print;\n\n\
+         fun main() {\n\
+         \tlet text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\";\n\
+         \tprint(text.debug());\n\
+         \tdbg(text);\n\
+         }\n",
+        "\"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\"\n",
+        "[native_probe_dbg_controls.vl:7:2] text = \"a\\u{1b}[1mb\\u{7}c\\u{7f}d\\u{1f}\\n\\0\\\"\\\\\"\n",
     );
 }
 
@@ -13881,6 +14054,116 @@ fn an_awaiting_inherent_next_drives_a_for_loop_on_both_backends() {
     );
 }
 
+/// F153: a `for x in subject` over a `[resource]` PLACE whose inherent `next`
+/// drives the loop BORROWS the subject natively (the analyzer loans it to the
+/// loop and drops it after), so cargo accepts the drop after the loop where
+/// it refused a use after the move (E0382) — and the teardown prints land
+/// where JS lands them: after a `jump break`, after a full walk, and at the
+/// end of a temporary subject's loop. A plain (non-resource) subject is the
+/// control. The emission pin: the place is borrowed, the temporary moves.
+#[test]
+fn f153_a_for_over_a_resource_place_loans_it_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_resource_for_in.vl";
+    std::fs::write(staged.join(file), include_str!("native/resource_for_in.vl"))
+        .expect("write the probe program");
+    let expected = "raw on\ntick 4\ntick 3\nraw off\nafter break\n\
+                    raw on\ntick 1\ntick 0\nraw off\nafter full\n\
+                    raw on\ntick 0\nraw off\nafter temporary\n\
+                    plain 1\nplain 0\nplain left 0\ndone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_resource_for_in")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert_eq!(
+        emitted.matches("let iterator = &mut ticks_").count(),
+        2,
+        "both place subjects are borrowed:\n{emitted}"
+    );
+    assert_eq!(
+        emitted.matches("let mut iterator = ticks_").count(),
+        1,
+        "the temporary subject still moves:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("let mut iterator = (plain_"),
+        "the plain subject is unchanged (rule 1's copy):\n{emitted}"
+    );
+}
+
+/// F153 / A173 S2's terminal.md Q6: `for key in keys` over `process::keys()`
+/// — a `[resource]` whose awaiting inherent `next` drives the loop — builds
+/// natively and decodes the same piped bytes to the same keys as on JS.
+#[test]
+fn f153_a_for_over_the_key_stream_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_keys_for_in.vl";
+    std::fs::write(staged.join(file), include_str!("native/keys_for_in.vl"))
+        .expect("write the probe program");
+    std::fs::write(
+        staged.join("native_probe_keys_for_in.stdin"),
+        include_bytes!("native/keys_for_in.stdin"),
+    )
+    .expect("write the probe's stdin");
+    let expected = "Key::Char(\"a\")\nKey::Char(\"b\")\nKey::Enter\nKey::Up\nkeys before q: 4\n";
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
+/// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
+/// and answers what JS answers. The synthesized `value()` (and a hand-written
+/// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where
+/// `&*` stopped short of the `&str` the variants' literals need (rustc E0308).
+/// Read through a method, off a call, a struct field and a list element;
+/// printed, matched after and parsed back; an int-backed `match self` is the
+/// control. The emission pin: the loaned receiver's match reaches the `str`
+/// through `AsRef`, and an owned subject keeps its `&*`.
+#[test]
+fn f154_a_str_backed_value_at_run_time_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_str_backed_value.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/str_backed_value.vl"),
+    )
+    .expect("write the probe program");
+    let expected =
+        "rem\n%\nUnit::Rem\ntrue\nfalse\n1.5%\npx;rem;%;\nmatched rem\ntrue\ntrue\nfalse\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_str_backed_value")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("match AsRef::<str>::as_ref(&(this)) {"),
+        "the loaned receiver reaches its `str`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("match &*(unit_"),
+        "an owned subject keeps its `&*`:\n{emitted}"
+    );
+}
+
 /// native-54's F?1: `Option::take` / `Option::replace` over a receiver that
 /// lives in a CELL natively — a module-level binding (`module_maybe.take()`),
 /// a field of one, a captured binding, a `Shared` view's field
@@ -14809,6 +15092,251 @@ fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
     }
 }
 
+/// M185: `std::image` prints the same pixels on both backends — the point of
+/// running ONE codec core (`vilan-image`) natively through `vilan-rt-image` and
+/// on node as its wasm32 build. Decode and sniff, the pixel limit's sentence,
+/// every `Fit` (an upscale, a downscale, `Contain`'s rounding, `Cover`'s centred
+/// window, a zero side), crop clamping, `rgba()` as a copy, an encode -> decode
+/// round trip per format with its byte count (JPEG too: the encoder is integer
+/// arithmetic, so even the lossy bytes agree), and the refusals. And the
+/// manifest of the program names the image crate — the reach recorded.
+#[test]
+fn m185_image_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_image.vl";
+    std::fs::write(staged.join(file), include_str!("native/image.vl"))
+        .expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "node and native print different pixels"
+    );
+    assert_eq!(
+        outputs[0],
+        concat!(
+            "png\n",
+            "none\n",
+            "decoded 2x2 ff0000ff00ff00ff0000ffffffffff80\n",
+            "2 x 2 exceeds the 3-pixel limit\n",
+            "not a PNG, JPEG, WebP or GIF\n",
+            "fill 1x1 1x1 6d6d6ddf\n",
+            "fill 5x3 5x3 ff0000fcff1800ff878700ff0af700ff00ff00ff8c008cff7d117df96d6d6ddf5ae25ac549ff49b30000ffff000afff34e4effb8ffd2ff7dffffff53\n",
+            "contain 4x3 0f13c3ff4913b0ff89139affc31387ff0f64c3ff4964b0ff89649affc36487ff0fb5c3ff49b5b0ff89b59affc3b587ff\n",
+            "cover 3x3 2d13b9ff6913a5ffa51391ff2d64b9ff6964a5ffa56491ff2db5b9ff69b5a5ffa5b591ff\n",
+            "zero side 1x2 692aa5ff699ea5ff\n",
+            "crop 2x2 b4a08cffd2a082ffb4c88cffd2c882ff\n",
+            "crop outside 0x2 \n",
+            "7 255\n",
+            "png png 86 bytes\n",
+            "png 2x2 ff0000ff00ff00ff0000ffffffffff80\n",
+            "webp webp 202 bytes\n",
+            "webp 2x2 ff0000ff00ff00ff0000ffffffffff80\n",
+            "jpeg jpeg 657 bytes\n",
+            "jpeg 8x6 0200c5ff1e00c0ff3c00b4ff5b00a7ff7800a0ff970096ffb70088ffd10082ff0327c6ff1d28c0ff3e27b3ff5b26a8ff7928a1ff972795ffb72588ffd12883ff0051c4ff1a53beff3b52b0ff5951a6ff77529fff945194ffb45086ffce5381ff0378c8ff1c7ac2ff3d79b7ff5a78aaff787aa3ff967998ffb6778affd17985ff009dc6ff1ba0c1ff3a9eb5ff599da8ff77a0a2ff959f97ffb49e89ffcfa084ff06c8caff20c9c4ff40c9b9ff5fc7acff7cc9a5ff9ac89affb9c78cffd4c987ff\n",
+            // M190: transparency flattened onto black — the half-transparent white
+            // pixel comes back grey.
+            "jpeg alpha jpeg 706 bytes\n",
+            "jpeg alpha 2x2 f00400ff04ff00ff0609ffff787f91ff\n",
+            "gif refused: GIF cannot be encoded\n",
+            "15 bytes are not 2 x 2 RGBA pixels (16 bytes)\n",
+        )
+    );
+    let manifest = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_image")
+            .join("Cargo.toml"),
+    )
+    .expect("read the generated manifest");
+    assert!(
+        manifest.contains("vilan-rt-image")
+            && !manifest.contains("vilan-rt-sqlite")
+            && !manifest.contains("vilan-rt-crypto"),
+        "a program reaching `std::image` names the image crate, and only it:\n{manifest}"
+    );
+    for package in vilan_rust::IMAGE_OPTIMIZED_PACKAGES {
+        assert!(
+            manifest.contains(&format!("[profile.dev.package.{package}]\nopt-level = 3")),
+            "the codec's `{package}` is optimized in the dev profile:\n{manifest}"
+        );
+    }
+}
+
+/// M190: a `resized` result over the 50,000,000-pixel limit is an `Err`
+/// naming both sizes — the owner's ruling, as `decode`'s limit is — on both
+/// backends, while a `Contain` into a box far past the limit whose result is
+/// small (4 x 3 into 100,000 x 1 is 1 x 1) is fine.
+#[test]
+fn m190_a_resize_past_the_pixel_limit_is_an_err_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_image_resize_cap.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/image_resize_cap.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "1 x 1\na 100000 x 100000 result exceeds the 50,000,000-pixel limit\n";
+    let native = run_on(&staged, Some("rust"), file);
+    assert_eq!(native.stdout, expected, "{}", native.stderr);
+    assert_eq!(native.code, Some(0), "{}", native.stderr);
+    let javascript = run_on(&staged, None, file);
+    assert_eq!(javascript.stdout, expected, "{}", javascript.stderr);
+    assert_eq!(javascript.code, Some(0), "{}", javascript.stderr);
+}
+
+/// M185: every package the generated manifest optimizes for an image program
+/// is in the graph `vilan-image` resolves to — read off this workspace's
+/// lockfile, which pins the same `image` the generated project resolves. A name
+/// outside the graph would make cargo warn "profile package spec … did not
+/// match any packages" in every image build.
+#[test]
+fn m185_the_optimized_image_packages_are_the_codecs_own_graph() {
+    let lock =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"))
+            .expect("read Cargo.lock");
+    // name -> the names it depends on (a `dependencies` entry may carry a
+    // version after a space when two versions of one crate are locked).
+    let mut graph: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for package in lock.split("[[package]]").skip(1) {
+        let name = package
+            .lines()
+            .find_map(|line| line.strip_prefix("name = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("a locked package has a name")
+            .to_string();
+        let dependencies: Vec<String> = package
+            .split_once("dependencies = [")
+            .map(|(_, rest)| rest.split(']').next().unwrap_or(""))
+            .unwrap_or("")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('"'))
+            .map(|entry| {
+                entry
+                    .trim_end_matches(['"', ','])
+                    .split(' ')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        graph.entry(name).or_default().extend(dependencies);
+    }
+    let mut reached = std::collections::BTreeSet::new();
+    let mut pending = vec!["vilan-image".to_string()];
+    while let Some(name) = pending.pop() {
+        if reached.insert(name.clone()) {
+            pending.extend(graph.get(&name).cloned().unwrap_or_default());
+        }
+    }
+    for package in vilan_rust::IMAGE_OPTIMIZED_PACKAGES {
+        assert!(
+            reached.contains(*package),
+            "`{package}` is optimized for image programs but is not in vilan-image's graph: \
+             {reached:?}"
+        );
+    }
+}
+
+/// M181: `std::url`'s percent-encoding pair answers the same bytes on both
+/// backends — `encodeURIComponent` and the total decoder (the host's
+/// `decodeURIComponent` per run of escapes) on node, `vilan_rt::url`'s
+/// hand-written twins natively. The table (`native/url.vl`) is the design's
+/// (`proposal/percent-encoding.md` §3): ASCII, spaces, the unreserved and the
+/// reserved sets, multi-byte UTF-8, a lone `%`, a truncated `%2`, `%G1`, `%FF`
+/// alone, runs that are not UTF-8 as a whole (truncated, overlong, a
+/// surrogate, past U+10FFFF), lower-case hex, and the empty string — and every
+/// input round-trips.
+#[test]
+fn m181_percent_encoding_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_url.vl";
+    std::fs::write(staged.join(file), include_str!("native/url.vl"))
+        .expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "node and native encode or decode differently"
+    );
+    assert_eq!(
+        outputs[0],
+        concat!(
+            "[] encode=[] decode=[]\n",
+            "[plain-ASCII_text.0123] encode=[plain-ASCII_text.0123] decode=[plain-ASCII_text.0123]\n",
+            "[two words] encode=[two%20words] decode=[two words]\n",
+            "[unreserved !~*'()] encode=[unreserved%20!~*'()] decode=[unreserved !~*'()]\n",
+            "[reserved ;/?:@&=+$,#[]%\"<>\\^`{|}] encode=[reserved%20%3B%2F%3F%3A%40%26%3D%2B%24%2C%23%5B%5D%25%22%3C%3E%5C%5E%60%7B%7C%7D] decode=[reserved ;/?:@&=+$,#[]%\"<>\\^`{|}]\n",
+            "[café] encode=[caf%C3%A9] decode=[café]\n",
+            "[日本語] encode=[%E6%97%A5%E6%9C%AC%E8%AA%9E] decode=[日本語]\n",
+            "[emoji 😀] encode=[emoji%20%F0%9F%98%80] decode=[emoji 😀]\n",
+            "[hello%20world] encode=[hello%2520world] decode=[hello world]\n",
+            "[caf%C3%A9] encode=[caf%25C3%25A9] decode=[café]\n",
+            "[caf%c3%a9] encode=[caf%25c3%25a9] decode=[café]\n",
+            "[%F0%9F%98%80] encode=[%25F0%259F%2598%2580] decode=[😀]\n",
+            "[100%] encode=[100%25] decode=[100%]\n",
+            "[%] encode=[%25] decode=[%]\n",
+            "[%2] encode=[%252] decode=[%2]\n",
+            "[%G1] encode=[%25G1] decode=[%G1]\n",
+            "[%zz%20] encode=[%25zz%2520] decode=[%zz ]\n",
+            "[%FF] encode=[%25FF] decode=[%FF]\n",
+            "[%41%FF] encode=[%2541%25FF] decode=[%41%FF]\n",
+            "[%41%FF then %41] encode=[%2541%25FF%20then%20%2541] decode=[%41%FF then A]\n",
+            "[%C3] encode=[%25C3] decode=[%C3]\n",
+            "[%C3x%A9] encode=[%25C3x%25A9] decode=[%C3x%A9]\n",
+            "[%C0%80] encode=[%25C0%2580] decode=[%C0%80]\n",
+            "[%ED%A0%80] encode=[%25ED%25A0%2580] decode=[%ED%A0%80]\n",
+            "[%F4%90%80%80] encode=[%25F4%2590%2580%2580] decode=[%F4%90%80%80]\n",
+            "[a%2Fb%3Fc%3Dd] encode=[a%252Fb%253Fc%253Dd] decode=[a/b?c=d]\n",
+            "round trips 26 of 26\n",
+        )
+    );
+}
+
+/// A179: `std::rpc::dial_within` answers the same on both backends over
+/// hand-written dials (`native/dial_within.vl`) — a dial that wins with `Ok`
+/// and one that wins with its own `Err`, a deadline that beats a minute-long
+/// dial (the nursery cancels it, and joins it, so a dial left running would
+/// hold the line back by that minute), a deadline already past — and the two
+/// new `RpcError` arms `Debug`-render, compare and encode as the others. The
+/// WebSocket dial itself is JS-only (the native backend refuses `WebSocket`),
+/// which `dial_cancel.rs` pins on node.
+#[test]
+fn a179_dial_within_answers_the_same_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_dial_within.vl";
+    std::fs::write(staged.join(file), include_str!("native/dial_within.vl"))
+        .expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "node and native answer differently");
+    assert_eq!(
+        outputs[0],
+        concat!(
+            "wins ok 7\n",
+            "refused err RpcError::Unavailable\n",
+            "hung err RpcError::Timeout\n",
+            "past err RpcError::Timeout\n",
+            "RpcError::Timeout true \"Timeout\"\n",
+            "RpcError::Cancelled false \"Cancelled\"\n",
+            "RpcError::Unavailable false \"Unavailable\"\n",
+        )
+    );
+}
+
 /// M169: `List::position` and `Iterator::position` answer the index of the
 /// first element a predicate holds for — over a struct's field, which
 /// `index_of` (equality on the whole element) cannot ask — or `None`, and stop
@@ -14890,4 +15418,74 @@ fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
             "{leg}: a server bound to 127.0.0.2 must not accept on 127.0.0.1"
         );
     }
+}
+
+/// A178 S1 + S2: `Length` is data — a number and a `Unit`, or a text — and its
+/// operators (`+ - * /` through std's traits), conversions (`as_rem`, `as_px`,
+/// `as_dp`) and comparisons (`PartialOrd` across px/rem/dp, structural `==`)
+/// answer the same bytes on both backends, a token's `:root` lines included;
+/// a `dp` renders in the role it is asked for (S2).
+#[test]
+fn a178_length_arithmetic_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_length_arithmetic.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/length_arithmetic.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "px: 8px []\n",
+                "rem: 0.375rem []\n",
+                "pct: 50% []\n",
+                "zero: 0 []\n",
+                "same unit: 1.5rem []\n",
+                "dp + rem: 0.5625rem []\n",
+                "px + dp: 9px []\n",
+                "px + rem: calc(8px + 0.5rem) []\n",
+                "token * 2: calc(var(--space-4) * 2) [:root{--space-4:1rem}]\n",
+                "token + px: calc(var(--space-4) + 1px) [:root{--space-4:1rem}]\n",
+                "calc * 2: calc((var(--space-4) + 1px) * 2) [:root{--space-4:1rem}]\n",
+                "two tokens: calc(var(--space-4) - (var(--space-2) + var(--space-4))) [:root{--space-4:1rem} | :root{--space-2:0.5rem}]\n",
+                "scaled: 12px []\n",
+                "halved: 4px []\n",
+                "em + pct: calc(1em + 50%) []\n",
+                "zero - token: calc(var(--space-1) * -1) [:root{--space-1:0.25rem}]\n",
+                "as_rem: 0.5rem []\n",
+                "as_px: 16px []\n",
+                "as_dp: 8 true\n",
+                "true true true\n",
+                "true false true\n",
+                "dp: 0.375rem []\n",
+                "dp + dp: 0.75rem []\n",
+                "rem + dp: 0.5625rem []\n",
+                "dp roles: 1px 0.0625rem 1px\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
+/// M186 (store-path-sharing.md §4.6): a store handle's path is a shared chain
+/// of steps on both backends — handles five steps down, made fresh and from
+/// copied handles, subscribe, write, notify and prune alike, and a path's
+/// identity is its steps'.
+#[test]
+fn m186_a_shared_store_path_subscribes_writes_and_prunes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_path_sharing.vl"),
+        include_str!("native/store_path_sharing.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_path_sharing.vl"),
+        Verdict::Identical,
+        "a shared store path must subscribe, write and prune alike on both backends"
+    );
 }

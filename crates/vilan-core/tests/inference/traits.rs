@@ -10422,3 +10422,147 @@ fn b655_the_methods_around_a_refused_item_still_parse_and_members_still_compile(
         "#,
     );
 }
+
+// --- B690: an operator's impl is a call the emitter's binding walk follows ---
+//
+// The call graph recorded no edge at an overloaded operator, so a module
+// binding read ONLY inside a body an operator reaches was never declared in
+// the emitted JS: `a > b` → `PartialOrd::gt` → `partial_compare` → `k` threw
+// `ReferenceError: k is not defined`. One pin per dispatch channel the
+// emitter reads: an inherited trait default, an impl's own member (`==`,
+// `!=`, `+`), a bounded generic operand, a `self` operand inside a trait
+// default, a concatenation rendering a bounded operand, and a module
+// initializer whose operator reads a LATER binding (the load order). The
+// native half is `native_differential`'s
+// `b690_an_operator_reads_a_module_binding_on_both_backends`.
+
+const B690_LEN: &str = "import std::compare::{ Ordering, PartialEq, PartialOrd };
+import std::display::Display;
+import std::operators::Add;
+const let scale = 10;
+const let unit = \"px\";
+struct Len { value: i32 }
+impl Len with PartialOrd {
+\tfun partial_compare(self, other: Len): Option<Ordering> {
+\t\t(self.value * scale).partial_compare(other.value)
+\t}
+}
+impl Len with PartialEq {
+\tfun eq(self, other: Len): bool { self.value * scale == other.value }
+}
+impl Len with Add {
+\tfun add(self, other: Len): Len { Len { value = self.value + other.value * scale } }
+}
+impl Len with Display {
+\tfun to_string(self): str { i\"{self.value}{unit}\" }
+}
+";
+
+#[test]
+fn b690_a_comparison_through_an_inherited_default_declares_the_binding_it_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B690_LEN}fun main() {{
+\tlet small = Len {{ value = 2 }};
+\tlet large = Len {{ value = 15 }};
+\tprint(small > large);
+\tprint(small <= large);
+}}
+"
+        ),
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b690_an_equality_through_the_impls_own_member_declares_the_binding_it_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B690_LEN}fun main() {{
+\tlet small = Len {{ value = 2 }};
+\tlet twenty = Len {{ value = 20 }};
+\tprint(small == twenty);
+\tprint(small != twenty);
+}}
+"
+        ),
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b690_an_arithmetic_operator_declares_the_binding_its_impl_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B690_LEN}fun main() {{
+\tlet total = Len {{ value = 1 }} + Len {{ value = 2 }};
+\tprint(total.value);
+}}
+"
+        ),
+        "21\n",
+    );
+}
+
+#[test]
+fn b690_an_operator_on_a_bounded_generic_declares_the_binding_its_impl_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B690_LEN}fun bigger<T: PartialOrd>(left: T, right: T): bool {{ left > right }}
+fun main() {{
+\tprint(bigger(Len {{ value = 2 }}, Len {{ value = 15 }}));
+}}
+"
+        ),
+        "true\n",
+    );
+}
+
+#[test]
+fn b690_an_operator_inside_a_trait_default_declares_the_binding_its_impl_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B690_LEN}trait Twice with Add {{
+\tfun twice(self): Self {{ self + self }}
+}}
+impl Len with Twice {{}}
+fun main() {{
+\tprint(Len {{ value = 1 }}.twice().value);
+}}
+"
+        ),
+        "11\n",
+    );
+}
+
+#[test]
+fn b690_a_concatenation_rendering_a_bounded_operand_declares_the_binding_it_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B690_LEN}fun shown<T: Display>(value: T): str {{ \"len=\" + value }}
+fun main() {{
+\tprint(shown(Len {{ value = 2 }}));
+}}
+"
+        ),
+        "len=2px\n",
+    );
+}
+
+#[test]
+fn b690_a_module_initializers_operator_loads_after_the_binding_its_impl_reads() {
+    assert_compiles_and_runs(
+        "import std::operators::Add;
+struct Len { value: i32 }
+impl Len with Add {
+\tfun add(self, other: Len): Len { Len { value = self.value + other.value * scale } }
+}
+let summed = Len { value = 1 } + Len { value = 2 };
+let scale = 10;
+fun main() {
+\tprint(summed.value);
+}
+",
+        "21\n",
+    );
+}

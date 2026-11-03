@@ -16,7 +16,9 @@
 // lives in ONE `Shared`, in place; a projection is another `Store` cut from its
 // parent, and its `set` writes back through the root. It is a `Source<T>` and a
 // `Signal<T>`, so every pipe, effect and binding takes one unchanged. Copying a
-// handle allocates nothing.
+// handle allocates nothing: its path is SHARED, a chain of steps (`StorePathStep`)
+// in which a projection allocates one step pointing at its parent's, read as a list
+// only where the slot tree is walked (M186, `proposal/store-path-sharing.md`).
 //
 // **Slots (§2.2, Q12).** A slot is one path's subscriber list: a notification-only
 // cell. It is made by the FIRST subscription at its path, together with the nodes
@@ -69,6 +71,7 @@
 // (`MapOp`, `SetOp`, `SeqOp`), not handed a copy to diff. Each flow started from a
 // handle keeps its own op log at the collection's node, recorded only while it is
 // open — a per-subscription FEED, as a slot is per path.
+import pkg::compare::PartialEq;
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
@@ -94,6 +97,7 @@ import pkg::reactive::delta::{
 import pkg::reactive::store_core::{
 	Spine,
 	StoreFlag,
+	StorePathStep,
 	attach_feed,
 	deliver,
 	detach_feed,
@@ -103,6 +107,7 @@ import pkg::reactive::store_core::{
 	spine,
 	store_identity_at,
 	store_keyed,
+	store_path_steps,
 	store_touch,
 	touch_spine,
 	watch_at,
@@ -128,6 +133,7 @@ export import pkg::reactive::store_core::{
 	StoreFlag,
 	StoreLeaf,
 	StoreNode,
+	StorePathStep,
 	StoreSlot,
 	StoreSome,
 	StoreStep,
@@ -148,8 +154,17 @@ export import pkg::reactive::store_core::{
 
 /// What `map` holds under the key whose hash is `hash` — one value, copied.
 fun value_at<K: Hashable, V>(map: &HashMap<K, V>, hash: Hash): Option<V> {
-	match map.table.get(hash) {
-		Some(let entry) => Some(entry.1),
+	map.table.get(hash)
+}
+
+/// The `(key, value)` entry `map` holds under the key whose hash is `hash` — both
+/// copied, read off the map's table.
+fun entry_at<K: Hashable, V>(map: &HashMap<K, V>, hash: Hash): Option<(K, V)> {
+	match map.table.key(hash) {
+		Some(let key) => match map.table.get(hash) {
+			Some(let value) => Some((key, value)),
+			None => None,
+		},
 		None => None,
 	}
 }
@@ -189,12 +204,12 @@ export impl HashMap<type K: Hashable, type V: Storable> with Storable {
 			}
 		}
 		if fed || (here && !changed) {
-			for hash in self.table.keys() {
+			for hash in self.table.hashes() {
 				if fed || !changed {
 					if store_keyed(node, hash).is_none() {
 						let moved = match self.table.get(hash) {
 							Some(let mine) => match other.table.get(hash) {
-								Some(let theirs) => differs(&mine.1, &theirs.1, woken),
+								Some(let theirs) => differs(&mine, &theirs, woken),
 								None => true,
 							},
 							None => false,
@@ -206,7 +221,7 @@ export impl HashMap<type K: Hashable, type V: Storable> with Storable {
 					}
 				}
 			}
-			for hash in other.table.keys() {
+			for hash in other.table.hashes() {
 				if (fed || !changed)
 					&& !self.table.contains_key(hash)
 					&& store_keyed(node, hash).is_none() {
@@ -244,7 +259,7 @@ export impl HashSet<type T: Hashable> with Storable {
 			}
 		}
 		if fed || (here && !changed) {
-			for hash in self.table.keys() {
+			for hash in self.table.hashes() {
 				if (fed || !changed)
 					&& !other.table.contains_key(hash)
 					&& store_keyed(node, hash).is_none() {
@@ -252,7 +267,7 @@ export impl HashSet<type T: Hashable> with Storable {
 					store_touch(node, StoreTouch::Key(hash), woken);
 				}
 			}
-			for hash in other.table.keys() {
+			for hash in other.table.hashes() {
 				if (fed || !changed)
 					&& !self.table.contains_key(hash)
 					&& store_keyed(node, hash).is_none() {
@@ -395,13 +410,14 @@ export impl List<type T: Storable + StoreKey> with Storable {
 /// nothing, or the same elements back) wakes nothing.
 fun splice_at<T: Storable + StoreKey>(
 	root: Shared<StoreNode>,
-	path: List<StoreStep>,
+	place: Shared<StorePathStep>,
 	lend: |(|&List<T>| void)| void,
 	modify: |(|&mut List<T>| void)| void,
 	at: usize,
 	removed: usize,
 	inserted: List<T>,
 ) {
+	let path = store_path_steps(place);
 	let found = spine(root, &path);
 	let node = found.node;
 	mut woken = StoreWoken { slots = [], feeds = [] };
@@ -523,7 +539,7 @@ fun map_feed<K: Hashable, V>(
 			olds = [];
 			lend(|map: &HashMap<K, V>| {
 				for hash in pending.keys {
-					olds.push(map.table.get(hash));
+					olds.push(entry_at(map, hash));
 				}
 			});
 		},
@@ -539,11 +555,11 @@ fun map_feed<K: Hashable, V>(
 				mut index: usize = 0;
 				for index < keys.len() {
 					match olds[index] {
-						Some(let was) => match map.table.get(keys[index]) {
+						Some(let was) => match entry_at(map, keys[index]) {
 							Some(let now) => log.record(MapOp::Put(now.0, Some(was.1), now.1)),
 							None => log.record(MapOp::Delete(was.0, was.1)),
 						},
-						None => match map.table.get(keys[index]) {
+						None => match entry_at(map, keys[index]) {
 							Some(let now) => log.record(MapOp::Put(now.0, None, now.1)),
 							None => {},
 						},
@@ -572,7 +588,7 @@ fun set_feed<T: Hashable>(lend: |(|&HashSet<T>| void)| void, log: DeltaLog<SetOp
 			olds = [];
 			lend(|set: &HashSet<T>| {
 				for hash in pending.keys {
-					olds.push(set.table.get(hash));
+					olds.push(set.table.key(hash));
 				}
 			});
 		},
@@ -593,7 +609,7 @@ fun set_feed<T: Hashable>(lend: |(|&HashSet<T>| void)| void, log: DeltaLog<SetOp
 								log.record(SetOp::Remove(was));
 							}
 						},
-						None => match set.table.get(keys[index]) {
+						None => match set.table.key(keys[index]) {
 							Some(let now) => log.record(SetOp::Add(now)),
 							None => {},
 						},
@@ -754,19 +770,16 @@ export impl Store<HashMap<type K: Hashable, type V>> {
 	/// The value under `key`, as a handle that depends on that key only: a write to
 	/// another key never wakes it. A `Store<Option<V>>`, so `set(None)` removes the
 	/// key, `.some()` reaches into a present value, and its subscription's slot
-	/// lives as long as its subscriptions do (Q12).
+	/// lives as long as its subscriptions do (Q12). The step LENDS the map's slot
+	/// in place (`peek` / `slot`, B689 + M191): a read below it copies only the
+	/// leaf it returns, and a write through it lands where the value is.
 	fun at(self, key: K): Store<Option<V>> {
-		self.descend(StoreStep::Key(key.hash()), |held: &HashMap<K, V>, f: |&Option<V>| void| {
-			let value = held.get(key);
-			f(&value);
-		}, |held: &mut HashMap<K, V>, f: |&mut Option<V>| void| {
-			mut value = held.get(key);
-			f(&mut value);
-			match value {
-				Some(let now) => held.insert(key, now),
-				None => held.remove(key),
-			}
-		})
+		self
+			.descend(
+				StoreStep::Key(key.hash()),
+				|held: &HashMap<K, V>, f: |&Option<V>| void| held.peek(key, f),
+				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| f(held.slot(key)),
+			)
 	}
 }
 
@@ -785,17 +798,12 @@ export impl Store<HashMap<type K: Hashable, type V: Storable>> {
 /// A map field inside a variant: the same keyed step, through the variant.
 export impl StoreSome<HashMap<type K: Hashable, type V>> {
 	fun at(self, key: K): StoreSome<Option<V>> {
-		self.descend(StoreStep::Key(key.hash()), |held: &HashMap<K, V>, f: |&Option<V>| void| {
-			let value = held.get(key);
-			f(&value);
-		}, |held: &mut HashMap<K, V>, f: |&mut Option<V>| void| {
-			mut value = held.get(key);
-			f(&mut value);
-			match value {
-				Some(let now) => held.insert(key, now),
-				None => held.remove(key),
-			}
-		})
+		self
+			.descend(
+				StoreStep::Key(key.hash()),
+				|held: &HashMap<K, V>, f: |&Option<V>| void| held.peek(key, f),
+				|held: &mut HashMap<K, V>, f: |&mut Option<V>| void| f(held.slot(key)),
+			)
 	}
 }
 
@@ -1674,10 +1682,13 @@ export fun mirror_boundary<T: StoreWire + Storable>(
 	path: List<MirrorStep>,
 	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
+	// The place is read as a list once, for the identity and the boundary both:
+	// relative paths from the wire are applied under it.
+	let place = store_path_steps(local.path);
 	MirrorBoundary {
 		path,
-		identity = store_identity_at(local.root, local.path),
-		place = local.path,
+		identity = store_identity_at(local.root, place),
+		place,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			mut copy = local.get();
@@ -1767,7 +1778,8 @@ export impl RemoteStoreSome<type P> {
 	}
 
 	/// This handle as a plain `RemoteStore<P>`, for a body that runs only while the
-	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526).
+	/// variant is live (`StoreSome::assume`'s face, and its last-value rule, B526);
+	/// an owner is required, as there (B696).
 	fun assume(self): RemoteStore<P> {
 		RemoteStore { local = self.local.assume(), at = self.at }
 	}
@@ -1892,8 +1904,11 @@ export struct RemoteStoreKeys<K> {
 }
 
 /// The key-set handle under `at`, a map's or a set's place on the wire.
-fun remote_keys<K: Hashable + Wire>(place: List<StoreStep>, at: MirrorAt): RemoteStoreKeys<K> {
-	mut keyset = place;
+fun remote_keys<K: Hashable + Wire>(
+	place: Shared<StorePathStep>,
+	at: MirrorAt,
+): RemoteStoreKeys<K> {
+	mut keyset = store_path_steps(place);
 	keyset.push(StoreStep::Field(KEY_SET));
 	let keys: SignalCell<List<K>> = SignalCell::new([]);
 	RemoteStoreKeys {
@@ -2003,10 +2018,13 @@ export fun mirror_boundary_some<P: StoreWire + Storable>(
 	path: List<MirrorStep>,
 	gone: (|| void) context turn_scope,
 ): MirrorBoundary {
+	// The place is read as a list once, for the identity and the boundary both:
+	// relative paths from the wire are applied under it.
+	let place = store_path_steps(local.path);
 	MirrorBoundary {
 		path,
-		identity = store_identity_at(local.root, local.path),
-		place = local.path,
+		identity = store_identity_at(local.root, place),
+		place,
 		apply = |rel: List<StoreStep>, deserializer: Deserializer| {
 			mut reader = deserializer;
 			match local.get() {

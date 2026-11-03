@@ -9,11 +9,12 @@
 [platform("@process")] mod self;
 
 import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
-import pkg::bytes::{ Bytes, new_text_decoder };
+import pkg::bytes::{ Bytes, encode_utf8, new_text_decoder };
 import pkg::crypto::sha256;
 import pkg::json::{ JsonKind, JsonValue, coerce_str };
 import pkg::option::Option::{ self, None, Some };
 import pkg::rpc::server::{ Service, fold_service_requests, fold_service_upgrades };
+import pkg::shared::Shared;
 
 // --- Raw node:http bindings ---
 
@@ -139,6 +140,43 @@ export impl NodeSocket {
 [extern("__http_read_body")]
 async external fun read_body(node: NodeRequest, reply: NodeResponse, limit: usize): Bytes;
 
+/// The next piece of the request body, at most `size` bytes of it and at least
+/// one while the body lasts — `None` once it has ended (M176:
+/// `BodyReader::next`). The body is taken off the wire only as far as the reads
+/// ask: the first call starts it, each later one resumes it for as long as it
+/// takes to have something to answer, and between calls the connection reads
+/// nothing, so a client sending faster than the handler reads stalls. The cap is
+/// `read_body`'s, counted as the pieces arrive: a declared `Content-Length` over
+/// `limit` is refused at the first call, before a byte of the body is read, and
+/// a chunked body at the chunk that crosses it — mid-stream, with whatever the
+/// handler has already read behind it — the same `413`, the same close and the
+/// same cancellation.
+[extern("__http_body_next")]
+async external fun read_body_piece(
+	node: NodeRequest,
+	reply: NodeResponse,
+	limit: usize,
+	size: usize,
+): Option<Bytes>;
+
+/// Records how this request's body is read — `"whole"` (`Request::bytes`/`body`) or
+/// `"stream"` (`Request::body_stream`) — on the request itself, and answers how it
+/// was claimed before this call (`""` when it was not). The `Request` value is
+/// copied freely, so the claim lives with the host request, where every copy sees
+/// it.
+[extern("__http_claim_body")]
+external fun claim_body(node: NodeRequest, how: str): str;
+
+/// Refuses the request on the server's side: answers `status` with `message` as a
+/// plain-text body and `Connection: close` (unless a response has already started,
+/// which is cut instead), closes the connection without reading the rest of the
+/// body, and ends the caller as a CANCELLATION, exactly as `read_body`'s `413`
+/// does. A `5xx` — the server's own fault — is also written to stderr
+/// (`std::http: <message>`), where whoever runs the server reads it; a `4xx` is the
+/// client's, and the answer is the whole of the report.
+[extern("__http_refuse")]
+external fun refuse(node: NodeRequest, reply: NodeResponse, status: i32, message: str): void;
+
 /// Whether answering now would leave a body behind that the connection should not
 /// spend `limit` bytes draining: unread, and either declared over `limit` or of no
 /// declared length (chunked). Such a response says `Connection: close` (M164's
@@ -148,15 +186,31 @@ async external fun read_body(node: NodeRequest, reply: NodeResponse, limit: usiz
 [extern("__http_body_left_unread")]
 external fun body_left_unread(node: NodeRequest, limit: usize): bool;
 
+/// How many request-body bytes this process's server has taken off its
+/// connections after deciding not to read them — a body refused over its cap
+/// (`413`), or one left unread past it — since it started. Zero is M164's
+/// contract: a declined body stays in the kernel, so its writer stalls. The
+/// body-cap pins read this rather than how much a client got out, which measures
+/// the two kernels' socket buffers and not the server (B687).
+[internal("an instrument for the body-cap pins (B687); it counts, it decides nothing")]
+export fun refused_body_census(): usize {
+	refused_body_read()
+}
+
+[extern("__http_refused_body_census")]
+external fun refused_body_read(): usize;
+
 /// Runs one request's answer. A CANCELLATION ends it quietly — the body was
 /// refused (`read_body`'s `413` is already on the wire) or the client went away,
-/// so the request is over and nobody is waiting for it; every other failure
-/// propagates exactly as it did without this. Node ignores the promise a
-/// `createServer` callback returns, so without it the refusal would be an
-/// unhandled rejection, which ends the process; the native server spawns the
-/// callback as a task, where a cancellation is already quiet.
+/// so the request is over and nobody is waiting for it. Any OTHER failure — a
+/// handler that panics — is reported once, the `unhandled task error (spawned in
+/// an http request handler)` line, and answered `500` with `Connection: close`
+/// when the response has not started (cut off when it has), and the server goes
+/// on serving (M179). Node ignores the promise a `createServer` callback returns,
+/// so without this a panic was an unhandled rejection that ended the process;
+/// natively the spawned task reported it and left the response open.
 [extern("__http_respond")]
-async external fun respond(body: async || void);
+async external fun respond(reply: NodeResponse, body: async || void);
 
 export external struct NodeResponse;
 
@@ -235,7 +289,38 @@ export impl Request {
 	/// not run and its response is never asked for. A client that hangs up mid-body
 	/// ends the handler the same way.
 	fun bytes(self): Bytes {
+		claim_read(self, "whole");
 		read_body(self.node, self.reply, self.limit)
+	}
+
+	/// The body as a STREAM (M176): a `BodyReader` whose `next(size)` answers the
+	/// body a piece at a time, so an upload costs a piece of memory instead of its
+	/// whole size — hash it, write it to a file, or parse it (`Multipart`) as it
+	/// arrives:
+	///
+	///	let reader = request.max_body_bytes(100 * 1024 * 1024).body_stream();
+	///	for {
+	///		reader.next(65536) is Some(let piece) else jump break;
+	///		store.write(piece);
+	///	}
+	///
+	/// Nothing is read until the first `next`, and the connection reads only as far
+	/// as the calls ask. The cap is the request's, as for `bytes`, counted as the
+	/// body arrives: a body over it is answered `413 Content Too Large` and the
+	/// handler ends at the `next` that met it — at the first one for a declared
+	/// `Content-Length`, at the piece that crosses the cap for a chunked body,
+	/// however much of it the handler has already read.
+	///
+	/// **A body is read whole or as a stream, not both**: `bytes()`/`body()` after
+	/// `body_stream()`, or `body_stream()` after `bytes()`/`body()`, is a fault in
+	/// the handler, refused with `500 Internal Server Error` and a sentence naming
+	/// both calls (also written to stderr), and the handler ends there. A second
+	/// `body_stream()` is a second reader of the same stream, continuing where the
+	/// first stopped. A stream the handler leaves unfinished is treated as an
+	/// unread body is: drained within the cap, closed with the connection past it.
+	fun body_stream(self): BodyReader {
+		claim_read(self, "stream");
+		BodyReader { node = self.node, reply = self.reply, limit = self.limit }
 	}
 
 	/// This request's body cap, in place of the server's — the PER-ROUTE override
@@ -285,6 +370,525 @@ export impl Request {
 		}
 		Some(coerce_str(headers.field(lowered)))
 	}
+}
+
+/// Claims `request`'s body for one way of reading it — `"whole"` or `"stream"` —
+/// and refuses the request when it was already claimed for the other (M176: a body
+/// is read whole or as a stream, not both). Claiming it the same way twice is not a
+/// fault: a second `bytes()` answers the cached body, and a second `body_stream()`
+/// continues the one stream.
+fun claim_read(request: Request, how: str) {
+	let earlier = claim_body(request.node, how);
+	if earlier == "" || earlier == how {
+		ret;
+	}
+	let message = if how == "stream" {
+		"`Request::body_stream()` was called after `Request::bytes()` or `body()` had read the body whole"
+	} else {
+		"`Request::bytes()` or `body()` was called after `Request::body_stream()` had started reading the body as a stream"
+	};
+	refuse(
+		request.node,
+		request.reply,
+		500,
+		message + ": a request body is read whole or as a stream, not both",
+	);
+}
+
+/// A request body read a piece at a time (M176) — what `Request::body_stream`
+/// answers. `next(size)` hands back the next piece, `None` once the body has ended;
+/// see `Request::body_stream` for the cap and the one-way-of-reading rule.
+export struct BodyReader {
+	node: NodeRequest,
+	reply: NodeResponse,
+	/// The request's cap when the reader was made — counted over every piece.
+	limit: usize,
+}
+
+export impl BodyReader {
+	/// The next piece of the body: at most `size` bytes, at least one while the
+	/// body lasts, `None` once it has ended. A piece is whatever has arrived, up to
+	/// `size` — SHORTER does not mean the end, only `None` does — and the call
+	/// waits only when nothing has. A `size` of `0` is read as `1`, so a piece is
+	/// never empty and `None` stays the one signal of the end.
+	///
+	/// A piece is never a window on memory a later call overwrites, so a handler
+	/// may keep one as long as it likes.
+	async fun next(self, size: usize): Option<Bytes> {
+		let wanted = if size == 0 { 1 } else { size };
+		read_body_piece(self.node, self.reply, self.limit, wanted)
+	}
+}
+
+// --- multipart/form-data (M177) ---
+//
+// A form read part by part off the body STREAM (RFC 7578 over RFC 2046 §5.1's
+// framing): `CRLF--boundary` ends whatever came before it, the line after it is
+// empty (a part follows) or `--` (the form is over), a part is its header lines,
+// an empty line and its bytes. Everything here is ordinary vilan over
+// `BodyReader` — one parser for both backends — and the one host call is the
+// delimiter search (`find_bytes`), the loop a part's bytes spend their time in.
+//
+// What is held is a WINDOW on the stream: `buffer[cursor..]`, the bytes read and
+// not yet decided. A part's bytes are handed out of it up to the next delimiter
+// — or, before one has arrived, up to the last `delimiter.len() - 1` bytes,
+// which could be the start of one — so a delimiter split across two pieces of
+// the body is found whole, wherever the pieces broke.
+
+/// Where `needle` next occurs in `haystack` at or after `from` (`Buffer.indexOf`
+/// on node, `vilan_rt::http::find_bytes` natively).
+[extern("__http_find")]
+external fun find_bytes(haystack: Bytes, needle: Bytes, from: usize): Option<usize>;
+
+/// How much of the body a form reads at a time while it looks for a part's head or
+/// skips a part's rest.
+let FORM_READ = 65536usize;
+
+/// The longest head one part may carry — every header line and the empty one after
+/// them — before the form is refused: a head is held whole while it is parsed, so
+/// an unbounded one is an unbounded allocation driven by a stranger.
+let MAX_PART_HEAD = 65536usize;
+
+/// Where a form's reading stands. Exported only because `Multipart`'s state names
+/// it; nothing outside this module reads one.
+[internal("a form's reading state (M177), named by `Multipart`'s fields")]
+export enum FormStage {
+	/// Before the first delimiter: the preamble, which is discarded.
+	Preamble,
+	/// Just past a delimiter: the rest of its line says what follows.
+	Delimited,
+	/// Inside a part's bytes.
+	Body,
+	/// Past the closing delimiter.
+	Done,
+}
+
+/// A `multipart/form-data` request body, read a part at a time off the body stream
+/// (M177) — the shape every browser file upload has:
+///
+///	let form = Multipart::of(request.max_body_bytes(100 * 1024 * 1024));
+///	for {
+///		let part = match form.next_part() {
+///			Some(let part) => part,
+///			None => jump break,
+///		};
+///		// part.name, part.filename, part.content_type; part.reader.next(size)
+///	}
+///
+/// Nothing is held but a window on the stream, so a part's bytes cost what one
+/// `next` asks for, not the part's size. The cap is the request's
+/// (`max_body_bytes`) over the whole form, exactly as for `body_stream`, which is
+/// what this reads through — so `bytes()`/`body()` on the same request is the
+/// one-way-of-reading refusal.
+///
+/// A malformed form is refused `400 Bad Request` with a sentence naming the defect,
+/// and the handler ends at the call that met it: a `Content-Type` that is not
+/// `multipart/form-data` or names no `boundary` (at `of`), a delimiter line with
+/// something after the boundary, a part header without a colon, a part head over 64
+/// KiB, and a body that ends before the closing `--boundary--`.
+export struct Multipart {
+	node: NodeRequest,
+	reply: NodeResponse,
+	body: BodyReader,
+	/// `CRLF--boundary` — what ends a preamble or a part.
+	delimiter: Bytes,
+	/// The `--boundary` the sender chose, for the refusals' sentences.
+	boundary: str,
+	/// The window on the stream: `buffer[cursor..]` is read and not yet decided.
+	buffer: Shared<Bytes>,
+	cursor: Shared<usize>,
+	/// In a part's bytes, how far the window is known to hold no delimiter start —
+	/// up to `edge` it can be handed out without searching again — and whether a
+	/// delimiter STARTS at `edge`. Both reset whenever the buffer is refilled.
+	edge: Shared<usize>,
+	delimited: Shared<bool>,
+	stage: Shared<FormStage>,
+	/// The current part's number, so a `PartReader` the form has moved past reads
+	/// nothing.
+	part: Shared<i32>,
+}
+
+/// One part of a form: its `name`, its `filename` when it is a file (`None`
+/// for an ordinary field; `Some("")` is a file input sent with no file chosen),
+/// its `content_type` (`text/plain` when the part did not say, RFC 7578 §4.4),
+/// every header it carried, and its bytes through `reader`.
+export struct Part {
+	name: str,
+	filename: Option<str>,
+	content_type: str,
+	/// `(lowercased name, value)`, in the order the part carried them.
+	headers: List<(str, str)>,
+	reader: PartReader,
+}
+
+export impl Part {
+	/// A header of this part by name, case-insensitively — `None` when it did not
+	/// carry one.
+	fun header(self, name: str): Option<str> {
+		let wanted = name.to_lowercase_ascii();
+		for header in self.headers {
+			let (known, value) = header;
+			if known == wanted {
+				ret Some(value);
+			}
+		}
+		None
+	}
+}
+
+/// A part's bytes, read a piece at a time: `next(size)` as `BodyReader::next`,
+/// ending (`None`) at the part's delimiter. Valid while its part is the form's
+/// current one — once `next_part` has moved on, it reads `None`.
+export struct PartReader {
+	form: Multipart,
+	index: i32,
+}
+
+export impl PartReader {
+	/// The next piece of this part: at most `size` bytes (`0` is read as `1`), at
+	/// least one while the part lasts, `None` at its end. A short piece is not the
+	/// end; only `None` is.
+	async fun next(self, size: usize): Option<Bytes> {
+		let wanted = if size == 0 { 1 } else { size };
+		read_part(self.form, self.index, wanted)
+	}
+}
+
+export impl Multipart {
+	/// The request's body as a form. Refuses the request (`400`) when its
+	/// `Content-Type` is not `multipart/form-data` or names no `boundary`;
+	/// otherwise reads nothing yet — the body is the stream's from here
+	/// (`body_stream`, with its one-way-of-reading rule).
+	fun of(request: Request): Multipart {
+		let content_type = request.header("Content-Type").unwrap_or("");
+		let media_type = content_type.split(";")[0].trim().to_lowercase_ascii();
+		if media_type != "multipart/form-data" {
+			refuse(
+				request.node,
+				request.reply,
+				400,
+				i"the request body is not multipart/form-data (its Content-Type is `{content_type}`)",
+			);
+		}
+		mut boundary = "";
+		for parameter in header_parameters(content_type) {
+			let (name, value) = parameter;
+			if name == "boundary" {
+				boundary = value;
+			}
+		}
+		if boundary == "" {
+			refuse(
+				request.node,
+				request.reply,
+				400,
+				i"the multipart/form-data request names no boundary in its Content-Type (`{content_type}`)",
+			);
+		}
+		Multipart {
+			node = request.node,
+			reply = request.reply,
+			body = request.body_stream(),
+			delimiter = encode_utf8("\r\n--" + boundary),
+			boundary,
+			// The first delimiter may open the body, with no line break before
+			// it: one is read as if it had been there.
+			buffer = Shared::new(encode_utf8("\r\n")),
+			cursor = Shared::new(0usize),
+			edge = Shared::new(0usize),
+			delimited = Shared::new(false),
+			stage = Shared::new(FormStage::Preamble),
+			part = Shared::new(0),
+		}
+	}
+
+	/// The next part, its head read and its bytes waiting in `reader` — `None` once
+	/// the closing delimiter has been read. Whatever the handler left unread of the
+	/// part before is skipped first (read and discarded), so a part can be passed
+	/// over without reading it.
+	async fun next_part(self): Option<Part> {
+		match self.stage.read() {
+			FormStage::Body => skip_part(self),
+			FormStage::Preamble => skip_preamble(self),
+			_ => {},
+		}
+		match self.stage.read() {
+			FormStage::Done => ret None,
+			_ => {},
+		}
+		// The rest of the delimiter's line: `--` closes the form; otherwise only
+		// transport padding (spaces, tabs) may stand between it and the line end.
+		let after = read_line(self, MAX_PART_HEAD);
+		if after.len() >= 2 && after.get(0) == 45 && after.get(1) == 45 {
+			self.stage.write() = FormStage::Done;
+			ret None;
+		}
+		mut index = 0usize;
+		for index < after.len() {
+			let byte = after.get(index);
+			if byte != 32 && byte != 9 {
+				let text = new_text_decoder().decode(after);
+				form_refuse(
+					self,
+					i"a delimiter line carries `{text}` after `--{self.boundary}`, where only `--` or the line end may follow",
+				);
+			}
+			index += 1;
+		}
+		// The head: header lines up to an empty one.
+		mut headers: List<(str, str)> = [];
+		mut spent = 0usize;
+		for {
+			let line = read_line(self, MAX_PART_HEAD - spent);
+			spent = spent + line.len() + 2;
+			if line.len() == 0 {
+				jump break;
+			}
+			let text = new_text_decoder().decode(line);
+			match find_bytes(line, encode_utf8(":"), 0) {
+				Some(let colon) => {
+					let name = new_text_decoder()
+						.decode(line.slice(0, colon))
+						.trim()
+						.to_lowercase_ascii();
+					let value = new_text_decoder().decode(line.slice(colon + 1, line.len())).trim();
+					headers.push((name, value));
+				},
+				None => form_refuse(self, i"a part header has no colon: `{text}`"),
+			}
+		}
+		mut name = "";
+		mut filename: Option<str> = None;
+		mut content_type = "text/plain";
+		for header in headers {
+			let (known, value) = header;
+			if known == "content-disposition" {
+				for parameter in header_parameters(value) {
+					let (parameter_name, parameter_value) = parameter;
+					if parameter_name == "name" {
+						name = parameter_value;
+					} else if parameter_name == "filename" {
+						filename = Some(parameter_value);
+					}
+				}
+			} else if known == "content-type" {
+				content_type = value;
+			}
+		}
+		let index = self.part.read() + 1;
+		self.part.write() = index;
+		self.stage.write() = FormStage::Body;
+		self.edge.write() = self.cursor.read();
+		self.delimited.write() = false;
+		Some(Part {
+			name,
+			filename,
+			content_type,
+			headers,
+			reader = PartReader { form = self, index },
+		})
+	}
+}
+
+/// Refuses a malformed form: `400` with `message` (`refuse`), the handler ending at
+/// the call that met it.
+fun form_refuse(form: Multipart, message: str) {
+	refuse(form.node, form.reply, 400, "malformed multipart/form-data: " + message);
+}
+
+/// Reads up to `size` more bytes of the body onto the window — `false` when the
+/// body has ended. What the window had already decided is dropped here, so the
+/// buffer holds the undecided bytes and the new piece, never more.
+async fun fill(form: Multipart, size: usize): bool {
+	match form.body.next(size) {
+		Some(let piece) => {
+			let buffer = form.buffer.read();
+			let rest = buffer.slice(form.cursor.read(), buffer.len());
+			form.buffer.write() = Bytes::concat(rest, piece);
+			form.cursor.write() = 0;
+			form.edge.write() = 0;
+			form.delimited.write() = false;
+			true
+		},
+		None => false,
+	}
+}
+
+/// The body ended before the closing delimiter.
+fun refuse_unterminated(form: Multipart) {
+	form_refuse(form, i"the body ended before the closing `--{form.boundary}--` delimiter");
+}
+
+/// The preamble — everything before the first delimiter — read and discarded. Only
+/// the last `delimiter.len() - 1` bytes are kept between reads: they could be the
+/// start of the delimiter.
+async fun skip_preamble(form: Multipart) {
+	let keep = form.delimiter.len() - 1;
+	for {
+		let buffer = form.buffer.read();
+		match find_bytes(buffer, form.delimiter, form.cursor.read()) {
+			Some(let at) => {
+				form.cursor.write() = at + form.delimiter.len();
+				form.stage.write() = FormStage::Delimited;
+				ret;
+			},
+			None => {
+				if buffer.len() > keep && buffer.len() - keep > form.cursor.read() {
+					form.cursor.write() = buffer.len() - keep;
+				}
+				if !fill(form, FORM_READ) {
+					form_refuse(form, i"the body has no `--{form.boundary}` delimiter");
+					ret;
+				}
+			},
+		}
+	}
+}
+
+/// The rest of the current part, read and discarded, up to its delimiter.
+async fun skip_part(form: Multipart) {
+	let index = form.part.read();
+	for {
+		match read_part(form, index, FORM_READ) {
+			Some(let _skipped) => {},
+			None => jump break,
+		}
+	}
+}
+
+/// One line of a part's head (or the delimiter's line), without its `CRLF`, the
+/// window moved past it. At most `budget` bytes before the line ends, or the form
+/// is refused.
+async fun read_line(form: Multipart, budget: usize): Bytes {
+	let line_end = encode_utf8("\r\n");
+	for {
+		let buffer = form.buffer.read();
+		let cursor = form.cursor.read();
+		match find_bytes(buffer, line_end, cursor) {
+			Some(let at) => {
+				if at - cursor > budget {
+					jump break;
+				}
+				form.cursor.write() = at + 2;
+				ret buffer.slice(cursor, at);
+			},
+			None => {
+				if buffer.len() - cursor > budget {
+					jump break;
+				}
+				if !fill(form, FORM_READ) {
+					refuse_unterminated(form);
+					ret Bytes::alloc(0);
+				}
+			},
+		}
+	}
+	form_refuse(form, i"a part's head is longer than {MAX_PART_HEAD} bytes");
+	Bytes::alloc(0)
+}
+
+/// The next piece of part `index`: at most `size` bytes of it, `None` at its
+/// delimiter (the form then stands just past it) — or at once, when the form has
+/// moved past this part.
+async fun read_part(form: Multipart, index: i32, size: usize): Option<Bytes> {
+	if form.part.read() != index {
+		ret None;
+	}
+	match form.stage.read() {
+		FormStage::Body => {},
+		_ => ret None,
+	}
+	let reach = form.delimiter.len();
+	for {
+		let buffer = form.buffer.read();
+		let cursor = form.cursor.read();
+		let edge = form.edge.read();
+		if cursor < edge {
+			let end = if edge - cursor < size { edge } else { cursor + size };
+			form.cursor.write() = end;
+			ret Some(buffer.slice(cursor, end));
+		}
+		if form.delimited.read() {
+			form.cursor.write() = edge + reach;
+			form.delimited.write() = false;
+			form.stage.write() = FormStage::Delimited;
+			ret None;
+		}
+		match find_bytes(buffer, form.delimiter, cursor) {
+			Some(let at) => {
+				form.edge.write() = at;
+				form.delimited.write() = true;
+			},
+			None => {
+				// Bytes that cannot be the start of a delimiter are the part's;
+				// the last `reach - 1` might be, and wait for more.
+				if buffer.len() >= reach && buffer.len() - (reach - 1) > cursor {
+					form.edge.write() = buffer.len() - (reach - 1);
+				} else if !fill(form, size) {
+					refuse_unterminated(form);
+					ret None;
+				}
+			},
+		}
+	}
+}
+
+/// The `name=value` parameters of a header value after its first `;` —
+/// `form-data; name="field"; filename="a;b.txt"` — names lowercased, values
+/// unquoted. A quoted value may carry `;` and backslash escapes (`\"`), which is
+/// why this walks the text rather than splitting it.
+fun header_parameters(value: str): List<(str, str)> {
+	mut found: List<(str, str)> = [];
+	let length = value.len();
+	mut index = 0usize;
+	for index < length && value.code_at(index) != 59 {
+		index += 1;
+	}
+	for index < length {
+		// Past the `;`.
+		index += 1;
+		let name_start = index;
+		for index < length && value.code_at(index) != 61 && value.code_at(index) != 59 {
+			index += 1;
+		}
+		let name = value.substring(name_start, index).trim().to_lowercase_ascii();
+		if index >= length || value.code_at(index) == 59 {
+			if name != "" {
+				found.push((name, ""));
+			}
+			jump continue;
+		}
+		// Past the `=`, and any space before the value.
+		index += 1;
+		for index < length && value.code_at(index) == 32 {
+			index += 1;
+		}
+		mut text = "";
+		if index < length && value.code_at(index) == 34 {
+			index += 1;
+			mut start = index;
+			for index < length && value.code_at(index) != 34 {
+				if value.code_at(index) == 92 && index + 1 < length {
+					text = text + value.substring(start, index);
+					index += 1;
+					start = index;
+				}
+				index += 1;
+			}
+			text = text + value.substring(start, index);
+			for index < length && value.code_at(index) != 59 {
+				index += 1;
+			}
+		} else {
+			let start = index;
+			for index < length && value.code_at(index) != 59 {
+				index += 1;
+			}
+			text = value.substring(start, index).trim();
+		}
+		found.push((name, text));
+	}
+	found
 }
 
 // --- Response ---
@@ -709,7 +1313,7 @@ export impl Server {
 			// handler is called indirectly and so can't suspend"), and a
 			// synchronous file read in `std::fs` was justified by that claim for
 			// the length of its life.
-			respond(|| answer(request_handler, body_limits, node_request, node_response));
+			respond(node_response, || answer(request_handler, body_limits, node_request, node_response));
 		});
 		match upgrade_handler {
 			Some(let handler) => node_server.on_upgrade("upgrade", handler),

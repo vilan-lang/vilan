@@ -68,8 +68,8 @@ import pkg::reactive::{
 };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, fresh_identity };
-import pkg::task::Task;
-import pkg::time::{ Duration, sleep_for };
+import pkg::task::{ CancelSignal, Task, ambient_nursery, ambient_signal, nursery };
+import pkg::time::Timer;
 import pkg::wire::{ Codec, Delta, Deserializer, Frame, Keyed, Serializer, Wire };
 
 // === Transport: request/response ============================================
@@ -577,6 +577,29 @@ export impl WebSocket {
 [extern(new, "Promise")]
 external fun dial_promise(executor: |(|bool| void)| void): Promise<bool>;
 
+/// A listener on a `CancelSignal`'s abort, as a value the dial can take back
+/// (A179): `detach()` removes it, so an abort after the dial settled reaches
+/// nothing of the dial's. The glue is `__dial_on_abort` in `transformer.rs`.
+external struct AbortHook;
+
+impl AbortHook {
+	[extern(method, "detach")]
+	external fun detach(self);
+}
+
+/// Run `handler` once when `signal` aborts — at once, when it already has.
+[extern("__dial_on_abort", retains)]
+external fun on_abort(signal: CancelSignal, handler: || void): AbortHook;
+
+/// The abortable host timer `std::time::sleep` is built on, with the signal
+/// passed EXPLICITLY (A179): the backoff waits on the signal its dial was handed,
+/// never on whatever nursery a closure captured — a redial runs from a socket
+/// event long after the nursery that opened the connection was cancelled. Rejects
+/// with the abort when `signal` fires first. The extern is the symbol, so this and
+/// `std::time`'s declaration name one emitted helper.
+[extern("__sleep")]
+async external fun sleep_on(ms: i32, signal: Option<CancelSignal>): void;
+
 /// The connection lifecycle, as a signal a UI can bind ("reconnecting…") —
 /// Railway's `isReady`, typed (proposal/transport-robustness.md §2.1). `Closed` is
 /// terminal: the retry budget ran out (or the server's contract drifted); the app
@@ -966,6 +989,11 @@ export enum DialFailure {
 	/// carried (`"401"`, `"403"`). TERMINAL: the credential is the problem, and no
 	/// amount of backoff improves a credential.
 	Refused(str),
+	/// The caller gave up (A179): the dial's nursery was cancelled — by a
+	/// `Task::race` that something else won, `dial_within`'s deadline, or the app —
+	/// before the socket opened. The half-open socket is closed and nothing is left
+	/// running; there is nothing to report, it is what the caller asked for.
+	Cancelled,
 }
 
 export impl DialFailure {
@@ -975,6 +1003,7 @@ export impl DialFailure {
 		match self {
 			DialFailure::Unreachable(let reason) => reason,
 			DialFailure::Refused(let status) => i"refused by the server ({status})",
+			DialFailure::Cancelled => "the dial was cancelled",
 		}
 	}
 }
@@ -986,6 +1015,9 @@ export impl DialFailure {
 /// first (an unreachable server) — or when the server upgrades this client only to
 /// refuse it in one `__reject:<status>` frame (A47), which is the one failure worth
 /// telling apart from the rest.
+///
+/// Inside a nursery the attempt honours its cancel signal (A179): see
+/// `dial_attempt`.
 export fun dial(
 	url: str,
 	protocols: List<str>,
@@ -993,10 +1025,29 @@ export fun dial(
 	dispatch: |Frame| void,
 	serve: |Frame| void,
 ): Result<(WebSocket, i32), DialFailure> {
+	dial_attempt(url, protocols, settle, dispatch, serve, ambient_signal())
+}
+
+/// `dial`, honouring `signal` (A179, proposal/dial-cancel.md §2.1). An abort before
+/// the socket opens unhooks the socket's handlers — so the close is not read as a
+/// failure, or later as a drop to reconnect from — closes the half-open socket, and
+/// answers `Err(DialFailure::Cancelled)`. An abort after it opened is not the
+/// dial's business: the listener is detached the moment the attempt settles, and
+/// the connection is the caller's.
+fun dial_attempt(
+	url: str,
+	protocols: List<str>,
+	settle: |i32, Frame| void,
+	dispatch: |Frame| void,
+	serve: |Frame| void,
+	signal: Option<CancelSignal>,
+): Result<(WebSocket, i32), DialFailure> {
 	let socket = new_web_socket(url, protocols);
 	socket.set_binary_type("arraybuffer");
 	mut connection = "";
 	mut refused = "";
+	mut cancelled = false;
+	mut hook: Option<AbortHook> = None;
 	let opened = await dial_promise(|finish: |bool| void| {
 		socket.set_on_close(|| finish(false));
 		socket.set_on_error(|| finish(false));
@@ -1019,8 +1070,25 @@ export fun dial(
 				route_socket_frame(frame, settle, dispatch, serve);
 			}
 		});
+		if signal is Some(let cancel) {
+			// Registered LAST: a signal already aborted runs the handler here and
+			// now, and the handlers it unhooks must exist to be unhooked.
+			hook = Some(on_abort(cancel, || {
+				cancelled = true;
+				socket.set_on_close(|| {});
+				socket.set_on_error(|| {});
+				socket.set_on_message(|_message| {});
+				socket.close();
+				finish(false);
+			}));
+		}
 	});
-	if opened {
+	if hook is Some(let listener) {
+		listener.detach();
+	}
+	if cancelled {
+		Err(DialFailure::Cancelled)
+	} else if opened {
 		Ok((socket, parse_announced(connection)))
 	} else if refused != "" {
 		Err(DialFailure::Refused(refused))
@@ -1039,33 +1107,56 @@ export fun dial(
 /// credential is not away, and nine more attempts over ~24 seconds buy nothing but
 /// nine more refusals — which is precisely what a refused client used to pay before
 /// the refusal was a frame it could see.
+///
+/// `signal` cancels the whole dial (A179, proposal/dial-cancel.md §2.1): an abort
+/// during an attempt ends it with `Cancelled` (`dial_attempt`), and an abort
+/// during the backoff's wait ends the dial there, rather than counting as one more
+/// failed attempt. It is a PARAMETER and not the ambient signal read here,
+/// because a redial (`handle_drop`) runs from a socket event whose closure
+/// captured the ambient of the connect — a nursery that may have been cancelled
+/// the moment the connect won its race. `dial_socket` hands the ambient one; a
+/// redial hands `None`.
 fun dial_with_backoff(
 	url: str,
 	protocols: List<str>,
 	settle: |i32, Frame| void,
 	dispatch: |Frame| void,
 	serve: |Frame| void,
+	signal: Option<CancelSignal>,
 ): Result<(WebSocket, i32), DialFailure> {
 	mut outcome: Result<(WebSocket, i32), DialFailure> = Err(
 		DialFailure::Unreachable(i"could not reach {url}"),
 	);
 	mut attempt = 0;
-	mut delay = 250i53;
+	mut delay = 250;
 	for attempt < 10 {
 		if attempt > 0 {
-			sleep_for(Duration::millis(delay));
-			delay = if delay * 2i53 > 4000i53 { 4000i53 } else { delay * 2i53 };
+			// The wait rejects when `signal` aborts; that is the end of the dial.
+			if guarded_async(|| backoff_wait(delay, signal)) is Err(let _aborted) {
+				ret Err(DialFailure::Cancelled);
+			}
+			delay = if delay * 2 > 4000 { 4000 } else { delay * 2 };
 		}
-		outcome = dial(url, protocols, settle, dispatch, serve);
+		outcome = dial_attempt(url, protocols, settle, dispatch, serve, signal);
 		if outcome is Ok(let _opened) {
 			jump break;
 		}
 		if outcome is Err(DialFailure::Refused(let _status)) {
 			jump break;
 		}
+		if outcome is Err(DialFailure::Cancelled) {
+			jump break;
+		}
 		attempt += 1;
 	}
 	outcome
+}
+
+/// One backoff wait — `true` once it has run out (the value is only there to give
+/// `guarded_async` something to carry).
+fun backoff_wait(ms: i32, signal: Option<CancelSignal>): bool {
+	sleep_on(ms, signal);
+	true
 }
 
 /// The terminal treatment, in ONE place: the duplex goes to `Closed`, the socket is
@@ -1135,7 +1226,8 @@ fun handle_drop(duplex: SocketDuplex) {
 		let settle = |request: i32, reply: Frame| settle_pending(pending, request, reply);
 		let dispatch = |payload: Frame| deliver_inbound(inbound, early, payload);
 		let serve = |payload: Frame| serve_client_request(handlers, early_serve, payload);
-		match dial_with_backoff(duplex.url, duplex.protocols, settle, dispatch, serve) {
+		// `None`: the redial is the connection's, not the connect's nursery's.
+		match dial_with_backoff(duplex.url, duplex.protocols, settle, dispatch, serve, None) {
 			Ok(let opened) => {
 				let (socket, connection) = opened;
 				duplex.socket.write() = socket;
@@ -1200,7 +1292,7 @@ export fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, Dia
 	let settle = |request: i32, reply: Frame| settle_pending(pending, request, reply);
 	let dispatch = |payload: Frame| deliver_inbound(inbound, early, payload);
 	let serve = |payload: Frame| serve_client_request(handlers, early_serve, payload);
-	match dial_with_backoff(url, protocols, settle, dispatch, serve) {
+	match dial_with_backoff(url, protocols, settle, dispatch, serve, ambient_signal()) {
 		Err(let reason) => Err(reason),
 		Ok(let opened) => {
 			let (socket, connection) = opened;
@@ -1399,6 +1491,15 @@ export enum RpcError {
 	/// right thing, retrying immediately is not, and re-authenticating is beside
 	/// the point.
 	Unavailable,
+	/// `dial_within`'s deadline ran out before the dial answered (A179): a
+	/// judgement about TIME — "not reachable in the time you gave it; retry later,
+	/// and say so". The dial was cancelled, so no socket it would have opened later
+	/// is left running.
+	Timeout,
+	/// The dial was cancelled before it opened (A179): its nursery was cancelled —
+	/// a race something else won, or the app. About the CALLER's intent, so there
+	/// is nothing to report.
+	Cancelled,
 }
 
 // --- Envelope encode/decode (shared by `call`, the protocol, and benchmarks) --
@@ -1612,9 +1713,15 @@ fun status_of_outcome(outcome: RpcOutcome): i32 {
 				}
 			},
 			// Never produced on this side — a transport failure is the CLIENT's
-			// reading of a call that did not arrive. If one is ever encoded into a
-			// reply, it is the server's own fault.
+			// reading of a call that did not arrive, and so is a cancelled dial
+			// (A179). If one is ever encoded into a reply, it is the server's own
+			// fault.
 			RpcError::Transport(let _reason) => 500,
+			RpcError::Cancelled => 500,
+			// A179's deadline arm. Never produced by the server's own machinery;
+			// a handler answering it says ITS dial upstream ran out of time,
+			// which is HTTP's gateway timeout.
+			RpcError::Timeout => 504,
 		},
 	}
 }
@@ -6409,6 +6516,7 @@ fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
 fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, RpcError> {
 	dial_socket(url, protocols).map_err(|failure: DialFailure| match failure {
 		DialFailure::Unreachable(let reason) => RpcError::Transport(reason),
+		DialFailure::Cancelled => RpcError::Cancelled,
 		// 401 and 403 are one arm here because `RpcError` has one (A40 minted
 		// `Unauthorized` and nothing since has needed a second): the client's
 		// answer to both is the same — this credential will not open this
@@ -6425,6 +6533,51 @@ fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, 
 		} else {
 			RpcError::Transport(i"refused by the server ({status})")
 		},
+	})
+}
+
+/// Run `dial` with a deadline (A179, proposal/dial-cancel.md §2.2): its answer,
+/// or `Err(RpcError::Timeout)` when `ms` milliseconds pass first.
+///
+///     match dial_within(4000, || KoltClient::connect_with(url, codec, protocols)) {
+///         Ok(let client) => run(client),
+///         Err(RpcError::Timeout) => show("Can't reach Kolt"),
+///         Err(let other) => show(other.debug()),
+///     }
+///
+/// It wraps ANY dial — a generated `connect`/`connect_with`, `dial_socket`
+/// mapped to `RpcError`, a hand-written one — because it is the race idiom
+/// (`std::task`) in one place: a `nursery` whose body races the dial against a
+/// `Timer`. When the timer wins, the nursery is cancelled, and the std dial
+/// honours that (a half-open socket is closed, an abort during the backoff ends
+/// the dial), so no socket the dial would have opened later is left running. When
+/// the dial wins, only the TIMER is called off: the nursery is not cancelled, so
+/// nothing the connection set up inside it (a closure that captured its signal)
+/// is torn down. The nursery joins the loser before this returns, which is what
+/// makes "nothing left running" a guarantee — and why a hand-written dial that
+/// ignores cancellation (no std IO, no `ambient_signal()`) holds the answer until
+/// it settles.
+export fun dial_within<T>(
+	ms: i32,
+	dial: (async || Result<T, RpcError>) context ambient_nursery,
+): Result<T, RpcError> {
+	nursery(|n| {
+		let deadline = Timer::after(ms);
+		let dialled: Task<Option<Result<T, RpcError>>> = async Some(dial());
+		let timed: Task<Option<Result<T, RpcError>>> = async {
+			deadline.wait();
+			None
+		};
+		match Task::race([dialled, timed]) {
+			Some(let answer) => {
+				deadline.cancel();
+				answer
+			},
+			None => {
+				n.cancel();
+				Err(RpcError::Timeout)
+			},
+		}
 	})
 }
 

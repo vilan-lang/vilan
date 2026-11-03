@@ -47,180 +47,180 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 249_511_737
-measured_at = "v0.53.0's seal"
+ceiling = 253_769_265
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 309_249_054
-measured_at = "v0.53.0's seal"
+ceiling = 314_147_244
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_320_729_931
-measured_at = "v0.53.0's seal"
+ceiling = 1_375_579_726
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_777_348_943
-measured_at = "v0.53.0's seal"
+ceiling = 2_880_318_603
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_428_627_939
-measured_at = "v0.53.0's seal"
+ceiling = 1_503_825_988
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_474_489_112
-measured_at = "v0.53.0's seal"
+ceiling = 1_532_108_839
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_135_735_765
-measured_at = "v0.53.0's seal"
+ceiling = 3_272_039_182
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_334_447_168
-measured_at = "v0.53.0's seal"
+ceiling = 1_388_523_712
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_548_674_718
-measured_at = "v0.53.0's seal"
+ceiling = 1_571_201_026
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_775_899_646
-measured_at = "v0.53.0's seal"
+ceiling = 3_932_589_199
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_940_795_609
-measured_at = "v0.53.0's seal"
+ceiling = 4_118_497_406
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 7_168_811_916
-measured_at = "v0.53.0's seal"
+ceiling = 7_386_514_048
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 263_771_320
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 268_582_037
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 325_234_676
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 330_710_277
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_381_489_478
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_438_025_974
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_897_341_758
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 3_008_654_855
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_490_527_360
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_570_762_250
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_538_671_054
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_598_751_195
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_277_232_758
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 3_414_418_750
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_395_562_584
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_450_748_347
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_614_434_653
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_638_764_101
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_941_073_589
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 4_100_030_241
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_108_340_550
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 4_297_355_471
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 7_453_824_040
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 7_664_854_438
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
 tolerance = 0.005
 
 [[growth]]
@@ -231,46 +231,50 @@ max_ratio = 2.3
 [[e121]]
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 3
+target_ms = 1500
+green_seals = 4
 blocking = true
 mandate = true
+series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
 
 [[e121]]
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 6
+green_seals = 4
 blocking = true
+series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
 
 [[e121]]
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 5
+target_ms = 600
+green_seals = 4
 blocking = true
-series = "Order 52 (N174): the keystroke edit is unchanged; the Find References probe moved from `fun messages(self)` (gone from model.vl) to `fun global()`, the mirrored store reader, so that probe starts a new series."
+series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - re-anchored in the same method body, `Channel::create` - the keystroke is at `get_client().get_safe()!.create_channel(org, name)` (the org parameter arrived with organizations, kolt@38a7ac9), hover on `create_channel(org, name)`, and the Find References probe moved from `fun global()` (gone) to `fun ids(talk` (`Channel::ids`, the mirrored store's key-set reader, used in four files none open); the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
 
 [[e121]]
 scenario = "model.vl keystroke, importers open"
 metric = "cpu_ms"
-target_ms = 500
-green_seals = 2
+target_ms = 3000
+green_seals = 4
 blocking = true
+series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the model.vl keystroke's new anchor (`create_channel(org, name)` in `Channel::create`) with client.vl, channel.vl and views.vl open beside it as before; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
 
 [[e121]]
 scenario = "css keystroke"
 metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 0
-blocking = false
+target_ms = 1300
+green_seals = 4
+blocking = true
 mandate = true
+series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
 
 [[e121]]
 scenario = "parse break"
 metric = "diagnostics_cpu_ms"
-target_ms = 500
-green_seals = 0
-blocking = false
+target_ms = 2500
+green_seals = 4
+blocking = true
 mandate = true
-series = "Order 52 (N174): re-anchored from `let messages = channel.messages();` (gone with the mirrored-store exhibit, kolt@dee494ab) to `channel_name.adopt(channel.current_name());` in the same channel.vl - a statement over a `g.channels()` boundary; the break and its repair are the same shape, the figures start a new series."
+series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - re-anchored from `channel_name.adopt(channel.current_name());` (gone from channel.vl with organizations, kolt@38a7ac9) to `let name = Channel { id }.current_name(g.talk());` in the same channel.vl (the hover card's channel arm) - a statement over the `talk.channels().at(id)` boundary, the `(` opened before it as before; the repair row (`parse repair`) is the undo of the same edit; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."

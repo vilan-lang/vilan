@@ -37,6 +37,7 @@ impl Option<type T> {
 	// always leaving a valid Option behind
 	fun take(&mut self): Option<T>                   // Some(v) -> None here, Some(v) out
 	fun replace(&mut self, own value: T): Option<T>  // value in, old contents out
+	fun get_or_insert(&mut self, lazy value: T): &mut T borrows self   // fill a None, then the payload in place
 
 	// transformation
 	fun map<U>(own self, fn: |T| U): Option<U>
@@ -135,6 +136,12 @@ them the sanctioned way to move a value *out* of a place. For a `resource` this
 is the partial move that works through a loan, or out of an aggregate with a
 `Drop` inside (`self.slot.take()`), and `match opt.take() {
 Some(let c) => drop(c), None => {} }` is the conditional-teardown idiom.
+
+`get_or_insert` fills a `None` with `value` — `lazy`, so evaluated only then —
+and answers a view of the payload, so what is written through it lands in the
+`Option` itself: `cache.get_or_insert(build()).push(x)`. On a map's slot it is
+the entry idiom (`groups.slot(key).get_or_insert([]).push(row)`,
+[collections.md](collections.md#reading-and-writing-in-place)).
 
 ## `Result<T, E>`
 

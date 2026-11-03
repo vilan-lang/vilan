@@ -1,0 +1,37 @@
+// `HashTable<V>` — the raw JS `Map` keyed by a canonical `Hash`, an internal
+// building block for std's own machinery that keys by hash and never needs the
+// original key back: the reactive turn's queues, the store's keyed nodes, the
+// tracer's tables. Not part of the public surface; `HashMap`/`HashSet` are over
+// `NativeMap<K, V>` (`std::js::native_map`), which keeps the key (M191).
+//
+// The key type is fixed as `Hash` rather than generic — the raw layer only ever
+// takes canonical keys — which keeps this table single-parameter and as cheap as
+// the JS `Map` it is: `new` is `new Map()`, `insert` is `.set`, `get` returns an
+// `Option<V>` (a copy), and `keys`/`values` are cloned `List` snapshots in
+// insertion order.
+import pkg::hash::Hash;
+import pkg::option::Option;
+
+export *;
+
+external struct HashTable<V>;
+
+impl HashTable<type V> {
+	external fun new(): HashTable<V>;
+
+	/// `own value`: the table KEEPS what it is given (as `List::push` does), so a
+	/// place passed here is copied in rather than aliased by the host map.
+	external fun insert(&mut self, key: Hash, own value: V): void;
+
+	external fun get(self, key: Hash): Option<V>;
+
+	external fun contains_key(self, key: Hash): bool;
+
+	external fun remove(&mut self, key: Hash): void;
+
+	external fun len(self): usize;
+
+	external fun keys(self): List<Hash>;
+
+	external fun values(self): List<V>;
+}

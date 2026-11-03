@@ -1,8 +1,8 @@
 # Encoding reference
 
 JSON (`std::json`), the codec-agnostic wire layer (`std::wire`), the binary
-codec (`std::binary`), raw bytes (`std::bytes`), and base64
-(`std::base64`).
+codec (`std::binary`), raw bytes (`std::bytes`), base64 (`std::base64`), and
+percent-encoding (`std::url`).
 
 The short version: derive `Json` for JSON in/out at app boundaries, derive
 `Wire` for rpc payloads, and let the codecs do the rest. Everything below
@@ -470,3 +470,37 @@ URL-safe alphabet, no padding (the JWT flavor):
 fun encode_url(bytes: Bytes): str
 fun decode_url(text: str): Option<Bytes>
 ```
+
+## Percent-encoding (`std::url`)
+
+The pair for building and reading URLs, on every platform (node, the browser,
+native):
+
+```vilan,fragment
+fun percent_encode(text: str): str   // encodeURIComponent's set
+fun percent_decode(text: str): str   // total: never fails
+```
+
+`percent_encode` escapes every byte of the UTF-8 encoding as `%XX`
+(upper-case hex) except the unreserved `A-Z a-z 0-9 - _ . ! ~ * ' ( )`, so its
+answer is safe as one path segment, one query value, or a
+`Content-Disposition` filename. `percent_decode` reads escapes back and never
+fails: a malformed escape (`%zz`, a lone `%`) is not an escape and stays as
+written, and a run of escapes whose bytes are not UTF-8 (`%FF`, `%41%FF`)
+decodes to itself, byte for byte, while a good run beside it still decodes.
+
+```vilan
+import std::url::{ percent_decode, percent_encode };
+
+fun main() {
+	let name = "Q3 report/final é.pdf";
+	let link = i"/files/{percent_encode(name)}";
+	print(link);                                // /files/Q3%20report%2Ffinal%20%C3%A9.pdf
+	print(percent_decode("Q3%20report%2Ffinal%20%C3%A9.pdf") == name);   // true
+	print(percent_decode("100% sure, %zz%20"));  // "100% sure, %zz " — malformed pieces kept
+}
+```
+
+The two answer the same bytes on every backend. `std::web::router`
+re-exports `percent_decode`, which its `parse_path` and `parse_query` use on
+every piece.

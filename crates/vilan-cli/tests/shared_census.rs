@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 const CENSUS: &[(&str, usize, &str)] = &[
     (
         "browser/web/ui.vl",
-        25,
+        26,
         "O + R: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s \
          row, owner and payload cell — A119), plus A121's focus scopes at Order \
          40 — the scope STACK and its id source are R (module bindings, program \
@@ -47,12 +47,23 @@ const CENSUS: &[(&str, usize, &str)] = &[
          latch is O (it dies with the boundary that installed the scope). −1 at \
          A112 S3: `each`'s row list IS its region's (`region.rows`), not a \
          second cell kept in step with it; −1 at A112 S3b: `each_by`'s, the \
-         same way",
+         same way; +1 at M187: the stack of runs LEAVING the document whole is \
+         R (a module binding: a closing region asks it whether its anchor is \
+         inside a run an ancestor is removing, and the answer is the DOM's, not \
+         one owner's)",
     ),
     (
         "fs.vl",
         1,
         "F (blocked: `Reader::next` awaits, so no `&mut self`)",
+    ),
+    (
+        "http.vl",
+        6,
+        "E: a form's window on the body stream (M177: buffer, cursor, edge, \
+         delimited, stage, part), minted by `Multipart::of` and read by every \
+         `PartReader` it hands out — and forced besides, as `fs::Reader.cursor` \
+         is: `next_part` and `PartReader::next` await the body",
     ),
     (
         "memo.vl",
@@ -145,7 +156,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive/store_core.vl",
-        5,
+        7,
         "E: a store's cells, all minted by the store and reached through every \
          copy of a handle (A142 S7, `proposal/store.md`) — the root's value \
          (`Store::new`), each node of its slot tree, and a slot's subscription \
@@ -155,8 +166,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
          set's members, a keyed list's keys), made by the first subscription \
          under a key and read by every write's diff; +1 at M172 (Order 55): the \
          root's identity table (`ids`), a cell as `keyed` is, because binding \
-         the map copied every identity minted once per boundary a mirror named. \
-         A collection flow's feed keeps its state in `mut` bindings its \
+         the map copied every identity minted once per boundary a mirror named; \
+         +2 at M186: a handle path's step (`path_child`) and a store's root \
+         path sentinel (`path_root`, one per `Store::new`), never written once \
+         made and shared by every copy of the handle and every projection made \
+         below it, so a projection allocates one step rather than copying its \
+         parent's path list. A collection flow's feed keeps its state in `mut` bindings its \
          closures capture, so `store.vl` itself mints none",
     ),
     (
@@ -360,7 +375,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 249,
+        total, 258,
         "the total number of `Shared` construction sites in std changed"
     );
 

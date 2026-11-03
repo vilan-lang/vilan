@@ -1391,6 +1391,16 @@ pub(crate) fn dispatch_at<'src>(
     if let Some(dispatch) = program.generic_dispatch.get(&call_id) {
         return Some(*dispatch);
     }
+    // B690: a concatenation rendering a bounded generic operand is a dispatch
+    // of the bound's `to_string` on that constraint — what the emitter
+    // re-resolves per monomorphization (B176), and the edge the call graph
+    // records at the binary.
+    if let Some(&(constraint_id, _)) = program.concat_render_dispatch.get(&call_id) {
+        return Some(GenericDispatch::OnConstraint(
+            constraint_id,
+            crate::analyzer::RENDER_MEMBER,
+        ));
+    }
     let subject_id = program.function_calls.get(&call_id)?.subject_id;
     program.generic_dispatch.get(&subject_id).copied()
 }

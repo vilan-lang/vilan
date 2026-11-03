@@ -1,6 +1,6 @@
 [package]
 name = "vilan-wasm"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The Vilan compiler as a WebAssembly module, for the web playground."
@@ -12,7 +12,10 @@ description = "The Vilan compiler as a WebAssembly module, for the web playgroun
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-vilan-core = { path = "../vilan-core" }
+# Without `image-codec` (M185): this compiler never emits a node program
+# that needs `std::image`'s ~780 KB codec blob, so it does not carry one
+# (vilan-core's Cargo.toml says why; such a program is refused by name).
+vilan-core = { path = "../vilan-core", default-features = false }
 # The completion engine and the line index, shared with the language server
 # (K9, proposal/playground-completion.md §3) — core-only, so it builds for
 # wasm32 exactly as it does natively.

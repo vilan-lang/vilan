@@ -11,7 +11,7 @@
 import pkg::compare::PartialEq;
 import pkg::hash::{ Hash, canonical_hash };
 import pkg::io::panic;
-import pkg::js::native_map::NativeMap;
+import pkg::js::hash_table::HashTable;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	DeltaCursor,
@@ -24,6 +24,7 @@ import pkg::reactive::{
 	also_releasing,
 	batch,
 	observe,
+	on_cleanup,
 };
 import pkg::shared::{ Shared, fresh_identity };
 
@@ -46,6 +47,56 @@ export struct StoreSlot {
 export enum StoreStep {
 	Field(usize),
 	Key(Hash),
+}
+
+/// One step of a handle's path (M186), and the path above it: a handle's `path`
+/// (and a `StoreSome`'s `gate`) is a `Shared<StorePathStep>`, its innermost step,
+/// so a projection allocates one step pointing at its parent's and copying a
+/// handle copies one pointer. Never written once made: two handles share it, and
+/// a projection made below either points at it. A store's ROOT path is a SENTINEL
+/// step at depth 0 whose `step` is never read (it holds `Field(0)`). Read as a list
+/// (`store_path_steps`) only where the slot tree is walked: a subscription, an
+/// identity, a write. Exported because it is the handles' field type (the reach
+/// rule); nothing outside the store builds one.
+export struct StorePathStep {
+	[internal("a store path's step; reach it through `store_path_steps`")] step: StoreStep,
+	[internal("a store path's parent; reach it through `store_path_steps`")] above: Option<Shared<StorePathStep>>,
+	/// How many steps from the root, this one included; `0` at the root's sentinel.
+	[internal("a store path's length; reach it through `store_path_steps`")] depth: usize,
+}
+
+/// A store's root path: the sentinel step, depth 0, whose `step` is never read.
+fun path_root(): Shared<StorePathStep> {
+	Shared::new(StorePathStep { step = StoreStep::Field(0), above = None, depth = 0 })
+}
+
+/// The path one `step` below `path`: one allocation, sharing `path`.
+fun path_child(path: Shared<StorePathStep>, own step: StoreStep): Shared<StorePathStep> {
+	let depth = path.read().depth + 1;
+	Shared::new(StorePathStep { step, above = Some(path), depth })
+}
+
+/// The steps of `path` from the root down — one list, made for a walk of the slot
+/// tree, an identity's key or the wire log.
+[internal("a store path, materialized for the slot tree (M186)")]
+export fun store_path_steps(path: Shared<StorePathStep>): List<StoreStep> {
+	mut steps: List<StoreStep> = [];
+	push_steps(path, &mut steps);
+	steps
+}
+
+/// Push `path`'s steps onto `into`, root first: up to the root's sentinel, which
+/// pushes nothing, then each step on the way back down — the list in order with no
+/// reverse and no placeholder.
+fun push_steps(path: Shared<StorePathStep>, into: &mut List<StoreStep>) {
+	if path.read().depth == 0 {
+		ret;
+	}
+	match path.read().above {
+		Some(let above) => push_steps(above, into),
+		None => {},
+	}
+	into.push(path.read().step);
 }
 
 /// What a write did to a collection, as the collection's open FEEDS are told it
@@ -101,9 +152,9 @@ export struct StoreWoken {
 export struct StoreNode {
 	me: Option<StoreSlot>,
 	kids: List<Option<Shared<StoreNode>>>,
-	keyed: Option<Shared<NativeMap<Shared<StoreNode>>>>,
+	keyed: Option<Shared<HashTable<Shared<StoreNode>>>>,
 	feeds: List<StoreFeed>,
-	ids: Option<Shared<NativeMap<i32>>>,
+	ids: Option<Shared<HashTable<i32>>>,
 	wire: Option<DeltaLog<WireWrite>>,
 }
 
@@ -126,8 +177,15 @@ fun empty_node(): Shared<StoreNode> {
 /// The identity of the path `path` under `root` (A146): one number for every handle
 /// to it — a projection made twice, a copy, the `Store` that `assume()` hands back
 /// beside its `StoreSome` — and a different one for every other path and every
-/// other store. A tracked read of a handle keeps one edge across runs by it.
-fun identity_at(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
+/// other store. A tracked read of a handle keeps one edge across runs by it. The
+/// key is the hash of the path's STEPS, so a projection remade from a copied handle
+/// asks under the same key (M186: the path is shared, the steps are equal).
+fun identity_at(root: Shared<StoreNode>, path: Shared<StorePathStep>): i32 {
+	identity_of(root, store_path_steps(path))
+}
+
+/// `identity_at` for a path already read as a list.
+fun identity_of(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
 	let key = canonical_hash(path);
 	// The table is a cell, as `keyed` is: binding it shares it, where binding
 	// the map itself copied every identity the store had minted — once per ask,
@@ -135,7 +193,7 @@ fun identity_at(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
 	let ids = match root.read().ids {
 		Some(let held) => held,
 		None => {
-			let made: Shared<NativeMap<i32>> = Shared::new(NativeMap::new());
+			let made: Shared<HashTable<i32>> = Shared::new(HashTable::new());
 			root.write().ids = Some(made);
 			made
 		},
@@ -151,10 +209,11 @@ fun identity_at(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
 }
 
 /// `identity_at`, for the mirror's dedup (A153 S1): one channel per store root,
-/// one grant per path.
+/// one grant per path. Takes the path as a LIST, as the wire holds it (a grant's
+/// path, a boundary's place).
 [internal("the mirrored store's dedup (A153 S1)")]
 export fun store_identity_at(root: Shared<StoreNode>, path: List<StoreStep>): i32 {
-	identity_at(root, path)
+	identity_of(root, path)
 }
 
 /// The child of `node` at `index`, if anything ever watched below it — the diff's
@@ -290,6 +349,11 @@ export fun store_wake_all(node: Option<Shared<StoreNode>>, woken: &mut StoreWoke
 /// moved wake, and a third variant's does not, since its answer did not change
 /// (Q7). Every live slot under either payload wakes too, each having gone between
 /// `Some` and `None`. Answers `true`, the diff's verdict.
+///
+/// The two flags' FEEDS are told too (B693): a feed on a flag is an assumed
+/// handle's keeper (`StoreSome::assume`), which must read the payload before the
+/// write that ends its variant lands. No inner write's spine passes a flag, so this
+/// is the one place a keeper is told anything.
 [internal("the derive's variant switch (A142 S7)")]
 export fun store_switch(
 	node: Option<Shared<StoreNode>>,
@@ -299,10 +363,14 @@ export fun store_switch(
 ): bool {
 	let flags = store_kid(node, 0);
 	store_wake_me(flags, true, woken);
-	store_wake_me(store_kid(flags, from), true, woken);
+	let left = store_kid(flags, from);
+	store_wake_me(left, true, woken);
+	store_touch(left, StoreTouch::Whole, woken);
 	store_wake_all(store_kid(node, from), woken);
 	if to != from {
-		store_wake_me(store_kid(flags, to), true, woken);
+		let arrived = store_kid(flags, to);
+		store_wake_me(arrived, true, woken);
+		store_touch(arrived, StoreTouch::Whole, woken);
 		store_wake_all(store_kid(node, to), woken);
 	}
 	true
@@ -310,8 +378,8 @@ export fun store_switch(
 
 /// The path of variant `index`'s flag under the enum at `path`: the discriminant's
 /// child `index`.
-fun flag_path(path: List<StoreStep>, index: usize): List<StoreStep> {
-	child_path(child_path(path, StoreStep::Field(0)), StoreStep::Field(index))
+fun flag_path(path: Shared<StorePathStep>, index: usize): Shared<StorePathStep> {
+	path_child(path_child(path, StoreStep::Field(0)), StoreStep::Field(index))
 }
 
 /// The child of `node` one `step` below, made (a field's list grown to it, a key's
@@ -331,7 +399,7 @@ fun kid_made(node: Shared<StoreNode>, step: StoreStep): Shared<StoreNode> {
 				StoreStep::Key(let hash) => match node.read().keyed {
 					Some(let table) => table.write().insert(hash, kid),
 					None => {
-						mut table: NativeMap<Shared<StoreNode>> = NativeMap::new();
+						mut table: HashTable<Shared<StoreNode>> = HashTable::new();
 						table.insert(hash, kid);
 						node.write().keyed = Some(Shared::new(table));
 					},
@@ -454,25 +522,27 @@ fun counted(root: Shared<StoreNode>, path: List<StoreStep>, slot: StoreSlot, han
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
 export fun watch_at(
 	root: Shared<StoreNode>,
-	path: List<StoreStep>,
+	path: Shared<StorePathStep>,
 	subscriber: Subscriber,
 ): Subscription {
-	let slot = slot_at(root, path);
+	let steps = store_path_steps(path);
+	let slot = slot_at(root, steps);
 	let handle = slot.signal.on_settle(subscriber);
-	counted(root, path, slot, handle);
+	counted(root, steps, slot, handle);
 	handle
 }
 
 /// Attach a WAKE to the slot at `path`, counted: `wake` runs when the value there
 /// changed, and reads nothing — the mirror's boundary forward (A153 S1), which
-/// reads what it sends when its turn settles.
+/// reads what it sends when its turn settles. Takes the path as a LIST, as the wire
+/// holds it (a grant's path joined with a slot's).
 [internal("the mirrored store's boundary forward (A153 S1)")]
 export fun store_watch(
 	root: Shared<StoreNode>,
 	path: List<StoreStep>,
 	wake: || void,
 ): Subscription {
-	observe_at(root, path, wake)
+	observe_steps(root, path, wake)
 }
 
 /// Stand one mirror forward on `root`'s wire log, made with the first (A153 S1):
@@ -517,7 +587,16 @@ export fun store_wire_detach(root: Shared<StoreNode>, cursor: DeltaCursor) {
 /// closure the slot keeps holds only the handle's READ — never the slot tree, which
 /// holds the slot: a handle captured there would be a loop through every node on
 /// the path (A132's, one level down; `HashMapEntry::attach_observer` is the model).
-fun observe_at(root: Shared<StoreNode>, path: List<StoreStep>, observer: || void): Subscription {
+fun observe_at(
+	root: Shared<StoreNode>,
+	path: Shared<StorePathStep>,
+	observer: || void,
+): Subscription {
+	observe_steps(root, store_path_steps(path), observer)
+}
+
+/// `observe_at` for a path already read as a list.
+fun observe_steps(root: Shared<StoreNode>, path: List<StoreStep>, observer: || void): Subscription {
 	let slot = slot_at(root, path);
 	let handle = observe(slot.signal, |_wake| observer());
 	counted(root, path, slot, handle);
@@ -572,13 +651,14 @@ fun prune_empty(chain: List<Shared<StoreNode>>, path: List<StoreStep>) {
 
 /// Stand `feed` on the node at `path`, made with the nodes on the way down.
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
-export fun attach_feed(root: Shared<StoreNode>, path: List<StoreStep>, feed: StoreFeed) {
-	node_made(root, path).write().feeds.push(feed);
+export fun attach_feed(root: Shared<StoreNode>, path: Shared<StorePathStep>, feed: StoreFeed) {
+	node_made(root, store_path_steps(path)).write().feeds.push(feed);
 }
 
 /// Take the feed `id` off the node at `path`, and drop every node it left empty.
 [internal("the store core, reached by `std::reactive::store`'s collection nodes (A149 S3)")]
-export fun detach_feed(root: Shared<StoreNode>, path: List<StoreStep>, id: i32) {
+export fun detach_feed(root: Shared<StoreNode>, at: Shared<StorePathStep>, id: i32) {
+	let path = store_path_steps(at);
 	let chain = node_chain(root, path);
 	if chain.len() != path.len() + 1 {
 		ret;
@@ -619,11 +699,12 @@ struct Lent {
 /// a dead variant diffs nothing, lands nothing, wakes nothing, and answers `false`.
 fun write_at<T: Storable>(
 	root: Shared<StoreNode>,
-	path: List<StoreStep>,
+	at: Shared<StorePathStep>,
 	lend: |(|&T| void)| void,
 	modify: |(|&mut T| void)| void,
 	value: T,
 ): bool {
+	let path = store_path_steps(at);
 	let found = spine(root, &path);
 	let need = !found.ancestors.is_empty() || !found.touches.is_empty();
 	let node = found.node;
@@ -674,7 +755,8 @@ fun write_at<T: Storable>(
 /// Wake the slot at `path` and every ancestor's, comparing nothing — `notify()`'s
 /// body, the escape hatch for a change the store cannot see. No feed records
 /// anything: nothing it can name happened.
-fun notify_at(root: Shared<StoreNode>, path: List<StoreStep>) {
+fun notify_at(root: Shared<StoreNode>, at: Shared<StorePathStep>) {
+	let path = store_path_steps(at);
 	let found = spine(root, &path);
 	mut woken = StoreWoken { slots = found.ancestors, feeds = [] };
 	store_wake_me(found.node, true, &mut woken);
@@ -683,13 +765,6 @@ fun notify_at(root: Shared<StoreNode>, path: List<StoreStep>) {
 		None => {},
 	}
 	deliver(woken.slots);
-}
-
-/// The path one step below `path`.
-fun child_path(path: List<StoreStep>, step: StoreStep): List<StoreStep> {
-	mut below = path;
-	below.push(step);
-	below
 }
 
 // === `Storable` and the leaf tiers (§2.3, §4) ================================
@@ -827,7 +902,7 @@ export impl Option<type P: Storable> with Storable {
 [hint(Signal<T>)]
 export struct Store<T> {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
-	[internal("the store's path; reach it through the handle")] path: List<StoreStep>,
+	[internal("the store's path; reach it through the handle")] path: Shared<StorePathStep>,
 	[internal("the in-place read; reach it through `get`")] lend: |(|&T| void)| void,
 	[internal("the in-place write; reach it through `set`")] modify: |(|&mut T| void)| void,
 }
@@ -839,10 +914,10 @@ export struct Store<T> {
 [hint(Source<Option<P>>)]
 export struct StoreSome<P> {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
-	[internal("the store's path; reach it through the handle")] path: List<StoreStep>,
+	[internal("the store's path; reach it through the handle")] path: Shared<StorePathStep>,
 	[internal("the in-place read; reach it through `get`")] lend: |(|&P| void)| void,
 	[internal("the in-place write; reach it through `patch`")] modify: |(|&mut P| void)| void,
-	[internal("the variant flag this handle is live behind; reach it through `live`")] gate: List<StoreStep>,
+	[internal("the variant flag this handle is live behind; reach it through `live`")] gate: Shared<StorePathStep>,
 }
 
 /// An enum's DISCRIMINANT, as one variant asks it: `presence.is_online()`. A
@@ -853,7 +928,7 @@ export struct StoreSome<P> {
 [hint(Source<bool>)]
 export struct StoreFlag {
 	[internal("the store's slot tree; reach it through the handle")] root: Shared<StoreNode>,
-	[internal("the store's path; reach it through the handle")] path: List<StoreStep>,
+	[internal("the store's path; reach it through the handle")] path: Shared<StorePathStep>,
 	[internal("the read; reach it through `get`")] read: || bool,
 }
 
@@ -864,7 +939,7 @@ export impl Store<type T> {
 		let cell = Shared::new(value);
 		Store<T> {
 			root = empty_node(),
-			path = [],
+			path = path_root(),
 			lend = |f: |&T| void| f(&cell.write()),
 			modify = |f: |&mut T| void| f(&mut cell.write()),
 		}
@@ -888,7 +963,7 @@ export impl Store<type T> {
 	[internal("a store's step down (A149 S3)")]
 	fun descend<F>(
 		self,
-		step: StoreStep,
+		own step: StoreStep,
 		read: |&T, (|&F| void)| void,
 		write: |&mut T, (|&mut F| void)| void,
 	): Store<F> {
@@ -896,7 +971,7 @@ export impl Store<type T> {
 		let modify = self.modify;
 		Store<F> {
 			root = self.root,
-			path = child_path(self.path, step),
+			path = path_child(self.path, step),
 			lend = |f: |&F| void| lend(|held: &T| read(held, f)),
 			modify = |f: |&mut F| void| modify(|held: &mut T| write(held, f)),
 		}
@@ -915,7 +990,7 @@ export impl Store<type T> {
 		let modify = self.modify;
 		StoreSome<P> {
 			root = self.root,
-			path = child_path(self.path, StoreStep::Field(index)),
+			path = path_child(self.path, StoreStep::Field(index)),
 			lend = |f: |&P| void| lend(|held: &T| read(held, f)),
 			modify = |f: |&mut P| void| modify(|held: &mut T| write(held, f)),
 			gate = flag_path(self.path, index),
@@ -958,7 +1033,7 @@ export impl StoreSome<type P> {
 	[internal("a store's step down (A149 S3)")]
 	fun descend<F>(
 		self,
-		step: StoreStep,
+		own step: StoreStep,
 		read: |&P, (|&F| void)| void,
 		write: |&mut P, (|&mut F| void)| void,
 	): StoreSome<F> {
@@ -966,7 +1041,7 @@ export impl StoreSome<type P> {
 		let modify = self.modify;
 		StoreSome<F> {
 			root = self.root,
-			path = child_path(self.path, step),
+			path = path_child(self.path, step),
 			lend = |f: |&F| void| lend(|held: &P| read(held, f)),
 			modify = |f: |&mut F| void| modify(|held: &mut P| write(held, f)),
 			gate = self.gate,
@@ -985,7 +1060,7 @@ export impl StoreSome<type P> {
 		let modify = self.modify;
 		StoreSome<V> {
 			root = self.root,
-			path = child_path(self.path, StoreStep::Field(index)),
+			path = path_child(self.path, StoreStep::Field(index)),
 			lend = |f: |&V| void| lend(|held: &P| read(held, f)),
 			modify = |f: |&mut V| void| modify(|held: &mut P| write(held, f)),
 			gate = flag_path(self.path, index),
@@ -1031,34 +1106,63 @@ export impl StoreSome<type P> {
 
 	/// This handle as a `Store<P>`, for a body that only runs while the variant is
 	/// live — `when_live`'s body (§2.6). Reads and writes go through the variant as
-	/// before. Should a reader run in the turn that ENDS the variant, before the
-	/// body is released — a derivation settles ahead of the effect that tears the
-	/// body down — it reads the LAST payload a read through the live variant saw
-	/// (B526, mirrored-store.md Q11: a message edited and then deleted repaints
-	/// nothing older than its edit), and a write then lands nowhere. Refuses a
-	/// variant that is not live now.
+	/// before, in place: a read copies nothing it does not return. Should a reader
+	/// run in the turn that ENDS the variant, before the body is released — a
+	/// derivation settles ahead of the effect that tears the body down — it reads
+	/// the payload as it stood when the variant ended (B526, mirrored-store.md Q11:
+	/// a message edited and then deleted repaints its edit, never the text the body
+	/// was built over), and a write then lands nowhere. Refuses a variant that is
+	/// not live now.
+	///
+	/// The fallback is taken by a KEEPER (B693): a feed on the variant's flag,
+	/// which copies the payload once, in the write that ends the variant, before it
+	/// lands. It goes with the ambient owner — the body's, under `when_live` —
+	/// through `on_cleanup`, so an owner is REQUIRED (B696): outside every owner
+	/// the keeper would stand for the store's life, and the call is refused at
+	/// compile time (`owner_scope` read without an enclosing `run`), as
+	/// `on_cleanup`'s is.
 	fun assume(self): Store<P> {
-		// The fallback is refreshed by every read that reaches the live payload, so
-		// it is the last value anyone read — every subscriber's wake is such a
-		// read. A binding the closure captures, not a cell (spec §6.9, M93's rule).
-		mut last = self.get();
-		if last.is_none() {
+		let lend = self.lend;
+		mut reached = false;
+		lend(|_payload: &P| {
+			reached = true;
+		});
+		if !reached {
 			panic("`StoreSome::assume` on a variant that is not live");
 		}
-		let lend = self.lend;
+		// The payload as it stood when the variant ended — copied by the keeper's
+		// `before` in the write that ends it, never on a read. A flag's feeds are
+		// told only when its variant comes or goes (`store_switch`, or an outer
+		// variant's `store_wake_all`), never by a write inside the payload, whose
+		// spine passes no flag. A binding the closures capture, not a cell (spec
+		// §6.9, M93's rule).
+		mut last: Option<P> = None;
+		let keeper = StoreFeed {
+			id = fresh_identity(),
+			touch = |_touch: StoreTouch| {},
+			before = || lend(|payload: &P| {
+				last = Some(*payload);
+			}),
+			after = || {},
+		};
+		let root = self.root;
+		let gate = self.gate;
+		attach_feed(root, gate, keeper);
+		on_cleanup(|| detach_feed(root, gate, keeper.id));
 		Store<P> {
 			root = self.root,
 			path = self.path,
 			lend = |f: |&P| void| {
-				mut reached = false;
+				mut live = false;
 				lend(|payload: &P| {
-					reached = true;
-					last = Some(*payload);
-					f(&payload);
+					live = true;
+					f(payload);
 				});
-				if !reached {
-					match last {
-						Some(let held) => f(&held),
+				if !live {
+					// Matched through `&` (the B689 form): natively the fallback is
+					// read where it is, not copied to destructure it.
+					match &last {
+						Some(let held) => f(held),
 						None => {},
 					}
 				}
@@ -1073,8 +1177,11 @@ export impl Store<Option<type P>> {
 	/// The `Some` payload, as a handle through it.
 	fun some(self): StoreSome<P> {
 		self.variant(1, |held: &Option<P>, f: |&P| void| {
-			match held {
-				Some(let payload) => f(&payload),
+			// In place too (B689): matched through `&`, the capture is a view into
+			// the payload, so the native backend reads it where it is rather than
+			// copying the whole `Option` to destructure it.
+			match &held {
+				Some(let payload) => f(payload),
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {
@@ -1097,8 +1204,11 @@ export impl Store<Option<type P>> {
 export impl StoreSome<Option<type P>> {
 	fun some(self): StoreSome<P> {
 		self.variant(1, |held: &Option<P>, f: |&P| void| {
-			match held {
-				Some(let payload) => f(&payload),
+			// In place too (B689): matched through `&`, the capture is a view into
+			// the payload, so the native backend reads it where it is rather than
+			// copying the whole `Option` to destructure it.
+			match &held {
+				Some(let payload) => f(payload),
 				None => {},
 			}
 		}, |held: &mut Option<P>, f: |&mut P| void| {

@@ -13,7 +13,7 @@ function unwrap_or(self, fallback) {
 	const $a = self;
 	let $b = null;
 	if ($a[0] === 0) {
-		const x = __clone($a[1]);
+		const x = $a[1];
 		$b = x;
 	} else {
 		$b = __clone(fallback);

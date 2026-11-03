@@ -67,6 +67,7 @@ import pkg::reactive::store_core::{
 	StoreNode,
 	WireWrite,
 	store_identity_at,
+	store_path_steps,
 	store_watch,
 	store_wire_attach,
 	store_wire_detach,
@@ -333,7 +334,7 @@ export fun reply_store<T: StoreWire>(request: RpcRequest, handle: Store<T>): Rpc
 		Some(let session) => {
 			let lend = handle.lend;
 			let mirror = mirror_channel(session, handle.root);
-			let base = mirror.grant(handle.path, walkers(lend));
+			let base = mirror.grant(store_path_steps(handle.path), walkers(lend));
 			let channel = mirror.channel;
 			RpcOutcome::Success(|mut serializer: Serializer| {
 				serializer.begin_list(3);
@@ -365,7 +366,7 @@ export fun reply_store_some<P: StoreWire>(request: RpcRequest, handle: StoreSome
 		Some(let session) => {
 			let lend = handle.lend;
 			let mirror = mirror_channel(session, handle.root);
-			let base = mirror.grant(handle.path, walkers(lend));
+			let base = mirror.grant(store_path_steps(handle.path), walkers(lend));
 			let channel = mirror.channel;
 			RpcOutcome::Success(|mut serializer: Serializer| {
 				serializer.begin_list(3);

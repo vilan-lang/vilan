@@ -1,6 +1,6 @@
 [package]
 name = "vilan-core"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -12,6 +12,18 @@ indexmap = { version = "2.14.0", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 sha2 = "0.10"
 toml = "0.8"
+
+# M185: `std::image`'s codec on node is a ~780 KB base64 wasm blob the emitter
+# writes into a bundle that reaches the module (`build.rs` embeds it). ON by
+# default — the `vilan` CLI is the compiler that builds node programs — and
+# OFF for the compilers that never emit one: the web playground (`vilan-wasm`,
+# which ships every byte of this crate to the visitor's browser) and the
+# editor (`vilan-ide`, `vilan-lsp`, which do not emit at all). A build without
+# it REFUSES a program that reaches the codec, naming this feature, rather
+# than emitting a bundle with no codec in it.
+[features]
+default = ["image-codec"]
+image-codec = []
 
 # G28: the build script hashes the crate's own sources (`BUILD_ID`).
 [build-dependencies]

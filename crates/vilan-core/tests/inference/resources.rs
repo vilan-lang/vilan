@@ -4413,8 +4413,10 @@ fn option_replace_rejects_a_read_of_the_value_it_was_handed() {
 }
 
 #[test]
-fn r10_refuses_a_native_map_of_a_resource() {
-    // B154, closed by the ruled fix. `NativeMap::insert` stores a bare
+fn r10_refuses_a_hash_table_of_a_resource() {
+    // B154, closed by the ruled fix (on the one-parameter raw table, which
+    // was `NativeMap<V>` until M191 renamed it `HashTable<V>` and gave the
+    // name to the two-parameter keyed table). `insert` stores a bare
     // `value: V` exactly as `replace` did, and the measured consequence was
     // worse: the caller destroyed the value at the insert statement while the
     // table went on holding it (`drop r` then `after`, host-side
@@ -4432,21 +4434,21 @@ fn r10_refuses_a_native_map_of_a_resource() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::js::native_map::NativeMap;
+        import std::js::hash_table::HashTable;
         import std::drop::Drop;
         [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
-            mut table: NativeMap<Res> = NativeMap::new();
+            mut table: HashTable<Res> = HashTable::new();
             print("built");
         }
         "#,
-        "`NativeMap` cannot hold the resource `Res`",
+        "`HashTable` cannot hold the resource `Res`",
     );
 }
 
 #[test]
-fn r10_refuses_the_measured_native_map_use_after_free() {
+fn r10_refuses_the_measured_hash_table_use_after_free() {
     // B154's actual program, the one that measured the defect: the insert
     // stores the resource in the table AND the widened temporary predicate
     // destroys it at that statement, so the table held a freed value (it
@@ -4455,34 +4457,34 @@ fn r10_refuses_the_measured_native_map_use_after_free() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::js::native_map::NativeMap;
+        import std::js::hash_table::HashTable;
         import std::hash::Hashable;
         import std::drop::Drop;
         [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
-            mut table: NativeMap<Res> = NativeMap::new();
+            mut table: HashTable<Res> = HashTable::new();
             let r = Res { tag = "r" };
             table.insert("k".hash(), r);
             print("after");
         }
         "#,
-        "`NativeMap` cannot hold the resource `Res`",
+        "`HashTable` cannot hold the resource `Res`",
     );
 }
 
 #[test]
-fn r10_admits_a_native_map_of_a_non_resource() {
-    // The green negative the head extension has to keep: `NativeMap` is only
+fn r10_admits_a_hash_table_of_a_non_resource() {
+    // The green negative the head extension has to keep: `HashTable` is only
     // refused AT a resource. The raw layer is still the thing `Map`/`Set` are
     // built on, and every one of their inserts goes through this.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::js::native_map::NativeMap;
+        import std::js::hash_table::HashTable;
         import std::hash::Hashable;
         fun main() {
-            mut table: NativeMap<str> = NativeMap::new();
+            mut table: HashTable<str> = HashTable::new();
             table.insert("k".hash(), "v");
             print(i"{table.len()}");
         }
@@ -4492,7 +4494,7 @@ fn r10_admits_a_native_map_of_a_non_resource() {
 }
 
 #[test]
-fn native_map_insert_loans_its_hash_key() {
+fn hash_table_insert_loans_its_hash_key() {
     // `insert(&mut self, key: Hash, value: V)` declares the KEY bare, and that
     // stays honest under B154's fix where `value` needed the head: a `Hash` is
     // a non-generic external struct nothing can declare `resource`, so no
@@ -4501,10 +4503,10 @@ fn native_map_insert_loans_its_hash_key() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::js::native_map::NativeMap;
+        import std::js::hash_table::HashTable;
         import std::hash::{ Hash, Hashable };
         fun main() {
-            mut table: NativeMap<str> = NativeMap::new();
+            mut table: HashTable<str> = HashTable::new();
             let key: Hash = "k".hash();
             table.insert(key, "v");
             print(i"{table.contains_key(key)}");
@@ -4514,9 +4516,27 @@ fn native_map_insert_loans_its_hash_key() {
     );
 }
 
+#[test]
+fn r10_refuses_a_native_map_of_a_resource() {
+    // M191: the two-parameter keyed table under `HashMap`/`HashSet` is a head of
+    // R10's list too — a resource as its key or its value is refused at it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::js::native_map::NativeMap;
+        [resource] struct Res { tag: str }
+        fun main() {
+            mut table: NativeMap<str, Res> = NativeMap::new();
+            print("built");
+        }
+        "#,
+        "`NativeMap` cannot hold the resource `Res`",
+    );
+}
+
 // --- B154's two-head shape: one mistake, one diagnostic ----------------------
 //
-// `Map<K, V>` stores a `NativeMap<(K, V)>` and `Set<T>` a `NativeMap<T>`, so
+// `Map<K, V>` stores a `NativeMap<K, V>` and `Set<T>` a `NativeMap<T, void>`, so
 // with the internal head in R10's rejecting list a `Map<str, Res>` offends at
 // BOTH heads. The public one is the mistake — it is the type the user wrote and
 // the only one they can fix — and the inner one is that refusal a layer in.
@@ -4553,7 +4573,7 @@ fn r10_set_of_a_resource_reports_once() {
 #[test]
 fn r10_map_construction_never_reports_the_native_map_inside_it() {
     // The constructing form, where `Map::new()`'s body binds the offending
-    // `NativeMap<(str, Res)>` under the substitution. The user's diagnostic is
+    // `NativeMap<str, Res>` under the substitution. The user's diagnostic is
     // about `Map`; the storage inside it is not a second thing to fix.
     assert_fails_without(
         r#"

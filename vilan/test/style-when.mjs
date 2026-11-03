@@ -11,11 +11,39 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_keys(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);
+	return out.map(__clone);
+}
+function __nmap_remove(table, hash) {
+	__nmap_settle(table);
+	table[0].delete(hash);
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
+}
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function __panic(message, location) {
 	const error = new Error(message);
@@ -31,30 +59,30 @@ function slot_of(key) {
 	const parts = key.split(":");
 	if (parts.length !== 3) {
 		(() => {
-			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:877:3");
+			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:1305:3");
 		})();
 	}
-	return [ __at(parts, 0, "std/src/web/style.vl:879:17"), __at(parts, 1, "std/src/web/style.vl:879:39"), __at(parts, 2, "std/src/web/style.vl:879:60") ];
+	return [ __at(parts, 0, "std/src/web/style.vl:1307:17"), __at(parts, 1, "std/src/web/style.vl:1307:39"), __at(parts, 2, "std/src/web/style.vl:1307:60") ];
 }
 function family_longhands(property) {
-	const $e = property;
-	let $f = null;
-	if ($e === "padding") {
-		$f = ";padding-top;padding-right;padding-bottom;padding-left;";
-	} else if ($e === "margin") {
-		$f = ";margin-top;margin-right;margin-bottom;margin-left;";
-	} else if ($e === "inset") {
-		$f = ";top;right;bottom;left;";
-	} else if ($e === "flex") {
-		$f = ";flex-grow;flex-shrink;flex-basis;";
-	} else if ($e === "background") {
-		$f = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
-	} else if ($e === "border") {
-		$f = border_longhands();
+	const $c = property;
+	let $d = null;
+	if ($c === "padding") {
+		$d = ";padding-top;padding-right;padding-bottom;padding-left;";
+	} else if ($c === "margin") {
+		$d = ";margin-top;margin-right;margin-bottom;margin-left;";
+	} else if ($c === "inset") {
+		$d = ";top;right;bottom;left;";
+	} else if ($c === "flex") {
+		$d = ";flex-grow;flex-shrink;flex-basis;";
+	} else if ($c === "background") {
+		$d = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
+	} else if ($c === "border") {
+		$d = border_longhands();
 	} else {
-		$f = "";
+		$d = "";
 	}
-	return $f;
+	return $d;
 }
 function border_longhands() {
 	let out = ";border-width;border-style;border-color;";
@@ -81,20 +109,20 @@ function without_covered(rules, media, condition, property) {
 	return out;
 }
 function when(self, condition, delta) {
-	let $g = null;
+	let $e = null;
 	if (condition) {
-		$g = add(self, delta);
+		$e = add(self, delta);
 	} else {
-		$g = __clone(self);
+		$e = __clone(self);
 	}
-	return $g;
+	return $e;
 }
 function class_list(self) {
 	let out = "";
 	for (const entry of values(self[0])) {
-		const $h = entry;
-		const class2 = $h[0];
-		const _declaration = $h[1];
+		const $f = entry;
+		const class2 = $f[0];
+		const _declaration = $f[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -106,18 +134,18 @@ function class_list(self) {
 function add(self, b) {
 	let rules = __clone(self[0]);
 	for (const key of keys(b[0])) {
-		const $c = get(b[0], key);
-		let $d = null;
-		if ($c[0] === 0) {
-			const entry = $c[1];
+		const $a = get(b[0], key);
+		let $b = null;
+		if ($a[0] === 0) {
+			const entry = $a[1];
 			const slot = slot_of(key);
 			rules = without_covered(rules, slot[0], slot[1], slot[2]);
 			insert(rules, key, entry);
-			$d = undefined;
+			$b = undefined;
 		} else {
-			$d = undefined;
+			$b = undefined;
 		}
-		$d;
+		$b;
 	}
 	return [ rules ];
 }
@@ -135,39 +163,23 @@ function built(is_chosen2, is_muted2) {
 	return class_list(out);
 }
 function keys(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
-	}
-	return result;
+	return __nmap_keys(self[0]);
 }
 function get(self, key) {
-	const $a = __map_get(self[0], hash(key));
-	let $b = null;
-	if ($a[0] === 0) {
-		const entry = $a[1];
-		$b = [ 0, __clone(entry.slice(1, 3)) ];
-	} else {
-		$b = [ 1 ];
-	}
-	return $b;
+	return __nmap_get(self[0], hash(key));
 }
 function remove(self, key) {
-	self[0].delete(hash(key));
+	__nmap_remove(self[0], hash(key));
 }
 function insert(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
 function values(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry.slice(1, 3)));
-	}
-	return result;
+	return __nmap_values(self[0]);
 }
-const base = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvp8", "padding:var(--space-2)" ] ], [ "::color", [ "::color", "s1hbuywq", "color:var(--gray-900)" ] ], [ "::background-color", [ "::background-color", "sdoeicu", "background-color:#ffffff" ] ] ]) ] ];
-const chosen = [ [ new Map([ [ "::color", [ "::color", "s1ip1dgv", "color:var(--blue-900)" ] ], [ "::background-color", [ "::background-color", "s1do7ev5", "background-color:var(--blue-100)" ] ] ]) ] ];
-const muted = [ [ new Map([ [ "::color", [ "::color", "s1hbr49h", "color:var(--gray-400)" ] ] ]) ] ];
+const base = [ [ [ new Map([ [ "::padding", [ "::padding", [ 0, [ "s1ufvp8", "padding:var(--space-2)" ] ] ] ], [ "::color", [ "::color", [ 0, [ "s1hbuywq", "color:var(--gray-900)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "sdoeicu", "background-color:#ffffff" ] ] ] ] ]), undefined ] ] ];
+const chosen = [ [ [ new Map([ [ "::color", [ "::color", [ 0, [ "s1ip1dgv", "color:var(--blue-900)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "s1do7ev5", "background-color:var(--blue-100)" ] ] ] ] ]), undefined ] ] ];
+const muted = [ [ [ new Map([ [ "::color", [ "::color", [ 0, [ "s1hbr49h", "color:var(--gray-400)" ] ] ] ] ]), undefined ] ] ];
 let cell = 0;
 while (cell < 4) {
 	const is_chosen = cell % 2 === 1;

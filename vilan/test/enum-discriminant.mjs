@@ -47,16 +47,15 @@ function __dbg_members(open, items, show, fill) {
 	}
 	return __dbg_group(open, "}", true, entries, fill);
 }
-function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {
-	const items = Array.from(table.values());
-	return __dbg_members(open, items, (pair) => {
-		const key = keyWidth === 1 ? pair[0] : pair.slice(0, keyWidth);
-		const value = valueWidth === 1 ? pair[keyWidth] : pair.slice(keyWidth, keyWidth + valueWidth);
-		return [ __dbg_flat(showKey(key)) + " => ", showValue(value) ];
-	});
+function __dbg_map(open, table, showKey, showValue) {
+	const items = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) items.push([ entry[0], entry[1][1] ]);
+	return __dbg_members(open, items, (entry) => [ __dbg_flat(showKey(entry[0])) + " => ", showValue(entry[1]) ]);
 }
 function __dbg_set(open, table, show, fill) {
-	return __dbg_members(open, Array.from(table.values()), (item) => [ "", show(item) ], fill);
+	const items = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) items.push(entry[0]);
+	return __dbg_members(open, items, (item) => [ "", show(item) ], fill);
 }
 function __dbg_str(text) {
 	let out = "\"";
@@ -67,6 +66,7 @@ function __dbg_str(text) {
 		else if (character === "\t") out += "\\t";
 		else if (character === "\r") out += "\\r";
 		else if (character === "\0") out += "\\0";
+		else if (character < " " || character === "\x7f") out += "\\u{" + character.charCodeAt(0).toString(16) + "}";
 		else out += character;
 	}
 	return out + "\"";

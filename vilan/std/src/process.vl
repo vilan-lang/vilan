@@ -178,11 +178,11 @@ export struct Keys {
 ///
 /// ```text
 /// let keys = process::keys();
-/// for {
-///     match keys.next() {
-///         Some(Key::Char("q")), Some(Key::Ctrl("c")), None => jump break,
-///         Some(Key::Up) => move_up(),
-///         Some(let other) => {}
+/// for key in keys {
+///     match key {
+///         Key::Char("q"), Key::Ctrl("c") => jump break,
+///         Key::Up => move_up(),
+///         let other => {}
 ///     }
 /// }
 /// ```

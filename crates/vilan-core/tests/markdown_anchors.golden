@@ -303,6 +303,7 @@ spec/names.md h1 spec-4--names-modules-and-packages
 spec/names.md h2 41-modules
 spec/names.md h2 42-the-three-namespaces
 spec/names.md h2 43-imports
+spec/names.md h3 431-what-an-import-means--the-elaboration
 spec/names.md h2 44-scopes-and-shadowing
 spec/names.md h2 45-type-position-vs-value-position
 spec/names.md h2 46-statics-and-members
@@ -365,6 +366,7 @@ std/collections.md h3 appending-a-run
 std/collections.md h3 joining
 std/collections.md h2 fixed-arrays-t-n
 std/collections.md h2 hashmapk-v
+std/collections.md h3 reading-and-writing-in-place
 std/collections.md h2 hashsett
 std/collections.md h2 memok-v
 std/collections.md h2 hashable
@@ -391,6 +393,12 @@ std/encoding.md h3 backed-enums-on-the-wire
 std/encoding.md h2 bytes
 std/encoding.md h2 binary-codec-stdbinary
 std/encoding.md h2 base64-stdbase64
+std/encoding.md h2 percent-encoding-stdurl
+std/image.md h1 images
+std/image.md h2 avatars-one-upload-three-sizes
+std/image.md h2 what-decode-does-for-you
+std/image.md h2 encoding
+std/image.md h2 cost-and-what-runs-it
 std/markdown.md h1 markdown
 std/markdown.md h2 parsing
 std/markdown.md h2 the-ast
@@ -482,6 +490,7 @@ std/rpc.md h2 keyed-cells-keyedcellk-t
 std/rpc.md h2 errors
 std/rpc.md h3 the-post-mountrpc-legs-statuses
 std/rpc.md h2 connection-state
+std/rpc.md h2 cancelling-a-dial-and-a-deadline
 std/rpc.md h2 transports
 std/rpc.md h2 server-plumbing-stdrpcserver-process-layer
 std/rpc.md h2 envelope--codec-layer
@@ -501,12 +510,15 @@ std/strings.md h2 str
 std/strings.md h3 case-the-full-pair-and-the-ascii-pair
 std/strings.md h3 locating-index_of-and-last_index_of
 std/strings.md h3 slicing-substring-refuses-it-does-not-correct
+std/strings.md h3 a-cut-inside-a-surrogate-pair
 std/strings.md h3 cutting-a-known-affix
 std/strings.md h2 display-user-facing-text
 std/strings.md h2 debug-developer-facing-text
 std/strings.md h2 into-conversions
 std/style.md h1 stdwebstyle-reference
 std/style.md h2 constructors-and-values
+std/style.md h3 lengths-are-data
+std/style.md h3 design-pixels-dp
 std/style.md h2 style-methods
 std/style.md h2 conditions
 std/style.md h3 the-condition-values

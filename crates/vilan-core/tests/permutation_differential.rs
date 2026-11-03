@@ -641,6 +641,7 @@ fn every_other_fixture_answers_the_same_under_every_permutation() {
         .chain(BOUND_FIXTURES)
         .chain(EFFECT_FIXTURES)
         .chain(WINDOW_FIXTURES)
+        .chain(RETAIN_FIXTURES)
     {
         divergences.extend(compare_fixture(fixture, &[]));
     }

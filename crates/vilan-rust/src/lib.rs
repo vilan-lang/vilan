@@ -146,6 +146,11 @@ pub struct OptionalCrates {
     /// `process::keys()`'s terminal mode — `vilan-rt-term` (`libc` /
     /// `windows-sys`; A173 S2). Reached by `keys()` and `Keys`'s `Drop`.
     pub term: bool,
+    /// `std::image` — `vilan-rt-image` (M185), the glue over `vilan-image`,
+    /// the codec core on the `image` crate. The core is a path dependency of
+    /// the glue and sits beside it in the cache too, so it is not named here:
+    /// the manifest names the crate the PROGRAM depends on.
+    pub image: bool,
 }
 
 impl OptionalCrates {
@@ -163,6 +168,9 @@ impl OptionalCrates {
         }
         if self.term {
             names.push("vilan-rt-term");
+        }
+        if self.image {
+            names.push("vilan-rt-image");
         }
         names
     }
@@ -221,6 +229,31 @@ mod dbg;
 /// functions, whose subject names the declaration. A generic resource
 /// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
 /// answer is per declaration, not per instantiation.
+/// F153: the `let` bindings that are the subject of a `for .. in` driven by a
+/// `next` member (`Program::for_each_next`) and whose declared type is a
+/// `[resource]`. Read off the declared type, before any substitution: a
+/// binding only a generic instance makes a resource is not in it, and its
+/// loop keeps the move ([`Emitter::for_each_borrows_its_subject`]).
+fn for_each_resource_subjects(program: &Program<'_>) -> HashSet<Id> {
+    let mut subjects = HashSet::new();
+    for for_each_id in program.for_each_next.keys() {
+        let Some(Expr::ForEach(iterable, _, _)) = program.entity_map.get(for_each_id) else {
+            continue;
+        };
+        let Some(Expr::Local(binding)) = program.entity_map.get(iterable) else {
+            continue;
+        };
+        if program
+            .variables
+            .get(binding)
+            .is_some_and(|variable| program.resource_types.contains(&variable.type_id))
+        {
+            subjects.insert(*binding);
+        }
+    }
+    subjects
+}
+
 fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, DropImpl> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
@@ -534,6 +567,11 @@ struct Emitter<'a, 'src> {
     /// `vilan-rt-term` (A173 S2) for raw mode. Set where `__term_enter` and
     /// `__term_leave` are lowered — the two doors the terminal mode has.
     reaches_term: bool,
+    /// Whether this program reaches `std::image` and so links
+    /// `vilan-rt-image` (M185). Set where one of the nine `__image_*` host
+    /// helpers is lowered and where `std::image::Image` is rendered — every
+    /// reach passes through one or the other.
+    reaches_image: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -602,6 +640,11 @@ struct Emitter<'a, 'src> {
     /// the ones rule 1's marking never reached, so the answer is computed here
     /// over the SAME bodies the emitter walks.
     last_uses: HashSet<Id>,
+    /// F153: the `let` bindings a `for x in <binding>` walks whose declared
+    /// type is a `[resource]` — the loop LOANS such a binding (the analyzer
+    /// drops it after the loop), so it is borrowed `&mut` and its `let` is
+    /// emitted `mut`. See [`Emitter::for_each_borrows_its_subject`].
+    for_each_resource_subjects: HashSet<Id>,
     /// F37: the FIELD reads (`record.live`) that are their field path's last
     /// use — [`Emitter::compute_liveness`]'s path-aware half.
     last_field_uses: HashSet<Id>,
@@ -769,6 +812,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_crypto: false,
             reaches_signal: false,
             reaches_term: false,
+            reaches_image: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -777,6 +821,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_adapted_bits: Vec::new(),
             current_instance: None,
             last_uses: HashSet::new(),
+            for_each_resource_subjects: for_each_resource_subjects(program),
             last_field_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
@@ -860,6 +905,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 crypto: self.reaches_crypto,
                 signal: self.reaches_signal,
                 term: self.reaches_term,
+                image: self.reaches_image,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -3081,16 +3127,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .cloned()
                     .unwrap_or_else(|| "()".to_string())
             )),
-            // The raw JS `Map` (`native_map.vl`), whose key type is FIXED as
-            // `Hash` rather than generic, so its one written argument is the
-            // VALUE. The arity is why this cannot share `List`'s shape: a
-            // `NativeMap<V>` is a `vilan_rt::Map<Hash, V>`.
-            "NativeMap" => Ok(format!(
+            // The raw one-parameter JS `Map` (`hash_table.vl`), whose key type
+            // is FIXED as `Hash` rather than generic, so its one written
+            // argument is the VALUE: a `HashTable<V>` is a
+            // `vilan_rt::Map<Hash, V>`.
+            "HashTable" => Ok(format!(
                 "vilan_rt::Map<vilan_rt::Hash, {}>",
                 rendered
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "()".to_string())
+            )),
+            // M191: the keyed table under `HashMap`/`HashSet` (`native_map.vl`)
+            // — keyed by `Hash`, the original key beside an `Option<V>` slot.
+            "NativeMap" => Ok(format!(
+                "vilan_rt::NativeMap<{}, {}>",
+                rendered
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "()".to_string()),
+                rendered.get(1).cloned().unwrap_or_else(|| "()".to_string())
             )),
             // F20: the opaque canonical key (`hash.vl`'s `external struct
             // Hash`). `vilan_rt::Hash` documents why it has four arms.
@@ -3165,6 +3221,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ if self.node_buffer_struct(id) => {
                 self.reaches_crypto = true;
                 Ok("vilan_rt_crypto::NodeBuffer".to_string())
+            }
+            // M185: `std::image::Image`, recognized by the helper that reads
+            // it (see [`Emitter::image_struct`]) — `Image` is too common a
+            // name for the name to be evidence.
+            _ if self.image_struct(id) => {
+                self.reaches_image = true;
+                Ok("vilan_rt_image::Image".to_string())
             }
             _ => {
                 let what = format!("the host type `{name}`");
@@ -3830,6 +3893,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // closure (it is hashable).
         if let Some((key, value)) = rendered
             .strip_prefix("vilan_rt::Map<")
+            .or_else(|| rendered.strip_prefix("vilan_rt::NativeMap<"))
             .and_then(|inner| inner.strip_suffix('>'))
             .and_then(split_at_the_top_level_comma)
         {
@@ -6246,6 +6310,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
         ) || self.is_a_view_call(id)
     }
 
+    /// F154: whether a string `match` subject is a BARE binding this backend
+    /// holds as a reference — a loaned parameter (a method's `self`), a `for e
+    /// in &mut` element, a payload view, a view-holding `let` — so `&*` over it
+    /// would stop at `&Rc<str>`. A subject already copied (rule 1's `.clone()`
+    /// for a binding leg) is a value, and so is every other subject: their
+    /// `&*` is unchanged.
+    fn matches_a_string_through_a_loan(&self, subject: Id, subject_text: &str) -> bool {
+        if subject_text.ends_with(".clone()") {
+            return false;
+        }
+        match self.program.entity_map.get(&subject) {
+            Some(Expr::Parameter(_)) => self.reads_a_loaned_parameter(subject),
+            Some(Expr::Local(binding)) => {
+                self.reads_a_loaned_parameter(subject)
+                    || self.program.for_each_views.contains_key(binding)
+                    || self.program.payload_view_captures.contains_key(binding)
+                    || self.binding_holds_a_view(*binding)
+            }
+            _ => false,
+        }
+    }
+
     /// F128: whether `*operand` reads a binding this backend holds as a
     /// VALUE, not a reference — so the `*` has nothing to cross. A parameter
     /// received by value (a bare one other than `self`, `own`, a closure's
@@ -6420,6 +6506,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// BEHIND it, and `&mut loan.field` already reborrows through the
     /// reference by Rust's own auto-deref.
     fn names_a_mutable_loan(&self, id: Id) -> bool {
+        // M191: a call to a `borrows` function handing back a `&mut` view
+        // (`map.slot(key)`) IS a `&mut` loan; `&mut` of it would borrow the
+        // temporary reference, which a hoisted place outlives.
+        if let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&id) {
+            return self
+                .program
+                .function_calls
+                .get(&call_id)
+                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => self.program.functions.get(target),
+                    _ => None,
+                })
+                .is_some_and(|function| function.returns_mut_view);
+        }
         let binding = match self.program.entity_map.get(&id) {
             Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
             _ => return false,
@@ -6718,6 +6818,32 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let mut prelude = String::new();
         let saved = std::mem::take(&mut self.hoisted);
+        // M191: a compound write through a VIEW-returning call —
+        // `counts.slot(word).get_or_insert(0) += 1` — finds its place ONCE: the
+        // view is bound by a `match` around the write and both halves name it.
+        // Walked twice, Rust evaluates the re-read (the value) before the place,
+        // so a key the call consumes was moved by the re-read and then read
+        // again by the place, and the call ran twice. A `match` rather than a
+        // `let` because its subject's temporaries live to its end: a receiver
+        // in a cell (a captured `mut` map) lends the view out of a `borrow_mut`
+        // that must outlive the write.
+        let (target_root, reread_root) = (self.place_root(target), self.place_root(reread));
+        let mut view_binding = None;
+        if self.is_a_view_call(target_root) && self.is_a_view_call(reread_root) {
+            let rendered = self.expression(target_root, depth);
+            match rendered {
+                Ok(view) => {
+                    let name = format!("__hoist{}", self.hoisted.len());
+                    self.hoisted.insert(target_root, name.clone());
+                    self.hoisted.insert(reread_root, name.clone());
+                    view_binding = Some((name, view));
+                }
+                Err(error) => {
+                    self.hoisted = saved;
+                    return Err(error);
+                }
+            }
+        }
         let paired = self.pair_places(target, reread, &mut prelude, depth);
         let expecting = self.type_of(target);
         let rendered = paired.and_then(|_| {
@@ -6727,6 +6853,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         });
         self.hoisted = saved;
         let (target_text, value_text) = rendered?;
+        if let Some((name, view)) = view_binding {
+            let write = self.finish_assignment(target, prelude, &target_text, &value_text);
+            return Ok(Some(format!("match {view} {{ {name} => {{ {write}; }} }}")));
+        }
         if prelude.is_empty() {
             return Ok(None);
         }
@@ -6736,6 +6866,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &target_text,
             &value_text,
         )))
+    }
+
+    /// The ROOT of a place spine — under every field, tuple slot, subscript
+    /// and dereference — which for `map.slot(k).get_or_insert((w, 0)).1` is the
+    /// view-returning call the spine reads through (M191).
+    fn place_root(&self, mut id: Id) -> Id {
+        loop {
+            match self.program.entity_map.get(&id) {
+                Some(
+                    &Expr::Field(subject, _, _)
+                    | &Expr::TupleIndex(subject, _, _)
+                    | &Expr::Index(subject, _)
+                    | &Expr::Dereference(subject),
+                ) => id = subject,
+                _ => return id,
+            }
+        }
     }
 
     /// An assignment's statement, its hoisted subscripts first: the prelude,
@@ -7280,7 +7427,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Err(unsupported("a `lazy` binding", self.span_of(binding)));
         }
         let name = self.binding_name(binding);
-        let mutable = if variable.mutable { "mut " } else { "" };
+        let mutable = if variable.mutable || self.for_each_resource_subjects.contains(&binding) {
+            "mut "
+        } else {
+            ""
+        };
         // An annotation is WRITTEN ONLY where the initializer cannot type the
         // binding — an empty collection literal, and a `Shared` cell built
         // around one (F74: `let leases: Shared<List<KeyLease>> =
@@ -8125,6 +8276,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     return Err(unsupported("a `const` value of an unresolved struct", span));
                 };
                 if declaration.external {
+                    if declaration.name == "NativeMap" {
+                        return self.const_native_map(items, &arguments, span);
+                    }
                     if declaration.name != "List" {
                         return Err(unsupported(
                             &format!("a `const` value of the host type `{}`", declaration.name),
@@ -8156,7 +8310,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .structs
                     .get(&struct_id)
                     .is_some_and(|declaration| {
-                        declaration.external && declaration.name == "NativeMap"
+                        declaration.external && declaration.name == "HashTable"
                     }) =>
             {
                 let element = arguments.first().copied();
@@ -8186,6 +8340,59 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             )),
         }
+    }
+
+    /// M191: a `NativeMap<K, V>` const is the JS pair `[ map, pending ]`, the
+    /// map each hash to its `[ key, slot ]` entry. Each held entry is inserted
+    /// under its hash; a tombstone (a `None` slot the const world left pending)
+    /// is the removal it would settle to.
+    fn const_native_map(
+        &mut self,
+        items: &[vilan_core::interpreter::ConstValue],
+        arguments: &[TypeId],
+        span: Span,
+    ) -> Result<String, Error> {
+        use vilan_core::interpreter::ConstValue;
+        let Some(ConstValue::Map(entries)) = items.first() else {
+            return Err(unsupported("a `const` table that is not a map", span));
+        };
+        let (key_type, value_type) = (arguments.first().copied(), arguments.get(1).copied());
+        let mut inserts = String::new();
+        for (hash, entry) in entries {
+            let hash = match hash {
+                ConstValue::Str(text) => {
+                    format!("vilan_rt::Hash::Text(vilan_rt::str_new({text:?}))")
+                }
+                ConstValue::Number(number) => {
+                    format!("vilan_rt::Hash::Number({number:?}f64)")
+                }
+                ConstValue::Bool(value) => format!("vilan_rt::Hash::Bool({value})"),
+                ConstValue::Null => "vilan_rt::Hash::Null".to_string(),
+                _ => return Err(unsupported("a `const` map keyed by a non-scalar", span)),
+            };
+            let ConstValue::Array(entry) = entry else {
+                return Err(unsupported(
+                    "a `const` table entry that is not a pair",
+                    span,
+                ));
+            };
+            let (Some(key), Some(ConstValue::Array(slot))) = (entry.first(), entry.get(1)) else {
+                return Err(unsupported(
+                    "a `const` table entry that is not a pair",
+                    span,
+                ));
+            };
+            let held = match (slot.first(), slot.get(1)) {
+                (Some(ConstValue::Number(tag)), Some(value)) if *tag == 0.0 => value,
+                _ => continue,
+            };
+            let key = self.const_value(key, key_type, span)?;
+            let value = self.const_value(held, value_type, span)?;
+            let _ = write!(inserts, "__table.insert({hash}, {key}, {value}); ");
+        }
+        Ok(format!(
+            "{{ let mut __table = vilan_rt::NativeMap::new(); {inserts}__table }}"
+        ))
     }
 
     /// F98: a `const` struct — its fields, in declaration order, are the
@@ -8834,7 +9041,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => false,
         });
         if matches_a_string {
-            subject_text = format!("&*({subject_text})");
+            subject_text = if self.matches_a_string_through_a_loan(subject, &subject_text) {
+                // F154: a binding held as a LOAN (`self` of a `str`-backed
+                // enum's method is a `&Rc<str>`: its synthesized `value()`,
+                // and any `match self` over its variants) — `&*` stops at
+                // `&Rc<str>`, which no `&str` literal matches (rustc E0308).
+                // `AsRef` reaches the `str` through either form, so a binding
+                // read as a loan that is a value after all still builds.
+                format!("AsRef::<str>::as_ref(&({subject_text}))")
+            } else {
+                format!("&*({subject_text})")
+            };
         }
         let pad = Self::indent(depth);
         let leg_pad = Self::indent(depth + 1);
@@ -9707,11 +9924,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 _ => false,
             });
         // F95: a `HashSet` iterates its members in INSERTION order on both
-        // backends — std stores each value beside its canonical hash in the
-        // set's `table`, and the JS backend's `__set_iter` walks that table's
-        // values. Natively the table is the runtime's insertion-ordered map,
-        // and `values()` is the walk: a copy of each member (rule 1's element
-        // copy), taken before the body runs, as JS's array iterator takes it.
+        // backends — std stores each value as a KEY of the set's `table`
+        // (M191), and the JS backend's `__set_iter` walks that table's keys.
+        // Natively the table is the runtime's insertion-ordered map, and
+        // `keys()` is the walk: a copy of each member (rule 1's element copy),
+        // taken before the body runs, as JS's array iterator takes it.
         if self.for_each_iterates_a_set(id) {
             let set_text = self.expression(iterable_place, depth)?;
             let binder = match item {
@@ -9722,7 +9939,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.emit_block(statements, tail, &mut body, depth + 1)?;
             let pad = Self::indent(depth);
             return Ok(format!(
-                "for {binder} in ({set_text}).table.values().into_iter() {{\n{body}{pad}}}"
+                "for {binder} in ({set_text}).table.keys().into_iter() {{\n{body}{pad}}}"
             ));
         }
         if iterates_something_else {
@@ -9800,6 +10017,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .is_some_and(|declaration| declaration.name == "HashSet"),
                 _ => false,
             })
+    }
+
+    /// F153: whether a `for .. in` over `iterable` borrows it rather than
+    /// moving it into the loop's iterator — an OWNED binding this frame holds
+    /// as a plain Rust place (a `let` in [`Emitter::for_each_resource_subjects`],
+    /// or a parameter received by value) whose type, under this instance, is a
+    /// `[resource]`. A loan, a view, a captured or boxed binding, a module
+    /// binding and every temporary keep the move.
+    fn for_each_borrows_its_subject(&self, iterable: Id) -> bool {
+        let binding = match self.program.entity_map.get(&iterable) {
+            Some(Expr::Local(binding)) => {
+                if !self.for_each_resource_subjects.contains(binding) {
+                    return false;
+                }
+                *binding
+            }
+            Some(Expr::Parameter(binding)) => *binding,
+            _ => return false,
+        };
+        !self.boxed.contains(&binding)
+            && !self.module_bindings.contains(&binding)
+            && self.moves_an_owned_resource(iterable)
     }
 
     fn for_each_iterator(
@@ -9890,6 +10129,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let next_step = step(format!("{next}(&mut {place_text}{context_arguments})"));
             return Ok(format!(
                 "while let Some({binder}) = {next_step} {{\n{body}{pad}}}"
+            ));
+        }
+        // F153: a `[resource]` PLACE the loop walks is LOANED to it — the
+        // analyzer drops the binding after the loop (`std::mem::drop(ticks)`),
+        // so a move into the iterator was a use after move (rustc E0382). The
+        // place is borrowed for the loop and every step reborrows it; a
+        // TEMPORARY subject (`for k in keys()`) still moves into the iterator.
+        if self.for_each_borrows_its_subject(iterable) {
+            let place_text = self.mutable_place(iterable, depth)?;
+            let binder = match item {
+                Some(item) => self.binding_name(item),
+                None => "_".to_string(),
+            };
+            let mut body = String::new();
+            self.emit_block(statements, tail, &mut body, depth + 2)?;
+            let pad = Self::indent(depth);
+            let inner = Self::indent(depth + 1);
+            let next_step = step(format!("{next}(iterator{context_arguments})"));
+            return Ok(format!(
+                "{{\n{inner}let iterator = &mut {place_text};\n\
+                 {inner}while let Some({binder}) = {next_step} {{\n{body}{inner}}}\n{pad}}}"
             ));
         }
         // The iterable is CONSUMED by the loop (the iterator is advanced), so a
@@ -10679,6 +10939,57 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     "vilan_rt::http::read_body(({request}).clone(), ({response}).clone(), {limit})"
                 )));
             }
+            // M176: the body as a stream — a future per piece, retained handles
+            // as `__http_read_body`'s.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_body_next",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let response = self.place_argument(argument_ids, 1, depth)?;
+                let limit = self.value_argument(argument_ids, 2, depth)?;
+                let size = self.value_argument(argument_ids, 3, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::body_next(({request}).clone(), ({response}).clone(), {limit}, \
+                     {size})"
+                )));
+            }
+            // M176: the one-way-of-reading claim, and the refusal `std::http`
+            // answers a fault with (M177's malformed form too).
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_claim_body",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let how = self.place_argument(argument_ids, 1, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::claim_body(&({request}), &{how})"
+                )));
+            }
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_refuse",
+            } => {
+                let request = self.place_argument(argument_ids, 0, depth)?;
+                let response = self.place_argument(argument_ids, 1, depth)?;
+                let status = self.value_argument(argument_ids, 2, depth)?;
+                let message = self.place_argument(argument_ids, 3, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::refuse(&({request}), &({response}), {status}, &{message})"
+                )));
+            }
+            // M177: the multipart delimiter search.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__http_find",
+            } => {
+                let haystack = self.place_argument(argument_ids, 0, depth)?;
+                let needle = self.place_argument(argument_ids, 1, depth)?;
+                let from = self.value_argument(argument_ids, 2, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::find_bytes(&({haystack}), &({needle}), {from})"
+                )));
+            }
             ExternBinding::Function {
                 module: None,
                 symbol: "__http_body_left_unread",
@@ -10687,20 +10998,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let limit = self.value_argument(argument_ids, 1, depth)?;
                 return Ok(Some(format!("({request}).body_left_unread({limit})")));
             }
-            // M164: one request's answer. The JS helper exists to keep a
-            // cancellation from reaching node unhandled; here the callback is
-            // already a spawned task, where a cancellation settles quietly, so
-            // the call IS the body's future (the call site awaits it).
+            // M164 + M179: one request's answer. The callback is already a
+            // spawned task, where a cancellation settles quietly; the runtime's
+            // `respond` answers a PANIC `500` (or cuts a started response off)
+            // and raises it on, so the task reports it once, as node's helper
+            // does (the call site awaits it).
             ExternBinding::Function {
                 module: None,
                 symbol: "__http_respond",
             } => {
-                return Ok(Some(self.pinned_body_argument(
-                    argument_ids,
-                    0,
-                    depth,
-                    span,
-                )?));
+                let response = self.place_argument(argument_ids, 0, depth)?;
+                let body = self.pinned_body_argument(argument_ids, 1, depth, span)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::respond(({response}).clone(), {body})"
+                )));
             }
             // `new TextDecoder()` / `new TextEncoder()` — both stateless for
             // the one encoding vilan has.
@@ -11562,7 +11873,121 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(rendered) = self.db_host_binding(name, binding, argument_ids, depth)? {
             return Ok(Some(rendered));
         }
+        if let Some(rendered) = self.image_host_binding(binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
         self.crypto_host_binding(target, name, binding, argument_ids, depth)
+    }
+
+    /// M185: `std::image`'s nine host helpers, each one call into
+    /// `vilan-rt-image` — the glue over `vilan-image`, the codec core the JS
+    /// backend runs as wasm — and each RECORDS the reach, so the generated
+    /// manifest names the crate.
+    ///
+    /// Keyed on the host symbol alone: every one is a `__image_`-prefixed name
+    /// only `std::image` declares (as [`Emitter::crypto_host_binding`]'s
+    /// helpers are). A picture or a byte buffer the runtime only READS is
+    /// passed by reference ([`Emitter::place_argument`]), so rule 1 owes no
+    /// copy for it; the counts are `usize` on both sides, and `Format` and
+    /// `Fit` arrive as the `i32` codes `image.vl` maps them to.
+    fn image_host_binding(
+        &mut self,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(ExternBinding::Function {
+            module: None,
+            symbol,
+        }) = binding
+        else {
+            return Ok(None);
+        };
+        let rendered = match *symbol {
+            "__image_decode" => format!(
+                "vilan_rt_image::decode(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            "__image_sniff" => format!(
+                "vilan_rt_image::sniff(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            "__image_from_rgba" => format!(
+                "vilan_rt_image::from_rgba({}, {}, &{})",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.place_argument(argument_ids, 2, depth)?
+            ),
+            "__image_width" => {
+                format!("({}).width()", self.place_argument(argument_ids, 0, depth)?)
+            }
+            "__image_height" => {
+                format!(
+                    "({}).height()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
+            "__image_rgba" => format!("({}).rgba()", self.place_argument(argument_ids, 0, depth)?),
+            "__image_resize" => format!(
+                "({}).resized({}, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
+            ),
+            "__image_crop" => format!(
+                "({}).cropped({}, {}, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?,
+                self.value_argument(argument_ids, 4, depth)?
+            ),
+            "__image_encode" => format!(
+                "({}).encode({}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            _ => return Ok(None),
+        };
+        self.reaches_image = true;
+        Ok(Some(rendered))
+    }
+
+    /// Whether an `external struct` is `std::image::Image` — decided by the
+    /// helper that READS it: the declared first parameter of a
+    /// `[extern("__image_width")]`. `Image` is a name a program may well give
+    /// a host class of its own (a DOM `HTMLImageElement`, say), so the name is
+    /// never read; [`Emitter::node_buffer_struct`] is the same rule.
+    fn image_struct(&self, struct_id: Id) -> bool {
+        if !self
+            .program
+            .structs
+            .get(&struct_id)
+            .is_some_and(|declaration| declaration.external)
+        {
+            return false;
+        }
+        self.program.external_functions.values().any(|external| {
+            matches!(
+                external.extern_binding,
+                Some(ExternBinding::Function {
+                    module: None,
+                    symbol: "__image_width",
+                })
+            ) && external
+                .parameters
+                .first()
+                .and_then(|first| self.program.parameters.get(first))
+                .is_some_and(|parameter| {
+                    matches!(
+                        self.resolve(parameter.type_id),
+                        Some(Type::Struct(id, _)) if *id == struct_id
+                    )
+                })
+        })
     }
 
     /// F40 (RULED (a)): the bindings `vilan-rt-crypto` answers — OS
@@ -11774,7 +12199,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.reaches_term = true;
                 Ok(Some("vilan_rt_term::leave()".to_string()))
             }
+            // M181: `std::url`'s percent-encoding pair, hand-written in
+            // `vilan_rt::url` to JavaScript's rules (the JS backend's
+            // `__percent_encode`/`__percent_decode` helpers).
+            (None, "__percent_encode", _) => Ok(Some(format!(
+                "vilan_rt::url::percent_encode(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ))),
+            (None, "__percent_decode", _) => Ok(Some(format!(
+                "vilan_rt::url::percent_decode(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ))),
             // A173 S1 / E?5: `prompt`'s unterminated, flushed write.
+            // B687: `std::http`'s declined-body instrument.
+            (None, "__http_refused_body_census", _) => {
+                Ok(Some("vilan_rt::http::refused_body_census()".to_string()))
+            }
             (None, "__stdout_write", _) => Ok(Some(format!(
                 "vilan_rt::process::stdout_write(&{})",
                 self.place_argument(argument_ids, 0, depth)?
@@ -12995,7 +13435,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F49: a `&` argument over a BOXED binding is a VIEW of its cell for
         // the call (see [`Emitter::cell_view_place`]), taken after every
         // by-value argument has been evaluated — the same hoist.
-        let views_allowed = !self.no_cell_views && self.views_its_arguments(target, callee_bits);
+        // M191: a callee that hands back a VIEW (`map.slot(key)`) of a receiver
+        // living in a cell keeps the cell's borrow for as long as the view
+        // lives, so its arguments cannot be settled in a block ahead of the
+        // borrow (F30/F49/F129): the block would drop the borrow the view is
+        // made of. They are evaluated in place instead, receiver first.
+        let returns_a_view = self
+            .program
+            .functions
+            .get(&target)
+            .is_some_and(|function| function.returns_view || function.returns_mut_view);
+        let views_allowed =
+            !self.no_cell_views && !returns_a_view && self.views_its_arguments(target, callee_bits);
         // F123: a std lookup that runs no user code (`HashSet::contains`,
         // `HashMap::get`/`contains_key` over a key whose `hash` is std's)
         // reads a `Shared` view's field receiver through the cell, as F114's
@@ -13030,7 +13481,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // where it stands (F135: spec §6.7).
         let defers_a_copy: Vec<bool> = (0..argument_ids.len())
             .map(|index| {
-                self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
+                !returns_a_view
+                    && self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
             })
             .collect();
         let defers_copies = defers_a_copy.contains(&true);
@@ -13049,8 +13501,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     })
                     .is_some()
         });
-        let borrows_a_cell =
-            borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies;
+        let borrows_a_cell = if returns_a_view {
+            borrows_a_read_place
+        } else {
+            borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies
+        };
         let mut deferred_copies = String::new();
         let mut view_borrows = String::new();
         let mut views = 0;
@@ -13176,12 +13631,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             // The receiver of a loaned `self` arrives as a place in the IR and
             // as a reference natively, so the `&`/`&mut` the source never wrote
-            // is synthesized here — unless the source DID write one.
+            // is synthesized here — unless the source DID write one, or the
+            // argument is a `borrows` call whose value already IS one (M191:
+            // `map.slot(key).is_some()` over a captured `map`, whose hoisted
+            // block would otherwise borrow the reference it answers).
             let already_a_reference = self
                 .program
                 .entity_map
                 .get(argument)
-                .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
+                .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)))
+                || self.is_a_view_call(*argument);
             // F129: the deferred copy is taken after every hoisted argument,
             // and a `&` argument that computes a value (`&mark(cell)`) is
             // settled in order with the by-value ones, ahead of it.
@@ -16194,6 +16653,47 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::MapNew => "vilan_rt::Map::new()".to_string(),
             Intrinsic::MapInsert => format!("{}.insert({}, {})", next(), next(), next()),
             Intrinsic::MapGet => format!("{}.get(&{}).cloned()", next(), next()),
+            // B689: the slot lent in place. The closure arrives as an
+            // `Rc<dyn Fn>`, which implements no `Fn` trait itself, so it is
+            // bound and CALLED inside the `FnOnce` the runtime takes — the
+            // `sort_by` comparator's shape. The key is bound first because
+            // Rust evaluates the receiver's borrow before the arguments.
+            // M191: `NativeMap<K, V>`, the keyed table under `HashMap`/`HashSet`.
+            Intrinsic::KeyedNew => "vilan_rt::NativeMap::new()".to_string(),
+            Intrinsic::KeyedInsert => {
+                format!("{}.insert({}, {}, {})", next(), next(), next(), next())
+            }
+            Intrinsic::KeyedGet => format!("{}.get(&{}).cloned()", next(), next()),
+            Intrinsic::KeyedKey => format!("{}.key(&{}).cloned()", next(), next()),
+            // The slot lent in place. The closure arrives as an `Rc<dyn Fn>`,
+            // which implements no `Fn` trait itself, so it is bound and CALLED
+            // inside the `FnOnce` the runtime takes — the `sort_by` comparator's
+            // shape. The key is bound first because Rust evaluates the
+            // receiver's borrow before the arguments.
+            Intrinsic::KeyedLend => {
+                let receiver = next();
+                let hash = next();
+                let read = next();
+                format!(
+                    "{{ let __hash = {hash}; let __read = {read}; \
+                     {receiver}.lend(&__hash, move |slot| __read(slot)) }}"
+                )
+            }
+            // A view (`&mut Option<V>`) of the table's own slot.
+            Intrinsic::KeyedSlot => {
+                format!("{}.slot({}, {})", next(), next(), next())
+            }
+            Intrinsic::KeyedContainsKey => format!("{}.contains_key(&{})", next(), next()),
+            Intrinsic::KeyedRemove => format!("{}.remove(&{})", next(), next()),
+            Intrinsic::KeyedLen => format!("{}.len()", next()),
+            Intrinsic::KeyedHashes => format!("{}.hashes()", next()),
+            Intrinsic::KeyedKeys => format!("{}.keys()", next()),
+            Intrinsic::KeyedValues => format!("{}.values()", next()),
+            // The payload of an option `get_or_insert` has just made `Some`.
+            Intrinsic::OptionSomeView => format!(
+                "match {} {{ Some(__payload) => __payload, None => unreachable!(\"some_view on None\") }}",
+                next()
+            ),
             Intrinsic::MapContainsKey => format!("{}.contains_key(&{})", next(), next()),
             Intrinsic::MapRemove => format!("{}.remove(&{})", next(), next()),
             Intrinsic::MapLen => format!("{}.len()", next()),
@@ -16582,6 +17082,24 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
     }
 }
 
+/// The packages a program reaching `std::image` builds at `opt-level = 3` in the
+/// dev profile (M185; see [`cargo_manifest`]): the core with its resampler, and
+/// the `image` crate's decoders, encoders and inflaters — every one in the
+/// graph `vilan-image` resolves to (a name outside it would be a cargo warning
+/// in every image build, which `cargo_manifest_names_only_packages_the_codec_graph_has`
+/// keeps from happening).
+pub const IMAGE_OPTIMIZED_PACKAGES: &[&str] = &[
+    "vilan-image",
+    "image",
+    "png",
+    "fdeflate",
+    "miniz_oxide",
+    "zune-jpeg",
+    "image-webp",
+    "gif",
+    "weezl",
+];
+
 /// The `Cargo.toml` of the project the backend writes, pointing at the runtime
 /// crate by path. `edition 2024` matches the workspace's own.
 pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) -> String {
@@ -16613,6 +17131,20 @@ pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) 
     } else {
         ""
     };
+    // M185, crypto's reason again: an unoptimized decoder and resampler are
+    // ten to fifty times slower (a 12-megapixel JPEG goes from a tenth of a
+    // second to several), so the codec core and the codec crates whose loops
+    // a decode, a resize and an encode spend their time in are optimized in
+    // the dev profile — named one by one, because `"*"` would optimize
+    // `vilan-rt` as well and cost every image program a slow runtime build.
+    let image_profile = if optional.image {
+        IMAGE_OPTIMIZED_PACKAGES
+            .iter()
+            .map(|package| format!("\n[profile.dev.package.{package}]\nopt-level = 3\n"))
+            .collect::<String>()
+    } else {
+        String::new()
+    };
     format!(
         "[package]\n\
          name = \"{name}\"\n\
@@ -16630,6 +17162,7 @@ pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) 
          [profile.release]\n\
          panic = \"unwind\"\n\
          {crypto_profile}\
+         {image_profile}\
          \n\
          [workspace]\n"
     )

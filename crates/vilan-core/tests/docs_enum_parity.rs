@@ -553,6 +553,12 @@ fn the_rpc_error_and_reject_listings_are_reached_by_the_gate() {
                 "Contract",
                 "Unauthorized",
                 "Unavailable",
+                // A179 (re-read, not silently updated): the dial's deadline
+                // and its cancellation. Both listings E159 named — the
+                // reference fence and the guide's counted sentence — were
+                // updated in the same change.
+                "Timeout",
+                "Cancelled",
             ],
         ),
         (

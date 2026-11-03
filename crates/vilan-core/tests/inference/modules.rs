@@ -2073,11 +2073,34 @@ fn element_event_arity_lowers_to_on_and_on_event_byte_for_byte() {
         fun beep() {}
         main();
         "#;
+    // E345: `View::child` is `[track_caller]`, so each call passes its own
+    // site — the element's head in one spelling, the `.child(` in the other.
+    // The places differ by construction and nothing else may: they are blanked
+    // before the bytes are compared.
     assert_eq!(
-        compile_browser(element).expect("the element program compiles"),
-        compile_browser(chain).expect("the chain program compiles"),
+        without_sites(&compile_browser(element).expect("the element program compiles")),
+        without_sites(&compile_browser(chain).expect("the chain program compiles")),
         "the element event lowering must emit the chain's exact JS"
     );
+}
+
+/// `js` with every `"test.vl:<line>:<column>"` location literal (a
+/// `[track_caller]` argument) written `"test.vl:_"`.
+fn without_sites(js: &str) -> String {
+    const SITE: &str = "\"test.vl:";
+    let mut out = String::with_capacity(js.len());
+    let mut rest = js;
+    while let Some(at) = rest.find(SITE) {
+        out.push_str(&rest[..at + SITE.len()]);
+        rest = &rest[at + SITE.len()..];
+        let digits = rest
+            .find(|character: char| !(character.is_ascii_digit() || character == ':'))
+            .unwrap_or(rest.len());
+        out.push('_');
+        rest = &rest[digits..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[test]
@@ -7260,15 +7283,18 @@ fn e142_an_aliased_import_resolves_to_the_item_it_renames() {
 // set, a re-export — answered "cannot find `rem` in the imported path". Both
 // rows read a type's self-less functions now, keyed by the module whose file
 // writes the `impl` block, so the enum shape and the struct shape are one rule.
+// (The rows read what a length RENDERS, `css_text()`: since A178 S1 a unit
+// length is its number and unit, and its `text` field is empty.)
 
 #[test]
 fn b317_a_types_static_imports_under_its_bare_name() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::web::style::CssValue;
         import std::web::style::Length::rem;
         fun main() {
-            print(rem(2f).text);
+            print(rem(2f).css_text());
         }
         "#,
         "2rem\n",
@@ -7283,10 +7309,11 @@ fn b317_a_brace_set_of_statics_imports_and_aliases() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::web::style::CssValue;
         import std::web::style::Length::{ px, auto as automatic };
         fun main() {
-            print(px(4f).text);
-            print(automatic().text);
+            print(px(4f).css_text());
+            print(automatic().css_text());
         }
         "#,
         "4px\nauto\n",
@@ -7301,12 +7328,13 @@ fn b317_use_binds_a_static_out_of_a_visible_type() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::web::style::CssValue;
         import std::web::style::Length;
         use Length::em;
         use Length::{ pct as percent };
         fun main() {
-            print(em(1f).text);
-            print(percent(50f).text);
+            print(em(1f).css_text());
+            print(percent(50f).css_text());
         }
         "#,
         "1em\n50%\n",
@@ -7409,13 +7437,16 @@ fn b317_a_missing_static_still_says_it_cannot_be_found() {
 // the recovery reported `found 'import' expected an expression` at column one
 // (probes P5/P5b/P5c/P10b, all four identical).
 
-/// A selector written outside a brace set is refused where it is written, with
-/// the braced spelling named.
+/// A181: a selector written with no module before it — at the head of the
+/// statement — is refused where it is written, with the bare spelling named.
+/// After a module path it is the one-selector form and parses
+/// (`a181_*` below).
 #[test]
-fn an_impl_selector_outside_a_brace_set_is_refused() {
+fn an_impl_selector_with_no_module_is_refused() {
     assert_fails_with(
-        "import pkg::a::(impl Thing);\n\nfun main() {}\n",
-        "an `impl` selector is a brace-set ELEMENT",
+        "import (impl Thing);\n\nfun main() {}\n",
+        "an `impl` selector takes implementations out of a MODULE, so a module path comes \
+         before it: write `import a::(impl T);`",
     );
 }
 
@@ -7429,6 +7460,11 @@ fn a_selector_writes_no_binders() {
     );
     assert_fails_with(
         "import pkg::a::{ (impl List<_: Display>) };\n\nfun main() {}\n",
+        "an `impl` selector writes no binders",
+    );
+    // A181: under a qualified, root-headed type too.
+    assert_fails_with(
+        "import pkg::a::(impl std::list::List<type T>);\n\nfun main() {}\n",
         "an `impl` selector writes no binders",
     );
 }
@@ -7818,6 +7854,563 @@ fn b515_a_trait_in_scope_is_accepted() {
             let c = 5.mine();
             let d = Point { x = 1 }.debug();
             let e = Display::to_string(8);
+        }
+        "#,
+    );
+}
+
+// --- A181: absolute selector subjects, the bare form, `(impl *)` ------------
+//
+// `import-foundation.md` §2 rows 9–11 and 26 (RULED 2026-11-03). The subject
+// of a selector is a TYPE PATH, and a type path's head may be a ROOT — `pkg`,
+// `std`, a dependency — at whatever position of the type it stands, resolved
+// as an import path's first segment is and independent of what the importing
+// file imported. Before A181 every one of these answered "`pkg` is a
+// namespace, not a value" at the subject.
+
+/// A library of blocks the A181 pins select from: a directory module
+/// `lib/overlay.vl` (so the root-headed descent crosses a directory child, as
+/// kolt's `pkg::lib::overlay::Overlay` does), a sibling `d.vl`, and one
+/// extension block per subject position in `blocks.vl`.
+const A181_OVERLAY: &str = "export struct Overlay {\n\tn: i32,\n}\n";
+const A181_D: &str = "export struct T {\n\tn: i32,\n}\n";
+const A181_BLOCKS: &str = "import pkg::lib::overlay::Overlay;\nimport pkg::d::T;\nimport std::web::style::Style;\n\n\
+     export impl Overlay {\n\tfun menu(self): i32 {\n\t\tself.n + 1\n\t}\n}\n\n\
+     export impl (Overlay, T) {\n\tfun pair(self): i32 {\n\t\tself.0.n + self.1.n\n\t}\n}\n\n\
+     export impl Option<T> {\n\tfun t_n(self): i32 {\n\t\tmatch self {\n\t\t\tSome(let t) => t.n,\n\t\t\tNone => 0,\n\t\t}\n\t}\n}\n\n\
+     export impl [Overlay; 2] {\n\tfun both(self): i32 {\n\t\tself[0].n + self[1].n\n\t}\n}\n\n\
+     export impl Style {\n\tfun ghosted(self): Style {\n\t\tself\n\t}\n}\n";
+
+/// Runs `main.vl` = `imports` + `body` against the A181 library.
+fn a181_run(imports: &str, body: &str) -> Result<String, Vec<String>> {
+    let main = format!("{imports}\nfun main() {{\n{body}\n}}\nmain();\n");
+    compile_and_run_package(
+        &[
+            ("lib/overlay.vl", A181_OVERLAY),
+            ("d.vl", A181_D),
+            ("blocks.vl", A181_BLOCKS),
+            ("main.vl", &main),
+        ],
+        "main.vl",
+    )
+    .map(|(_, stdout)| stdout)
+}
+
+/// The WHOLE subject is a root-headed path, in the bare one-selector form —
+/// E359's quick-fix spelling — and the file imports nothing from `lib` but the
+/// type it constructs.
+#[test]
+fn a181_an_absolute_whole_subject_selects_its_block() {
+    let stdout = a181_run(
+        "import pkg::lib::overlay::Overlay;\nimport pkg::blocks::(impl pkg::lib::overlay::Overlay);\n",
+        "\tprint(Overlay { n = 1 }.menu());",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(stdout, "2\n");
+}
+
+/// A root head in each TUPLE element.
+#[test]
+fn a181_an_absolute_path_in_a_tuple_element_selects_its_block() {
+    let stdout = a181_run(
+        "import pkg::lib::overlay::Overlay;\nimport pkg::d::T;\n\
+         import pkg::blocks::(impl (pkg::lib::overlay::Overlay, pkg::d::T));\n",
+        "\tprint((Overlay { n = 1 }, T { n = 2 }).pair());",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(stdout, "3\n");
+}
+
+/// A root head in a GENERIC ARGUMENT — and the `d` module is never imported
+/// whole, only the type.
+#[test]
+fn a181_an_absolute_path_in_a_generic_argument_selects_its_block() {
+    let stdout = a181_run(
+        "import pkg::d::T;\nimport pkg::blocks::(impl Option<pkg::d::T>);\n",
+        "\tprint(Some(T { n = 7 }).t_n());",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(stdout, "7\n");
+}
+
+/// A root head in an ARRAY element.
+#[test]
+fn a181_an_absolute_path_in_an_array_element_selects_its_block() {
+    let stdout = a181_run(
+        "import pkg::lib::overlay::Overlay;\nimport pkg::blocks::(impl [pkg::lib::overlay::Overlay; 2]);\n",
+        "\tlet pair: [Overlay; 2] = [Overlay { n = 1 }, Overlay { n = 2 }];\n\tprint(pair.both());",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(stdout, "3\n");
+}
+
+/// A `std` root head: the selector names std's `Style` though the file never
+/// imports `std::web::style::Style` itself.
+#[test]
+fn a181_a_std_rooted_subject_selects_its_block() {
+    assert_eq!(
+        a181_run(
+            "import std::web::style::style;\nimport pkg::blocks::(impl std::web::style::Style);\n",
+            "\tlet ghost = style().ghosted();\n\tprint(\"ok\");",
+        )
+        .unwrap_or_else(|errors| panic!("{errors:?}")),
+        "ok\n"
+    );
+}
+
+/// A root head in a CLOSURE type resolves (no "`pkg` is a namespace" at the
+/// subject): the absolute and the bare-name spellings of one closure subject
+/// answer identically. (Neither selects a block — a closure-typed subject
+/// does not unify with an `impl List<|T| U>` block under either spelling,
+/// which is the selector's unification and not the path's.)
+#[test]
+fn a181_an_absolute_path_in_a_closure_type_resolves_as_the_bare_name_does() {
+    let diagnostics = |subject: &str| {
+        let main = format!(
+            "import pkg::lib::overlay::Overlay;\nimport pkg::blocks::(impl List<{subject}>);\n\nfun main() {{}}\nmain();\n"
+        );
+        analyze_package(
+            &[
+                ("lib/overlay.vl", A181_OVERLAY),
+                ("d.vl", A181_D),
+                ("blocks.vl", A181_BLOCKS),
+                ("main.vl", &main),
+            ],
+            "main.vl",
+        )
+        .diagnostics
+        .into_iter()
+        .map(|(message, ..)| message.replace("pkg::lib::overlay::Overlay", "Overlay"))
+        .collect::<Vec<_>>()
+    };
+    let absolute = diagnostics("|pkg::lib::overlay::Overlay| i32");
+    assert!(
+        !absolute
+            .iter()
+            .any(|message| message.contains("is a namespace, not a value")),
+        "{absolute:?}"
+    );
+    assert_eq!(absolute, diagnostics("|Overlay| i32"));
+}
+
+/// The absolute subject is a real TYPE: it selects its own block and no other,
+/// so a call on a block it does not name is refused naming the selector —
+/// a root-headed path that stopped resolving would read as a hole and admit
+/// everything.
+#[test]
+fn a181_an_absolute_subject_admits_only_its_own_block() {
+    let errors = a181_run(
+        "import pkg::lib::overlay::Overlay;\nimport pkg::blocks::(impl pkg::d::T);\n",
+        "\tprint(Overlay { n = 1 }.menu());",
+    )
+    .expect_err("`(impl pkg::d::T)` does not admit `impl Overlay`");
+    assert!(
+        errors.iter().any(
+            |error| error.contains("this file's selector `(impl pkg::d::T)` does not admit it")
+        ),
+        "{errors:?}"
+    );
+}
+
+/// The two rules A181 leaves alone: a BARE name resolves in the importing
+/// file's scope (kolt's `(impl Overlay)`, `(impl bool with Display)` — here a
+/// trait of the package's own, std's `Display` already implementing `bool`), and a
+/// MODULE-QUALIFIED one through a module the file imported. The braced and
+/// bare spellings of one selector admit the same.
+#[test]
+fn a181_the_bare_name_and_module_qualified_subjects_are_unchanged() {
+    for imports in [
+        "import pkg::lib::overlay::Overlay;\nimport pkg::blocks::{ (impl Overlay) };\n",
+        "import pkg::lib::overlay::Overlay;\nimport pkg::blocks::(impl Overlay);\n",
+        "import pkg::lib::overlay;\nimport pkg::lib::overlay::Overlay;\nimport pkg::blocks::(impl overlay::Overlay);\n",
+    ] {
+        assert_eq!(
+            a181_run(imports, "\tprint(Overlay { n = 1 }.menu());")
+                .unwrap_or_else(|errors| panic!("{imports}: {errors:?}")),
+            "2\n",
+            "{imports}"
+        );
+    }
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "said.vl",
+                "export trait Said {\n\tfun said(self): str;\n}\n",
+            ),
+            (
+                "shown.vl",
+                "import pkg::said::Said;\n\nexport impl bool with Said {\n\tfun said(self): str {\n\t\tif self { \"yes\" } else { \"no\" }\n\t}\n}\n",
+            ),
+            (
+                "main.vl",
+                "import pkg::said::Said;\nimport pkg::shown::(impl bool with Said);\n\nfun main() {\n\tprint(true.said());\n}\nmain();\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(stdout, "yes\n");
+}
+
+/// `(impl *)` admits every block the module declares, bare or in a set; the
+/// retired `(impl _)` is READ as `(impl *)` this release — the program's one
+/// diagnostic is the steer, at the `_`, carrying the fix (Q6: refused from
+/// the next release).
+#[test]
+fn a181_the_star_admits_every_block_and_the_underscore_is_steered() {
+    for imports in [
+        "import pkg::lib::overlay::Overlay;\nimport pkg::d::T;\nimport pkg::blocks::(impl *);\n",
+        "import pkg::lib::overlay::Overlay;\nimport pkg::d::T;\nimport pkg::blocks::{ (impl *) };\n",
+    ] {
+        assert_eq!(
+            a181_run(
+                imports,
+                "\tprint(Overlay { n = 1 }.menu() + (Overlay { n = 1 }, T { n = 2 }).pair());"
+            )
+            .unwrap_or_else(|errors| panic!("{imports}: {errors:?}")),
+            "5\n"
+        );
+    }
+    let main = "import pkg::lib::overlay::Overlay;\nimport pkg::d::T;\nimport pkg::blocks::{ (impl _) };\n\n\
+                fun main() {\n\tprint(Overlay { n = 1 }.menu() + (Overlay { n = 1 }, T { n = 2 }).pair());\n}\nmain();\n";
+    let outcome = analyze_package(
+        &[
+            ("lib/overlay.vl", A181_OVERLAY),
+            ("d.vl", A181_D),
+            ("blocks.vl", A181_BLOCKS),
+            ("main.vl", main),
+        ],
+        "main.vl",
+    );
+    let messages: Vec<&str> = outcome
+        .diagnostics
+        .iter()
+        .map(|(message, ..)| message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "a selector that takes every block is written `(impl *)`: `*` is EVERYTHING, a set \
+          (`export *;`, `::*`), and `_` is a hole inside a type (`(impl List<_>)`). `(impl _)` is \
+          read as `(impl *)` in this release and refused in the next; `vilan fmt` rewrites it"
+        ],
+        "read as `(impl *)`: the steer and nothing else"
+    );
+    let (_, span, file) = &outcome.diagnostics[0];
+    assert_eq!(&main[span.clone()], "_");
+    assert_eq!(file.as_deref(), Some("main.vl"));
+}
+
+/// Q3 (RULED): `self` and `super` are the file's own module and its parent,
+/// so an import aliasing either is refused at the alias — once, and only that.
+#[test]
+fn a181_an_import_aliased_self_or_super_is_refused() {
+    for (alias, message) in [
+        (
+            "self",
+            "`self` is reserved: `self` names this file's own module",
+        ),
+        (
+            "super",
+            "`super` is reserved: `self` names this file's own module",
+        ),
+    ] {
+        let source = format!("import std::io::print as {alias};\n\nfun main() {{}}\n");
+        assert_fails_once_with(&source, message);
+        assert_fails_spanning(&source, alias, "and neither can be rebound by an import");
+    }
+    assert_compiles("import std::io::print as show;\n\nfun main() {\n    show(\"x\");\n}\n");
+}
+
+// --- B688: an extension block's methods need its module in scope ------------
+//
+// An INHERENT member of an `impl` written outside its subject's module —
+// `std::display`'s `impl List<type T: Display> { fun join }` — is a trait with
+// no name, and B515's rule had never asked it: once ANY file of the build
+// loaded the block's module, the method resolved in every file, and a build of
+// the same file alone refused it. The file must reach the block's module.
+
+const B688_WORDS: &str =
+    "export fun joined(list: List<str>): str {\n\tlist.map(|each| each).join(\", \")\n}\n";
+
+const B688_OTHER: &str = "import std::display::Display;\n\nexport fun listed(list: List<str>): str {\n\tlist.join(\"; \")\n}\n";
+
+/// B688's three-file repro: `words.vl` leans on `other.vl`'s import of
+/// `std::display`. Refused in the build that holds `other.vl`, at `join`, in
+/// `words.vl`, naming the module and the import — as the build without
+/// `other.vl` refuses it (there with the "no method" steer, the block never
+/// having loaded). Either way the file is wrong on its own, and says so.
+#[test]
+fn b688_the_items_three_file_repro_is_refused_in_the_build_as_alone() {
+    let wide = analyze_package(
+        &[
+            ("words.vl", B688_WORDS),
+            ("other.vl", B688_OTHER),
+            (
+                "main.vl",
+                "import pkg::other::listed;\nimport pkg::words::joined;\n\nfun main() {\n\tprint(listed([\"x\"]));\n\tprint(joined([\"a\", \"b\"]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    );
+    let refusal = wide
+        .diagnostics
+        .iter()
+        .find(|(message, ..)| message.contains("`join` comes from the"))
+        .unwrap_or_else(|| panic!("the wide build refuses `join`: {:?}", wide.diagnostics));
+    assert_eq!(refusal.2.as_deref(), Some("words.vl"));
+    assert_eq!(&B688_WORDS[refusal.1.clone()], "join");
+    assert!(
+        refusal.0.contains(
+            "block in `std::display`, which extends a type declared elsewhere, and this file \
+             does not import `std::display` or a name from it"
+        ) && refusal
+            .0
+            .ends_with("Import it (`import std::display::Display;`)"),
+        "{}",
+        refusal.0
+    );
+    assert_eq!(
+        vilan_core::analyzer::trait_scope_import(&refusal.0),
+        Some("import std::display::Display;"),
+        "the editor's quick fix reads the import back"
+    );
+    let narrow = analyze_package(
+        &[
+            ("words.vl", B688_WORDS),
+            (
+                "main.vl",
+                "import pkg::words::joined;\n\nfun main() {\n\tprint(joined([\"a\", \"b\"]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    );
+    assert!(
+        narrow
+            .diagnostics
+            .iter()
+            .any(|(message, ..)| message
+                .contains("has no method 'join'; import std::display::Display")),
+        "the narrow build refuses it too: {:?}",
+        narrow.diagnostics
+    );
+}
+
+/// The fix the refusal names: `words.vl` imports from the block's module (the
+/// trait the block's bound names), and the wide build runs.
+#[test]
+fn b688_a_file_that_imports_the_blocks_module_resolves() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "words.vl",
+                &format!("import std::display::Display;\n\n{B688_WORDS}"),
+            ),
+            ("other.vl", B688_OTHER),
+            (
+                "main.vl",
+                "import pkg::other::listed;\nimport pkg::words::joined;\n\nfun main() {\n\tprint(listed([\"x\"]));\n\tprint(joined([\"a\", \"b\"]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("the file that imports the block's module resolves");
+    assert_eq!(stdout, "x\na, b\n");
+}
+
+/// The prelude admits what it binds, with no import written: the base
+/// prelude's `Option` reaches `option.vl`, whose `impl List<type T>`
+/// answers `get`, and its `Iterator` answers `map`'s trait members — in a
+/// MODULE, where B688 asks. A block of a std module every program loads
+/// (`compare.vl`'s `contains`) is `List`'s own wherever it is called.
+#[test]
+fn b688_the_prelude_and_the_always_loaded_core_still_admit() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "lists.vl",
+                "export fun probe(list: List<i32>): i32 {\n\tlet first = list.get(0).unwrap_or(0);\n\tlet doubled = list.iter().map(|each| each * 2).to_list();\n\tif list.contains(3) {\n\t\tfirst + doubled[1]\n\t} else {\n\t\t0\n\t}\n}\n",
+            ),
+            (
+                "main.vl",
+                "import pkg::lists::probe;\n\nfun main() {\n\tprint(probe([1, 2, 3]));\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("the prelude and the core admit their blocks");
+    assert_eq!(stdout, "5\n");
+}
+
+/// A DERIVED block's file is its attribute's (B354): `[derive(Debug)]` on
+/// `Point` in `shapes.vl` writes `impl Point with Debug` there, and a file
+/// that imports `Point` reaches it — `debug` is not refused though the file
+/// never names `Debug`. And a block written beside one of its subject's
+/// ARGUMENTS (`impl Box<Point>` in `shapes.vl`, the shape `[derive(Store)]`
+/// writes as `impl RemoteStore<AccountState>`) is that type's own surface.
+#[test]
+fn b688_a_derived_block_and_a_block_beside_its_argument_type_are_reached() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "boxes.vl",
+                "export struct Box<T> {\n\tvalue: T,\n}\n",
+            ),
+            (
+                "shapes.vl",
+                "import std::debug::Debug;\nimport pkg::boxes::Box;\n\n[derive(Debug)]\nexport struct Point {\n\tx: i32,\n}\n\nexport impl Box<Point> {\n\tfun x_of(self): i32 {\n\t\tself.value.x\n\t}\n}\n",
+            ),
+            (
+                "user.vl",
+                "import pkg::boxes::Box;\nimport pkg::shapes::Point;\n\nexport fun show(): str {\n\tlet boxed = Box { value = Point { x = 4 } };\n\tlet point = Point { x = 1 };\n\ti\"{point.debug()} {boxed.x_of()}\"\n}\n",
+            ),
+            (
+                "main.vl",
+                "import pkg::user::show;\n\nfun main() {\n\tprint(show());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("a derived block and an argument-type block are reached");
+    assert_eq!(stdout, "Point { x = 1 } 4\n");
+}
+
+/// A program's own extension block: `extra.vl` extends `Thing` (declared in
+/// `thing.vl`). A file that imports `Thing` alone is refused at `bump`, naming
+/// `pkg::extra` and the selector that admits the block (E359:
+/// `import pkg::extra::(impl pkg::thing::Thing);`, the subject spelled
+/// absolutely — no longer `extra`'s first declaration, which read as an
+/// unrelated import); importing from `extra` — by the fix's own line, by a name, or
+/// by a selector-only statement, or by a statement written inside the
+/// function body — resolves.
+#[test]
+fn b688_a_programs_own_extension_block_needs_its_module() {
+    let thing = "export struct Thing {\n\tn: i32,\n}\n";
+    let extra = "import pkg::thing::Thing;\n\nexport impl Thing {\n\tfun bump(self): i32 {\n\t\tself.n + 1\n\t}\n}\n\nexport fun helper(): i32 {\n\t8\n}\n";
+    let main = "import pkg::user::run;\nimport pkg::extra::helper;\n\nfun main() {\n\tprint(run() + helper());\n}\n";
+    let refused = analyze_package(
+        &[
+            ("thing.vl", thing),
+            ("extra.vl", extra),
+            (
+                "user.vl",
+                "import pkg::thing::Thing;\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+            ),
+            ("main.vl", main),
+        ],
+        "main.vl",
+    );
+    assert!(
+        refused.diagnostics.iter().any(|(message, _, file)| {
+            file.as_deref() == Some("user.vl")
+                && message.contains("`bump` comes from the `impl Thing` block in `pkg::extra`")
+                && message.ends_with("Import it (`import pkg::extra::(impl pkg::thing::Thing);`)")
+        }),
+        "{:?}",
+        refused.diagnostics
+    );
+    for user in [
+        "import pkg::thing::Thing;\nimport pkg::extra::helper;\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+        "import pkg::thing::Thing;\nimport pkg::extra::{ (impl Thing) };\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+        // E359: the quick fix's own line, verbatim — a file that imports
+        // nothing from `extra` but the block.
+        "import pkg::thing::Thing;\nimport pkg::extra::(impl pkg::thing::Thing);\n\nexport fun run(): i32 {\n\tThing { n = 1 }.bump()\n}\n",
+        "import pkg::thing::Thing;\n\nexport fun run(): i32 {\n\timport pkg::extra::helper;\n\tThing { n = 1 }.bump()\n}\n",
+    ] {
+        let (_, stdout) = compile_and_run_package(
+            &[
+                ("thing.vl", thing),
+                ("extra.vl", extra),
+                ("user.vl", user),
+                ("main.vl", main),
+            ],
+            "main.vl",
+        )
+        .unwrap_or_else(|errors| panic!("{user}: {errors:?}"));
+        assert_eq!(stdout, "10\n");
+    }
+}
+
+/// E359 (A181 Q7): the quick fix for a block in a USER module extending a
+/// STD type — kolt's `pkg::styles` writing `impl Style { fun ghost }` — spells
+/// the selector with std's absolute path, and the editor reads that line back
+/// as the fix; applied verbatim, the file compiles and runs. A generic
+/// subject's binder is the hole `_`, inside the type.
+#[test]
+fn e359_the_quick_fix_spells_the_block_absolutely_and_compiles() {
+    let styles = "import std::web::style::Style;\n\nexport impl Style {\n\tfun ghost(self): Style {\n\t\tself\n\t}\n}\n\n\
+                  export impl List<type T> {\n\tfun second(self): Option<T> {\n\t\tself.get(1)\n\t}\n}\n\n\
+                  export fun unrelated(): i32 {\n\t1\n}\n";
+    let user = |imports: &str| {
+        format!(
+            "import std::web::style::style;\n{imports}\nexport fun run(): i32 {{\n\tlet ghost = style().ghost();\n\t[1, 2].second().unwrap_or(0)\n}}\n"
+        )
+    };
+    // `other.vl` imports `pkg::styles`, so its blocks LOAD in this build —
+    // B688's shape — and `user.vl` leans on that.
+    let other = "import pkg::styles::unrelated;\n\nexport fun one(): i32 {\n\tunrelated()\n}\n";
+    let main = "import pkg::other::one;\nimport pkg::user::run;\n\nfun main() {\n\tprint(run() + one());\n}\nmain();\n";
+    let refused = analyze_package(
+        &[
+            ("styles.vl", styles),
+            ("other.vl", other),
+            ("user.vl", &user("")),
+            ("main.vl", main),
+        ],
+        "main.vl",
+    );
+    let fixes: Vec<&str> = refused
+        .diagnostics
+        .iter()
+        .filter(|(_, _, file)| file.as_deref() == Some("user.vl"))
+        .filter_map(|(message, ..)| vilan_core::analyzer::trait_scope_import(message))
+        .collect();
+    assert_eq!(
+        fixes,
+        [
+            "import pkg::styles::(impl std::web::style::Style);",
+            "import pkg::styles::(impl std::list::List<_>);",
+        ],
+        "{:?}",
+        refused.diagnostics
+    );
+    assert!(
+        refused.diagnostics.iter().any(|(message, ..)| message
+            .starts_with("`ghost` comes from the `impl Style` block in `pkg::styles`")),
+        "the sentence names the block: {:?}",
+        refused.diagnostics
+    );
+    let fixed = user(&format!("{}\n", fixes.join("\n")));
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("styles.vl", styles),
+            ("other.vl", other),
+            ("user.vl", &fixed),
+            ("main.vl", main),
+        ],
+        "main.vl",
+    )
+    .unwrap_or_else(|errors| panic!("{fixed}: {errors:?}"));
+    assert_eq!(stdout, "3\n");
+}
+
+/// B688's reach reads every import statement of the file, wherever it is
+/// written: a TRAIT imported inside a function body brings its methods in
+/// scope there (B535 refused it as no import at all — std's macro bodies
+/// import `macro_std` that way).
+#[test]
+fn b688_a_trait_imported_inside_a_function_body_is_in_scope() {
+    assert_compiles(
+        r#"
+        import std::markdown;
+
+        fun shown(): str {
+            import std::display::Display;
+            42.to_string()
+        }
+
+        fun main() {
+            print(shown());
         }
         "#,
     );
@@ -8390,4 +8983,94 @@ fn s4_a_named_length_crosses_an_import() {
         emitted.is_ok(),
         "a named length must cross an import: {emitted:?}"
     );
+}
+
+// --- E360: a path through an imported FUNCTION ------------------------------
+//
+// `import pkg::editor::editor;` then `editor::reader(..)`: the head names the
+// function, not the module of the same name, and nothing said so — the access
+// stayed unresolved and only its cascade printed ("could not be resolved" at
+// the binding, the enclosing call and a later `print`), in kolt pointing at a
+// closure several lines below.
+
+const E360_EDITOR: &str = "export *;\n\nfun editor(text: str): str {\n\ti\"editing {text}\"\n}\n\nfun reader(text: str): str {\n\ti\"reading {text}\"\n}\n";
+
+const E360_MAIN: &str = "import pkg::editor::editor;\n\nfun row(body: str, on_menu: |str| void): str {\n\ton_menu(body);\n\tbody\n}\n\nfun main() {\n\tlet shown = row(editor::reader(\"hello\"), |event| {\n\t\tprint(event);\n\t});\n\tprint(shown);\n}\n";
+
+/// The item's repro: ONE diagnostic, at the path, naming the function and both
+/// imports that make the path's intent work — and none of the cascade.
+#[test]
+fn e360_a_path_through_an_imported_function_names_the_cause_and_nothing_else() {
+    let analyzed = analyze_package(
+        &[("editor.vl", E360_EDITOR), ("main.vl", E360_MAIN)],
+        "main.vl",
+    );
+    assert_eq!(
+        analyzed.diagnostics.len(),
+        1,
+        "one root error, no cascade: {:?}",
+        analyzed.diagnostics
+    );
+    let (message, span, file) = &analyzed.diagnostics[0];
+    assert_eq!(file.as_deref(), Some("main.vl"));
+    assert_eq!(&E360_MAIN[span.clone()], "editor::reader");
+    assert_eq!(
+        message,
+        "`editor` is a function, not a module: `editor::reader` looks `reader` up in `editor`, \
+         and a function has no members; `editor` here is the function imported from \
+         `pkg::editor` — import `reader` too (`import pkg::editor::{ editor, reader }`), or \
+         import the module under a name of its own (`import pkg::editor::{ self as \
+         editor_module, editor }`, then `editor_module::reader(..)`)"
+    );
+}
+
+/// Both steers compile and run.
+#[test]
+fn e360_both_imports_the_refusal_names_resolve() {
+    for (import, call) in [
+        (
+            "import pkg::editor::{ editor, reader };",
+            "reader(\"hello\")",
+        ),
+        (
+            "import pkg::editor::{ self as editor_module, editor };",
+            "editor_module::reader(\"hello\")",
+        ),
+    ] {
+        let main = E360_MAIN
+            .replace("import pkg::editor::editor;", import)
+            .replace("editor::reader(\"hello\")", call);
+        let (_, stdout) =
+            compile_and_run_package(&[("editor.vl", E360_EDITOR), ("main.vl", &main)], "main.vl")
+                .unwrap_or_else(|errors| panic!("{import}: {errors:#?}"));
+        assert_eq!(stdout, "reading hello\nreading hello\n", "{import}");
+    }
+}
+
+/// A function declared in the same file as the path: the cause alone, with no
+/// import to name.
+#[test]
+fn e360_a_path_through_a_local_function_names_the_cause() {
+    assert_fails_once_with(
+        "fun editor(text: str): str { text }\nfun main() {\n\tprint(editor::reader(\"x\"));\n}\n",
+        "`editor` is a function, not a module: `editor::reader` looks `reader` up in `editor`, \
+         and a function has no members",
+    );
+}
+
+/// A path through a module, a type and an enum still resolves.
+#[test]
+fn e360_a_path_through_a_module_a_type_or_an_enum_is_unchanged() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("editor.vl", E360_EDITOR),
+            (
+                "main.vl",
+                "import pkg::editor;\nimport std::option::Option;\nstruct Point { x: i32 }\nimpl Point { fun origin(): Point { Point { x = 0 } } }\nfun main() {\n\tprint(editor::reader(\"m\"));\n\tprint(Point::origin().x);\n\tlet none: Option<i32> = Option::None;\n\tprint(none.is_none());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("a path through a module, a type and an enum resolves");
+    assert_eq!(stdout, "reading m\n0\ntrue\n");
 }

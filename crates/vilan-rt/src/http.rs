@@ -63,7 +63,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::bytes::Bytes;
-use crate::executor::{Boxed, IoSource, Parked, raise_cancelled, register_io, spawn};
+use crate::executor::{
+    Boxed, Failure, IoSource, Parked, caught, raise_cancelled, raise_failure, register_io, spawn,
+};
 use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
 
@@ -458,6 +460,15 @@ enum BodyState {
     Unread,
     /// A handler asked: it is being taken off the wire, up to `limit` bytes.
     Reading { limit: usize },
+    /// A handler is reading it as a STREAM (M176): it is taken off the wire only
+    /// while a reader waits with nothing to take, up to `limit` bytes in all.
+    /// `ended` once the framing says the body is over — what is still in
+    /// [`Body::decoded`] is the readers' to take.
+    Streaming { limit: usize, ended: bool },
+    /// A stream the handler's answer left unfinished (M176): nothing reads it
+    /// any more, and the close treats its rest as an unread body's — drained
+    /// within the cap, never read past it.
+    Abandoned,
     /// Read whole.
     Read(Bytes),
     /// The response ended with it unread and within the cap the server resolved:
@@ -476,12 +487,22 @@ enum BodyState {
 struct Body {
     framing: Framing,
     state: BodyState,
+    /// Decoded and not yet handed out: a whole read keeps all of it, a stream
+    /// hands it out from [`Body::taken`] on.
     decoded: Vec<u8>,
+    /// How much of [`Body::decoded`] a stream's readers have already taken.
+    taken: usize,
+    /// How many body bytes the framing has produced so far — what the cap
+    /// counts, however many of them a stream has already handed out.
+    received: usize,
     chunks: ChunkDecoder,
     waiters: Vec<Parked>,
     /// The cap [`Request::body_left_unread`] was asked with — what the drain
     /// spends at most.
     drain_limit: Option<usize>,
+    /// How a handler claimed the body (`"whole"` or `"stream"`, M176): `std::http`
+    /// reads it one way or the other, and this is what remembers which.
+    claim: String,
 }
 
 impl Body {
@@ -490,9 +511,12 @@ impl Body {
             framing,
             state: BodyState::Unread,
             decoded: Vec::new(),
+            taken: 0,
+            received: 0,
             chunks: ChunkDecoder::new(),
             waiters: Vec::new(),
             drain_limit: None,
+            claim: String::new(),
         }
     }
 
@@ -500,9 +524,33 @@ impl Body {
     fn settle(&mut self, state: BodyState) {
         self.state = state;
         self.decoded = Vec::new();
+        self.taken = 0;
+        self.wake();
+    }
+
+    /// Wakes everyone waiting for the body, to look at it again.
+    fn wake(&mut self) {
         for waiter in self.waiters.drain(..) {
             waiter.wake();
         }
+    }
+
+    /// The next piece of a stream: up to `size` of what is decoded and not yet
+    /// taken, or `None` when nothing is. A copy — the piece is the reader's, and
+    /// the buffer it came out of is reused.
+    fn take_piece(&mut self, size: usize) -> Option<Bytes> {
+        let available = self.decoded.len() - self.taken;
+        if available == 0 {
+            return None;
+        }
+        let end = self.taken + available.min(size.max(1));
+        let piece = self.decoded[self.taken..end].to_vec();
+        self.taken = end;
+        if self.taken == self.decoded.len() {
+            self.decoded.clear();
+            self.taken = 0;
+        }
+        Some(Bytes::from_vec(piece))
     }
 }
 
@@ -571,44 +619,68 @@ impl Connection {
     fn wants_bytes(&self) -> bool {
         match self.stage.get() {
             Stage::Reading | Stage::Upgraded => true,
-            Stage::Dispatched | Stage::Closing => matches!(
-                self.body.borrow().state,
-                BodyState::Reading { .. } | BodyState::Draining { .. }
-            ),
+            Stage::Dispatched | Stage::Closing => {
+                let body = self.body.borrow();
+                match body.state {
+                    BodyState::Reading { .. } | BodyState::Draining { .. } => true,
+                    // A stream reads only for a reader waiting with nothing to
+                    // take (M176): between reads its body stays in the kernel.
+                    BodyState::Streaming { ended: false, .. } => !body.waiters.is_empty(),
+                    _ => false,
+                }
+            }
             Stage::Closed => false,
         }
     }
 
-    /// Moves a body being read forward with what the inbox holds. `true` if
-    /// anything changed.
+    /// Moves a body being read — whole, or as a stream — forward with what the
+    /// inbox holds. `true` if anything changed.
     fn advance_body(&self, hung_up: bool) -> bool {
         let mut body = self.body.borrow_mut();
-        let BodyState::Reading { limit } = body.state else {
-            return false;
+        let (limit, streaming) = match body.state {
+            BodyState::Reading { limit } => (limit, false),
+            BodyState::Streaming {
+                limit,
+                ended: false,
+            } => (limit, true),
+            _ => return false,
         };
         let mut inbox = self.inbox.borrow_mut();
         let before = inbox.len();
+        let decoded_before = body.decoded.len();
         let outcome = match body.framing {
             Framing::Empty => Decoded::Done,
             Framing::Length(length) => {
-                let taken = (length - body.decoded.len()).min(inbox.len());
+                let taken = (length - body.received).min(inbox.len());
                 body.decoded.extend(inbox.drain(..taken));
-                if body.decoded.len() == length {
+                if body.received + taken == length {
                     Decoded::Done
                 } else {
                     Decoded::More
                 }
             }
             Framing::Chunked => {
+                // The decoder refuses a chunk that would take what `decoded`
+                // holds past the limit it is given; the cap counts what the
+                // body has PRODUCED, some of which a stream has already handed
+                // out, so the limit it is given is the cap less those.
+                let handed_out = body.received - body.decoded.len();
                 let Body {
                     chunks, decoded, ..
                 } = &mut *body;
-                chunks.feed(&mut inbox, decoded, limit)
+                chunks.feed(&mut inbox, decoded, limit - handed_out)
             }
         };
+        let grew = body.decoded.len() != decoded_before;
+        body.received += body.decoded.len() - decoded_before;
         let progressed = inbox.len() != before;
         drop(inbox);
         match outcome {
+            Decoded::Done if streaming => {
+                body.state = BodyState::Streaming { limit, ended: true };
+                body.wake();
+                true
+            }
             Decoded::Done => {
                 let bytes = Bytes::from_vec(std::mem::take(&mut body.decoded));
                 body.settle(BodyState::Read(bytes));
@@ -624,7 +696,12 @@ impl Connection {
                 self.close();
                 true
             }
-            Decoded::More => progressed,
+            Decoded::More => {
+                if grew {
+                    body.wake();
+                }
+                progressed
+            }
             Decoded::OverLimit => {
                 body.settle(BodyState::Refused);
                 drop(body);
@@ -635,7 +712,7 @@ impl Connection {
                 body.settle(BodyState::Refused);
                 drop(body);
                 if !self.answered.replace(true) {
-                    refuse(self, 400, "Bad Request");
+                    refuse_protocol(self, 400, "Bad Request");
                 } else {
                     self.stage.set(Stage::Closing);
                 }
@@ -645,17 +722,28 @@ impl Connection {
     }
 
     /// The over-the-cap answer (M164): `413` with the sentence node's twin
-    /// sends, and the connection closing without the rest of the body read. A
-    /// response already under way cannot become a `413`, so it is cut instead.
+    /// sends, and the connection closing without the rest of the body read.
     fn refuse_body(&self, limit: usize) {
+        self.refuse_with(
+            413,
+            &format!("the request body is larger than {limit} bytes"),
+        );
+    }
+
+    /// A refusal with a sentence (M164's `413`, and M176's `400` and `500` that
+    /// `std::http` answers through [`refuse`]): `status` with `message` as a
+    /// plain-text body, and the connection closing without the rest of the body
+    /// read. A response already under way cannot become a refusal, so it is cut
+    /// instead.
+    fn refuse_with(&self, status: u16, message: &str) {
         if self.answered.replace(true) {
             self.stage.set(Stage::Closing);
             return;
         }
-        let message = format!("the request body is larger than {limit} bytes");
         let head = format!(
-            "HTTP/1.1 413 Content Too Large\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+            "HTTP/1.1 {status} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n",
+            reason(status),
             message.len()
         );
         self.enqueue(head.as_bytes());
@@ -699,6 +787,9 @@ impl Connection {
             match read {
                 Ok(0) => return (progressed, true),
                 Ok(count) => {
+                    if self.declined_body() {
+                        REFUSED_BODY_READ.fetch_add(count, Ordering::Relaxed);
+                    }
                     self.inbox.borrow_mut().extend_from_slice(&chunk[..count]);
                     taken += count;
                     progressed = true;
@@ -714,6 +805,13 @@ impl Connection {
                 Err(_) => return (progressed, true),
             }
         }
+    }
+
+    /// Whether the connection has decided not to read its body — refused it
+    /// over the cap, or lingers with it unread — so any byte it reads now is
+    /// one [`refused_body_census`] counts.
+    fn declined_body(&self) -> bool {
+        matches!(self.body.borrow().state, BodyState::Refused) || self.linger_until.get().is_some()
     }
 
     /// Pushes whatever is queued. Answers `(progressed, the socket is dead)`.
@@ -778,7 +876,12 @@ impl Connection {
         {
             // A read still waiting ends: the body will never arrive now.
             let mut body = self.body.borrow_mut();
-            if matches!(body.state, BodyState::Unread | BodyState::Reading { .. }) {
+            if matches!(
+                body.state,
+                BodyState::Unread
+                    | BodyState::Reading { .. }
+                    | BodyState::Streaming { ended: false, .. }
+            ) {
                 body.settle(BodyState::Gone);
             }
         }
@@ -933,10 +1036,18 @@ impl Request {
     /// closes the connection anyway, so the answer only decides between a drain
     /// and an immediate close; `std::http` adds the `Connection: close` it asks
     /// for, which [`Response`] does not write twice.
+    ///
+    /// A STREAM the handler left unfinished (M176) is the same body with part
+    /// of it read: what the stream decoded and nobody took is let go here, and
+    /// the rest is drained or not by the same rule.
     pub fn body_left_unread(&self, limit: usize) -> bool {
         let mut body = self.0.connection.body.borrow_mut();
-        if !matches!(body.state, BodyState::Unread) {
-            return false;
+        match body.state {
+            BodyState::Unread => {}
+            // A reader that outlived the handler looks again, and finds the
+            // body the connection's now.
+            BodyState::Streaming { ended: false, .. } => body.settle(BodyState::Abandoned),
+            _ => return false,
         }
         match body.framing {
             Framing::Empty => false,
@@ -983,6 +1094,18 @@ impl Js for Request {
     }
 }
 
+/// What [`refused_body_census`] reads: body bytes taken off connections after
+/// they declined the body.
+static REFUSED_BODY_READ: AtomicUsize = AtomicUsize::new(0);
+
+/// `__http_refused_body_census()` — how many body bytes this process's server
+/// read off its connections after deciding not to read them (B687; `std::http`'s
+/// `refused_body_census`). Zero is M164's contract: a declined body stays in the
+/// kernel. An instrument — it counts, it decides nothing.
+pub fn refused_body_census() -> usize {
+    REFUSED_BODY_READ.load(Ordering::Relaxed)
+}
+
 /// `__http_read_body(request, response, limit)` — the request's body, read on
 /// the FIRST call and answered from there after (M164; `std::http`'s
 /// `Request::bytes`). See the module comment for the cap; the response handle is
@@ -1013,7 +1136,11 @@ impl Future for BodyRead {
                 BodyState::Read(bytes) => return Poll::Ready(bytes.clone()),
                 BodyState::Unread => true,
                 BodyState::Reading { .. } => false,
-                BodyState::Draining { .. } | BodyState::Refused | BodyState::Gone => {
+                BodyState::Streaming { .. }
+                | BodyState::Abandoned
+                | BodyState::Draining { .. }
+                | BodyState::Refused
+                | BodyState::Gone => {
                     drop(body);
                     raise_cancelled()
                 }
@@ -1054,6 +1181,151 @@ impl Future for BodyRead {
         }
         Poll::Pending
     }
+}
+
+/// `__http_claim_body(request, how)` — records how the handler reads the body
+/// (`"whole"` or `"stream"`, M176's one-way-of-reading rule) when it has not
+/// been claimed yet, and answers the earlier claim (`""` for none). `std::http`'s
+/// `claim_read` refuses the request when the two differ.
+pub fn claim_body(request: &Request, how: &str) -> Str {
+    let mut body = request.0.connection.body.borrow_mut();
+    let earlier = body.claim.clone();
+    if earlier.is_empty() {
+        body.claim = how.to_string();
+    }
+    str_new(&earlier)
+}
+
+/// `__http_refuse(request, response, status, message)` — `std::http`'s refusal
+/// of a request on the server's side (M176/M177): `status` with `message` as
+/// its body and the connection closing without the rest of the body read (a
+/// response already under way is cut), then the caller ends as a cancellation,
+/// exactly as an over-the-cap read does. A `5xx` is the server's own fault and
+/// is written to stderr too, which is node's twin's `console.error`.
+///
+/// Typed `()` rather than `!`, although it never returns: the emitted code
+/// calls it as the `void` extern it is declared as, and code after the call is
+/// ordinary code there (unreachable code warns).
+pub fn refuse(request: &Request, _response: &Response, status: i32, message: &str) {
+    let connection = &request.0.connection;
+    if status >= 500 {
+        eprintln!("std::http: {message}");
+    }
+    {
+        let mut body = connection.body.borrow_mut();
+        if !matches!(body.state, BodyState::Gone) {
+            body.settle(BodyState::Refused);
+        }
+    }
+    connection.refuse_with(status.clamp(100, 599) as u16, message);
+    raise_cancelled()
+}
+
+/// `__http_body_next(request, response, limit, size)` — the next piece of the
+/// request body as a stream (M176; `std::http`'s `BodyReader::next`): at most
+/// `size` bytes, `None` at the end. See [`BodyPiece`].
+pub fn body_next(request: Request, _response: Response, limit: usize, size: usize) -> BodyPiece {
+    BodyPiece {
+        connection: Rc::clone(&request.0.connection),
+        limit,
+        size,
+    }
+}
+
+/// The future [`body_next`] returns. Public because emitted code's TYPE
+/// inference names it, never its text.
+///
+/// The first piece STARTS the stream — the cap's declared-length check, as the
+/// whole read's, then whatever arrived with the head — and every piece is
+/// answered from what is decoded and not yet taken. Only when nothing is does
+/// the reader park, and only a parked reader makes the connection read
+/// ([`Connection::wants_bytes`]): a [`BODY_SLICE`] a turn, decoded, the readers
+/// woken. So the body is taken off the wire as fast as it is read and no faster,
+/// and what is in memory is a slice, not the upload. A chunked body is counted
+/// against the cap as it is decoded and refused at the chunk that crosses it,
+/// however much of it the readers have already had.
+pub struct BodyPiece {
+    connection: Rc<Connection>,
+    limit: usize,
+    size: usize,
+}
+
+impl Future for BodyPiece {
+    type Output = Option<Bytes>;
+
+    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Bytes>> {
+        let connection = &self.connection;
+        let starts = matches!(connection.body.borrow().state, BodyState::Unread);
+        if starts {
+            let mut body = connection.body.borrow_mut();
+            if connection.answered.get() {
+                // Read after the response went out: the body is the drain's now,
+                // or already gone with the connection.
+                body.settle(BodyState::Gone);
+                drop(body);
+                raise_cancelled();
+            }
+            if let Framing::Length(length) = body.framing
+                && length > self.limit
+            {
+                body.settle(BodyState::Refused);
+                drop(body);
+                connection.refuse_body(self.limit);
+                raise_cancelled();
+            }
+            body.state = BodyState::Streaming {
+                limit: self.limit,
+                ended: false,
+            };
+            drop(body);
+            connection.advance_body(false);
+        }
+        let mut body = connection.body.borrow_mut();
+        let BodyState::Streaming { ended, .. } = body.state else {
+            // Refused, gone, drained — or read whole, which `std::http`'s
+            // one-way-of-reading claim refuses before a reader can get here.
+            drop(body);
+            raise_cancelled()
+        };
+        if let Some(piece) = body.take_piece(self.size) {
+            return Poll::Ready(Some(piece));
+        }
+        if ended {
+            return Poll::Ready(None);
+        }
+        if let Some(parked) = Parked::current() {
+            body.waiters.push(parked);
+        }
+        Poll::Pending
+    }
+}
+
+/// `__http_find(haystack, needle, from)` — where `needle` next occurs in
+/// `haystack` at or after `from` (M177's delimiter search; node's
+/// `Buffer.indexOf`). An empty needle is found at `from`, as node's is when
+/// `from` is within the haystack.
+pub fn find_bytes(haystack: &Bytes, needle: &Bytes, from: usize) -> Option<usize> {
+    let haystack = haystack.as_slice();
+    let needle = needle.as_slice();
+    if from > haystack.len() {
+        return None;
+    }
+    if needle.is_empty() {
+        return Some(from);
+    }
+    let first = needle[0];
+    let mut index = from;
+    while index + needle.len() <= haystack.len() {
+        let at = index
+            + haystack[index..=haystack.len() - needle.len()]
+                .iter()
+                .position(|byte| *byte == first)?;
+        if haystack[at..at + needle.len()] == *needle {
+            return Some(at);
+        }
+        index = at + 1;
+    }
+    None
 }
 
 // --------------------------------------------------------------- response ---
@@ -1202,6 +1474,26 @@ impl Response {
         self.0.connection.stage.set(Stage::Closing);
     }
 
+    /// M179: the handler FAILED. A response whose head has not gone out answers
+    /// `500` with `Connection: close` — what node's `__http_respond` writes — and
+    /// one already streaming is cut off where it stands (`destroy`, the flush
+    /// kept), so its reader sees it end short rather than wait for an end that
+    /// will not come. An ended response is left alone.
+    fn fail(&self) {
+        if self.0.ended.get() {
+            return;
+        }
+        if !self.0.head_sent.get() {
+            self.set_status_code(500);
+            self.set_header("Content-Type", "text/plain");
+            self.set_header("Connection", "close");
+            self.end("internal server error");
+        } else {
+            self.0.ended.set(true);
+            self.0.connection.destroy();
+        }
+    }
+
     /// `response.on("close", callback)` — the connection ended. For a
     /// never-ended streaming response that is the client going away, which is
     /// the event `std::http`'s `ResponseStream::on_close` exists for.
@@ -1237,7 +1529,7 @@ impl Js for Response {
 /// refusal in [`parse_head`] and [`body_length`] takes. It writes the head by
 /// hand rather than through [`Response`], because a refused request never
 /// reaches the application and never gets a `Response` at all.
-fn refuse(connection: &Connection, status: u16, phrase: &str) {
+fn refuse_protocol(connection: &Connection, status: u16, phrase: &str) {
     let head =
         format!("HTTP/1.1 {status} {phrase}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     connection.answered.set(true);
@@ -1286,6 +1578,26 @@ fn termination_requested() -> bool {
 }
 
 // ----------------------------------------------------------------- server ---
+
+/// `__http_respond(response, body)` (M164 + M179) — one request's answer. A
+/// cancellation travels on and settles the spawned task quietly, as before; a
+/// PANIC first answers the request (`Response::fail`: `500`, or a started stream
+/// cut off) and then travels on, so the task's unobserved-failure line reports
+/// it ONCE — `unhandled task error (spawned in an http request handler):
+/// panicked at <site>: <message>`, the line node's helper prints — and the
+/// server goes on serving. Before, the response was left open and the client
+/// waited until it gave up.
+pub async fn respond(response: Response, body: Boxed<()>) {
+    match caught(body).await {
+        Ok(()) => {}
+        Err(failure) => {
+            if !matches!(failure, Failure::Cancelled) {
+                response.fail();
+            }
+            raise_failure(failure);
+        }
+    }
+}
 
 /// The request handler a server is built with: `createServer`'s callback.
 ///
@@ -1510,6 +1822,16 @@ impl Server {
         let (read, hung_up) = if connection.wants_bytes() {
             let budget = match connection.stage.get() {
                 Stage::Dispatched | Stage::Closing => BODY_SLICE,
+                // A head is at most `MAX_HEAD`, and what a fast client has
+                // already sent after it is a body nobody has asked for yet:
+                // read past the head by at most one slice, and leave the rest
+                // in the kernel for the reads a handler makes (N192: with no
+                // bound, a 4 MiB chunked upload already on the wire was fed
+                // whole to the decoder at the handler's first `next`, and the
+                // cap refused it with `413` before the handler took its ten
+                // bytes - on Linux, whose loopback buffers hold megabytes;
+                // Windows never handed that much in one turn).
+                Stage::Reading => MAX_HEAD + BODY_SLICE,
                 _ => usize::MAX,
             };
             connection.read_available(budget)
@@ -1584,15 +1906,22 @@ impl Server {
     fn lingers(&self, connection: &Rc<Connection>, hung_up: bool) -> bool {
         let draining = {
             let mut body = connection.body.borrow_mut();
-            if let (BodyState::Unread, Framing::Length(length), Some(limit)) =
-                (&body.state, body.framing, body.drain_limit)
+            // An unread body — or the unread rest of an unfinished stream —
+            // within the cap is drained.
+            let unread = matches!(body.state, BodyState::Unread | BodyState::Abandoned);
+            if let (true, Framing::Length(length), Some(limit)) =
+                (unread, body.framing, body.drain_limit)
                 && length <= limit
             {
-                body.state = BodyState::Draining { remaining: length };
+                body.state = BodyState::Draining {
+                    remaining: length - body.received,
+                };
             }
             match body.state {
                 BodyState::Draining { .. } => true,
-                BodyState::Refused => false,
+                // Refused, or a stream left unfinished past what a drain may
+                // spend: the rest is never read.
+                BodyState::Refused | BodyState::Abandoned => false,
                 // Unread, and not all of it already off the wire.
                 BodyState::Unread => match body.framing {
                     Framing::Empty => return false,
@@ -1644,14 +1973,14 @@ impl Server {
             Ok(head) => head,
             Err(HeadError::Incomplete) => return false,
             Err(HeadError::Refused(status, phrase)) => {
-                refuse(connection, status, phrase);
+                refuse_protocol(connection, status, phrase);
                 return true;
             }
         };
         let framing = match body_framing(&head) {
             Ok(framing) => framing,
             Err(HeadError::Refused(status, phrase)) => {
-                refuse(connection, status, phrase);
+                refuse_protocol(connection, status, phrase);
                 return true;
             }
             // `body_framing` never asks for more bytes.
@@ -1979,6 +2308,24 @@ mod tests {
         // outgrows any size a chunk could need.
         let long = vec![b'1'; MAX_CHUNK_LINE + 2];
         assert_eq!(decode(&long, 512, usize::MAX).0, Decoded::Malformed);
+    }
+
+    /// M177's delimiter search answers what node's `Buffer.indexOf` does: the
+    /// first occurrence at or after `from`, a match at the very end, a near
+    /// miss skipped, nothing past the haystack, and an empty needle at `from`.
+    #[test]
+    fn find_bytes_answers_the_first_occurrence_at_or_after_from() {
+        let bytes = |text: &str| Bytes::from_vec(text.as_bytes().to_vec());
+        let haystack = bytes("ab\r\n--b\r\n--bound\r\n--boundary");
+        let needle = bytes("\r\n--boundary");
+        assert_eq!(find_bytes(&haystack, &needle, 0), Some(16));
+        assert_eq!(find_bytes(&haystack, &needle, 16), Some(16));
+        assert_eq!(find_bytes(&haystack, &needle, 17), None);
+        assert_eq!(find_bytes(&haystack, &bytes("--b"), 3), Some(4));
+        assert_eq!(find_bytes(&haystack, &bytes("--b"), 5), Some(9));
+        assert_eq!(find_bytes(&bytes("short"), &needle, 0), None);
+        assert_eq!(find_bytes(&haystack, &needle, 1000), None);
+        assert_eq!(find_bytes(&haystack, &bytes(""), 3), Some(3));
     }
 
     #[test]

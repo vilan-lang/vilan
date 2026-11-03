@@ -359,6 +359,9 @@ pub fn mutates_its_receiver(intrinsic: Intrinsic) -> bool {
             | Intrinsic::ListSortBy
             | Intrinsic::MapInsert
             | Intrinsic::MapRemove
+            | Intrinsic::KeyedInsert
+            | Intrinsic::KeyedRemove
+            | Intrinsic::KeyedSlot
             | Intrinsic::SetInsert
             | Intrinsic::SetRemove
     )
@@ -391,6 +394,10 @@ pub fn reads_its_receiver_in_place(intrinsic: Intrinsic) -> bool {
             | Intrinsic::MapGet
             | Intrinsic::MapContainsKey
             | Intrinsic::MapLen
+            | Intrinsic::KeyedGet
+            | Intrinsic::KeyedKey
+            | Intrinsic::KeyedContainsKey
+            | Intrinsic::KeyedLen
             | Intrinsic::CanonicalHash
     )
 }

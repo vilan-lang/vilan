@@ -121,6 +121,13 @@ copy alike. A constructor that KEEPS its argument (`Shared::new`, `ListCell::of`
 declares it `own`, so a value its caller still reads afterwards is copied in
 rather than shared with the new cell.
 
+A tuple written only to be taken apart — `match (self, other)`, the shape a
+derived `PartialEq` over an enum takes — is not a construction: nothing outlives
+the match, so its patterns bind pieces of the places it names, and each capture
+copies (or shares, when nothing can write the place) exactly as a capture of
+that place alone would. A payload-less variant named bare (`None`) names no
+place at all: every use is a fresh value.
+
 The return reads **through** a view to reach the place, because a returned
 expression can name storage without being a place: `fun grab(&self): Inner {
 &self.inner }` hands back a reference, and `fun get(h: &Holder): (i32, i32) {

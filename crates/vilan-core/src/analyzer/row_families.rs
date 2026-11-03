@@ -5,9 +5,11 @@
 //! has no clone site", and the restore is exact. Some passes do not run on
 //! every analysis, though. The move scan's whole-program helper sets
 //! (`move_tables.rs`) are derived only once a program holds a resource
-//! binding, and the lazy tables (M150) only once one writes a `lazy`
-//! parameter or binding — so an empty row from an analysis that never asked
-//! is not "nothing here", it is "not computed". A family is the set of rows
+//! binding, the lazy tables (M150) only once one writes a `lazy`
+//! parameter or binding, and C16's retaining rows (M188) only once a summary
+//! is asked or a seeded analysis files them — so an empty row from an
+//! analysis that never asked is not "nothing here", it is "not computed". A
+//! family is the set of rows
 //! one such pass contributes, and a slice says, per family, whether its rows
 //! were FILED ([`FamilySet`]); the regions whose slices carry a family are its
 //! restored ranges, and the complement is the family's live lane — the
@@ -28,9 +30,11 @@ pub(super) enum RowFamily {
     Hmr,
     /// R11's lexical candidates (M155, `r11_candidates.rs`).
     R11,
+    /// C16's retaining rows (M188, `retain_tables.rs`).
+    Retain,
 }
 
-pub(super) const FAMILIES: usize = 4;
+pub(super) const FAMILIES: usize = 5;
 
 impl RowFamily {
     pub(super) const ALL: [RowFamily; FAMILIES] = [
@@ -38,6 +42,7 @@ impl RowFamily {
         RowFamily::Lazy,
         RowFamily::Hmr,
         RowFamily::R11,
+        RowFamily::Retain,
     ];
 
     pub(super) fn index(self) -> usize {
@@ -46,6 +51,7 @@ impl RowFamily {
             RowFamily::Lazy => 1,
             RowFamily::Hmr => 2,
             RowFamily::R11 => 3,
+            RowFamily::Retain => 4,
         }
     }
 }

@@ -7473,6 +7473,204 @@ fn the_storing_callee_refusal_follows_a_chain_of_callees() {
     );
 }
 
+/// The analysis of `source` on a large-stack worker, with that thread's
+/// census (E340, M188, M189) and the diagnostics.
+fn escape_census_of(source: &str) -> (vilan_core::incremental::Census, Vec<String>) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            (
+                vilan_core::incremental::census(),
+                errors.into_iter().map(|error| error.msg).collect(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the analysis")
+}
+
+#[test]
+fn the_retaining_summary_is_computed_only_for_a_call_that_hands_on_a_capturing_closure() {
+    // E340 (Order 56): C16's summary was a whole-program fixpoint, and it ran
+    // whenever ANY closure captured a view - on kolt two of ~5,900 do, so
+    // every editor keystroke paid ~400 ms for a question no live call asked.
+    // It is asked now only by a call that hands a view-capturing closure to
+    // an ordinary callee (`stored_view_capturing_arguments`' only question),
+    // so a capturing closure that is called in place costs nothing...
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        fun read(v: &mut i32): i32 { let g = || *v; g() }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+    );
+    let summaries = census.retaining_summaries;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        summaries, 0,
+        "a capturing closure called in place computed a summary"
+    );
+    // ...a view-capturing closure handed to a callee asks for THAT callee's
+    // summary once (M188: the second call is a lookup), and the callee that
+    // only calls it still compiles...
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        fun twice(g: || i32): i32 { g() + g() }
+        fun read(v: &mut i32): i32 { twice(|| *v) + twice(|| *v + 1) }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+    );
+    let summaries = census.retaining_summaries;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        summaries, 1,
+        "one callee asked, one summary, computed once per analysis"
+    );
+    // ...and the storing callee is still refused through it.
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun make(v: &mut i32): Holder { keep(|| *v) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+    );
+    let summaries = census.retaining_summaries;
+    assert_eq!(summaries, 1);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`keep` keeps what it is handed past the call")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn a_summary_that_reaches_a_derived_function_reads_its_synthesized_body() {
+    // M188: a `[derive(..)]`-synthesized body is no module's, so its rows are
+    // never filed and are walked only when a summary reaches a derived
+    // function. `compare` hands its `Point` parameters to the derived `eq`,
+    // so asking `compare` (for the closure at position 0) reaches `eq`'s
+    // body; the debug build checks the answer against the whole-program
+    // rounds, and the closure, at a position nothing keeps, is admitted.
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        [derive(PartialEq)]
+        struct Point { x: i32, y: i32 }
+        fun compare(g: || i32, a: Point, b: Point): bool { a.eq(b) && g() > 0 }
+        fun read(v: &mut i32): bool {
+            compare(|| *v, Point { x = 1, y = 2 }, Point { x = 1, y = 2 })
+        }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        census.retaining_summaries, 2,
+        "`compare` and the derived `eq` it reaches"
+    );
+}
+
+#[test]
+fn the_capture_scan_asks_only_the_closures_the_escape_pass_meets() {
+    // M189 (Order 56): whether a closure captures a view was scanned for
+    // EVERY closure of the program on every analysis (~5,900 on kolt, std's
+    // included). It is asked now of the closures the pass meets - here the
+    // two handed to calls and the one stored in a field - and once each: the
+    // closure called in place, the one bound and never handed on, and std's
+    // closures are not scanned.
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun twice(g: || i32): i32 { g() + g() }
+        fun read(v: &mut i32): i32 {
+            let local = || *v;
+            let unused = || 7;
+            twice(|| *v) + twice(|| 1) + local()
+        }
+        fun main() {
+            mut n = 3;
+            let h = Holder { f = || 2 };
+            print(read(&mut n) + (h.f)());
+        }
+        "#,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        census.capture_scans, 3,
+        "the two closures handed to `twice` and the one stored in `Holder`"
+    );
+}
+
+#[test]
+fn the_retaining_summary_closes_over_the_asked_callees_reach_only() {
+    // M188 (Order 56): the summary of an asked callee reads the rows of the
+    // bodies it reaches - `pass` hands its parameter to `keep`, so both are
+    // summarized - and of no other: `store` and `relay` keep what they are
+    // handed (and `relay` names `store`), but nothing the asked callee
+    // reaches calls either, so neither is summarized.
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun pass(g: || i32): Holder { keep(g) }
+        fun store(g: || i32): Holder { Holder { f = g } }
+        fun relay(g: || i32): Holder { store(g) }
+        fun make(v: &mut i32): Holder { pass(|| *v) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); print((relay(|| 1).f)()); }
+        "#,
+    );
+    let summaries = census.retaining_summaries;
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pass` keeps what it is handed past the call")),
+        "{errors:?}"
+    );
+    assert_eq!(
+        summaries, 2,
+        "the asked callee and the one callee its rows reach, nothing else"
+    );
+    // A cycle among the reached callees closes too: `ping` and `pong` hand
+    // the closure to each other and `pong` stores it, so `ping` keeps it.
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun ping(g: || i32, n: i32): Holder { if n > 0 { pong(g, n - 1) } else { Holder { f = || 0 } } }
+        fun pong(g: || i32, n: i32): Holder { if n > 0 { ping(g, n - 1) } else { Holder { f = g } } }
+        fun make(v: &mut i32): Holder { ping(|| *v, 2) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+    );
+    let summaries = census.retaining_summaries;
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`ping` keeps what it is handed past the call")),
+        "{errors:?}"
+    );
+    assert_eq!(summaries, 2, "the cycle's two members");
+}
+
 #[test]
 fn a_callee_that_puts_the_closure_in_a_collection_keeps_it() {
     // A collection is a store like a field is: the list outlives the call.
@@ -13329,7 +13527,9 @@ fn b509_a_through_variant_write_copies_nothing() {
     // std's own steps, through a derived enum's handle and an `Option`'s:
     // the copies a write makes do not include the 10,000-element payload — a
     // deep copy of it alone is over 10,000 `__clone` calls, and 199 more
-    // writes add a handful each (the written leaf), never that.
+    // writes add a handful each (the written leaf, and since B691 the path's
+    // `StoreStep`s and the spine's `Option` slots — an enum with a payload is
+    // a value rule 1 copies: 14 visits a write, measured), never that.
     let through_std = |writes: usize| {
         format!(
             r#"
@@ -13368,7 +13568,7 @@ fn b509_a_through_variant_write_copies_nothing() {
     let once = copies_made(&through_std(1));
     let many = copies_made(&through_std(200));
     assert!(
-        many - once < 199 * 2 * 10,
+        many - once < 199 * 2 * 20,
         "a write through std's variant and Option steps copies the payload: {once} copies for one write, {many} for 200"
     );
 }
@@ -14910,5 +15110,250 @@ fn b647_a_module_binding_handed_by_value_to_a_writer_is_a_copy() {
             "}\n",
         ),
         "1\n2\n0\n1\n",
+    );
+}
+
+// --- B691: an enum with a payload is a value at every seam -------------------
+//
+// The `[index, ..data]` array an enum with a payload lowers to was handed out
+// BY REFERENCE at every rule-1 seam (`is_cloneable_aggregate` answered structs,
+// tuples, lists and maps, not enums), and a `match &mut` / `if &mut .. is`
+// capture writes the payload IN PLACE — so `mut b = a` of an
+// `Option<List<i32>>` showed `b`'s push in `a`. A scalar payload aliased the
+// same way (`n += 5` through `b` moved `a`). One pin per seam; the native half
+// is `native_differential`'s `b691_an_enum_is_a_value_at_every_seam_on_both_backends`.
+
+const B691_PRELUDE: &str = "struct Holder { items: Option<List<i32>> }
+fun show(value: Option<List<i32>>): str {
+\tmatch value {
+\t\tSome(let list) => i\"Some({list.len()})\",
+\t\tNone => \"None\",
+\t}
+}
+fun grow(held: &mut Option<List<i32>>) {
+\tif &mut *held is Some(let list) {
+\t\tlist.push(9);
+\t}
+}
+";
+
+fn b691_runs(main_body: &str, expected: &str) {
+    assert_compiles_and_runs(
+        &format!("{B691_PRELUDE}fun main() {{\n{main_body}\n}}\n"),
+        expected,
+    );
+}
+
+#[test]
+fn b691_a_binding_copies_an_enum() {
+    b691_runs(
+        "\tlet a: Option<List<i32>> = Some([1, 2]);
+\tmut b = a;
+\tgrow(&mut b);
+\tprint(i\"{show(a)} {show(b)}\");",
+        "Some(2) Some(3)\n",
+    );
+}
+
+#[test]
+fn b691_an_assignment_copies_an_enum() {
+    b691_runs(
+        "\tlet a: Option<List<i32>> = Some([1, 2]);
+\tmut b: Option<List<i32>> = None;
+\tb = a;
+\tgrow(&mut b);
+\tprint(i\"{show(a)} {show(b)}\");",
+        "Some(2) Some(3)\n",
+    );
+}
+
+#[test]
+fn b691_a_mut_parameter_copies_an_enum_argument() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B691_PRELUDE}fun grown(mut value: Option<List<i32>>): str {{
+\tgrow(&mut value);
+\tshow(value)
+}}
+fun main() {{
+\tlet c: Option<List<i32>> = Some([1]);
+\tprint(grown(c));
+\tprint(show(c));
+}}
+"
+        ),
+        "Some(2)\nSome(1)\n",
+    );
+}
+
+#[test]
+fn b691_a_struct_literal_field_copies_an_enum() {
+    b691_runs(
+        "\tlet d: Option<List<i32>> = Some([1]);
+\tmut holder = Holder { items = d };
+\tgrow(&mut holder.items);
+\tprint(i\"{show(d)} {show(holder.items)}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_list_element_copies_an_enum() {
+    b691_runs(
+        "\tlet e: Option<List<i32>> = Some([1]);
+\tmut many = [e];
+\tgrow(&mut many[0]);
+\tprint(i\"{show(e)} {show(many[0])}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_read_through_a_view_copies_an_enum() {
+    b691_runs(
+        "\tlet f: Option<List<i32>> = Some([1]);
+\tlet view = &f;
+\tmut g = *view;
+\tgrow(&mut g);
+\tprint(i\"{show(f)} {show(g)}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_return_of_a_view_read_copies_an_enum() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B691_PRELUDE}fun read(view: &Option<List<i32>>): Option<List<i32>> {{ *view }}
+fun main() {{
+\tlet h: Option<List<i32>> = Some([1]);
+\tmut i = read(&h);
+\tgrow(&mut i);
+\tprint(i\"{{show(h)}} {{show(i)}}\");
+}}
+"
+        ),
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_closure_answering_a_view_read_copies_an_enum() {
+    // hash-map-lend.md §8's deviation 1: `peek(key, |slot| *slot)` would have
+    // aliased the table's value; it is a copy now.
+    assert_compiles_and_runs(
+        &format!(
+            "{B691_PRELUDE}fun peek<R>(slot: &Option<List<i32>>, f: |&Option<List<i32>>| R): R {{ f(slot) }}
+fun main() {{
+\tlet j: Option<List<i32>> = Some([1]);
+\tmut k = peek(&j, |slot| *slot);
+\tgrow(&mut k);
+\tprint(i\"{{show(j)}} {{show(k)}}\");
+}}
+"
+        ),
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_scalar_payload_is_copied_too() {
+    assert_compiles_and_runs(
+        "enum Shape { Dot, Circle(i32) }
+fun main() {
+\tlet scalar: Option<i32> = Some(1);
+\tmut bumped = scalar;
+\tif &mut bumped is Some(let n) {
+\t\tn += 5;
+\t}
+\tprint(i\"{scalar.unwrap_or(0)} {bumped.unwrap_or(0)}\");
+\tlet circle = Shape::Circle(2);
+\tmut resized = circle;
+\tif &mut resized is Shape::Circle(let radius) {
+\t\tradius = 9;
+\t}
+\tmatch circle {
+\t\tShape::Circle(let radius) => print(radius),
+\t\tShape::Dot => print(0),
+\t}
+}
+",
+        "1 6\n2\n",
+    );
+}
+
+#[test]
+fn b691_to_array_answers_a_deep_copy() {
+    // `unwrap`'s payload copy hid `__list_to_array`'s shallow `slice()`.
+    b691_runs(
+        "\tmut points = [Some([1]), None];
+\tmut array = points.to_array<2>().unwrap();
+\tgrow(&mut array[0]);
+\tmut held = points.to_array<2>();
+\tif &mut held is Some(let inner) {
+\t\tgrow(&mut inner[0]);
+\t}
+\tprint(i\"{show(points[0])} {show(array[0])}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+/// The copies B691 must NOT add, counted: a bare payload-less variant is a fresh
+/// value (`mut out = None`), and a tuple of places a pattern takes apart —
+/// `match (self, other)`, a derived `PartialEq` over an enum — copies neither
+/// operand, a 10,000-element payload included.
+#[test]
+fn b691_a_fresh_variant_and_a_matched_tuple_of_places_copy_nothing() {
+    let js = compile(
+        "[derive(PartialEq)]
+enum Payload { Empty, Full(List<i32>) }
+fun main() {
+\tmut big: List<i32> = [];
+\tmut index = 0;
+\tfor index < 10000 {
+\t\tbig.push(index);
+\t\tindex += 1;
+\t}
+\tlet left = Payload::Full(big);
+\tlet right = Payload::Empty;
+\tmut same = 0;
+\tmut round = 0;
+\tfor round < 100 {
+\t\tif left == right {
+\t\t\tsame += 1;
+\t\t}
+\t\tif left == left {
+\t\t\tsame += 1;
+\t\t}
+\t\tmut out: Option<i32> = None;
+\t\tif round > 50 {
+\t\t\tout = Some(round);
+\t\t}
+\t\tsame += out.unwrap_or(0) * 0;
+\t\tround += 1;
+\t}
+\tprint(same);
+}
+",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let counted = js.replace(
+        "function __clone(value) {",
+        "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+    );
+    let counted = format!(
+        "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+    );
+    let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(stdout.starts_with("100\n"), "{stdout}");
+    let copies: usize = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("copies="))
+        .expect("the exit hook prints the count")
+        .parse()
+        .expect("a count");
+    assert!(
+        copies < 100,
+        "a derived `==` over an enum and a fresh `None` copied {copies} values"
     );
 }

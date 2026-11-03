@@ -13,6 +13,7 @@ import std::reactive::{
 	SignalCell,
 	Source,
 	batch,
+	derive,
 	run_with_owner,
 	turn,
 };
@@ -78,6 +79,18 @@ fun main() {
 		let source: dyn Source<i32> = count;
 		let _watch = source.on_change(|value| print(i"object {value}"));
 		erased.set(12);
+	} else if path == "tracked" {
+		// A derivation whose dependency is TRACKED: the edge's relay names the
+		// `derive` that made it, and the seal's refresh its `.memo()` (E345).
+		let tripled = derive(|| count.track() * 3).memo();
+		let _watch = tripled.sub(|value| print(i"tracked {value}"));
+		count.set(14);
+	} else if path == "switch" {
+		// A `switch`'s re-selection names the `.switch(..)` that made it (E345).
+		let flag = SignalCell::new(true);
+		let chosen = flag.switch(|on| if on { count } else { plain }).memo();
+		let _watch = chosen.sub(|value| print(i"switch {value}"));
+		flag.set(false);
 	} else if path == "effect" {
 		// An effect names where it was made (B646).
 		run_with_owner(Owner::new(), || {

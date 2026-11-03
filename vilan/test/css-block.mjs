@@ -11,11 +11,39 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_keys(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);
+	return out.map(__clone);
+}
+function __nmap_remove(table, hash) {
+	__nmap_settle(table);
+	table[0].delete(hash);
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
+}
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);
+	return out.map(__clone);
 }
 function __panic(message, location) {
 	const error = new Error(message);
@@ -31,30 +59,30 @@ function slot_of(key) {
 	const parts = key.split(":");
 	if (parts.length !== 3) {
 		(() => {
-			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:877:3");
+			throw __panic("this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read", "std/src/web/style.vl:1305:3");
 		})();
 	}
-	return [ __at(parts, 0, "std/src/web/style.vl:879:17"), __at(parts, 1, "std/src/web/style.vl:879:39"), __at(parts, 2, "std/src/web/style.vl:879:60") ];
+	return [ __at(parts, 0, "std/src/web/style.vl:1307:17"), __at(parts, 1, "std/src/web/style.vl:1307:39"), __at(parts, 2, "std/src/web/style.vl:1307:60") ];
 }
 function family_longhands(property) {
-	const $f = property;
-	let $g = null;
-	if ($f === "padding") {
-		$g = ";padding-top;padding-right;padding-bottom;padding-left;";
-	} else if ($f === "margin") {
-		$g = ";margin-top;margin-right;margin-bottom;margin-left;";
-	} else if ($f === "inset") {
-		$g = ";top;right;bottom;left;";
-	} else if ($f === "flex") {
-		$g = ";flex-grow;flex-shrink;flex-basis;";
-	} else if ($f === "background") {
-		$g = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
-	} else if ($f === "border") {
-		$g = border_longhands();
+	const $d = property;
+	let $e = null;
+	if ($d === "padding") {
+		$e = ";padding-top;padding-right;padding-bottom;padding-left;";
+	} else if ($d === "margin") {
+		$e = ";margin-top;margin-right;margin-bottom;margin-left;";
+	} else if ($d === "inset") {
+		$e = ";top;right;bottom;left;";
+	} else if ($d === "flex") {
+		$e = ";flex-grow;flex-shrink;flex-basis;";
+	} else if ($d === "background") {
+		$e = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
+	} else if ($d === "border") {
+		$e = border_longhands();
 	} else {
-		$g = "";
+		$e = "";
 	}
-	return $g;
+	return $e;
 }
 function border_longhands() {
 	let out = ";border-width;border-style;border-color;";
@@ -97,58 +125,42 @@ function class_list(self) {
 function add(self, b) {
 	let rules = __clone(self[0]);
 	for (const key of keys(b[0])) {
-		const $d = get(b[0], key);
-		let $e = null;
-		if ($d[0] === 0) {
-			const entry = $d[1];
+		const $b = get(b[0], key);
+		let $c = null;
+		if ($b[0] === 0) {
+			const entry = $b[1];
 			const slot = slot_of(key);
 			rules = without_covered(rules, slot[0], slot[1], slot[2]);
 			insert(rules, key, entry);
-			$e = undefined;
+			$c = undefined;
 		} else {
-			$e = undefined;
+			$c = undefined;
 		}
-		$e;
+		$c;
 	}
 	return [ rules ];
 }
 function values(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry.slice(1, 3)));
-	}
-	return result;
+	return __nmap_values(self[0]);
 }
 function keys(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
-	}
-	return result;
+	return __nmap_keys(self[0]);
 }
 function get(self, key) {
-	const $b = __map_get(self[0], hash(key));
-	let $c = null;
-	if ($b[0] === 0) {
-		const entry = $b[1];
-		$c = [ 0, __clone(entry.slice(1, 3)) ];
-	} else {
-		$c = [ 1 ];
-	}
-	return $c;
+	return __nmap_get(self[0], hash(key));
 }
 function remove(self, key) {
-	self[0].delete(hash(key));
+	__nmap_remove(self[0], hash(key));
 }
 function insert(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
-const block = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "::flex-direction", "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "::gap", "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "::border-radius", "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "768px::padding", "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
-const chain = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "::flex-direction", "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "::gap", "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "::border-radius", "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "768px::padding", "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
+const block = [ [ [ new Map([ [ "::display", [ "::display", [ 0, [ "sbiovxm", "display:flex" ] ] ] ], [ "::flex-direction", [ "::flex-direction", [ 0, [ "s1atdsbb", "flex-direction:column" ] ] ] ], [ "::gap", [ "::gap", [ 0, [ "s8myyrk", "gap:var(--space-4)" ] ] ] ], [ "::padding", [ "::padding", [ 0, [ "s1ufvr2", "padding:var(--space-4)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "siolu0w", "background-color:var(--gray-50)" ] ] ] ], [ "::border-radius", [ "::border-radius", [ 0, [ "s94jklx", "border-radius:8px" ] ] ] ], [ "768px::padding", [ "768px::padding", [ 0, [ "s1wyflm5", "padding:var(--space-6)" ] ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ 0, [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ] ]), undefined ] ] ];
+const chain = [ [ [ new Map([ [ "::display", [ "::display", [ 0, [ "sbiovxm", "display:flex" ] ] ] ], [ "::flex-direction", [ "::flex-direction", [ 0, [ "s1atdsbb", "flex-direction:column" ] ] ] ], [ "::gap", [ "::gap", [ 0, [ "s8myyrk", "gap:var(--space-4)" ] ] ] ], [ "::padding", [ "::padding", [ 0, [ "s1ufvr2", "padding:var(--space-4)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "siolu0w", "background-color:var(--gray-50)" ] ] ] ], [ "::border-radius", [ "::border-radius", [ 0, [ "s94jklx", "border-radius:8px" ] ] ] ], [ "768px::padding", [ "768px::padding", [ 0, [ "s1wyflm5", "padding:var(--space-6)" ] ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ 0, [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(block));
 console.log(class_list(chain));
 console.log("sflnbwj sgdl28p sw0ajwn s9bu6v3 s16sw83c s1e7dqf5 s17s8g64");
 console.log("s1hbuywq s1dwvy7w s3s9k3d scur295 sxzag36 skr9oll");
-const wider = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
+const wider = [ [ [ new Map([ [ "::padding", [ "::padding", [ 0, [ "s1ufvsw", "padding:var(--space-6)" ] ] ] ] ]), undefined ] ] ];
 console.log(class_list(add(block, wider)));
 //# sourceMappingURL=css-block.mjs.map

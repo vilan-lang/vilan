@@ -1209,10 +1209,26 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__db_bind");
         added = true;
     }
+    // M164/M176: every body read and the extern refusal answer a refusal
+    // through `__http_refusal`, which cancels through `__http_cancel`.
+    if helpers.iter().any(|helper| {
+        matches!(
+            *helper,
+            "__http_read_body" | "__http_body_next" | "__http_refuse"
+        )
+    }) && !helpers.contains(&"__http_refusal")
+    {
+        helpers.push("__http_refusal");
+        added = true;
+    }
+    if helpers.contains(&"__http_refusal") && !helpers.contains(&"__http_cancel") {
+        helpers.push("__http_cancel");
+        added = true;
+    }
     // M164: a refused or unread-over-the-cap body lingers its connection.
     if helpers
         .iter()
-        .any(|helper| matches!(*helper, "__http_read_body" | "__http_body_left_unread"))
+        .any(|helper| matches!(*helper, "__http_refusal" | "__http_body_left_unread"))
         && !helpers.contains(&"__http_linger")
     {
         helpers.push("__http_linger");
@@ -1227,6 +1243,20 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__stdin_pump");
         added = true;
     }
+    // M185: every `std::image` helper that reaches the codec drives it
+    // through the one lazily instantiated module, and the module's bytes are
+    // `__image_wasm` — the big one, so it is emitted only here, never for a
+    // program that reads a picture's width and nothing else.
+    if helpers.iter().any(|helper| reaches_image_codec(helper))
+        && !helpers.contains(&"__image_runtime")
+    {
+        helpers.push("__image_runtime");
+        added = true;
+    }
+    if helpers.contains(&"__image_runtime") && !helpers.contains(&"__image_wasm") {
+        helpers.push("__image_wasm");
+        added = true;
+    }
     // `dbg_stack()`'s lines lay their values out with `dbg`'s layout.
     if helpers.contains(&"__dbg_stack") && !helpers.contains(&"__dbg") {
         helpers.push("__dbg");
@@ -1235,6 +1265,51 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
     if added {
         helpers.sort();
     }
+}
+
+/// M185: the `std::image` helpers that drive the wasm codec (and so need
+/// `__image_runtime` and its `__image_wasm`) — every one but the three reads a
+/// JS `Image` answers itself.
+fn reaches_image_codec(helper: &str) -> bool {
+    matches!(
+        helper,
+        "__image_decode"
+            | "__image_sniff"
+            | "__image_from_rgba"
+            | "__image_resize"
+            | "__image_crop"
+            | "__image_encode"
+    )
+}
+
+/// `std::image`'s codec as the one JS statement `__image_wasm` is — written by
+/// `build.rs` from the committed blob under the `image-codec` feature.
+#[cfg(feature = "image-codec")]
+const IMAGE_WASM: &str = include_str!(concat!(env!("OUT_DIR"), "/image_wasm.js"));
+
+/// Without the feature there is no blob, and nothing can emit this: assembly
+/// refuses a program that reaches the codec first ([`image_codec_refusal`]).
+#[cfg(not(feature = "image-codec"))]
+const IMAGE_WASM: &str = "";
+
+/// The refusal a compiler built without `image-codec` (the playground's, the
+/// editor's) answers for a program that reaches `std::image`'s codec — never a
+/// bundle whose codec is missing. `None` when the program does not reach it,
+/// or when this compiler carries the codec.
+fn image_codec_refusal(helpers: &BTreeSet<&'static str>) -> Option<Error> {
+    if cfg!(feature = "image-codec") || !helpers.iter().any(|helper| reaches_image_codec(helper)) {
+        return None;
+    }
+    Some(Error {
+        trace: Vec::new(),
+        note: None,
+        span: Span::default(),
+        msg: "this program decodes, scales, crops or encodes a picture through `std::image`, \
+              and this build of the compiler does not carry the image codec: it was built \
+              without vilan-core's `image-codec` feature (the web playground's compiler leaves \
+              it out to stay small). Build and run the program with the `vilan` CLI"
+            .to_string(),
+    })
 }
 
 /// The `__`-named free externs whose implementations live in the helper table:
@@ -1275,18 +1350,29 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__local_get",
         "__response_header",
         "__http_read_body",
+        "__http_body_next",
+        "__http_claim_body",
+        "__http_refuse",
+        "__http_find",
         "__http_body_left_unread",
         "__http_respond",
+        "__http_refused_body_census",
         "__session_get",
         "__dom_window",
         "__dom_active_element",
         "__dom_computed_style",
         "__dom_bounding_rect",
         "__dom_query_all",
+        "__dom_cut_run",
+        "__dom_remove_run",
+        "__dom_run_nodes",
+        "__dom_run_holds",
         "__router_path",
         "__router_url",
         "__router_state",
         "__module_dir",
+        "__percent_encode",
+        "__dial_on_abort",
         "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1302,6 +1388,15 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__trace_line",
         "__trace_task",
         "__trace_run",
+        "__image_decode",
+        "__image_sniff",
+        "__image_from_rgba",
+        "__image_width",
+        "__image_height",
+        "__image_rgba",
+        "__image_resize",
+        "__image_crop",
+        "__image_encode",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -1527,44 +1622,22 @@ fn helper_source(name: &str) -> &'static str {
         // kept on the request object, so a later `bytes()` answers the same
         // promise; at most `limit` bytes — a declared `Content-Length` over it is
         // refused before a byte of the body is read, a chunked body is counted
-        // per `data` event and refused at the chunk that crosses it. A refusal
-        // answers `413` with `Connection: close` — node destroys the socket once
-        // it is flushed, and the stream is paused, so the rest is never read —
-        // under RFC 9110's phrase (node's table still says `Payload Too Large`;
-        // the native server says the RFC's, so the two answer one status line),
-        // and rejects with an `AbortError`: the handler ends as a cancelled task
-        // does, and `__http_respond` keeps that quiet. A client that goes away
-        // mid-body (`error`, node's `aborted`) ends it the same way — before
-        // M164 that rejection reached node unhandled and ended the process. The
-        // `error` listener stays on: node raises a request's `error` only to a
-        // listener, and a second one with none would.
+        // per `data` event and refused at the chunk that crosses it. A refusal is
+        // `__http_refusal`'s `413`, and the read rejects with its `AbortError`:
+        // the handler ends as a cancelled task does, and `__http_respond` keeps
+        // that quiet. A client that goes away mid-body (`error`, node's
+        // `aborted`) ends it the same way — before M164 that rejection reached
+        // node unhandled and ended the process. The `error` listener stays on:
+        // node raises a request's `error` only to a listener, and a second one
+        // with none would.
         "__http_read_body" => {
             "function __http_read_body(request, response, limit) {\n\
              \tif (request.__vilan_body !== undefined) return request.__vilan_body;\n\
              \trequest.__vilan_body = new Promise((resolve, reject) => {\n\
-             \t\tconst over = (message) => {\n\
-             \t\t\tconst error = new Error(message);\n\
-             \t\t\terror.name = \"AbortError\";\n\
-             \t\t\treturn error;\n\
-             \t\t};\n\
-             \t\tconst refuse = () => {\n\
-             \t\t\trequest.removeAllListeners(\"data\");\n\
-             \t\t\trequest.pause();\n\
-             \t\t\tif (!response.headersSent) {\n\
-             \t\t\t\tresponse.statusCode = 413;\n\
-             \t\t\t\tresponse.statusMessage = \"Content Too Large\";\n\
-             \t\t\t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
-             \t\t\t\tresponse.setHeader(\"Connection\", \"close\");\n\
-             \t\t\t\t__http_linger(request);\n\
-             \t\t\t\tresponse.end(\"the request body is larger than \" + limit + \" bytes\");\n\
-             \t\t\t} else {\n\
-             \t\t\t\trequest.socket.destroy();\n\
-             \t\t\t}\n\
-             \t\t\treject(over(\"the request body is larger than \" + limit + \" bytes\"));\n\
-             \t\t};\n\
-             \t\trequest.on(\"error\", () => reject(over(\"the client went away before the request body arrived\")));\n\
+             \t\tconst refuse = () => reject(__http_refusal(request, response, 413, \"the request body is larger than \" + limit + \" bytes\"));\n\
+             \t\trequest.on(\"error\", () => reject(__http_cancel(\"the client went away before the request body arrived\")));\n\
              \t\tif (request.readableEnded || response.writableEnded) {\n\
-             \t\t\treject(over(\"the request body was read after the request was answered\"));\n\
+             \t\t\treject(__http_cancel(\"the request body was read after the request was answered\"));\n\
              \t\t\treturn;\n\
              \t\t}\n\
              \t\tconst declared = request.headers[\"content-length\"];\n\
@@ -1588,18 +1661,177 @@ fn helper_source(name: &str) -> &'static str {
              \treturn request.__vilan_body;\n\
              }"
         }
+        // M176: `std::http`'s request body as a STREAM — `BodyReader::next`. The
+        // first call starts it (the cap's declared-length check, then the
+        // listeners); every call queues a waiter and pumps. The pump answers
+        // waiters from what has arrived — at most `size` bytes each, a node
+        // chunk split with `subarray` when it is longer (two disjoint views, so
+        // neither is ever overwritten) — and RESUMES the request only while a
+        // waiter has nothing to take, pausing it again the moment none is
+        // waiting: a paused `IncomingMessage` stops node's parser reading the
+        // socket once its buffer fills, so the client's writes stall rather
+        // than the server buffering an upload nobody asked for yet. Every piece
+        // is counted against `limit` as it arrives (`__http_refusal`'s `413`,
+        // mid-stream too: the rest is never read); a client gone mid-body, a
+        // refusal, or a read after the answer FAILS the stream, and every
+        // waiter, then and later, rejects with that cancellation. The end is
+        // `[ 1 ]` (`None`), a piece `[ 0, chunk ]`.
+        "__http_body_next" => {
+            "function __http_body_next(request, response, limit, size) {\n\
+             \tlet stream = request.__vilan_stream;\n\
+             \tif (stream === undefined) {\n\
+             \t\tstream = request.__vilan_stream = { chunks: [], ended: false, failure: null, waiters: [] };\n\
+             \t\tstream.pump = () => {\n\
+             \t\t\twhile (stream.waiters.length > 0) {\n\
+             \t\t\t\tif (stream.failure !== null) {\n\
+             \t\t\t\t\tstream.waiters.shift().reject(stream.failure);\n\
+             \t\t\t\t} else if (stream.chunks.length > 0) {\n\
+             \t\t\t\t\tconst waiter = stream.waiters.shift();\n\
+             \t\t\t\t\tconst chunk = stream.chunks[0];\n\
+             \t\t\t\t\tif (chunk.length <= waiter.size) {\n\
+             \t\t\t\t\t\tstream.chunks.shift();\n\
+             \t\t\t\t\t\twaiter.resolve([ 0, chunk ]);\n\
+             \t\t\t\t\t} else {\n\
+             \t\t\t\t\t\tstream.chunks[0] = chunk.subarray(waiter.size);\n\
+             \t\t\t\t\t\twaiter.resolve([ 0, chunk.subarray(0, waiter.size) ]);\n\
+             \t\t\t\t\t}\n\
+             \t\t\t\t} else if (stream.ended) {\n\
+             \t\t\t\t\tstream.waiters.shift().resolve([ 1 ]);\n\
+             \t\t\t\t} else {\n\
+             \t\t\t\t\trequest.resume();\n\
+             \t\t\t\t\treturn;\n\
+             \t\t\t\t}\n\
+             \t\t\t}\n\
+             \t\t\tif (!stream.ended && stream.failure === null) request.pause();\n\
+             \t\t};\n\
+             \t\tstream.fail = (error) => {\n\
+             \t\t\tif (stream.failure === null) stream.failure = error;\n\
+             \t\t\tstream.chunks.length = 0;\n\
+             \t\t\tstream.pump();\n\
+             \t\t};\n\
+             \t\tconst declared = request.headers[\"content-length\"];\n\
+             \t\tif (request.readableEnded || response.writableEnded) {\n\
+             \t\t\tstream.fail(__http_cancel(\"the request body was read after the request was answered\"));\n\
+             \t\t} else if (declared !== undefined && Number(declared) > limit) {\n\
+             \t\t\t__http_refusal(request, response, 413, \"the request body is larger than \" + limit + \" bytes\");\n\
+             \t\t} else {\n\
+             \t\t\tlet total = 0;\n\
+             \t\t\trequest.on(\"error\", () => stream.fail(__http_cancel(\"the client went away before the request body arrived\")));\n\
+             \t\t\trequest.on(\"data\", (chunk) => {\n\
+             \t\t\t\ttotal += chunk.length;\n\
+             \t\t\t\tif (total > limit) {\n\
+             \t\t\t\t\t__http_refusal(request, response, 413, \"the request body is larger than \" + limit + \" bytes\");\n\
+             \t\t\t\t\treturn;\n\
+             \t\t\t\t}\n\
+             \t\t\t\tstream.chunks.push(chunk);\n\
+             \t\t\t\tstream.pump();\n\
+             \t\t\t});\n\
+             \t\t\trequest.once(\"end\", () => {\n\
+             \t\t\t\tstream.ended = true;\n\
+             \t\t\t\tstream.pump();\n\
+             \t\t\t});\n\
+             \t\t}\n\
+             \t}\n\
+             \treturn new Promise((resolve, reject) => {\n\
+             \t\tstream.waiters.push({ size, resolve, reject });\n\
+             \t\tstream.pump();\n\
+             \t});\n\
+             }"
+        }
+        // M176: the one-way-of-reading claim (`std::http`'s `claim_read`): the
+        // first claim sticks to the request object — every copy of the vilan
+        // `Request` is one host request — and the earlier one is answered.
+        "__http_claim_body" => {
+            "function __http_claim_body(request, how) {\n\
+             \tconst earlier = request.__vilan_claim ?? \"\";\n\
+             \tif (earlier === \"\") request.__vilan_claim = how;\n\
+             \treturn earlier;\n\
+             }"
+        }
+        // A cancellation, as `__http_respond` recognises one.
+        "__http_cancel" => {
+            "function __http_cancel(message) {\n\
+             \tconst error = new Error(message);\n\
+             \terror.name = \"AbortError\";\n\
+             \treturn error;\n\
+             }"
+        }
+        // M164/M176: every refusal of a request — a body over its cap (`413`),
+        // a malformed form (`400`), a handler reading one body two ways
+        // (`500`) — answered the one way. The body stops here: the `data`
+        // listeners go, the request pauses, and `__http_linger` stops the
+        // socket and keeps the answer from being overtaken by a reset. The
+        // status goes out with `Connection: close` — node destroys the socket
+        // once it is flushed — and RFC 9110's phrase for a `413` (node's table
+        // still says `Payload Too Large`; the native server says the RFC's, so
+        // the two answer one status line). A response already under way cannot
+        // become a refusal, so its socket is cut instead. A `5xx` is the
+        // server's own fault and is written to stderr too. Answers the
+        // cancellation the caller rejects (or throws) with, after failing a
+        // stream in progress with it, so a later `next` ends the same way.
+        "__http_refusal" => {
+            "function __http_refusal(request, response, status, message) {\n\
+             \trequest.removeAllListeners(\"data\");\n\
+             \trequest.pause();\n\
+             \tif (status >= 500) console.error(\"std::http: \" + message);\n\
+             \tif (!response.headersSent) {\n\
+             \t\tresponse.statusCode = status;\n\
+             \t\tif (status === 413) response.statusMessage = \"Content Too Large\";\n\
+             \t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
+             \t\tresponse.setHeader(\"Connection\", \"close\");\n\
+             \t\t__http_linger(request);\n\
+             \t\tresponse.end(message);\n\
+             \t} else {\n\
+             \t\trequest.socket.destroy();\n\
+             \t}\n\
+             \tconst error = __http_cancel(message);\n\
+             \tif (request.__vilan_stream !== undefined) request.__vilan_stream.fail(error);\n\
+             \treturn error;\n\
+             }"
+        }
+        // `std::http`'s `refuse`: the refusal, thrown — the handler ends there.
+        "__http_refuse" => {
+            "function __http_refuse(request, response, status, message) {\n\
+             \tthrow __http_refusal(request, response, status, message);\n\
+             }"
+        }
+        // M177: where `needle` next occurs in `haystack` at or after `from` —
+        // `Buffer.indexOf` over the same memory, which takes a byte sequence
+        // where `Uint8Array.indexOf` takes one element. `[ 1 ]` (`None`) when it
+        // does not.
+        "__http_find" => {
+            "function __http_find(haystack, needle, from) {\n\
+             \tconst at = Buffer.from(haystack.buffer, haystack.byteOffset, haystack.byteLength).indexOf(needle, from);\n\
+             \treturn at < 0 ? [ 1 ] : [ 0, at ];\n\
+             }"
+        }
         // M164's keep-alive rule: an UNREAD body the connection should not drain
         // — declared over the cap, or chunked (no length to bound the drain by).
         // A body within the cap is left to node, which discards it and keeps the
         // connection; `request.complete` is a body that already arrived whole.
+        // M176: a STREAM the handler left unfinished is the same body, with the
+        // stream's hold on it let go first (its listeners and what it buffered).
+        // Node discards an unread body itself only when nothing ever read from
+        // it (`_consuming`), so a started stream within the cap is resumed here
+        // with no listener left — node's own discard, by hand.
         "__http_body_left_unread" => {
             "function __http_body_left_unread(request, limit) {\n\
-             \tif (request.__vilan_body !== undefined || request.complete) return false;\n\
+             \tconst stream = request.__vilan_stream;\n\
+             \tif (stream !== undefined) {\n\
+             \t\trequest.removeAllListeners(\"data\");\n\
+             \t\tstream.chunks.length = 0;\n\
+             \t\tif (stream.ended || stream.failure !== null) return false;\n\
+             \t}\n\
+             \tif (request.__vilan_body !== undefined || request.complete) {\n\
+             \t\tif (stream !== undefined) request.resume();\n\
+             \t\treturn false;\n\
+             \t}\n\
              \tconst declared = request.headers[\"content-length\"];\n\
              \tconst leaves = declared === undefined\n\
              \t\t? request.headers[\"transfer-encoding\"] !== undefined\n\
              \t\t: Number(declared) > limit;\n\
              \tif (leaves) __http_linger(request);\n\
+             \telse if (stream !== undefined) request.resume();\n\
              \treturn leaves;\n\
              }"
         }
@@ -1616,12 +1848,37 @@ fn helper_source(name: &str) -> &'static str {
         // already dumped keeps the socket paused, so the client's writes stall.
         // `_dumped` is node's own flag; were it renamed, node would read and
         // discard again, which is slower and still correct.
+        //
+        // B687: the socket stops reading HERE, at the decision, not at the
+        // answer's flush — between the two, `_dumped` keeps node's parser from
+        // ever pausing it, so a client already writing was read until the
+        // flush. And it STAYS stopped: node's http server restarts a socket
+        // from two places (`IncomingMessage._read` resumes it, and the socket's
+        // own `_read` starts its handle), so both are made inert for the half
+        // second the socket has left. What it reads after the decision anyway
+        // is counted (`globalThis.__vilan_refused_body`, read by
+        // `__http_refused_body_census`): an instrument, deciding nothing.
         "__http_linger" => {
             "function __http_linger(request) {\n\
              \tconst socket = request.socket;\n\
              \tif (!socket || socket.__vilan_linger) return;\n\
              \tsocket.__vilan_linger = true;\n\
              \trequest._dumped = true;\n\
+             \tconst census = (globalThis.__vilan_refused_body ??= { read: 0, open: new Map() });\n\
+             \tcensus.open.set(socket, socket.bytesRead);\n\
+             \tsocket.once(\"close\", () => {\n\
+             \t\tcensus.read += socket.bytesRead - census.open.get(socket);\n\
+             \t\tcensus.open.delete(socket);\n\
+             \t});\n\
+             \tsocket.pause();\n\
+             \tif (socket._handle && socket._handle.reading) {\n\
+             \t\tsocket._handle.reading = false;\n\
+             \t\tsocket._handle.readStop();\n\
+             \t}\n\
+             \tsocket.resume = function () {\n\
+             \t\treturn this;\n\
+             \t};\n\
+             \tsocket._read = function () {};\n\
              \tsocket.destroySoon = function () {\n\
              \t\tthis.pause();\n\
              \t\tthis.end();\n\
@@ -1633,14 +1890,39 @@ fn helper_source(name: &str) -> &'static str {
         // M164: one request's answer, with a CANCELLATION ended quietly — node
         // ignores the promise a `createServer` callback returns, so a refused
         // body's `AbortError` would otherwise be an unhandled rejection, which
-        // ends the process. Any other failure is rethrown, unchanged.
+        // ends the process. M179: any other failure (a handler's panic) is
+        // reported ONCE, in the line an unobserved task's failure prints (the
+        // native server's executor prints the same one), and answered `500`
+        // with `Connection: close` when the response has not started — cut off
+        // when it has — and the server goes on serving.
         "__http_respond" => {
-            "async function __http_respond(body) {\n\
+            "async function __http_respond(response, body) {\n\
              \ttry {\n\
              \t\tawait body();\n\
              \t} catch (error) {\n\
-             \t\tif (!error || error.name !== \"AbortError\") throw error;\n\
+             \t\tif (error && error.name === \"AbortError\") return;\n\
+             \t\tconsole.error(\"unhandled task error (spawned in an http request handler): \" + String(error));\n\
+             \t\tif (!response.headersSent) {\n\
+             \t\t\tresponse.statusCode = 500;\n\
+             \t\t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
+             \t\t\tresponse.setHeader(\"Connection\", \"close\");\n\
+             \t\t\tresponse.end(\"internal server error\");\n\
+             \t\t} else if (!response.writableEnded) {\n\
+             \t\t\tresponse.destroy();\n\
+             \t\t}\n\
              \t}\n\
+             }"
+        }
+        // B687: how many body bytes the server took off its sockets after it
+        // decided not to read them (`__http_linger` counts) — the open sockets
+        // read live, so the figure is exact at the call. Zero is the contract.
+        "__http_refused_body_census" => {
+            "function __http_refused_body_census() {\n\
+             \tconst census = globalThis.__vilan_refused_body;\n\
+             \tif (!census) return 0;\n\
+             \tlet read = census.read;\n\
+             \tfor (const [socket, start] of census.open) read += socket.bytesRead - start;\n\
+             \treturn read;\n\
              }"
         }
         "__local_get" => {
@@ -1693,6 +1975,56 @@ fn helper_source(name: &str) -> &'static str {
              \treturn Array.from(element.querySelectorAll(selector));\n\
              }"
         }
+        // M187: a `std::web::ui` region's RUN of sibling nodes, walked by
+        // `nextSibling` — what a DOM Range did before, without the Range. A
+        // Range is LIVE until it is collected: the browser updates every one
+        // still alive on every mutation of its document, so a Range per row
+        // made closing a long list quadratic and slowed everything after it.
+        // A walk leaves nothing behind. `__dom_cut_run` takes every node
+        // strictly between `after` and `before` into a fresh fragment (a
+        // row's order-pass cut); `__dom_remove_run` removes `from` and every
+        // node after it up to, not including, `before` (a row's retirement,
+        // a region's close).
+        "__dom_cut_run" => {
+            "function __dom_cut_run(after, before) {\n\
+             \tconst fragment = document.createDocumentFragment();\n\
+             \tfor (let node = after.nextSibling; node !== null && node !== before; ) {\n\
+             \t\tconst next = node.nextSibling;\n\
+             \t\tfragment.appendChild(node);\n\
+             \t\tnode = next;\n\
+             \t}\n\
+             \treturn fragment;\n\
+             }"
+        }
+        "__dom_remove_run" => {
+            "function __dom_remove_run(from, before) {\n\
+             \tfor (let node = from; node !== null && node !== before; ) {\n\
+             \t\tconst next = node.nextSibling;\n\
+             \t\tnode.remove();\n\
+             \t\tnode = next;\n\
+             \t}\n\
+             }"
+        }
+        // M187: a run that is LEAVING the document whole, as the set of its
+        // top-level nodes, and the question a region inside it asks — does a
+        // walk up from my anchor meet one of them. A set, so that a closing
+        // run of n rows answers each of the n nested regions in a walk as
+        // deep as the nesting, not one as long as the run.
+        "__dom_run_nodes" => {
+            "function __dom_run_nodes(from, before) {\n\
+             \tconst nodes = new Set();\n\
+             \tfor (let node = from; node !== null && node !== before; node = node.nextSibling) nodes.add(node);\n\
+             \treturn nodes;\n\
+             }"
+        }
+        "__dom_run_holds" => {
+            "function __dom_run_holds(nodes, node) {\n\
+             \tfor (let walk = node; walk !== null; walk = walk.parentNode) {\n\
+             \t\tif (nodes.has(walk)) return true;\n\
+             \t}\n\
+             \treturn false;\n\
+             }"
+        }
         // Router glue (std::web::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
@@ -1718,18 +2050,54 @@ fn helper_source(name: &str) -> &'static str {
         "__router_url" => {
             "function __router_url() {\n\treturn location.pathname + location.search + location.hash;\n}"
         }
-        // `router::percent_decode`: `decodeURIComponent`, made TOTAL. The host
-        // function throws a `URIError` on a malformed escape (`%zz`, a lone
-        // `%`), and a URL is attacker-supplied text — a router that crashes on
-        // one is a denial of service, so an undecodable piece decodes to
-        // itself.
+        // `std::rpc`'s dial listening on its cancel signal (A179): run the
+        // handler once on abort — at once when the signal already fired, the
+        // way `__sleep` checks first — and hand back the means to take the
+        // listener off again, so an abort after the dial settled reaches
+        // nothing of the dial's and a long-lived signal does not keep one
+        // listener per attempt.
+        "__dial_on_abort" => {
+            "function __dial_on_abort(signal, handler) {\n\
+             \tif (signal.aborted) {\n\
+             \t\thandler();\n\
+             \t\treturn { detach() {} };\n\
+             \t}\n\
+             \tconst listener = () => handler();\n\
+             \tsignal.addEventListener(\"abort\", listener, { once: true });\n\
+             \treturn { detach() { signal.removeEventListener(\"abort\", listener); } };\n\
+             }"
+        }
+        // `std::url::percent_encode` (M181): `encodeURIComponent`, made
+        // TOTAL. The host function throws a `URIError` on a lone surrogate, which
+        // a JS string can hold and a native (UTF-8) `str` cannot; the retry
+        // encodes each one as U+FFFD (`%EF%BF%BD`), the replacement character,
+        // rather than failing. The fast path is the host call alone.
+        "__percent_encode" => {
+            "function __percent_encode(text) {\n\
+             \ttry {\n\
+             \t\treturn encodeURIComponent(text);\n\
+             \t} catch {\n\
+             \t\treturn encodeURIComponent(text.replace(/[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]/g, \"\\uFFFD\"));\n\
+             \t}\n\
+             }"
+        }
+        // `std::url::percent_decode` (M181; `std::web::router` re-exports
+        // it): `decodeURIComponent`, made TOTAL. The host function throws a
+        // `URIError` on a malformed escape (`%zz`, a lone `%`) or on escapes
+        // that are not UTF-8, and a URL is attacker-supplied text — a router
+        // that crashes on one is a denial of service. So the host function is
+        // applied to each MAXIMAL RUN of `%XX` escapes, and a run it refuses
+        // stays as written; text that is no escape never reaches it.
+        // `vilan_rt::url::percent_decode` is the native twin, rule for rule.
         "__percent_decode" => {
             "function __percent_decode(text) {\n\
-             \ttry {\n\
-             \t\treturn decodeURIComponent(text);\n\
-             \t} catch {\n\
-             \t\treturn text;\n\
-             \t}\n\
+             \treturn text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {\n\
+             \t\ttry {\n\
+             \t\t\treturn decodeURIComponent(run);\n\
+             \t\t} catch {\n\
+             \t\t\treturn run;\n\
+             \t\t}\n\
+             \t});\n\
              }"
         }
         // HMR activity guard (std::web::dev, `hmr.md` §4/§5): true only when a `run
@@ -2221,6 +2589,107 @@ fn helper_source(name: &str) -> &'static str {
         // `require("fs")` inside the emitted ES module (`.mjs` since B86b,
         // v0.33.0), and its own `catch` turned the `ReferenceError` into ""
         // for every call.
+        // M185 (proposal/image.md §2): `std::image` on node is `vilan-image` —
+        // the codec core the native backend links — built for wasm32 and
+        // carried here as base64 (`vilan-core`'s build script writes this
+        // statement from the committed `crates/vilan-image-wasm/vilan_image.wasm`).
+        // Emitted only beside `__image_runtime`, so a program that never
+        // reaches the codec carries none of it.
+        "__image_wasm" => IMAGE_WASM,
+        // The module, instantiated on FIRST use and kept (`std::image` is
+        // `@process`: node, deno and bun all compile a module this size
+        // synchronously), and the protocol `vilan-image-wasm`'s crate header
+        // describes: bytes are written into a buffer the module allocates and
+        // CONSUMES, one scratch picture lives in it between the calls of one
+        // helper, and every result is COPIED out into a `Uint8Array` of the
+        // program's own — so wasm memory holds nothing a vilan value points at,
+        // and nothing leaks. A JS `Image` is `{ width, height, pixels }`.
+        //
+        // A trap inside the module (an allocation past wasm32's 4 GiB, a
+        // codec bug) can leave its scratch state mid-update, so the instance
+        // is dropped and the next call instantiates a fresh one; the trap
+        // itself travels on as the throw it is, as a native panic would.
+        // Refusals the surface types as `Result` arrive as status 1 with the
+        // sentence in the module's output, and leave as `[ 1, sentence ]`.
+        "__image_runtime" => {
+            "let __image_exports;\n\
+             function __image_runtime(body) {\n\
+             \tif (__image_exports === undefined) {\n\
+             \t\tconst bytes = typeof Buffer === \"function\" ? Buffer.from(__image_wasm, \"base64\") : Uint8Array.from(atob(__image_wasm), (c) => c.charCodeAt(0));\n\
+             \t\t__image_exports = new WebAssembly.Instance(new WebAssembly.Module(bytes), {}).exports;\n\
+             \t}\n\
+             \tconst exports = __image_exports;\n\
+             \ttry {\n\
+             \t\treturn body(exports);\n\
+             \t} catch (error) {\n\
+             \t\t__image_exports = undefined;\n\
+             \t\tthrow error;\n\
+             \t}\n\
+             }\n\
+             function __image_put(exports, bytes) {\n\
+             \tconst pointer = exports.image_alloc(bytes.length);\n\
+             \tnew Uint8Array(exports.memory.buffer, pointer, bytes.length).set(bytes);\n\
+             \treturn pointer;\n\
+             }\n\
+             function __image_load(exports, image) {\n\
+             \texports.image_load(image.width, image.height, __image_put(exports, image.pixels), image.pixels.length);\n\
+             }\n\
+             function __image_take(exports) {\n\
+             \tconst pixels = new Uint8Array(exports.memory.buffer, exports.image_pixels(), exports.image_pixels_len()).slice();\n\
+             \treturn { width: exports.image_width(), height: exports.image_height(), pixels };\n\
+             }\n\
+             function __image_output(exports) {\n\
+             \treturn new Uint8Array(exports.memory.buffer, exports.image_output(), exports.image_output_len()).slice();\n\
+             }\n\
+             function __image_refusal(exports) {\n\
+             \treturn [ 1, new TextDecoder().decode(__image_output(exports)) ];\n\
+             }"
+        }
+        "__image_decode" => {
+            "function __image_decode(bytes, limit) {\n\
+             \treturn __image_runtime((exports) => exports.image_decode(__image_put(exports, bytes), bytes.length, limit) === 0 ? [ 0, __image_take(exports) ] : __image_refusal(exports));\n\
+             }"
+        }
+        "__image_sniff" => {
+            "function __image_sniff(bytes) {\n\
+             \treturn __image_runtime((exports) => exports.image_sniff(__image_put(exports, bytes), bytes.length));\n\
+             }"
+        }
+        "__image_from_rgba" => {
+            "function __image_from_rgba(width, height, pixels) {\n\
+             \treturn __image_runtime((exports) => exports.image_load(width, height, __image_put(exports, pixels), pixels.length) === 0 ? [ 0, __image_take(exports) ] : __image_refusal(exports));\n\
+             }"
+        }
+        // The three reads touch no codec: the JS `Image` holds its own size
+        // and its own copy of the pixels, and `rgba` hands out a copy of that.
+        "__image_width" => "function __image_width(image) {\n\treturn image.width;\n}",
+        "__image_height" => "function __image_height(image) {\n\treturn image.height;\n}",
+        "__image_rgba" => "function __image_rgba(image) {\n\treturn image.pixels.slice();\n}",
+        "__image_resize" => {
+            "function __image_resize(image, width, height, fit) {\n\
+             \treturn __image_runtime((exports) => {\n\
+             \t\t__image_load(exports, image);\n\
+             \t\treturn exports.image_resize(width, height, fit) === 0 ? [ 0, __image_take(exports) ] : __image_refusal(exports);\n\
+             \t});\n\
+             }"
+        }
+        "__image_crop" => {
+            "function __image_crop(image, x, y, width, height) {\n\
+             \treturn __image_runtime((exports) => {\n\
+             \t\t__image_load(exports, image);\n\
+             \t\texports.image_crop(x, y, width, height);\n\
+             \t\treturn __image_take(exports);\n\
+             \t});\n\
+             }"
+        }
+        "__image_encode" => {
+            "function __image_encode(image, format, quality) {\n\
+             \treturn __image_runtime((exports) => {\n\
+             \t\t__image_load(exports, image);\n\
+             \t\treturn exports.image_encode(format, quality) === 0 ? [ 0, __image_output(exports) ] : __image_refusal(exports);\n\
+             \t});\n\
+             }"
+        }
         "__stdin_pump" => {
             "const __vilan_stdin = { buffer: Buffer.alloc(0), ended: false, carriage: false, started: false, waiters: [] };\n\
              function __stdin_start() {\n\
@@ -2468,16 +2937,15 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              \treturn __dbg_group(open, \"}\", true, entries, fill);\n\
              }\n\
-             function __dbg_map(open, table, showKey, showValue, keyWidth, valueWidth) {\n\
-             \tconst items = Array.from(table.values());\n\
-             \treturn __dbg_members(open, items, (pair) => {\n\
-             \t\tconst key = keyWidth === 1 ? pair[0] : pair.slice(0, keyWidth);\n\
-             \t\tconst value = valueWidth === 1 ? pair[keyWidth] : pair.slice(keyWidth, keyWidth + valueWidth);\n\
-             \t\treturn [ __dbg_flat(showKey(key)) + \" => \", showValue(value) ];\n\
-             \t});\n\
+             function __dbg_map(open, table, showKey, showValue) {\n\
+             \tconst items = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) items.push([ entry[0], entry[1][1] ]);\n\
+             \treturn __dbg_members(open, items, (entry) => [ __dbg_flat(showKey(entry[0])) + \" => \", showValue(entry[1]) ]);\n\
              }\n\
              function __dbg_set(open, table, show, fill) {\n\
-             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ], fill);\n\
+             \tconst items = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) items.push(entry[0]);\n\
+             \treturn __dbg_members(open, items, (item) => [ \"\", show(item) ], fill);\n\
              }\n\
              function __dbg_str(text) {\n\
              \tlet out = \"\\\"\";\n\
@@ -2488,6 +2956,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\telse if (character === \"\\t\") out += \"\\\\t\";\n\
              \t\telse if (character === \"\\r\") out += \"\\\\r\";\n\
              \t\telse if (character === \"\\0\") out += \"\\\\0\";\n\
+             \t\telse if (character < \" \" || character === \"\\x7f\") out += \"\\\\u{\" + character.charCodeAt(0).toString(16) + \"}\";\n\
              \t\telse out += character;\n\
              \t}\n\
              \treturn out + \"\\\"\";\n\
@@ -2609,10 +3078,34 @@ fn helper_source(name: &str) -> &'static str {
         // -1)` quietly returns `s[0..k]`, the complement of the request; and it
         // clamps `end` past the length rather than saying so. One rule replaces
         // all three guesses: `0 <= start <= end <= len`, refused otherwise.
+        //
+        // B695 (strings.md, "A cut inside a surrogate pair"): a bound that falls
+        // between the two halves of a pair moves back to the pair's start, so
+        // no cut answers half a character — natively the half is
+        // unrepresentable, and flooring keeps `s.substring(0, k) +
+        // s.substring(k, s.len())` equal to `s` at every `k`.
         "__substring" => {
             "function __substring(text, start, end) {\n\
-             \tif (0 <= start && start <= end && end <= text.length) return text.substring(start, end);\n\
+             \tif (0 <= start && start <= end && end <= text.length) return text.substring(__code_point_floor(text, start), __code_point_floor(text, end));\n\
              \tthrow \"substring out of range: the length is \" + text.length + \" but the range is \" + start + \"..\" + end + \" — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end\";\n\
+             }\n\
+             function __code_point_floor(text, at) {\n\
+             \treturn at > 0 && (text.charCodeAt(at) & 0xFC00) === 0xDC00 && (text.charCodeAt(at - 1) & 0xFC00) === 0xD800 ? at - 1 : at;\n\
+             }"
+        }
+        // B695: `split` and `replace` over an EMPTY pattern cut between every
+        // code UNIT on the host — `"😀".split("")` is two lone halves — where
+        // natively they cut between characters. Over code points on both: the
+        // helper is emitted only where the pattern is not a non-empty literal.
+        "__str_split" => {
+            "function __str_split(text, separator) {\n\
+             \treturn separator === \"\" ? Array.from(text) : text.split(separator);\n\
+             }"
+        }
+        "__str_replace" => {
+            "function __str_replace(text, from, to) {\n\
+             \tif (from !== \"\") return text.replaceAll(from, to);\n\
+             \treturn text === \"\" ? to : to + Array.from(text).join(to) + to;\n\
              }"
         }
         // `List.pop(): Option<T>` — removes and returns the last element (no clone:
@@ -2629,10 +3122,14 @@ fn helper_source(name: &str) -> &'static str {
             "function __list_sort_by(list, compare) {\n\treturn list.slice().sort(compare);\n}"
         }
         // `List.to_array<const N>(self): Option<[T; N]>` (A172) — `Some` of a
-        // copy when the length is `N`, `None` otherwise. A copy for the reason
-        // `sort_by`'s is one: `self` is by value and the array grows apart.
+        // copy when the length is `N`, `None` otherwise: the array and the list
+        // grow apart. A DEEP copy, because `self` is a loan (bare, not `own`,
+        // so the caller hands the list itself) and the answer is a fresh value
+        // nothing else copies: a shallow `slice()` shared every aggregate
+        // element with the list, which `unwrap`'s payload copy hid until B691
+        // let the caller's copy stand in for it.
         "__list_to_array" => {
-            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.slice() ] : [ 1 ];\n}"
+            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.map(__clone) ] : [ 1 ];\n}"
         }
         // `Option.take(&mut self): Option<T>` — snapshot the slot (a structural
         // copy, not a deep clone: the payload MOVES out), then rewrite it to `None`
@@ -2662,6 +3159,117 @@ fn helper_source(name: &str) -> &'static str {
         "__map_get" => {
             "function __map_get(map, key) {\n\treturn map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];\n}"
         }
+        // `NativeMap<K, V>` (M191, hash-map-lend.md §10): the table is the pair
+        // `[ map, pending ]` — a JS `Map` from the hash to the entry `[ key,
+        // slot ]`, the slot the `Option` array itself, so a view of it IS the
+        // stored object (`__replace`, `take`, `replace` write it in place); and
+        // the hash of the slot last lent by `slot`, which every write settles
+        // first (a slot still `None` loses its key). A pair rather than an
+        // expando on the `Map` so `__clone` (and the const-eval interpreter,
+        // and a const value) carry the mark as they carry any array slot. A
+        // `None` slot is a tombstone: every read below skips it.
+        "__nmap_settle" => {
+            "function __nmap_settle(table) {\n\
+             \tconst hash = table[1];\n\
+             \tif (hash === undefined) return;\n\
+             \ttable[1] = undefined;\n\
+             \tconst entry = table[0].get(hash);\n\
+             \tif (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);\n\
+             }"
+        }
+        // An overwrite keeps the entry and replaces its slot with a FRESH one
+        // (a copy taken out of the old slot stays what it was), unless the slot
+        // already holds this very value — a set's `void`, a scalar written
+        // again — where there is nothing to replace.
+        "__nmap_insert" => {
+            "function __nmap_insert(table, hash, key, value) {\n\
+             \t__nmap_settle(table);\n\
+             \tconst entry = table[0].get(hash);\n\
+             \tif (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);\n\
+             \telse {\n\
+             \t\tentry[0] = key;\n\
+             \t\tif (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];\n\
+             \t}\n\
+             }"
+        }
+        "__nmap_get" => {
+            "function __nmap_get(table, hash) {\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];\n\
+             }"
+        }
+        "__nmap_key" => {
+            "function __nmap_key(table, hash) {\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[0]) ] : [ 1 ];\n\
+             }"
+        }
+        // The slot IN PLACE, no `__clone`: the `&` discipline is what makes the
+        // alias safe, as `descend`'s closures already rely on.
+        "__nmap_lend" => {
+            "function __nmap_lend(table, hash, read) {\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn read(entry !== undefined ? entry[1] : [ 1 ]);\n\
+             }"
+        }
+        "__nmap_slot" => {
+            "function __nmap_slot(table, hash, key) {\n\
+             \t__nmap_settle(table);\n\
+             \tlet entry = table[0].get(hash);\n\
+             \tif (entry === undefined) {\n\
+             \t\tentry = [ key, [ 1 ] ];\n\
+             \t\ttable[0].set(hash, entry);\n\
+             \t}\n\
+             \ttable[1] = hash;\n\
+             \treturn entry[1];\n\
+             }"
+        }
+        // Only the pending slot can be a tombstone (every write settles the last
+        // one), so any other hash is a plain `has`.
+        "__nmap_has" => {
+            "function __nmap_has(table, hash) {\n\
+             \tif (hash !== table[1]) return table[0].has(hash);\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn entry !== undefined && entry[1][0] === 0;\n\
+             }"
+        }
+        "__nmap_remove" => {
+            "function __nmap_remove(table, hash) {\n\
+             \t__nmap_settle(table);\n\
+             \ttable[0].delete(hash);\n\
+             }"
+        }
+        "__nmap_len" => {
+            "function __nmap_len(table) {\n\
+             \tconst hash = table[1];\n\
+             \tif (hash !== undefined) {\n\
+             \t\tconst entry = table[0].get(hash);\n\
+             \t\tif (entry !== undefined && entry[1][0] === 1) return table[0].size - 1;\n\
+             \t}\n\
+             \treturn table[0].size;\n\
+             }"
+        }
+        "__nmap_hashes" => {
+            "function __nmap_hashes(table) {\n\
+             \tconst out = [];\n\
+             \tfor (const [ hash, entry ] of table[0]) if (entry[1][0] === 0) out.push(hash);\n\
+             \treturn out;\n\
+             }"
+        }
+        "__nmap_keys" => {
+            "function __nmap_keys(table) {\n\
+             \tconst out = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[0]);\n\
+             \treturn out.map(__clone);\n\
+             }"
+        }
+        "__nmap_values" => {
+            "function __nmap_values(table) {\n\
+             \tconst out = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(entry[1][1]);\n\
+             \treturn out.map(__clone);\n\
+             }"
+        }
         // `Map.keys()`/`Map.values(): List<_>` — a fresh array snapshot (cloned, so
         // it can't alias the map's stored entries) in insertion order.
         "__map_keys" => "function __map_keys(map) {\n\treturn [ ...map.keys() ].map(__clone);\n}",
@@ -2669,8 +3277,15 @@ fn helper_source(name: &str) -> &'static str {
             "function __map_values(map) {\n\treturn [ ...map.values() ].map(__clone);\n}"
         }
         // `for x in set`: `HashSet` is a struct `[table]` over a `NativeMap`, so the
-        // elements are the backing map's stored originals, in insertion order (I1).
-        "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
+        // elements are the table's stored KEYS, the originals, in insertion order
+        // (I1, M191), tombstones skipped.
+        "__set_iter" => {
+            "function __set_iter(set) {\n\
+             \tconst out = [];\n\
+             \tfor (const entry of set[0][0].values()) if (entry[1][0] === 0) out.push(entry[0]);\n\
+             \treturn out;\n\
+             }"
+        }
         // proposal/lazy.md §5 — the memo cell, and the ONE forcing helper both
         // lazy positions share (a `lazy` parameter and a `lazy let` module
         // binding). `{ state, value, thunk }` is the paper's shape; `name` is
@@ -4268,7 +4883,7 @@ impl<'src> Transformer<'src> {
                      `{here}` does not admit it: a generic body resolves under the file it was \
                      DECLARED in, not the file that instantiated it, so widening the import at \
                      the CALLER does not reach it. Widen `{here}`'s own import of \
-                     `{declaring}` — `(impl _)` admits every implementation it declares"
+                     `{declaring}` — `(impl *)` admits every implementation it declares"
                 ),
             };
             // E185: and PLACED — through the one anchoring rule every
@@ -4493,6 +5108,12 @@ impl<'src> Transformer<'src> {
                 format!("import {{ {} }} from \"{}\";", names, module)
             })
             .collect::<Vec<_>>();
+        // M185: a compiler without the image codec refuses a program that
+        // needs it, rather than emitting a bundle with no codec in it. Here,
+        // where the helper set is final: every emission is done.
+        if let Some(error) = image_codec_refusal(&self.used_helpers) {
+            return Err(error);
+        }
         let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
         close_helper_dependencies(&mut helpers);
 
@@ -4502,7 +5123,8 @@ impl<'src> Transformer<'src> {
         //
         // Everything this function can REFUSE has already been decided above —
         // the missing `main` at the top, then B55's body-less emission, B68's
-        // unresolved `drop` sink and B176's unrendered concatenation — and this
+        // unresolved `drop` sink, B176's unrendered concatenation and M185's
+        // missing image codec — and this
         // pass returns `()`, so there is nothing left here for a `check` to
         // learn. It is also 5.8% of a cold check's instructions (backlog M34),
         // which is why a caller that is going to drop the text says so rather
@@ -5263,8 +5885,11 @@ impl<'src> Transformer<'src> {
             // scalar `Shared::write()` is one too: it lowers to the `(base,
             // key)` pair, and the analyzer cannot classify it (the pointee is
             // generic until this monomorphization).
-            Some(Expr::Call(..)) => {
-                self.program.scalar_view_calls.contains(&id) || self.call_is_scalar_shared_write(id)
+            Some(Expr::Call(call_id)) => {
+                self.program.scalar_view_calls.contains(&id)
+                    || self.call_is_scalar_shared_write(id)
+                    || self.call_is_scalar_option_view(id)
+                    || self.generic_view_call_is_scalar(*call_id)
             }
             // B514: a value `if`/`match`/block evaluates to whatever its tail
             // leaves emit, so it IS a pair when they are — `*if c { &a } else {
@@ -5615,6 +6240,86 @@ impl<'src> Transformer<'src> {
     /// Whether a call expression is a `Shared::write()` with a scalar pointee.
     fn call_is_scalar_shared_write(&self, call_expr_id: Id) -> bool {
         self.is_shared_write(call_expr_id) && self.shared_write_pointee_is_scalar(call_expr_id)
+    }
+
+    /// Whether `call_id` calls a `borrows` function whose return is a view of a
+    /// bare GENERIC built by `Option::some_view` (`get_or_insert`, M191) that
+    /// this call instantiates at a scalar. B506 keeps every other generic view
+    /// return on the DECLARED pointee's protocol (the instance hands the value
+    /// back); `some_view` is the one producer that pairs per instance, so its
+    /// callers read the pair it makes.
+    fn generic_view_call_is_scalar(&self, call_id: Id) -> bool {
+        let Some(function_call) = self.program.function_calls.get(&call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return false;
+        };
+        let Some(function) = self.program.functions.get(target) else {
+            return false;
+        };
+        let tail_is_a_some_view = match self.program.entity_map.get(&function.body.1) {
+            Some(Expr::Call(tail_call)) => self
+                .program
+                .function_calls
+                .get(tail_call)
+                .and_then(|tail| self.program.entity_map.get(&tail.subject_id))
+                .is_some_and(|subject| {
+                    matches!(subject, Expr::Local(callee)
+                        if matches!(self.program.intrinsics.get(callee), Some(Intrinsic::OptionSomeView)))
+                }),
+            _ => false,
+        };
+        tail_is_a_some_view
+            && function.returns_mut_view
+            && self.call_result_resolves_to_scalar(call_id)
+    }
+
+    /// Whether a call expression is `Option::some_view()` (M191) over a scalar
+    /// payload — a view the intrinsic lowers to the `(slot, 1)` pair.
+    fn call_is_scalar_option_view(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let Some(function_call) = self.program.function_calls.get(call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(function_id)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return false;
+        };
+        matches!(
+            self.program.intrinsics.get(function_id),
+            Some(Intrinsic::OptionSomeView)
+        ) && self.option_payload_is_scalar(call_expr_id)
+    }
+
+    /// Whether the RECEIVER of the call `call_expr_id` is an `Option` whose
+    /// payload resolves, at this monomorphization, to a scalar view pointee.
+    fn option_payload_is_scalar(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let Some(receiver_type_id) = self
+            .program
+            .function_calls
+            .get(call_id)
+            .and_then(|function_call| function_call.argument_ids.first())
+            .and_then(|receiver_id| self.expr_type_id(*receiver_id))
+        else {
+            return false;
+        };
+        let Some(Type::Enum(_, arguments)) = self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(receiver_type_id))
+        else {
+            return false;
+        };
+        arguments
+            .first()
+            .is_some_and(|payload| self.resolves_to_scalar_view_pointee(*payload))
     }
 
     /// A `&`/`&mut` parameter whose declared pointee is a generic that resolves,
@@ -10855,9 +11560,33 @@ impl<'src> Transformer<'src> {
             Intrinsic::StrContains => native_method(&mut args, "includes"),
             Intrinsic::StrStartsWith => native_method(&mut args, "startsWith"),
             Intrinsic::StrEndsWith => native_method(&mut args, "endsWith"),
-            Intrinsic::StrReplace => native_method(&mut args, "replaceAll"),
+            Intrinsic::StrReplace => {
+                let arguments: Vec<js::Node> = args.collect();
+                if matches!(arguments.get(1), Some(js::Node::String(pattern)) if !pattern.is_empty())
+                {
+                    native_method(&mut arguments.into_iter(), "replaceAll")
+                } else {
+                    self.used_helpers.insert("__str_replace");
+                    js::Node::Call(
+                        Box::new(js::Node::Local("__str_replace".to_string())),
+                        arguments,
+                    )
+                }
+            }
             Intrinsic::StrRepeat => native_method(&mut args, "repeat"),
-            Intrinsic::StrSplit => native_method(&mut args, "split"),
+            Intrinsic::StrSplit => {
+                let arguments: Vec<js::Node> = args.collect();
+                if matches!(arguments.get(1), Some(js::Node::String(pattern)) if !pattern.is_empty())
+                {
+                    native_method(&mut arguments.into_iter(), "split")
+                } else {
+                    self.used_helpers.insert("__str_split");
+                    js::Node::Call(
+                        Box::new(js::Node::Local("__str_split".to_string())),
+                        arguments,
+                    )
+                }
+            }
             // NOT `native_method`: JS `substring` clamps negatives to 0 and
             // SWAPS an inverted pair, so `s.substring(offset, -1)` silently
             // returns the prefix — the complement of what was asked for. The
@@ -10928,6 +11657,7 @@ impl<'src> Transformer<'src> {
             // substitution reached is an analyzer bug, not a program).
             Intrinsic::ListToArray => {
                 self.used_helpers.insert("__list_to_array");
+                self.used_helpers.insert("__clone");
                 let length = call_expr_id
                     .and_then(|id| self.list_to_array_length(id))
                     .expect("internal: `to_array`'s `N` is a length under every instance");
@@ -10947,6 +11677,21 @@ impl<'src> Transformer<'src> {
                     Box::new(js::Node::Local("__option_take".to_string())),
                     vec![args.next().unwrap_or(js::Node::Void)],
                 )
+            }
+            // M191: the `Some` payload as a view — the payload object itself when
+            // it is an aggregate (a view of an aggregate IS the object), the
+            // `(slot, 1)` pair when it is a scalar, decided per instance as a
+            // scalar `Shared::write()` is.
+            Intrinsic::OptionSomeView => {
+                let slot = args.next().unwrap_or(js::Node::Void);
+                if call_expr_id.is_some_and(|id| self.option_payload_is_scalar(id)) {
+                    js::Node::Array(vec![slot, js::Node::Number("1".to_string(), None)])
+                } else {
+                    js::Node::PropertyIndex(
+                        Box::new(slot),
+                        Box::new(js::Node::Number("1".to_string(), None)),
+                    )
+                }
             }
             Intrinsic::OptionReplace => {
                 self.used_helpers.insert("__option_replace");
@@ -11104,6 +11849,56 @@ impl<'src> Transformer<'src> {
                 self.used_helpers.insert("__clone");
                 js::Node::Call(
                     Box::new(js::Node::Local("__map_values".to_string())),
+                    args.collect(),
+                )
+            }
+            // `NativeMap::new()` -> the `[ map, pending ]` pair (M191).
+            Intrinsic::KeyedNew => js::Node::Array(vec![
+                js::Node::Call(Box::new(js::Node::Local("new Map".to_string())), Vec::new()),
+                js::Node::Void,
+            ]),
+            Intrinsic::KeyedInsert
+            | Intrinsic::KeyedGet
+            | Intrinsic::KeyedKey
+            | Intrinsic::KeyedLend
+            | Intrinsic::KeyedSlot
+            | Intrinsic::KeyedContainsKey
+            | Intrinsic::KeyedRemove
+            | Intrinsic::KeyedLen
+            | Intrinsic::KeyedHashes
+            | Intrinsic::KeyedKeys
+            | Intrinsic::KeyedValues => {
+                let helper = match intrinsic {
+                    Intrinsic::KeyedInsert => "__nmap_insert",
+                    Intrinsic::KeyedGet => "__nmap_get",
+                    Intrinsic::KeyedKey => "__nmap_key",
+                    Intrinsic::KeyedLend => "__nmap_lend",
+                    Intrinsic::KeyedSlot => "__nmap_slot",
+                    Intrinsic::KeyedContainsKey => "__nmap_has",
+                    Intrinsic::KeyedRemove => "__nmap_remove",
+                    Intrinsic::KeyedLen => "__nmap_len",
+                    Intrinsic::KeyedHashes => "__nmap_hashes",
+                    Intrinsic::KeyedKeys => "__nmap_keys",
+                    _ => "__nmap_values",
+                };
+                self.used_helpers.insert(helper);
+                if matches!(
+                    intrinsic,
+                    Intrinsic::KeyedInsert | Intrinsic::KeyedSlot | Intrinsic::KeyedRemove
+                ) {
+                    self.used_helpers.insert("__nmap_settle");
+                }
+                if matches!(
+                    intrinsic,
+                    Intrinsic::KeyedGet
+                        | Intrinsic::KeyedKey
+                        | Intrinsic::KeyedKeys
+                        | Intrinsic::KeyedValues
+                ) {
+                    self.used_helpers.insert("__clone");
+                }
+                js::Node::Call(
+                    Box::new(js::Node::Local(helper.to_string())),
                     args.collect(),
                 )
             }
@@ -15822,11 +16617,26 @@ const RESERVED_NAMES: &[&str] = &[
     "__list_pop",
     "__list_sort_by",
     "__list_to_array",
+    "__str_split",
+    "__str_replace",
+    "__code_point_floor",
     "__option_take",
     "__option_replace",
     "__map_get",
     "__map_keys",
     "__map_values",
+    "__nmap_settle",
+    "__nmap_insert",
+    "__nmap_get",
+    "__nmap_key",
+    "__nmap_lend",
+    "__nmap_slot",
+    "__nmap_has",
+    "__nmap_remove",
+    "__nmap_len",
+    "__nmap_hashes",
+    "__nmap_keys",
+    "__nmap_values",
     "__task",
     "__Task",
     "__nursery_new",

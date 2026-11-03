@@ -273,7 +273,7 @@ function release_under(handle, ambient) {
 	if ($W[0] === 0) {
 		const release = $W[1];
 		handle[3].v = [ 1 ];
-		releasing_turns.v.push(ambient);
+		releasing_turns.v.push(__clone(ambient));
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
@@ -432,7 +432,7 @@ function new4(value2, caller) {
 	return cell;
 }
 function list_cell(elements, log) {
-	return [ __shared_new(elements), new4(0, "std/src/reactive/delta.vl:790:68"), __clone(log) ];
+	return [ __shared_new(elements), new4(0, "std/src/reactive/delta.vl:792:68"), __clone(log) ];
 }
 function new5() {
 	return list_cell([  ], new3());
@@ -456,7 +456,7 @@ function map(self, fn) {
 	return result;
 }
 function list_cell2(elements, log) {
-	return [ __shared_new(elements), new4(0, "std/src/reactive/delta.vl:790:68"), __clone(log) ];
+	return [ __shared_new(elements), new4(0, "std/src/reactive/delta.vl:792:68"), __clone(log) ];
 }
 function of(elements) {
 	return list_cell2(elements, new3());
@@ -517,7 +517,7 @@ function splice_in_place(list, start, taking, inserted) {
 	let left = [  ];
 	let taken = 0;
 	while (taken < taking) {
-		left.push(__remove_at(list, start, "std/src/reactive/delta.vl:693:18"));
+		left.push(__remove_at(list, start, "std/src/reactive/delta.vl:695:18"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -527,7 +527,7 @@ function splice_in_place(list, start, taking, inserted) {
 		let $n = null;
 		if ($m[0] === 0) {
 			const value2 = $m[1];
-			$n = __insert_at(list, start + offset, value2, "std/src/reactive/delta.vl:700:28");
+			$n = __insert_at(list, start + offset, value2, "std/src/reactive/delta.vl:702:28");
 		} else {
 			$n = undefined;
 		}
@@ -640,7 +640,7 @@ function set(self, value2, $r, caller) {
 	notify(self, $r);
 }
 function publish(cell, $q) {
-	set(cell[1], at(cell[2]), $q, "std/src/reactive/delta.vl:797:17");
+	set(cell[1], at(cell[2]), $q, "std/src/reactive/delta.vl:799:17");
 }
 function splice(self, at2, removed, inserted, $j) {
 	const held2 = size(self);
@@ -657,7 +657,7 @@ function set_at(self, at2, value2, $B) {
 	let $D = null;
 	if ($C[0] === 0) {
 		const previous = $C[1];
-		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:853:5");
+		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:855:5");
 		record(self[2], [ 1, at2, previous, __clone(value2) ]);
 		publish(self, $B);
 		$D = undefined;
@@ -678,7 +678,7 @@ function move_range(self, from, count, to, $F) {
 	let lifted = [  ];
 	let taken = 0;
 	while (taken < count) {
-		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:873:35"));
+		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:875:35"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -687,7 +687,7 @@ function move_range(self, from, count, to, $F) {
 		let $H = null;
 		if ($G[0] === 0) {
 			const value2 = $G[1];
-			$H = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:879:43");
+			$H = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:881:43");
 		} else {
 			$H = undefined;
 		}
@@ -773,7 +773,7 @@ function map_each(source2, g, $a, $b) {
 				$i = set_at(out, at3, g(value2), $a);
 			} else if ($h[0] === 2) {
 				const items = $h[1];
-				$i = set2(out, map(items, g), $a, "std/src/reactive/delta.vl:1143:36");
+				$i = set2(out, map(items, g), $a, "std/src/reactive/delta.vl:1145:36");
 			} else {
 				const from = $h[1];
 				const count = $h[2];
@@ -801,7 +801,7 @@ function record2(self, op) {
 	}
 }
 function publish2(cell, $q) {
-	set(cell[1], at(cell[2]), $q, "std/src/reactive/delta.vl:797:17");
+	set(cell[1], at(cell[2]), $q, "std/src/reactive/delta.vl:799:17");
 }
 function splice2(self, at2, removed, inserted, $j) {
 	const held2 = size(self);
@@ -834,7 +834,7 @@ function set_at2(self, at2, value2, $B) {
 	let $aq = null;
 	if ($ap[0] === 0) {
 		const previous = $ap[1];
-		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:853:5");
+		__at_put(self[0].v, at2, __clone(value2), "std/src/reactive/delta.vl:855:5");
 		record2(self[2], [ 1, at2, previous, __clone(value2) ]);
 		publish2(self, $B);
 		$aq = undefined;
@@ -855,7 +855,7 @@ function move_range2(self, from, count, to, $F) {
 	let lifted = [  ];
 	let taken = 0;
 	while (taken < count) {
-		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:873:35"));
+		lifted.push(__remove_at(self[0].v, from, "std/src/reactive/delta.vl:875:35"));
 		taken = taken + 1;
 	}
 	let offset = 0;
@@ -864,7 +864,7 @@ function move_range2(self, from, count, to, $F) {
 		let $as = null;
 		if ($ar[0] === 0) {
 			const value2 = $ar[1];
-			$as = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:879:43");
+			$as = __insert_at(self[0].v, to + offset, value2, "std/src/reactive/delta.vl:881:43");
 		} else {
 			$as = undefined;
 		}
@@ -896,7 +896,7 @@ function map_each2(source2, g, $a, $b) {
 				$ak = set_at2(out, at3, g(value2), $a);
 			} else if ($aj[0] === 2) {
 				const items = $aj[1];
-				$ak = set3(out, map(items, g), $a, "std/src/reactive/delta.vl:1143:36");
+				$ak = set3(out, map(items, g), $a, "std/src/reactive/delta.vl:1145:36");
 			} else {
 				const from = $aj[1];
 				const count = $aj[2];
@@ -1003,14 +1003,14 @@ function reconcile_to(self, items, $aM) {
 	const new_length = items.length;
 	let prefix = 0;
 	while (prefix < old_length && prefix < new_length) {
-		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:945:7") !== __at(items, prefix, "std/src/reactive/delta.vl:945:36")) {
+		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:947:7") !== __at(items, prefix, "std/src/reactive/delta.vl:947:36")) {
 			break;
 		}
 		prefix = prefix + 1;
 	}
 	let suffix = 0;
 	while (prefix + suffix < old_length && prefix + suffix < new_length) {
-		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:952:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:952:53")) {
+		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:954:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:954:53")) {
 			break;
 		}
 		suffix = suffix + 1;
@@ -1125,7 +1125,7 @@ function map_each3(source2, g, $a, $b) {
 				$bd = set_at2(out, at3, g(value2), $a);
 			} else if ($bc[0] === 2) {
 				const items = $bc[1];
-				$bd = set3(out, map(items, g), $a, "std/src/reactive/delta.vl:1143:36");
+				$bd = set3(out, map(items, g), $a, "std/src/reactive/delta.vl:1145:36");
 			} else {
 				const from = $bc[1];
 				const count = $bc[2];
@@ -1181,14 +1181,14 @@ function reconcile_to2(self, items, $aM) {
 	const new_length = items.length;
 	let prefix = 0;
 	while (prefix < old_length && prefix < new_length) {
-		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:945:7") !== __at(items, prefix, "std/src/reactive/delta.vl:945:36")) {
+		if (__at(self[0].v, prefix, "std/src/reactive/delta.vl:947:7") !== __at(items, prefix, "std/src/reactive/delta.vl:947:36")) {
 			break;
 		}
 		prefix = prefix + 1;
 	}
 	let suffix = 0;
 	while (prefix + suffix < old_length && prefix + suffix < new_length) {
-		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:952:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:952:53")) {
+		if (__at(self[0].v, old_length - 1 - suffix, "std/src/reactive/delta.vl:954:7") !== __at(items, new_length - 1 - suffix, "std/src/reactive/delta.vl:954:53")) {
 			break;
 		}
 		suffix = suffix + 1;

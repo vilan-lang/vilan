@@ -7,6 +7,7 @@
     scripts/perf_gate.py seal      --vilan TIP --base RELEASE --kolt DIR [--tip-kolt MIGRATED] [--lsp-json BASE.json TIP.json]
                                    [--threshold 1.10 (CPU, instructions, LSP rows)] [--rss-threshold 1.05 (peak RSS)]
     scripts/perf_gate.py calibrate --vilan BIN --kolt DIR                       # S4: genapp vs kolt phase split
+    scripts/perf_gate.py e121-reset (--scenario NAME ... | --all) [--write-budgets]  # N186: a new series' counts
     scripts/perf_gate.py report    --verdict perf-<sha>.json --out perf/report-vX.Y.Z.md
 
 The three tiers (§3):
@@ -715,8 +716,22 @@ def advance_e121(data, rows):
             target["green_seals"] = 0
 
 
+def median_instructions(samples):
+    """The median of a row's edit-to-idle instruction counts, or None when any sample lacks one (the harness
+    writes `None` where `perf_event_open` is refused)."""
+    counts = [s.get("instructions") for s in samples]
+    if not counts or any(count is None for count in counts):
+        return None
+    return statistics.median(counts)
+
+
 def lsp_compare(base_json, tip_json, threshold):
-    """The LSP harness's rows tip against base, each row's median CPU to diagnostics (find 4)."""
+    """The LSP harness's rows tip against base (find 4). N186 (6): a row is JUDGED on its median user-space
+    INSTRUCTIONS from the edit to idle, and its median CPU to diagnostics is reported beside. CPU on this
+    host has a +-7 % floor base-vs-base on one binary and one copy (Order 55's seal: leaf 460 / 440 / 430 ms,
+    importers-open 720 / 670 / 720), so a x1.10 CPU threshold went red on noise one seal in three, while the
+    instruction count held to 0.3 % on every pass. Where either side has no instruction count (the counter
+    refused), the row falls back to CPU and says so (`judged_on`)."""
     with open(base_json) as handle:
         base = json.load(handle)
     with open(tip_json) as handle:
@@ -728,10 +743,18 @@ def lsp_compare(base_json, tip_json, threshold):
             continue
         b = statistics.median(s["diagnostics_cpu_ms"] for s in before)
         t = statistics.median(s["diagnostics_cpu_ms"] for s in samples)
-        ratio = t / b if b else 1.0
-        rows.append({"scenario": scenario, "base_ms": b, "tip_ms": t, "ratio": ratio})
+        cpu_ratio = t / b if b else 1.0
+        bi, ti = median_instructions(before), median_instructions(samples)
+        instr_ratio = ti / bi if bi and ti is not None else None
+        judged_on = "instructions" if instr_ratio is not None else "cpu"
+        ratio = instr_ratio if instr_ratio is not None else cpu_ratio
+        rows.append({"scenario": scenario, "base_ms": b, "tip_ms": t, "cpu_ratio": cpu_ratio,
+                     "base_instructions": bi, "tip_instructions": ti, "instructions_ratio": instr_ratio,
+                     "judged_on": judged_on, "ratio": ratio})
         if ratio > threshold:
-            red.append(f"LSP {scenario}: CPU to diagnostics x{ratio:.2f}")
+            red.append(f"LSP {scenario}: instructions edit-to-idle x{ratio:.3f} (CPU x{cpu_ratio:.2f} beside)"
+                       if judged_on == "instructions" else
+                       f"LSP {scenario}: CPU to diagnostics x{ratio:.2f} (no instruction count: judged on CPU)")
     return rows, red
 
 
@@ -804,8 +827,14 @@ def command_seal(options):
             lsp_measured = lsp_measured_names(options.lsp_json)
             print(f"  LSP rows measured ({len(lsp_measured)}): " + ", ".join(lsp_measured))
             for row in lsp_rows:
-                print(f"  LSP row {row['scenario']}: CPU to diagnostics base {row['base_ms']:.0f} ms, "
-                      f"tip {row['tip_ms']:.0f} ms (x{row['ratio']:.2f})")
+                if row["judged_on"] == "instructions":
+                    print(f"  LSP row {row['scenario']}: instructions edit-to-idle base "
+                          f"{row['base_instructions'] / 1e9:.3f} G, tip {row['tip_instructions'] / 1e9:.3f} G "
+                          f"(x{row['instructions_ratio']:.3f}, judged); CPU to diagnostics base {row['base_ms']:.0f} ms, "
+                          f"tip {row['tip_ms']:.0f} ms (x{row['cpu_ratio']:.2f}, reported)")
+                else:
+                    print(f"  LSP row {row['scenario']}: CPU to diagnostics base {row['base_ms']:.0f} ms, "
+                          f"tip {row['tip_ms']:.0f} ms (x{row['cpu_ratio']:.2f}, judged: no instruction count)")
             for skip in lsp_skipped:
                 kind = "mandate row - RED" if skip["mandate"] else "informational row - a note"
                 print(f"  LSP SKIPPED ({skip['side']}) {skip['scenario']}: {kind}"
@@ -821,8 +850,12 @@ def command_seal(options):
         # N146: `--advance` counts this seal toward E121's two-green rule IN THE VERDICT. Writing
         # `perf/budgets.toml` here moved the tree past the sha the verdict is for, so the tip a cut tags had
         # none; the advance is applied by `ratchet --from <this verdict>` in the release commit instead.
+        # N186 (5): only a GREEN verdict advances the state (the owner's 2026-10-10 rule: a true green). The
+        # Order 55 seal's pass 1 was red and still moved `shared.vl keystroke` 6 -> 7, restored by hand.
         e121_after = None
-        if options.advance:
+        if options.advance and red:
+            print("  E121  NOT advanced: the verdict is red (only a green seal counts toward the two-green rule)")
+        if options.advance and not red:
             advanced = {"e121": [dict(target) for target in data["e121"]]}
             advance_e121(advanced, e121)
             e121_after = advanced["e121"]
@@ -874,6 +907,40 @@ def command_e121(options):
         print("E121 VERDICT: RED — " + "; ".join(blocking))
         return 1
     print("E121 VERDICT: green (no blocking row is red)")
+    return 0
+
+
+def command_e121_reset(options):
+    """N186 (4): start a NEW series for E121 rows whose figures no longer compare (their anchors moved, or the
+    exhibit did): their two-green count in the seals' state (`e121-state.json`, N146) goes back to 0 and they
+    stop blocking, as the owner's 2026-10-10 ruling did for N165. The state's previous content is kept beside
+    it (`e121-state.json.pre-reset-<date>`) and the rows are printed before and after. `--write-budgets` also
+    writes the reset into `perf/budgets.toml` (the commit that starts the series; a seal never does, N146)."""
+    data = load_budgets(options.budgets)
+    overlay_e121_state(data, options.verdict_dir)
+    names = {target["scenario"] for target in data["e121"]}
+    chosen = names if options.all else set(options.scenario or [])
+    unknown = sorted(chosen - names)
+    if unknown or not chosen:
+        sys.exit("perf_gate e121-reset: name rows with --scenario (or --all); "
+                 + (f"no [[e121]] row is named {', '.join(unknown)}" if unknown else "none named"))
+    path = os.path.join(options.verdict_dir, E121_STATE)
+    if os.path.exists(path):
+        kept = f"{path}.pre-reset-{datetime.date.today().isoformat()}"
+        shutil.copyfile(path, kept)
+        print(f"kept the previous state as {kept}")
+    for target in data["e121"]:
+        before = f"green_seals {target.get('green_seals', 0)}, blocking {str(bool(target.get('blocking'))).lower()}"
+        if target["scenario"] in chosen:
+            target["green_seals"] = 0
+            target["blocking"] = False
+        after = f"green_seals {target.get('green_seals', 0)}, blocking {str(bool(target.get('blocking'))).lower()}"
+        print(f"  {target['scenario']:36} {before:32} -> {after}")
+    write_e121_state(options.verdict_dir, [dict(target) for target in data["e121"]])
+    print(f"wrote {path}")
+    if options.write_budgets:
+        write_budgets(data, options.budgets)
+        print(f"wrote {options.budgets}")
     return 0
 
 
@@ -1083,6 +1150,14 @@ def main():
     p.add_argument("--lsp-json", required=True, help="the tip's `scripts/lsp-latency.py --json` output")
     p.add_argument("--advance", action="store_true", help="count this seal toward the two-green rule")
     p.set_defaults(run=command_e121)
+
+    p = sub.add_parser("e121-reset", help="N186: start a new series - reset rows' two-green count in the state")
+    p.add_argument("--scenario", action="append", help="an [[e121]] row to reset (repeatable)")
+    p.add_argument("--all", action="store_true", help="every [[e121]] row (the exhibit itself moved)")
+    p.add_argument("--verdict-dir", default=os.environ.get("VILAN_PERF_VERDICTS", DEFAULT_VERDICTS))
+    p.add_argument("--write-budgets", action="store_true",
+                   help="also write the reset counts into perf/budgets.toml (the series' starting commit)")
+    p.set_defaults(run=command_e121_reset)
 
     p = sub.add_parser("calibrate")
     p.add_argument("--vilan", required=True)

@@ -1,0 +1,30 @@
+// B695: every UTF-16-indexed `str` operation at a surrogate boundary answers
+// alike on both backends — a cut between the halves of a pair moves back to the
+// pair's start (strings.md), `code_at` reads either half as a number, and an
+// empty pattern splits and replaces between characters. JS answered half a pair
+// for `"😀".substring(0, 1)` and split it in two; natively the half cannot exist.
+fun main() {
+	let face = "😀";
+	print(face.len());
+	print(face.substring(0, 1).len());
+	print(face.substring(1, 2));
+	print(face.substring(0, 2));
+	print(face.code_at(0));
+	print(face.code_at(1));
+	let mixed = "a😀b";
+	print(mixed.substring(3, 4));
+	print(mixed.substring(1, 3));
+	print(mixed.substring(2, 4));
+	print(mixed.substring(0, 2));
+	mut cut = 0;
+	for cut <= 4 {
+		print(i"{cut}: [{mixed.substring(0, cut)}|{mixed.substring(cut, 4)}]");
+		cut += 1;
+	}
+	print("a😀b".split("").len());
+	print("a😀b".split("😀").len());
+	let empty = "";
+	print("a😀b".replace(empty, "-"));
+	print(empty.replace(empty, "-"));
+	print("a😀b".replace("😀", "-"));
+}

@@ -474,6 +474,7 @@ impl Region {
 	fun insert(self, child: View)        // before the anchor — a live child MOVES
 	fun hold(self, live: List<View>)     // the run that is live now, for close
 	fun close(self)                      // remove the live run, then the anchor
+	fun close_with(self, disposal: || void)  // the rows' owners go first, then close
 }
 ```
 
@@ -489,6 +490,16 @@ Disposal takes the region OUT of the document — every live node, then the
 anchor. That is invisible when the subtree was leaving with its parent, and
 it is the whole point for a **portal**, whose container outlives the boundary
 that filled it: nothing is left to remove by hand.
+
+A run leaves in ONE walk over its siblings, never through a DOM `Range`: a
+`Range` stays live until it is collected and every later change to the
+document pays for it, so one per row made closing a long list quadratic.
+And a run that leaves WHOLE takes its regions with it: while a page's owner
+is disposed its run is marked as leaving, and every region inside it — the
+table's `each`, each row's `each` of cells — only clears its bookkeeping,
+because its nodes go with the page's. The test is the DOM's (is my anchor
+inside the run that is leaving), not the owner tree's, so a portal the page
+owns but placed elsewhere is still emptied.
 
 The anchor is an empty text node rather than a comment deliberately: it
 serializes to nothing, so a browser tree and the `@process` twin's HTML string
@@ -545,7 +556,7 @@ struct HistoryEntry { path: str, state: str, popped: bool }
 fun current_entry(): SignalCell<HistoryEntry>   // live; popped = back/forward reached it
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
-fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
+fun percent_decode(text: str): str    // std::url's, re-exported: total (a bad escape decodes to itself)
 fun parse_query(query: str): HashMap<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
 
 struct PathParts { segments: List<str>, query: HashMap<str, str>, fragment: Option<str> }

@@ -1076,6 +1076,71 @@ fn the_rss_probe_reads_each_fresh_runs_own_peak_not_the_max_over_children() {
     assert_eq!(median, runs[1], "the median is the middle run: {text}");
 }
 
+/// E358: every edit sample keeps the phase lines of its own stderr window —
+/// one `lsp-context` line per analysis the server ran and the `hot-set` line —
+/// and counts its analyses from them, and a sample over 1.5x its row's median
+/// instructions, or with more analyses than its median, is listed under the
+/// table WITH those lines. A `parse repair` sample read 50.2 G against a 17.4 G
+/// median on the N186 exhibit, and nothing recorded said what ran.
+#[cfg(target_os = "linux")]
+#[test]
+fn e358_the_lsp_harness_names_an_outliers_analyses() {
+    let probe = r#"
+import contextlib, importlib.util, io, sys
+spec = importlib.util.spec_from_file_location("latency", sys.argv[1])
+latency = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(latency)
+window = [
+    "[vilan phase] hot-set 1/40 interface-moved 0 global-moved 0 unknown-interfaces 0 hot-world 1",
+    "[vilan phase] lsp-context 1ms lsp-analyze 300ms lsp-index 2ms lsp-landed 3ms lsp-legs 0ms legs 1",
+    "[vilan] something else",
+    "[vilan phase] lsp-context 1ms lsp-analyze 290ms lsp-index 2ms lsp-landed 3ms lsp-legs 0ms legs 1",
+]
+record = latency.phase_record(window)
+print("analyses:", record["analyses"], "kept:", len(record["phase"]))
+def sample(instructions, analyses, tag):
+    return {"instructions": instructions, "analyses": analyses, "phase": [f"[vilan phase] lsp-context {tag}"]}
+rows = {
+    "parse repair": [sample(17.0e9, 1, "a"), sample(17.4e9, 1, "b"), sample(50.2e9, 2, "c"), sample(18.0e9, 1, "d")],
+    "leaf keystroke": [sample(1.0e9, 1, "e"), sample(1.1e9, 2, "f"), sample(1.0e9, 1, "g")],
+    "steady": [sample(2.0e9, 1, "h"), sample(2.1e9, 1, "i"), sample(2.9e9, 1, "j")],
+}
+print("found:", [(name, run) for name, run, _ in latency.outliers(rows)])
+printed = io.StringIO()
+with contextlib.redirect_stdout(printed):
+    latency.print_outliers(rows)
+print(printed.getvalue())
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c"])
+        .arg(probe)
+        .arg(repository_root().join("scripts/lsp-latency.py"))
+        .output()
+        .expect("run the outlier probe");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("analyses: 2 kept: 3"), "{text}");
+    // The heavy sample and the one with an extra analysis; a sample 1.38x its
+    // median with the median's analyses is not one.
+    assert!(
+        text.contains("found: [('parse repair', 3), ('leaf keystroke', 2)]"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- parse repair, run 3: 50.20 G, 2 analyses\n    [vilan phase] lsp-context c"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- leaf keystroke, run 2: 1.10 G, 2 analyses\n    [vilan phase] lsp-context f"
+        ),
+        "{text}"
+    );
+}
+
 /// N150: a hover or completion anchor is resolved in the EDITED buffer —
 /// `measure_edit` asks the keystroke-path requests before the edit is undone —
 /// so the preflight checks it against the text AFTER the scenario's edit too.
@@ -1599,5 +1664,171 @@ sys.exit(perf_gate.main())
     assert!(
         report.contains("Rows measured (2): leaf keystroke, parse break."),
         "{report}"
+    );
+}
+
+/// N186 (6) + (5): an LSP row is JUDGED on its median instructions edit-to-idle, with the CPU to
+/// diagnostics reported beside (CPU held a +-7 % floor base-vs-base at the Order 55 seal, instructions
+/// 0.3 %); a row without an instruction count falls back to CPU and says so. A RED verdict does not
+/// advance E121's state (pass 1 of the Order 55 seal moved `shared.vl keystroke` 6 -> 7 on a red verdict).
+/// `e121-reset` starts a new series: the rows' counts go to 0, non-blocking, the old state kept beside.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_lsp_row_is_judged_on_instructions_and_only_a_green_seal_advances_e121() {
+    let scratch = Scratch::new("lsp-instructions");
+    let budgets = scratch.path("budgets.toml");
+    let fixture = format!(
+        "{HEADER}\n[[e121]]\nscenario = \"leaf keystroke\"\nmetric = \"diagnostics_cpu_ms\"\n\
+         target_ms = 500\ngreen_seals = 0\nblocking = false\n\
+         \n[[e121]]\nscenario = \"css keystroke\"\nmetric = \"diagnostics_cpu_ms\"\n\
+         target_ms = 500\ngreen_seals = 4\nblocking = true\n"
+    );
+    fs::write(&budgets, &fixture).expect("write the fixture budgets");
+    let vilan = fake_vilan(&scratch);
+    let base = base_kolt(&scratch, "base", false);
+    // (cpu ms, instructions) per sample; `None` = the counter refused.
+    let harness = |name: &str, leaf: &[(u32, Option<u64>)]| {
+        let path = scratch.path(name);
+        let samples = leaf
+            .iter()
+            .map(|(cpu, count)| {
+                let count = count.map_or("null".to_string(), |c| c.to_string());
+                format!("{{\"diagnostics_cpu_ms\": {cpu}, \"instructions\": {count}}}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"header": "", "source": {{"kind": "commit", "sha": "aaaa"}}, "open": {{}}, "edits": {{"leaf keystroke": [{samples}], "css keystroke": [{{"diagnostics_cpu_ms": 100, "instructions": 1000}}]}}}}"#
+            ),
+        )
+        .expect("write a harness JSON");
+        path
+    };
+    let verdicts = scratch.path("verdicts");
+    let seal = |sha: &str, lsp_base: &Path, lsp_tip: &Path| {
+        let driver = format!(
+            r#"
+import os, sys
+sys.path.insert(0, {scripts:?})
+import perf_count, perf_gate
+perf_count.measure = lambda argv, cwd=None, env=None, counter="auto", log=None: {{
+    "counter": "instructions:u", "instructions": 1, "peak_rss_kb": 100, "cpu_s": 1.0, "exit": 0}}
+perf_count.hardware_counter_available = lambda: True
+perf_gate.loadavg = lambda: 0.5
+perf_gate.phase_split = lambda vilan, directory: {{"analyze": 1.0}}
+perf_gate.subject_dir = lambda subject, work: work
+sys.argv = ["perf_gate.py", "--budgets", {budgets:?}, "--work", {work:?}, "--scratch", {work:?}, "seal",
+            "--tip", {vilan:?}, "--base", {vilan:?}, "--kolt", {base:?}, "--base-std", {work:?},
+            "--runs", "1", "--verdict-dir", {verdicts:?}, "--sha", {sha:?},
+            "--lsp-json", {lsp_base:?}, {lsp_tip:?}, "--advance"]
+sys.exit(perf_gate.main())
+"#,
+            scripts = repository_root().join("scripts").display().to_string(),
+            budgets = budgets.display().to_string(),
+            work = scratch.0.display().to_string(),
+            vilan = vilan.display().to_string(),
+            base = base.display().to_string(),
+            verdicts = verdicts.display().to_string(),
+            lsp_base = lsp_base.display().to_string(),
+            lsp_tip = lsp_tip.display().to_string(),
+        );
+        let output = Command::new("python3")
+            .args(["-c", &driver])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .expect("run the seal driver");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        (output.status.success(), text)
+    };
+    let state = verdicts.join("e121-state.json");
+    // CPU x1.30 on noise, instructions x1.003: green, judged on instructions, CPU beside; it advances.
+    let base_json = harness(
+        "base.json",
+        &[(400, Some(1_000_000)), (420, Some(1_000_000))],
+    );
+    let noisy = harness(
+        "noisy.json",
+        &[(530, Some(1_003_000)), (540, Some(1_003_000))],
+    );
+    let (ok, text) = seal("1111111111", &base_json, &noisy);
+    assert!(ok, "a CPU-noise row went red:\n{text}");
+    assert!(
+        text.contains("LSP row leaf keystroke: instructions edit-to-idle")
+            && text.contains("(x1.003, judged)")
+            && text.contains("(x1.30, reported)"),
+        "{text}"
+    );
+    let advanced = fs::read_to_string(&state).expect("a green seal writes the state");
+    assert!(advanced.contains("\"green_seals\": 5"), "{advanced}");
+    // Instructions x1.20: RED, and the state is NOT advanced.
+    let heavier = harness(
+        "heavier.json",
+        &[(400, Some(1_200_000)), (410, Some(1_200_000))],
+    );
+    let (ok, text) = seal("2222222222", &base_json, &heavier);
+    assert!(
+        !ok && text.contains("LSP leaf keystroke: instructions edit-to-idle x1.200"),
+        "{text}"
+    );
+    assert!(
+        text.contains("E121  NOT advanced: the verdict is red"),
+        "{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&state).expect("the state"),
+        advanced,
+        "a red seal advanced the E121 state"
+    );
+    // No instruction count on one side: the row is judged on CPU and says so.
+    let uncounted = harness("uncounted.json", &[(600, None), (600, None)]);
+    let (ok, text) = seal("3333333333", &base_json, &uncounted);
+    assert!(
+        !ok && text.contains("(no instruction count: judged on CPU)"),
+        "{text}"
+    );
+    // e121-reset: a new series - every row back to 0, non-blocking, the old state kept beside it.
+    let (ok, text) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "e121-reset",
+            "--all",
+            "--verdict-dir",
+            verdicts.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("green_seals 5, blocking true")
+            && text.contains("-> green_seals 0, blocking false"),
+        "{text}"
+    );
+    let reset = fs::read_to_string(&state).expect("the reset state");
+    assert!(
+        !reset.contains("\"green_seals\": 5") && !reset.contains("\"blocking\": true"),
+        "{reset}"
+    );
+    assert_eq!(
+        fs::read_to_string(&budgets).expect("read"),
+        fixture,
+        "e121-reset wrote the budgets without --write-budgets"
+    );
+    let (ok, text) = perf_gate(
+        &budgets,
+        &scratch.0,
+        &[
+            "e121-reset",
+            "--scenario",
+            "no such row",
+            "--verdict-dir",
+            verdicts.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(
+        !ok && text.contains("no [[e121]] row is named no such row"),
+        "{text}"
     );
 }

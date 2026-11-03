@@ -8451,7 +8451,9 @@ fn spawn_watched_node(
 ) -> std::io::Result<ManagedChild> {
     let mut env: Vec<(&str, String)> = vec![(WATCHING_ENV, "1".to_string())];
     env.extend(extra.iter().map(|(name, value)| (*name, value.clone())));
-    spawn_node_with_env(script, node_flags, args, cwd, &env)
+    // E341: registered with the signal pipeline, so a signal that ends the
+    // session reaches the round's program first.
+    job::spawn_watched(|| spawn_node_with_env(script, node_flags, args, cwd, &env))
 }
 
 fn spawn_node_with_env(

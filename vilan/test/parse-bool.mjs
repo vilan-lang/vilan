@@ -30,7 +30,7 @@ function unwrap_or(self, fallback) {
 	const $c = self;
 	let $d = null;
 	if ($c[0] === 0) {
-		const x = __clone($c[1]);
+		const x = $c[1];
 		$d = x;
 	} else {
 		$d = __clone(fallback);
@@ -41,7 +41,7 @@ function unwrap(self, caller) {
 	const $e = self;
 	let $f = null;
 	if ($e[0] === 0) {
-		const x = __clone($e[1]);
+		const x = $e[1];
 		$f = x;
 	} else {
 		$f = (() => {

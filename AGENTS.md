@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, twelve crates, plus the language's own tree:
+Rust workspace, fifteen crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -81,6 +81,19 @@ Rust workspace, twelve crates, plus the language's own tree:
   `keys()`. The KEYS are not here — std's `KeyDecoder` (vilan) decodes the bytes
   `vilan-rt`'s stdin pump reads, the same on both backends. Unlike its three siblings it
   cannot be `forbid(unsafe_code)`: every `unsafe` block carries its reason.
+- `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
+  header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
+  additions and multiplications, so both backends get the same bits), crop, encode — over the
+  `image` crate, with no vilan types in it, `forbid(unsafe_code)`. ONE implementation for both
+  backends, pinned by its own unit tests on the host.
+- `crates/vilan-rt-image` — the core's glue for emitted Rust (M185): the `__image_*` externs over
+  `vilan-rt`'s `Bytes`; a generated cargo project names it only when the program reaches
+  `std::image` (the codec crates optimized even in the dev profile), and it materializes beside
+  `vilan-rt` with `vilan-image` beside it.
+- `crates/vilan-image-wasm` — the core as a wasm32 C-ABI `cdylib` for node (M185): its build is
+  COMMITTED as `vilan_image.wasm`, carried into the compiler as base64 by `vilan-core`'s build
+  script and written into a bundle only when a program reaches the codec.
+  `scripts/build-image-wasm.sh` rebuilds it reproducibly; the `wasm` CI leg byte-checks it.
 
 ## Definition of done (the gates)
 

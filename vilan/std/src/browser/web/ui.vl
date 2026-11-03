@@ -29,6 +29,7 @@
 // Only available when building for the browser (`vilan build --target browser`).
 
 import pkg::compare::PartialEq;
+import pkg::debug::caller;
 import pkg::hash::Hashable;
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
@@ -50,6 +51,7 @@ import pkg::reactive::{
 	comp,
 	get_owner,
 	owner_scope,
+	place_subscriber,
 	queue_microtask,
 	reconcile,
 	run_with_owner,
@@ -69,7 +71,6 @@ import pkg::web::dom::{
 	create_document_fragment,
 	create_element,
 	create_element_ns,
-	create_range,
 	create_text_node,
 	get_element_by_id,
 	request_animation_frame,
@@ -83,6 +84,7 @@ import pkg::web::style::Style;
 /// and no nursery per change. A form that builds per value (`when`, `swap`,
 /// `each`) keeps the owners it makes itself. The observer is a callback position
 /// like `sub`'s (B482): it runs with `tracking` cleared.
+[track_caller]
 fun follow<T, F: Flow<T>>(own flow: F, observer: (|T| void) context tracking) {
 	get_owner().take(flow.sub(observer));
 }
@@ -209,6 +211,7 @@ export impl View {
 	/// never through runtime rule construction. Registers with the nearest
 	/// enclosing boundary (an ambient `effect`), exactly like every `bind_*`:
 	/// a subscription parked in a `let _sub` outlives the view it writes to.
+	[track_caller]
 	fun style_var<S: Flow<str>>(self, name: str, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -227,6 +230,7 @@ export impl View {
 	/// an element on mount, or to say where a focus scope starts, write
 	/// `.autofocus()`; the compiler steers an element head's written `autofocus`
 	/// there, because the native attribute acts only at the page's initial parse.
+	[track_caller]
 	fun attr<V: AttrValue>(self, name: str, own value: V): View {
 		value.apply(self, name);
 		self
@@ -263,6 +267,7 @@ export impl View {
 	/// Structure only for the static arms; the reactive ones register their one
 	/// subscription with the nearest enclosing boundary, exactly as every `bind_*`
 	/// does.
+	[track_caller]
 	fun child<C: Slot>(self, own content: C): View {
 		content.place(self);
 		self
@@ -280,6 +285,7 @@ export impl View {
 	/// nearest enclosing boundary (an ambient `effect`). Any `Source<str>` drives
 	/// it: a `Signal`, a derived signal, a `RemoteSource` mirror, a user's own cell
 	/// (A33).
+	[track_caller]
 	fun bind_text<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -289,6 +295,7 @@ export impl View {
 	}
 
 	/// Reactive CSS class.
+	[track_caller]
 	fun bind_class<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -302,6 +309,7 @@ export impl View {
 	/// CONSTRUCTED here: every candidate style emitted its rules inside its own
 	/// `const` expression, and `class_list` is a map read, so the
 	/// construct-in-const rule holds with a signal in the middle.
+	[track_caller]
 	fun bind_styled<S: Flow<Style>>(self, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -327,6 +335,7 @@ export impl View {
 	/// is nothing to disambiguate: a `Source<str>` is not a `Source<Option<str>>`
 	/// and vice versa, so a `SignalCell<str>` argument selects the first arm and a
 	/// `SignalCell<Option<str>>` the second.
+	[track_caller]
 	fun bind_attr<V: AttrBinding>(self, name: str, own source: V): View {
 		source.bind_attribute(self, name);
 		self
@@ -342,6 +351,7 @@ export impl View {
 	/// The set writes the empty string, which is the canonical spelling of a
 	/// present boolean attribute (`<div inert>` and `<div inert="">` serialize
 	/// alike).
+	[track_caller]
 	fun toggle_attr<S: Flow<bool>>(self, name: str, own source: S): View {
 		let element = self.element;
 		follow(source, |present| {
@@ -367,6 +377,7 @@ export impl View {
 	/// the EVENT, and the listener is created in a scope that never held an
 	/// element. What survives an unmount is then element → listener → signal,
 	/// with nothing pointing back.
+	[track_caller]
 	fun bind_value<S: Signal<str>>(self, signal: S): View {
 		let element = self.element;
 		follow(signal, |value| {
@@ -384,6 +395,7 @@ export impl View {
 	///
 	/// Concrete `Draft`, with `bind_value` (A33): a draft is the write side by
 	/// construction — this pushes.
+	[track_caller]
 	fun bind_draft(self, draft: Draft<str>): View {
 		let element = self.element;
 		follow(draft.local, |value| {
@@ -548,6 +560,7 @@ export impl View {
 	/// `display` itself, after `show` has bound it, loses that write on the next
 	/// toggle. Style the element through a `Style` — which is what the styling
 	/// surface is for — and the two never meet.
+	[track_caller]
 	fun show<S: Flow<bool>>(self, own condition: S): View {
 		let element = self.element;
 		let restored = element.style_property("display");
@@ -691,9 +704,17 @@ fun clear_chunk_error() {
 /// The region does not RECONCILE the run — each form still tracks what it has live
 /// and disposes its owners, which is the half the region has no business repeating
 /// — it is TOLD the current run (`hold`) after each update, so `close` has the node
-/// list without a second copy of the bookkeeping. The cost is one `remove` per live
-/// node at disposal, and it is paid only at disposal; a `remove` of a node whose
-/// parent already went is a no-op.
+/// list without a second copy of the bookkeeping. The cost is one walk over the run
+/// at disposal, and it is paid only at disposal.
+///
+/// A RUN LEAVING WHOLE takes its regions with it (M187). When a region closes, or
+/// retires one row, the run it is about to remove is marked as LEAVING while the
+/// owners inside it are disposed, and a region whose anchor lies inside a leaving
+/// run only clears its bookkeeping when it closes: its nodes go with the ancestor's
+/// run, so every nested `each` under a page that is swapped away cuts nothing. The
+/// test is on the DOM — is my anchor inside the run that is leaving — and not on
+/// the owner tree, because a PORTAL's region is owned inside the run and placed
+/// outside it, and its content must still go.
 ///
 /// A85 (positional slots) is the design this serves: there, `when(..)` / `swap(..)`
 /// / `each(..)` become VALUES that create their region in `Slot::place`, and the
@@ -797,12 +818,31 @@ export impl Region {
 	/// read — the next row's marker, or this region's anchor for the last row. The
 	/// marker itself stays where it is, so a whole run can be cut row by row before
 	/// anything moves: every boundary is still meaningful.
+	///
+	/// A walk from the marker to `end`, NOT a DOM Range (M187): a Range is live
+	/// until it is collected, every mutation of the document updates every Range
+	/// still alive, and one per row made closing a list of n rows cost n² and
+	/// slowed whatever the app did next. The walk leaves nothing behind.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun cut_row(self, row: Row, end: Text): Element {
-		let range = create_range();
-		range.set_start_after(row.marker);
-		range.set_end_before(end);
-		range.extract_contents()
+		cut_run(row.marker, end)
+	}
+
+	/// RETIRES a row for good (M187): `disposal` — the row's owner going — runs
+	/// first, with the row's span marked as LEAVING, and then the span and the
+	/// marker leave the document in one walk. `end` bounds the row as it bounds
+	/// `cut_row`.
+	///
+	/// The owner goes FIRST, while its nodes are still in the document, which is
+	/// the order every form has always kept: a focus scope inside the row gives
+	/// focus back only while focus is still inside it. What the mark buys is that
+	/// every region inside the span then closes as bookkeeping alone, because its
+	/// nodes are leaving with this one. KEEP IN STEP with the process twin's copy
+	/// (process/ui.vl).
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
+	fun retire_row(self, row: Row, end: Text, disposal: || void) {
+		while_leaving(row.marker, end, disposal);
+		remove_run(row.marker, end);
 	}
 
 	/// Puts a cut row back immediately BEFORE `end`: its marker first, then its
@@ -852,25 +892,101 @@ export impl Region {
 	/// boundary, so the content and the marker die with it rather than outliving it
 	/// in a parent that survives.
 	///
-	/// A row is cut by its span rather than removed node by node, for the reason
-	/// `Row` records: whatever a row's `Slot` placed, and whatever it grew
-	/// afterwards, lies between its marker and the next boundary.
+	/// The rows leave as ONE run — the first row's marker up to the anchor, in one
+	/// walk with nothing kept (M187) — for the reason `Row` records: whatever a
+	/// row's `Slot` placed, and whatever it grew afterwards, lies between its
+	/// marker and the next boundary, so everything between the first marker and the
+	/// anchor is the rows'.
+	///
+	/// Under a run that is LEAVING whole (see `close_with`) the region only clears
+	/// its bookkeeping: its nodes are inside that run and go with it.
 	fun close(self) {
-		for view in self.live.read() {
-			view.element.remove();
+		if !is_leaving(self.anchor) {
+			for view in self.live.read() {
+				view.element.remove();
+			}
+			match self.rows.read().first() {
+				Some(let first) => remove_run(first.marker, self.anchor),
+				None => {},
+			}
+			self.anchor.remove();
 		}
 		self.live.write() = [];
-		let rows = self.rows.read();
-		mut at = 0;
-		for row in rows {
-			let end = if at + 1 < rows.len() { rows[at + 1].marker } else { self.anchor };
-			let _cut = self.cut_row(row, end);
-			self.drop_row(row);
-			at += 1;
-		}
 		self.rows.write() = [];
-		self.anchor.remove();
 	}
+
+	/// `close`, with the rows' owners going first: `disposal` runs while the
+	/// region's run is marked as LEAVING (M187), so every region inside it closes
+	/// as bookkeeping alone, and then `close` takes the run out in one walk. The
+	/// form for a region whose rows have owners — `each`'s, `when`'s, `swap`'s —
+	/// where a bare `close` after the owners' disposal would have every nested
+	/// region cut its own rows out first, one region at a time. KEEP IN STEP with
+	/// the process twin's copy (process/ui.vl).
+	fun close_with(self, disposal: || void) {
+		match self.rows.read().first() {
+			Some(let first) => {
+				if is_leaving(self.anchor) {
+					disposal();
+				} else {
+					while_leaving(first.marker, self.anchor, disposal);
+				}
+			},
+			None => disposal(),
+		}
+		self.close();
+	}
+}
+
+/// The set of a run's top-level nodes (M187) — the host's `Set`, opaque here.
+external struct RunNodes;
+
+/// Every node strictly between `after` and `before`, moved into a fresh fragment.
+[extern("__dom_cut_run")]
+external fun cut_run(after: Text, before: Text): Element;
+
+/// Removes `from` and every node after it up to, not including, `before`.
+[extern("__dom_remove_run")]
+external fun remove_run(from: Text, before: Text): void;
+
+/// The top-level nodes from `from` up to, not including, `before`.
+[extern("__dom_run_nodes")]
+external fun run_nodes(from: Text, before: Text): RunNodes;
+
+/// Whether `node` is one of `nodes` or lies inside one of them.
+[extern("__dom_run_holds")]
+external fun run_holds(nodes: RunNodes, node: Text): bool;
+
+/// The runtime's `try`/`finally` (`std::reactive`'s, tracker B292): a disposal that
+/// throws must not leave its run marked as leaving.
+[extern("__with_finally")]
+external fun with_finally(body: || void, after: || void);
+
+/// The RUNS leaving the document whole right now, innermost last (M187): a region
+/// pushes its run while its rows' owners are disposed and pops it after, and every
+/// region closing in between asks whether its anchor is inside one.
+let leaving_runs: Shared<List<RunNodes>> = Shared::new([]);
+
+/// Whether `node` lies inside a run that is leaving the document whole — the
+/// question a closing region asks of its anchor, and a reactive text node of
+/// itself.
+fun is_leaving(node: Text): bool {
+	mut at: usize = 0;
+	for at < leaving_runs.read().len() {
+		if run_holds(leaving_runs.read()[at], node) {
+			ret true;
+		}
+		at += 1;
+	}
+	false
+}
+
+/// Runs `disposal` with the run from `from` up to, not including, `before` marked
+/// as leaving (M187).
+fun while_leaving(from: Text, before: Text, disposal: || void) {
+	leaving_runs.write().push(run_nodes(from, before));
+	with_finally(disposal, || {
+		let _done = leaving_runs.write().pop();
+	});
 }
 
 /// Something that can fill a child position (proposal/element-syntax.md §5) — the
@@ -891,6 +1007,7 @@ export impl Region {
 /// generic helper in the estate spells the bound `Slot` today. KEEP IN STEP with
 /// the process twin's copy (process/ui.vl).
 export trait Slot {
+	[track_caller]
 	fun place(own self, parent: View);
 }
 
@@ -921,15 +1038,21 @@ export impl type S: Flow<str> with Slot {
 	}
 }
 
+[track_caller]
 fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
 	let node = create_text_node("");
 	parent.element.append_text(node);
 	// A88: the boundary removes what it PLACED. This arm has no region — one text
-	// node is its whole run — so it takes that node out itself. The three STATIC
-	// arms take no such defer, deliberately: a static child's lifetime is its
-	// parent element's, and it was placed while the caller was building that
+	// node is its whole run — so it takes that node out itself, unless a run it
+	// lies in is leaving whole (M187), exactly as a region's `close` does. The
+	// three STATIC arms take no such defer, deliberately: a static child's lifetime
+	// is its parent element's, and it was placed while the caller was building that
 	// parent, not by a boundary.
-	get_owner().defer(|| node.remove());
+	get_owner().defer(|| {
+		if !is_leaving(node) {
+			node.remove();
+		}
+	});
 	follow(flow, |value| {
 		node.set_text(value);
 	});
@@ -977,6 +1100,7 @@ export impl type S: Flow<View> with Slot {
 	}
 }
 
+[track_caller]
 fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	let live: Shared<Option<View>> = Shared::new(None);
@@ -1012,6 +1136,7 @@ export impl type S: Flow<List<View>> with Slot {
 	}
 }
 
+[track_caller]
 fun place_views_flow<F: Flow<List<View>>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	let live: Shared<List<View>> = Shared::new([]);
@@ -1054,6 +1179,7 @@ export impl type S: Flow<Option<View>> with Slot {
 	}
 }
 
+[track_caller]
 fun place_optional_view_flow<F: Flow<Option<View>>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	// A binding the closure captures is its storage (spec §6.9, M93's rule): no
@@ -1340,10 +1466,9 @@ export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
 		let live_row: Shared<Option<Row>> = Shared::new(None);
 		let live_owner: Shared<Option<Owner>> = Shared::new(None);
 		// Live content dies with the enclosing boundary, and the anchor with it.
-		get_owner().defer(|| {
+		get_owner().defer(|| region.close_with(|| {
 			live_owner.read()?.dispose();
-			region.close();
-		});
+		}));
 		let body = self.body;
 		follow(self.condition, |on| {
 			if on {
@@ -1366,12 +1491,13 @@ export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
 			} else {
 				match live_row.read() {
 					Some(let row) => {
-						live_owner.read()?.dispose();
 						// The instantiation is a ROW, not an element: its body may
 						// be a fragment, a text node or a value form that grew
-						// after it was placed, so it leaves by its span.
-						let _cut = region.cut_row(row, region.anchor);
-						region.drop_row(row);
+						// after it was placed, so it leaves by its span — retired,
+						// so a region inside it cuts nothing of its own (M187).
+						region.retire_row(row, region.anchor, || {
+							live_owner.read()?.dispose();
+						});
 						region.hold_rows([]);
 						live_row.write() = None;
 						live_owner.write() = None;
@@ -1428,6 +1554,7 @@ export impl EachBy<type T, type K: PartialEq + Hashable, type S: RowFeed<T>, typ
 /// `swap`'s body, against a region opened at `parent`'s current end — shared by the
 /// `swap` and `swap_split` values. `armed` is the route gate's hold (see `Swap`):
 /// `true` for every ordinary swap.
+[track_caller]
 fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 	parent: View,
 	own source: S,
@@ -1442,23 +1569,26 @@ fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 	let live_row: Shared<Option<Row>> = Shared::new(None);
 	let live_owner: Shared<Option<Owner>> = Shared::new(None);
 	// The live subtree dies with the enclosing boundary, and the anchor with it.
-	get_owner().defer(|| {
+	get_owner().defer(|| region.close_with(|| {
 		live_owner.read()?.dispose();
-		region.close();
-	});
+	}));
 	follow(source, |value: T| {
 		let unchanged = match last_value.read() {
 			Some(let previous) => previous == value,
 			None => false,
 		};
 		if armed.read() && !unchanged {
-			live_owner.read()?.dispose();
+			// The page that goes is RETIRED (M187): its owner is disposed with its
+			// span marked as leaving, so every region inside it — a table's `each`,
+			// each row's `each` of cells — clears its bookkeeping and cuts nothing,
+			// and then the span leaves in one walk.
 			match live_row.read() {
-				Some(let row) => {
-					let _cut = region.cut_row(row, region.anchor);
-					region.drop_row(row);
+				Some(let row) => region.retire_row(row, region.anchor, || {
+					live_owner.read()?.dispose();
+				}),
+				None => {
+					live_owner.read()?.dispose();
 				},
-				None => {},
 			}
 			let owner = Owner::new();
 			let row = run_with_owner(owner, || region.open_row(render(value)));
@@ -1641,6 +1771,7 @@ fun row_references(
 /// fall back to on the op path, and a splice that both removes and inserts is the
 /// pass over its own SPAN (A129), so a key that leaves and arrives in one splice
 /// keeps its row.
+[track_caller]
 fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
 	own source: S,
@@ -1660,12 +1791,11 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	let row_owners: Shared<List<Owner>> = Shared::new([]);
 	// Whichever rows are live when the enclosing boundary is disposed go with it,
 	// and the anchor goes with them.
-	get_owner().defer(|| {
+	get_owner().defer(|| region.close_with(|| {
 		for owner in row_owners.read() {
 			owner.dispose();
 		}
-		region.close();
-	});
+	}));
 	// The keyed pass over ONE SPAN of the run — the rows at `at .. at + count` —
 	// against `list`: diff what the span holds against `list` and apply the plan,
 	// leaving every row outside the span where it is (A129). The whole-list pass
@@ -1705,20 +1835,30 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 		let settled = settled_steps(plan.steps);
 		let references = row_references(plan.steps, previous_rows, settled, boundary);
 		mut staying: List<bool> = [];
+		// The rows that LEAVE in this pass — the plan's removals, and every row a
+		// `Refresh` rebuilds — retired where they stand by the cut below (M187).
+		mut retiring: List<bool> = [];
 		mut fill = 0;
 		for fill < previous_rows.len() {
 			staying.push(false);
+			retiring.push(false);
 			fill += 1;
+		}
+		for gone in plan.removed {
+			retiring[gone] = true;
 		}
 		mut settled_at = 0;
 		for step in plan.steps {
-			if settled[settled_at] {
-				match step {
-					RowStep::Keep(let index) => {
+			match step {
+				RowStep::Keep(let index) => {
+					if settled[settled_at] {
 						staying[index] = true;
-					},
-					_ => {},
-				}
+					}
+				},
+				RowStep::Refresh(let index) => {
+					retiring[index] = true;
+				},
+				RowStep::Fresh => {},
 			}
 			settled_at += 1;
 		}
@@ -1726,8 +1866,9 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 		// somewhere, in the order the document holds them: a row's extent runs from
 		// its own marker to the next row's, and those boundaries are only
 		// meaningful while nothing has moved. A settled row is not cut at all (A98)
-		// — it keeps its marker, its nodes and its place — and a `None` in `cut` is
-		// exactly "this row did not move".
+		// — it keeps its marker, its nodes and its place — and a row that LEAVES is
+		// retired where it stands (M187), so a `None` in `cut` is exactly "this row
+		// did not move, or is gone".
 		mut cut: List<Option<Element>> = [];
 		mut index = 0;
 		for row in previous_rows {
@@ -1739,13 +1880,18 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				} else {
 					boundary
 				};
-				cut.push(Some(region.cut_row(row, end)));
+				if retiring[index] {
+					// Retired HERE, in document order while every boundary still
+					// means what it says: the owner goes with the span marked as
+					// leaving, so a region inside the row cuts nothing (M187).
+					let owner = previous_owners[index];
+					region.retire_row(row, end, || owner.dispose());
+					cut.push(None);
+				} else {
+					cut.push(Some(region.cut_row(row, end)));
+				}
 			}
 			index += 1;
-		}
-		for gone in plan.removed {
-			previous_owners[gone].dispose();
-			region.drop_row(previous_rows[gone]);
 		}
 		mut next_rows: List<Row> = [];
 		mut next_owners: List<Owner> = [];
@@ -1768,9 +1914,8 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 					next_rows.push(previous_rows[kept]);
 					next_owners.push(previous_owners[kept]);
 				},
-				RowStep::Refresh(let kept) => {
-					previous_owners[kept].dispose();
-					region.drop_row(previous_rows[kept]);
+				// The row it replaces was retired by the cut above.
+				RowStep::Refresh(let _retired) => {
 					let owner = Owner::new();
 					next_rows.push(run_with_owner(owner, || {
 						region.open_row_before(render(item), reference)
@@ -1843,9 +1988,8 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				region.anchor
 			};
 			let going = row_rows.read()[at];
-			let _cut = region.cut_row(going, end);
-			row_owners.read()[at].dispose();
-			region.drop_row(going);
+			let owner = row_owners.read()[at];
+			region.retire_row(going, end, || owner.dispose());
 			let _row = row_rows.write().remove(at);
 			let _owner = row_owners.write().remove(at);
 			let _key = row_keys.write().remove(at);
@@ -1883,7 +2027,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	// exactly the state its first drain starts from. An EFFECT's subscriber (the
 	// run writes the DOM), minted here since `mint_subscriber` is reactive.vl's
 	// own.
-	let handle = (instance.attach)(subscriber_of(|| {
+	let run = subscriber_of(|| {
 		for op in live_ops(drain()) {
 			match op {
 				// A splice that only removes or only inserts cannot re-meet a key,
@@ -1940,7 +2084,10 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				},
 			}
 		}
-	}, false));
+	}, false);
+	// E345: under the reactive trace the run names the program's placement.
+	place_subscriber(run.id, caller());
+	let handle = (instance.attach)(run);
 	also_releasing(handle, instance.release);
 	let _owned = get_owner().take(handle);
 	reconcile_pass((instance.snapshot)());
@@ -1954,6 +2101,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 /// element changed in place under the same key is WRITTEN INTO that row's cell and
 /// nothing is built, exactly as the pass's `Keep` does it — but only for the row
 /// the op names, where the pass writes into every surviving row's cell.
+[track_caller]
 fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
 	own source: S,
@@ -1971,12 +2119,11 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	let row_owners: Shared<List<Owner>> = Shared::new([]);
 	// Whichever rows are live when the enclosing boundary is disposed go with it,
 	// exactly as `place_each`'s do.
-	get_owner().defer(|| {
+	get_owner().defer(|| region.close_with(|| {
 		for owner in row_owners.read() {
 			owner.dispose();
 		}
-		region.close();
-	});
+	}));
 	// The keyed pass over ONE SPAN of the run, as `place_each`'s is (A129): the
 	// whole-list pass is this over the whole run, which is `each_by` as it has
 	// always been, and a `Splice` that both removes and inserts is this over its
@@ -2013,10 +2160,17 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 		let settled = settled_steps(plan.steps);
 		let references = row_references(plan.steps, previous_rows, settled, boundary);
 		mut staying: List<bool> = [];
+		// The rows that LEAVE in this pass — the plan's removals (a surviving key
+		// is always kept here) — retired where they stand by the cut below (M187).
+		mut retiring: List<bool> = [];
 		mut fill = 0;
 		for fill < previous_rows.len() {
 			staying.push(false);
+			retiring.push(false);
 			fill += 1;
+		}
+		for gone in plan.removed {
+			retiring[gone] = true;
 		}
 		mut settled_at = 0;
 		for step in plan.steps {
@@ -2043,13 +2197,18 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				} else {
 					boundary
 				};
-				cut.push(Some(region.cut_row(row, end)));
+				if retiring[index] {
+					// Retired HERE, in document order while every boundary still
+					// means what it says: the owner goes with the span marked as
+					// leaving, so a region inside the row cuts nothing (M187).
+					let owner = previous_owners[index];
+					region.retire_row(row, end, || owner.dispose());
+					cut.push(None);
+				} else {
+					cut.push(Some(region.cut_row(row, end)));
+				}
 			}
 			index += 1;
-		}
-		for gone in plan.removed {
-			previous_owners[gone].dispose();
-			region.drop_row(previous_rows[gone]);
 		}
 		mut next_cells: List<SignalCell<T>> = [];
 		mut next_rows: List<Row> = [];
@@ -2150,9 +2309,8 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				region.anchor
 			};
 			let going = row_rows.read()[at];
-			let _cut = region.cut_row(going, end);
-			row_owners.read()[at].dispose();
-			region.drop_row(going);
+			let owner = row_owners.read()[at];
+			region.retire_row(going, end, || owner.dispose());
 			let _row = row_rows.write().remove(at);
 			let _owner = row_owners.write().remove(at);
 			let _cell = row_cells.write().remove(at);
@@ -2181,7 +2339,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	// The input, opened as `place_each` opens its own.
 	let instance = source.open_rows();
 	let drain = instance.drain;
-	let handle = (instance.attach)(subscriber_of(|| {
+	let run = subscriber_of(|| {
 		for op in live_ops(drain()) {
 			match op {
 				// Positional when it only removes or only inserts; the pass over
@@ -2239,7 +2397,10 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				},
 			}
 		}
-	}, false));
+	}, false);
+	// E345: under the reactive trace the run names the program's placement.
+	place_subscriber(run.id, caller());
+	let handle = (instance.attach)(run);
 	also_releasing(handle, instance.release);
 	let _owned = get_owner().take(handle);
 	reconcile_pass((instance.snapshot)());
@@ -2252,6 +2413,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 /// `Source<str>` (B158/B165), so any reactive value fills an attribute. KEEP IN
 /// STEP with the process twin's copy (process/ui.vl).
 export trait AttrValue {
+	[track_caller]
 	fun apply(own self, parent: View, name: str);
 }
 
@@ -2269,6 +2431,7 @@ export impl type S: Flow<str> with AttrValue {
 	}
 }
 
+[track_caller]
 fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2304,6 +2467,7 @@ export impl type S: Flow<Option<str>> with AttrValue {
 	}
 }
 
+[track_caller]
 fun apply_optional_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2330,6 +2494,7 @@ fun apply_optional_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: s
 ///
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 export trait AttrBinding {
+	[track_caller]
 	fun bind_attribute(own self, parent: View, name: str);
 }
 
@@ -2340,6 +2505,7 @@ export impl type S: Flow<str> with AttrBinding {
 	}
 }
 
+[track_caller]
 fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2355,6 +2521,7 @@ export impl type S: Flow<Option<str>> with AttrBinding {
 	}
 }
 
+[track_caller]
 fun bind_optional_attribute_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2480,6 +2647,7 @@ export impl WhenSome<type T, type S: Flow<Option<T>>, type C: Slot> with Slot {
 /// `when_some`'s body, against a region opened at `parent`'s current end —
 /// `place_swap`'s machinery, with the presence deciding structure and the cell
 /// carrying the value.
+[track_caller]
 fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 	parent: View,
 	own source: S,
@@ -2492,10 +2660,9 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 	let live_row: Shared<Option<Row>> = Shared::new(None);
 	let live_owner: Shared<Option<Owner>> = Shared::new(None);
 	// Live content dies with the enclosing boundary, and the anchor with it.
-	get_owner().defer(|| {
+	get_owner().defer(|| region.close_with(|| {
 		live_owner.read()?.dispose();
-		region.close();
-	});
+	}));
 	follow(source, |value: Option<T>| {
 		match value {
 			Some(let payload) => {
@@ -2522,12 +2689,13 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 			None => {
 				match live_row.read() {
 					Some(let row) => {
-						live_owner.read()?.dispose();
 						// The instantiation is a ROW, not an element: its body may
 						// be a fragment, a text node or a value form that grew
-						// after it was placed, so it leaves by its span.
-						let _cut = region.cut_row(row, region.anchor);
-						region.drop_row(row);
+						// after it was placed, so it leaves by its span — retired,
+						// so a region inside it cuts nothing of its own (M187).
+						region.retire_row(row, region.anchor, || {
+							live_owner.read()?.dispose();
+						});
 						region.hold_rows([]);
 						live_cell.write() = None;
 						live_row.write() = None;

@@ -1106,9 +1106,9 @@ write reached, as it runs — naming what woke it:
 
 ```text
 [reactive] effect #4 at src/views.vl:30:8 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
-[reactive] derivation #2 woken by cell #1, set at src/main.vl:9:7
-[reactive] effect #5 woken by cell #3, set by derivation #2
-[reactive] effect #6 woken by derivation #2
+[reactive] derivation #2 at src/main.vl:8:40 woken by cell #1, set at src/main.vl:9:7
+[reactive] effect #5 at src/views.vl:31:4 woken by cell #3 (made at src/main.vl:8:40), set by derivation #2
+[reactive] effect #6 at src/views.vl:34:11 woken by derivation #2
 ```
 
 A subscriber is an `effect` (it acts on a value) or a `derivation` (a pipe's
@@ -1122,6 +1122,18 @@ write through a `S: Signal<T>` bound or a `dyn Signal` names its place as a
 concrete cell's does. A write std makes inside a traced wake (a `.memo()`
 publishing its value) says `set by` that wake instead, and a relay's wake
 (`distinct`, `switch`) names the relay.
+
+A **derivation** names where your code made it: a seal (`.memo()`, `.cell()`,
+the `_global` twins, a collection's `.memo()`, `unzip`, `selector`) at that
+call — and the cell it writes is "made at" the same place — and a stage's own
+relay (`.distinct()`, `.distinct_by(..)`, `.switch(..)`, `.switch_some(..)`,
+`.and_then(..)`, `.then_some(..)`, `.flatten()`, and a tracked read's edge in a
+`derive` or an `effect`) at the call that made the stage. A **UI binding**
+names the element that made it: `std::web::ui`'s helpers (`.child(..)` and the
+`{hole}` it stands for, `bind_*`, `attr`, `show`, `style_var`, the `each` /
+`when` / `swap` forms) track their caller from your call down to the
+subscription, so `<p>{count}</p>`'s line says `effect #3 at src/views.vl:12:4`,
+the `<p>`, where it named nothing.
 
 The lines are the same bytes on both backends. Turn the trace on before the
 cells you want named are made (a cell remembers where it was made only while

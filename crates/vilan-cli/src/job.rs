@@ -13,9 +13,13 @@
 //! forwards a `SIGTERM`, `SIGHUP` or `SIGINT` the CLI is sent to it (E335) - a
 //! supervisor, an editor task or a harness that stops `vilan run` stops the
 //! program with it, and the program's own death by a signal is what the run
-//! then reports (128 + the signal, as a shell does). The `--watch` rounds keep
-//! their own path (`ManagedChild::kill` on a restart) and no child registered
-//! there, so an interrupt in a watch session behaves as it always did.
+//! then reports (128 + the signal, as a shell does). A `--watch` round's child
+//! is registered too (E341), in the other mode: the signal is forwarded to it,
+//! the session waits up to [`WATCH_CHILD_GRACE`] for it to end (and kills it
+//! past that), and then ends as an interrupted session always has - exit 130.
+//! Before, a supervisor's `SIGTERM` ended the watcher and left the round's
+//! program holding its port. Restarts keep their own path (`ManagedChild::kill`
+//! on the previous round's child).
 //!
 //! Windows has no such group. `Child::kill` is `TerminateProcess` on the direct
 //! `node.exe` **only**, so a dev server that forked a worker keeps the port and
@@ -78,10 +82,45 @@ impl ManagedChild {
 
     /// Reaps the direct child. (On Windows the job's other members are already
     /// terminated by `kill`; they were never this process's children, so there
-    /// is nothing to reap for them.)
+    /// is nothing to reap for them.) A child the signal pipeline holds is taken
+    /// off it FIRST: once reaped its pid may be reused, and a late forwarded
+    /// signal must not find it.
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        #[cfg(unix)]
+        forward::forget(self.child.id() as libc::pid_t);
         self.child.wait()
     }
+}
+
+/// How long an ending `--watch` session waits for its round's child after
+/// forwarding it the signal that ends the session (E341), before it kills the
+/// child: long enough for a server's graceful stop (F45) to drain, short enough
+/// that a supervisor's stop is not left waiting on a program that ignores it.
+#[cfg(unix)]
+pub const WATCH_CHILD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Spawns a `--watch` round's child and registers it with the signal pipeline
+/// in [`forward::Mode::Exit`] (E341): a `SIGTERM`, `SIGHUP` or `SIGINT` that
+/// ends the session reaches the program too. `spawn` runs under the registry's
+/// lock, as [`run_to_end`]'s does, so a signal that lands while the child is
+/// being started is handled once it exists rather than by the bare hook.
+#[cfg(unix)]
+pub fn spawn_watched(
+    spawn: impl FnOnce() -> std::io::Result<ManagedChild>,
+) -> std::io::Result<ManagedChild> {
+    let mut registered = forward::registry();
+    let child = spawn()?;
+    *registered = Some((child.child.id() as libc::pid_t, forward::Mode::Exit));
+    Ok(child)
+}
+
+/// The non-unix form: the Job object [`ManagedChild::adopt`] assigns takes the
+/// round's tree when the session dies.
+#[cfg(not(unix))]
+pub fn spawn_watched(
+    spawn: impl FnOnce() -> std::io::Result<ManagedChild>,
+) -> std::io::Result<ManagedChild> {
+    spawn()
 }
 
 /// Spawns the program a plain `vilan run` executes, waits for it to end and
@@ -96,7 +135,7 @@ pub fn run_to_end(
     let mut child = {
         let mut registered = forward::registry();
         let child = spawn()?;
-        *registered = Some(child.child.id() as libc::pid_t);
+        *registered = Some((child.child.id() as libc::pid_t, forward::Mode::Wait));
         child
     };
     forward::wait_unreaped(child.child.id() as libc::pid_t);
@@ -131,23 +170,89 @@ pub fn signal_exit_code(_status: &ExitStatus) -> Option<i32> {
 /// The unix signal pipeline (E335): `SIGINT`, `SIGTERM` and `SIGHUP` are caught
 /// by a handler that only writes the signal's number to a pipe (the one thing a
 /// handler may do), and a thread reads the pipe and either forwards the signal
-/// to the child a plain run has registered or - with none registered, as in a
-/// compile or a watch session - hands it to the interrupt hook, which removes
-/// the temp script and exits 130, as it did when `ctrlc` installed the handler
-/// (`ctrlc` hands its closure no signal number, which forwarding needs).
+/// to the registered child - a plain run's, or a watch round's (E341) - or,
+/// with none registered (a compile, a watch session between rounds), hands it
+/// to the interrupt hook, which removes the temp script and exits 130, as it
+/// did when `ctrlc` installed the handler (`ctrlc` hands its closure no signal
+/// number, which forwarding needs).
 #[cfg(unix)]
 mod forward {
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::{Mutex, MutexGuard, Once, PoisonError};
+    use std::time::{Duration, Instant};
 
-    /// The child a plain `vilan run` is waiting on (`None` outside one).
-    static CHILD: Mutex<Option<libc::pid_t>> = Mutex::new(None);
+    /// What a signal does with the registered child.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Mode {
+        /// A plain `vilan run`: forward it and keep waiting - the program's own
+        /// end is the run's.
+        Wait,
+        /// A `--watch` round's child: forward it, wait up to
+        /// [`super::WATCH_CHILD_GRACE`] for the child to end (killing it past
+        /// that), then hand the signal to the interrupt hook - the session ends.
+        Exit,
+    }
+
+    /// The child the CLI is waiting on, and in which mode (`None` outside one).
+    static CHILD: Mutex<Option<(libc::pid_t, Mode)>> = Mutex::new(None);
 
     /// The pipe's write end the handler writes to (-1 before [`install`]).
     static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
-    pub fn registry() -> MutexGuard<'static, Option<libc::pid_t>> {
+    pub fn registry() -> MutexGuard<'static, Option<(libc::pid_t, Mode)>> {
         CHILD.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes `pid` off the registry if it is the child registered there.
+    pub fn forget(pid: libc::pid_t) {
+        let mut registered = registry();
+        if registered.is_some_and(|(held, _)| held == pid) {
+            *registered = None;
+        }
+    }
+
+    /// Whether `pid` has exited, without reaping it and without blocking.
+    fn exited_unreaped(pid: libc::pid_t) -> bool {
+        // SAFETY: `siginfo_t` is plain data (zeroed is a valid value) and the
+        // pointer is to a live local of that type; `si_pid` reads the field
+        // `waitid` fills (zero when no child changed state).
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let waited = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            );
+            // An error (the child is not ours any more) ends the wait too.
+            waited != 0 || info.si_pid() != 0
+        }
+    }
+
+    /// Waits for a forwarded-to watch child to end, up to the grace period,
+    /// killing it past that, and reaps it - so the session that exits next
+    /// leaves no process behind, not even one for init to collect. Called with
+    /// the registry locked, so nothing else reaps the pid first; the round's
+    /// `ManagedChild` is never waited on again, because the session exits.
+    fn end_watched(pid: libc::pid_t) {
+        let deadline = Instant::now() + super::WATCH_CHILD_GRACE;
+        while !exited_unreaped(pid) {
+            if Instant::now() >= deadline {
+                // SAFETY: a plain `kill` on the unreaped child.
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        loop {
+            // SAFETY: `waitpid` on our own child, with a null status pointer.
+            let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            if reaped >= 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return;
+            }
+        }
     }
 
     /// Blocks until the child has exited WITHOUT reaping it (`WNOWAIT`), so the
@@ -272,14 +377,26 @@ mod forward {
                 // The registry stays locked across the `kill`: the run clears
                 // it before it reaps the child, so the pid is still ours here.
                 let guard = registry();
+                // A terminal's `Ctrl-C` reached the child with the rest of the
+                // foreground group: delivering it again would run a program's
+                // SIGINT handler twice.
+                let delivered = signal == libc::SIGINT && from_kernel;
                 match *guard {
-                    // A terminal's `Ctrl-C` reached the child with the rest of
-                    // the foreground group: delivering it again would run a
-                    // program's SIGINT handler twice.
-                    Some(_) if signal == libc::SIGINT && from_kernel => {}
-                    Some(pid) => {
+                    Some((_, Mode::Wait)) if delivered => {}
+                    Some((pid, Mode::Wait)) => {
                         // SAFETY: a plain `kill` on the unreaped child.
                         let _ = unsafe { libc::kill(pid, signal) };
+                    }
+                    // E341: a watch session ends with its round's program. The
+                    // registry stays locked to the end, so no round can start
+                    // another child while the session goes.
+                    Some((pid, Mode::Exit)) => {
+                        if !delivered {
+                            // SAFETY: a plain `kill` on the unreaped child.
+                            let _ = unsafe { libc::kill(pid, signal) };
+                        }
+                        end_watched(pid);
+                        unclaimed(signal);
                     }
                     None => {
                         drop(guard);

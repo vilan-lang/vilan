@@ -31,6 +31,7 @@ mod liveness;
 mod move_tables;
 mod r11_candidates;
 mod r11_records;
+mod retain_tables;
 mod row_families;
 mod written_types;
 
@@ -697,10 +698,41 @@ impl TupleBoundRequirement {
     }
 }
 
+/// A181 (RULED 2026-11-03): the steer at `(impl _)`, the retired spelling of
+/// the whole-module selector (`import-foundation.md` §5, §10 Q6). `_` is
+/// UNSPECIFIED — a hole — and `*` is EVERYTHING, a set; a selector taking
+/// every block names a set. Read as `(impl *)` for v0.54.0 and refused from
+/// v0.55.0 (the refusal replaces this sentence then).
+const RETIRED_WHOLE_SELECTOR: &str = "a selector that takes every block is written `(impl *)`: \
+     `*` is EVERYTHING, a set (`export *;`, `::*`), and `_` is a hole inside a type (`(impl \
+     List<_>)`). `(impl _)` is read as `(impl *)` in this release and refused in the next; `vilan \
+     fmt` rewrites it";
+
+/// A182 (Q8): the refusal of a glob leaf outside an `export import`. `m::*`
+/// re-publishes every name `m` exports, which is a module's act of publication
+/// (`export import std::web::prelude::*;`, the two-line package prelude); a
+/// plain import of every name would bind names this file never wrote.
+const GLOB_IS_A_REEXPORT: &str = "`::*` names every export of a module, and is written only \
+     as a RE-EXPORT — `export import m::*;` publishes them from this module, as a package \
+     prelude does: import the names this file uses";
+
 /// B535's stable code: a trait's method called in a file that does not import
 /// the trait ([`Analyzer::check_trait_method_scope`]'s refusal). The editor
 /// publishes it as the diagnostic's `code`.
 pub const TRAIT_SCOPE_CODE: &str = "trait-scope/not-imported";
+
+/// What brings a member a user file calls into that file's scope
+/// ([`Analyzer::check_trait_method_scope`]).
+#[derive(Clone, Copy)]
+enum ScopedMember {
+    /// A trait's member (B515): the trait, which the file must reach.
+    Trait(Id),
+    /// B688: an inherent member of an EXTENSION block — an `impl` written in
+    /// a module other than its subject's own (`std::display`'s
+    /// `impl List<type T: Display> { fun join }`): the block's index into
+    /// `implementations`, whose file the caller must reach.
+    Extension(usize),
+}
 
 /// The fixed head of B535's refusal after its member and trait names, which
 /// recognizes it.
@@ -3527,6 +3559,9 @@ pub struct StructInitializerConstraint<'src> {
     /// itself is what's wrong, not the value assigned to it).
     pub fields: Vec<(&'src str, Id, Span, Span)>,
     pub fields_span: Span,
+    /// B657: a `..base` update tail was written, and refused by the parser —
+    /// so the fields it would have filled are not reported missing again.
+    pub update_refused: bool,
 }
 
 /// A constraint that a variable's type must unify with its
@@ -3879,6 +3914,7 @@ impl<'src> StructInitializerConstraint<'src> {
         generic_argument_ids: Vec<TypeId>,
         e_fields: Vec<(&'src str, Id, Span, Span)>,
         fields_span: Span,
+        update_refused: bool,
     ) -> Self {
         Self {
             initializer_id,
@@ -3892,6 +3928,7 @@ impl<'src> StructInitializerConstraint<'src> {
             generic_parameter_constraint_ids: Vec::new(),
             fields: e_fields,
             fields_span,
+            update_refused,
         }
     }
 
@@ -4335,6 +4372,15 @@ pub struct Analyzer<'src> {
     /// files no move rows); and the fold, read by R11 and the drop plan.
     move_rows_live: move_tables::MoveRows,
     move_rows_filed: bool,
+    /// M188: the live lane's retaining rows (`retain_tables.rs`) and whether
+    /// this analysis walked them (an asked summary, or a seeded analysis —
+    /// [`Self::retain_rows_eager`]).
+    retain_rows_live: retain_tables::RetainRows,
+    retain_rows_filed: bool,
+    /// M188: whether `check_view_escape` walks the retaining rows' live lane
+    /// even when no call asks a summary — a SEEDED analysis's records must
+    /// carry the family for the keystroke that first asks.
+    retain_rows_eager: bool,
     /// M155: the live lane's R11 candidate rows, and whether this analysis
     /// derived them (it met an instantiation).
     r11_rows_live: r11_candidates::CandidateRows,
@@ -4926,6 +4972,30 @@ pub struct Analyzer<'src> {
     // sealed, which is after `build()`; recorded unconditionally, beside
     // `import_reaches`, which pays the same push for the same kind of reason.
     import_targets: Vec<(SourceId, Id)>,
+    // A182 (`import-foundation.md` §8): per resolved import leaf, the
+    // statement it belongs to (file, statement span), the LEAF module the
+    // walk stood in when the leaf resolved, and the leaf's target. The files
+    // a statement CARRIES — whose blocks it admits, restricts and reaches —
+    // are that module's and the leaf's own ([`Analyzer::statement_carried`]),
+    // never a parent directory body's.
+    import_leaf_modules: Vec<(SourceId, Span, Id, Id)>,
+    // A182: the module each import path SEGMENT resolved to, by (file, the
+    // segment's span) — how a selector finds the module it selects from when
+    // a sibling leaf's walk, not its own, resolved the path above it
+    // (`import pkg::x::{ y::helper, (impl T) }` walks `x` once).
+    import_segment_modules: HashMap<(SourceId, Span), Id>,
+    // A182 (Q8): the re-exported ADMISSIONS each module scope writes — its
+    // `export import` statements that write a selector — by (file, statement
+    // span). Each travels to every file that imports from the module, and to
+    // every file whose prelude it is.
+    exported_imports_by_scope: HashMap<Id, Vec<(SourceId, Span)>>,
+    // A182: every `export import` statement, by (file, statement span) — where
+    // a glob leaf (`m::*`) may stand.
+    exported_import_spans: HashSet<(SourceId, Span)>,
+    // A182: the prelude module scope each seeded module scope took its
+    // ambient names from (`seed_preludes`), so the prelude's re-exported
+    // admissions reach the files it seeds.
+    prelude_scope_of: HashMap<Id, Id>,
     // M19 T0: whether the entry tail has begun — set once, after
     // `resolve_world` on a miss and after the base-cache lookup on a hit. The
     // world's OWN resolution writes slots constantly and dirties nothing; only
@@ -5208,11 +5278,6 @@ pub struct Analyzer<'src> {
     /// by call anchor. A declared member needs no record; the pass finds its
     /// block by its declarations.
     declined_default_calls: HashMap<Id, (Id, Id, String)>,
-    /// The loaded files' paths by `SourceId`, handed in by the driver before
-    /// each resolve: [`Analyzer::build_lookup_admission`] reads a module's
-    /// ANCESTOR files off them (`ancestor_module_sources`), as the post-build
-    /// pass reads `Program::canonical_sources`.
-    source_paths: Vec<PathBuf>,
     /// E224 (R-j): every `import`/`use` STATEMENT's span, by file — what
     /// `labels::check` reads to tell an import line's own name rows (which are
     /// not uses) from the uses it warns at.
@@ -5645,6 +5710,11 @@ pub struct Analyzer<'src> {
     /// [`Program::declared_function_contexts`].
     prepped_function_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
     declared_function_contexts: HashMap<Id, Vec<Id>>,
+    /// B677 door 2: each `fun` parameter whose declared type is a closure
+    /// type, with that type's id — the candidates for the implied
+    /// `context owner_scope` [`Analyzer::resolve_context_clauses`] gives one
+    /// answering a view, once the names its result spells have resolved.
+    prepped_view_parameters: Vec<(Id, TypeId)>,
     function_context_clause_spans: HashMap<Id, Span>,
     /// Where a `context` clause would be inserted on each function, by
     /// function id (E148) — the parser's [`crate::node::Func::signature_end`].
@@ -6105,6 +6175,20 @@ pub struct Analyzer<'src> {
     // check must not read it as an under-supply. Marked, like the trait
     // positions above, so the default stays the checked one.
     path_head_type_ids: HashSet<TypeId>,
+    // A181 (`import-foundation.md` §7): the scopes an `(impl …)` selector's
+    // subject (and its `with` trait) is walked in. A path HEAD written there may
+    // be a ROOT — `pkg`, `std`, a dependency — which the type drain resolves
+    // as an import statement's first segment does (`resolve_import_root`), at
+    // every position of the subject type: the subject is a type path, and a
+    // type path's head may be a root (row 11 of the elaboration table). Only
+    // here: an inline root anywhere else is the later inline-roots slice.
+    selector_subject_scopes: HashSet<Id>,
+    // A181: the type slots holding a namespace a ROOT-headed type path reached
+    // (`pkg`, `pkg::lib`, `pkg::lib::overlay`) — so the next segment descends
+    // as an import path does, a module's directory children included
+    // (`member_or_submodule`), rather than as an expression's qualified path,
+    // which asks the module scope alone.
+    root_path_type_ids: HashSet<TypeId>,
     // The annotation type ids of `let` bindings, keyed to the binding they
     // annotate. B161: a trait written HERE — and only here among the value
     // positions — is a CHECKED CONSTRAINT on the binding's inferred type
@@ -6966,6 +7050,9 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
                         Some((last, _)) => *last,
                         None => continue,
                     },
+                    // A182: a glob's names are the globbed module's, known
+                    // once it resolves (`resolve_glob_reexport` publishes them).
+                    (None, crate::node::GLOB_IMPORT_LEAF) => continue,
                     (None, leaf) => leaf,
                 };
                 out.push(Importable {
@@ -7439,6 +7526,36 @@ fn operator_symbol(op: BinaryOp) -> &'static str {
     }
 }
 
+/// Every `(trait name, member name, spelling)` an overloaded operator calls —
+/// [`operator_trait_method`] over each operator, for a reader that asks the
+/// other way round (B646's guard: such a member is called with no argument
+/// list, so it cannot take its caller's location).
+pub(crate) fn operator_members() -> impl Iterator<Item = (&'static str, &'static str, &'static str)>
+{
+    [
+        BinaryOp::Add,
+        BinaryOp::Sub,
+        BinaryOp::Mul,
+        BinaryOp::Div,
+        BinaryOp::Rem,
+        BinaryOp::Shl,
+        BinaryOp::Shr,
+        BinaryOp::BitAnd,
+        BinaryOp::BitXor,
+        BinaryOp::BitOr,
+        BinaryOp::Eq,
+        BinaryOp::Lt,
+        BinaryOp::Gt,
+        BinaryOp::LtEq,
+        BinaryOp::GtEq,
+    ]
+    .into_iter()
+    .filter_map(|op| {
+        operator_trait_method(op)
+            .map(|(trait_name, member)| (trait_name, member, operator_symbol(op)))
+    })
+}
+
 /// The `(trait name, method name)` an arithmetic operator dispatches to, e.g.
 /// `+` -> `("Add", "add")`. Returns `None` for comparison/logical operators,
 /// which are not overloadable.
@@ -7824,6 +7941,16 @@ impl LookupAdmission {
     }
 }
 
+/// A182: what one import statement CARRIES ([`Analyzer::statement_carry_index`]).
+#[derive(Debug, Clone, Default)]
+struct StatementCarry {
+    /// The files whose implementations it admits — the leaf modules', and
+    /// each item leaf's own — the importing file left out.
+    files: Vec<SourceId>,
+    /// The leaf modules' scopes, whose re-exported admissions travel with it.
+    module_scopes: Vec<Id>,
+}
+
 /// B318 S3 — one `import` statement's claim on the implementations its walk
 /// carries, banked by the import walk and resolved after `build()` by
 /// [`check_impl_selector_admission`].
@@ -7840,11 +7967,14 @@ pub struct ImportImplRestriction {
     pub source: SourceId,
     /// The statement's span, for a refusal that has nowhere better to sit.
     pub span: Span,
-    /// Every segment span of the statement's path, leaves included. The
-    /// resolution pass reads each one's definition out of `type_references` and
-    /// takes its FILE: those are the files whose implementations this statement
-    /// carried, and therefore the ones it restricts.
-    pub path_spans: Vec<Span>,
+    /// A182: the FILES this statement carries — the leaf module's, for each
+    /// leaf and selector, and each item leaf's own declaring file — whose
+    /// implementations it admits, restricts and reaches. Never a parent
+    /// directory body's (`import-foundation.md` §2 row 1, §8): those arrive
+    /// through a statement that names them, or a prelude. Filled from the
+    /// resolved walk ([`Analyzer::statement_carry_index`]) when the program is
+    /// handed over; the importing file itself is never in it.
+    pub carried: Vec<SourceId>,
     /// `only`'s own span, when the statement carried it.
     pub only: Option<Span>,
     /// The `(impl …)` selectors the statement's brace set wrote.
@@ -7861,7 +7991,7 @@ pub struct ImportImplSelector {
     pub text: String,
     /// The subject's type. `_` anywhere in it is an anonymous binder, which is
     /// exactly a hole: the admission test unifies in BOTH directions, so
-    /// `(impl List<_>)` reaches a concrete `impl List<i32>` and `(impl _)`
+    /// `(impl List<_>)` reaches a concrete `impl List<i32>` and `(impl *)`
     /// reaches every block.
     pub subject: TypeId,
     /// `(impl Box with One)` — the trait the selected block implements (B455,
@@ -7879,6 +8009,10 @@ pub struct ImportImplSelector {
     /// block its module does not `export` contributes nothing to a file that
     /// did not write one; this is that file saying it knows.
     pub reached: bool,
+    /// A182: the span of the path segment the selector stands under — the
+    /// module it selects from (`x` in `pkg::x::(impl T)`), whose files the
+    /// statement carries.
+    pub module_span: Option<Span>,
 }
 
 /// Flattens an `import`/`use` tree into (path, leaf-name, leaf-span, alias)
@@ -8021,6 +8155,9 @@ impl<'src> Analyzer<'src> {
             partial_move_roots: HashMap::default(),
             move_rows_live: move_tables::MoveRows::default(),
             move_rows_filed: false,
+            retain_rows_live: retain_tables::RetainRows::default(),
+            retain_rows_filed: false,
+            retain_rows_eager: false,
             r11_rows_live: r11_candidates::CandidateRows::default(),
             r11_rows_filed: false,
             r11_records_served: None,
@@ -8139,6 +8276,11 @@ impl<'src> Analyzer<'src> {
             entry_dirty_sources: HashSet::default(),
             reuse_prefix_len: u32::MAX,
             import_targets: Vec::new(),
+            import_leaf_modules: Vec::new(),
+            import_segment_modules: HashMap::default(),
+            exported_imports_by_scope: HashMap::default(),
+            exported_import_spans: HashSet::default(),
+            prelude_scope_of: HashMap::default(),
             entry_phase: false,
             types_settled: false,
             item_costs: HashMap::default(),
@@ -8190,7 +8332,6 @@ impl<'src> Analyzer<'src> {
             lookup_anchor: None,
             lookup_asker: None,
             declined_default_calls: HashMap::default(),
-            source_paths: Vec::new(),
             import_statement_spans: Vec::new(),
             pending_hints: Vec::new(),
             hint_attributes: HashMap::default(),
@@ -8274,6 +8415,7 @@ impl<'src> Analyzer<'src> {
             prepped_number_literals: Vec::new(),
             negated_number_literals: HashMap::default(),
             parameter_contexts: HashMap::default(),
+            prepped_view_parameters: Vec::new(),
             prepped_type_context_clauses: Vec::new(),
             prepped_function_context_clauses: Vec::new(),
             declared_function_contexts: HashMap::default(),
@@ -8372,6 +8514,8 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             bound_position_type_ids: HashSet::default(),
             path_head_type_ids: HashSet::default(),
+            selector_subject_scopes: HashSet::default(),
+            root_path_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
             written_nominal_bound_sites: Vec::new(),
             binding_trait_constraints: Vec::new(),
@@ -14391,6 +14535,7 @@ impl<'src> Analyzer<'src> {
             "HashMap",
             "HashSet",
             "NativeMap",
+            "HashTable",
             "Shared",
             "Weak",
             "Context",
@@ -20288,8 +20433,8 @@ impl<'src> Analyzer<'src> {
     /// the instantiation is the only place to say so. When the signature IS
     /// refused, the opposite is true — the caller holds the offending type
     /// itself, was told at the type it wrote, and the body's container is that
-    /// same refusal one layer in. `HashMap<K, V>`'s storage is a `NativeMap<(K,
-    /// V)>` and `HashSet<T>`'s is a `NativeMap<T>`, so with the internal head in
+    /// same refusal one layer in. `HashMap<K, V>`'s storage is a `NativeMap<K,
+    /// V>` and `HashSet<T>`'s is a `NativeMap<T, void>`, so with the internal head in
     /// R10's list (B154) `HashMap<str, Database>` reported at `HashMap` and again at
     /// the `NativeMap` inside `Map::new`'s body — one mistake, two heads.
     ///
@@ -20350,7 +20495,7 @@ impl<'src> Analyzer<'src> {
     /// `covered` — and that there is at least one, so a type that mentions no
     /// parameter at all is never vacuously covered.
     ///
-    /// The "traces to" of E104's stand-down: the body's `NativeMap<(K, V)>` is
+    /// The "traces to" of E104's stand-down: the body's `NativeMap<K, V>` is
     /// the signature's refused `HashMap<K, V>` a layer deeper, while its `List<B>`
     /// under a signature that only refused `HashMap<str, A>` is its own offense.
     fn traces_only_to(&self, type_id: TypeId, covered: &HashSet<TypeId>) -> bool {
@@ -25660,6 +25805,167 @@ impl<'src> Analyzer<'src> {
                 self.parameter_contexts.insert(owner, context_ids);
             }
         }
+        self.imply_owner_scope_on_view_parameters();
+    }
+
+    /// E360: the refusal at `head::member` where `head` names a function. The
+    /// usual way to write it is the import of a function that shares its
+    /// module's name (`import pkg::editor::editor;`), so when the function
+    /// was declared in another module the message names both imports that
+    /// would make the path's intent work. The module's own name cannot be the
+    /// second: with `import pkg::editor::{ self, editor }` the head still
+    /// resolves to the function, so the steer renames the module.
+    fn refuse_a_path_through_a_function(&mut self, access_id: Id, function_id: Id, member: &str) {
+        let Some(name) = self
+            .functions
+            .get(&function_id)
+            .map(|function| function.name)
+        else {
+            return;
+        };
+        let declared_elsewhere = self.source_of_id(function_id) != self.source_of_id(access_id);
+        let module_path = self
+            .source_of_id(function_id)
+            .filter(|_| declared_elsewhere)
+            .and_then(|source| {
+                let module_id = self
+                    .modules
+                    .values()
+                    .find(|module| self.source_of_id(module.id) == Some(source))?
+                    .id;
+                self.module_import_paths().remove(&module_id)
+            });
+        let mut msg = format!(
+            "`{name}` is a function, not a module: `{name}::{member}` looks `{member}` up in \
+             `{name}`, and a function has no members"
+        );
+        if let Some(path) = module_path {
+            msg.push_str(&format!(
+                "; `{name}` here is the function imported from `{path}` — import `{member}` too \
+                 (`import {path}::{{ {name}, {member} }}`), or import the module under a name \
+                 of its own (`import {path}::{{ self as {name}_module, {name} }}`, then \
+                 `{name}_module::{member}(..)`)"
+            ));
+        }
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&access_id).unwrap_or(&&EMPTY_SPAN),
+                msg,
+            },
+            access_id,
+        );
+        self.expr_id_to_expr_map.insert(access_id, Expr::Error);
+    }
+
+    /// B677 door 2 (`closure-owner.md` §4, RULED 2026-11-02): a `fun`'s
+    /// closure parameter whose declared result is a view — std's `View`, or a
+    /// `Slot` (the trait the UI places) — carries `context owner_scope` by
+    /// default, and `sync` with it. A view is built where it is SHOWN: a
+    /// builder that captured the owner it was made under registered every
+    /// effect and store hold of what it built there, and nothing released them
+    /// when the body that called it went (kolt's `with_org`, `when_loaded`, the
+    /// picker's `probes`: 12 s to close a menu after 30 hovers).
+    ///
+    /// The clause is written into the parameter's TYPE, exactly where a written
+    /// one lands (B309), so `clause_of_type`, the landing rules, the carrier
+    /// classes and the hidden-parameter threading read it as written, and the
+    /// type prints it wherever it prints. A written clause naming other
+    /// contexts keeps them after the implied one (`context (owner_scope,
+    /// page_focus)`, the order kolt's patch note writes); one already naming
+    /// `owner_scope` adds nothing. An `async`-marked parameter is left as
+    /// written: the implied `sync` would contradict it. No opt-out is spelled
+    /// until a caller wants the creation owner (§5 Q3).
+    fn imply_owner_scope_on_view_parameters(&mut self) {
+        let candidates = std::mem::take(&mut self.prepped_view_parameters);
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(owner_scope) = self.std_owner_scope_context() else {
+            return;
+        };
+        for (parameter_id, type_id) in candidates {
+            if self.async_values.contains(&parameter_id) || self.is_external_parameter(parameter_id)
+            {
+                continue;
+            }
+            let Some(Type::Closure(parameters, result, contexts, modes)) =
+                self.type_id_to_type_map.get(&type_id).cloned()
+            else {
+                continue;
+            };
+            if !self.answers_a_view(result) {
+                continue;
+            }
+            self.sync_values.insert(parameter_id);
+            if contexts.contains(&owner_scope) {
+                continue;
+            }
+            let mut implied = Vec::with_capacity(contexts.len() + 1);
+            implied.push(owner_scope);
+            implied.extend(contexts);
+            self.write_type_slot(
+                type_id,
+                Type::Closure(parameters, result, implied.clone(), modes),
+            );
+            self.parameter_contexts.insert(parameter_id, implied);
+        }
+    }
+
+    /// Whether the parameter is an `external` function's — a host function
+    /// threads no hidden argument.
+    fn is_external_parameter(&self, parameter_id: Id) -> bool {
+        self.parameters
+            .get(&parameter_id)
+            .is_some_and(|parameter| self.external_functions.contains_key(&parameter.function_id))
+    }
+
+    /// B677 door 2: whether a closure answering `result` builds a view —
+    /// std's `View`, or a value of std's `Slot` trait (a bare `Slot`, a binder
+    /// bounded by it, a `dyn Slot`).
+    fn answers_a_view(&self, result: TypeId) -> bool {
+        let declared_in_std = |id: Id| {
+            self.source_of_id(id)
+                .is_some_and(|source| self.std_sources.contains(&source))
+        };
+        let is_slot = |trait_id: Id| {
+            self.traits
+                .get(&trait_id)
+                .is_some_and(|trait_| trait_.name == "Slot" && declared_in_std(trait_.id))
+        };
+        match self.type_id_to_type_map.get(&result) {
+            Some(Type::Struct(id, _)) => self
+                .structs
+                .get(id)
+                .is_some_and(|struct_| struct_.name == "View" && declared_in_std(struct_.id)),
+            Some(Type::Trait(id, _) | Type::Dyn(id, _)) => is_slot(*id),
+            Some(Type::Generic(constraint)) => self
+                .generic_bound_traits(*constraint)
+                .into_iter()
+                .any(|(trait_id, _)| is_slot(trait_id)),
+            _ => false,
+        }
+    }
+
+    /// std's `owner_scope` context — `std::reactive`'s module binding, the
+    /// ambient owner — when the program loaded it.
+    fn std_owner_scope_context(&self) -> Option<Id> {
+        let std_scope = self
+            .module_id_by_name
+            .get("std")
+            .and_then(|std_id| self.modules.get(std_id))
+            .and_then(|module| self.scopes.get(&module.body.1))?;
+        let reactive = std_scope
+            .name_to_id_map
+            .get("reactive")
+            .and_then(|id| self.modules.get(id))
+            .and_then(|module| self.scopes.get(&module.body.1))?;
+        let binding = *reactive.name_to_id_map.get("owner_scope")?;
+        Some(match self.expr_id_to_expr_map.get(&binding) {
+            Some(Expr::Local(inner)) => *inner,
+            _ => binding,
+        })
     }
 
     /// A `context` clause rendered as it is written — ` context owner_scope`,
@@ -27690,6 +27996,22 @@ impl<'src> Analyzer<'src> {
             // over the concrete type leaves `b` alone. `__clone` of the pair
             // copies the value and keeps the table, which is what a copy is.
             Type::Dyn(_, _) => true,
+            // B691: an enum with a payload lowers to the `[index, ..data]`
+            // array, and a `match &mut`/`if &mut .. is` capture writes its
+            // payload IN PLACE — so two bindings sharing the array share every
+            // write, whatever the payload's type: `mut b = a` of an
+            // `Option<List<i32>>` showed `b`'s push in `a`, and of an
+            // `Option<i32>` showed `b`'s `+= 5` in `a`. Natively every binding
+            // is its own value. A payload-less enum has nothing to write in
+            // place (a write through a view replaces the whole value), and a
+            // backed one is a bare number or string: both stay scalar copies.
+            Type::Enum(id, _) => self.enums.get(id).is_some_and(|enum_| {
+                enum_.backing.is_none()
+                    && enum_
+                        .variants
+                        .iter()
+                        .any(|variant| !variant.data_type_ids.is_empty())
+            }),
             _ => false,
         }
     }
@@ -27945,10 +28267,21 @@ impl<'src> Analyzer<'src> {
     /// for every copy and move question here — `let ys = xs as List<i32>`
     /// copies as `let ys = xs` does. (Writing through one is refused at the
     /// walk, §7.1.)
+    ///
+    /// A payload-less VARIANT named bare (`None`, `Shape::Dot`) is a `Local`
+    /// too, but it names no storage: each use is a fresh value, exactly as
+    /// `Some(x)` is. Read as a place it took rule 1's copy once B691 made a
+    /// payload enum an aggregate — `mut out: Option<T> = None` cloned the
+    /// literal it had just built.
     fn is_place_expr(&self, expr_id: Id) -> bool {
         match self.expr_id_to_expr_map.get(&expr_id) {
-            Some(Expr::Local(_) | Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _))
-            | Some(Expr::Index(_, _)) => true,
+            Some(Expr::Local(binding)) => !matches!(
+                self.expr_id_to_expr_map.get(binding),
+                Some(Expr::EnumVariant(..))
+            ),
+            Some(Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _)) | Some(Expr::Index(_, _)) => {
+                true
+            }
             Some(Expr::Ascribe(inner)) => self.is_place_expr(*inner),
             _ => false,
         }
@@ -27992,7 +28325,32 @@ impl<'src> Analyzer<'src> {
         match self.expr_id_to_expr_map.get(&expr_id) {
             Some(Expr::Dereference(_)) => true,
             Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
+            Some(Expr::Tuple(_)) => self.tuple_of_capture_places(expr_id).is_some(),
             _ => self.is_place_expr(expr_id),
+        }
+    }
+
+    /// B691: a TUPLE LITERAL whose every element names storage —
+    /// `match (self, other)`, the shape a derived `PartialEq` over an enum
+    /// writes — is a pattern subject over those places, not a fresh value: the
+    /// tuple is a temporary the patterns take apart, and each capture binds a
+    /// piece of an element's storage. So its captures are the capture pass's
+    /// (copied, or shared when nothing can write the element), and rule 1 takes
+    /// no copy of the elements themselves (`compute_clone_sites`). Read as a
+    /// construction it copied BOTH operands, whole, on every comparison once an
+    /// enum with a payload became an aggregate. `None` for any other tuple: one
+    /// fresh element makes the literal a construction, as before.
+    fn tuple_of_capture_places(&self, expr_id: Id) -> Option<&[Id]> {
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Tuple(element_ids))
+                if !element_ids.is_empty()
+                    && element_ids
+                        .iter()
+                        .all(|element_id| self.is_capture_subject_place(*element_id)) =>
+            {
+                Some(element_ids)
+            }
+            _ => None,
         }
     }
 
@@ -28007,6 +28365,12 @@ impl<'src> Analyzer<'src> {
     /// ROOT walk needs no alias analysis holds here because the receiver is
     /// right there in the call.
     fn capture_subject_places(&self, subject_id: Id) -> Vec<Id> {
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
+            return element_ids
+                .iter()
+                .flat_map(|element_id| self.capture_subject_places(*element_id))
+                .collect();
+        }
         let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return vec![subject_id];
         };
@@ -28299,6 +28663,12 @@ impl<'src> Analyzer<'src> {
     /// resource program pays for, and widening it moves goldens for a gain
     /// nothing has asked for.
     fn share_subject_is_stable(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
+        // B691: a tuple of places is stable when every element is.
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
+            return element_ids
+                .iter()
+                .all(|element_id| self.share_subject_is_stable(*element_id, written_roots));
+        }
         if self.readonly_root(subject_id).is_some() {
             return true;
         }
@@ -28331,6 +28701,12 @@ impl<'src> Analyzer<'src> {
     /// (and the SHARE elision that rides on it — the two sets are disjoint,
     /// since `share_subject_is_stable` admits no writable-view root).
     fn subject_is_writable_view(&self, subject_id: Id) -> bool {
+        // B691: a tuple of places is written through when any element is.
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
+            return element_ids
+                .iter()
+                .any(|element_id| self.subject_is_writable_view(*element_id));
+        }
         // B97: a `borrows` CALL is a writable view when the projection it
         // returns is `&mut` — the arm is total for the same construction
         // reason, since that is the only way the write reaches the receiver.
@@ -29402,12 +29778,13 @@ impl<'src> Analyzer<'src> {
     fn check_view_escape(&mut self) {
         let view_bindings = self.view_bindings().clone();
         // A closure that captures a view is itself second-class (P4c): it cannot
-        // escape either, or the captured view would outlive its target.
-        let closure_ids: Vec<Id> = self.closures.keys().copied().collect();
-        let capturing: HashSet<Id> = closure_ids
-            .into_iter()
-            .filter(|closure_id| self.closure_captures_view_param(*closure_id))
-            .collect();
+        // escape either, or the captured view would outlive its target. M189:
+        // asked per closure, of the closures this pass meets (a live escape
+        // position's value, a live call's argument, a live body's return leaf)
+        // and remembered for the pass — it used to scan every closure of the
+        // program (~5,900 on kolt, std's included, ~10-20 ms) on every
+        // keystroke, for the handful a served keystroke's live set can name.
+        let capturing = CaptureMemo::default();
         // Variant constructors that *are* a function's `Some(&mut self.x)` return
         // (including each branch of a conditional `if live { Some(..) } else { None
         // }`): the wrapped view projects a parameter, so the pair is a sanctioned
@@ -29420,6 +29797,7 @@ impl<'src> Analyzer<'src> {
             .flat_map(|function_id| self.wrapped_view_return_calls(function_id))
             .chain(self.transient_wrapped_view_calls())
             .collect();
+        crate::phase_pass_mark("check_view_escape: sanctioned wrapped calls");
         // A CLOSURE's `ret` never enters `return_sites` (its rets take part
         // in the closure's own return inference, `ret-checking.md` rule 4)
         // and gets no exemption at all — a closure may not declare `borrows`,
@@ -29435,14 +29813,20 @@ impl<'src> Analyzer<'src> {
             .map(|(_, value_id)| *value_id)
             .collect();
         // C16 (Order 37, R7): which parameter positions a callee KEEPS past the
-        // call. Computed only when some closure captures a view — for every
-        // other program the set below is asked nothing, so the fixpoint is not
-        // run at all and the check costs what it always cost.
-        let retaining = if capturing.is_empty() {
-            HashMap::default()
-        } else {
-            self.compute_retaining_positions()
-        };
+        // call. E340 (Order 56) asked it only of a live call handing a
+        // view-capturing closure to an ordinary callee; M188 answers it for
+        // THAT callee alone, over the rows of the bodies it reaches
+        // (`retain_tables.rs`) — the rows are walked for the family's live
+        // lane on the first ask and folded into an index by function, and
+        // each asked callee's summary closes over the callees its own rows
+        // name. The whole-program sweep E340 still ran on that first ask
+        // (~50 ms of a kolt css keystroke) is gone.
+        let mut retain: Option<(retain_tables::RetainIndex, HashMap<Id, BTreeSet<u32>>)> = None;
+        let mut retain_live: Option<retain_tables::RetainRows> = None;
+        // The round-based fixpoint the summaries must agree with, on a debug
+        // build (the C16 pins among the programs that ask).
+        #[cfg(debug_assertions)]
+        let mut rounds: Option<HashMap<Id, BTreeSet<u32>>> = None;
         let mut escapes: Vec<Id> = Vec::new();
         // C16's own list: the argument id and the callee that keeps it, which is
         // the whole diagnosis and the reason this escape gets its own sentence.
@@ -29496,9 +29880,45 @@ impl<'src> Analyzer<'src> {
                 // back a closure reading a view of its own dead local. Memory-
                 // safe on JS only because the host boxes the place and traces
                 // it; on the emit-Rust backend (F1) it is a freed slot.
-                Expr::Call(call_id) if !capturing.is_empty() => {
+                Expr::Call(call_id)
+                    if self.call_hands_on_a_capturing_closure(*call_id, &capturing) =>
+                {
+                    let Some((callee_id, name)) = self.named_ordinary_callee(*call_id) else {
+                        continue;
+                    };
+                    let bodied = self
+                        .functions
+                        .get(&callee_id)
+                        .is_some_and(|function| function.has_body);
+                    let keeps = if bodied {
+                        let (index, memo) = retain.get_or_insert_with(|| {
+                            let (lane, derived) = self.retain_lanes();
+                            let live = self.live_retain_rows(&lane);
+                            let index = self.fold_retain(&live, derived);
+                            retain_live = Some(live);
+                            (index, HashMap::default())
+                        });
+                        let summary = self.retaining_summary(index, memo, callee_id);
+                        #[cfg(debug_assertions)]
+                        if !crate::incremental::planted(
+                            crate::incremental::Plant::RetainRowsUnrestored,
+                        ) {
+                            let rounds = rounds.get_or_insert_with(|| {
+                                self.compute_retaining_positions_by_rounds()
+                            });
+                            assert_eq!(
+                                summary,
+                                rounds.get(&callee_id).cloned().unwrap_or_default(),
+                                "M188: the retaining summary of `{name}` over the rows disagrees \
+                                 with the whole-program rounds"
+                            );
+                        }
+                        summary
+                    } else {
+                        self.callee_retaining_positions(callee_id, &HashMap::default())
+                    };
                     stored_escapes.extend(
-                        self.stored_view_capturing_arguments(*call_id, &capturing, &retaining),
+                        self.stored_view_capturing_arguments(*call_id, &capturing, &keeps, name),
                     );
                 }
                 _ => {}
@@ -29590,35 +30010,81 @@ impl<'src> Analyzer<'src> {
                 expr_id,
             );
         }
+        if !crate::macros::in_macro_world() {
+            let scanned = capturing.answers.borrow().len() as u64;
+            crate::incremental::update_census(|census| census.capture_scans += scanned);
+        }
+        // M188: the rows this analysis walked are filed with its record. A
+        // SEEDED analysis (the editor's) walks them even when no call asked,
+        // so the world's records carry the family before the keystroke that
+        // first needs it; an unseeded one that asked nothing walks nothing.
+        if retain_live.is_none() && self.retain_rows_eager {
+            let (lane, _) = self.retain_lanes();
+            retain_live = Some(self.live_retain_rows(&lane));
+        }
+        if let Some(live) = retain_live {
+            if !crate::macros::in_macro_world() {
+                let walked = live.len() as u64;
+                crate::incremental::update_census(|census| census.retain_rows_live += walked);
+            }
+            self.retain_rows_live = live;
+            self.retain_rows_filed = true;
+        }
+    }
+
+    /// E340: whether `call_id` is an ordinary call (not a variant constructor)
+    /// with a view-capturing closure among its arguments — the calls
+    /// [`Self::stored_view_capturing_arguments`] can answer anything for, and
+    /// so the only ones that need C16's retaining fixpoint.
+    fn call_hands_on_a_capturing_closure(&self, call_id: Id, capturing: &CaptureMemo) -> bool {
+        if self.call_is_variant_constructor(call_id) {
+            return false;
+        }
+        self.function_calls
+            .get(&call_id)
+            .is_some_and(|function_call| {
+                function_call.argument_ids.iter().any(|argument_id| {
+                    matches!(
+                        self.expr_id_to_expr_map.get(argument_id),
+                        Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
+                            if self.closure_captures_view(capturing, *closure_id)
+                    )
+                })
+            })
+    }
+
+    /// C16: the callee of an ordinary call (not a variant constructor) whose
+    /// subject names a declared function or an `external` one, with its name
+    /// — the calls whose closure arguments the storing-callee refusal can
+    /// speak about. A variant constructor is not asked here: the arm above
+    /// already refuses every escaping argument of one, and asking twice would
+    /// report the same closure under two sentences.
+    fn named_ordinary_callee(&self, call_id: Id) -> Option<(Id, &'src str)> {
+        if self.call_is_variant_constructor(call_id) {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        Some((*callee_id, self.callee_name(*callee_id)?))
     }
 
     /// C16: the arguments of `call_id` that are view-capturing closures handed
-    /// to a parameter position the callee KEEPS — each paired with the callee's
-    /// name, which is what the refusal has to say to be actionable.
-    ///
-    /// A variant constructor is not asked here: the arm above already refuses
-    /// every escaping argument of one, and asking twice would report the same
-    /// closure under two sentences.
+    /// to a parameter position the callee KEEPS (`keeps`) — each paired with
+    /// the callee's name, which is what the refusal has to say to be
+    /// actionable.
     fn stored_view_capturing_arguments(
         &self,
         call_id: Id,
-        capturing: &HashSet<Id>,
-        retaining: &HashMap<Id, BTreeSet<u32>>,
+        capturing: &CaptureMemo,
+        keeps: &BTreeSet<u32>,
+        name: &str,
     ) -> Vec<(Id, String)> {
-        if self.call_is_variant_constructor(call_id) {
-            return Vec::new();
-        }
         let Some(function_call) = self.function_calls.get(&call_id) else {
             return Vec::new();
         };
-        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
-        else {
-            return Vec::new();
-        };
-        let Some(name) = self.callee_name(*callee_id) else {
-            return Vec::new();
-        };
-        let keeps = self.callee_retaining_positions(*callee_id, retaining);
         function_call
             .argument_ids
             .iter()
@@ -29628,7 +30094,7 @@ impl<'src> Analyzer<'src> {
                     && matches!(
                         self.expr_id_to_expr_map.get(*argument_id),
                         Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
-                            if capturing.contains(closure_id)
+                            if self.closure_captures_view(capturing, *closure_id)
                     )
             })
             .map(|(_, argument_id)| (*argument_id, name.to_string()))
@@ -29681,24 +30147,26 @@ impl<'src> Analyzer<'src> {
         (0..arity as u32).collect()
     }
 
-    /// C16's interprocedural summary: per function, the parameter positions
-    /// whose value is KEPT past the call — stored in a struct field, put in a
-    /// collection or an enum payload, assigned to a place, handed back as the
-    /// return value, or passed on to a callee that keeps it.
-    ///
-    /// The shape is `infer_bumps`'s (a monotone fixpoint over parameter
-    /// positions), and the walk is a GLOBAL sweep rather than a per-function
-    /// recursion: a parameter id is unique to its function, so an escaping
-    /// position anywhere in the program names the function it belongs to
-    /// without an expression-to-function map. The set only grows, so it
-    /// terminates.
+    /// C16's interprocedural summary over the WHOLE program, by rounds: per
+    /// function, the parameter positions whose value is KEPT past the call —
+    /// stored in a struct field, put in a collection or an enum payload,
+    /// assigned to a place, handed back as the return value, or passed on to
+    /// a callee that keeps it. The shape is `infer_bumps`'s (a monotone
+    /// fixpoint over parameter positions), the walk a global sweep: a
+    /// parameter id is unique to its function, so an escaping position
+    /// anywhere names the function it belongs to.
     ///
     /// Deliberately an OVER-approximation at the edges (an assignment counts
     /// whatever its target, a callee with no readable body keeps everything):
     /// the only question it ever decides is whether a view-capturing closure
     /// may be handed to a callee, and over-approximating there refuses a
     /// program rather than miscompiling one.
-    fn compute_retaining_positions(&self) -> HashMap<Id, BTreeSet<u32>> {
+    ///
+    /// The analysis answers per asked callee over the rows of the bodies it
+    /// reaches (M188, `retain_tables.rs`); this is the definition those
+    /// summaries must equal, which a debug build checks on every ask.
+    #[cfg(debug_assertions)]
+    fn compute_retaining_positions_by_rounds(&self) -> HashMap<Id, BTreeSet<u32>> {
         let mut summaries: HashMap<Id, BTreeSet<u32>> = HashMap::default();
         // Every return position of every bodied function — the tail and each
         // value-carrying `ret`, the same set the seam walk above reads.
@@ -29761,29 +30229,30 @@ impl<'src> Analyzer<'src> {
 
     /// Records `value_id`'s place root as a retained parameter position, if it
     /// is one. Answers whether the set grew, which is the fixpoint's condition.
+    #[cfg(debug_assertions)]
     fn note_retained_parameter(
         &self,
         value_id: Id,
         summaries: &mut HashMap<Id, BTreeSet<u32>>,
     ) -> bool {
-        let Some(root) = self.place_root(value_id) else {
+        let Some((function_id, position)) = self.retained_parameter_of(value_id) else {
             return false;
         };
-        let Some(parameter) = self.parameters.get(&root) else {
-            return false;
-        };
-        let function_id = parameter.function_id;
-        let Some(position) = self
+        summaries.entry(function_id).or_default().insert(position)
+    }
+
+    /// The `(function, parameter position)` `value_id`'s place roots at, if
+    /// its root is a parameter — what C16's summary records as kept.
+    fn retained_parameter_of(&self, value_id: Id) -> Option<(Id, u32)> {
+        let root = self.place_root(value_id)?;
+        let function_id = self.parameters.get(&root)?.function_id;
+        let position = self
             .functions
-            .get(&function_id)
-            .and_then(|function| function.parameters.iter().position(|id| *id == root))
-        else {
-            return false;
-        };
-        summaries
-            .entry(function_id)
-            .or_default()
-            .insert(position as u32)
+            .get(&function_id)?
+            .parameters
+            .iter()
+            .position(|id| *id == root)?;
+        Some((function_id, position as u32))
     }
 
     /// Whether an expression escapes a view when placed in a return / field /
@@ -29792,7 +30261,7 @@ impl<'src> Analyzer<'src> {
         &self,
         expr_id: Id,
         view_bindings: &HashSet<Id>,
-        capturing: &HashSet<Id>,
+        capturing: &CaptureMemo,
     ) -> bool {
         if self.is_view_expr(expr_id, view_bindings) {
             return true;
@@ -29800,7 +30269,7 @@ impl<'src> Analyzer<'src> {
         matches!(
             self.expr_id_to_expr_map.get(&expr_id),
             Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
-                if capturing.contains(closure_id)
+                if self.closure_captures_view(capturing, *closure_id)
         )
     }
 
@@ -29851,6 +30320,18 @@ impl<'src> Analyzer<'src> {
         let mut visited = HashSet::default();
         self.scan_view_param_ref(&[], expr_id, &mut found, &mut visited);
         found
+    }
+
+    /// M189: [`Self::closure_captures_view_param`], asked once per closure per
+    /// pass. A function of the closure's own body and the conventions of the
+    /// parameters it names, so the memo answers exactly what the scan does.
+    fn closure_captures_view(&self, memo: &CaptureMemo, closure_id: Id) -> bool {
+        if let Some(captures) = memo.answers.borrow().get(&closure_id) {
+            return *captures;
+        }
+        let captures = self.closure_captures_view_param(closure_id);
+        memo.answers.borrow_mut().insert(closure_id, captures);
+        captures
     }
 
     /// Whether a closure body references a `&` / `&mut` parameter it CAPTURES —
@@ -35389,6 +35870,11 @@ impl<'src> Analyzer<'src> {
         );
     }
 
+    ///
+    /// E356: a BUILDER's dropped result warns the same way, unmarked — a method
+    /// taking `own self` and answering a value of the receiver's own type,
+    /// called as a statement, built a new value and dropped it, while the
+    /// receiver binding still holds the one from before ([`Self::dropped_builder`]).
     fn check_must_use(&mut self) {
         // Value-discarded statements: every non-tail entry of a function body
         // (`body.0`; the tail `body.1` is the return value) and of every inner
@@ -35415,6 +35901,8 @@ impl<'src> Analyzer<'src> {
             };
             let message = if self.call_is_must_use(*call_id) {
                 "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string()
+            } else if let Some(message) = self.dropped_builder(*call_id) {
+                message
             } else if self.discarded_pipe(statement_id, &pipe_traits) {
                 // F60 (R-d door (a)): a pipe NODE is must-use by its type, so a
                 // dropped one warns whichever function built it — a std
@@ -35436,6 +35924,71 @@ impl<'src> Analyzer<'src> {
             let source = self.source_of_id(statement_id).unwrap_or(SourceId(0));
             self.warning_sources.push(source);
         }
+    }
+
+    /// E356: the warning for a discarded BUILDER call — a method whose
+    /// receiver is `own self` and whose result is the receiver's own type
+    /// (`fun on_close(own self, fn: || void): Dialog`), called as the bare
+    /// statement `statement_id`. The method took the value, built a changed
+    /// one and answered it; the statement drops the answer, and the binding
+    /// the method was called on still holds the value from before, so the
+    /// change is silently lost. `None` for any other call. The shape is the
+    /// callee's DECLARATION — its return type is its receiver's — so a builder
+    /// declared by a trait (`fun tag(own self): Self`) and reached through a
+    /// bound answers the same way as its impl.
+    fn dropped_builder(&self, call_id: Id) -> Option<String> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let function = self.functions.get(member_id)?;
+        let receiver_parameter = function
+            .parameters
+            .first()
+            .and_then(|parameter_id| self.parameters.get(parameter_id))?;
+        if receiver_parameter.name != "self" || receiver_parameter.convention != Convention::Own {
+            return None;
+        }
+        let declared_return = function.return_type_id?;
+        if !self.same_type_structure(declared_return, receiver_parameter.type_id, 0) {
+            return None;
+        }
+        let receiver = *function_call.argument_ids.first()?;
+        let built = self
+            .resolved_type_id_of(receiver)
+            .unwrap_or(declared_return);
+        let method = self.callable_name(*member_id)?;
+        let type_label = self.pretty_print_type(&built.get_type(self), &HashMap::default());
+        let head = format!(
+            "`{method}` takes `own self` and answers the `{type_label}` it built, which this \
+             statement drops"
+        );
+        // The binding the call was made on, when it is one: the value it still
+        // holds is the one from before, and the fix rebinds it.
+        let binding = match self.expr_id_to_expr_map.get(&receiver) {
+            Some(Expr::Local(binding_id)) => match self.variables.get(binding_id) {
+                Some(variable) => Some((variable.name, variable.mutable)),
+                None => self
+                    .parameters
+                    .get(binding_id)
+                    .map(|parameter| (parameter.name, parameter.mutable)),
+            },
+            _ => None,
+        }
+        // `self` cannot be rebound by `let`.
+        .filter(|(name, _)| *name != "self");
+        Some(match binding {
+            Some((name, true)) => format!(
+                "{head} — `{name}` still holds the value from before; assign the result: \
+                 `{name} = {name}.{method}(…)`"
+            ),
+            Some((name, false)) => format!(
+                "{head} — `{name}` still holds the value from before; bind the result: \
+                 `let {name} = {name}.{method}(…)`"
+            ),
+            None => format!("{head}; bind the result, or `let _ = …` to discard it"),
+        })
     }
 
     /// std's pipe traits (F60): `std::reactive`'s `Pipe` and `std::reactive::delta`'s
@@ -35663,6 +36216,9 @@ impl<'src> Analyzer<'src> {
         // first argument over one) every write of them.
         let module_mut = self.module_mut_bindings();
         let module_writes: std::cell::OnceCell<ModuleWrites> = std::cell::OnceCell::new();
+        // B691: the tuple literals, and those a pattern takes apart.
+        let mut tuples = Vec::new();
+        let mut pattern_tuples: HashSet<Id> = HashSet::default();
         // M19 T1b: a reused module's decisions are restored below. Every
         // position this loop `consider`s is a sub-expression of the entry it
         // is standing on, so skipping the expression skips exactly the rows
@@ -35691,10 +36247,22 @@ impl<'src> Analyzer<'src> {
                 // A construction's slots are field initializations (rule 1 names
                 // them outright): each one installs its value in a new aggregate
                 // that outlives the literal, so a place read there copies.
-                Expr::List(element_ids) | Expr::Tuple(element_ids) => {
+                Expr::List(element_ids) => {
                     for element_id in element_ids {
                         consider(self, *element_id, None);
                     }
+                }
+                // B691: except a tuple of places that a pattern takes apart —
+                // its captures are the capture pass's (`tuple_of_capture_places`).
+                // Which tuples those are is known only once every subject is
+                // seen, so the tuples wait for the end of the walk.
+                Expr::Tuple(element_ids) => tuples.push((*expr_id, element_ids)),
+                Expr::Match(subject_id, _)
+                | Expr::Is(subject_id, _)
+                | Expr::Destructure(subject_id, _)
+                    if self.tuple_of_capture_places(*subject_id).is_some() =>
+                {
+                    pattern_tuples.insert(*subject_id);
                 }
                 Expr::StructInitializer(_struct_id, assignments) => {
                     for value_id in assignments.values() {
@@ -35892,6 +36460,14 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 _ => {}
+            }
+        }
+        for (tuple_id, element_ids) in tuples {
+            if pattern_tuples.contains(&tuple_id) {
+                continue;
+            }
+            for element_id in element_ids {
+                consider(self, *element_id, None);
             }
         }
         // Phase 2 — the type filter and the per-instantiation question, exactly
@@ -38326,6 +38902,121 @@ impl<'src> Analyzer<'src> {
             || self.impl_subject_admits(&impl_type, &selector_type, &HashMap::default())
     }
 
+    /// A182 (`import-foundation.md` §2 row 1, §8): what each import statement
+    /// CARRIES, by (file, statement span) — the files whose implementations it
+    /// admits, restricts and reaches, and the modules it stands in. Per leaf
+    /// (and per selector, whose walk resolves the module it selects from): the
+    /// LEAF module's files, and an item leaf's own declaring file. Nothing on
+    /// the path above the leaf: a directory body's blocks arrive through a
+    /// statement that names the directory, or a prelude — the term the
+    /// surface never wrote is gone. The importing file is never carried.
+    fn statement_carry_index(&self) -> HashMap<(SourceId, Span), StatementCarry> {
+        let module_files = self.module_files_by_scope();
+        let mut index: HashMap<(SourceId, Span), StatementCarry> = HashMap::default();
+        for (source, span, module_id, target) in &self.import_leaf_modules {
+            let carry = index.entry((*source, *span)).or_default();
+            let Some(module) = self.modules.get(module_id) else {
+                continue;
+            };
+            let leaf_file = match self.expr_id_to_expr_map.get(target) {
+                Some(Expr::Module(_)) => None,
+                _ => self.declaring_file(*target),
+            };
+            for file in module_files
+                .get(&module.body.1)
+                .into_iter()
+                .flatten()
+                .copied()
+                .chain(leaf_file)
+            {
+                if file != *source && !carry.files.contains(&file) {
+                    carry.files.push(file);
+                }
+            }
+            if !carry.module_scopes.contains(&module.body.1) {
+                carry.module_scopes.push(module.body.1);
+            }
+        }
+        // A selector carries the module it selects from, found by the path
+        // segment it stands under — whichever leaf's walk resolved it.
+        for row in &self.import_impl_restrictions {
+            for selector in &row.selectors {
+                let Some(module) = selector
+                    .module_span
+                    .and_then(|span| self.import_segment_modules.get(&(row.source, span)))
+                    .and_then(|module_id| self.modules.get(module_id))
+                else {
+                    continue;
+                };
+                let carry = index.entry((row.source, row.span)).or_default();
+                for file in module_files.get(&module.body.1).into_iter().flatten() {
+                    if *file != row.source && !carry.files.contains(file) {
+                        carry.files.push(*file);
+                    }
+                }
+                if !carry.module_scopes.contains(&module.body.1) {
+                    carry.module_scopes.push(module.body.1);
+                }
+            }
+        }
+        index
+    }
+
+    /// A182: each module scope's FILES — the file its declarations were walked
+    /// from, and the file of every `impl` block written in it (a module whose
+    /// file declares nothing but blocks has no declaration to find it by).
+    fn module_files_by_scope(&self) -> HashMap<Id, Vec<SourceId>> {
+        let mut files: HashMap<Id, Vec<SourceId>> = HashMap::default();
+        for module in self.modules.values() {
+            if let Some(file) = self.scope_file(module.body.1) {
+                files.entry(module.body.1).or_default().push(file);
+            }
+        }
+        for implementation in &self.implementations {
+            let entry = files.entry(implementation.module_scope).or_default();
+            if !entry.contains(&implementation.source) {
+                entry.push(implementation.source);
+            }
+        }
+        files
+    }
+
+    /// A182 (Q8, `import-foundation.md` §2 row 15): the files a module's
+    /// RE-EXPORTED admissions carry — every `export import` the module scope
+    /// writes, and theirs in turn — added to `into`. A re-export is "as if
+    /// declared here", so a file that imports from the module, or takes it as
+    /// its prelude, reaches what those statements carry: `export import
+    /// pkg::app_overlay::(impl Overlay);` in a package's prelude module admits
+    /// the overlay blocks to every file of the package, once.
+    fn reexported_admissions(
+        &self,
+        module_scope: Id,
+        carried: &HashMap<(SourceId, Span), StatementCarry>,
+        visited: &mut HashSet<Id>,
+        into: &mut HashSet<SourceId>,
+    ) {
+        if !visited.insert(module_scope) {
+            return;
+        }
+        for statement in self
+            .exported_imports_by_scope
+            .get(&module_scope)
+            .into_iter()
+            .flatten()
+        {
+            let Some(carry) = carried.get(statement) else {
+                continue;
+            };
+            into.extend(carry.files.iter().copied());
+            // The re-exporting module's own file is the statement's source,
+            // which the carry leaves out; an importer of the module reaches it
+            // through the module itself.
+            for scope in &carry.module_scopes {
+                self.reexported_admissions(*scope, carried, visited, into);
+            }
+        }
+    }
+
     /// B401 — the admission map the method lookups read DURING the fixpoint
     /// ([`LookupAdmission`]), from the rows the import walk banked. The same
     /// statements, the same files per statement (`statement_sources`, shared
@@ -38347,29 +39038,13 @@ impl<'src> Analyzer<'src> {
             self.lookup_admission = None;
             return;
         }
-        // The statement walk below reads these only for a RESTRICTING file's
+        // The statement walk below reads this only for a RESTRICTING file's
         // statements; a program whose only departure from the estate is a
-        // hidden block (a curated module) skips the index and the paths.
-        let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
-        let mut canonical_sources: Vec<PathBuf> = Vec::new();
-        if !restricting.is_empty() {
-            for (source, span, definition, _) in &self.type_references {
-                if let Some(definition) = definition {
-                    references.entry((*source, *span)).or_insert(*definition);
-                }
-            }
-            canonical_sources = self
-                .source_paths
-                .iter()
-                .map(crate::util::canonical_path)
-                .collect();
-        }
-        let mut source_of_path: HashMap<&Path, SourceId> = HashMap::default();
-        for (position, path) in canonical_sources.iter().enumerate() {
-            source_of_path
-                .entry(path.as_path())
-                .or_insert(SourceId(position as u32));
-        }
+        // hidden block (a curated module) skips the index.
+        let carried = match restricting.is_empty() {
+            true => HashMap::default(),
+            false => self.statement_carry_index(),
+        };
         let mut admitted: HashMap<(SourceId, SourceId), HashMap<Id, Option<Vec<String>>>> =
             HashMap::default();
         let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
@@ -38389,13 +39064,10 @@ impl<'src> Analyzer<'src> {
             if !restricting.contains(&row.source) {
                 continue;
             }
-            let sources = statement_sources(
-                |id| self.source_of_id(id),
-                &canonical_sources,
-                &references,
-                &source_of_path,
-                row,
-            );
+            let sources = carried
+                .get(&(row.source, row.span))
+                .map(|carry| carry.files.clone())
+                .unwrap_or_default();
             if row.only.is_none() && row.selectors.is_empty() {
                 for module in sources {
                     unrestricted.insert((row.source, module));
@@ -38462,13 +39134,13 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         let meant = match name {
-            "Length" | "Color" => "`.text` (the field) or `Length::raw(…)`",
+            "Length" | "Color" => "`.css_text()` or `Length::raw(…)`",
             _ => "`.raw(…)`",
         };
         Some(format!(
             "; did you mean {meant}? `css` became the `css {{ … }}` block's keyword, and the \
              style values' `css` members were renamed out of its way: `Length::css(…)` is now \
-             `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.text`"
+             `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.css_text()`"
         ))
     }
 
@@ -39746,6 +40418,16 @@ impl<'src> Analyzer<'src> {
                         }
                         continue;
                     }
+                    self.register_subject_binders(argument, scope_id);
+                }
+            }
+            // A181: a QUALIFIED head's arguments bind too — `(impl
+            // std::list::List<_>)`, the spelling E359's quick fix writes, and
+            // `(impl list::List<_>)` after `import std::list;`. The head names
+            // a type through a module, so its declared bounds are not looked
+            // up here; a binder takes the bounds it writes.
+            Node::StaticAccessor(_, _, Some(generic_arguments)) => {
+                for argument in &generic_arguments.0 {
                     self.register_subject_binders(argument, scope_id);
                 }
             }
@@ -42368,6 +43050,24 @@ impl<'src> Analyzer<'src> {
                 });
             }
         }
+        // A182 (Q8): a re-exported ADMISSION — an `export import` that
+        // writes a selector (`export import a::(impl T);`) — travels to the
+        // module's importers. A plain re-export publishes NAMES, which reach
+        // a file by its binding them, as they always have; it carries no
+        // admission of its own, or importing anything from a module would
+        // bring every trait it re-exports into scope (B515's rule).
+        if let Node::Import(branch, _) = &inner.0 {
+            self.exported_import_spans
+                .insert((self.current_source_id, inner.1));
+            let mut selectors = Vec::new();
+            collect_impl_selectors(branch, Vec::new(), &mut selectors);
+            if !selectors.is_empty() {
+                self.exported_imports_by_scope
+                    .entry(scope_id)
+                    .or_default()
+                    .push((self.current_source_id, inner.1));
+            }
+        }
         let walked = self.walk_expr_node(inner, scope_id);
         // A transparent wrapper's own entity is not the declaration's
         // (`transparent_declarations`): `[derive(Wire)] export struct
@@ -42481,6 +43181,22 @@ impl<'src> Analyzer<'src> {
                 path_spans.push(*segment_span);
             }
             path_spans.push(leaf_span);
+            if let Some((alias, alias_span)) = alias {
+                self.refuse_a_reserved_alias(alias, alias_span);
+            }
+            if name == crate::node::GLOB_IMPORT_LEAF
+                && !self
+                    .exported_import_spans
+                    .contains(&(self.current_source_id, node.1))
+            {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: leaf_span,
+                    msg: GLOB_IS_A_REEXPORT.to_string(),
+                });
+                continue;
+            }
             self.prepped_imports.push((
                 path,
                 name,
@@ -42493,12 +43209,11 @@ impl<'src> Analyzer<'src> {
             ));
         }
         // B318 S4: a selector's own path is walked too, BINDING
-        // nothing. The walk is what puts the module's segments in
-        // `type_references`, which is where the admission pass reads
-        // the files a statement carried — the one channel that works
-        // the same on every host.
+        // nothing. The walk is what records the module it selects from
+        // (`import_leaf_modules`, A182), which is where the admission
+        // pass reads the files a statement carried.
         self.queue_selector_paths(root_branch, scope_id, node.1, &mut path_spans);
-        self.bank_import_restriction(root_branch, *modifier, scope_id, node.1, path_spans);
+        self.bank_import_restriction(root_branch, *modifier, scope_id, node.1);
         Some(Expr::Void)
     }
 
@@ -42693,7 +43408,8 @@ impl<'src> Analyzer<'src> {
         scope_id: Id,
         id: Id,
     ) -> Option<Expr<'src>> {
-        let Node::StructInitializer(namespace, name, generic_arguments, fields) = &node.0 else {
+        let Node::StructInitializer(namespace, name, generic_arguments, fields, update) = &node.0
+        else {
             unreachable!("only the `Node::StructInitializer` arm walks here")
         };
         let generic_argument_ids = generic_arguments
@@ -42747,6 +43463,7 @@ impl<'src> Analyzer<'src> {
                 generic_argument_ids,
                 e_fields,
                 fields.1,
+                *update,
             ),
         ));
         None
@@ -44612,6 +45329,13 @@ impl<'src> Analyzer<'src> {
         // shape produced before the clause moved into the type.
         if let Some(names) = clause {
             self.record_type_context_clause(type_id, names, type_scope_id, Some(parameter_id));
+        }
+        // B677 door 2: a `fun`'s closure-typed parameter may answer a view,
+        // which only the resolved result type says.
+        if implicit_generic_owner.is_some()
+            && declared_type.is_some_and(|node| clause_target_is_a_closure(&node.0))
+        {
+            self.prepped_view_parameters.push((parameter_id, type_id));
         }
         // A tuple binder is not referenceable by name; `_` keeps it positional.
         let name = match pattern {
@@ -53749,18 +54473,38 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// A183 §4 (`import-foundation.md` §10 Q3, RULED): `self` names the
+    /// file's own module and `super` its parent — implicit, location-derived
+    /// bindings every file begins with — so an import cannot bind either
+    /// name. Refused at the alias; the import still binds under it, so the
+    /// one mistake is the one report.
+    fn refuse_a_reserved_alias(&mut self, alias: &str, alias_span: Span) {
+        if !matches!(alias, "self" | "super") {
+            return;
+        }
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: alias_span,
+            msg: format!(
+                "`{alias}` is reserved: `self` names this file's own module and `super` its \
+                 parent, and neither can be rebound by an import — choose another alias"
+            ),
+        });
+    }
+
     fn bank_import_restriction(
         &mut self,
         branch: &'src ImportBranch<'src>,
         modifier: ImportModifier,
         scope_id: Id,
         span: Span,
-        mut path_spans: Vec<Span>,
     ) {
         let mut written = Vec::new();
         collect_impl_selectors(branch, Vec::new(), &mut written);
         let mut selectors = Vec::with_capacity(written.len());
         for (path, selector) in written {
+            let module_span = path.last().map(|(_, span)| *span);
             let Some(subject) = selector.subject.as_deref() else {
                 continue;
             };
@@ -53768,16 +54512,24 @@ impl<'src> Analyzer<'src> {
             // the selector's, and nothing outside it may see them.
             let selector_scope = self.create_scope(Some(scope_id));
             let selector_scope_id = self.push_scope(selector_scope);
+            // A181: a root head in the subject (or the `with` trait) resolves
+            // from the root, at whatever position of the type it stands.
+            self.selector_subject_scopes.insert(selector_scope_id);
+            // A181 (RULED 2026-11-03, `import-foundation.md` §10 Q6): `(impl
+            // _)` is the retired spelling of `(impl *)`. READ as `(impl *)` —
+            // the anonymous binder over the whole subject is what both
+            // spellings elaborate to — with an error carrying the fix for one
+            // release; `vilan fmt` rewrites it.
+            if selector.writes_the_retired_whole_subject() {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: subject.1,
+                    msg: RETIRED_WHOLE_SELECTOR.to_string(),
+                });
+            }
             self.register_subject_binders(subject, selector_scope_id);
             let subject_type_id = self.walk_type_node(subject, selector_scope_id);
-            // A statement whose brace set holds ONLY selectors has no name
-            // leaf, so the loop above recorded none of its segments: the
-            // selector's own path carries them.
-            for (_, segment_span) in &path {
-                if !path_spans.contains(segment_span) {
-                    path_spans.push(*segment_span);
-                }
-            }
             let reached = self
                 .reach_marked_spans
                 .contains(&(self.current_source_id, selector.span));
@@ -53808,6 +54560,7 @@ impl<'src> Analyzer<'src> {
                     .map(|(name, span)| ((*name).to_string(), *span))
                     .collect(),
                 reached,
+                module_span,
             });
         }
         let only = match modifier {
@@ -53817,7 +54570,7 @@ impl<'src> Analyzer<'src> {
         self.import_impl_restrictions.push(ImportImplRestriction {
             source: self.current_source_id,
             span,
-            path_spans,
+            carried: Vec::new(),
             only,
             selectors,
         });
@@ -53902,6 +54655,7 @@ impl<'src> Analyzer<'src> {
             if prelude_scope_id == scope_id {
                 continue;
             }
+            self.prelude_scope_of.insert(scope_id, prelude_scope_id);
             let Some(names) = self.prelude_exports.get(&prelude_scope_id).cloned() else {
                 continue;
             };
@@ -53981,6 +54735,90 @@ impl<'src> Analyzer<'src> {
         self.module_id_by_name.get(root).copied()
     }
 
+    /// A182 (`import-foundation.md` §10 Q8): `export import m::*;` — every
+    /// name `m` publishes, re-published here as if declared here, which is
+    /// what lets a package prelude be two lines (`export import
+    /// std::web::prelude::*;` and the package's admissions). The names are
+    /// the module's importables (`prelude_exports`, read at load), bound once
+    /// every one of them has bound in `m` — `m`'s own re-exports resolve in
+    /// the same fixpoint — and added to THIS module's importables, so a prelude
+    /// that globs publishes what it globbed. A name this module already binds
+    /// keeps its own meaning. The walk refuses the leaf outside an `export
+    /// import` ([`GLOB_IS_A_REEXPORT`]), so only a re-export reaches here.
+    fn resolve_glob_reexport(
+        &mut self,
+        path: &[(&'src str, Span)],
+        scope_id: Id,
+        span: Span,
+        report: bool,
+        source_id: SourceId,
+    ) -> bool {
+        let Some(((leaf, leaf_span), segments)) = path.split_last() else {
+            return true;
+        };
+        let spelled = path
+            .iter()
+            .map(|(segment, _)| *segment)
+            .collect::<Vec<_>>()
+            .join("::");
+        // A side-effect-free walk first, so a module whose own re-exports have
+        // not bound yet is retried without recording the path twice.
+        let module_scope = self.prelude_module_scope(&spelled, source_id);
+        let names: Vec<&'src str> = module_scope
+            .and_then(|module_scope| self.prelude_exports.get(&module_scope).cloned())
+            .unwrap_or_default();
+        let ready = module_scope.is_some_and(|module_scope| {
+            self.scopes.get(&module_scope).is_some_and(|scope| {
+                names
+                    .iter()
+                    .all(|name| scope.name_to_id_map.contains_key(name))
+            })
+        });
+        if !ready && !report {
+            return false;
+        }
+        // The path itself, as any import walks it: its references, its edge
+        // and the module it stands in — and its diagnostics when it misses.
+        if !self.resolve_import(
+            segments, leaf, scope_id, span, report, *leaf_span, source_id, None, false,
+        ) {
+            return false;
+        }
+        let Some(module_scope) = module_scope else {
+            if report {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: *leaf_span,
+                    msg: format!(
+                        "`{spelled}::*` re-exports a MODULE's names, and `{spelled}` is not a \
+                         module: re-export the names it holds one by one"
+                    ),
+                });
+            }
+            return true;
+        };
+        let bindings: Vec<(&'src str, Id)> = match self.scopes.get(&module_scope) {
+            Some(scope) => names
+                .iter()
+                .filter_map(|name| scope.name_to_id_map.get_key_value(name))
+                .map(|(name, id)| (*name, *id))
+                .collect(),
+            None => Vec::new(),
+        };
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        for (name, id) in &bindings {
+            scope.name_to_id_map.entry(name).or_insert(*id);
+        }
+        let published = self.prelude_exports.entry(scope_id).or_default();
+        for (name, _) in bindings {
+            if !published.contains(&name) {
+                published.push(name);
+            }
+        }
+        true
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "one queued import's whole record; the queue's own tuple, spread"
@@ -53997,6 +54835,9 @@ impl<'src> Analyzer<'src> {
         alias: Option<(&'src str, Span)>,
         bind: bool,
     ) -> bool {
+        if name == crate::node::GLOB_IMPORT_LEAF {
+            return self.resolve_glob_reexport(path, scope_id, span, report, source_id);
+        }
         // The segments to walk, each with its source span. A `self` leaf re-binds
         // the namespace it sits in (e.g. `Option::{ self }` binds `Option`);
         // otherwise the leaf is the final segment and binds under its own name.
@@ -54063,6 +54904,13 @@ impl<'src> Analyzer<'src> {
         // registers its top-level modules in its own scope and has no submodule
         // scope, so it starts as `None`.
         let mut namespace_module_id: Option<Id> = None;
+        // A182 (`import-foundation.md` §2 row 1): the LEAF module — the last
+        // module the walk descends into, which a type segment does not
+        // replace (`std::web::style::Length::rem` stands in `style`). A leaf
+        // that is an item stands in its parent; a leaf that is a module is
+        // its own. The root namespace stands in for a path with no module
+        // segment at all.
+        let mut leaf_module_id: Id = module_id;
         // B317/B332: the TYPE the previous segment named — which, after B332,
         // IS the walk's namespace rather than an extra place to look. A type
         // segment REPLACES what the rest of the path resolves against: an enum
@@ -54129,6 +54977,9 @@ impl<'src> Analyzer<'src> {
                     let sub_scope_id = match self.expr_id_to_expr_map.get(&id) {
                         Some(Expr::Module(sub_module_id)) => {
                             namespace_module_id = Some(*sub_module_id);
+                            leaf_module_id = *sub_module_id;
+                            self.import_segment_modules
+                                .insert((source_id, part_span), *sub_module_id);
                             self.modules.get(sub_module_id).map(|module| module.body.1)
                         }
                         Some(Expr::Enum(enum_id)) => {
@@ -54355,6 +55206,11 @@ impl<'src> Analyzer<'src> {
             return false;
         }
         self.import_targets.push((source_id, target_id));
+        // A182: and the module the leaf stands in, by statement — the one
+        // module whose blocks a plain statement carries (row 1's admission
+        // term), with the leaf itself for the file that declares it.
+        self.import_leaf_modules
+            .push((source_id, span, leaf_module_id, target_id));
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {
             self.record_reference(source_id, leaf_span, target_id);
@@ -64210,20 +65066,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// B515: a TRAIT's method called on a concrete receiver in a file that
-    /// reaches neither the trait nor the block providing it. An `impl` registers
-    /// when its file LOADS, and loading is program-wide, so `42.to_string()`
-    /// compiled in any file once some loaded module (`std::markdown`) imported
-    /// `std::display` — and a wasm steer test depended on which std modules a
-    /// layer loads. B318's rule is that a trait method needs its trait in
-    /// scope: the file imports the trait, or a name from the trait's module or
-    /// the block's module, or the prelude binds one, or the file declares it.
-    ///
-    /// R-g door (b): a WARNING for one release, refused in v0.45.0.
-    ///
-    /// Calls through a bound are not asked — the bound wrote the trait's name —
-    /// nor are calls in std, in a frozen file or a dependency, nor generated
-    /// code (its source is no user file).
     /// The file whose attribute generated `id`, when a derive or another macro
     /// expansion minted it ([`Self::derived_origins`]).
     fn derived_origin_file(&self, id: Id) -> Option<SourceId> {
@@ -64299,6 +65141,8 @@ impl<'src> Analyzer<'src> {
             .map(|reach| (reach.source, reach.target))
             .collect();
         let mut reached: HashMap<SourceId, HashSet<SourceId>> = HashMap::default();
+        // A182: each user file's module scope, for its prelude's admissions.
+        let mut module_scope_sources: Vec<(Id, SourceId)> = Vec::new();
         for scope_id in &self.module_scope_ids {
             // The entry walks in the GLOBAL scope; a module's file is the
             // file its own declarations were walked from (a scope is minted
@@ -64317,6 +65161,7 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
+            module_scope_sources.push((*scope_id, source));
             let Some(scope) = self.scopes.get(scope_id) else {
                 continue;
             };
@@ -64339,6 +65184,60 @@ impl<'src> Analyzer<'src> {
                     files.insert(declared);
                 }
             }
+        }
+        // B688: and every file an import statement of the file resolved into,
+        // WHEREVER it is written — an import inside a function body binds in
+        // that body's scope, which the module scope above never sees (std's
+        // macro bodies import `macro_std` that way, and a function-local
+        // `import std::display::Display;` was refused as no import at all),
+        // and a selector-only statement (`import a::{ (impl T) };`) binds no
+        // name. M76's edge list records both.
+        for (importer, target) in &self.import_targets {
+            let Some(files) = reached.get_mut(importer) else {
+                continue;
+            };
+            let declared = match self.expr_id_to_expr_map.get(target) {
+                Some(Expr::Module(module_id)) => self
+                    .modules
+                    .get(module_id)
+                    .and_then(|module| self.scope_file(module.body.1)),
+                _ => self.source_of_id(*target),
+            };
+            if let Some(declared) = declared {
+                files.insert(declared);
+            }
+        }
+        // A182 (`import-foundation.md` §8): and every file an import
+        // statement CARRIES — the leaf module's, whatever leaf it names:
+        // `import std::reactive::store::Store;` reaches `store.vl`, whose
+        // blocks extend `Store`, though `Store` itself is declared in
+        // `store_core.vl` — and never a directory body ABOVE the leaf, which
+        // arrives through a statement that names it or a prelude. An `only`
+        // statement carries its leaf too: whether the file ADMITS what it
+        // reached is B318's question, and its refusal ("imports that module
+        // `only`") is the one that names the mistake. Then the admissions the
+        // modules it imports from RE-EXPORT (Q8: `export import a::(impl T);`
+        // is as if declared there), and its prelude's.
+        let carried = self.statement_carry_index();
+        let mut visited_by_file: HashMap<SourceId, HashSet<Id>> = HashMap::default();
+        for ((importer, _), carry) in &carried {
+            let Some(files) = reached.get_mut(importer) else {
+                continue;
+            };
+            files.extend(carry.files.iter().copied());
+            let visited = visited_by_file.entry(*importer).or_default();
+            for scope in &carry.module_scopes {
+                self.reexported_admissions(*scope, &carried, visited, files);
+            }
+        }
+        for (scope_id, source) in &module_scope_sources {
+            let (Some(prelude_scope), Some(files)) =
+                (self.prelude_scope_of.get(scope_id), reached.get_mut(source))
+            else {
+                continue;
+            };
+            let visited = visited_by_file.entry(*source).or_default();
+            self.reexported_admissions(*prelude_scope, &carried, visited, files);
         }
         reached
     }
@@ -64553,12 +65452,242 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// B688: the files an impl block's SUBJECT calls home — the file declaring
+    /// its nominal head (`List`'s `list.vl`) and those declaring the nominal
+    /// types among its arguments (`impl RemoteStore<AccountState>`, which
+    /// `[derive(Store)]` writes beside `AccountState`, is that type's own
+    /// surface, as Rust's orphan rule reads a local argument); for a blanket
+    /// (`impl type F: Flow<T>`) and a trait object, the files declaring its
+    /// bound traits. Empty for a subject with no declaration of its own: a
+    /// tuple, an array, a closure, an unbounded binder.
+    fn impl_subject_home_files(&self, subject: TypeId) -> Vec<SourceId> {
+        let mut homes = Vec::new();
+        match subject.get_type(self) {
+            Type::Generic(constraint) => {
+                for (trait_id, _) in self.generic_bound_traits(constraint) {
+                    if let Some(trait_) = self.traits.get(&trait_id) {
+                        homes.extend(self.declaring_file(trait_.id));
+                    }
+                }
+            }
+            Type::Trait(id, _) | Type::Dyn(id, _) => {
+                if let Some(trait_) = self.traits.get(&id) {
+                    homes.extend(self.declaring_file(trait_.id));
+                }
+            }
+            _ => self.collect_nominal_home_files(subject, &mut homes),
+        }
+        homes
+    }
+
+    /// The declaring files of every nominal type `type_id` writes, its head
+    /// and its arguments at any depth ([`Self::impl_subject_home_files`]).
+    fn collect_nominal_home_files(&self, type_id: TypeId, homes: &mut Vec<SourceId>) {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return;
+        };
+        let (declaration, arguments) = match type_id.get_type(self) {
+            Type::Struct(id, arguments) => {
+                (self.structs.get(&id).map(|struct_| struct_.id), arguments)
+            }
+            Type::Enum(id, arguments) => (self.enums.get(&id).map(|enum_| enum_.id), arguments),
+            Type::Tuple(items, _) => (None, items),
+            Type::Array(item, _) => (None, vec![item]),
+            _ => return,
+        };
+        if let Some(file) = declaration.and_then(|id| self.declaring_file(id))
+            && !homes.contains(&file)
+        {
+            homes.push(file);
+        }
+        for argument in arguments {
+            self.collect_nominal_home_files(argument, homes);
+        }
+    }
+
+    /// The file whose text declares `id` — a generated declaration's is the
+    /// file whose attribute generated it (B354).
+    fn declaring_file(&self, id: Id) -> Option<SourceId> {
+        self.derived_origin_file(id)
+            .or_else(|| self.source_of_id(id))
+    }
+
+    /// B688: the file of the block `implementations[index]` when it is an
+    /// EXTENSION — written in a file that is not its subject's home
+    /// ([`Self::impl_subject_home_files`]); `None` for a block in its
+    /// subject's own module, whose inherent members are the type's own and
+    /// resolve wherever a value of the type does. A derived block's file is
+    /// its attribute's (B354).
+    fn extension_block_file(&self, index: usize) -> Option<SourceId> {
+        let implementation = &self.implementations[index];
+        let block_file = self
+            .derived_origin_file(implementation.impl_id)
+            .unwrap_or(implementation.source);
+        let homes = self.impl_subject_home_files(implementation.subject);
+        (!homes.contains(&block_file)).then_some(block_file)
+    }
+
+    /// B688: the files of the std modules every program loads
+    /// ([`ALWAYS_LOADED_STD`]). Their blocks arrive in every build whatever
+    /// any file imports, so no file's surface can depend on the rest of the
+    /// build through them: `compare.vl`'s `impl List<type T: PartialEq>`
+    /// (`contains`, `index_of`) is `List`'s as surely as `list.vl`'s own block
+    /// is, and lives apart only to keep `list.vl` off `compare`'s imports.
+    fn always_loaded_std_files(&self) -> HashSet<SourceId> {
+        let paths = self.module_import_paths();
+        self.modules
+            .values()
+            .filter(|module| {
+                paths.get(&module.id).is_some_and(|path| {
+                    path.strip_prefix("std::")
+                        .is_some_and(|module_path| ALWAYS_LOADED_STD.contains(&module_path))
+                })
+            })
+            .filter_map(|module| self.scope_file(module.body.1))
+            .filter(|file| self.std_sources.contains(file))
+            .collect()
+    }
+
+    /// B688: the module an extension block is written in, as an import path
+    /// (`std::display`), and the import statement that brings it in scope.
+    ///
+    /// A std block keeps std's steer index's choice — the trait the block
+    /// names, as the "no method" steer quotes it — so a std refusal reads the
+    /// same whether or not the block loaded. Every other block is admitted by
+    /// the statement that says exactly that (E359; A181, `import-foundation.md`
+    /// §10 Q7): the block's module projected to the block's subject, spelled
+    /// absolutely — `import pkg::app_overlay::(impl pkg::lib::overlay::Overlay);`
+    /// — which compiles in a file that imports nothing else from either module.
+    /// The module's first declaration it steered to before read as an import
+    /// unrelated to the call.
+    fn extension_block_import(&mut self, index: usize, member_name: &str) -> (String, String) {
+        let (subject, impl_id, source, written_in) = {
+            let implementation = &self.implementations[index];
+            (
+                implementation.subject,
+                implementation.impl_id,
+                implementation.source,
+                implementation.module_scope,
+            )
+        };
+        // A derived block's scope is the expansion's; its module is the one
+        // whose file holds the attribute.
+        let derived_from = self.derived_origin_file(impl_id);
+        let paths = self.module_import_paths();
+        let module = self.modules.values().find(|module| match derived_from {
+            Some(file) => self.scope_file(module.body.1) == Some(file),
+            None => module.body.1 == written_in,
+        });
+        let module_path = module
+            .and_then(|module| paths.get(&module.id).cloned())
+            .unwrap_or_default();
+        let block_file = derived_from.unwrap_or(source);
+        if self.std_sources.contains(&block_file) {
+            self.build_std_indexes_if_needed();
+            let head = self.type_head_name(subject);
+            if let Some(name) = head.and_then(|head| {
+                self.std_trait_method_index
+                    .as_ref()?
+                    .get(&(head.to_string(), member_name.to_string()))
+                    .filter(|(_, module)| format!("std::{module}") == module_path)
+                    .map(|(importable, _)| importable.clone())
+            }) {
+                return (
+                    module_path.clone(),
+                    format!("import {module_path}::{name};"),
+                );
+            }
+        }
+        let subject_text = self.absolute_subject_text(subject, true);
+        let import = format!("import {module_path}::(impl {subject_text});");
+        (module_path, import)
+    }
+
+    /// E359: an impl block's SUBJECT as a selector writes it absolutely
+    /// (A181) — every nominal type by the root-headed path of the module that
+    /// declares it (`pkg::lib::overlay::Overlay`, `std::web::style::Style`), a
+    /// binder as the hole `_`, and a subject that is a binder WHOLE as `*`
+    /// (`impl type T` takes every block, `(impl *)`). So the spelling resolves
+    /// whatever the importing file has imported. A shape with no path of its
+    /// own falls back to the type as the reader sees it.
+    fn absolute_subject_text(&self, type_id: TypeId, whole: bool) -> String {
+        let arguments = |arguments: &[TypeId]| match arguments.is_empty() {
+            true => String::new(),
+            false => format!(
+                "<{}>",
+                arguments
+                    .iter()
+                    .map(|argument| self.absolute_subject_text(*argument, false))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        match type_id.get_type(self) {
+            Type::Generic(_) => match whole {
+                true => crate::node::EVERY_IMPL_SUBJECT.to_string(),
+                false => crate::node::ANONYMOUS_TYPE_BINDER.to_string(),
+            },
+            Type::Struct(id, written) | Type::Enum(id, written) | Type::Trait(id, written) => {
+                match self.import_path_of(id) {
+                    Some(path) => format!("{path}{}", arguments(&written)),
+                    None => self.pretty_print_type(&type_id.get_type(self), &HashMap::default()),
+                }
+            }
+            Type::Tuple(elements, labels) if !labels.is_labelled() => format!(
+                "({})",
+                elements
+                    .iter()
+                    .map(|element| self.absolute_subject_text(*element, false))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Type::Array(element, length) => format!(
+                "[{}; {}]",
+                self.absolute_subject_text(element, false),
+                match length.get_type(self) {
+                    Type::Length(length) => length.to_string(),
+                    _ => crate::node::ANONYMOUS_TYPE_BINDER.to_string(),
+                }
+            ),
+            other => self.pretty_print_type(&other, &HashMap::default()),
+        }
+    }
+
+    /// B515: a TRAIT's method called on a concrete receiver in a file that
+    /// reaches neither the trait nor the block providing it. An `impl` registers
+    /// when its file LOADS, and loading is program-wide, so `42.to_string()`
+    /// compiled in any file once some loaded module (`std::markdown`) imported
+    /// `std::display` — and a wasm steer test depended on which std modules a
+    /// layer loads. B318's rule is that a trait method needs its trait in
+    /// scope: the file imports the trait, or a name from the trait's module or
+    /// the block's module, or the prelude binds one, or the file declares it.
+    ///
+    /// R-g door (b): a WARNING for one release, refused in v0.45.0.
+    ///
+    /// B688: the same holds for an INHERENT member of an EXTENSION block — an
+    /// `impl` written outside its subject's module ([`ScopedMember`]), which
+    /// is a trait with no name: `std::display`'s `impl List<type T: Display>
+    /// { fun join }` resolved `list.join(", ")` in a file that imports nothing
+    /// from `std::display` whenever ANOTHER file of the build did (its block
+    /// was loaded), and was refused in a build of that file alone (it was
+    /// not). The file reaches the block's file — by a name it binds, by an
+    /// import statement anywhere in it whose path runs through that file
+    /// (a selector-only one included), or by the prelude. A block in its
+    /// subject's own module (or a module of one of its argument types) is the
+    /// type's own surface and is never asked, nor is a block of a std module
+    /// every program loads, nor one the ENTRY writes (B553: no file can import
+    /// the entry, and the entry's blocks serve every module of its build).
+    ///
+    /// Calls through a bound are not asked — the bound wrote the trait's name —
+    /// nor are calls in std, in a frozen file or a dependency, nor generated
+    /// code (its source is no user file).
     fn check_trait_method_scope(&mut self, global_scope_id: Id) {
         let reached = self.trait_reach_by_file(global_scope_id, None);
         if reached.is_empty() {
             return;
         }
-        let mut sites: Vec<(SourceId, Span, Id, &'src str, Id)> = Vec::new();
+        let always_loaded = self.always_loaded_std_files();
+        let mut sites: Vec<(SourceId, Span, ScopedMember, &'src str, Id)> = Vec::new();
         let calls: Vec<(Id, Id, Id)> = self
             .function_calls
             .iter()
@@ -64580,18 +65709,30 @@ impl<'src> Analyzer<'src> {
             let Some(files) = reached.get(&source) else {
                 continue;
             };
-            // The trait the member is, and the files that would bring it in
-            // scope: the trait's own, the impl clause's trait's, the block's.
+            // What the member is, and the files that would bring it in scope:
+            // for a trait's, the trait's own, the impl clause's trait's, the
+            // block's; for an extension block's, the block's.
             let mut providing: Vec<SourceId> = Vec::new();
-            let trait_id = match self.implementation_by_declaration.get(member_id) {
-                Some(_) => {
-                    let Some((trait_id, files)) = self.impl_member_providing_files(*member_id)
-                    else {
-                        continue;
-                    };
-                    providing = files;
-                    trait_id
-                }
+            let scoped = match self.implementation_by_declaration.get(member_id).copied() {
+                Some(index) => match self.impl_member_providing_files(*member_id) {
+                    Some((trait_id, files)) => {
+                        providing = files;
+                        ScopedMember::Trait(trait_id)
+                    }
+                    None => {
+                        // B553: a block the ENTRY writes serves every module
+                        // (no file can import the entry); the entry is in
+                        // every build of itself.
+                        let Some(block_file) = self
+                            .extension_block_file(index)
+                            .filter(|file| !always_loaded.contains(file) && *file != SourceId(0))
+                        else {
+                            continue;
+                        };
+                        providing.push(block_file);
+                        ScopedMember::Extension(index)
+                    }
+                },
                 None => match self.trait_by_declaration.get(member_id) {
                     // A default reached on a concrete receiver (Gap E's
                     // re-dispatch); through a bound the bound named the trait.
@@ -64601,16 +65742,21 @@ impl<'src> Analyzer<'src> {
                             Some(GenericDispatch::OnType(..))
                         ) =>
                     {
-                        *trait_id
+                        ScopedMember::Trait(*trait_id)
                     }
                     _ => continue,
                 },
             };
-            let Some(trait_) = self.traits.get(&trait_id) else {
-                continue;
-            };
-            if let Some(trait_source) = self.source_of_id(trait_.id) {
-                providing.push(trait_source);
+            match scoped {
+                ScopedMember::Trait(trait_id) => {
+                    let Some(trait_) = self.traits.get(&trait_id) else {
+                        continue;
+                    };
+                    if let Some(trait_source) = self.source_of_id(trait_.id) {
+                        providing.push(trait_source);
+                    }
+                }
+                ScopedMember::Extension(_) => {}
             }
             // Generated code is not the author's spelling: a derive's body
             // calls what its own expansion needs.
@@ -64633,56 +65779,76 @@ impl<'src> Analyzer<'src> {
                         .unwrap_or(&&EMPTY_SPAN)
                 });
             let member_name = self.callable_name(*member_id).unwrap_or("this method");
-            sites.push((source, span, trait_id, member_name, *call_id));
+            sites.push((source, span, scoped, member_name, *call_id));
         }
         // The calls are visited in the table's order, not the file's — sorted so
         // `vilan check` prints them stably, and one per site (an entry world
         // per package entry resolves a shared file's calls once each).
         sites.sort_by_key(|(source, span, ..)| (source.0, span.start, span.end));
-        sites.dedup_by_key(|(source, span, trait_id, ..)| (*source, *span, *trait_id));
+        sites.dedup_by_key(|(source, span, ..)| (*source, *span));
         if !sites.is_empty() {
             self.build_std_indexes_if_needed();
         }
-        for (_, span, trait_id, member_name, call_id) in sites {
-            let trait_name = self.traits.get(&trait_id).map_or("", |trait_| trait_.name);
-            // A std trait's import is spelled from std's own index — its
-            // module path whole (`std::reactive::delta::CollPipe`), where the
-            // flat lookup knew only top-level modules and spelled a nested
-            // one `pkg::delta::CollPipe`, which no user file can write.
-            let std_module = self
-                .traits
-                .get(&trait_id)
-                .and_then(|trait_| self.source_of_id(trait_.id))
-                .filter(|source| self.std_sources.contains(source))
-                .and_then(|_| {
-                    self.std_export_index
-                        .as_ref()
-                        .and_then(|index| index.get(trait_name))
-                        .cloned()
-                });
-            let import = match (std_module, self.import_path_of(trait_id)) {
-                (Some(module), _) => format!("import std::{module}::{trait_name};"),
-                (None, Some(path)) => format!("import {path};"),
-                (None, None) => format!("import {trait_name};"),
+        for (_, span, scoped, member_name, call_id) in sites {
+            let msg = match scoped {
+                ScopedMember::Trait(trait_id) => self.trait_scope_message(trait_id, member_name),
+                ScopedMember::Extension(index) => {
+                    let (module_path, import) = self.extension_block_import(index, member_name);
+                    let subject = self.impl_subject_label(self.implementations[index].subject);
+                    format!(
+                        "`{member_name}` comes from the `impl {subject}` block in \
+                         `{module_path}`, which extends a type declared elsewhere, and this file \
+                         does not import `{module_path}` or a name from it: such a block's \
+                         methods resolve only in a file that imports from its module. Import it \
+                         (`{import}`)"
+                    )
+                }
             };
             // B535 (v0.45.0, R-c): the refusal B515's one-release warning
             // announced. Its fix data is the message's own import statement
             // (`trait_scope_import`), under the stable code
-            // `TRAIT_SCOPE_CODE`.
+            // `TRAIT_SCOPE_CODE` — B688's extension-block refusal shares both.
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
                     note: None,
                     span,
-                    msg: format!(
-                        "`{member_name}` is `{trait_name}`'s, and this file does not import \
-                         `{trait_name}`: a trait's methods resolve only in a file that imports \
-                         the trait. Import it (`{import}`)"
-                    ),
+                    msg,
                 },
                 call_id,
             );
         }
+    }
+
+    /// B535's refusal for a trait's member called where the file does not
+    /// import the trait.
+    fn trait_scope_message(&self, trait_id: Id, member_name: &str) -> String {
+        let trait_name = self.traits.get(&trait_id).map_or("", |trait_| trait_.name);
+        // A std trait's import is spelled from std's own index — its
+        // module path whole (`std::reactive::delta::CollPipe`), where the
+        // flat lookup knew only top-level modules and spelled a nested
+        // one `pkg::delta::CollPipe`, which no user file can write.
+        let std_module = self
+            .traits
+            .get(&trait_id)
+            .and_then(|trait_| self.source_of_id(trait_.id))
+            .filter(|source| self.std_sources.contains(source))
+            .and_then(|_| {
+                self.std_export_index
+                    .as_ref()
+                    .and_then(|index| index.get(trait_name))
+                    .cloned()
+            });
+        let import = match (std_module, self.import_path_of(trait_id)) {
+            (Some(module), _) => format!("import std::{module}::{trait_name};"),
+            (None, Some(path)) => format!("import {path};"),
+            (None, None) => format!("import {trait_name};"),
+        };
+        format!(
+            "`{member_name}` is `{trait_name}`'s, and this file does not import \
+             `{trait_name}`: a trait's methods resolve only in a file that imports \
+             the trait. Import it (`{import}`)"
+        )
     }
 
     /// A155: one element whose class is written twice in one chain — an element
@@ -67511,7 +68677,14 @@ impl<'src> Analyzer<'src> {
         if self.refuse_repeated_field(constraint) {
             return Resolution::Failed;
         }
-        if constraint.fields.len() != struct_fields.len() {
+        // B657: the parser refused a `..base` tail — the one diagnostic this
+        // literal gets for it. The fields it was written to fill are missing
+        // because of it, so they are not reported again, and the literal is
+        // still read as the struct it names (its given fields checked), so
+        // nothing that uses it cascades.
+        let missing_for_the_refused_update =
+            constraint.update_refused && constraint.fields.len() < struct_fields.len();
+        if constraint.fields.len() != struct_fields.len() && !missing_for_the_refused_update {
             let (msg, span) = self.struct_field_count_message(
                 constraint.struct_name,
                 &struct_fields,
@@ -69407,6 +70580,23 @@ impl<'src> Analyzer<'src> {
             let resolved = self
                 .try_get_type_id_by_name(name, scope_id)
                 .or_else(|| self.try_get_expr_id_by_name(name, scope_id));
+            // A181 (`import-foundation.md` §7): the HEAD of a type path in an
+            // `(impl …)` selector's subject may be a ROOT — `pkg`, `std`, a
+            // dependency's name — and resolves as an import statement's first
+            // segment does, relative to the importing file's package. Asked
+            // only when the name binds nothing in the file's scope, so the
+            // module-qualified rule (`(impl overlay::Overlay)` after `import
+            // pkg::lib::overlay;`) is unchanged: a root is reached by
+            // evaluation, never by lookup, and no binding can be one.
+            if resolved.is_none()
+                && self.path_head_type_ids.contains(&type_id)
+                && self.selector_subject_scopes.contains(&scope_id)
+                && let Some(root_id) = self.resolve_import_root(name, source_id)
+            {
+                self.root_path_type_ids.insert(type_id);
+                self.write_type_slot(type_id, Type::Module(root_id));
+                continue;
+            }
             match resolved {
                 // array-lengths.md §6 (S4): a length position naming a VALUE
                 // binding is a named length — resolved here, before the
@@ -70239,7 +71429,28 @@ impl<'src> Analyzer<'src> {
                     let module = self.modules.get(&module_id).unwrap();
                     let module_scope_id = module.body.1;
                     let module_name = module.name;
-                    match self.member_in_namespace(member_name, module_scope_id) {
+                    // A181: a ROOT-headed path descends as an import path does
+                    // — a module's directory children answer after its own
+                    // items (`member_or_submodule`, A65) — where a path headed
+                    // by a NAME in scope asks the module scope alone.
+                    let root_headed = self.root_path_type_ids.contains(&subject_type_id);
+                    let member = match root_headed {
+                        true => {
+                            self.member_or_submodule(member_name, module_scope_id, Some(module_id))
+                        }
+                        false => self.member_in_namespace(member_name, module_scope_id),
+                    };
+                    if root_headed
+                        && member.is_some_and(|member_id| {
+                            matches!(
+                                self.expr_id_to_expr_map.get(&member_id),
+                                Some(Expr::Module(_))
+                            )
+                        })
+                    {
+                        self.root_path_type_ids.insert(type_id);
+                    }
+                    match member {
                         // A member that is not a TYPE ends the search here
                         // (B172). The unqualified twin above may skip a value
                         // binding and keep walking outward; a path cannot —
@@ -71058,6 +72269,15 @@ impl<'src> Analyzer<'src> {
                             }
                         }
                     }
+                }
+                // E360: a path through a FUNCTION — `editor::reader(..)` with
+                // the function `editor` imported and the module of the same
+                // name not. Nothing answered here, so the access stayed
+                // unresolved and only its cascade printed ("could not be
+                // resolved", at the enclosing call and binding), never the
+                // cause.
+                Type::Function(function_id) => {
+                    self.refuse_a_path_through_a_function(id, function_id, member_name);
                 }
                 _ => {}
             }
@@ -75720,6 +76940,11 @@ pub enum Intrinsic {
     // `Option.replace(&mut self, value): Option<T>` -> a runtime helper that reads
     // the slot, writes `Some(value)` back in place, and returns the old contents.
     OptionReplace,
+    // `Option.some_view(&mut self): &mut T borrows self` (`[internal]`, M191) ->
+    // the `Some` payload as a VIEW: the stored object for an aggregate payload,
+    // the `(slot, 1)` pair for a scalar one; `get_or_insert`'s tail, reached only
+    // once the option is `Some`.
+    OptionSomeView,
     // `Shared::new(value)` -> a `{ v: value }` cell (a JS object, so `__clone`
     // shares it by reference instead of deep-copying — that is what makes a
     // `Shared` co-owned rather than snapshotted).
@@ -75774,6 +76999,8 @@ pub enum Intrinsic {
     SetRemove,
     // `Set.len(): i32` -> native `.size` (property read).
     SetLen,
+    // The `Map*` rows are std's one-parameter `HashTable<V>`
+    // (`std::js::hash_table`): a JS `Map` from a `Hash` to the value itself.
     // `Map::new(): Map<K, V>` -> `new Map()`.
     MapNew,
     // `Map.insert(key, value)` -> native `.set(key, value)`.
@@ -75790,6 +77017,40 @@ pub enum Intrinsic {
     MapKeys,
     // `Map.values(): List<V>` -> a runtime helper snapshotting the values.
     MapValues,
+    // The `Keyed*` rows are `NativeMap<K, V>` (`std::js::native_map`, M191,
+    // hash-map-lend.md §10), the one table under `HashMap`/`HashSet`: a JS
+    // `Map` from a `Hash` to the entry `[key, slot]`, the slot the `Option`
+    // array itself; a `None` slot is a tombstone every read skips, and the
+    // pending one (the slot last lent) is settled by the next write.
+    // `NativeMap::new()` -> `new Map()`.
+    KeyedNew,
+    // `insert(hash, key, value)` -> a helper settling, then setting the entry
+    // (a present key's entry rewritten in place, keeping its position).
+    KeyedInsert,
+    // `get(hash): Option<V>` -> a copy of the slot.
+    KeyedGet,
+    // `key(hash): Option<K>` -> a copy of the stored key, when held.
+    KeyedKey,
+    // `lend(hash, read): U` -> `read` called once with the slot IN PLACE (or
+    // `[ 1 ]`), nothing cloned. Runs user code.
+    KeyedLend,
+    // `slot(hash, key): &mut Option<V> borrows self` -> the slot itself, a
+    // fresh `None` appended under `key` for an absent hash; marked pending.
+    // Writes its receiver.
+    KeyedSlot,
+    // `contains_key(hash): bool` -> a held, non-`None` slot.
+    KeyedContainsKey,
+    // `remove(hash)` -> a helper settling, then deleting.
+    KeyedRemove,
+    // `len(): usize` -> the size less the pending slot when it is `None`.
+    KeyedLen,
+    // `hashes() / keys() / values()` -> snapshots in insertion order,
+    // tombstones skipped (`keys`/`values` cloned). There is no `entries` row: a
+    // `(K, V)` pair's JS layout splices a tuple key or value into it, which only
+    // the vilan side knows, so `HashMap::entries` pairs `keys` and `values`.
+    KeyedHashes,
+    KeyedKeys,
+    KeyedValues,
     // `JsonValue.field(name): JsonValue` -> native `self[name]` (a dynamic
     // property read on a `JSON.parse` result, for which there is no host fn).
     JsonField,
@@ -82428,6 +83689,9 @@ struct ModuleTables {
     /// M155: the module's R11 lexical candidates (`r11_candidates.rs`),
     /// filed only by a seeded analysis that built R11's indexes.
     r11: r11_candidates::CandidateRows,
+    /// M188: the module's retaining rows (`retain_tables.rs`), filed only by
+    /// an analysis that walked them.
+    retain: retain_tables::RetainRows,
     families: row_families::FamilySet,
     bumps: Vec<(Id, BTreeSet<u32>)>,
     clone_sites: Vec<(Id, CopyDecision)>,
@@ -82560,8 +83824,18 @@ impl ModuleTables {
             + self.lazy.bytes()
             + self.hmr.bytes()
             + self.r11.bytes()
+            + self.retain.bytes()
             + self.hover.bytes()
     }
+}
+
+/// M189: `check_view_escape`'s per-closure answers to "does this closure
+/// capture a view parameter" (`Analyzer::closure_captures_view`), filled as
+/// the pass asks. A `RefCell` because the pass's readers take the analyzer
+/// shared; the pass's census reads its size (`capture-scans`).
+#[derive(Default)]
+struct CaptureMemo {
+    answers: std::cell::RefCell<HashMap<Id, bool>>,
 }
 
 /// The reused modules' rows, merged into the shape the passes read (M19 T1b).
@@ -82623,6 +83897,8 @@ struct RestoredTables {
     hmr: lazy_tables::HmrRows,
     /// M155: the restored R11 candidate rows.
     r11: r11_candidates::CandidateRows,
+    /// M188: the restored retaining rows.
+    retain: retain_tables::RetainRows,
     family_ranges: row_families::FamilyRanges,
     /// M148: the restored hover rows, the entity ranges of the modules and
     /// items whose record carried them, and the restored MODULES as sources
@@ -82665,6 +83941,7 @@ impl Default for RestoredTables {
             lazy: lazy_tables::LazyRows::default(),
             hmr: lazy_tables::HmrRows::default(),
             r11: r11_candidates::CandidateRows::default(),
+            retain: retain_tables::RetainRows::default(),
             family_ranges: row_families::FamilyRanges::default(),
             hover: hover_records::RecordedHoverRows::default(),
             hover_ranges: Vec::new(),
@@ -82719,6 +83996,9 @@ impl RestoredTables {
         }
         if tables.families.contains(row_families::RowFamily::R11) {
             self.r11.extend(&tables.r11);
+        }
+        if tables.families.contains(row_families::RowFamily::Retain) {
+            self.retain.extend(&tables.retain);
         }
         if tables.hover_recorded {
             self.hover.extend(&tables.hover);
@@ -83877,7 +85157,6 @@ impl World<'static> {
             }
         };
         self.sources.iter_mut().for_each(moved);
-        self.analyzer.source_paths.iter_mut().for_each(moved);
         for (_, path) in &mut self.analyzer.std_module_files {
             moved(path);
         }
@@ -84853,7 +86132,6 @@ fn resolve_package_over_prefix(
 ) {
     let resolve_started = crate::prefix_file::now();
     let analyzer = &mut world.analyzer;
-    analyzer.source_paths = world.sources.clone();
     let filter = match layered {
         Some(layered) => layered.world_key.reach.clone(),
         None => ReachFilter::of(std::iter::once(&nodes.0)),
@@ -86137,7 +87415,7 @@ fn package_reach(
             continue;
         };
         // The entry's own bypass test (`base_cacheable`), applied per module.
-        if loaded.text.contains("macro") {
+        if crate::macros::defines_macros(&loaded.ast.0) {
             reach.macro_text.insert(name);
         }
         let mut depends_on: Vec<&'static str> = collect_module_paths(&loaded.ast.0, "pkg")
@@ -86948,8 +88226,11 @@ fn analyze_inner<'src>(
         // region registers NOTHING (`macro_registry`'s `in_macro_world` early
         // return), so a world's blanked entry — whose surviving macro bodies
         // are full of the substring `macro_std` — contributes no rows, and
-        // the syntactic test would only be reading its own tail.
-        && (crate::macros::in_macro_world() || !entry_source.contains("macro"));
+        // the test would only be reading its own tail. N183: the test reads
+        // the parsed tree (`defines_macros`: a `macro fun` or a `macro { .. }`
+        // block), where it read the TEXT, so a comment or a string saying
+        // `macro` refused the entry the cache and the std prefix.
+        && (crate::macros::in_macro_world() || !crate::macros::defines_macros(&nodes.0));
     // Overlays need no bypass (S3d): every load AND every per-hit validation
     // reads through `read_source`, which consults the overlay first — so a
     // world built from overlay-served std (the wasm playground's boot) hits
@@ -87034,7 +88315,7 @@ fn analyze_inner<'src>(
         && !crate::macros::in_macro_world();
     // N179: a program the prefix is asked for and NOT attempted says why, so
     // the census reads every program by name (`prefix-world 0 prefix-refusal
-    // macro-text`) rather than `-`. A refusal of an attempt (the hot shapes'
+    // defines-a-macro`) rather than `-`. A refusal of an attempt (the hot shapes'
     // guards, `refused-before`) has already said so; these are the gates in
     // front of the attempt — the reuse gate's own reasons, and the shapes a
     // rebuild narrows to.
@@ -87052,9 +88333,9 @@ fn analyze_inner<'src>(
         } else if entry_is_inside_std {
             Some("inside-std")
         } else if !base_cacheable {
-            // The entry's text says `macro` (the reuse gate is syntactic: a
-            // macro-DEFINING entry registers into the world's registry).
-            Some("macro-text")
+            // The entry defines a macro (N183: read off its tree), and a
+            // macro-DEFINING entry registers into the world's registry.
+            Some("defines-a-macro")
         } else {
             None
         };
@@ -89434,8 +90715,8 @@ fn analyze_inner<'src>(
     }
 
     // The raw `std::js::native_map` `NativeMap` struct, if loaded (imported by the
-    // public `HashMap`/`HashSet` wrappers). It carries the map intrinsics; the public
-    // `HashMap`/`HashSet` are ordinary vilan structs over it (I1).
+    // public `HashMap`/`HashSet` wrappers). It carries the keyed-table intrinsics;
+    // the public `HashMap`/`HashSet` are ordinary vilan structs over it (I1, M191).
     let native_map_struct_id = module_scopes
         .get("js::native_map")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
@@ -89444,6 +90725,17 @@ fn analyze_inner<'src>(
         analyzer
             .primitive_struct_ids
             .insert("NativeMap", native_map_struct_id);
+    }
+    // The raw `std::js::hash_table` `HashTable` struct — the one-parameter
+    // `Hash`-keyed table std's reactive machinery keeps — the same way.
+    let hash_table_struct_id = module_scopes
+        .get("js::hash_table")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+        .and_then(|scope| scope.name_to_id_map.get("HashTable").copied());
+    if let Some(hash_table_struct_id) = hash_table_struct_id {
+        analyzer
+            .primitive_struct_ids
+            .insert("HashTable", hash_table_struct_id);
     }
 
     // The `std::shared` `Shared` struct, if `shared.vl` loaded — same treatment.
@@ -89602,7 +90894,6 @@ fn analyze_inner<'src>(
     // keeps the monolithic order: its tiers hold the entry.
     let phase_base_start = crate::PhaseClock::now();
     if !entry_is_module {
-        analyzer.source_paths = sources.clone();
         analyzer.resolve_tiers();
     }
     let tiers_entity_end = (!entry_is_module).then_some(analyzer.entity_id);
@@ -89698,7 +90989,6 @@ fn analyze_inner<'src>(
     let phase_package_start = crate::PhaseClock::now();
     let resolve_deferred = entry_is_open_module || shape.defer_resolve;
     if !entry_is_module && !resolve_deferred {
-        analyzer.source_paths = sources.clone();
         // M121 / B553: what this resolve asks of the impl table is recorded,
         // so the impls walked after it — the entry's, a hot set's — can be
         // tested against it once they have resolved (`impl_reach`).
@@ -90107,10 +91397,6 @@ fn analyze_over_world<'src>(
     // key, so a stored world's value is another call's.
     analyzer.platform = platform;
     analyzer.platform_reason = workspace.platform_reason.clone();
-    // B401: the admission the build's lookups read climbs a module's ANCESTOR
-    // files by path — this call's paths, since a cached world's entry is
-    // another call's (`sources[0]` is re-pointed on the hit path).
-    analyzer.source_paths = sources.clone();
     debug_assert!(
         analyzer.id_windows.source_keys.len() == sources.len(),
         "every source registers its path key ({} keys, {} sources)",
@@ -90305,6 +91591,9 @@ fn analyze_over_world<'src>(
     // The push is a write into the binding's window because the element slot
     // is minted at its owner (`element_slot_of`), so the dirty closure carries
     // the pusher's edit to the owner's record.
+    // M188: a seeded analysis files C16's retaining rows whether or not a
+    // call asks a summary (`retain_tables.rs`).
+    analyzer.retain_rows_eager = !workspace.hot_seeds.is_empty();
     analyzer.enable_item_records(
         !entry_is_module
             && checks_key.is_some()
@@ -90429,7 +91718,7 @@ fn analyze_over_world<'src>(
     // authoritative: `infer_bumps` seeds it and does not re-infer the body. Rows
     // whose module is not loaded resolve to `None` and drop out — the table is
     // inert until a container is actually used (the `try_trait_id` precedent).
-    let bumps_rows: [(Option<Id>, bool); 11] = {
+    let bumps_rows: [(Option<Id>, bool); 14] = {
         // Resolve a method id inside the impl of a resolved container struct
         // (the `intrinsics` table's own pattern), matching the impl subject by
         // nominal id.
@@ -90446,6 +91735,7 @@ fn analyze_over_world<'src>(
         };
         let list_struct = analyzer.primitive_struct_ids.get("List").copied();
         let native_map_struct = analyzer.primitive_struct_ids.get("NativeMap").copied();
+        let hash_table_struct = analyzer.primitive_struct_ids.get("HashTable").copied();
         let map_struct = analyzer.primitive_struct_ids.get("HashMap").copied();
         let set_struct = analyzer.primitive_struct_ids.get("HashSet").copied();
         // `Arena` is reached only by `import std::arena`, so it is not among the
@@ -90466,6 +91756,13 @@ fn analyze_over_world<'src>(
             (container_method(native_map_struct, "insert"), true),
             // `NativeMap::remove` — a hash remove.
             (container_method(native_map_struct, "remove"), true),
+            // `NativeMap::slot` — lends a slot, appending one for an absent key
+            // and settling the last one lent (M191): a geometry op like the two
+            // above.
+            (container_method(native_map_struct, "slot"), true),
+            // `HashTable::insert` / `remove` — the one-parameter table's.
+            (container_method(hash_table_struct, "insert"), true),
+            (container_method(hash_table_struct, "remove"), true),
             // `Map::insert` — a value-keyed insert over `NativeMap` (§1: Map insert bumps).
             (container_method(map_struct, "insert"), true),
             // `Map::remove` — a value-keyed remove.
@@ -90924,26 +92221,53 @@ fn analyze_over_world<'src>(
             }
         }
     }
-    // The raw `NativeMap` (the JS `Map`) carries the map intrinsics; the public
-    // `HashMap`/`HashSet` are vilan wrappers over it that dispatch `key.hash()` (I1), so
-    // their own methods are ordinary vilan code, not intrinsics.
-    if let Some(native_map_struct_id) = analyzer.primitive_struct_ids.get("NativeMap").copied() {
+    // The raw tables (JS `Map`s) carry the map intrinsics: `HashTable<V>` the
+    // `Map*` rows, `NativeMap<K, V>` the `Keyed*` ones. The public
+    // `HashMap`/`HashSet` are vilan wrappers over `NativeMap` that dispatch
+    // `key.hash()` (I1, M191), so their own methods are ordinary vilan code.
+    let tables = [
+        (
+            analyzer.primitive_struct_ids.get("HashTable").copied(),
+            &[
+                ("new", Intrinsic::MapNew),
+                ("insert", Intrinsic::MapInsert),
+                ("get", Intrinsic::MapGet),
+                ("contains_key", Intrinsic::MapContainsKey),
+                ("remove", Intrinsic::MapRemove),
+                ("len", Intrinsic::MapLen),
+                ("keys", Intrinsic::MapKeys),
+                ("values", Intrinsic::MapValues),
+            ][..],
+        ),
+        (
+            analyzer.primitive_struct_ids.get("NativeMap").copied(),
+            &[
+                ("new", Intrinsic::KeyedNew),
+                ("insert", Intrinsic::KeyedInsert),
+                ("get", Intrinsic::KeyedGet),
+                ("key", Intrinsic::KeyedKey),
+                ("lend", Intrinsic::KeyedLend),
+                ("slot", Intrinsic::KeyedSlot),
+                ("contains_key", Intrinsic::KeyedContainsKey),
+                ("remove", Intrinsic::KeyedRemove),
+                ("len", Intrinsic::KeyedLen),
+                ("hashes", Intrinsic::KeyedHashes),
+                ("keys", Intrinsic::KeyedKeys),
+                ("values", Intrinsic::KeyedValues),
+            ][..],
+        ),
+    ];
+    for (table_struct_id, rows) in tables {
+        let Some(table_struct_id) = table_struct_id else {
+            continue;
+        };
         for implementation in &analyzer.implementations {
-            let subject_is_native_map = matches!(
+            let subject_is_the_table = matches!(
                 analyzer.type_id_to_type_map.get(&implementation.subject),
-                Some(Type::Struct(id, _)) if *id == native_map_struct_id
+                Some(Type::Struct(id, _)) if *id == table_struct_id
             );
-            if subject_is_native_map {
-                for (name, intrinsic) in [
-                    ("new", Intrinsic::MapNew),
-                    ("insert", Intrinsic::MapInsert),
-                    ("get", Intrinsic::MapGet),
-                    ("contains_key", Intrinsic::MapContainsKey),
-                    ("remove", Intrinsic::MapRemove),
-                    ("len", Intrinsic::MapLen),
-                    ("keys", Intrinsic::MapKeys),
-                    ("values", Intrinsic::MapValues),
-                ] {
+            if subject_is_the_table {
+                for &(name, intrinsic) in rows {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)
                     {
@@ -91057,6 +92381,7 @@ fn analyze_over_world<'src>(
                 for (name, intrinsic) in [
                     ("take", Intrinsic::OptionTake),
                     ("replace", Intrinsic::OptionReplace),
+                    ("some_view", Intrinsic::OptionSomeView),
                 ] {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)
@@ -91718,8 +93043,18 @@ fn analyze_over_world<'src>(
                 .hmr_rows_live
                 .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
         }
+        // M188: the retaining rows likewise.
+        analyzer
+            .retain_rows_live
+            .partition_into(&|id| file_of(&analyzer, id), &mut tables);
+        if items_enabled {
+            analyzer
+                .retain_rows_live
+                .partition_into(&|id| item_of(&analyzer, id), &mut item_tables);
+        }
         let families = row_families::FamilySet::default()
             .with(row_families::RowFamily::Moves, analyzer.move_rows_filed)
+            .with(row_families::RowFamily::Retain, analyzer.retain_rows_filed)
             .with(row_families::RowFamily::Lazy, analyzer.lazy_rows_filed)
             .with(row_families::RowFamily::Hmr, analyzer.hmr_rows_filed)
             .with(row_families::RowFamily::R11, r11_filed);
@@ -92208,6 +93543,16 @@ fn analyze_over_world<'src>(
             incremental.window_outside_anchor = outside;
         });
     }
+    // A182: each import statement's carried files, from the resolved walk,
+    // onto the row the post-build admission pass reads — computed while every
+    // table it reads is still the analyzer's.
+    let carried = analyzer.statement_carry_index();
+    for row in &mut analyzer.import_impl_restrictions {
+        row.carried = carried
+            .get(&(row.source, row.span))
+            .map(|carry| carry.files.clone())
+            .unwrap_or_default();
+    }
     Ok(Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -92622,7 +93967,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
 /// Backward — `subject_applies(selector, impl_subject)` — is the placeholder's:
 /// `(impl List<_>)` is itself a pattern with a hole, so it reaches a concrete
 /// `impl List<i32>` that the forward test refuses (a constructor-headed subject
-/// does not match a hole), and `(impl _)` reaches every block there is. One
+/// does not match a hole), and `(impl *)` reaches every block there is. One
 /// predicate, both readings, and no new type machinery.
 pub fn build_impl_admission(program: &mut Program) {
     let statements = std::mem::take(&mut program.import_impl_restrictions);
@@ -92640,35 +93985,6 @@ pub fn build_impl_admission(program: &mut Program) {
     {
         return;
     }
-    // `statement_sources` reads a span's definition out of `type_references`,
-    // which is a flat `Vec` of every reference the program recorded: asked once
-    // per path segment of every import statement, that product is the pass. One
-    // index, built once, answers each of them in a probe.
-    let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
-    for (source, span, definition, _) in &program.type_references {
-        if let Some(definition) = definition {
-            references.entry((*source, *span)).or_insert(*definition);
-        }
-    }
-    // M77: and the SECOND product inside the same pass. `statement_sources`
-    // climbs each resolved segment's ancestor modules
-    // (`ancestor_module_sources`, `names.md` §4.1 — "a child pulls its
-    // parent"), and it found each one with
-    // `canonical_sources.iter().position(..)`: a linear scan of every loaded
-    // file, twice per level, per segment, per statement. M75's indexes took
-    // the collision x file x statement product out of the refusal and left
-    // this one — 60 ms of the large leg, following the whole program's
-    // statement count. One map, built once, answers a level in a probe; the
-    // FIRST index wins, which is what `position` answered.
-    let source_of_path: HashMap<&Path, SourceId> = {
-        let mut index: HashMap<&Path, SourceId> = HashMap::default();
-        for (position, path) in program.canonical_sources.iter().enumerate() {
-            index
-                .entry(path.as_path())
-                .or_insert(SourceId(position as u32));
-        }
-        index
-    };
     // M77: the only sources the collision refusal ever asks `carried` about —
     // `statement_for` looks up `collision.first_source` and
     // `collision.second_source` and nothing else. A row carrying neither is a
@@ -92729,13 +94045,7 @@ pub fn build_impl_admission(program: &mut Program) {
         if !restricting.contains(&row.source) && collisions.is_empty() {
             continue;
         }
-        let sources = statement_sources(
-            |id| program.source_of(id),
-            &program.canonical_sources,
-            &references,
-            &source_of_path,
-            row,
-        );
+        let sources = row.carried.clone();
         if !collisions.is_empty() {
             // M77: only a COLLIDING block's file can be asked for, so only
             // those are kept — and a statement that carried none of them
@@ -92898,7 +94208,7 @@ pub fn build_impl_admission(program: &mut Program) {
                     format!(
                         "no `impl` this statement carries has a subject `{subject}` admits, so \
                          the selector admits nothing. The modules it walks are {modules}; \
-                         `(impl _)` admits every block they declare"
+                         `(impl *)` admits every block they declare"
                     )
                 };
                 selector_misses.push((row.source, selector.span, claim));
@@ -93538,7 +94848,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         };
         let fix = match selector_of.get(&(source, implementation.source)) {
             Some(_) => format!(
-                "widen the selector, or add one that names this block — `(impl _)` admits every \
+                "widen the selector, or add one that names this block — `(impl *)` admits every \
                  implementation `{module}` declares"
             ),
             None => "drop the `only`, or name the block in a selector".to_string(),
@@ -93561,108 +94871,6 @@ pub fn check_call_site_admission(program: &mut Program) {
     for (error, source) in violations {
         program.push_diagnostic(error, source);
     }
-}
-
-/// The FILES one `import` statement's walk loaded — every path segment's own
-/// declaring file, read out of `type_references`, into which `resolve_import`
-/// wrote one row per segment.
-///
-/// The path's files and not only the leaf's, because that is what a plain
-/// import brings: `names.md` §4.1's "a child pulls its parent" loads every file
-/// on the way, and probe P7's whole point is that an intermediate module's
-/// `impl` arrives with it. `only` declines the lot.
-fn statement_sources(
-    source_of: impl Fn(Id) -> Option<SourceId>,
-    canonical_sources: &[PathBuf],
-    references: &HashMap<(SourceId, Span), Id>,
-    source_of_path: &HashMap<&Path, SourceId>,
-    restriction: &ImportImplRestriction,
-) -> Vec<SourceId> {
-    let mut sources: Vec<SourceId> = Vec::new();
-    for span in &restriction.path_spans {
-        let Some(definition) = references.get(&(restriction.source, *span)).copied() else {
-            continue;
-        };
-        let Some(home) = source_of(definition) else {
-            continue;
-        };
-        if home != restriction.source && !sources.contains(&home) {
-            sources.push(home);
-        }
-        for ancestor in ancestor_module_sources(
-            canonical_sources,
-            source_of_path,
-            home,
-            restriction.path_spans.len(),
-        ) {
-            if ancestor != restriction.source && !sources.contains(&ancestor) {
-                sources.push(ancestor);
-            }
-        }
-    }
-    sources
-}
-
-/// The files of the modules ABOVE `source` on its own path — `x.vl` for
-/// `x/y.vl` — which a plain import of anything under them loads
-/// (`names.md` §4.1, "a child pulls its parent"), and whose implementations
-/// therefore arrive with it (probe P7).
-///
-/// Derived from the FILE rather than from the path segment's entity, which is
-/// not reliable here: a module that has both a file and a directory
-/// (`x.vl` beside `x/`) resolves its segment to the directory NAMESPACE, an
-/// entity minted in the importing file's own id range, so `source_of` on it
-/// answers the importer rather than `x.vl`. The file layout is the loader's own
-/// rule and says the same thing without an entity: a module's file is
-/// `<dir>/<name>.vl` or `<dir>/<name>/lib.vl`, so the module above
-/// `<dir>/<name>.vl` is whichever of `<dir>.vl` / `<dir>/lib.vl` the program
-/// actually loaded.
-///
-/// Bounded by the statement's own segment count: a walk that keeps climbing
-/// would eventually reach a package's entry file, which no import of a module
-/// under it loads.
-fn ancestor_module_sources(
-    canonical_sources: &[PathBuf],
-    source_of_path: &HashMap<&Path, SourceId>,
-    source: SourceId,
-    bound: usize,
-) -> Vec<SourceId> {
-    let mut found = Vec::new();
-    let Some(start) = canonical_sources.get(source.0 as usize) else {
-        return found;
-    };
-    let mut current = start.clone();
-    for _ in 0..bound {
-        let Some(directory) = current.parent() else {
-            break;
-        };
-        let stem = current.file_stem().and_then(|stem| stem.to_str());
-        // `<dir>/lib.vl` IS the module `<dir>`, so the module above it is the
-        // one the PARENT directory names; any other file's module sits inside
-        // its own directory and the module above it is that directory's.
-        let home = if stem == Some("lib") {
-            let Some(above) = directory.parent() else {
-                break;
-            };
-            above.to_path_buf()
-        } else {
-            directory.to_path_buf()
-        };
-        let candidates = [home.with_extension("vl"), home.join("lib.vl")];
-        // M77: a probe per candidate rather than a scan of every loaded file.
-        // The map keeps the FIRST index for a path, which is what `position`
-        // answered when two sources canonicalized the same way.
-        let Some((index, hit)) = candidates.iter().find_map(|candidate| {
-            source_of_path
-                .get(candidate.as_path())
-                .map(|source| (*source, candidate.clone()))
-        }) else {
-            break;
-        };
-        found.push(index);
-        current = hit;
-    }
-    found
 }
 
 /// B455: the trait DEFAULTS a block inherits — each member with a body that a

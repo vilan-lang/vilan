@@ -677,6 +677,385 @@ fn i8_hash_map_get_or_insert_stores_the_key_it_was_given() {
     );
 }
 
+// --- B689 / M182 / M191: a `HashMap` read and written in place -------------
+//
+// proposal/hash-map-lend.md §4 and §10. `peek` lends the slot under a key as an
+// `&Option<V>`; `slot` answers the slot ITSELF, an `&mut Option<V>` the map
+// keeps (None is a tombstone every read skips, Some under an absent key lands
+// LAST, a present key keeps its place), and `Option::get_or_insert` fills it and
+// answers the payload in place — M182's grouping idiom with no handle type. The
+// native leg is `native_differential`'s
+// `b689_hash_map_lends_in_place_on_both_backends`.
+
+/// §4.1: `peek` on an absent key reads `&None`; on a present key it reads the
+/// stored value, and a write through `slot` is what the next `peek` sees.
+#[test]
+fn m191_peek_reads_the_slot_and_sees_a_write_through_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut scores: HashMap<str, List<i32>> = HashMap::new();
+            print(scores.peek("ada", |slot| slot.is_none()));
+            scores.insert("ada", [1, 2]);
+            print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
+            scores.slot("ada").get_or_insert([]).push(3);
+            print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
+            print(scores.get("ada").unwrap_or([]));
+            print(scores.peek("alan", |slot| slot.is_some()));
+        }
+        "#,
+        "true\n2\n3\n[1, 2, 3]\nfalse\n",
+    );
+}
+
+/// §10 rule 1: a slot left `None` is a TOMBSTONE — `contains_key`, `len`,
+/// `get`, `keys()`, `values()` and `entries()` all agree the key is gone the
+/// moment the view leaves it so, before any later write settles it.
+#[test]
+fn m191_a_slot_left_none_is_a_tombstone_every_read_skips() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut ages: HashMap<str, i32> = HashMap::new();
+            ages.insert("ada", 36);
+            ages.insert("alan", 41);
+            ages.insert("grace", 85);
+            let was = ages.slot("alan").take();
+            print(was);
+            print(ages.contains_key("alan"));
+            print(ages.len());
+            print(ages.keys());
+            print(ages.values());
+            print(ages.entries().len());
+            print(ages.get("alan").is_none());
+            print(ages.peek("alan", |slot| slot.is_none()));
+        }
+        "#,
+        "Some(41)\nfalse\n2\n[\"ada\", \"grace\"]\n[36, 85]\n2\ntrue\ntrue\n",
+    );
+}
+
+/// §10 rules 2-3: a slot made `Some` under an ABSENT key lands last; under a
+/// PRESENT key the key keeps its position whatever is written; a `None` left
+/// under an absent key inserts nothing; a key emptied through its slot and
+/// written again goes LAST (the next write settled the tombstone).
+#[test]
+fn m191_a_slot_inserts_an_absent_key_last_and_keeps_a_present_keys_place() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut ages: HashMap<str, i32> = HashMap::new();
+            ages.insert("ada", 36);
+            ages.insert("alan", 41);
+            ages.slot("grace") = Some(85);
+            ages.slot("ada") = Some(37);
+            print(ages.slot("linus").is_none());
+            print(ages.keys());
+            print(ages.values());
+            print(ages.contains_key("linus"));
+            print(ages.len());
+            let _gone = ages.slot("alan").take();
+            ages.slot("alan") = Some(42);
+            for entry in ages.entries() {
+                print(i"{entry.0} {entry.1}");
+            }
+        }
+        "#,
+        "true\n[\"ada\", \"alan\", \"grace\"]\n[37, 41, 85]\nfalse\n3\nada 37\ngrace 85\nalan 42\n",
+    );
+}
+
+/// `Option::get_or_insert` makes its value only on a miss — `lazy`, so on a
+/// hit the maker is not evaluated at all (it counts its runs through a
+/// `Shared`) — and the push lands in place either way; on a scalar payload the
+/// answer is a place too (`+= 1` counts).
+#[test]
+fn m191_get_or_insert_makes_its_value_only_on_a_miss_and_changes_in_place() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::shared::Shared;
+
+        fun fresh(runs: Shared<i32>): List<i32> {
+            runs.write() = runs.read() + 1;
+            [0]
+        }
+
+        fun main() {
+            let runs = Shared::new(0);
+            mut groups: HashMap<str, List<i32>> = HashMap::new();
+            groups.slot("a").get_or_insert(fresh(runs)).push(1);
+            groups.slot("a").get_or_insert(fresh(runs)).push(2);
+            groups.slot("b").get_or_insert(fresh(runs)).push(3);
+            groups.slot("a").get_or_insert(fresh(runs)).push(4);
+            print(groups.get("a").unwrap_or([]));
+            print(groups.get("b").unwrap_or([]));
+            print(groups.keys());
+            print(runs.read());
+            mut counts: HashMap<str, i32> = HashMap::new();
+            for word in ["to", "be", "or", "not", "to", "be"] {
+                counts.slot(word).get_or_insert(0) += 1;
+            }
+            print(counts.entries());
+            mut cached: Option<List<i32>> = None;
+            cached.get_or_insert([7]).push(8);
+            cached.get_or_insert([9]).push(10);
+            print(cached);
+        }
+        "#,
+        "[0, 1, 2, 4]\n[0, 3]\n[\"a\", \"b\"]\n2\n[(\"to\", 2), (\"be\", 2), (\"or\", 1), (\"not\", 1)]\nSome([7, 8, 10])\n",
+    );
+}
+
+/// M182's grouping idiom on the M191 spelling, the item's own repro: rows into
+/// each key's list in insertion order, every push landing in place — O(1) per
+/// push, pinned as CODEGEN SHAPE: the loop pushes onto what
+/// `slot(..).get_or_insert(..)` answers, and on a hit neither of those two
+/// copies the list (on a miss `slot` copies the KEY the table keeps and
+/// `get_or_insert` the `[]` it stores).
+#[test]
+fn m182_the_entry_idiom_groups_rows_under_their_keys_in_place() {
+    let source = r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut groups: HashMap<i32, List<i32>> = HashMap::new();
+            mut index = 0;
+            for index < 10 {
+                groups.slot(index % 3).get_or_insert([]).push(index);
+                index += 1;
+            }
+            for entry in groups.entries() {
+                print(entry.0);
+                print(entry.1);
+            }
+        }
+        "#;
+    assert_compiles_and_runs(source, "0\n[0, 3, 6, 9]\n1\n[1, 4, 7]\n2\n[2, 5, 8]\n");
+    let js = compile(source).expect("the grouping compiles");
+    let push = js
+        .lines()
+        .find(|line| line.contains(".push(index)"))
+        .unwrap_or_else(|| panic!("the loop pushes in place:\n{js}"));
+    assert!(
+        push.contains("get_or_insert") && push.contains("slot(groups"),
+        "the push lands on the slot's payload:\n{push}"
+    );
+    assert!(
+        !push.contains("__clone") && !push.contains("insert(groups"),
+        "no copy out and no put-back:\n{push}"
+    );
+    for name in ["slot", "__nmap_slot"] {
+        let body = emitted_function(&js, name).replace("__clone(key", "");
+        assert!(
+            !body.contains("__clone"),
+            "`{name}` copies the value:\n{body}"
+        );
+    }
+    // `get_or_insert` copies the value it MADE, once, on the miss that stores
+    // it (a forced `lazy` is the caller's to read again); the hit path, which
+    // every push after the first takes, copies nothing.
+    let get_or_insert = emitted_function(&js, "get_or_insert");
+    for line in get_or_insert
+        .lines()
+        .filter(|line| line.contains("__clone"))
+    {
+        assert!(
+            line.contains("__replace(self, [ 0, "),
+            "`get_or_insert` copies off the miss:\n{get_or_insert}"
+        );
+    }
+}
+
+/// The view's second-class rule (spec memory.md §6.5, rule 4): a slot held in
+/// a local is a view of the map, so writing the map while it lives is refused
+/// — the existing view refusal, nothing new.
+#[test]
+fn m191_a_slot_held_across_a_write_of_its_map_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut map: HashMap<str, i32> = HashMap::new();
+            map.insert("a", 1);
+            let held = map.slot("a");
+            map.insert("b", 2);
+            print(held.take());
+        }
+        "#,
+        "while a view into it is live",
+    );
+}
+
+/// Value semantics through the one table: `insert` KEEPS a copy of the key
+/// and the value it is given (`NativeMap::insert` takes `own key, own value`, as
+/// `List::push` does), so the caller's later writes to its own bindings do not
+/// reach the map — nor, through the same external, a `HashSet`'s member, which
+/// the JS backend aliased before. A value copied OUT by `get` is the caller's.
+#[test]
+fn b689_insert_keeps_copies_of_what_it_is_given() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        fun main() {
+            mut map: HashMap<List<i32>, List<i32>> = HashMap::new();
+            mut key = [1];
+            mut value = [10];
+            map.insert(key, value);
+            key.push(2);
+            value.push(20);
+            print(map.keys());
+            print(map.values());
+            mut got = map.get([1]).unwrap_or([]);
+            got.push(30);
+            print(map.values());
+            mut set: HashSet<List<i32>> = HashSet::new();
+            mut member = [1];
+            set.insert(member);
+            member.push(2);
+            print(set.contains([1]));
+            for item in set {
+                print(item);
+            }
+        }
+        "#,
+        "[[1]]\n[[10]]\n[[10]]\ntrue\n[1]\n",
+    );
+}
+
+/// §4.5, the CODEGEN SHAPE of B689's repro: the store's keyed step lends the
+/// map's slot — `at`'s two closures call `peek`/`slot` (M191), which reach the
+/// slot through `__nmap_lend`/`__nmap_slot`, and NONE of the four clones the
+/// value. A
+/// read through `at(1).some().title().get()` copies only the leaf (the
+/// timings are the lane report's: a timing is not a gate).
+#[test]
+fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
+    let js = compile(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::reactive::store::Store;
+
+        [derive(PartialEq, Storable)]
+        struct Record {
+            title: str,
+            notes: List<str>,
+        }
+
+        [derive(Storable)]
+        struct State {
+            records: HashMap<i32, Record>,
+        }
+
+        fun main() {
+            mut records: HashMap<i32, Record> = HashMap::new();
+            records.insert(1, Record { title = "first", notes = ["a", "b"] });
+            let store = Store::new(State { records });
+            print(store.records().at(1).some().title().get().unwrap_or("?"));
+            let _changed = store.records().at(1).some().title().patch("renamed");
+            print(store.records().at(1).some().title().get().unwrap_or("?"));
+        }
+        "#,
+    )
+    .expect("the B689 repro compiles");
+    let at = emitted_function(&js, "at");
+    // The emitter suffixes a name another function already took (`peek2`),
+    // so the two the step calls are read off its own body.
+    let callee = |method: &str, marker: &str| -> String {
+        at.match_indices(marker)
+            .map(|(end, _)| {
+                let head = &at[..end];
+                let start = head
+                    .rfind(|character: char| !(character.is_alphanumeric() || character == '_'))
+                    .map_or(0, |offset| offset + 1);
+                head[start..].to_string()
+            })
+            .find(|name| name.starts_with(method))
+            .unwrap_or_else(|| panic!("the keyed step lends through `{method}`:\n{at}"))
+    };
+    let (peek, slot) = (
+        callee("peek", "(held, key, f)"),
+        callee("slot", "(held, key))"),
+    );
+    for name in ["at", &peek, &slot, "__nmap_lend", "__nmap_slot"] {
+        let body = emitted_function(&js, name);
+        // The one copy on the path is of the KEY, which `slot` hands the table
+        // to keep on a miss (as `insert` does); the value is never copied.
+        let without_the_new_key = body.replace("__clone(key)", "");
+        assert!(
+            !without_the_new_key.contains("__clone"),
+            "`{name}` copies on the keyed step:\n{body}"
+        );
+    }
+    assert!(
+        emitted_function(&js, &peek).contains("__nmap_lend("),
+        "`peek` is the in-place lend"
+    );
+    assert!(
+        emitted_function(&js, &slot).contains("__nmap_slot("),
+        "`slot` is the in-place write"
+    );
+}
+
+/// §4.5 run, and §4.6: the same reads and writes through `at(key)` answer the
+/// values they did when the step copied — a write through `some().title()`
+/// lands in the map, `at(2).set(Some(..))` inserts, `at(1).set(None)` removes.
+#[test]
+fn b689_a_store_write_through_the_keyed_step_lands_in_place() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::reactive::store::Store;
+
+        [derive(PartialEq, Storable)]
+        struct Record {
+            title: str,
+            notes: List<str>,
+        }
+
+        [derive(Storable)]
+        struct State {
+            records: HashMap<i32, Record>,
+        }
+
+        fun main() {
+            mut records: HashMap<i32, Record> = HashMap::new();
+            records.insert(1, Record { title = "first", notes = ["a"] });
+            let store = Store::new(State { records });
+            let title = store.records().at(1).some().title();
+            print(title.get().unwrap_or("?"));
+            let _changed = title.patch("renamed");
+            print(title.get().unwrap_or("?"));
+            store.records().at(2).set(Some(Record { title = "second", notes = [] }));
+            print(store.records().len());
+            store.records().at(1).set(None);
+            print(store.records().len());
+            print(store.records().at(1).get().is_none());
+            print(store.records().at(2).some().title().get().unwrap_or("?"));
+        }
+        "#,
+        "first\nrenamed\n2\n1\ntrue\nsecond\n",
+    );
+}
+
 /// `Memo::get_or_insert` stays three steps (read, make, write) rather than a
 /// call to `HashMap::get_or_insert` through `write()`, because a maker may ask
 /// the same memo again: the memoized recursion. Pinned so a "thin wrapper"
@@ -8404,5 +8783,524 @@ fn a173_s2_the_keys_handle_is_a_resource() {
         }
         "#,
         "a closure cannot capture the resource `keys`",
+    );
+}
+
+// --- M185: `std::image` (proposal/image.md) -----------------------------------
+//
+// The surface on node: the program runs through the wasm build of
+// `vilan-image` the compiler carries (`__image_wasm`). The codec's own
+// behaviour is pinned by `vilan-image`'s unit tests on the host and the two
+// backends against each other by `native_differential`'s
+// `m185_image_is_identical_on_both_backends`; these pin the vilan surface, the
+// JS seam's encodings (`Result` as `[0, value]`/`[1, sentence]`, `Option` from
+// the sniff code, `Format`/`Fit` as integers) and where the helper is emitted.
+
+/// A 2 x 2 RGBA PNG (red, green / blue, half-transparent white), base64url.
+const M185_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR42mP4z8DwHwyBNAg0AABJSQl4nFEXkgAAAABJRU5ErkJggg";
+
+fn m185_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::base64::decode_url;
+        import std::bytes::Bytes;
+        import std::image::{{ Fit, Format, Image }};
+        import std::io::{{ panic, print }};
+        import std::option::Option::{{ None, Some }};
+        import std::result::Result::{{ Err, Ok }};
+        fun png(): Bytes {{
+            match decode_url("{M185_PNG}") {{
+                Some(let bytes) => bytes,
+                None => panic("base64url"),
+            }}
+        }}
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn m185_a_png_decodes_resizes_and_reads_back_on_node() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::decode(png()) {
+                Ok(let picture) => {
+                    print(i"{picture.width()} x {picture.height()}");
+                    print(picture.rgba().to_hex());
+                    let one = picture.resized(1, 1, Fit::Fill).unwrap();
+                    print(i"{one.width()} x {one.height()} {one.rgba().to_hex()}");
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "2 x 2\nff0000ff00ff00ff0000ffffffffff80\n1 x 1 6d6d6ddf\n",
+    );
+}
+
+#[test]
+fn m185_sniff_answers_the_format_or_none() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            print(match Image::sniff(png()) {
+                Some(Format::Png) => "png",
+                Some(_) => "another",
+                None => "none",
+            });
+            print(Image::sniff(Bytes::alloc(8)).is_none());
+            "#,
+        ),
+        "png\ntrue\n",
+    );
+}
+
+#[test]
+fn m185_the_refusals_are_errs_carrying_their_sentences() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::decode_within(png(), 3) {
+                Ok(_) => print("admitted"),
+                Err(let reason) => print(reason),
+            }
+            match Image::decode(Bytes::alloc(4)) {
+                Ok(_) => print("decoded"),
+                Err(let reason) => print(reason),
+            }
+            match Image::from_rgba(2, 2, Bytes::alloc(15)) {
+                Ok(_) => print("built"),
+                Err(let reason) => print(reason),
+            }
+            match Image::decode(png()) {
+                Ok(let picture) => match picture.encode(Format::Gif, 80) {
+                    Ok(_) => print("encoded a GIF"),
+                    Err(let reason) => print(reason),
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "2 x 2 exceeds the 3-pixel limit\nnot a PNG, JPEG, WebP or GIF\n\
+         15 bytes are not 2 x 2 RGBA pixels (16 bytes)\nGIF cannot be encoded\n",
+    );
+}
+
+#[test]
+fn m185_from_rgba_encode_and_decode_round_trip_exactly() {
+    // `rgba` -> `from_rgba` is exact, and so is PNG and WebP through the codec;
+    // `rgba()` hands out a copy, and `from_rgba` took one.
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            let pixels = Bytes::alloc(8);
+            pixels.set(0, 10);
+            pixels.set(7, 200);
+            match Image::from_rgba(2, 1, pixels) {
+                Ok(let picture) => {
+                    pixels.set(0, 99);
+                    let copy = picture.rgba();
+                    copy.set(7, 1);
+                    print(picture.rgba().to_hex());
+                    for format in [Format::Png, Format::Webp] {
+                        match picture.encode(format, 0) {
+                            Ok(let bytes) => match Image::decode(bytes) {
+                                Ok(let back) => print(back.rgba().to_hex()),
+                                Err(let reason) => print(reason),
+                            },
+                            Err(let reason) => print(reason),
+                        }
+                    }
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "0a000000000000c8\n0a000000000000c8\n0a000000000000c8\n",
+    );
+}
+
+#[test]
+fn m185_every_fit_and_a_clamped_crop_answer_their_sizes() {
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::from_rgba(4, 2, Bytes::alloc(32)) {
+                Ok(let picture) => {
+                    for fit in [Fit::Contain, Fit::Cover, Fit::Fill] {
+                        let resized = picture.resized(3, 3, fit).unwrap();
+                        print(i"{resized.width()} x {resized.height()}");
+                    }
+                    let window = picture.cropped(3, 1, 10, 10);
+                    print(i"{window.width()} x {window.height()}");
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "3 x 2\n3 x 3\n3 x 3\n1 x 1\n",
+    );
+}
+
+#[test]
+fn m190_a_resize_past_the_pixel_limit_is_an_err_naming_both_sizes() {
+    // M190 (the owner's ruling): an `Err`, as `decode`'s limit is. The result,
+    // not the box, is measured: the `Contain` into a 100,000 x 1 box is 1 x 1
+    // and fine; the `Fill` is 10,000,000,000 pixels and refused.
+    assert_compiles_and_runs(
+        &m185_program(
+            r#"
+            match Image::from_rgba(4, 3, Bytes::alloc(48)) {
+                Ok(let picture) => {
+                    match picture.resized(100000, 1, Fit::Contain) {
+                        Ok(let small) => print(i"{small.width()} x {small.height()}"),
+                        Err(let reason) => print(reason),
+                    }
+                    match picture.resized(100000, 100000, Fit::Fill) {
+                        Ok(let huge) => print(huge.width()),
+                        Err(let reason) => print(reason),
+                    }
+                },
+                Err(let reason) => print(reason),
+            }
+            "#,
+        ),
+        "1 x 1\na 100000 x 100000 result exceeds the 50,000,000-pixel limit\n",
+    );
+}
+
+#[test]
+fn m185_std_image_is_refused_on_the_browser_leg() {
+    // `@process`, like `std::db`: the browser has `createImageBitmap` and a
+    // canvas, and nothing of this module is emitted into a browser bundle.
+    assert_fails_browser_with(
+        r#"
+        import std::bytes::Bytes;
+        import std::image::Image;
+        fun main() {
+            let _ = Image::decode(Bytes::alloc(4));
+        }
+        "#,
+        "requires the `@process` platform its file declares and cannot run on `browser`",
+    );
+}
+
+#[test]
+fn m185_the_codec_is_emitted_only_when_reached() {
+    // The blob is ~800 KB of base64: a program that reaches the codec carries
+    // it ONCE, and one that does not — including one that imports the module
+    // and never calls into it — carries none of it.
+    let reached = compile(&m185_program(
+        r#"
+        let _ = Image::decode(png());
+        let _ = Image::sniff(png());
+        "#,
+    ))
+    .expect("compiles");
+    assert_eq!(reached.matches("const __image_wasm = \"").count(), 1);
+    assert_eq!(reached.matches("function __image_runtime(").count(), 1);
+    let plain = compile(
+        r#"
+        import std::io::print;
+        fun main() { print("no pictures"); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        !plain.contains("__image"),
+        "a plain program carries no image helper"
+    );
+    let imported = compile(
+        r#"
+        import std::image::Fit;
+        import std::io::print;
+        fun main() {
+            let fit = Fit::Cover;
+            print(match fit { Fit::Cover => "cover", _ => "other" });
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        !imported.contains("__image_wasm"),
+        "naming `Fit` is not reaching the codec"
+    );
+}
+
+// --- M181: `std::url`, percent-encoding on every platform ----------------------
+//
+// proposal/percent-encoding.md §4. The node side here; the native twin is held
+// to the same bytes by `native_differential::m181_*`.
+
+fn m181_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::url::{{ percent_decode, percent_encode }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn m181_the_encoder_keeps_exactly_the_unreserved_set() {
+    // Every unreserved character survives; every other printable ASCII
+    // character is escaped, upper-case hex; UTF-8 is escaped byte by byte.
+    assert_compiles_and_runs(
+        &m181_program(
+            r##"
+            print(percent_encode("ABCXYZabcxyz0123456789-_.!~*'()"));
+            print(percent_encode(" "));
+            print(percent_encode("/"));
+            print(percent_encode("é"));
+            print(percent_encode("😀"));
+            print(percent_encode("#$%&+,:;=?@[]\"<>\\^`{|}"));
+            print(i"[{percent_encode("")}]");
+            "##,
+        ),
+        "ABCXYZabcxyz0123456789-_.!~*'()\n%20\n%2F\n%C3%A9\n%F0%9F%98%80\n\
+         %23%24%25%26%2B%2C%3A%3B%3D%3F%40%5B%5D%22%3C%3E%5C%5E%60%7B%7C%7D\n[]\n",
+    );
+}
+
+#[test]
+fn m181_the_encoder_is_total_over_a_lone_surrogate() {
+    // A JS string can hold half of a surrogate pair — no vilan operation makes
+    // one since B695 (a cut inside a pair floors), but a host value can — and
+    // `encodeURIComponent` itself throws on one: the helper answers U+FFFD's
+    // escape instead.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::url::percent_encode;
+        [extern("String.fromCharCode")]
+        external fun from_char_code(code: u32): str;
+        fun main() {
+            print(percent_encode(from_char_code(55357)));
+            print(percent_encode(i"a{from_char_code(56832)}b"));
+        }
+        "#,
+        "%EF%BF%BD\na%EF%BF%BDb\n",
+    );
+}
+
+#[test]
+fn m181_the_decoder_decodes_every_escape_run() {
+    assert_compiles_and_runs(
+        &m181_program(
+            r#"
+            print(percent_decode("hello%20world"));
+            print(percent_decode("caf%C3%A9"));
+            print(percent_decode("caf%c3%a9"));
+            print(percent_decode("%F0%9F%98%80!"));
+            print(percent_decode("a%2Fb%3Fc%3Dd"));
+            "#,
+        ),
+        "hello world\ncafé\ncafé\n😀!\na/b?c=d\n",
+    );
+}
+
+#[test]
+fn m181_the_decoder_is_total_each_malformed_shape_decodes_to_itself() {
+    // A lone `%`, a truncated escape, a non-hex escape, a byte that is not
+    // UTF-8, a run that is not UTF-8 as a whole (truncated, overlong, an
+    // encoded surrogate, past U+10FFFF) — each answers itself, and the good
+    // run beside a bad one still decodes.
+    assert_compiles_and_runs(
+        &m181_program(
+            r#"
+            for text in ["%", "100%", "%2", "%G1", "%zz", "%FF", "%41%FF", "%C3", "%C0%80", "%ED%A0%80", "%F4%90%80%80", "%C3x%A9"] {
+                print(percent_decode(text) == text);
+            }
+            print(percent_decode("%zz%20"));
+            print(percent_decode("%41%FF %41"));
+            print(i"[{percent_decode("")}]");
+            "#,
+        ),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n%zz \n%41%FF A\n[]\n",
+    );
+}
+
+#[test]
+fn m181_decoding_inverts_encoding() {
+    assert_compiles_and_runs(
+        &m181_program(
+            r#"
+            for text in ["", "a b/c?d=e&f", "é😀", "100%", "%41", "%FF", "~*'()"] {
+                print(percent_decode(percent_encode(text)) == text);
+            }
+            "#,
+        ),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn m181_std_url_compiles_for_the_browser_and_the_router_re_exports_the_decoder() {
+    // Platform-neutral: a browser program imports it as a node one does, and
+    // `std::web::router::percent_decode` is the same function.
+    assert_compiles_browser(
+        r#"
+        import std::io::print;
+        import std::url::{ percent_decode, percent_encode };
+        import std::web::router;
+        fun main() {
+            print(percent_encode("a b"));
+            print(percent_decode("a%20b") == router::percent_decode("a%20b"));
+        }
+        "#,
+    );
+}
+
+// --- B695: a cut inside a surrogate pair rounds to the code point ------------
+//
+// `str` is indexed by UTF-16 code unit (`len()` says so), and a bound between
+// the two halves of a pair answered HALF a character on JS — a string the
+// native backend cannot hold. RULED: the bound moves back to the pair's start on
+// both backends (strings.md, "A cut inside a surrogate pair"). One pin per
+// operation; the native half is `native_differential`'s
+// `b695_a_cut_inside_a_surrogate_pair_is_identical_on_both_backends`.
+
+#[test]
+fn b695_substring_floors_a_bound_inside_a_pair() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet face = \"😀\";
+\tprint(face.substring(0, 1).len());
+\tprint(face.substring(1, 2) == face);
+\tprint(face.substring(0, 2) == face);
+\tprint(\"a😀b\".substring(2, 4));
+\tprint(\"a😀b\".substring(0, 2));
+}
+",
+        "0\ntrue\ntrue\n😀b\na\n",
+    );
+}
+
+#[test]
+fn b695_a_cut_at_every_position_recombines() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet text = \"a😀b😀\";
+\tmut cut = 0;
+\tmut whole = true;
+\tfor cut <= text.len() {
+\t\twhole = whole && text.substring(0, cut) + text.substring(cut, text.len()) == text;
+\t\tcut += 1;
+\t}
+\tprint(whole);
+}
+",
+        "true\n",
+    );
+}
+
+#[test]
+fn b695_a_unit_walker_reads_the_whole_character_at_its_second_half() {
+    // kolt's markdown and search walkers take `substring(i, i + 1)` per unit:
+    // the first half answers "", the second the character.
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet text = \"x😀\";
+\tmut index = 0;
+\tmut out = \"\";
+\tfor index < text.len() {
+\t\tlet piece = text.substring(index, index + 1);
+\t\tout = out + i\"[{piece}]\";
+\t\tindex += 1;
+\t}
+\tprint(out);
+}
+",
+        "[x][][😀]\n",
+    );
+}
+
+#[test]
+fn b695_code_at_reads_either_half_as_a_number() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tprint(\"😀\".code_at(0));
+\tprint(\"😀\".code_at(1));
+}
+",
+        "55357\n56832\n",
+    );
+}
+
+#[test]
+fn b695_index_of_answers_a_code_point_boundary() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet text = \"a😀b😀\";
+\tprint(text.index_of(\"😀\").unwrap_or(99));
+\tprint(text.last_index_of(\"😀\").unwrap_or(99));
+\tprint(text.index_of(\"b\").unwrap_or(99));
+\tlet at = text.index_of(\"b\").unwrap_or(0);
+\tprint(text.substring(at, text.len()));
+}
+",
+        "1\n4\n3\nb😀\n",
+    );
+}
+
+#[test]
+fn b695_an_empty_pattern_splits_and_replaces_between_characters() {
+    assert_compiles_and_runs(
+        "fun main() {
+\tlet empty = \"\";
+\tprint(\"a😀b\".split(\"\").len());
+\tprint(\"a😀b\".split(empty).len());
+\tprint(\"a😀b\".replace(empty, \"-\"));
+\tprint(empty.replace(empty, \"-\"));
+\tprint(\"a😀b\".replace(\"😀\", \"-\"));
+\tprint(\"a,b\".split(\",\").len());
+}
+",
+        "3\n3\n-a-😀-b-\n-\na-b\n2\n",
+    );
+}
+
+#[test]
+fn b695_a_literal_pattern_keeps_the_host_method() {
+    let js = compile("fun main() {\n\tprint(\"a,b\".split(\",\").len());\n\tprint(\"ab\".replace(\"a\", \"c\"));\n}\n")
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(
+        js.contains(".split(\",\")") && js.contains(".replaceAll(\"a\", \"c\")"),
+        "{js}"
+    );
+    assert!(
+        !js.contains("__str_split") && !js.contains("__str_replace"),
+        "{js}"
+    );
+}
+
+/// The same answers at BUILD time: the const interpreter hosts the helpers the
+/// emitter calls (`__str_split`, `__str_replace`, the floored `__substring`) —
+/// kolt's dictionary splits at const time, and its build failed with "unknown
+/// host call `__str_split`" before the interpreter knew the helper.
+#[test]
+fn b695_the_const_interpreter_answers_the_same() {
+    assert_compiles_and_runs(
+        "const let pieces = \"a😀b\".split(\"\");
+const let words = \"a b\".split(\" \");
+const let cut = \"😀\".substring(0, 1);
+const let rest = \"😀\".substring(1, 2);
+const let empty = \"\";
+const let joined = \"a😀b\".replace(empty, \"-\");
+fun main() {
+\tprint(pieces.len());
+\tprint(words.len());
+\tprint(cut.len());
+\tprint(rest);
+\tprint(joined);
+}
+",
+        "3\n2\n0\n😀\n-a-😀-b-\n",
     );
 }

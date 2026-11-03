@@ -512,12 +512,12 @@ row	flagship	key
 488	-	implementing `Callable` requires a `call` method: `{rendered}` declares none, so `value(..)` has nothing to resolve to. The marker carries no signature of its own — write the arity and the types you mean (`fun call(self, ..): ..`), here or in an `impl {rendered}` of its own
 489	-	{base}; it declares a `call` method but does not implement `Callable` — write `impl {rendered} with Callable` to call it as a function
 490	-	`{name}` is declared `const fun`, but its body reaches {capability}, which has no compile-time answer: a `const fun` promises its body is const-evaluable, and that promise is checked here rather than at a call site. Drop the `const` to keep an ordinary function, or move the capability out of the body
-491	-	'{member}' is provided by an `impl` in module `{declaring}`, and module `{here}` does not admit it: a generic body resolves under the file it was DECLARED in, not the file that instantiated it, so widening the import at the CALLER does not reach it. Widen `{here}`'s own import of `{declaring}` — `(impl _)` admits every implementation it declares
+491	-	'{member}' is provided by an `impl` in module `{declaring}`, and module `{here}` does not admit it: a generic body resolves under the file it was DECLARED in, not the file that instantiated it, so widening the import at the CALLER does not reach it. Widen `{here}`'s own import of `{declaring}` — `(impl *)` admits every implementation it declares
 492	-	'{member}' is already defined for '{subject}' by module '{other}', which this file also imports; a file may take only one. Select one — {fix} — or drop an import
 493	-	'{member}' is declared for '{subject}' by two blanket impls whose bounds OVERLAP, one of them module '{other}''s, and this file imports both: a type satisfying both clauses matches both impls, and an inherent member is taken from the first without ranking. Select one — {fix} — or drop an import
 494	-	'{member}' is provided by an `impl` in module `{module}` that `{module}` does not export, so it contributes no methods here. Reach it — `import {module}::{{ #(impl {subject}) }};` — or write `export` on the block
 495	-	this receiver satisfies the bounds of TWO blanket `impl` blocks that both declare '{member}', and an inherent member is taken from the first declared without ranking — swapping the two blocks would change which body runs: {fix}
-496	-	no `impl` this statement carries has a subject `{subject}` admits, so the selector admits nothing. The modules it walks are {modules}; `(impl _)` admits every block they declare
+496	-	no `impl` this statement carries has a subject `{subject}` admits, so the selector admits nothing. The modules it walks are {modules}; `(impl *)` admits every block they declare
 497	-	no `impl {subject}` this statement carries declares {named}: the selector admits nothing
 498	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
 499	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own
@@ -785,3 +785,15 @@ row	flagship	key
 763	-	{described} reaches `asset::emit` at run time, which makes every function calling it compile-time-only; write `const` in front of it to build it once, at compile time
 764	-	`{name}` is a closure parameter; to run it under this context, type it `{spelled}` — a `context`-typed parameter takes a value with the same `context` clause, a named function or variant, a local closure binding (which adopts the clause), or a closure literal, and a closure called inside a literal keeps the context it was made in: `{wrap}` would run `{name}` under the context the caller was made with
 765	-	`{name}` is a closure parameter called inside {body}, which establishes an owner: what it builds belongs to the owner it was made under, not this one, and is released with that owner; type it `({sync}{closure}) context owner_scope` so it takes the owner at the call
+NEW	-	this program decodes, scales, crops or encodes a picture through `std::image`, and this build of the compiler does not carry the image codec
+NEW	-	`[{name}]` is written twice over {item}: merge them, `{merged}`
+NEW	-	`[{name}]` is written twice over {item}; keep one
+NEW	-	a struct literal names every field; there is no `..base` update form: bind the base and assign the fields that change (`mut p = origin(); p.x = 1;`)
+NEW	-	`{member_name}` comes from the `impl {subject}` block in `{module_path}`, which extends a type declared elsewhere, and this file does not import `{module_path}` or a name from it: such a block's methods resolve only in a file that imports from its module. Import it (`{import}`)
+NEW	-	`{method}` takes `own self` and answers the `{type_label}` it built, which this statement drops
+NEW	-	a selector that takes every block is written `(impl *)`: `*` is EVERYTHING, a set (`export *;`, `::*`), and `_` is a hole inside a type (`(impl List<_>)`). `(impl _)` is read as `(impl *)` in this release and refused in the next; `vilan fmt` rewrites it
+NEW	-	`{alias}` is reserved: `self` names this file's own module and `super` its parent, and neither can be rebound by an import — choose another alias
+NEW	-	`::*` names every export of a module, and is written only as a RE-EXPORT — `export import m::*;` publishes them from this module, as a package prelude does: import the names this file uses
+NEW	-	`{spelled}::*` re-exports a MODULE's names, and `{spelled}` is not a module: re-export the names it holds one by one
+NEW	-	`{name}` is a function, not a module: `{name}::{member}` looks `{member}` up in `{name}`, and a function has no members
+NEW	-	`[track_caller]` on `{trait}`'s `{member}`, which the compiler calls implicitly — {how} — with no argument list to pass a location through; drop the attribute

@@ -203,15 +203,14 @@ pub enum Layout {
         field: usize,
         value: u32,
     },
-    /// std's `HashMap<K, V>`: the JS `Map` at field `field`, whose values are
-    /// the flat `(K, V)` pairs.
+    /// std's `HashMap<K, V>`: the table at field `table` (M191) — `[ map,
+    /// pending ]`, the JS `Map` from each hash to its `[ key, slot ]` entry,
+    /// a `None` slot a tombstone to skip.
     Map {
         label: String,
-        field: usize,
+        table: usize,
         key: u32,
         value: u32,
-        key_width: usize,
-        value_width: usize,
     },
     /// std's `HashSet<T>`: the JS `Map` at field `field`.
     Set {
@@ -616,16 +615,14 @@ impl Layout {
             }
             Layout::Map {
                 label: text,
-                field,
+                table,
                 key,
                 value,
-                key_width,
-                value_width,
             } => {
                 shape(json, "map");
                 label(json, text);
                 json.push_str(&format!(
-                    ",\"field\":{field},\"key\":{key},\"value\":{value},\"keyWidth\":{key_width},\"valueWidth\":{value_width}"
+                    ",\"table\":{table},\"key\":{key},\"value\":{value}"
                 ));
             }
             Layout::Set {

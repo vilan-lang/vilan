@@ -366,7 +366,11 @@ declare it.
 
 A binder the head never mentions again needs no name, and is written `_` —
 the wildcard of `Some(_)` and `let _`, in the impl-subject position, with
-the same optional bound:
+the same optional bound. `_` means **unspecified** everywhere it appears —
+a name not kept (`let _`), a pattern that binds nothing, an element left
+open (`List<_>`), a length left open (`[type T; _]`) — where `*` means
+**everything**, a set operation (`export *;`, `::*`, `(impl *)`; names
+§4.3), and is never a type: `List<*>` is not written.
 
 ```vilan,fragment
 impl Source<Option<_: Source<type U>>> { … }    // a signal of an optional signal

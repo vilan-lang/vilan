@@ -1,7 +1,8 @@
 # Process modules reference
 
 The process modules (Node/Deno/Bun builds): `std::db`, `std::http`,
-`std::fs`, `std::process`, `std::rpc::server`, `std::watch`. Task-oriented
+`std::fs`, `std::process`, `std::rpc::server`, `std::watch` — and
+`std::image`, which has [a page of its own](image.md). Task-oriented
 usage: [Persistence and the server](../guide/persistence.md).
 
 ## std::db: SQLite
@@ -105,8 +106,25 @@ impl Request {
 	fun method(self): str
 	fun body(self): str      // the body as text, read on the first call
 	fun bytes(self): Bytes   // the same body raw (binary POSTs)
+	fun body_stream(self): BodyReader   // the body a piece at a time
 	fun max_body_bytes(own self, limit: usize): Request   // this request's cap (a route's)
 	fun header(self, name: str): Option<str>   // a request header, case-insensitive
+}
+impl BodyReader {
+	async fun next(self, size: usize): Option<Bytes>   // at most `size` bytes; None at the end
+}
+
+// multipart/form-data, read part by part off the stream
+impl Multipart {
+	fun of(request: Request): Multipart              // 400 unless a form with a boundary
+	async fun next_part(self): Option<Part>           // skips what was left of the last part
+}
+// Part { name: str, filename: Option<str>, content_type: str, headers: List<(str, str)>, reader: PartReader }
+impl Part {
+	fun header(self, name: str): Option<str>
+}
+impl PartReader {
+	async fun next(self, size: usize): Option<Bytes>   // None at the part's end
 }
 impl Response {
 	fun builder(): ResponseBuilder
@@ -143,6 +161,13 @@ interface, so anything on the network can reach it (and Windows asks the
 user about the firewall). A server meant for this machine only (a desktop
 app's own, a dev tool, a test) binds the loopback: `.host("127.0.0.1")`, or
 `"::1"` for IPv6. `url()` then names that address.
+
+**A handler that panics is answered `500`.** The panic is reported once on
+stderr — `unhandled task error (spawned in an http request handler):
+panicked at <site>: <message>`, the line any unobserved task's failure
+prints — and the client gets `500 Internal Server Error` with `Connection:
+close` (a response that had already started streaming is cut off instead).
+The server goes on serving the next request, on both backends.
 
 **Request bodies: capped, and read when the handler asks.** A handler runs
 on the request's head. The body stays on the wire until the handler calls
@@ -205,9 +230,109 @@ one within the cap is drained (node discards it and keeps the connection
 alive for the client's next request; the native server, which closes every
 connection, discards it before the close so the client reads its response
 rather than a reset), and one over the cap, or chunked, is not — the
-response says `Connection: close` and the connection is closed. The body is
-read whole into memory when it is read; streaming it as it arrives is not
-here yet.
+response says `Connection: close` and the connection is closed.
+
+**Reading a body as a stream.** `bytes()` holds the whole body in memory
+at once, which is the right shape for a form or a JSON call and the wrong
+one for an upload. `body_stream()` reads it a piece at a time instead:
+`next(size)` answers the next piece — at most `size` bytes, whatever has
+arrived up to that — and `None` once the body has ended, so an upload
+costs a piece of memory rather than its whole size:
+
+```vilan,norun
+import std::http::{ Request, Response, Server };
+
+fun upload(request: Request): Response {
+	let reader = request.max_body_bytes(1024 * 1024 * 1024).body_stream();
+	mut total = 0usize;
+	for {
+		let piece = match reader.next(65536) {
+			Some(let piece) => piece,
+			None => jump break,
+		};
+		total = total + piece.len();   // write it to a file, hash it, parse it
+	}
+	Response::builder().body(i"received {total} bytes").build()
+}
+
+fun main() {
+	Server::builder().port(3000).on_request(|request| upload(request)).build().start();
+}
+```
+
+A short piece does not mean the end — only `None` does. The connection
+reads only as far as the calls ask, so a client sending faster than the
+handler reads is made to wait rather than buffered. The cap is the same
+cap, counted as the pieces arrive: a declared `Content-Length` over it is
+refused at the first `next`, and a chunked body at the piece that crosses
+it, with whatever the handler has already read behind it — the same `413`,
+and the handler ends at that `next`. A stream the handler leaves
+unfinished is treated as an unread body (drained within the cap, closed
+past it).
+
+A body is read **whole or as a stream, not both**: `bytes()`/`body()`
+after `body_stream()`, or the other way round, is a fault in the handler.
+It is answered `500 Internal Server Error` with a sentence naming both
+calls, the same sentence goes to the server's stderr, and the handler ends
+there. A second `body_stream()` is a second reader of the one stream.
+
+**Reading a form.** A browser's file upload is `multipart/form-data`:
+the fields and files of a form, one after the other in one body, each with
+a small head of its own. `Multipart::of(request)` reads such a body part by
+part off the stream — `next_part()` answers the next `Part` with its
+`name`, its `filename` (`Some` for a file input), its `content_type`
+(`text/plain` when the part did not say) and its bytes through
+`part.reader`, whose `next(size)` ends at the part's end exactly as the
+body's does:
+
+```vilan,norun
+import std::http::{ Multipart, Request, Response, Server };
+
+fun upload(request: Request): Response {
+	let form = Multipart::of(request.max_body_bytes(100 * 1024 * 1024));
+	mut stored = 0usize;
+	for {
+		let part = match form.next_part() {
+			Some(let part) => part,
+			None => jump break,
+		};
+		if part.filename.is_none() {
+			jump continue;   // a plain field: skipped unread
+		}
+		for {
+			let piece = match part.reader.next(65536) {
+				Some(let piece) => piece,
+				None => jump break,
+			};
+			stored = stored + piece.len();   // write it where the file goes
+		}
+	}
+	Response::builder().body(i"stored {stored} bytes").build()
+}
+
+fun main() {
+	Server::builder().port(3000).on_request(|request| upload(request)).build().start();
+}
+```
+
+Only a window on the stream is held, so a 10 MiB file costs what one
+`next` asks for. A part left unread is skipped by the next `next_part`.
+The cap is the request's, over the whole form, and the body is the
+stream's, so the one-way rule applies: `bytes()` on the same request is
+refused. A malformed form is answered `400 Bad Request` with the defect
+named, and the handler ends there: a `Content-Type` that is not
+`multipart/form-data` or names no `boundary` (at `of`), a delimiter line
+with something after the boundary, a part header without a colon, a part
+head over 64 KiB, and a body that ends before the closing `--boundary--`.
+A mounted rpc service still refuses a form on its POST leg (its CSRF gate,
+see std::rpc::server).
+
+Measured on Linux, one 64 MiB upload hashed from the stream grows the
+native server's peak memory by under a mebibyte, where reading 25 MiB whole
+costs 25 MB; on node the stream holds one socket read at a time and the
+peak is the garbage collector's lag behind node's own read buffers (about
+20–30 MB, below a bare `on("data")` loop's), where reading 25 MiB whole
+costs 54 MB.
 
 `Request::header` reads one header off the request, and the conditional
 request built on it ships whole. `etag_of` mints a **strong validator** for
@@ -1191,24 +1316,25 @@ impl KeyDecoder {
 }
 ```
 
-The loop reads like `read_line`'s, and ends on the keys the program chooses
-(a leg's comma-separated patterns are an or-pattern):
+`for key in keys` walks the keys through `next` and ends with the input
+(`None`); the loop LOANS the handle, so raw mode is restored after the loop, on
+both backends. It ends earlier on the keys the program chooses (a leg's
+comma-separated patterns are an or-pattern):
 
 ```vilan,norun
 import std::debug::Debug;
 import std::io::{ print, write };
-import std::option::Option::{ self, None, Some };
 import std::process::{ Key, keys };
 
 fun main() {
 	let keys = keys();
 	mut row = 0;
-	for {
-		match keys.next() {
-			Some(Key::Char("q")), Some(Key::Ctrl("c")), Some(Key::Escape), None => jump break,
-			Some(Key::Up) => row -= 1,
-			Some(Key::Down) => row += 1,
-			Some(let other) => print(other.debug()),
+	for key in keys {
+		match key {
+			Key::Char("q"), Key::Ctrl("c"), Key::Escape => jump break,
+			Key::Up => row -= 1,
+			Key::Down => row += 1,
+			let other => print(other.debug()),
 		}
 		write(i"\rrow {row}   ");
 	}

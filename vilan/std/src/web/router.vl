@@ -18,6 +18,10 @@ import pkg::hash_map::HashMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ FlushPolicy, SignalCell, turn };
 import pkg::shared::Shared;
+/// Decodes percent-escapes — `std::url::percent_decode`, re-exported here where
+/// `parse_path` and `parse_query` use it (M181 moved it to a module every platform
+/// can import). TOTAL: a malformed escape decodes to itself.
+export import pkg::url::percent_decode;
 import pkg::web::dom::{ Event, window };
 import pkg::web::ui::{ View, chunk_failure, chunk_pending, view };
 
@@ -51,16 +55,6 @@ external fun location_path(): str;
 /// routing on the path.
 [extern("__router_url")]
 export external fun location_url(): str;
-
-/// Decodes percent-escapes (`decodeURIComponent`): `"hello%20world"` is
-/// `"hello world"`, `"caf%C3%A9"` is `"café"`.
-///
-/// TOTAL, unlike the host function it wraps: a malformed escape (`%zz`, a trailing
-/// `%`) decodes to ITSELF rather than throwing. A URL is text a stranger chose, so
-/// a decoder that can crash is a route that a link can take down — and the useful
-/// answer for a piece that is not an escape sequence is the piece.
-[extern("__percent_decode")]
-export external fun percent_decode(text: str): str;
 
 /// A history entry as the app sees it (M167): its path, the text the app stored on
 /// it, and how the app arrived there.

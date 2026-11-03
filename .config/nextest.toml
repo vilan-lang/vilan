@@ -64,6 +64,13 @@ priority = 100
 # The edit-replay differential's corpus leg is 97 s in the suite and 149 s alone
 # under load 12; the 60 s default flags it as slow on every run. The kill is at
 # 15 minutes, which nothing but a hang can reach.
+#
+# N188: it did reach it - one test of the whole corpus, with nextest's two-worker
+# pool (N159), grew to 724-900 s under a five-lane `-j 6` and was killed at 900 s
+# in every loaded full suite. It is twelve shard tests now
+# (`..._answers_00`..`_11`, a program's index modulo 12), 36-62 s each and 100 s
+# for all twelve at -j 6, loadavg 15; a killed shard's output names the program it
+# was in. The timeout below is unchanged.
 slow-timeout = { period = "180s", terminate-after = 5 }
 
 # TIER 90 - 15-35 s of wall in the suite, or tens of CPU-s that fan out wide.

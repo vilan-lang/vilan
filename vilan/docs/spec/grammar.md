@@ -70,11 +70,13 @@ instead the block's **trailing expression** and supplies the block's value
 ```text
 import  = "import" path-branch [ "only" ] ;   (* impls-free, §4.3 *)
 use     = "use"    path-branch ;
-path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
+path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set
+                                   | [ "#" ] impl-selector     (* bare, §4.3 *)
+                                   | "*" )   (* a glob: `export import` only, §4.7 *)
                    | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
-set-element = path-branch | impl-selector ;
-impl-selector = "(" "impl" type [ "with" type ] ")"
+set-element = path-branch | [ "#" ] impl-selector ;
+impl-selector = "(" "impl" ( type | "*" ) [ "with" type ] ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
@@ -153,6 +155,13 @@ shape — `[` then a name — leads a head; `export *;` takes none. The
 marker is written once: a second `export` on one declaration is refused
 (B492).
 
+So is each attribute but `[hint(..)]`, which a declaration may carry more
+than once: a repeat is an **error** at the repeat, read as if it were not
+written, so nothing else is reported for it — `` `[deprecated]` is written twice over
+`f`; keep one ``. A repeated `[derive(..)]` is read with the lists merged,
+and the error spells the merge: `[derive(PartialEq)]` ⏎ `[derive(Json)]` ⏎
+`struct Pair` — `` merge them, `[derive(PartialEq, Json)]` `` (E355).
+
 A `#` before a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
@@ -171,18 +180,27 @@ says the statement brings its names and no implementations (§4.3). Like
 as the modifier only where the whole path has ended — and a `use` refuses
 it, because a `use` never brought an implementation along.
 
-An `impl-selector` is a brace-set ELEMENT that binds no name: it says
-which of the module's `impl` blocks this file admits, and its optional
-`::` tail names the members it takes (§4.3). `_` stands for any type at
-an argument position (`(impl List<_>)`) and `(impl _)` selects every
-implementation the module declares; a selector writes no `type X` binders
-and takes no `as`. `with TRAIT` names the block by the trait it implements,
+An `impl-selector` binds no name: it says which of the module's `impl`
+blocks this file admits, and its optional `::` tail names the members it
+takes (§4.3). It follows a module path — bare, `import a::(impl T);`, the
+one-selector spelling exactly as `import a::b;` is the one-name spelling
+of `import a::{ b };`, or as an element of a set beside the names it
+travels with — and `vilan fmt` writes a one-member set holding one in the
+bare form, so braces appear only with two or more members. At the head of
+a statement, with no module before it, a selector is refused. `_` stands for any type at
+an argument position (`(impl List<_>)`, a hole) and `(impl *)` selects
+every implementation the module declares (a set; `(impl _)`, the earlier
+spelling, is read as `(impl *)` with a steer); a selector writes no
+`type X` binders and takes no `as`. `with TRAIT` names the block by the trait it implements,
 as its declaration does — `(impl Box with One)` takes `impl Box with One`
 and no other `Box` block — which is how a block with no declarations of its
 own (all defaults, or a marker) is named; the trait resolves in the
 importing file's scope, as the subject does. The subject is the ordinary `type` production, and it
 resolves in the IMPORTING file's scope, so `impl S` reaches an alias that
-file bound and `impl item::Struct` is the qualified spelling.
+file bound and `impl item::Struct` is the qualified spelling; a path in it
+may also begin at a ROOT — `pkg`, `std`, a dependency — anywhere a path
+stands in the type (`(impl (pkg::d::T, std::e::U))`, `(impl
+List<pkg::d::T>)`), resolved as an import path's first segment is.
 
 A `::` path may **not cross a line break**: the segment after a `::`
 must begin on the same line the `::` is on. Without the rule `a::` at the
@@ -987,6 +1005,12 @@ Two consequences of the tier split are normative:
 - `const` captures **weakly**: everything to the end of the expression
   (up to the enclosing bracket or comma) folds; parenthesize to narrow
   (§9).
+
+A struct literal names **every** field. There is no update form: a tuple
+spreads (`(0, ..pair, 9)`), but `Point { x = 1, ..origin() }` is refused at
+the `..`, the literal read without its tail, so the fields the tail was to
+fill are not reported missing as well (B657). Bind the base and assign the
+fields that change: `mut p = origin(); p.x = 1;`.
 
 A closure's body is one expression (commonly a block). `||` in operand
 position always begins a zero-parameter closure; logical-or is only

@@ -175,7 +175,7 @@ fn declaration_link<'src>(
         take_and_desugar(argument, source);
     }
     let property_text = &source[property.into_range()];
-    let value = build_value(arguments, parens);
+    let value = build_value(arguments, parens, property_text);
     // Zero-width scaffolding span: the property name is CSS, not a method
     // reference, and the LSP paints it as a property.
     let anchor: Span = (property.start..property.start).into();
@@ -200,12 +200,17 @@ fn declaration_link<'src>(
 /// `margin(px(4), px(8));` is `margin:4px 8px`. `raw`'s ARITY does not change:
 /// the join is built here, as the same parenthesized concatenation the lexer
 /// builds for an i-string (`("" + a + " " + b)`, left-associated, seeded with
-/// the empty string), with every argument through `std::web::style::piece` (A34) —
-/// which returns the piece's text and puts its `:root` line on the sheet on the
-/// way past. Without it a `Length` mid-list would emit `var(--space-4)` with
-/// nothing declaring it, which is the hazard the one-argument path exists to
-/// close.
-fn build_value<'src>(arguments: Vec<Spanned<Node<'src>>>, parens: Span) -> Spanned<Node<'src>> {
+/// the empty string), with every argument through `std::web::style::piece_for`
+/// (A34, A178 Q4) — which returns the piece's text, a `dp` in the PROPERTY's role
+/// (`border(dp(1), ..)` writes `1px`, as the dotted `.border` does), and puts its
+/// `:root` line on the sheet on the way past. Without it a `Length` mid-list
+/// would emit `var(--space-4)` with nothing declaring it, which is the hazard the
+/// one-argument path exists to close.
+fn build_value<'src>(
+    arguments: Vec<Spanned<Node<'src>>>,
+    parens: Span,
+    property: &'src str,
+) -> Spanned<Node<'src>> {
     if arguments.len() == 1 {
         let Some(only) = arguments.into_iter().next() else {
             unreachable!("just checked the length");
@@ -218,7 +223,7 @@ fn build_value<'src>(arguments: Vec<Spanned<Node<'src>>>, parens: Span) -> Spann
             let separator = (Node::String(" "), argument.1);
             concatenation = join(concatenation, separator);
         }
-        let part = wrap_piece(argument);
+        let part = wrap_piece(argument, property);
         concatenation = join(concatenation, part);
     }
     (concatenation.0, parens)
@@ -233,21 +238,24 @@ fn join<'src>(left: Spanned<Node<'src>>, right: Spanned<Node<'src>>) -> Spanned<
     )
 }
 
-/// One argument of a MULTI-argument value, wrapped in `std::web::style::piece`
-/// (A34): the call returns the argument's text and emits its `:root` line, so a
-/// typed style token mid-value carries its token exactly as a whole value does.
+/// One argument of a MULTI-argument value, wrapped in
+/// `std::web::style::piece_for(property, ..)` (A34, A178 Q4): the call returns the
+/// argument's text — a `dp` in the property's role — and emits its `:root` line,
+/// so a typed style token mid-value carries its token exactly as a whole value
+/// does.
 ///
-/// The callee is a `StdItem`, so it means std's `piece` whatever the site binds
-/// — the same hygiene B270 gave the seed, and for the same reason: this is a
-/// call nobody wrote. Its span is the argument's own, which is where a
-/// `CssPiece` failure should underline.
-fn wrap_piece<'src>(expression: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
+/// The callee is a `StdItem`, so it means std's `piece_for` whatever the site
+/// binds — the same hygiene B270 gave the seed, and for the same reason: this is
+/// a call nobody wrote. Its span is the argument's own, which is where a
+/// `CssPiece` failure should underline; the property's string rides that span.
+fn wrap_piece<'src>(expression: Spanned<Node<'src>>, property: &'src str) -> Spanned<Node<'src>> {
     let span = expression.1;
+    let anchor: Span = (span.start..span.start).into();
     (
         Node::Call(
-            Box::new((Node::StdItem("web::style", "piece"), span)),
+            Box::new((Node::StdItem("web::style", "piece_for"), span)),
             None,
-            (vec![expression], span),
+            (vec![(Node::String(property), anchor), expression], span),
         ),
         span,
     )
@@ -436,13 +444,13 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Repeat(value, length) => {
             Node::Repeat(desugar_boxed(value, source), desugar_boxed(length, source))
         }
-        Node::StructInitializer(namespace, name, generics, mut fields) => {
+        Node::StructInitializer(namespace, name, generics, mut fields, update) => {
             for field in fields.0.iter_mut() {
                 if let Some(value) = field.0.1.as_mut() {
                     take_and_desugar(value, source);
                 }
             }
-            Node::StructInitializer(namespace, name, generics, fields)
+            Node::StructInitializer(namespace, name, generics, fields, update)
         }
         Node::Binary(op, left, right) => Node::Binary(
             op,
@@ -693,17 +701,20 @@ mod tests {
         // R10: N arguments are ONE value, joined by a single space — the same
         // parenthesized concatenation `lexing::emit_interpolated` builds for an
         // i-string, seeded with the empty string — with every ARGUMENT wrapped
-        // in `std::web::style::piece` (A34), which returns its text and puts its
-        // `:root` line on the sheet.
+        // in `std::web::style::piece_for(property, ..)` (A34, A178 Q4), which
+        // returns its text in the property's role and puts its `:root` line on
+        // the sheet.
         //
         // The chain side spells the wrapper out, so the two sides are the same
-        // tree and the claim stays "the lowering IS the chain". `piece` is a
+        // tree and the claim stays "the lowering IS the chain". `piece_for` is a
         // hygienic reference in the block, and the normalization below reads it
         // as the name a hand-written chain would import.
-        let block = strip_spans(&peeled("css { border(\"1px solid\", gray(500)); }"))
-            .replace("StdItem(\"web::style\", \"piece\")", "Accessor(\"piece\")");
+        let block = strip_spans(&peeled("css { border(\"1px solid\", gray(500)); }")).replace(
+            "StdItem(\"web::style\", \"piece_for\")",
+            "Accessor(\"piece_for\")",
+        );
         let chain = strip_spans(&peeled(
-            r#"style().raw("border", "" + piece("1px solid") + " " + piece(gray(500)))"#,
+            r#"style().raw("border", "" + piece_for("border", "1px solid") + " " + piece_for("border", gray(500)))"#,
         ));
         assert_eq!(block, chain);
     }

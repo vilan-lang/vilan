@@ -394,6 +394,14 @@ export impl Region {
 		row
 	}
 
+	/// Retires a row (M187): there is nothing to take out, so what is left is the
+	/// row's owner going — `disposal` runs, as the browser twin runs it, so the two
+	/// twins' owner bookkeeping agrees. KEEP IN STEP.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
+	fun retire_row(self, row: Row, end: Row, disposal: || void) {
+		disposal();
+	}
+
 	/// Puts a cut row back — see `cut_row`: nothing was ever taken out, and A98's
 	/// `end` bound has nothing to bound. KEEP IN STEP.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
@@ -417,6 +425,14 @@ export impl Region {
 	/// Drops the anchor — there is none to drop, and no live content to take out of
 	/// a document that does not exist yet (A88). KEEP IN STEP.
 	fun close(self) {}
+
+	/// `close`, with the rows' owners going first (M187): `disposal` runs, as the
+	/// browser twin runs it, and there is no run to mark as leaving and nothing to
+	/// take out. KEEP IN STEP.
+	fun close_with(self, disposal: || void) {
+		disposal();
+		self.close();
+	}
 }
 
 /// Something that can fill a child position (proposal/element-syntax.md §5) — the
@@ -641,6 +657,9 @@ export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
 			let region = Region::open(parent);
 			let owner = Owner::new();
 			let _row = run_with_owner(owner, || region.open_row((self.body)()));
+			// B694: a server render is the body's whole life — release what it
+			// registered (a subscription, an `on_cleanup`, a store keeper) now.
+			owner.dispose();
 		}
 	}
 }
@@ -679,13 +698,16 @@ fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 	let value = read_once(source);
 	let owner = Owner::new();
 	let _row = run_with_owner(owner, || region.open_row(render(value)));
+	owner.dispose();
 }
 
 /// `each`'s body, server side — one child per element of the CURRENT list,
 /// in order, no reconciliation. Each row runs under a fresh throwaway `Owner`:
 /// `run_with_owner` establishes the `owner_scope` the injected `render` closure
 /// declares, so this is self-contained — the caller need not establish any
-/// boundary. Nothing a row registers survives, so the owner is discarded.
+/// boundary. The render is the row's whole life, so the owner is DISPOSED once
+/// the row is placed (B694): whatever the row registered — a subscription, an
+/// `on_cleanup`, a store keeper — is released then, not kept for the process.
 /// (`List<T>` is annotated so `get`'s element type resolves — the
 /// two-parameter-generic inference trap.)
 ///
@@ -703,6 +725,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	for item in items {
 		let owner = Owner::new();
 		let _row = run_with_owner(owner, || region.open_row(render(item)));
+		owner.dispose();
 	}
 }
 
@@ -738,6 +761,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 		let cell: SignalCell<T> = SignalCell::new(item);
 		let owner = Owner::new();
 		let _row = run_with_owner(owner, || region.open_row(render(cell)));
+		owner.dispose();
 	}
 }
 
@@ -955,6 +979,7 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 			let cell: SignalCell<T> = SignalCell::new(payload);
 			let owner = Owner::new();
 			let _row = run_with_owner(owner, || region.open_row(render(cell)));
+			owner.dispose();
 		},
 		None => {},
 	}

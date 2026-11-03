@@ -29,7 +29,7 @@ import pkg::compare::PartialEq;
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::io::panic;
-import pkg::js::native_map::NativeMap;
+import pkg::js::hash_table::HashTable;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::delta::{ DeltaCursor, DeltaLog, DeltaSource, MapOp };
 import pkg::reactive::{
@@ -62,18 +62,18 @@ export struct KeySlot {
 /// `HashSetCell`'s `contains(x)`, and a store's keyed node all stand on it. A handle,
 /// like the cells that hold it: a copy is the same table.
 export struct KeySlots {
-	table: Shared<NativeMap<KeySlot>>,
+	table: Shared<HashTable<KeySlot>>,
 	/// Each ASKED key's identity (`HashMapEntry::identity`), minted on first ask and
 	/// kept: an identity must not change while anything holds it, and a slot comes
 	/// and goes with its subscriptions. One number per key ever asked about.
-	identities: Shared<NativeMap<i32>>,
+	identities: Shared<HashTable<i32>>,
 }
 
 export impl KeySlots {
 	/// An empty table: nothing watched.
 	fun new(): KeySlots {
-		let table: NativeMap<KeySlot> = NativeMap::new();
-		let identities: NativeMap<i32> = NativeMap::new();
+		let table: HashTable<KeySlot> = HashTable::new();
+		let identities: HashTable<i32> = HashTable::new();
 		KeySlots { table = Shared::new(table), identities = Shared::new(identities) }
 	}
 
@@ -345,7 +345,7 @@ export impl HashMapCell<type K: Hashable, type V> {
 /// all of them for a `Reset`. A batch's observers wake once per key, as its
 /// whole-map observers wake once.
 fun wake_for<K: Hashable, V>(slots: KeySlots, ops: List<MapOp<K, V>>) {
-	mut named: NativeMap<bool> = NativeMap::new();
+	mut named: HashTable<bool> = HashTable::new();
 	mut order: List<Hash> = [];
 	for op in ops {
 		let hash = match op {

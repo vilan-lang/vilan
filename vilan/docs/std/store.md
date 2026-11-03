@@ -107,12 +107,12 @@ projections, so its store reads no fields this way. The handle's own fields
 are std's `[internal]` machinery and are not members outside std, so a field
 of `T` named `path` or `root` reads `T`'s field.
 
-A handle is data: copying it allocates nothing, and it has no owner. It is a
-`Source<T>`, so every pipe, effect and binding takes one (`city.derive(..)`,
-`<p>{city}</p>`), and a `Signal<T>`, so anything that writes a signal writes it
-(`set_with`, `optimistic`, `bind_value`). Every handle to one path of one store
-has one `identity()`, so a body that `track()`s a handle on every run keeps one
-edge on it.
+A handle is data: copying it allocates nothing, a projection allocates one step
+of its path, and it has no owner. It is a `Source<T>`, so every pipe, effect
+and binding takes one (`city.derive(..)`, `<p>{city}</p>`), and a `Signal<T>`,
+so anything that writes a signal writes it (`set_with`, `optimistic`,
+`bind_value`). Every handle to one path of one store has one `identity()`, so
+a body that `track()`s a handle on every run keeps one edge on it.
 
 ## What a write wakes
 
@@ -268,7 +268,12 @@ fun main() {
 
 A payload variant's handle also has `live()`, its discriminant as a `StoreFlag`,
 and `assume()`, the payload as a `Store<P>` for code that only runs while the
-variant is live.
+variant is live. `assume()` needs an owner — it stands a keeper on the variant
+that goes with the ambient owner, as an `on_cleanup` does — so a call outside
+every owner is refused at compile time ("context `owner_scope` is read here,
+but this code can be reached without an enclosing `run`"); `when_live` calls it
+inside its body's owner, and code of your own wraps it in `run_with_owner` or
+`comp`.
 
 ### when_live — rebuild only on the variant
 
@@ -284,9 +289,12 @@ The body is built under a fresh owner when the variant goes live and disposed
 when it goes away; a write inside the payload wakes only the bindings that read
 what changed. Should a derivation in the body run in the turn that ends the
 variant — a derivation settles before the effect that tears the body down — it
-reads the LAST payload a read through the live variant saw (a message edited
-and then deleted shows its edit, never the text the body was built over), and a
-write then lands nowhere. On the server it renders the live payload once.
+reads the payload as it stood when the variant ended — a message edited and
+then deleted shows its edit, never the text the body was built over — and a
+write then lands nowhere. The handle keeps nothing on a read: a read below it
+lends the payload in place, and the payload is copied once, by the write that
+ends the variant, for that fallback — released with the body's owner. On the
+server it renders the live payload once.
 
 ## Collections
 
@@ -296,7 +304,11 @@ A collection field takes its declared shape — no derive to write:
   slot is that key's alone: a write to key 7 wakes the readers of key 7 and
   nobody else. `at(key).set(None)` removes the key, and `.some()` reaches into
   a present value. `insert(key, value)` and `remove(key)` are the same two
-  writes.
+  writes. The step lends the map's slot IN PLACE on both backends
+  (`HashMap::peek` / `slot`): a read of one field through
+  `at(key).some().title()` copies only that field, however large the value it
+  sits in, and a write through `at(key)` lands where the value is — no copy out
+  and back in.
 - a **`HashSet<T>`** likewise: `contains(x)` is a `Store<bool>`, and
   `set(true)`/`set(false)` (or `insert`/`remove`) add and remove `x`.
 - a **`List<T>`** is a SEQUENCE node. Every `SequenceCell` write — `push`,

@@ -1124,7 +1124,7 @@ fn s7_the_sidecar_lists_each_user_function_with_its_bindings_by_static_type() {
     );
     assert!(matches!(
         layout_of(info, "HashMap<str, i32>"),
-        Layout::Map { label, key, value, key_width: 1, value_width: 1, .. }
+        Layout::Map { label, table: 0, key, value }
             if label == "HashMap" && *key == str_index && *value == i32_index
     ));
     assert!(matches!(

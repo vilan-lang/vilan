@@ -1668,7 +1668,10 @@ impl<'a> Interpreter<'a> {
             }
             "__dbg_set" => {
                 let open = take(0);
-                let items = map_or_set_values(&take(1))?;
+                let items = nmap_held_entries(&take(1))?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect();
                 let show = take(2);
                 self.dbg_members(
                     open,
@@ -1682,24 +1685,18 @@ impl<'a> Interpreter<'a> {
             }
             "__dbg_map" => {
                 let open = take(0);
-                let items = map_or_set_values(&take(1))?;
+                let items = nmap_held_entries(&take(1))?
+                    .into_iter()
+                    .map(|(key, value)| array(vec![key, value]))
+                    .collect();
                 let (show_key, show_value) = (take(2), take(3));
-                let key_width = expect_number(&take(4))? as usize;
-                let value_width = expect_number(&take(5))? as usize;
                 self.dbg_members(
                     open,
                     items,
-                    |interpreter, pair| {
-                        let slots = array_items(&pair)?;
-                        let slice = |from: usize, width: usize| -> Value<'a> {
-                            if width == 1 {
-                                slots.get(from).cloned().unwrap_or(Value::Undefined)
-                            } else {
-                                array(slots.iter().skip(from).take(width).cloned().collect())
-                            }
-                        };
-                        let key = slice(0, key_width);
-                        let value = slice(key_width, value_width);
+                    |interpreter, entry| {
+                        let slots = array_items(&entry)?;
+                        let key = slots.first().cloned().unwrap_or(Value::Undefined);
+                        let value = slots.get(1).cloned().unwrap_or(Value::Undefined);
                         let key_document = interpreter.call_value(&show_key, vec![key])?;
                         let label = format!("{} => ", dbg_flat(&key_document)?);
                         let value_document = interpreter.call_value(&show_value, vec![value])?;
@@ -2077,16 +2074,17 @@ impl<'a> Interpreter<'a> {
                     None => Ok(option_none()),
                 }
             }
-            // `List.to_array<const N>()` (A172) — `Some` of a shallow copy at
-            // the length, `None` otherwise: the JS helper's
-            // `list.length === length ? [ 0, list.slice() ] : [ 1 ]`.
+            // `List.to_array<const N>()` (A172) — `Some` of a DEEP copy at the
+            // length, `None` otherwise: the JS helper's `list.length === length
+            // ? [ 0, list.map(__clone) ] : [ 1 ]` (B691: the shallow copy shared
+            // every aggregate element with the list).
             "__list_to_array" => {
                 let list = expect_array(&take(0))?;
                 let length = expect_number(&take(1))?;
                 let list = list.borrow();
                 if list.len() as f64 == length {
                     Ok(option_some(Value::Array(Rc::new(RefCell::new(
-                        list.clone(),
+                        list.iter().map(deep_clone).collect(),
                     )))))
                 } else {
                     Ok(option_none())
@@ -2537,6 +2535,28 @@ impl<'a> Interpreter<'a> {
             // range outside `0 <= start <= end <= len` is a panic (`Thrown`),
             // so a const-time violation fails the build with the same message a
             // runtime one prints.
+            // B695: an empty pattern cuts between CHARACTERS, as the emitted
+            // `__str_split` / `__str_replace` helpers do.
+            "__str_split" => {
+                let text = expect_str(&take(0))?;
+                let separator = expect_str(&take(1))?;
+                let parts: Vec<Value> = if separator.is_empty() {
+                    text.chars()
+                        .map(|character| Value::Str(Rc::from(character.to_string().as_str())))
+                        .collect()
+                } else {
+                    text.split(&*separator)
+                        .map(|part| Value::Str(Rc::from(part)))
+                        .collect()
+                };
+                Ok(Value::Array(Rc::new(RefCell::new(parts))))
+            }
+            "__str_replace" => {
+                let text = expect_str(&take(0))?;
+                let from = expect_str(&take(1))?;
+                let to = expect_str(&take(2))?;
+                Ok(Value::Str(Rc::from(text.replace(&*from, &to).as_str())))
+            }
             "__substring" => {
                 let text = expect_str(&take(0))?;
                 let start = expect_number(&take(1))?;
@@ -2552,6 +2572,119 @@ impl<'a> Interpreter<'a> {
                     Some((_, value)) => Ok(option_some(deep_clone(value))),
                     None => Ok(option_none()),
                 }
+            }
+            // M191 (hash-map-lend.md §10): `NativeMap<K, V>` is the pair `[ map,
+            // pending ]`, the `Map` from each hash to the entry `[ key, slot ]`,
+            // the slot the `Option` array itself (`Value`'s aggregates are
+            // `Rc`-shared, so handing it out IS the in-place view). Mirrors the
+            // `__nmap_*` helpers in `helper_source`, settle rule and all.
+            "__nmap_insert" => {
+                let (pair, map) = nmap_parts(&take(0))?;
+                nmap_settle(&pair, &map)?;
+                let hash = take(1);
+                let key = Key::of(&hash)?;
+                let (key_value, value) = (take(2), take(3));
+                let existing = map.borrow().get(&key).map(|(_, entry)| entry.clone());
+                match existing {
+                    Some(entry) => {
+                        let entry = expect_array(&entry)?;
+                        let mut entry = entry.borrow_mut();
+                        entry.clear();
+                        entry.push(key_value);
+                        entry.push(option_some(value));
+                    }
+                    None => {
+                        let entry = array(vec![key_value, option_some(value)]);
+                        map.borrow_mut().insert(key, (hash, entry));
+                    }
+                }
+                Ok(Value::Undefined)
+            }
+            "__nmap_get" | "__nmap_key" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let key = Key::of(&take(1))?;
+                let held = map
+                    .borrow()
+                    .get(&key)
+                    .and_then(|(_, entry)| nmap_held(entry));
+                Ok(match held {
+                    Some((key_value, value)) => option_some(deep_clone(if name == "__nmap_get" {
+                        &value
+                    } else {
+                        &key_value
+                    })),
+                    None => option_none(),
+                })
+            }
+            "__nmap_lend" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let key = Key::of(&take(1))?;
+                let read = take(2);
+                let slot = match map.borrow().get(&key) {
+                    Some((_, entry)) => nmap_slot_of(entry)?,
+                    None => option_none(),
+                };
+                self.call_value(&read, vec![slot])
+            }
+            "__nmap_slot" => {
+                let (pair, map) = nmap_parts(&take(0))?;
+                nmap_settle(&pair, &map)?;
+                let hash = take(1);
+                let key = Key::of(&hash)?;
+                let key_value = take(2);
+                let existing = map.borrow().get(&key).map(|(_, entry)| entry.clone());
+                let entry = match existing {
+                    Some(entry) => entry,
+                    None => {
+                        let entry = array(vec![key_value, option_none()]);
+                        map.borrow_mut().insert(key, (hash.clone(), entry.clone()));
+                        entry
+                    }
+                };
+                if let Some(pending) = pair.borrow_mut().get_mut(1) {
+                    *pending = hash;
+                }
+                nmap_slot_of(&entry)
+            }
+            "__nmap_has" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let key = Key::of(&take(1))?;
+                let held = map
+                    .borrow()
+                    .get(&key)
+                    .is_some_and(|(_, entry)| nmap_held(entry).is_some());
+                Ok(Value::Bool(held))
+            }
+            "__nmap_remove" => {
+                let (pair, map) = nmap_parts(&take(0))?;
+                nmap_settle(&pair, &map)?;
+                let key = Key::of(&take(1))?;
+                map.borrow_mut().shift_remove(&key);
+                Ok(Value::Undefined)
+            }
+            "__nmap_len" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let held = map
+                    .borrow()
+                    .values()
+                    .filter(|(_, entry)| nmap_held(entry).is_some())
+                    .count();
+                Ok(Value::Number(held as f64))
+            }
+            "__nmap_hashes" | "__nmap_keys" | "__nmap_values" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let walked = map
+                    .borrow()
+                    .values()
+                    .filter_map(|(hash, entry)| {
+                        nmap_held(entry).map(|(key_value, value)| match name {
+                            "__nmap_hashes" => hash.clone(),
+                            "__nmap_keys" => deep_clone(&key_value),
+                            _ => deep_clone(&value),
+                        })
+                    })
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(walked))))
             }
             "__map_keys" => {
                 let map = expect_map(&take(0))?;
@@ -2571,8 +2704,8 @@ impl<'a> Interpreter<'a> {
                     .collect();
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
-            // `[...set[0].values()]` — the `Set` struct is `[table]`; iterate the
-            // backing map's stored originals by reference (matching the spread).
+            // The `Set` struct is `[table]`; iterate the table's held KEYS — the
+            // stored originals, by reference (matching the emitted helper).
             "__set_iter" => {
                 let set = take(0);
                 let Value::Array(elements) = &set else {
@@ -2583,13 +2716,11 @@ impl<'a> Interpreter<'a> {
                     .first()
                     .cloned()
                     .unwrap_or(Value::Undefined);
-                let map = expect_map(&table)?;
-                let values = map
-                    .borrow()
-                    .values()
-                    .map(|(_, value)| value.clone())
+                let members = nmap_held_entries(&table)?
+                    .into_iter()
+                    .map(|(key, _)| key)
                     .collect();
-                Ok(Value::Array(Rc::new(RefCell::new(values))))
+                Ok(Value::Array(Rc::new(RefCell::new(members))))
             }
             // The externally-tagged enum discriminator (mirrors the
             // `__json_tag` codegen helper). A116: everything that is neither a
@@ -3638,8 +3769,15 @@ fn substring_checked(text: &str, start: f64, end: f64) -> Result<String, Failure
     let length = units.len();
     let whole = start.fract() == 0.0 && end.fract() == 0.0;
     if whole && 0.0 <= start && start <= end && end <= length as f64 {
+        // B695: a bound between a pair's halves moves back to its start.
+        let floor = |at: usize| {
+            let inside_a_pair = at > 0
+                && units.get(at).is_some_and(|unit| (unit & 0xFC00) == 0xDC00)
+                && (units[at - 1] & 0xFC00) == 0xD800;
+            if inside_a_pair { at - 1 } else { at }
+        };
         return Ok(String::from_utf16_lossy(
-            &units[start as usize..end as usize],
+            &units[floor(start as usize)..floor(end as usize)],
         ));
     }
     Err(Failure::new(
@@ -4143,19 +4281,75 @@ fn array_items<'a>(value: &Value<'a>) -> Result<Vec<Value<'a>>, Failure> {
 }
 
 /// `Array.from(table.values())` over a `Map` or a `Set`.
-fn map_or_set_values<'a>(value: &Value<'a>) -> Result<Vec<Value<'a>>, Failure> {
-    match value {
-        Value::Map(map) => Ok(map
-            .borrow()
-            .values()
-            .map(|(_, value)| value.clone())
-            .collect()),
-        Value::Set(set) => Ok(set.borrow().values().cloned().collect()),
-        other => Err(Failure::internal(format!(
-            "expected a Map or a Set, got {}",
-            type_name(other)
-        ))),
+/// A `NativeMap` table's halves (M191): the `[ map, pending ]` pair and its map.
+#[allow(clippy::type_complexity)]
+fn nmap_parts<'a>(
+    table: &Value<'a>,
+) -> Result<
+    (
+        Rc<RefCell<Vec<Value<'a>>>>,
+        Rc<RefCell<IndexMap<Key, (Value<'a>, Value<'a>)>>>,
+    ),
+    Failure,
+> {
+    let pair = expect_array(table)?;
+    let map = expect_map(&pair.borrow().first().cloned().unwrap_or(Value::Undefined))?;
+    Ok((pair, map))
+}
+
+/// An entry's `slot` — the `Option` array itself, shared (the in-place view).
+fn nmap_slot_of<'a>(entry: &Value<'a>) -> Result<Value<'a>, Failure> {
+    Ok(array_items(entry)?
+        .get(1)
+        .cloned()
+        .unwrap_or_else(option_none))
+}
+
+/// An entry's `(key, value)` when its slot is `Some` — `None` for a tombstone.
+fn nmap_held<'a>(entry: &Value<'a>) -> Option<(Value<'a>, Value<'a>)> {
+    let entry = array_items(entry).ok()?;
+    let slot = array_items(entry.get(1)?).ok()?;
+    match (slot.first(), slot.get(1)) {
+        (Some(Value::Number(tag)), Some(value)) if *tag == 0.0 => {
+            Some((entry.first()?.clone(), value.clone()))
+        }
+        _ => None,
     }
+}
+
+/// The table's held entries in insertion order, by reference.
+fn nmap_held_entries<'a>(table: &Value<'a>) -> Result<Vec<(Value<'a>, Value<'a>)>, Failure> {
+    let (_, map) = nmap_parts(table)?;
+    let held = map
+        .borrow()
+        .values()
+        .filter_map(|(_, entry)| nmap_held(entry))
+        .collect();
+    Ok(held)
+}
+
+/// The settle every write runs first: the pending slot, still `None`, loses
+/// its key.
+fn nmap_settle<'a>(
+    pair: &Rc<RefCell<Vec<Value<'a>>>>,
+    map: &Rc<RefCell<IndexMap<Key, (Value<'a>, Value<'a>)>>>,
+) -> Result<(), Failure> {
+    let pending = pair.borrow().get(1).cloned().unwrap_or(Value::Undefined);
+    if matches!(pending, Value::Undefined) {
+        return Ok(());
+    }
+    if let Some(slot) = pair.borrow_mut().get_mut(1) {
+        *slot = Value::Undefined;
+    }
+    let key = Key::of(&pending)?;
+    let tombstone = map
+        .borrow()
+        .get(&key)
+        .is_some_and(|(_, entry)| nmap_held(entry).is_none());
+    if tombstone {
+        map.borrow_mut().shift_remove(&key);
+    }
+    Ok(())
 }
 
 /// `__dbg_group(open, close, padded, entries, fill)`: `{ o, c, p, e, f }`.

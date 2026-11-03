@@ -325,16 +325,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Shape::Map {
                 label,
-                field: (_, field),
+                table: (_, table),
                 key,
                 value: entry_value,
             } => {
                 let key_printer = self.native_printer_for(key, span)?;
                 let value_printer = self.native_printer_for(entry_value, span)?;
                 format!(
-                    "vilan_rt::show::members({}, &value.{}.values(), false, |entry| (format!(\"{{}} => \", {key_printer}(&entry.0).flat()), {value_printer}(&entry.1)))",
+                    "vilan_rt::show::members({}, &value.{}.iter().map(|(_, key, value)| (key, value)).collect::<Vec<_>>(), false, |entry| (format!(\"{{}} => \", {key_printer}(entry.0).flat()), {value_printer}(entry.1)))",
                     rust_literal(&format!("{label} {{")),
-                    sanitize(&field)
+                    sanitize(&table)
                 )
             }
             Shape::Set {
@@ -345,7 +345,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let printer = self.native_printer_for(element, span)?;
                 let fill = self.prints_as_a_scalar(element);
                 format!(
-                    "vilan_rt::show::members({}, &value.{}.values(), {fill}, |item| (String::new(), {printer}(item)))",
+                    "vilan_rt::show::members({}, &value.{}.keys(), {fill}, |item| (String::new(), {printer}(item)))",
                     rust_literal(&format!("{label} {{")),
                     sanitize(&field)
                 )

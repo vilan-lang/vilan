@@ -29,7 +29,7 @@ function size(words2, extra) {
 	return words2[0].length + as_usize(extra);
 }
 function sized(words2, extra) {
-	return words2[0].length + as_usize(unwrap_or(extra, 0));
+	return words2[0].length + as_usize(unwrap_or(__clone(extra), 0));
 }
 function traced(first, words2, extra) {
 	return words2[0].length + as_usize(first) + as_usize(extra);
@@ -45,7 +45,7 @@ function unwrap_or(self, fallback) {
 	const $e = self;
 	let $f = null;
 	if ($e[0] === 0) {
-		const x = __clone($e[1]);
+		const x = $e[1];
 		$f = x;
 	} else {
 		$f = __clone(fallback);

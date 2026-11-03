@@ -1,0 +1,164 @@
+// B689 / M182 / M191 (proposal/hash-map-lend.md §4.8, §10): a `HashMap` read
+// and written in place — `peek`, and `slot` with `Option::get_or_insert` — on
+// ONE table, its tombstone rules, and the store's keyed step that lends through
+// them, on both backends. Every line is one of §4's semantics, a §10 tombstone
+// rule, or a read, write or removal through `Store<HashMap<K, V>>::at(key)`.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::io::print;
+import std::reactive::store::Store;
+import std::shared::Shared;
+
+[derive(PartialEq, Storable)]
+struct Record {
+	title: str,
+	notes: List<str>,
+}
+
+[derive(Storable)]
+struct State {
+	records: HashMap<i32, Record>,
+}
+
+fun fresh(runs: Shared<i32>): List<i32> {
+	runs.write() = runs.read() + 1;
+	[0]
+}
+
+fun main() {
+	// 1: `peek` reads `&None` on a miss and the stored value on a hit, and sees
+	// a write made through `slot`.
+	mut scores: HashMap<str, List<i32>> = HashMap::new();
+	print(scores.peek("ada", |slot| slot.is_none()));
+	scores.insert("ada", [1, 2]);
+	print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
+	scores.slot("ada").get_or_insert([]).push(3);
+	print(scores.get("ada").unwrap_or([]));
+
+	// 2: a slot left `None` is a tombstone: the key is gone from every read at
+	// once — `contains_key`, `len`, `get`, the walks.
+	mut ages: HashMap<str, i32> = HashMap::new();
+	ages.insert("ada", 36);
+	ages.insert("alan", 41);
+	ages.insert("grace", 85);
+	let was = ages.slot("alan").take();
+	print(was);
+	print(ages.contains_key("alan"));
+	print(ages.get("alan").is_none());
+	print(ages.len());
+	print(ages.keys());
+	print(ages.values());
+
+	// 3: `Some` under an absent key goes last; a present key keeps its place;
+	// `None` under an absent key inserts nothing; a key emptied and written
+	// again (the tombstone settled) goes last.
+	ages.slot("linus") = Some(54);
+	ages.slot("ada") = Some(37);
+	print(ages.slot("ken").is_none());
+	print(ages.len());
+	print(ages.contains_key("ken"));
+	ages.insert("alan", 42);
+	for entry in ages.entries() {
+		print(i"{entry.0} {entry.1}");
+	}
+
+	// 4: `get_or_insert` makes its value only on a miss, then the push lands in
+	// place; on a scalar payload the view is a place too.
+	let runs = Shared::new(0);
+	mut groups: HashMap<i32, List<i32>> = HashMap::new();
+	mut index = 0;
+	for index < 7 {
+		groups.slot(index % 2).get_or_insert(fresh(runs)).push(index);
+		index += 1;
+	}
+	print(groups.get(0).unwrap_or([]));
+	print(groups.get(1).unwrap_or([]));
+	print(runs.read());
+	mut counts: HashMap<str, i32> = HashMap::new();
+	for word in ["to", "be", "or", "not", "to", "be"] {
+		counts.slot(word).get_or_insert(0) += 1;
+	}
+	print(counts.entries());
+	// A field of the payload as the compound's place: the slot is found once.
+	mut firsts: HashMap<str, (str, i32)> = HashMap::new();
+	for word in ["To", "to", "be"] {
+		firsts.slot(word.to_lowercase()).get_or_insert((word, 0)).1 += 1;
+	}
+	print(firsts.entries());
+	// One table compares as one map: the same keys, equal values, any order.
+	mut reordered: HashMap<i32, List<i32>> = HashMap::new();
+	reordered.insert(1, groups.get(1).unwrap_or([]));
+	reordered.insert(0, groups.get(0).unwrap_or([]));
+	print(groups == reordered);
+	reordered.slot(0).get_or_insert([]).push(99);
+	print(groups == reordered);
+
+	// The tombstones through a churn of slots compact (natively) and keep the
+	// order; a present key re-inserted keeps its place, a new one goes last.
+	mut churned: HashMap<i32, i32> = HashMap::new();
+	mut key_index = 0;
+	for key_index < 200 {
+		churned.insert(key_index, key_index);
+		key_index += 1;
+	}
+	key_index = 0;
+	for key_index < 200 {
+		if key_index % 50 != 3 {
+			let _gone = churned.slot(key_index).take();
+		}
+		key_index += 1;
+	}
+	churned.insert(53, 530);
+	churned.insert(500, 5);
+	print(churned.len());
+	print(churned.entries());
+
+	// A copy taken while a tombstone is pending carries it: neither side counts
+	// the emptied key, and each settles on its own next write.
+	mut original: HashMap<str, i32> = HashMap::new();
+	original.insert("a", 1);
+	original.insert("b", 2);
+	let _gone = original.slot("a").take();
+	mut copy = original;
+	print(copy.len());
+	copy.insert("a", 10);
+	original.insert("c", 3);
+	print(copy.keys());
+	print(original.keys());
+
+	// `insert` keeps COPIES of the key and the value (`own value` on the
+	// table's insert): the caller's later writes reach neither table, nor a
+	// set's member.
+	mut lists: HashMap<List<i32>, List<i32>> = HashMap::new();
+	mut key = [1];
+	mut value = [10];
+	lists.insert(key, value);
+	key.push(2);
+	value.push(20);
+	print(lists.keys());
+	print(lists.values());
+	mut set: HashSet<List<i32>> = HashSet::new();
+	mut member = [1];
+	set.insert(member);
+	member.push(2);
+	for item in set {
+		print(item);
+	}
+
+	// The store's keyed step: a read through `at(1).some().title()`, a write
+	// through it, an insert and a removal through `at(key).set(..)`.
+	mut records: HashMap<i32, Record> = HashMap::new();
+	records.insert(1, Record { title = "first", notes = ["a", "b"] });
+	let store = Store::new(State { records });
+	let title = store.records().at(1).some().title();
+	print(title.get().unwrap_or("?"));
+	let _renamed = title.patch("renamed");
+	print(title.get().unwrap_or("?"));
+	store.records().at(2).set(Some(Record { title = "second", notes = [] }));
+	print(store.records().len());
+	store.records().at(1).set(None);
+	print(store.records().len());
+	print(store.records().at(1).get().is_none());
+	print(store.records().at(2).some().title().get().unwrap_or("?"));
+	print(store.records().at(2).some().notes().get().map_or(|notes| notes.len(), 9usize));
+}

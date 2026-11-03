@@ -1,0 +1,20 @@
+// F153: `for key in keys` over `process::keys()` (a `[resource]` whose
+// awaiting inherent `next` drives the loop) builds natively and reads the
+// same keys from the same piped bytes as on JS; the handle is loaned to the
+// loop and dropped after it.
+import std::debug::Debug;
+import std::io::print;
+import std::process::{ Key, keys };
+
+fun main() {
+	let keys = keys();
+	mut count = 0;
+	for key in keys {
+		match key {
+			Key::Char("q") => jump break,
+			let other => print(other.debug()),
+		}
+		count += 1;
+	}
+	print(i"keys before q: {count}");
+}

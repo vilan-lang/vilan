@@ -13,10 +13,10 @@ use std::borrow::Cow;
 use std::cell::Cell;
 
 use crate::node::{
-    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
-    GenericArguments, GenericParameters, If, IfSpelling, ImplSelector, ImportBranch,
-    ImportModifier, ImportTail, ItemLabels, Node, NodeIfBranch, NodeList, Pattern,
-    StructInitializerField,
+    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, EVERY_IMPL_SUBJECT, ExportScope, Exposure,
+    ExternBinding, Func, GLOB_IMPORT_LEAF, GenericArguments, GenericParameters, If, IfSpelling,
+    ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels, Node, NodeIfBranch,
+    NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -675,9 +675,57 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
 /// TRAIT` when the selector names its block by the trait (B455). The token
 /// path keys on the same run of tokens, so the two keys agree.
 fn selector_written_text<'src>(selector: &ImplSelector<'src>) -> Cow<'src, str> {
+    let subject = canonical_selector_subject(selector);
     match &selector.trait_text {
-        Some(trait_text) => Cow::Owned(format!("{} with {trait_text}", selector.subject_text)),
-        None => selector.subject_text.clone(),
+        Some(trait_text) => Cow::Owned(format!("{subject} with {trait_text}")),
+        None => subject,
+    }
+}
+
+/// The subject a selector PRINTS: its text, except the retired whole-subject
+/// `_`, which prints as `*` (A181, RULED 2026-11-03 — `(impl _)` is read as
+/// `(impl *)` for one release and `vilan fmt` rewrites it). `_` inside a type
+/// (`(impl List<_>)`) is a hole and prints as written.
+fn canonical_selector_subject<'src>(selector: &ImplSelector<'src>) -> Cow<'src, str> {
+    match selector.writes_the_retired_whole_subject() {
+        true => Cow::Borrowed(EVERY_IMPL_SUBJECT),
+        false => selector.subject_text.clone(),
+    }
+}
+
+/// The token twin of [`canonical_selector_subject`]: a subject run whose
+/// WHOLE type is `_` — alone, or before the ` with TRAIT` the run carries —
+/// becomes `*`, so the safety net reduces the source and its reprint to the
+/// same tokens.
+fn canonical_selector_tokens(subject: &mut [Token<'_>]) {
+    let whole = matches!(
+        subject,
+        [Token::Ident(ANONYMOUS_TYPE_BINDER)]
+            | [
+                Token::Ident(ANONYMOUS_TYPE_BINDER),
+                Token::Ident("with"),
+                ..
+            ]
+    );
+    if whole {
+        subject[0] = Token::Op(EVERY_IMPL_SUBJECT);
+    }
+}
+
+/// A181: the branch a `::` continuation leads to, seen through a one-member
+/// brace set holding a lone selector — `a::{ (impl T) }` IS `a::(impl T)`, the
+/// one-selector spelling, exactly as `a::{ b }` is `a::b`. Only a CONTINUATION
+/// collapses: a selector has no spelling at a statement's head, where there is
+/// no module for it to select from (the parser refuses one there).
+fn selector_continuation<'branch, 'src>(
+    child: &'branch TokenBranch<'src>,
+) -> &'branch TokenBranch<'src> {
+    match child {
+        TokenBranch::Set(branches) => match branches.as_slice() {
+            [only @ TokenBranch::Selector(..)] => only,
+            _ => child,
+        },
+        _ => child,
     }
 }
 
@@ -731,9 +779,10 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
             },
             Box::new(BranchKey::End),
         ),
-        TokenBranch::Path(name, Some(child), _) => {
-            BranchKey::Path((*name).to_string(), Box::new(branch_key(child)))
-        }
+        TokenBranch::Path(name, Some(child), _) => BranchKey::Path(
+            (*name).to_string(),
+            Box::new(branch_key(selector_continuation(child))),
+        ),
         // The marker sorts with the name it marks — `#hidden` lands beside
         // `hidden` rather than in a block of its own — and still keys apart,
         // because the `#` is in the rendered name.
@@ -781,7 +830,7 @@ fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey 
                 other => RootRank::Dependency(other.to_string()),
             };
             let rest = match child {
-                Some(child) => branch_key(child),
+                Some(child) => branch_key(selector_continuation(child)),
                 None => BranchKey::End,
             };
             (root, rest)
@@ -861,14 +910,23 @@ fn parse_token_branch<'src>(
     // B318: the reach marker wraps whatever follows it, exactly as it does in
     // the real grammar.
     if tokens.get(index) == Some(&Token::Hash) {
-        let (inner, next) = parse_token_branch(tokens, index + 1)?;
+        // `#(impl T)` — the marker on a SELECTOR (B318 S4), which the path
+        // production reads past the `#` exactly as the parser does.
+        let (inner, next) = parse_token_selector(tokens, index + 1)
+            .or_else(|| parse_token_branch(tokens, index + 1))?;
         return Some((TokenBranch::Reach(Box::new(inner)), next));
+    }
+    // A182: `m::*`, the glob leaf — a leaf spelled with the set operator.
+    if tokens.get(index) == Some(&Token::Op(GLOB_IMPORT_LEAF)) {
+        return Some((TokenBranch::Path(GLOB_IMPORT_LEAF, None, None), index + 1));
     }
     if let Some(name) = token_name(tokens, index) {
         let mut next = index + 1;
         let mut alias = None;
         let continuation = if tokens.get(next) == Some(&Token::Op("::")) {
-            let (child, after) = parse_token_branch(tokens, next + 1)?;
+            // A181: `a::(impl T)`, the one-selector set without its braces.
+            let (child, after) = parse_token_selector(tokens, next + 1)
+                .or_else(|| parse_token_branch(tokens, next + 1))?;
             next = after;
             Some(Box::new(child))
         } else {
@@ -910,7 +968,8 @@ fn parse_token_branch<'src>(
             let mut after = next + 1;
             let mut alias = None;
             let continuation = if tokens.get(after) == Some(&Token::Op("::")) {
-                let (child, past) = parse_token_branch(tokens, after + 1)?;
+                let (child, past) = parse_token_selector(tokens, after + 1)
+                    .or_else(|| parse_token_branch(tokens, after + 1))?;
                 after = past;
                 Some(Box::new(child))
             } else {
@@ -990,6 +1049,7 @@ fn parse_token_selector<'src>(
             next += 1;
         }
     }
+    canonical_selector_tokens(&mut subject);
     let key = selector_key_text(&subject.iter().map(Token::to_string).collect::<String>());
     Some((TokenBranch::Selector(key, subject, members), next))
 }
@@ -1035,10 +1095,13 @@ fn parse_import_statement<'src>(
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
     match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, child, alias) => {
-            out.push(Token::Ident(name));
+            out.push(match *name {
+                GLOB_IMPORT_LEAF => Token::Op(GLOB_IMPORT_LEAF),
+                name => Token::Ident(name),
+            });
             if let Some(child) = child {
                 out.push(Token::Op("::"));
-                emit_branch_tokens(child, out);
+                emit_branch_tokens(selector_continuation(child), out);
             }
             if let Some(alias) = alias {
                 out.push(Token::Ident("as"));
@@ -1480,6 +1543,7 @@ pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "rule",
     "raw",
     "with_length",
+    "with_length_as",
     "with_color",
     "with_border",
     "on",
@@ -5808,7 +5872,7 @@ impl<'src> Printer<'src> {
                     ImportTail::Continue(child) => {
                         self.out.push_str("::");
                         self.split = split;
-                        self.print_import_branch(child, sort);
+                        self.print_import_branch(self.lone_selector_of(child), sort);
                     }
                     // `import a::b as b;` renames `b` to `b` — it binds
                     // exactly what the plain import binds, so the plain import
@@ -5829,7 +5893,7 @@ impl<'src> Printer<'src> {
             // step with the first.
             ImportBranch::Selector(selector) => {
                 self.out.push_str("(impl ");
-                self.out.push_str(&selector.subject_text);
+                self.out.push_str(&canonical_selector_subject(selector));
                 if let Some(trait_text) = &selector.trait_text {
                     self.out.push_str(" with ");
                     self.out.push_str(trait_text);
@@ -5875,9 +5939,11 @@ impl<'src> Printer<'src> {
                 // `Option`), and a comment inside them, which is anchored to the
                 // set's split form. `emit_branch_tokens` mirrors this collapse so
                 // the safety net reduces both spellings to the same tokens.
-                // A selector has no unbraced spelling at all — the parser
-                // refuses `import a::(impl T);` — so a one-member set holding
-                // one keeps its braces, the way a lone `self` does.
+                // A lone selector collapses one level up, where the `::` that
+                // leads to it is printed ([`Self::lone_selector_of`]): it has an
+                // unbraced spelling only after a module path (A181), so a set
+                // reaching here still holding one is a statement's head, which
+                // keeps its braces.
                 if let [only] = order.as_slice()
                     && !inside_comment
                     && !matches!(only, ImportBranch::Path("self", ..))
@@ -5903,6 +5969,31 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" }");
                 }
             }
+        }
+    }
+
+    /// A181: what a `::` continuation prints — the selector itself when the
+    /// continuation is a one-member set holding a lone selector (`a::{ (impl
+    /// T) }` IS `a::(impl T)`, the one-selector spelling, as `a::{ b }` is
+    /// `a::b`), else the continuation as it is. A comment inside the braces
+    /// keeps them, as it does for any one-member set: it is anchored to the
+    /// split form. [`selector_continuation`] is the token side's twin.
+    fn lone_selector_of<'branch>(
+        &self,
+        child: &'branch ImportBranch<'src>,
+    ) -> &'branch ImportBranch<'src> {
+        let ImportBranch::Set(branches) = child else {
+            return child;
+        };
+        let [only @ ImportBranch::Selector(selector)] = branches.as_slice() else {
+            return child;
+        };
+        let inside_comment = self
+            .import_set_extent(&[selector.span])
+            .is_some_and(|extent| self.comment_outside_elements(extent, &[selector.span]));
+        match inside_comment {
+            true => child,
+            false => only,
         }
     }
 
@@ -7198,6 +7289,19 @@ impl<'src> Printer<'src> {
         matches!(&subject.0, Node::Call(_, _, arguments) if !arguments.0.is_empty())
     }
 
+    /// Whether the chain's subject is a struct or list literal (E354): a
+    /// receiver that breaks one field or element per line where it stands,
+    /// with the chain's postfixes after its closing bracket.
+    fn has_literal_subject(expr: &Spanned<Node<'src>>) -> bool {
+        let (subject, spine) = Self::postfix_spine(expr);
+        !spine.is_empty()
+            && match &subject.0 {
+                Node::StructInitializer(_, _, _, fields, _) => !fields.0.is_empty(),
+                Node::List(elements) => !elements.is_empty(),
+                _ => false,
+            }
+    }
+
     /// Whether a spine step is a `.name(…)` call link — the unit the split form
     /// gives its own line. Every other postfix (`.field`, `[i]`, `?`, `!`) glues
     /// to the segment printed before it.
@@ -7398,8 +7502,12 @@ impl<'src> Printer<'src> {
         // a `?`/`!` subject through the plain operand rule.
         match &spine[0].0 {
             // E314: a call subject whose own line runs out breaks its arguments
-            // one per line; the links then follow on lines of their own.
-            Node::MemberAccessor(_, _) | Node::Index(_, _) if Self::has_call_subject(expr) => {
+            // one per line; the links then follow on lines of their own. A
+            // struct or list literal subject breaks one field or element per
+            // line the same way (E354).
+            Node::MemberAccessor(_, _) | Node::Index(_, _)
+                if Self::has_call_subject(expr) || Self::has_literal_subject(expr) =>
+            {
                 if self.subject_needs_split(subject) {
                     self.split = Split::Tail;
                 }
@@ -8949,6 +9057,38 @@ impl<'src> Printer<'src> {
             self.print_split_chain(expr);
             return;
         }
+        // E354: a chain whose RECEIVER is a struct or list literal —
+        // `Body { .. }.size()`, `[a, b].len()`. The recursive arm below prints
+        // the receiver with the permission dropped, so the literal stayed one
+        // line at any width. Measured like the rest: the inline form first,
+        // and only if its first line is still over budget does the receiver
+        // break as it breaks standing alone, one field (or element) per line,
+        // with the postfixes glued after its closing brace. A chain the doors
+        // above split (two links, or one whose last argument is a closure)
+        // never reaches here.
+        if split != Split::Off && Self::has_literal_subject(expr) {
+            let (subject, spine) = Self::postfix_spine(expr);
+            let start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_inline_chain(expr, &spine, split);
+            if !self.first_line_over_budget(start) {
+                return;
+            }
+            self.out.truncate(start);
+            self.cursor = comment_cursor;
+            self.split = Split::Tail;
+            self.print_postfix_subject(subject);
+            for (at, step) in spine.iter().enumerate() {
+                self.split = if at + 1 == spine.len() {
+                    split
+                } else {
+                    Split::Off
+                };
+                self.print_postfix_suffix(step);
+            }
+            self.split = Split::Off;
+            return;
+        }
         match &expr.0 {
             Node::Number(whole, fraction, suffix) => {
                 self.out.push_str(whole);
@@ -9449,7 +9589,7 @@ impl<'src> Printer<'src> {
                 self.print_argument_spans(argument_spans);
                 self.out.push(')');
             }
-            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
+            Node::StructInitializer(namespace, name, generic_arguments, fields, _) => {
                 // The path as written (B190) — the namespace spine, then the
                 // name. The printer BAILS on a form it does not know, falling
                 // the whole file back to its source silently, so a qualified
@@ -15263,16 +15403,72 @@ mod import_sorting {
         );
     }
 
-    // A selector has no unbraced spelling — `import a::(impl T);` is refused —
-    // so a one-member set holding one keeps its braces where a one-member set
-    // holding a NAME collapses (kolt.local 005).
+    // A181: a one-member set holding a selector collapses to the BARE form —
+    // `a::{ (impl T) }` IS `a::(impl T)`, the one-selector spelling, exactly as
+    // a one-member set holding a NAME collapses (kolt.local 005) — so braces
+    // appear only with two or more members. The bare form is canonical already
+    // and reprints as written; nested under a set member it collapses too; a
+    // reach-marked selector does as it did; a comment inside the braces keeps
+    // them (it is anchored to the split form).
     #[test]
-    fn a_one_member_set_holding_a_selector_keeps_its_braces() {
+    fn a_one_member_set_holding_a_selector_takes_the_bare_form() {
         assert_sorts(
             "import pkg::a::{ (impl Style) };\n",
-            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::(impl Style);\n",
+        );
+        assert_sorts(
+            "import pkg::a::(impl Style);\n",
+            "import pkg::a::(impl Style);\n",
         );
         assert_sorts("import pkg::a::{ Style };\n", "import pkg::a::Style;\n");
+        assert_sorts(
+            "import pkg::{ a::{ (impl Style) }, b };\n",
+            "import pkg::{ a::(impl Style), b };\n",
+        );
+        assert_sorts(
+            "import pkg::a::{ #(impl Style) };\n",
+            "import pkg::a::#(impl Style);\n",
+        );
+        assert_sorts(
+            "import pkg::a::{ (impl Style), (impl Theme) };\n",
+            "import pkg::a::{ (impl Style), (impl Theme) };\n",
+        );
+    }
+
+    // A182 (Q8): the glob re-export reprints as written and sorts with its
+    // path; the safety net reads its `*` as the leaf it is.
+    #[test]
+    fn a_glob_reexport_round_trips_and_sorts() {
+        assert_sorts(
+            "export import std::web::prelude::*;\n",
+            "export import std::web::prelude::*;\n",
+        );
+        assert_sorts(
+            "export import pkg::a::(impl Thing);\nexport import std::web::prelude::*;\n",
+            "export import std::web::prelude::*;\nexport import pkg::a::(impl Thing);\n",
+        );
+    }
+
+    // A181: the bare form with a member tail, and with the absolute subject the
+    // quick fix writes (E359), parses and prints as written (`assert_sorts`
+    // holds the reprint idempotent and un-bailed), and the two spellings of one
+    // import sort to one place.
+    #[test]
+    fn the_bare_selector_form_round_trips_and_is_idempotent() {
+        for source in [
+            "import pkg::a::(impl Style)::ghost;\n",
+            "import pkg::a::(impl Style)::{ ghost, solid };\n",
+            "import pkg::app_overlay::(impl pkg::lib::overlay::Overlay);\n",
+            "import pkg::a::(impl (pkg::d::T, std::e::U));\n",
+            "import pkg::a::(impl *);\n",
+            "import pkg::a::(impl Box with One);\n",
+        ] {
+            assert_sorts(source, source);
+        }
+        assert_sorts(
+            "import pkg::b::Thing;\nimport pkg::a::{ (impl Style)::{ ghost } };\n",
+            "import pkg::a::(impl Style)::ghost;\nimport pkg::b::Thing;\n",
+        );
     }
 
     // A selector's METHOD set sorts like any other, and a lone member takes the
@@ -15281,11 +15477,11 @@ mod import_sorting {
     fn selector_members_sort_and_a_lone_member_unbraces() {
         assert_sorts(
             "import pkg::a::{ (impl List<i32>)::{ last, first } };\n",
-            "import pkg::a::{ (impl List<i32>)::{ first, last } };\n",
+            "import pkg::a::(impl List<i32>)::{ first, last };\n",
         );
         assert_sorts(
             "import pkg::a::{ (impl List<i32>)::{ first } };\n",
-            "import pkg::a::{ (impl List<i32>)::first };\n",
+            "import pkg::a::(impl List<i32>)::first;\n",
         );
     }
 
@@ -15301,18 +15497,55 @@ mod import_sorting {
     }
 
     // The placeholder round-trips in every position B318 gives it: an argument
-    // (`List<_>`), a nested one, an independent pair, and the whole-module
-    // `(impl _)`.
+    // (`List<_>`), a nested one, an independent pair — and the whole-module
+    // selector is `(impl *)` (A181, RULED 2026-11-03), which round-trips too.
     #[test]
     fn the_selector_placeholder_round_trips() {
         for source in [
-            "import pkg::a::{ (impl _) };\n",
-            "import pkg::a::{ (impl List<_>) };\n",
-            "import pkg::a::{ (impl List<Option<_>>) };\n",
-            "import pkg::a::{ (impl Map<_, _>) };\n",
+            "import pkg::a::{ Thing, (impl *) };\n",
+            "import pkg::a::(impl List<_>);\n",
+            "import pkg::a::(impl List<Option<_>>);\n",
+            "import pkg::a::(impl Map<_, _>);\n",
+            "import pkg::a::(impl * with Display);\n",
         ] {
             assert_sorts(source, source);
         }
+    }
+
+    // A181: `(impl _)` WHOLE is the retired spelling of `(impl *)` and fmt
+    // rewrites it — alone, with a `with` trait, beside names, bare or marked.
+    // `_` INSIDE a type is a hole and stays (`(impl List<_>)`).
+    #[test]
+    fn the_retired_whole_selector_is_rewritten_to_the_star() {
+        for (source, expected) in [
+            (
+                "import pkg::a::{ (impl _) };\n",
+                "import pkg::a::(impl *);\n",
+            ),
+            (
+                "import std::display::{ Display, (impl _) };\n",
+                "import std::display::{ Display, (impl *) };\n",
+            ),
+            (
+                "import pkg::a::{ (impl _ with Display) };\n",
+                "import pkg::a::(impl * with Display);\n",
+            ),
+            (
+                "import pkg::b::{ #(impl _) };\n",
+                "import pkg::b::#(impl *);\n",
+            ),
+            (
+                "import pkg::a::{ (impl List<_>) };\n",
+                "import pkg::a::(impl List<_>);\n",
+            ),
+        ] {
+            assert_sorts(source, expected);
+        }
+        // The safety net reads the two spellings as one import.
+        assert_eq!(
+            normalize(raw_tokens("import pkg::a::{ (impl _) };\n")),
+            normalize(raw_tokens("import pkg::a::(impl *);\n")),
+        );
     }
 
     // B455: `with TRAIT` names the block by its trait and round-trips with a
@@ -15321,9 +15554,9 @@ mod import_sorting {
     #[test]
     fn a_selector_naming_its_trait_round_trips_and_sorts() {
         for source in [
-            "import pkg::a::{ (impl Box with One) };\n",
-            "import pkg::a::{ (impl Box with One)::describe };\n",
-            "import pkg::a::{ (impl Box<_> with Feed<i32>) };\n",
+            "import pkg::a::(impl Box with One);\n",
+            "import pkg::a::(impl Box with One)::describe;\n",
+            "import pkg::a::(impl Box<_> with Feed<i32>);\n",
         ] {
             assert_sorts(source, source);
         }
@@ -15840,13 +16073,13 @@ mod organize {
     fn an_emptied_statement_rescued_by_one_subject_becomes_a_selector() {
         assert_eq!(
             organize_selecting("import pkg::a::b;\n", &["b"], &[("a", "Style")]),
-            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::(impl Style);\n",
         );
         // A brace set's common prefix is the path before it, so a set whose
         // members all died rewrites the same way.
         assert_eq!(
             organize_selecting("import pkg::a::{ b, c };\n", &["b", "c"], &[("a", "Style")]),
-            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::(impl Style);\n",
         );
     }
 
@@ -15865,7 +16098,7 @@ mod organize {
         );
         assert_eq!(
             organize("import pkg::a::{ Thing, (impl Thing) };\n", &["Thing"]),
-            "import pkg::a::{ (impl Thing) };\n",
+            "import pkg::a::(impl Thing);\n",
         );
         // Every element dead: the statement goes, and the module rescue is a
         // second question it was not offered here.
@@ -20339,5 +20572,265 @@ mod trailing_comment_anchor {
             "fun one(): i32 { 7 } // one-line fn\n",
             "fun one(): i32 {\n\t7\n} // one-line fn\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod return_value_layout {
+    //! E347: a call that is the value of a `ret` (`ret f(a, b, c);`) breaks its
+    //! arguments one per line at the width a `let v = f(..);` does - 100
+    //! columns with the `;` stays, 101 breaks - because `ret` hands its value
+    //! the split permission the statement hook armed, with the `;` counted
+    //! (E329). The item's repro spelled it `return`, which is not vilan (the
+    //! parser refuses it with the `ret` steer, and `vilan fmt` DECLINES the
+    //! file, exit 2), so it was left as written; these pin the `ret` shapes.
+    use super::bailing_constructs::assert_construct;
+
+    /// A function whose body is `statement`.
+    fn body(statement: &str) -> String {
+        format!(
+            "fun f(argument_one: i32, argument_two: i32, argument_three: i32): i32 {{\n{statement}}}\n"
+        )
+    }
+
+    /// The call, its last argument a name of `length` characters: `ret` and
+    /// the call are `9 + 68 + length` columns at the body's depth (a tab is
+    /// four), with the `;` one more.
+    fn call(length: usize) -> String {
+        format!(
+            "plain_function_call_with_no_chain_at_all(argument_one, argument_two, {})",
+            last(length)
+        )
+    }
+
+    fn last(length: usize) -> String {
+        format!("argument_{}", "x".repeat(length - "argument_".len()))
+    }
+
+    /// The width of the widest line of `source`, a tab four columns.
+    fn widest(source: &str) -> usize {
+        source
+            .lines()
+            .map(|line| line.replace('\t', "    ").chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_returned_call_at_100_columns_with_its_semicolon_stays() {
+        let source = body(&format!("\tret {};\n", call(21)));
+        assert_eq!(widest(&source), 100);
+        assert_construct(&source, &source);
+    }
+
+    #[test]
+    fn a_returned_call_at_101_columns_with_its_semicolon_breaks() {
+        let source = body(&format!("\tret {};\n", call(22)));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tret plain_function_call_with_no_chain_at_all(\n\t\targument_one,\n\t\targument_two,\n\t\t{},\n\t);\n",
+            last(22)
+        ));
+        assert_construct(&source, &expected);
+    }
+
+    #[test]
+    fn a_returned_call_inside_an_if_breaks_at_its_own_depth() {
+        let source = body(&format!(
+            "\tif argument_one > 0 {{\n\t\tret {};\n\t}}\n\t0\n",
+            call(18)
+        ));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tif argument_one > 0 {{\n\t\tret plain_function_call_with_no_chain_at_all(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{},\n\t\t);\n\t}}\n\t0\n",
+            last(18)
+        ));
+        assert_construct(&source, &expected);
+    }
+
+    #[test]
+    fn a_returned_call_in_a_closure_body_breaks() {
+        let source = body(&format!(
+            "\tlet later = || {{\n\t\tret {};\n\t}};\n\tlater()\n",
+            call(18)
+        ));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tlet later = || {{\n\t\tret plain_function_call_with_no_chain_at_all(\n\t\t\targument_one,\n\t\t\targument_two,\n\t\t\t{},\n\t\t);\n\t}};\n\tlater()\n",
+            last(18)
+        ));
+        assert_construct(&source, &expected);
+    }
+
+    #[test]
+    fn an_unterminated_returned_call_counts_no_semicolon() {
+        // A block's tail `ret` written without its `;`: 100 columns stays...
+        let kept = body(&format!("\tret {}\n", call(22)));
+        assert_eq!(widest(&kept), 100);
+        assert_construct(&kept, &kept);
+        // ...and 101 breaks.
+        let source = body(&format!("\tret {}\n", call(23)));
+        assert_eq!(widest(&source), 101);
+        let expected = body(&format!(
+            "\tret plain_function_call_with_no_chain_at_all(\n\t\targument_one,\n\t\targument_two,\n\t\t{},\n\t)\n",
+            last(23)
+        ));
+        assert_construct(&source, &expected);
+    }
+}
+
+#[cfg(test)]
+mod literal_receiver_layout {
+    //! E354: a chain whose RECEIVER is a struct or list literal —
+    //! `Body { .. }.size()` — was printed with the receiver's split permission
+    //! dropped, so the literal stayed on one line at any width (kolt's
+    //! 161-column `body = MessageBody { .. }.to_json(),`). Over budget, the
+    //! receiver now breaks as it breaks standing alone, one field or element
+    //! per line, with the postfixes after its closing bracket; as a statement's
+    //! value, inside another literal's field and as a `then`/`else` arm. Every
+    //! case runs through `assert_construct`: token round trip, the canonical
+    //! form, idempotence (`fmt(fmt(x)) == fmt(x)`), the canonical form's own
+    //! round trip.
+    use super::bailing_constructs::assert_construct;
+
+    /// The item's repro, its 110-column statement inline.
+    const REPRO: &str = concat!(
+        "fun main() {\n",
+        "\tlet shown = \"a block of code, long enough to push the line past the budget\";\n",
+        "\tlet blocks = Body { version = 1, blocks = [Inner { kind = \"code\", content = ",
+        "shown.to_uppercase() }] }.size();\n",
+        "\tprint(blocks);\n",
+        "}\n",
+    );
+
+    #[test]
+    fn the_repro_breaks_its_receiver_one_field_per_line() {
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet shown = \"a block of code, long enough to push the line past the budget\";\n",
+            "\tlet blocks = Body {\n",
+            "\t\tversion = 1,\n",
+            "\t\tblocks = [Inner { kind = \"code\", content = shown.to_uppercase() }],\n",
+            "\t}.size();\n",
+            "\tprint(blocks);\n",
+            "}\n",
+        );
+        assert_construct(REPRO, expected);
+    }
+
+    #[test]
+    fn a_receiver_under_the_budget_stays_inline() {
+        let source = "fun main() {\n\tlet short = Body { version = 1, blocks = [] }.size();\n}\n";
+        assert_construct(source, source);
+    }
+
+    #[test]
+    fn a_receiver_in_another_literals_field_breaks_inside_it() {
+        // kolt's `file_page.vl` shape.
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet message = Message { id = 1, body = MessageBody { version = body_version, ",
+            "blocks = [BodyBlock { kind = \"code\", content = shown }] }.to_json() };\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet message = Message {\n",
+            "\t\tid = 1,\n",
+            "\t\tbody = MessageBody {\n",
+            "\t\t\tversion = body_version,\n",
+            "\t\t\tblocks = [BodyBlock { kind = \"code\", content = shown }],\n",
+            "\t\t}.to_json(),\n",
+            "\t};\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    #[test]
+    fn a_receiver_as_a_then_arm_breaks_on_the_arms_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet chosen = flag then Body { version = 1, blocks = [Inner { kind = \"code\", ",
+            "content = shown.to_uppercase() }] }.size() else 0;\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet chosen = flag\n",
+            "\t\tthen Body {\n",
+            "\t\t\tversion = 1,\n",
+            "\t\t\tblocks = [Inner { kind = \"code\", content = shown.to_uppercase() }],\n",
+            "\t\t}.size()\n",
+            "\t\telse 0;\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    #[test]
+    fn a_list_receiver_breaks_one_element_per_line() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet counted = [\"a block of code, long enough\", \"to push the line past the budget\", ",
+            "\"of one hundred columns\"].len();\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet counted = [\n",
+            "\t\t\"a block of code, long enough\",\n",
+            "\t\t\"to push the line past the budget\",\n",
+            "\t\t\"of one hundred columns\",\n",
+            "\t].len();\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// Two links: the chain splits one link per line, as it did, and the
+    /// receiver that still runs its own line out breaks first — the shape a
+    /// call receiver takes (E314).
+    #[test]
+    fn a_two_link_chain_breaks_its_receiver_then_its_links() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet two = Body { version = 1, blocks = [Inner { kind = \"code\", content = ",
+            "shown.to_uppercase() }] }.to_text().len();\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet two = Body {\n",
+            "\t\tversion = 1,\n",
+            "\t\tblocks = [Inner { kind = \"code\", content = shown.to_uppercase() }],\n",
+            "\t}\n",
+            "\t\t.to_text()\n",
+            "\t\t.len();\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
+    }
+
+    /// A chain whose receiver is a CALL is the one-link door's (E314),
+    /// unchanged.
+    #[test]
+    fn a_chain_whose_receiver_is_a_call_is_unchanged() {
+        let source = concat!(
+            "fun main() {\n",
+            "\tlet called = make(1, \"a block of code, long enough to push the line past the budget, ",
+            "the call's own\").size();\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fun main() {\n",
+            "\tlet called = make(\n",
+            "\t\t1,\n",
+            "\t\t\"a block of code, long enough to push the line past the budget, the call's own\",\n",
+            "\t)\n",
+            "\t\t.size();\n",
+            "}\n",
+        );
+        assert_construct(source, expected);
     }
 }

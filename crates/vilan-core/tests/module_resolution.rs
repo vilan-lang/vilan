@@ -1307,11 +1307,14 @@ fn a149_s3_a_storable_derive_in_an_imported_module_resolves_and_keys_its_map() {
     // is the first to load `std::reactive::store` (the entry imports none of it
     // here, as kolt's does not), and the output named `store_core` to step
     // around it. B547's std side reverted the step: red on a compiler without
-    // B547's fix.
+    // B547's fix. The entry's import of `Store` comes AFTER the model's, so the
+    // model still loads the module first; it is there because `at` is
+    // `store.vl`'s extension of `Store` (B688: the calling file must reach it).
     let entry = concat!(
         "import std::io::print;\n",
         "import std::reactive::{ Owner, Signal, Source, run_with_owner };\n",
         "import pkg::model::board;\n",
+        "import std::reactive::store::Store;\n",
         "fun main() {\n",
         "    let store = board();\n",
         "    let owner = Owner::new();\n",
@@ -6713,28 +6716,37 @@ fn analyze_p7(app: &str) -> Vec<String> {
     analyze_package(&files, "app.vl", Platform::default())
 }
 
-/// P7, unchanged: an intermediate module's `impl` arrives with an import that
-/// reaches something under it, and the call compiles. The control the paper
-/// records (P7b — drop the `y_helper` import) is the "has no method" arm.
+/// P7, REVERSED by A182 (`import-foundation.md` §8, RULED 2026-11-03): an
+/// intermediate module's `impl` no longer arrives with an import that reaches
+/// something under it — `x.vl` is a directory body above the leaf `y`, and
+/// the statement never named it — so the call is refused, naming the
+/// selector that admits the block. Naming `x` admits it (the second half).
 #[test]
-fn b318_p7s_exhibit_is_admitted_by_a_plain_import() {
+fn b318_p7s_exhibit_is_no_longer_admitted_by_a_childs_import() {
     let diagnostics = analyze_p7(
         "import pkg::a::Thing;\nimport pkg::x::y::y_helper;\n\n\
          fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
     );
     assert!(
-        diagnostics.is_empty(),
-        "P7's exhibit should compile unchanged: {diagnostics:?}"
+        diagnostics.len() == 1
+            && diagnostics[0].contains("`bump` comes from the `impl Thing` block in `pkg::x`")
+            && diagnostics[0].ends_with("Import it (`import pkg::x::(impl pkg::a::Thing);`)"),
+        "P7's exhibit is refused under the leaf rule: {diagnostics:?}"
     );
+    let admitted = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x::y::y_helper;\nimport pkg::x::(impl pkg::a::Thing);\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert!(admitted.is_empty(), "naming `x` admits it: {admitted:?}");
 }
 
-/// The same program with `only` on the statement that loaded `x.vl`: the names
-/// still arrive (`y_helper` resolves), and the implementation does not. The
-/// refusal names the module and the fix.
+/// `only` on the statement that carries `x.vl` — the module itself: the name
+/// still arrives, and the implementation does not. The refusal names the
+/// module and the fix.
 #[test]
-fn b318_only_declines_the_impls_along_the_path() {
+fn b318_only_declines_the_impls_its_leaf_carries() {
     let diagnostics = analyze_p7(
-        "import pkg::a::Thing;\nimport pkg::x::y::y_helper only;\n\n\
+        "import pkg::a::Thing;\nimport pkg::x::y::y_helper;\nimport pkg::x only;\n\n\
          fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
     );
     assert_eq!(
@@ -6845,17 +6857,17 @@ fn b318_the_placeholder_selector_serves_every_argument() {
     );
 }
 
-/// `(impl _)` is the whole-module impls-only form: every block the module
+/// `(impl *)` is the whole-module impls-only form: every block the module
 /// declares, and no name — the file still has to import `Boxed` itself.
 #[test]
 fn b318_the_whole_module_selector_admits_every_block() {
     let diagnostics = analyze_boxed(
-        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl *) };\n\n\
          fun main() {\n\tlet _ = Boxed::make(1).tag() + Boxed::make(\"a\").other();\n}\n",
     );
     assert!(
         diagnostics.is_empty(),
-        "`(impl _)` should admit every block: {diagnostics:?}"
+        "`(impl *)` should admit every block: {diagnostics:?}"
     );
 }
 
@@ -7874,16 +7886,16 @@ fn b338_a_selector_that_admits_no_impl_is_a_row_at_the_import() {
     assert!(
         missed.iter().any(|message| message
             .contains("no `impl` this statement carries has a subject `i32` admits")
-            && message.contains("`(impl _)` admits every block they declare")),
+            && message.contains("`(impl *)` admits every block they declare")),
         "a selector admitting nothing should be reported at the import: {missed:?}"
     );
-    // The `(impl _)` control: the whole-module form admits every block the
+    // The `(impl *)` control: the whole-module form admits every block the
     // statement carries, so it never earns this row.
     let control = analyze_boxed(
-        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl *) };\n\n\
          fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
     );
-    assert!(control.is_empty(), "`(impl _)` admits: {control:?}");
+    assert!(control.is_empty(), "`(impl *)` admits: {control:?}");
 }
 
 /// The other shape: the subject reaches a block, and the `::` tail names a
@@ -8567,11 +8579,11 @@ fn transform_derive_admission(thing_selector: &str) -> Result<String, String> {
 /// non-exported `impl` in the program for every derived visitor. That is why
 /// E185's placeholder fired sixteen times at Order 36's sweep merge, and the
 /// refusal's own advice was unfollowable: it said "widen `thing`'s own import
-/// of `w`", and `thing.vl` writing `#(impl _)` changed nothing, because
+/// of `w`", and `thing.vl` writing `#(impl *)` changed nothing, because
 /// `thing.vl`'s set was not the set being consulted.
 #[test]
 fn b354_a_derived_body_resolves_under_the_file_that_carries_the_derive() {
-    let emitted = transform_derive_admission(", #(impl _)")
+    let emitted = transform_derive_admission(", #(impl *)")
         .expect("`thing.vl`'s own reach marker must answer its derived body");
     assert!(
         emitted.contains("function"),
@@ -9237,12 +9249,12 @@ fn b547_a_with_clause_names_a_reexported_trait_beside_a_same_named_derive() {
 
 /// B367: B318 S4's ADMISSION MISS is reachable. The four-module reproducer —
 /// the trait in `a`, a non-exported `impl` in `b`, a generic body in `c` that
-/// imports only the trait, the entry importing `b` with `#(impl _)` — was once
+/// imports only the trait, the entry importing `b` with `#(impl *)` — was once
 /// reported to compile clean (which would have made the refusal dead code). On
 /// this base it is refused, at `c`, naming the member, the providing module and
 /// the declaring one, as visibility.md §3.5 writes the rule: a generic body
 /// resolves under the file it was DECLARED in, so the entry's marker does not
-/// reach it. `c`'s own `import pkg::b::{ #(impl _) };` — the fix the refusal
+/// reach it. `c`'s own `import pkg::b::{ #(impl *) };` — the fix the refusal
 /// names — admits it.
 #[test]
 fn b367_a_generic_body_resolves_under_its_own_files_admission() {
@@ -9265,7 +9277,7 @@ fn b367_a_generic_body_resolves_under_its_own_files_admission() {
             ),
             (
                 "main.vl".to_string(),
-                "import pkg::b::{ Dog, #(impl _) };\nimport pkg::c::twice;\nfun main() {\n    print(twice(Dog {}));\n}\nmain();\n"
+                "import pkg::b::{ Dog, #(impl *) };\nimport pkg::c::twice;\nfun main() {\n    print(twice(Dog {}));\n}\nmain();\n"
                     .to_string(),
             ),
         ]
@@ -9282,7 +9294,7 @@ fn b367_a_generic_body_resolves_under_its_own_files_admission() {
             && refusal.contains("module `c` does not admit it"),
         "{refusal}"
     );
-    let admitted_files = files("import pkg::b::{ #(impl _) };\n");
+    let admitted_files = files("import pkg::b::{ #(impl *) };\n");
     let admitted: Vec<(&str, &str)> = admitted_files
         .iter()
         .map(|(name, body)| (name.as_str(), body.as_str()))
@@ -10140,4 +10152,231 @@ fn m144_a_std_items_id_does_not_move_with_the_packages_module_count() {
     );
     let _ = std::fs::remove_dir_all(single_dir);
     let _ = std::fs::remove_dir_all(package_dir);
+}
+
+// --- A182: a plain import admits the LEAF module's blocks only ---------------
+//
+// `import-foundation.md` §2 row 1, §8 (RULED 2026-11-03, part B "B1-leaf"). A
+// plain `import a::b::c;` carries the blocks of the module its leaf stands in
+// — `b`'s for an item `c`, `c`'s for a module — and never a directory body
+// ABOVE it: `a.vl`'s blocks arrive through a statement that names `a`, or
+// through a prelude that re-exports the admission. Until A182 the path's
+// directory bodies were carried too: the one term of the elaboration the
+// surface never wrote.
+
+/// `thing.vl` declares `Thing`; the DIRECTORY BODY `a.vl` extends it (and
+/// declares a type of its own, `Home`, with its own block); `a/b.vl` is a
+/// child with a plain function.
+fn a182_files(main: &str) -> Vec<(&str, &str)> {
+    vec![
+        ("thing.vl", "export struct Thing {\n\tn: i32,\n}\n"),
+        (
+            "a.vl",
+            "import pkg::thing::Thing;\n\n\
+             export impl Thing {\n\tfun bump(self): i32 {\n\t\tself.n + 1\n\t}\n}\n\n\
+             export struct Home {\n\tn: i32,\n}\n\n\
+             export impl Home {\n\tfun home(self): i32 {\n\t\tself.n\n\t}\n}\n",
+        ),
+        (
+            "a/b.vl",
+            "import pkg::a::Home;\nimport pkg::thing::Thing;\n\n\
+             export struct Other {\n\tn: i32,\n}\n\n\
+             export impl Other {\n\tfun other(self): i32 {\n\t\tself.n\n\t}\n}\n\n\
+             export fun helper(): i32 {\n\t2\n}\n\n\
+             export fun made(): Home {\n\tHome { n = 3 }\n}\n",
+        ),
+        ("main.vl", main),
+    ]
+}
+
+fn a182_diagnostics(main: &str) -> Vec<String> {
+    analyze_under_prelude(
+        PreludeSpec::default(),
+        &a182_files(main),
+        "main.vl",
+        Platform::default(),
+    )
+}
+
+/// A directory body's EXTENSION block no longer reaches a file that imports a
+/// CHILD of the directory: `main.vl` imports `pkg::a::b::helper` and nothing
+/// that names `a`, so `bump` (written in `a.vl`) is refused, naming the
+/// module and the selector that admits the block. Red before A182: the path
+/// `a::b` carried `a.vl`.
+#[test]
+fn a182_a_directory_bodys_block_does_not_reach_a_childs_importer() {
+    let diagnostics = a182_diagnostics(
+        "import pkg::thing::Thing;\nimport pkg::a::b::helper;\n\n\
+         fun main() {\n\tprint(Thing { n = helper() }.bump());\n}\nmain();\n",
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("`bump` comes from the `impl Thing` block in `pkg::a`")
+            && message.ends_with("Import it (`import pkg::a::(impl pkg::thing::Thing);`)")),
+        "{diagnostics:?}"
+    );
+}
+
+/// The explicit import of the directory does admit it — the module whole, a
+/// name from it, or the selector the refusal names.
+#[test]
+fn a182_an_explicit_import_of_the_directory_admits_its_blocks() {
+    for admits in [
+        "import pkg::a;\n",
+        "import pkg::a::Home;\n",
+        "import pkg::a::(impl pkg::thing::Thing);\n",
+        "import pkg::a::(impl *);\n",
+    ] {
+        let diagnostics = a182_diagnostics(&format!(
+            "import pkg::thing::Thing;\nimport pkg::a::b::helper;\n{admits}\n\
+             fun main() {{\n\tprint(Thing {{ n = helper() }}.bump());\n}}\nmain();\n"
+        ));
+        assert!(diagnostics.is_empty(), "{admits}: {diagnostics:?}");
+    }
+}
+
+/// The package PRELUDE is the place a package admits its extension blocks
+/// once (Q8): a prelude module that re-exports the admission — `export import
+/// pkg::a::(impl pkg::thing::Thing);` — admits `bump` to a file that imports
+/// nothing from `a`. Without the line the same file is refused.
+#[test]
+fn a182_a_prelude_that_reexports_the_admission_admits_the_block() {
+    let main = "import pkg::thing::Thing;\nimport pkg::a::b::helper;\n\n\
+                fun main() {\n\tprint(Thing { n = helper() }.bump());\n}\nmain();\n";
+    let analyze = |prelude: &str| {
+        let mut files = a182_files(main);
+        files.push(("prelude.vl", prelude));
+        analyze_under_prelude(
+            PreludeSpec::Module("pkg::prelude".to_string()),
+            &files,
+            "main.vl",
+            Platform::default(),
+        )
+    };
+    let admitted =
+        analyze("export import std::io::print;\nexport import pkg::a::(impl pkg::thing::Thing);\n");
+    assert!(admitted.is_empty(), "{admitted:?}");
+    let refused = analyze("export import std::io::print;\n");
+    assert!(
+        refused
+            .iter()
+            .any(|message| message.contains("`bump` comes from the `impl Thing` block in `pkg::a`")),
+        "{refused:?}"
+    );
+}
+
+/// Q8: a re-exported admission travels to ANY importer of the re-exporting
+/// module, not only through a prelude — a re-export is "as if declared here".
+#[test]
+fn a182_a_reexported_admission_travels_to_an_importer() {
+    let mut files = a182_files(
+        "import pkg::thing::Thing;\nimport pkg::admit::nothing;\n\n\
+         fun main() {\n\tprint(Thing { n = nothing() }.bump());\n}\nmain();\n",
+    );
+    files.push((
+        "admit.vl",
+        "export import pkg::a::(impl pkg::thing::Thing);\n\nexport fun nothing(): i32 {\n\t0\n}\n",
+    ));
+    let diagnostics = analyze_under_prelude(
+        PreludeSpec::default(),
+        &files,
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+/// Adding a selector to a plain statement drops nothing it did not name: the
+/// set `a::b::{ made, (impl Other) }` restricts `b`'s blocks to `Other`'s, and
+/// says nothing about `a.vl` — so `Home`'s own block, reached through the
+/// value `made()` returns, still resolves. Red before A182: the statement
+/// carried `a.vl` along its path and its selector declined `home`.
+#[test]
+fn a182_a_selector_beside_a_plain_name_drops_nothing_it_did_not_name() {
+    let diagnostics = a182_diagnostics(
+        "import pkg::a::b::{ made, Other, (impl Other) };\n\n\
+         fun main() {\n\tprint(made().home() + Other { n = 1 }.other());\n}\nmain();\n",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    // And the selector still narrows the module it DOES name.
+    let diagnostics = a182_diagnostics(
+        "import pkg::a::b::{ made, Other, (impl pkg::a::Home) };\n\n\
+         fun main() {\n\tprint(Other { n = 1 }.other());\n}\nmain();\n",
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|message| message.contains("'other' is provided by an `impl` in module `b`")),
+        "{diagnostics:?}"
+    );
+}
+
+/// A182 (Q8): `export import m::*;` re-publishes every name `m` publishes, so
+/// a package prelude that EXTENDS std's set is two lines — the glob and the
+/// package's admissions. Here the base set (`Option`, `Some`, `None`, `print`)
+/// arrives through the glob and `bump` through the admission.
+#[test]
+fn a182_a_two_line_prelude_globs_std_and_admits_the_packages_blocks() {
+    let main = "import pkg::thing::Thing;\nimport pkg::a::b::helper;\n\n\
+                fun main() {\n\tlet found: Option<i32> = [1, 2].get(0);\n\tmatch found {\n\
+                \t\tSome(let n) => print(Thing { n = n + helper() }.bump()),\n\
+                \t\tNone => print(0),\n\t}\n}\nmain();\n";
+    let analyze = |prelude: &str| {
+        let mut files = a182_files(main);
+        files.push(("prelude.vl", prelude));
+        analyze_under_prelude(
+            PreludeSpec::Module("pkg::prelude".to_string()),
+            &files,
+            "main.vl",
+            Platform::default(),
+        )
+    };
+    let two_lines = analyze(
+        "export import std::prelude::*;\nexport import pkg::a::(impl pkg::thing::Thing);\n",
+    );
+    assert!(two_lines.is_empty(), "{two_lines:?}");
+    // Without the glob the base set is gone — the prelude REPLACES std's.
+    let without = analyze("export import pkg::a::(impl pkg::thing::Thing);\n");
+    assert!(
+        without
+            .iter()
+            .any(|message| message.contains("cannot find type 'Option'")),
+        "{without:?}"
+    );
+}
+
+/// A glob is a RE-EXPORT and nothing else: a plain `import m::*;` is refused
+/// at the `*`, naming the re-export; a glob over something that is not a
+/// module is refused naming what it is.
+#[test]
+fn a182_a_glob_is_written_only_as_a_reexport_of_a_module() {
+    let plain = analyze_under_prelude(
+        PreludeSpec::default(),
+        &[("main.vl", "import std::prelude::*;\n\nfun main() {}\n")],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(
+        plain,
+        [
+            "`::*` names every export of a module, and is written only as a RE-EXPORT — \
+          `export import m::*;` publishes them from this module, as a package prelude does: \
+          import the names this file uses"
+        ]
+    );
+    let not_a_module = analyze_under_prelude(
+        PreludeSpec::default(),
+        &[
+            ("glob.vl", "export import std::option::Option::*;\n"),
+            ("main.vl", "import pkg::glob;\n\nfun main() {}\n"),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        not_a_module.iter().any(|message| message
+            == "`std::option::Option::*` re-exports a MODULE's names, and \
+                `std::option::Option` is not a module: re-export the names it holds one by one"),
+        "{not_a_module:?}"
+    );
 }

@@ -34,6 +34,15 @@ members = [
     # `windows-sys` (both already the CLI's) live in a fourth optional crate,
     # linked only by a program that reaches `keys()`.
     "crates/vilan-rt-term",
+    # M185 (proposal/image.md): `std::image`'s codec core over the `image`
+    # crate, kept free of vilan types so ONE implementation serves both
+    # backends — `vilan-rt-image` links it natively (a fifth optional crate,
+    # linked only by a program that reaches `std::image`), and
+    # `vilan-image-wasm` builds it for wasm32 as the blob the JS emitter
+    # carries for node.
+    "crates/vilan-image",
+    "crates/vilan-rt-image",
+    "crates/vilan-image-wasm",
 ]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace
@@ -146,3 +155,18 @@ inherits = "release"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
+
+# `std::image`'s codec as wasm32 for node (M185; proposal/image.md §2.3):
+# `scripts/build-image-wasm.sh` builds `vilan-image-wasm` with this profile and
+# commits the result. SIZE over speed as the playground's profile is (`s`
+# rather than `z`: a decode's inner loops are the module's whole job, and `z`
+# gives up loop unrolling the decoders measurably want), whole-program LTO,
+# and `panic = "abort"` — unlike `wasm-release` there is no `catch_unwind` to
+# keep, a panic in the codec is a trap the JS helper reports, and the unwinding
+# tables are weight for nothing.
+[profile.image-wasm]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

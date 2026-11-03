@@ -72,6 +72,7 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
         return;
     };
     imply_trait_tracking(program);
+    refuse_implicitly_called_tracking(program);
     let tracking: HashSet<Id> = program
         .functions
         .iter()
@@ -164,9 +165,16 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
             }
             if program.function_calls.contains_key(&call.call_id) {
                 into.push((call.call_id, forward));
-            } else {
+            } else if matches!(
+                program.entity_map.get(&call.call_id),
+                Some(Expr::ForEach(..))
+            ) {
                 argumentless.push((call.call_id, target));
             }
+            // Any other call without an argument list is an operator's (B690's
+            // edge), which reaches only a member the trait declares tracking —
+            // and that declaration is refused where it is written
+            // (`refuse_implicitly_called_tracking`), once, not at every `+`.
         }
     };
     for node in graph.nodes() {
@@ -420,6 +428,95 @@ pub fn imply_trait_tracking(program: &mut Program) {
             source,
         );
     }
+}
+
+/// B646's guard: `[track_caller]` declared on a trait member the compiler calls
+/// IMPLICITLY — with no argument list to append a location to — is refused at
+/// the declaration. The tracking contract would oblige every call to pass a
+/// place, and these calls have none to pass: an operator (`a + b` lowers to
+/// `add(a, b)`; resolved by the trait's NAME, so a program's own `trait Add`
+/// is reached too), a concatenation or i-string hole rendering a bounded
+/// operand through its `to_string`, a scope's end tearing a value down through
+/// `Drop::drop`, and `!`/`?` reaching std's `Try`. A derived impl calls what it
+/// derives through these same forms (`==`) or through ordinary calls in the
+/// generated source, which pass a place.
+fn refuse_implicitly_called_tracking(program: &mut Program) {
+    let mut refused: Vec<(Id, String)> = Vec::new();
+    for trait_ in program.traits.values() {
+        let in_std = program
+            .source_of(trait_.id)
+            .is_some_and(|source| program.std_sources.contains(&source));
+        for (&member, &declaration) in &trait_.declarations {
+            let Some(function) = program.functions.get(&declaration) else {
+                continue;
+            };
+            if !function.track_caller {
+                continue;
+            }
+            let how = if let Some((_, _, symbol)) = crate::analyzer::operator_members()
+                .find(|(trait_name, name, _)| *trait_name == trait_.name && *name == member)
+            {
+                Some(format!("`a {symbol} b` calls it"))
+            } else if member == crate::analyzer::RENDER_MEMBER && returns_str(program, declaration)
+            {
+                Some(
+                    "a concatenation or an i-string hole renders a value bounded by \
+                     the trait through it"
+                        .to_string(),
+                )
+            } else if in_std && trait_.name == "Drop" && member == "drop" {
+                Some("a scope's end tears a value down through it".to_string())
+            } else if in_std && trait_.name == "Try" {
+                Some("`!` and `?` reach it".to_string())
+            } else {
+                None
+            };
+            if let Some(how) = how {
+                refused.push((
+                    declaration,
+                    format!(
+                        "`[track_caller]` on `{}`'s `{member}`, which the compiler calls \
+                         implicitly — {how} — with no argument list to pass a location \
+                         through; drop the attribute",
+                        trait_.name
+                    ),
+                ));
+            }
+        }
+    }
+    for (declaration, msg) in refused {
+        let span = program
+            .functions
+            .get(&declaration)
+            .map(|function| function.name_span)
+            .unwrap_or(Span { start: 0, end: 0 });
+        let source = program.source_of(declaration).unwrap_or(SourceId(0));
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
+    }
+}
+
+/// Whether a member declares a `str` return — the render bound's promise.
+fn returns_str(program: &Program, function_id: Id) -> bool {
+    program
+        .functions
+        .get(&function_id)
+        .and_then(|function| function.return_type_id)
+        .and_then(|type_id| program.type_id_to_type_map.get(&type_id))
+        .is_some_and(|type_| {
+            matches!(
+                type_,
+                Type::Struct(id, _)
+                    if program.structs.get(id).is_some_and(|struct_| struct_.name == "str")
+            )
+        })
 }
 
 /// The trait member `name` implements in `implementation`: the declaration in

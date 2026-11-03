@@ -353,6 +353,19 @@ impl<T> Future for Catch<T> {
     }
 }
 
+/// `body` to its end, answering its FAILURE instead of raising it — the seam
+/// `vilan_rt::http::respond` answers a request at before [`raise_failure`] puts
+/// the failure back on its way (M179).
+pub(crate) async fn caught<T>(body: Boxed<T>) -> Result<T, Failure> {
+    Catch::new(body).await
+}
+
+/// Raises `failure` again, location and all — a caught failure continuing as if
+/// it had never been caught.
+pub(crate) fn raise_failure(failure: Failure) -> ! {
+    raise(failure)
+}
+
 /// `__guarded_async` — run `body` to its end, answering `Err(message)` if it
 /// panicked: `guarded`'s async twin, the shape `std::rpc`'s `guarded_async`
 /// names (M165: an `[rpc]` body that throws answers its call with the error).
