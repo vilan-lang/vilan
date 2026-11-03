@@ -13410,7 +13410,9 @@ fn b509_a_through_variant_write_copies_nothing() {
     // std's own steps, through a derived enum's handle and an `Option`'s:
     // the copies a write makes do not include the 10,000-element payload — a
     // deep copy of it alone is over 10,000 `__clone` calls, and 199 more
-    // writes add a handful each (the written leaf), never that.
+    // writes add a handful each (the written leaf, and since B691 the path's
+    // `StoreStep`s and the spine's `Option` slots — an enum with a payload is
+    // a value rule 1 copies: 14 visits a write, measured), never that.
     let through_std = |writes: usize| {
         format!(
             r#"
@@ -13449,7 +13451,7 @@ fn b509_a_through_variant_write_copies_nothing() {
     let once = copies_made(&through_std(1));
     let many = copies_made(&through_std(200));
     assert!(
-        many - once < 199 * 2 * 10,
+        many - once < 199 * 2 * 20,
         "a write through std's variant and Option steps copies the payload: {once} copies for one write, {many} for 200"
     );
 }
@@ -14991,5 +14993,250 @@ fn b647_a_module_binding_handed_by_value_to_a_writer_is_a_copy() {
             "}\n",
         ),
         "1\n2\n0\n1\n",
+    );
+}
+
+// --- B691: an enum with a payload is a value at every seam -------------------
+//
+// The `[index, ..data]` array an enum with a payload lowers to was handed out
+// BY REFERENCE at every rule-1 seam (`is_cloneable_aggregate` answered structs,
+// tuples, lists and maps, not enums), and a `match &mut` / `if &mut .. is`
+// capture writes the payload IN PLACE — so `mut b = a` of an
+// `Option<List<i32>>` showed `b`'s push in `a`. A scalar payload aliased the
+// same way (`n += 5` through `b` moved `a`). One pin per seam; the native half
+// is `native_differential`'s `b691_an_enum_is_a_value_at_every_seam_on_both_backends`.
+
+const B691_PRELUDE: &str = "struct Holder { items: Option<List<i32>> }
+fun show(value: Option<List<i32>>): str {
+\tmatch value {
+\t\tSome(let list) => i\"Some({list.len()})\",
+\t\tNone => \"None\",
+\t}
+}
+fun grow(held: &mut Option<List<i32>>) {
+\tif &mut *held is Some(let list) {
+\t\tlist.push(9);
+\t}
+}
+";
+
+fn b691_runs(main_body: &str, expected: &str) {
+    assert_compiles_and_runs(
+        &format!("{B691_PRELUDE}fun main() {{\n{main_body}\n}}\n"),
+        expected,
+    );
+}
+
+#[test]
+fn b691_a_binding_copies_an_enum() {
+    b691_runs(
+        "\tlet a: Option<List<i32>> = Some([1, 2]);
+\tmut b = a;
+\tgrow(&mut b);
+\tprint(i\"{show(a)} {show(b)}\");",
+        "Some(2) Some(3)\n",
+    );
+}
+
+#[test]
+fn b691_an_assignment_copies_an_enum() {
+    b691_runs(
+        "\tlet a: Option<List<i32>> = Some([1, 2]);
+\tmut b: Option<List<i32>> = None;
+\tb = a;
+\tgrow(&mut b);
+\tprint(i\"{show(a)} {show(b)}\");",
+        "Some(2) Some(3)\n",
+    );
+}
+
+#[test]
+fn b691_a_mut_parameter_copies_an_enum_argument() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B691_PRELUDE}fun grown(mut value: Option<List<i32>>): str {{
+\tgrow(&mut value);
+\tshow(value)
+}}
+fun main() {{
+\tlet c: Option<List<i32>> = Some([1]);
+\tprint(grown(c));
+\tprint(show(c));
+}}
+"
+        ),
+        "Some(2)\nSome(1)\n",
+    );
+}
+
+#[test]
+fn b691_a_struct_literal_field_copies_an_enum() {
+    b691_runs(
+        "\tlet d: Option<List<i32>> = Some([1]);
+\tmut holder = Holder { items = d };
+\tgrow(&mut holder.items);
+\tprint(i\"{show(d)} {show(holder.items)}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_list_element_copies_an_enum() {
+    b691_runs(
+        "\tlet e: Option<List<i32>> = Some([1]);
+\tmut many = [e];
+\tgrow(&mut many[0]);
+\tprint(i\"{show(e)} {show(many[0])}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_read_through_a_view_copies_an_enum() {
+    b691_runs(
+        "\tlet f: Option<List<i32>> = Some([1]);
+\tlet view = &f;
+\tmut g = *view;
+\tgrow(&mut g);
+\tprint(i\"{show(f)} {show(g)}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_return_of_a_view_read_copies_an_enum() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B691_PRELUDE}fun read(view: &Option<List<i32>>): Option<List<i32>> {{ *view }}
+fun main() {{
+\tlet h: Option<List<i32>> = Some([1]);
+\tmut i = read(&h);
+\tgrow(&mut i);
+\tprint(i\"{{show(h)}} {{show(i)}}\");
+}}
+"
+        ),
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_closure_answering_a_view_read_copies_an_enum() {
+    // hash-map-lend.md §8's deviation 1: `peek(key, |slot| *slot)` would have
+    // aliased the table's value; it is a copy now.
+    assert_compiles_and_runs(
+        &format!(
+            "{B691_PRELUDE}fun peek<R>(slot: &Option<List<i32>>, f: |&Option<List<i32>>| R): R {{ f(slot) }}
+fun main() {{
+\tlet j: Option<List<i32>> = Some([1]);
+\tmut k = peek(&j, |slot| *slot);
+\tgrow(&mut k);
+\tprint(i\"{{show(j)}} {{show(k)}}\");
+}}
+"
+        ),
+        "Some(1) Some(2)\n",
+    );
+}
+
+#[test]
+fn b691_a_scalar_payload_is_copied_too() {
+    assert_compiles_and_runs(
+        "enum Shape { Dot, Circle(i32) }
+fun main() {
+\tlet scalar: Option<i32> = Some(1);
+\tmut bumped = scalar;
+\tif &mut bumped is Some(let n) {
+\t\tn += 5;
+\t}
+\tprint(i\"{scalar.unwrap_or(0)} {bumped.unwrap_or(0)}\");
+\tlet circle = Shape::Circle(2);
+\tmut resized = circle;
+\tif &mut resized is Shape::Circle(let radius) {
+\t\tradius = 9;
+\t}
+\tmatch circle {
+\t\tShape::Circle(let radius) => print(radius),
+\t\tShape::Dot => print(0),
+\t}
+}
+",
+        "1 6\n2\n",
+    );
+}
+
+#[test]
+fn b691_to_array_answers_a_deep_copy() {
+    // `unwrap`'s payload copy hid `__list_to_array`'s shallow `slice()`.
+    b691_runs(
+        "\tmut points = [Some([1]), None];
+\tmut array = points.to_array<2>().unwrap();
+\tgrow(&mut array[0]);
+\tmut held = points.to_array<2>();
+\tif &mut held is Some(let inner) {
+\t\tgrow(&mut inner[0]);
+\t}
+\tprint(i\"{show(points[0])} {show(array[0])}\");",
+        "Some(1) Some(2)\n",
+    );
+}
+
+/// The copies B691 must NOT add, counted: a bare payload-less variant is a fresh
+/// value (`mut out = None`), and a tuple of places a pattern takes apart —
+/// `match (self, other)`, a derived `PartialEq` over an enum — copies neither
+/// operand, a 10,000-element payload included.
+#[test]
+fn b691_a_fresh_variant_and_a_matched_tuple_of_places_copy_nothing() {
+    let js = compile(
+        "[derive(PartialEq)]
+enum Payload { Empty, Full(List<i32>) }
+fun main() {
+\tmut big: List<i32> = [];
+\tmut index = 0;
+\tfor index < 10000 {
+\t\tbig.push(index);
+\t\tindex += 1;
+\t}
+\tlet left = Payload::Full(big);
+\tlet right = Payload::Empty;
+\tmut same = 0;
+\tmut round = 0;
+\tfor round < 100 {
+\t\tif left == right {
+\t\t\tsame += 1;
+\t\t}
+\t\tif left == left {
+\t\t\tsame += 1;
+\t\t}
+\t\tmut out: Option<i32> = None;
+\t\tif round > 50 {
+\t\t\tout = Some(round);
+\t\t}
+\t\tsame += out.unwrap_or(0) * 0;
+\t\tround += 1;
+\t}
+\tprint(same);
+}
+",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let counted = js.replace(
+        "function __clone(value) {",
+        "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+    );
+    let counted = format!(
+        "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+    );
+    let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(stdout.starts_with("100\n"), "{stdout}");
+    let copies: usize = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("copies="))
+        .expect("the exit hook prints the count")
+        .parse()
+        .expect("a count");
+    assert!(
+        copies < 100,
+        "a derived `==` over an enum and a fresh `None` copied {copies} values"
     );
 }

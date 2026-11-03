@@ -466,7 +466,7 @@ function unwrap_or(self, fallback) {
 	const $M = self;
 	let $N = null;
 	if ($M[0] === 0) {
-		const x = __clone($M[1]);
+		const x = $M[1];
 		$N = x;
 	} else {
 		$N = __clone(fallback);

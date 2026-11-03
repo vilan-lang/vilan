@@ -313,7 +313,7 @@ function fail(self, reason) {
 	report(self, reason);
 }
 function failed(self) {
-	return self[2];
+	return __clone(self[2]);
 }
 function binary_codec() {
 	return [ () => {
@@ -787,7 +787,7 @@ function fail2(self, reason) {
 	report2(self, reason);
 }
 function failed2(self) {
-	return self[1];
+	return __clone(self[1]);
 }
 function opened_reader(text) {
 	const $q = __try_parse_json(text);

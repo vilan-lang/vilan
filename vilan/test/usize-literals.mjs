@@ -77,7 +77,7 @@ function unwrap_or(self, fallback) {
 	const $g = self;
 	let $h = null;
 	if ($g[0] === 0) {
-		const x = __clone($g[1]);
+		const x = $g[1];
 		$h = x;
 	} else {
 		$h = __clone(fallback);

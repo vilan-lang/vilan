@@ -229,7 +229,7 @@ function release_under(handle, ambient) {
 	if ($F[0] === 0) {
 		const release = $F[1];
 		handle[3].v = [ 1 ];
-		releasing_turns.v.push(ambient);
+		releasing_turns.v.push(__clone(ambient));
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
@@ -269,7 +269,7 @@ function advance(self, carried) {
 	let $ah = null;
 	if (!(is_disposed(self))) {
 		const held = self[0].v;
-		self[0].v = [ self[1] + 1, no_cleanups, false, carried ];
+		self[0].v = [ self[1] + 1, no_cleanups, false, __clone(carried) ];
 		const $Y = held[3];
 		let $Z = null;
 		if ($Y[0] === 0) {

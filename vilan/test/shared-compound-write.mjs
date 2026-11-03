@@ -304,7 +304,7 @@ function release_under(handle, ambient) {
 	if ($U[0] === 0) {
 		const release = $U[1];
 		handle[3].v = [ 1 ];
-		releasing_turns.v.push(ambient);
+		releasing_turns.v.push(__clone(ambient));
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
@@ -376,7 +376,7 @@ function advance(self, carried) {
 	let $A = null;
 	if (!(is_disposed(self))) {
 		const held = self[0].v;
-		self[0].v = [ self[1] + 1, no_cleanups, false, carried ];
+		self[0].v = [ self[1] + 1, no_cleanups, false, __clone(carried) ];
 		const $r = held[3];
 		let $s = null;
 		if ($r[0] === 0) {
@@ -435,7 +435,7 @@ function place_subscription(subscription, site) {
 	return subscription;
 }
 function also_releasing(handle, release) {
-	const previous = handle[3].v;
+	const previous = __clone(handle[3].v);
 	handle[3].v = [ 0, () => {
 		release();
 		const $I = previous;

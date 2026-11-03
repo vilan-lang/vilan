@@ -10894,6 +10894,28 @@ fn b690_an_operator_reads_a_module_binding_on_both_backends() {
     );
 }
 
+/// B691: an enum with a payload is a value at every seam — a binding, a `mut`
+/// parameter, a struct literal's field, a list element, a `*view` read, a
+/// return of one, a closure answering `*slot`, a scalar payload, a user enum,
+/// and `to_array`'s answer. JS shared the `[index, ..data]` array at each, so a
+/// write through one copy's payload showed in the other; natively each was
+/// its own value. `inference::borrows`' `b691_*` pins hold the JS values per
+/// seam.
+#[test]
+fn b691_an_enum_is_a_value_at_every_seam_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_enum_value_seams.vl"),
+        include_str!("native/enum_value_seams.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_enum_value_seams.vl"),
+        Verdict::Identical,
+        "an enum must copy at every value seam on both backends"
+    );
+}
+
 /// B693 (store-assume-keeper.md §4.5): an assumed handle's fallback is kept by
 /// a feed on its variant's flag and read in place on both backends — every way
 /// a variant ends (the enum's own handle, `Option` → `None`, a key removed by

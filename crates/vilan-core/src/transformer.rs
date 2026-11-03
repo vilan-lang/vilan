@@ -2833,10 +2833,14 @@ fn helper_source(name: &str) -> &'static str {
             "function __list_sort_by(list, compare) {\n\treturn list.slice().sort(compare);\n}"
         }
         // `List.to_array<const N>(self): Option<[T; N]>` (A172) — `Some` of a
-        // copy when the length is `N`, `None` otherwise. A copy for the reason
-        // `sort_by`'s is one: `self` is by value and the array grows apart.
+        // copy when the length is `N`, `None` otherwise: the array and the list
+        // grow apart. A DEEP copy, because `self` is a loan (bare, not `own`,
+        // so the caller hands the list itself) and the answer is a fresh value
+        // nothing else copies: a shallow `slice()` shared every aggregate
+        // element with the list, which `unwrap`'s payload copy hid until B691
+        // let the caller's copy stand in for it.
         "__list_to_array" => {
-            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.slice() ] : [ 1 ];\n}"
+            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.map(__clone) ] : [ 1 ];\n}"
         }
         // `Option.take(&mut self): Option<T>` — snapshot the slot (a structural
         // copy, not a deep clone: the payload MOVES out), then rewrite it to `None`
@@ -11158,6 +11162,7 @@ impl<'src> Transformer<'src> {
             // substitution reached is an analyzer bug, not a program).
             Intrinsic::ListToArray => {
                 self.used_helpers.insert("__list_to_array");
+                self.used_helpers.insert("__clone");
                 let length = call_expr_id
                     .and_then(|id| self.list_to_array_length(id))
                     .expect("internal: `to_array`'s `N` is a length under every instance");

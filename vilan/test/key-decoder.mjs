@@ -33,35 +33,35 @@ function debug(self) {
 	return "\"" + escaped + "\"";
 }
 function key(self) {
-	const $K = self[0];
-	let $L = null;
-	if ($K[0] === 0) {
-		const scalar = $K[1];
-		let $M = null;
-		if (self[1]) {
-			$M = [ 1, scalar ];
-		} else if (self[2]) {
-			$M = [ 2, scalar ];
-		} else {
-			$M = [ 0, scalar ];
-		}
-		$L = $M;
-	} else if ($K[0] === 4) {
+	const $L = self[0];
+	let $M = null;
+	if ($L[0] === 0) {
+		const scalar = $L[1];
 		let $N = null;
-		if (self[3]) {
-			$N = [ 5 ];
+		if (self[1]) {
+			$N = [ 1, scalar ];
+		} else if (self[2]) {
+			$N = [ 2, scalar ];
 		} else {
-			$N = [ 4 ];
+			$N = [ 0, scalar ];
 		}
-		$L = $N;
+		$M = $N;
+	} else if ($L[0] === 4) {
+		let $O = null;
+		if (self[3]) {
+			$O = [ 5 ];
+		} else {
+			$O = [ 4 ];
+		}
+		$M = $O;
 	} else {
-		const other = $K;
-		$L = other;
+		const other = __clone($L);
+		$M = other;
 	}
-	return $L;
+	return $M;
 }
 function plain(key2) {
-	return [ key2, false, false, false ];
+	return [ __clone(key2), false, false, false ];
 }
 function new2() {
 	return [ new Uint8Array(0), 0, false, false, false ];
@@ -79,15 +79,15 @@ function finish(self) {
 	self[4] = true;
 }
 function next(self) {
-	const $G = step(self, false);
-	let $H = null;
-	if ($G[0] === 0) {
-		const press = $G[1];
-		$H = [ 0, press ];
+	const $H = step(self, false);
+	let $I = null;
+	if ($H[0] === 0) {
+		const press = $H[1];
+		$I = [ 0, press ];
 	} else {
-		$H = [ 1 ];
+		$I = [ 1 ];
 	}
-	return $H;
+	return $I;
 }
 function step(self, terminal) {
 	const resolving = self[3] || self[4];
@@ -109,62 +109,62 @@ function step(self, terminal) {
 			}
 			return $c;
 		}
-		const $D = decode_step(self[0], self[1], resolving, self[4]);
-		let $E = null;
-		if ($D[0] === 0) {
-			const press = $D[1];
-			const used = $D[2];
+		const $E = decode_step(self[0], self[1], resolving, self[4]);
+		let $F = null;
+		if ($E[0] === 0) {
+			const press = $E[1];
+			const used = $E[2];
 			self[2] = self[0].at(self[1]) === 13;
 			self[1] = self[1] + used;
 			return [ 0, press ];
-			$E = undefined;
-		} else if ($D[0] === 1) {
-			const used2 = $D[1];
-			$E = self[1] = self[1] + used2;
-		} else if ($D[0] === 2) {
-			let $F = null;
+			$F = undefined;
+		} else if ($E[0] === 1) {
+			const used2 = $E[1];
+			$F = self[1] = self[1] + used2;
+		} else if ($E[0] === 2) {
+			let $G = null;
 			if (terminal) {
-				$F = 50;
+				$G = 50;
 			} else {
-				$F = -(1);
+				$G = -(1);
 			}
-			return [ 2, $F ];
+			return [ 2, $G ];
 		} else {
 			return [ 2, -(1) ];
 		}
-		$E;
+		$F;
 	}
 }
 function decode_step(bytes2, at, resolving, ended) {
 	const lead = bytes2.at(at);
-	let $z = null;
+	let $A = null;
 	if (lead === 27) {
-		$z = decode_escape(bytes2, at, resolving, ended);
+		$A = decode_escape(bytes2, at, resolving, ended);
 	} else if (lead >= 128) {
-		$z = decode_scalar(bytes2, at, ended);
+		$A = decode_scalar(bytes2, at, ended);
 	} else {
-		$z = [ 0, control_or_char(lead), 1 ];
+		$A = [ 0, control_or_char(lead), 1 ];
 	}
-	return $z;
+	return $A;
 }
 function control_or_char(byte) {
-	let $C = null;
+	let $D = null;
 	if (byte === 13 || byte === 10) {
-		$C = plain([ 3 ]);
+		$D = plain([ 3 ]);
 	} else if (byte === 9) {
-		$C = plain([ 4 ]);
+		$D = plain([ 4 ]);
 	} else if (byte === 127 || byte === 8) {
-		$C = plain([ 6 ]);
+		$D = plain([ 6 ]);
 	} else if (byte === 0) {
-		$C = [ [ 0, " " ], true, false, false ];
+		$D = [ [ 0, " " ], true, false, false ];
 	} else if (byte < 27) {
-		$C = [ [ 0, ascii(byte + 96) ], true, false, false ];
+		$D = [ [ 0, ascii(byte + 96) ], true, false, false ];
 	} else if (byte < 32) {
-		$C = [ [ 0, ascii(byte + 64) ], true, false, false ];
+		$D = [ [ 0, ascii(byte + 64) ], true, false, false ];
 	} else {
-		$C = [ [ 0, ascii(byte) ], false, false, byte >= 65 && byte <= 90 ];
+		$D = [ [ 0, ascii(byte) ], false, false, byte >= 65 && byte <= 90 ];
 	}
-	return $C;
+	return $D;
 }
 function ascii(code) {
 	const byte = new Uint8Array(1);
@@ -173,17 +173,17 @@ function ascii(code) {
 }
 function decode_scalar(bytes2, at, ended) {
 	const lead = bytes2.at(at);
-	let $A = null;
+	let $B = null;
 	if (lead >= 194 && lead <= 223) {
-		$A = 2;
+		$B = 2;
 	} else if (lead >= 224 && lead <= 239) {
-		$A = 3;
+		$B = 3;
 	} else if (lead >= 240 && lead <= 244) {
-		$A = 4;
+		$B = 4;
 	} else {
-		$A = 0;
+		$B = 0;
 	}
-	const width = $A;
+	const width = $B;
 	if (width === 0) {
 		return [ 1, 1 ];
 	}
@@ -191,13 +191,13 @@ function decode_scalar(bytes2, at, ended) {
 	let index = 1;
 	while (index < width) {
 		if (index >= left) {
-			let $B = null;
+			let $C = null;
 			if (ended) {
-				$B = [ 1, left ];
+				$C = [ 1, left ];
 			} else {
-				$B = [ 3 ];
+				$C = [ 3 ];
 			}
-			return $B;
+			return $C;
 		}
 		const continuation = bytes2.at(at + index);
 		if (continuation < 128 || continuation > 191) {
@@ -220,73 +220,73 @@ function decode_escape(bytes2, at, resolving, ended) {
 		return $d;
 	}
 	const second = bytes2.at(at + 1);
-	let $t = null;
+	let $u = null;
 	if (second === 91) {
-		$t = decode_csi(bytes2, at, resolving, ended);
+		$u = decode_csi(bytes2, at, resolving, ended);
 	} else if (second === 79) {
-		$t = decode_ss3(bytes2, at, resolving);
+		$u = decode_ss3(bytes2, at, resolving);
 	} else if (second === 27) {
-		$t = [ 0, plain([ 9 ]), 1 ];
+		$u = [ 0, plain([ 9 ]), 1 ];
 	} else {
-		const $x = decode_step(bytes2, at + 1, resolving, ended);
-		let $y = null;
-		if ($x[0] === 0) {
-			const press = $x[1];
-			const used = $x[2];
-			$y = [ 0, [ press[0], press[1], true, press[3] ], used + 1 ];
-		} else if ($x[0] === 1) {
-			const used2 = $x[1];
-			$y = [ 1, used2 + 1 ];
-		} else if ($x[0] === 2) {
-			$y = [ 2 ];
+		const $y = decode_step(bytes2, at + 1, resolving, ended);
+		let $z = null;
+		if ($y[0] === 0) {
+			const press = $y[1];
+			const used = $y[2];
+			$z = [ 0, [ __clone(press[0]), press[1], true, press[3] ], used + 1 ];
+		} else if ($y[0] === 1) {
+			const used2 = $y[1];
+			$z = [ 1, used2 + 1 ];
+		} else if ($y[0] === 2) {
+			$z = [ 2 ];
 		} else {
-			$y = [ 3 ];
+			$z = [ 3 ];
 		}
-		$t = $y;
+		$u = $z;
 	}
-	return $t;
+	return $u;
 }
 function decode_ss3(bytes2, at, resolving) {
 	if (bytes2.length - at < 3) {
-		let $u = null;
+		let $v = null;
 		if (resolving) {
-			$u = [ 0, [ [ 0, "O" ], false, true, true ], 2 ];
+			$v = [ 0, [ [ 0, "O" ], false, true, true ], 2 ];
 		} else {
-			$u = [ 2 ];
+			$v = [ 2 ];
 		}
-		return $u;
+		return $v;
 	}
 	const final = bytes2.at(at + 2);
-	const $v = final_key(final);
-	let $w = null;
-	if ($v[0] === 0) {
-		const key2 = $v[1];
-		$w = [ 0, plain(key2), 3 ];
+	const $w = final_key(final);
+	let $x = null;
+	if ($w[0] === 0) {
+		const key2 = $w[1];
+		$x = [ 0, plain(key2), 3 ];
 	} else {
-		$w = [ 1, 3 ];
+		$x = [ 1, 3 ];
 	}
-	return $w;
+	return $x;
 }
 function final_key(final) {
-	let $q = null;
+	let $r = null;
 	if (final === 65) {
-		$q = [ 0, [ 10 ] ];
+		$r = [ 0, [ 10 ] ];
 	} else if (final === 66) {
-		$q = [ 0, [ 11 ] ];
+		$r = [ 0, [ 11 ] ];
 	} else if (final === 67) {
-		$q = [ 0, [ 13 ] ];
+		$r = [ 0, [ 13 ] ];
 	} else if (final === 68) {
-		$q = [ 0, [ 12 ] ];
+		$r = [ 0, [ 12 ] ];
 	} else if (final === 72) {
-		$q = [ 0, [ 14 ] ];
+		$r = [ 0, [ 14 ] ];
 	} else if (final === 70) {
-		$q = [ 0, [ 15 ] ];
+		$r = [ 0, [ 15 ] ];
 	} else if (final >= 80 && final <= 83) {
-		$q = [ 0, [ 18, final - 79 ] ];
+		$r = [ 0, [ 18, final - 79 ] ];
 	} else {
-		$q = [ 1 ];
+		$r = [ 1 ];
 	}
-	return $q;
+	return $r;
 }
 function tilde_key(number) {
 	let $j = null;
@@ -398,15 +398,15 @@ function decode_csi(bytes2, at, resolving, ended) {
 	if (final === 90) {
 		return [ 0, [ [ 4 ], false, false, true ], used ];
 	}
-	const $r = final_key(final);
-	let $s = null;
-	if ($r[0] === 0) {
-		const key3 = $r[1];
-		$s = [ 0, modified(key3, second), used ];
+	const $s = final_key(final);
+	let $t = null;
+	if ($s[0] === 0) {
+		const key3 = $s[1];
+		$t = [ 0, modified(key3, second), used ];
 	} else {
-		$s = [ 1, used ];
+		$t = [ 1, used ];
 	}
-	return $s;
+	return $t;
 }
 function modified(key2, parameter) {
 	let $m = null;
@@ -416,10 +416,11 @@ function modified(key2, parameter) {
 		$m = 0;
 	}
 	const bits = $m;
-	const $n = bits % 2 === 1;
-	const $o = Math.trunc(bits / 2) % 2 === 1 || Math.trunc(bits / 8) % 2 === 1;
-	const $p = Math.trunc(bits / 4) % 2 === 1;
-	return [ key2, $p, $o, $n ];
+	const $n = __clone(key2);
+	const $o = bits % 2 === 1;
+	const $p = Math.trunc(bits / 2) % 2 === 1 || Math.trunc(bits / 8) % 2 === 1;
+	const $q = Math.trunc(bits / 4) % 2 === 1;
+	return [ $n, $q, $p, $o ];
 }
 function decode_paste(bytes2, at, from, ended) {
 	const length = bytes2.length;
@@ -440,55 +441,55 @@ function decode_paste(bytes2, at, from, ended) {
 	return $i;
 }
 function debug2(self) {
-	const $O = self;
-	let $P = null;
-	if ($O[0] === 0) {
-		const p0 = $O[1];
-		$P = "Key::Char(" + debug(p0) + ")";
-	} else if ($O[0] === 1) {
-		const p02 = $O[1];
-		$P = "Key::Ctrl(" + debug(p02) + ")";
-	} else if ($O[0] === 2) {
-		const p03 = $O[1];
-		$P = "Key::Alt(" + debug(p03) + ")";
-	} else if ($O[0] === 3) {
-		$P = "Key::Enter";
-	} else if ($O[0] === 4) {
-		$P = "Key::Tab";
-	} else if ($O[0] === 5) {
-		$P = "Key::BackTab";
-	} else if ($O[0] === 6) {
-		$P = "Key::Backspace";
-	} else if ($O[0] === 7) {
-		$P = "Key::Delete";
-	} else if ($O[0] === 8) {
-		$P = "Key::Insert";
-	} else if ($O[0] === 9) {
-		$P = "Key::Escape";
-	} else if ($O[0] === 10) {
-		$P = "Key::Up";
-	} else if ($O[0] === 11) {
-		$P = "Key::Down";
-	} else if ($O[0] === 12) {
-		$P = "Key::Left";
-	} else if ($O[0] === 13) {
-		$P = "Key::Right";
-	} else if ($O[0] === 14) {
-		$P = "Key::Home";
-	} else if ($O[0] === 15) {
-		$P = "Key::End";
-	} else if ($O[0] === 16) {
-		$P = "Key::PageUp";
-	} else if ($O[0] === 17) {
-		$P = "Key::PageDown";
-	} else if ($O[0] === 18) {
-		const p04 = $O[1];
-		$P = "Key::F(" + JSON.stringify(p04) + ")";
+	const $P = self;
+	let $Q = null;
+	if ($P[0] === 0) {
+		const p0 = $P[1];
+		$Q = "Key::Char(" + debug(p0) + ")";
+	} else if ($P[0] === 1) {
+		const p02 = $P[1];
+		$Q = "Key::Ctrl(" + debug(p02) + ")";
+	} else if ($P[0] === 2) {
+		const p03 = $P[1];
+		$Q = "Key::Alt(" + debug(p03) + ")";
+	} else if ($P[0] === 3) {
+		$Q = "Key::Enter";
+	} else if ($P[0] === 4) {
+		$Q = "Key::Tab";
+	} else if ($P[0] === 5) {
+		$Q = "Key::BackTab";
+	} else if ($P[0] === 6) {
+		$Q = "Key::Backspace";
+	} else if ($P[0] === 7) {
+		$Q = "Key::Delete";
+	} else if ($P[0] === 8) {
+		$Q = "Key::Insert";
+	} else if ($P[0] === 9) {
+		$Q = "Key::Escape";
+	} else if ($P[0] === 10) {
+		$Q = "Key::Up";
+	} else if ($P[0] === 11) {
+		$Q = "Key::Down";
+	} else if ($P[0] === 12) {
+		$Q = "Key::Left";
+	} else if ($P[0] === 13) {
+		$Q = "Key::Right";
+	} else if ($P[0] === 14) {
+		$Q = "Key::Home";
+	} else if ($P[0] === 15) {
+		$Q = "Key::End";
+	} else if ($P[0] === 16) {
+		$Q = "Key::PageUp";
+	} else if ($P[0] === 17) {
+		$Q = "Key::PageDown";
+	} else if ($P[0] === 18) {
+		const p04 = $P[1];
+		$Q = "Key::F(" + JSON.stringify(p04) + ")";
 	} else {
-		const p05 = $O[1];
-		$P = "Key::Paste(" + debug(p05) + ")";
+		const p05 = $P[1];
+		$Q = "Key::Paste(" + debug(p05) + ")";
 	}
-	return $P;
+	return $Q;
 }
 function is_empty(self) {
 	return self.length === 0;
@@ -521,15 +522,15 @@ function describe(press) {
 }
 function drain(decoder, chunk) {
 	while (true) {
-		const $I = next(decoder);
-		let $J = null;
-		if ($I[0] === 0) {
-			const press = $I[1];
-			$J = console.log("  " + chunk + ": " + describe(press));
+		const $J = next(decoder);
+		let $K = null;
+		if ($J[0] === 0) {
+			const press = $J[1];
+			$K = console.log("  " + chunk + ": " + describe(press));
 		} else {
 			break;
 		}
-		$J;
+		$K;
 	}
 }
 function decode(label, chunks) {
@@ -548,7 +549,7 @@ function unwrap(self, caller) {
 	const $a = self;
 	let $b = null;
 	if ($a[0] === 0) {
-		const x = __clone($a[1]);
+		const x = $a[1];
 		$b = x;
 	} else {
 		$b = (() => {
