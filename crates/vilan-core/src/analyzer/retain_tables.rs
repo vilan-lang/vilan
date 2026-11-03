@@ -32,14 +32,22 @@
 //! SEEDED analysis (the editor's), so the world's records carry the rows
 //! before the keystroke that first needs them; a cold `vilan check` that asks
 //! nothing walks nothing.
+//!
+//! One part of the lane is never filed and so never restored: the bodies
+//! `[derive(..)]` synthesizes (`DERIVED_SOURCE`, no module's), ~9,000 rows of
+//! kolt's on every keystroke. Their rows matter only to a summary that
+//! reaches a derived function — a derived body names its own parameters
+//! alone — so they are walked on the first such reach, never eagerly
+//! ([`RetainIndex::derived_pending`]).
 
 use std::collections::BTreeSet;
 
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 
+use super::live_ranges::LiveRanges;
 use super::row_families::RowFamily;
-use super::{Analyzer, Expr};
+use super::{Analyzer, DERIVED_SOURCE, Expr};
 
 /// One region's (or one analysis's live) contributions to C16's summary.
 /// Every row's FIRST id is the region's own expression the row was read off
@@ -134,6 +142,23 @@ pub(super) struct RetainIndex {
     kept: HashMap<Id, Vec<u32>>,
     /// Per function, `(call, argument position, parameter position)`.
     handed: HashMap<Id, Vec<(Id, u32, u32)>>,
+    /// The derived bodies' part of the live lane, not yet walked: walked
+    /// (and folded in) the first time a summary reaches a derived function.
+    derived_pending: Option<LiveRanges>,
+}
+
+impl RetainIndex {
+    fn absorb(&mut self, rows: &RetainRows) {
+        for (_, function, position) in &rows.kept {
+            self.kept.entry(*function).or_default().push(*position);
+        }
+        for (call, argument, function, position) in &rows.handed {
+            self.handed
+                .entry(*function)
+                .or_default()
+                .push((*call, *argument, *position));
+        }
+    }
 }
 
 /// What a call does with one argument, read from the call at the fold.
@@ -150,11 +175,27 @@ enum HandedTo {
 }
 
 impl<'src> Analyzer<'src> {
-    /// The live lane's rows: every return site, keeping position and call
+    /// The family's live lane split in two: the modules' and items' part
+    /// (filed with the record) and the derived bodies' part (never filed).
+    pub(super) fn retain_lanes(&self) -> (LiveRanges, LiveRanges) {
+        let mut derived: Vec<(u32, u32)> = self
+            .source_ranges
+            .iter()
+            .filter(|range| range.source == DERIVED_SOURCE)
+            .map(|range| (range.start, range.end))
+            .collect();
+        derived.sort_unstable();
+        let live = self.live_families.of(RowFamily::Retain);
+        (
+            live.split_by(&derived, false),
+            live.split_by(&derived, true),
+        )
+    }
+
+    /// The rows of `live`: every return site, keeping position and call
     /// argument of a region whose rows are not restored, whose place roots at
     /// a parameter.
-    pub(super) fn live_retain_rows(&self) -> RetainRows {
-        let live = self.live_families.of(RowFamily::Retain);
+    pub(super) fn live_retain_rows(&self, live: &LiveRanges) -> RetainRows {
         let mut rows = RetainRows::default();
         for (_, value_id) in &self.return_sites {
             if live.covers(value_id.0)
@@ -203,32 +244,20 @@ impl<'src> Analyzer<'src> {
         rows
     }
 
-    /// The fold of the restored rows and `live`. Under the plant
-    /// (`Plant::RetainRowsUnrestored`) the restored rows are dropped while
-    /// their regions stay out of the live lane — a summary that reads a
-    /// restored region's body then answers without it.
-    pub(super) fn fold_retain(&self, live: &RetainRows) -> RetainIndex {
-        let mut index = RetainIndex::default();
-        let restored_dropped =
-            crate::incremental::planted(crate::incremental::Plant::RetainRowsUnrestored);
-        let restored = &self.restored_tables.retain;
-        let all: &[&RetainRows] = if restored_dropped {
-            &[live]
-        } else {
-            &[restored, live]
+    /// The fold of the restored rows and `live`, with the derived lane left
+    /// to walk on a reach. Under the plant (`Plant::RetainRowsUnrestored`)
+    /// the restored rows are dropped while their regions stay out of the
+    /// live lane — a summary that reads a restored region's body then
+    /// answers without it.
+    pub(super) fn fold_retain(&self, live: &RetainRows, derived: LiveRanges) -> RetainIndex {
+        let mut index = RetainIndex {
+            derived_pending: Some(derived),
+            ..RetainIndex::default()
         };
-        for rows in all {
-            for (_, function, position) in &rows.kept {
-                index.kept.entry(*function).or_default().push(*position);
-            }
-            for (call, argument, function, position) in &rows.handed {
-                index
-                    .handed
-                    .entry(*function)
-                    .or_default()
-                    .push((*call, *argument, *position));
-            }
+        if !crate::incremental::planted(crate::incremental::Plant::RetainRowsUnrestored) {
+            index.absorb(&self.restored_tables.retain);
         }
+        index.absorb(live);
         index
     }
 
@@ -264,7 +293,7 @@ impl<'src> Analyzer<'src> {
     /// it), so all of them go into `memo` and a later ask of any is a lookup.
     pub(super) fn retaining_summary(
         &self,
-        index: &RetainIndex,
+        index: &mut RetainIndex,
         memo: &mut HashMap<Id, BTreeSet<u32>>,
         callee: Id,
     ) -> BTreeSet<u32> {
@@ -283,6 +312,16 @@ impl<'src> Analyzer<'src> {
         while next < members.len() {
             let function = members[next];
             next += 1;
+            if self.source_of_id(function) == Some(DERIVED_SOURCE)
+                && let Some(derived) = index.derived_pending.take()
+            {
+                let rows = self.live_retain_rows(&derived);
+                if !crate::macros::in_macro_world() {
+                    let walked = rows.len() as u64;
+                    crate::incremental::update_census(|census| census.retain_rows_live += walked);
+                }
+                index.absorb(&rows);
+            }
             let summary = summaries.entry(function).or_default();
             for position in index.kept.get(&function).into_iter().flatten() {
                 if summary.insert(*position) {

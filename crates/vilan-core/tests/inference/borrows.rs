@@ -7557,6 +7557,30 @@ fn the_retaining_summary_is_computed_only_for_a_call_that_hands_on_a_capturing_c
 }
 
 #[test]
+fn a_summary_that_reaches_a_derived_function_reads_its_synthesized_body() {
+    // M188: a `[derive(..)]`-synthesized body is no module's, so its rows are
+    // never filed and are walked only when a summary reaches a derived
+    // function. `compare` hands its `Point` parameters to the derived `eq`,
+    // so asking `compare` (for the closure at position 0) reaches `eq`'s
+    // body; the debug build checks the answer against the whole-program
+    // rounds, and the closure, at a position nothing keeps, is admitted.
+    let (summaries, errors) = retaining_summaries_of(
+        r#"
+        import std::io::print;
+        [derive(PartialEq)]
+        struct Point { x: i32, y: i32 }
+        fun compare(g: || i32, a: Point, b: Point): bool { a.eq(b) && g() > 0 }
+        fun read(v: &mut i32): bool {
+            compare(|| *v, Point { x = 1, y = 2 }, Point { x = 1, y = 2 })
+        }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(summaries, 2, "`compare` and the derived `eq` it reaches");
+}
+
+#[test]
 fn the_retaining_summary_closes_over_the_asked_callees_reach_only() {
     // M188 (Order 56): the summary of an asked callee reads the rows of the
     // bodies it reaches - `pass` hands its parameter to `keep`, so both are

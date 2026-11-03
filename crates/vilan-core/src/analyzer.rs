@@ -29670,8 +29670,9 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|function| function.has_body);
                     let keeps = if bodied {
                         let (index, memo) = retain.get_or_insert_with(|| {
-                            let live = self.live_retain_rows();
-                            let index = self.fold_retain(&live);
+                            let (lane, derived) = self.retain_lanes();
+                            let live = self.live_retain_rows(&lane);
+                            let index = self.fold_retain(&live, derived);
                             retain_live = Some(live);
                             (index, HashMap::default())
                         });
@@ -29792,7 +29793,8 @@ impl<'src> Analyzer<'src> {
         // so the world's records carry the family before the keystroke that
         // first needs it; an unseeded one that asked nothing walks nothing.
         if retain_live.is_none() && self.retain_rows_eager {
-            retain_live = Some(self.live_retain_rows());
+            let (lane, _) = self.retain_lanes();
+            retain_live = Some(self.live_retain_rows(&lane));
         }
         if let Some(live) = retain_live {
             if !crate::macros::in_macro_world() {
