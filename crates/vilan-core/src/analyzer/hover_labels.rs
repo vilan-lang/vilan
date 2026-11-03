@@ -950,9 +950,9 @@ impl<'src> Analyzer<'src> {
     /// read off the payload argument written in the slot the variant declares
     /// AS that parameter: the argument's recorded type, or a literal's own
     /// (`"six"` is `str`, `5` an `i32` - nothing expects otherwise, the
-    /// parameter being open - `1.5` an `f64`, a suffix its type). Anything else
-    /// - a payload slot that only CONTAINS an open parameter, an argument with
-    /// no type to read - leaves the label untabled: a hole says nothing.
+    /// parameter being open - `1.5` an `f64`, a suffix its type). Anything
+    /// else (a payload slot that only CONTAINS an open parameter, an argument
+    /// with no type to read) leaves the label untabled: a hole says nothing.
     fn receiver_payload_label(
         &self,
         enum_id: Id,
