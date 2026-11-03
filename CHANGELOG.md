@@ -25,6 +25,10 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**N192: a native server reads past a request's head by at most one slice before a handler asks for the body — a fast client's 4 MiB chunked upload already on the wire was read whole while the head was parsed and fed to the decoder at the handler's first `next`, so the cap refused it with `413` before the handler took the ten bytes it wanted (Linux's loopback buffers hold megabytes; Windows never handed that much in one turn).** The rest of a body nobody asked for stays in the kernel, as M164 says it does, and a stream's reads pull it a slice at a time. Pins: `request_body::m176_a_body_read_as_a_stream_on_both_backends`'s `an unfinished stream is discarded as an unread body` case — red three times on CI's Linux shard at the v0.54.0 cut, green on Windows and locally. Tracker N192.
+---
+
 <!-- family: tooling -->
 **N193: `scripts/cut-release.sh` rebuilds `std::image`'s committed wasm blob after the version bump and stages it in the release commit — the blob carries the crate version, so a bump without a rebuild tagged a tree whose blob was not what the tree builds, and CI's `wasm` leg (M190's byte check) went red on the v0.54.0 release commit itself.** `release_files` names the blob beside the manifests it already stages; `build-image-wasm.sh` runs between the bump and the perf report. Pin: `release_scripts::the_release_commit_stages_every_workspace_members_manifest` holds the staged set to the workspace. Tracker N193.
 ---

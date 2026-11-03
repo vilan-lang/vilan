@@ -1822,6 +1822,16 @@ impl Server {
         let (read, hung_up) = if connection.wants_bytes() {
             let budget = match connection.stage.get() {
                 Stage::Dispatched | Stage::Closing => BODY_SLICE,
+                // A head is at most `MAX_HEAD`, and what a fast client has
+                // already sent after it is a body nobody has asked for yet:
+                // read past the head by at most one slice, and leave the rest
+                // in the kernel for the reads a handler makes (N192: with no
+                // bound, a 4 MiB chunked upload already on the wire was fed
+                // whole to the decoder at the handler's first `next`, and the
+                // cap refused it with `413` before the handler took its ten
+                // bytes - on Linux, whose loopback buffers hold megabytes;
+                // Windows never handed that much in one turn).
+                Stage::Reading => MAX_HEAD + BODY_SLICE,
                 _ => usize::MAX,
             };
             connection.read_available(budget)
