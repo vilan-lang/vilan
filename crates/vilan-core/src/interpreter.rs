@@ -2074,16 +2074,17 @@ impl<'a> Interpreter<'a> {
                     None => Ok(option_none()),
                 }
             }
-            // `List.to_array<const N>()` (A172) — `Some` of a shallow copy at
-            // the length, `None` otherwise: the JS helper's
-            // `list.length === length ? [ 0, list.slice() ] : [ 1 ]`.
+            // `List.to_array<const N>()` (A172) — `Some` of a DEEP copy at the
+            // length, `None` otherwise: the JS helper's `list.length === length
+            // ? [ 0, list.map(__clone) ] : [ 1 ]` (B691: the shallow copy shared
+            // every aggregate element with the list).
             "__list_to_array" => {
                 let list = expect_array(&take(0))?;
                 let length = expect_number(&take(1))?;
                 let list = list.borrow();
                 if list.len() as f64 == length {
                     Ok(option_some(Value::Array(Rc::new(RefCell::new(
-                        list.clone(),
+                        list.iter().map(deep_clone).collect(),
                     )))))
                 } else {
                     Ok(option_none())
@@ -2534,6 +2535,28 @@ impl<'a> Interpreter<'a> {
             // range outside `0 <= start <= end <= len` is a panic (`Thrown`),
             // so a const-time violation fails the build with the same message a
             // runtime one prints.
+            // B695: an empty pattern cuts between CHARACTERS, as the emitted
+            // `__str_split` / `__str_replace` helpers do.
+            "__str_split" => {
+                let text = expect_str(&take(0))?;
+                let separator = expect_str(&take(1))?;
+                let parts: Vec<Value> = if separator.is_empty() {
+                    text.chars()
+                        .map(|character| Value::Str(Rc::from(character.to_string().as_str())))
+                        .collect()
+                } else {
+                    text.split(&*separator)
+                        .map(|part| Value::Str(Rc::from(part)))
+                        .collect()
+                };
+                Ok(Value::Array(Rc::new(RefCell::new(parts))))
+            }
+            "__str_replace" => {
+                let text = expect_str(&take(0))?;
+                let from = expect_str(&take(1))?;
+                let to = expect_str(&take(2))?;
+                Ok(Value::Str(Rc::from(text.replace(&*from, &to).as_str())))
+            }
             "__substring" => {
                 let text = expect_str(&take(0))?;
                 let start = expect_number(&take(1))?;
@@ -3672,8 +3695,15 @@ fn substring_checked(text: &str, start: f64, end: f64) -> Result<String, Failure
     let length = units.len();
     let whole = start.fract() == 0.0 && end.fract() == 0.0;
     if whole && 0.0 <= start && start <= end && end <= length as f64 {
+        // B695: a bound between a pair's halves moves back to its start.
+        let floor = |at: usize| {
+            let inside_a_pair = at > 0
+                && units.get(at).is_some_and(|unit| (unit & 0xFC00) == 0xDC00)
+                && (units[at - 1] & 0xFC00) == 0xD800;
+            if inside_a_pair { at - 1 } else { at }
+        };
         return Ok(String::from_utf16_lossy(
-            &units[start as usize..end as usize],
+            &units[floor(start as usize)..floor(end as usize)],
         ));
     }
     Err(Failure::new(

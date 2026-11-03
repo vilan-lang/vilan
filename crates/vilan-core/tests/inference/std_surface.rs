@@ -9221,3 +9221,28 @@ fn b695_a_literal_pattern_keeps_the_host_method() {
         "{js}"
     );
 }
+
+/// The same answers at BUILD time: the const interpreter hosts the helpers the
+/// emitter calls (`__str_split`, `__str_replace`, the floored `__substring`) —
+/// kolt's dictionary splits at const time, and its build failed with "unknown
+/// host call `__str_split`" before the interpreter knew the helper.
+#[test]
+fn b695_the_const_interpreter_answers_the_same() {
+    assert_compiles_and_runs(
+        "const let pieces = \"a😀b\".split(\"\");
+const let words = \"a b\".split(\" \");
+const let cut = \"😀\".substring(0, 1);
+const let rest = \"😀\".substring(1, 2);
+const let empty = \"\";
+const let joined = \"a😀b\".replace(empty, \"-\");
+fun main() {
+\tprint(pieces.len());
+\tprint(words.len());
+\tprint(cut.len());
+\tprint(rest);
+\tprint(joined);
+}
+",
+        "3\n2\n0\n😀\n-a-😀-b-\n",
+    );
+}
