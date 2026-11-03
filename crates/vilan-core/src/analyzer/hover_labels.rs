@@ -971,8 +971,9 @@ impl<'src> Analyzer<'src> {
         let mut recordable: Vec<bool> = Vec::new();
         let mut seen: HashSet<(SourceId, Span)> = HashSet::default();
         // E310: the files each user file reaches (B515/B598's rule), asked
-        // once, and only when a trait row needs it.
-        let mut reach: Option<HashMap<SourceId, HashSet<SourceId>>> = None;
+        // once, and only when a trait row needs it — with the impls indexed by
+        // trait and each answer remembered (`ImplementorMemo`).
+        let mut reach = ImplementorMemo::default();
         for (source, span, definition, type_id) in &self.type_references {
             if !self.renders_hover_rows(*source, rows) || seen.contains(&(*source, *span)) {
                 continue;
@@ -1069,28 +1070,63 @@ impl<'src> Analyzer<'src> {
     /// an impl whose concrete argument differs from the written one cannot be
     /// passed here and is left out. A blanket (`impl type S: ..`) names no
     /// subject and is left out too.
+    ///
+    /// E292 (Order 56): every trait-position hover row asked this, and each
+    /// ask walked EVERY impl of the program for the ones providing the
+    /// trait — 512 asks on the kolt exhibit's served leaf keystroke, 1.39 G
+    /// instructions of its 10.4 (13 %). The impls are now indexed by the
+    /// traits they provide once per rendering, and an answer is a function of
+    /// `(trait, written arguments, file)` alone, so a repeated row is a
+    /// lookup ([`ImplementorMemo`]).
     fn implementors_in_reach(
         &self,
         trait_id: Id,
         written: &[TypeId],
         source: SourceId,
-        reach: &mut Option<HashMap<SourceId, HashSet<SourceId>>>,
+        memo: &mut ImplementorMemo,
         every_view: bool,
     ) -> Vec<String> {
         // Only an editor reads the list (it is the hover's preview).
         if !every_view {
             return Vec::new();
         }
-        let reach = reach.get_or_insert_with(|| match self.entry_scope_id {
+        let key = (trait_id, written.to_vec(), source);
+        if let Some(answer) = memo.answers.get(&key) {
+            return answer.clone();
+        }
+        let reach = memo.reach.get_or_insert_with(|| match self.entry_scope_id {
             Some(entry_scope_id) => self.trait_reach_by_file(entry_scope_id, None),
             None => HashMap::default(),
         });
         let Some(files) = reach.get(&source) else {
             return Vec::new();
         };
+        let by_trait = memo.by_trait.get_or_insert_with(|| {
+            let mut by_trait: HashMap<Id, Vec<usize>> = HashMap::default();
+            for (index, implementation) in self.implementations.iter().enumerate() {
+                let mut provides: Vec<Id> = implementation
+                    .trait_args
+                    .iter()
+                    .map(|(provided, _)| *provided)
+                    .collect();
+                provides.dedup();
+                for provided in provides {
+                    let indices = by_trait.entry(provided).or_default();
+                    if indices.last() != Some(&index) {
+                        indices.push(index);
+                    }
+                }
+            }
+            by_trait
+        });
         let empty = SubstitutionContext::default();
         let mut subjects: Vec<String> = Vec::new();
-        for implementation in &self.implementations {
+        let implementations = by_trait
+            .get(&trait_id)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.implementations[*index]);
+        for implementation in implementations {
             // A derive's impl is provided from its attribute's file (B354).
             let provided_from = self
                 .derived_origin_file(implementation.impl_id)
@@ -1134,6 +1170,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         subjects.sort();
+        memo.answers.insert(key, subjects.clone());
         subjects
     }
 
@@ -1497,4 +1534,16 @@ fn definition_block(head: &str, members: &[String]) -> String {
     }
     out.push_str("\n}");
     out
+}
+
+/// [`Analyzer::implementors_in_reach`]'s state across one rendering of the
+/// hover rows: the files each file reaches, the impls indexed by the traits
+/// they provide (positions into `implementations`, in its order, so a
+/// subject list is built in the order the walk of every impl built it), and
+/// each `(trait, written arguments, file)` answer.
+#[derive(Default)]
+pub(super) struct ImplementorMemo {
+    reach: Option<HashMap<SourceId, HashSet<SourceId>>>,
+    by_trait: Option<HashMap<Id, Vec<usize>>>,
+    answers: HashMap<(Id, Vec<TypeId>, SourceId), Vec<String>>,
 }
