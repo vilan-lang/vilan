@@ -550,6 +550,20 @@ impl Js for Location {
     }
 }
 
+/// E345: a `Location` held in a struct FIELD — a reactive stage keeps the site
+/// that made it, for the trace — is its text on the JS backend, so
+/// `JSON.stringify` (an aggregate's wire form and canonical hash) writes it as
+/// a string; natively it writes the same quoted text and keys as that text,
+/// as a `str` does.
+impl Json for Location {
+    fn json(&self) -> String {
+        json_string(self.0)
+    }
+    fn canonical_hash(&self) -> Hash {
+        Hash::Text(str_new(self.0))
+    }
+}
+
 /// A vilan `panic` — what [`panic_at`] raises: the message, and the site the
 /// report names. [`describe_panic`] answers the message alone, so a catcher
 /// (`guarded`, a task's failure) sees exactly what the JS `error.message`
@@ -2585,6 +2599,19 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// E345: a `Location` in a struct field renders as the JS backend's
+    /// `JSON.stringify` writes its text — a quoted, escaped string — and keys
+    /// as that text, as a `str` does.
+    #[test]
+    fn a_location_renders_and_keys_as_its_text() {
+        let site = Location("src/main.vl:3:7");
+        assert_eq!(site.json(), "\"src/main.vl:3:7\"");
+        assert_eq!(Location("a\"b").json(), "\"a\\\"b\"");
+        assert_eq!(site.canonical_hash(), "src/main.vl:3:7".canonical_hash());
+        // A tracker's `Option<Location>`: the enum's array form, as for a `str`.
+        assert_eq!(Some(site).json(), "[0,\"src/main.vl:3:7\"]");
+    }
 
     /// F136: a map of closures compares as std's `HashMap` does — the same
     /// keys, in ANY order — each value by reference; a key compares by value.

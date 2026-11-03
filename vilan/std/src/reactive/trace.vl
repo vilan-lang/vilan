@@ -5,9 +5,9 @@
 // runs — naming what woke it:
 //
 //     [reactive] effect #4 at src/views.vl:30:8 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
-//     [reactive] derivation #2 woken by cell #1, set at src/main.vl:9:7
-//     [reactive] effect #5 woken by cell #3, set by derivation #2
-//     [reactive] effect #6 woken by derivation #2
+//     [reactive] derivation #2 at src/main.vl:8:40 woken by cell #1, set at src/main.vl:9:7
+//     [reactive] effect #5 at src/views.vl:31:4 woken by cell #3 (made at src/main.vl:8:40), set by derivation #2
+//     [reactive] effect #6 at src/views.vl:34:11 woken by derivation #2
 //
 // A subscriber is an `effect` (it acts on a value) or a `derivation` (it publishes
 // one, a relay included), numbered by its id; a cell by its identity. A place is a
@@ -18,6 +18,13 @@
 // names the traced wake a write ran inside. The `Signal` and `Flow` members are
 // `[track_caller]` on the TRAIT (B646), so every implementation takes the place and
 // every call passes it. A relay's `wake` is woken by the relay.
+//
+// A derivation is placed too (E345): a seal (`Pipe::memo`/`cell` and their
+// `_global` twins, a collection's `memo`) and a stage constructor (`distinct`,
+// `switch`, ...) are `[track_caller]`, and the subscriber the seal or the stage's
+// relay mints is placed at that caller (`place_subscriber`). A UI binding is
+// placed where the program made it: `std::web::ui`'s helpers are `[track_caller]`
+// down to `follow`, so the `sub` it calls is handed the program's site.
 //
 // A wake that waits in a turn's queue runs later, on another stack — at the
 // extent's end, or on a microtask. Queued under the trace, it is wrapped in a host

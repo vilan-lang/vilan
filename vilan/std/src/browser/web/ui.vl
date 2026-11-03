@@ -29,6 +29,7 @@
 // Only available when building for the browser (`vilan build --target browser`).
 
 import pkg::compare::PartialEq;
+import pkg::debug::caller;
 import pkg::hash::Hashable;
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
@@ -50,6 +51,7 @@ import pkg::reactive::{
 	comp,
 	get_owner,
 	owner_scope,
+	place_subscriber,
 	queue_microtask,
 	reconcile,
 	run_with_owner,
@@ -82,6 +84,7 @@ import pkg::web::style::Style;
 /// and no nursery per change. A form that builds per value (`when`, `swap`,
 /// `each`) keeps the owners it makes itself. The observer is a callback position
 /// like `sub`'s (B482): it runs with `tracking` cleared.
+[track_caller]
 fun follow<T, F: Flow<T>>(own flow: F, observer: (|T| void) context tracking) {
 	get_owner().take(flow.sub(observer));
 }
@@ -208,6 +211,7 @@ export impl View {
 	/// never through runtime rule construction. Registers with the nearest
 	/// enclosing boundary (an ambient `effect`), exactly like every `bind_*`:
 	/// a subscription parked in a `let _sub` outlives the view it writes to.
+	[track_caller]
 	fun style_var<S: Flow<str>>(self, name: str, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -226,6 +230,7 @@ export impl View {
 	/// an element on mount, or to say where a focus scope starts, write
 	/// `.autofocus()`; the compiler steers an element head's written `autofocus`
 	/// there, because the native attribute acts only at the page's initial parse.
+	[track_caller]
 	fun attr<V: AttrValue>(self, name: str, own value: V): View {
 		value.apply(self, name);
 		self
@@ -262,6 +267,7 @@ export impl View {
 	/// Structure only for the static arms; the reactive ones register their one
 	/// subscription with the nearest enclosing boundary, exactly as every `bind_*`
 	/// does.
+	[track_caller]
 	fun child<C: Slot>(self, own content: C): View {
 		content.place(self);
 		self
@@ -279,6 +285,7 @@ export impl View {
 	/// nearest enclosing boundary (an ambient `effect`). Any `Source<str>` drives
 	/// it: a `Signal`, a derived signal, a `RemoteSource` mirror, a user's own cell
 	/// (A33).
+	[track_caller]
 	fun bind_text<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -288,6 +295,7 @@ export impl View {
 	}
 
 	/// Reactive CSS class.
+	[track_caller]
 	fun bind_class<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -301,6 +309,7 @@ export impl View {
 	/// CONSTRUCTED here: every candidate style emitted its rules inside its own
 	/// `const` expression, and `class_list` is a map read, so the
 	/// construct-in-const rule holds with a signal in the middle.
+	[track_caller]
 	fun bind_styled<S: Flow<Style>>(self, own source: S): View {
 		let element = self.element;
 		follow(source, |value| {
@@ -326,6 +335,7 @@ export impl View {
 	/// is nothing to disambiguate: a `Source<str>` is not a `Source<Option<str>>`
 	/// and vice versa, so a `SignalCell<str>` argument selects the first arm and a
 	/// `SignalCell<Option<str>>` the second.
+	[track_caller]
 	fun bind_attr<V: AttrBinding>(self, name: str, own source: V): View {
 		source.bind_attribute(self, name);
 		self
@@ -341,6 +351,7 @@ export impl View {
 	/// The set writes the empty string, which is the canonical spelling of a
 	/// present boolean attribute (`<div inert>` and `<div inert="">` serialize
 	/// alike).
+	[track_caller]
 	fun toggle_attr<S: Flow<bool>>(self, name: str, own source: S): View {
 		let element = self.element;
 		follow(source, |present| {
@@ -366,6 +377,7 @@ export impl View {
 	/// the EVENT, and the listener is created in a scope that never held an
 	/// element. What survives an unmount is then element → listener → signal,
 	/// with nothing pointing back.
+	[track_caller]
 	fun bind_value<S: Signal<str>>(self, signal: S): View {
 		let element = self.element;
 		follow(signal, |value| {
@@ -383,6 +395,7 @@ export impl View {
 	///
 	/// Concrete `Draft`, with `bind_value` (A33): a draft is the write side by
 	/// construction — this pushes.
+	[track_caller]
 	fun bind_draft(self, draft: Draft<str>): View {
 		let element = self.element;
 		follow(draft.local, |value| {
@@ -547,6 +560,7 @@ export impl View {
 	/// `display` itself, after `show` has bound it, loses that write on the next
 	/// toggle. Style the element through a `Style` — which is what the styling
 	/// surface is for — and the two never meet.
+	[track_caller]
 	fun show<S: Flow<bool>>(self, own condition: S): View {
 		let element = self.element;
 		let restored = element.style_property("display");
@@ -993,6 +1007,7 @@ fun while_leaving(from: Text, before: Text, disposal: || void) {
 /// generic helper in the estate spells the bound `Slot` today. KEEP IN STEP with
 /// the process twin's copy (process/ui.vl).
 export trait Slot {
+	[track_caller]
 	fun place(own self, parent: View);
 }
 
@@ -1023,6 +1038,7 @@ export impl type S: Flow<str> with Slot {
 	}
 }
 
+[track_caller]
 fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
 	let node = create_text_node("");
 	parent.element.append_text(node);
@@ -1084,6 +1100,7 @@ export impl type S: Flow<View> with Slot {
 	}
 }
 
+[track_caller]
 fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	let live: Shared<Option<View>> = Shared::new(None);
@@ -1119,6 +1136,7 @@ export impl type S: Flow<List<View>> with Slot {
 	}
 }
 
+[track_caller]
 fun place_views_flow<F: Flow<List<View>>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	let live: Shared<List<View>> = Shared::new([]);
@@ -1161,6 +1179,7 @@ export impl type S: Flow<Option<View>> with Slot {
 	}
 }
 
+[track_caller]
 fun place_optional_view_flow<F: Flow<Option<View>>>(own flow: F, parent: View) {
 	let region = Region::open(parent);
 	// A binding the closure captures is its storage (spec §6.9, M93's rule): no
@@ -1535,6 +1554,7 @@ export impl EachBy<type T, type K: PartialEq + Hashable, type S: RowFeed<T>, typ
 /// `swap`'s body, against a region opened at `parent`'s current end — shared by the
 /// `swap` and `swap_split` values. `armed` is the route gate's hold (see `Swap`):
 /// `true` for every ordinary swap.
+[track_caller]
 fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 	parent: View,
 	own source: S,
@@ -1751,6 +1771,7 @@ fun row_references(
 /// fall back to on the op path, and a splice that both removes and inserts is the
 /// pass over its own SPAN (A129), so a key that leaves and arrives in one splice
 /// keeps its row.
+[track_caller]
 fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
 	own source: S,
@@ -2006,7 +2027,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	// exactly the state its first drain starts from. An EFFECT's subscriber (the
 	// run writes the DOM), minted here since `mint_subscriber` is reactive.vl's
 	// own.
-	let handle = (instance.attach)(subscriber_of(|| {
+	let run = subscriber_of(|| {
 		for op in live_ops(drain()) {
 			match op {
 				// A splice that only removes or only inserts cannot re-meet a key,
@@ -2063,7 +2084,10 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				},
 			}
 		}
-	}, false));
+	}, false);
+	// E345: under the reactive trace the run names the program's placement.
+	place_subscriber(run.id, caller());
+	let handle = (instance.attach)(run);
 	also_releasing(handle, instance.release);
 	let _owned = get_owner().take(handle);
 	reconcile_pass((instance.snapshot)());
@@ -2077,6 +2101,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 /// element changed in place under the same key is WRITTEN INTO that row's cell and
 /// nothing is built, exactly as the pass's `Keep` does it — but only for the row
 /// the op names, where the pass writes into every surviving row's cell.
+[track_caller]
 fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
 	own source: S,
@@ -2314,7 +2339,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	// The input, opened as `place_each` opens its own.
 	let instance = source.open_rows();
 	let drain = instance.drain;
-	let handle = (instance.attach)(subscriber_of(|| {
+	let run = subscriber_of(|| {
 		for op in live_ops(drain()) {
 			match op {
 				// Positional when it only removes or only inserts; the pass over
@@ -2372,7 +2397,10 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				},
 			}
 		}
-	}, false));
+	}, false);
+	// E345: under the reactive trace the run names the program's placement.
+	place_subscriber(run.id, caller());
+	let handle = (instance.attach)(run);
 	also_releasing(handle, instance.release);
 	let _owned = get_owner().take(handle);
 	reconcile_pass((instance.snapshot)());
@@ -2385,6 +2413,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 /// `Source<str>` (B158/B165), so any reactive value fills an attribute. KEEP IN
 /// STEP with the process twin's copy (process/ui.vl).
 export trait AttrValue {
+	[track_caller]
 	fun apply(own self, parent: View, name: str);
 }
 
@@ -2402,6 +2431,7 @@ export impl type S: Flow<str> with AttrValue {
 	}
 }
 
+[track_caller]
 fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2437,6 +2467,7 @@ export impl type S: Flow<Option<str>> with AttrValue {
 	}
 }
 
+[track_caller]
 fun apply_optional_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2463,6 +2494,7 @@ fun apply_optional_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: s
 ///
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 export trait AttrBinding {
+	[track_caller]
 	fun bind_attribute(own self, parent: View, name: str);
 }
 
@@ -2473,6 +2505,7 @@ export impl type S: Flow<str> with AttrBinding {
 	}
 }
 
+[track_caller]
 fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2488,6 +2521,7 @@ export impl type S: Flow<Option<str>> with AttrBinding {
 	}
 }
 
+[track_caller]
 fun bind_optional_attribute_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
 	follow(flow, |value| {
@@ -2613,6 +2647,7 @@ export impl WhenSome<type T, type S: Flow<Option<T>>, type C: Slot> with Slot {
 /// `when_some`'s body, against a region opened at `parent`'s current end —
 /// `place_swap`'s machinery, with the presence deciding structure and the cell
 /// carrying the value.
+[track_caller]
 fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 	parent: View,
 	own source: S,

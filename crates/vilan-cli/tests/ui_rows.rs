@@ -2480,6 +2480,87 @@ fn m187_a_region_under_a_leaving_run_cuts_nothing_and_makes_no_range() {
     }
 }
 
+// --- E345: a binding's trace line names the element that made it ------------
+
+/// Four bindings over two cells under the reactive trace: a `{count}` hole
+/// written as a `.child(..)` call, the same hole in element syntax, a
+/// `bind_text`, and an `each`.
+const E345_BINDINGS: &str = r#"import std::reactive::trace::trace;
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ View, each, mount_root, view };
+
+fun main() {
+	trace(true);
+	let count: SignalCell<str> = Signal::new("1");
+	let rows: SignalCell<List<i32>> = Signal::new([1, 2]);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("p").child(count))
+			.child(<b>{count}</b>)
+			.child(view("i").bind_text(count))
+			.child(view("ul").child(each(rows, |row: i32| row, |row: i32| view("li").text(i"{row}"))))
+	});
+	count.set("2");
+	rows.set([1, 2, 3]);
+}
+
+main();
+"#;
+
+/// `app.vl:<line>:<column>` of `column_needle` on the first line of
+/// `E345_BINDINGS` holding `line_needle` — a column counts characters, a tab
+/// one, as the compiler's locations do.
+fn e345_site(line_needle: &str, column_needle: &str) -> String {
+    let (index, line) = E345_BINDINGS
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(line_needle))
+        .unwrap_or_else(|| panic!("no line holds {line_needle:?}"));
+    let byte = line
+        .find(column_needle)
+        .unwrap_or_else(|| panic!("{column_needle:?} is not on {line:?}"));
+    format!("app.vl:{}:{}", index + 1, line[..byte].chars().count() + 1)
+}
+
+/// E345: under the reactive trace a UI binding's wake names the PROGRAM's site
+/// that made it — the `.child(..)` that placed a text hole, the element whose
+/// syntax holds the hole, the `bind_text` call, the `.child(..)` that placed an `each` —
+/// where it named nothing: the subscription is made inside std (`follow` calls
+/// `.sub`), and a std place is left out of the trace. The ui helpers are
+/// `[track_caller]` from the user's call down to `follow` (`Slot::place`,
+/// `AttrValue::apply` and `AttrBinding::bind_attribute` on their traits), so the
+/// place is forwarded rather than read where the `.sub` sits.
+///
+/// Non-vacuity: on the std before E345 the same four lines read
+/// `[reactive] effect #N woken by ...`, with no `at`.
+#[test]
+fn e345_a_ui_binding_names_the_site_that_made_it() {
+    // The trace writes to stderr under node (`console.error`; the console in a
+    // browser): the harness hands it to stdout, which is what is read back.
+    let harness = format!("{DOM_STUB}\nconsole.error = console.log;\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("e345_bindings", E345_BINDINGS, &harness);
+    let count_made = e345_site("let count: SignalCell<str> = Signal::new(", "new");
+    let rows_made = e345_site("let rows: SignalCell<List<i32>> = Signal::new(", "new");
+    let count_set = e345_site("count.set(\"2\")", "set");
+    let rows_set = e345_site("rows.set([1, 2, 3])", "set");
+    let expected = format!(
+        "[reactive] effect #0 at {} woken by cell #1 (made at {count_made}), set at {count_set}\n\
+         [reactive] effect #1 at {} woken by cell #1 (made at {count_made}), set at {count_set}\n\
+         [reactive] effect #2 at {} woken by cell #1 (made at {count_made}), set at {count_set}\n\
+         [reactive] effect #3 at {} woken by cell #2 (made at {rows_made}), set at {rows_set}\n",
+        e345_site(".child(view(\"p\").child(count))", "child(count)"),
+        // An element-syntax hole is the element's own `.child(..)`: it names
+        // the element.
+        e345_site(".child(<b>{count}</b>)", "<b>"),
+        e345_site(".bind_text(count)", "bind_text"),
+        e345_site(".child(each(rows", "child(each"),
+    );
+    assert_eq!(
+        stdout, expected,
+        "E345: every binding's trace line names the program's site that made it"
+    );
+}
+
 /// A85: the five value forms, each in a MIDDLE position of one chain, so every
 /// region has to keep its place from the static siblings AND from the other
 /// four. This is the shape the item exists for — `<ul>{header}{each(..)}

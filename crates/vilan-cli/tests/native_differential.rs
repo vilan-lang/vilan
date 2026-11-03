@@ -12448,7 +12448,9 @@ const REACTIVE_TRACE_FILE: &str = "native_probe_reactive_trace.vl";
 /// made by `Signal::new` and written through a bound, a write through a `dyn
 /// Signal` with a subscriber made through a `dyn Source` (B646: the `Signal`
 /// and `Flow` members are `[track_caller]` on the trait, so every one of these
-/// names its place), an `effect`, and the trace off. Native has no host task
+/// names its place), an `effect`, a tracked `derive` and a `switch` (E345: a
+/// derivation names the `.memo()`, `.distinct()`, `derive` or `.switch(..)` that
+/// made it), and the trace off. Native has no host task
 /// to tag a queued wake with (`console.createTask` is the JS backend's): the
 /// lines are the same, only a debugger's async stack differs.
 #[test]
@@ -12488,12 +12490,15 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 ),
             )
         }),
+        // E345: the seal's refresh names its `.memo()`, and so does the cell
+        // it writes.
         ("draining", |file, made, site| {
+            let memo = site(file, "let doubled = count.derive(", "memo");
             (
                 "draining 2\ndraining 8\n".to_string(),
                 format!(
-                    "[reactive] derivation #0 woken by cell #1 (made at {}), set at {}\n\
-                     [reactive] effect #1 at {} woken by cell #3, set by derivation #0\n",
+                    "[reactive] derivation #0 at {memo} woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] effect #1 at {} woken by cell #3 (made at {memo}), set by derivation #0\n",
                     made(file),
                     site(file, "batch(|| count.set(4))", "set"),
                     site(file, "print(i\"draining {value}\")", "sub"),
@@ -12511,15 +12516,50 @@ fn e257_s8_every_wake_path_traces_the_same_on_both_backends() {
                 ),
             )
         }),
+        // E345: a stage's relay names the constructor that made the stage.
         ("relay", |file, made, site| {
             (
                 "relay 1\nrelay 6\n".to_string(),
                 format!(
-                    "[reactive] derivation #1 woken by cell #1 (made at {}), set at {}\n\
+                    "[reactive] derivation #1 at {} woken by cell #1 (made at {}), set at {}\n\
                      [reactive] effect #0 at {} woken by derivation #1\n",
+                    site(file, "count.distinct().sub(", "distinct"),
                     made(file),
                     site(file, "count.set(6)", "set"),
                     site(file, "print(i\"relay {value}\")", "sub"),
+                ),
+            )
+        }),
+        // E345: a tracked dependency's edge relay names the `derive` that made
+        // it; the seal's refresh, woken by it, names the `.memo()`.
+        ("tracked", |file, made, site| {
+            let memo = site(file, "derive(|| count.track() * 3)", "memo");
+            (
+                "tracked 3\ntracked 42\n".to_string(),
+                format!(
+                    "[reactive] derivation #1 at {} woken by cell #1 (made at {}), set at {}\n\
+                     [reactive] derivation #0 at {memo} woken by derivation #1\n\
+                     [reactive] effect #2 at {} woken by cell #3 (made at {memo}), set by derivation #0\n",
+                    site(file, "derive(|| count.track() * 3)", "derive"),
+                    made(file),
+                    site(file, "count.set(14)", "set"),
+                    site(file, "print(i\"tracked {value}\")", "sub"),
+                ),
+            )
+        }),
+        // E345: a `switch`'s re-selection names the `.switch(..)`.
+        ("switch", |file, _, site| {
+            let memo = site(file, "flag.switch(", "memo");
+            (
+                "switch 1\nswitch 10\n".to_string(),
+                format!(
+                    "[reactive] derivation #2 at {} woken by cell #3 (made at {}), set at {}\n\
+                     [reactive] derivation #0 at {memo} woken by derivation #2\n\
+                     [reactive] effect #3 at {} woken by cell #4 (made at {memo}), set by derivation #0\n",
+                    site(file, "flag.switch(", "switch"),
+                    site(file, "let flag = SignalCell::new(true)", "new"),
+                    site(file, "flag.set(false)", "set"),
+                    site(file, "print(i\"switch {value}\")", "sub"),
                 ),
             )
         }),

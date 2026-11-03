@@ -1533,6 +1533,9 @@ export struct TrackRuns {
 	target: Option<Subscriber>,
 	/// The dependency lists, made at the stage's first tracked read (M93).
 	lists: Option<Shared<TrackLists>>,
+	/// Where the program made the stage or effect this tracker serves (E345): its
+	/// relays are derivations, and under the reactive trace they name it.
+	site: Option<Location>,
 }
 
 /// A tracking stage's dependency lists, in ONE cell of their own.
@@ -1570,8 +1573,8 @@ export fun trackers_allocated(): i32 {
 }
 
 /// A fresh tracker: no runs, nothing attached, and no lists until something is
-/// tracked.
-fun new_tracker(): Tracker {
+/// tracked. `site` is where the program made what it serves, for its relays.
+fun new_tracker(own site: Option<Location>): Tracker {
 	Tracker {
 		runs = Shared::new(TrackRuns {
 			epoch = 0,
@@ -1581,6 +1584,7 @@ fun new_tracker(): Tracker {
 			missed = false,
 			target = None,
 			lists = None,
+			site,
 		}),
 	}
 }
@@ -1775,7 +1779,7 @@ fun same_identity(identity: Option<i32>, wanted: i32): bool {
 /// waking its target — or, while edges are being attached, noting the wake for when
 /// they stand.
 fun relay_for(tracker: Tracker, target: Subscriber): Subscriber {
-	subscriber_of(|| {
+	let relay = subscriber_of(|| {
 		let connecting = tracker.runs.read().connecting;
 		tracker.runs.write().dirty = true;
 		if connecting {
@@ -1783,7 +1787,12 @@ fun relay_for(tracker: Tracker, target: Subscriber): Subscriber {
 		} else {
 			wake(target);
 		}
-	}, true)
+	}, true);
+	match tracker.runs.read().site {
+		Some(let site) => place_subscriber(relay.id, site),
+		None => {},
+	}
+	relay
 }
 
 /// Follow the stage's dependencies from now on, waking `target`: the last run's
@@ -1912,10 +1921,11 @@ export impl type S: Source<type T> {
 /// The body runs once per change of what it tracked on its last run, under an owner
 /// of its own (§4) and in a scope of its own; a consumer that does not read at once
 /// (`on_change`) primes it, so its dependencies are known from the start.
+[track_caller]
 export fun derive<T>(
 	body: (sync || T) context (owner_scope, tracking, ambient_nursery),
 ): TrackedDerive<T> {
-	TrackedDerive<T> { body }
+	TrackedDerive<T> { body, site = caller() }
 }
 
 /// The free `derive` as a stage: its body, and nothing upstream.
@@ -1923,13 +1933,14 @@ export fun derive<T>(
 [resource]
 export struct TrackedDerive<T> {
 	body: (|| T) context (owner_scope, tracking, ambient_nursery),
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl TrackedDerive<type T> with Flow<T> {
 	fun start(own self): Instance<T> {
 		let body = self.body;
 		let runs = Owner::new();
-		let tracker = new_tracker();
+		let tracker = new_tracker(Some(self.site));
 		Instance<T> {
 			pull = || run_tracked(runs, tracker, body),
 			attach = |subscriber: Subscriber| {
@@ -2191,7 +2202,7 @@ export trait Flow<T> {
 	[track_caller]
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery)) {
 		let runs = Owner::new();
-		let tracker = new_tracker();
+		let tracker = new_tracker(Some(caller()));
 		// The value the input delivered last, which a tracked re-run runs with: a
 		// binding the two closures capture (spec §6.9), not a cell (M93).
 		mut latest: Option<T> = None;
@@ -2251,11 +2262,12 @@ export impl type F: Flow<type T> {
 	/// A pipe of `transform` applied to this flow's value (A142 R1, the rename of
 	/// `Source.map`). It runs when the pipe's consumer reads it — once per change,
 	/// inside the one instance that consumed it.
+	[track_caller]
 	fun derive<U>(
 		own self,
 		transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery),
 	): Derive<F, T, U> {
-		Derive<F, T, U> { up = self, transform }
+		Derive<F, T, U> { up = self, transform, site = caller() }
 	}
 
 	/// The DYNAMIC dependency (A123): follow the flow `select` builds for this
@@ -2263,18 +2275,20 @@ export impl type F: Flow<type T> {
 	/// `select` runs once per change of this flow, and it must BUILD the flow it
 	/// answers (a closure cannot capture a prebuilt pipe); the flow a previous
 	/// selection built is released at re-selection.
+	[track_caller]
 	fun switch<U, I: Flow<U>>(
 		own self,
 		select: (sync |T| I) context (owner_scope, tracking, ambient_nursery),
 	): Switch<F, T, I, U> {
-		Switch<F, T, I, U> { up = self, select }
+		Switch<F, T, I, U> { up = self, select, site = caller() }
 	}
 
 	/// This flow, passing a change on only when `key` of the value differs from
 	/// `key` of the last value passed on (A142 R7). The value passed downstream is
 	/// the whole `T`.
+	[track_caller]
 	fun distinct_by<K: PartialEq>(own self, key: sync |T| K): DistinctBy<F, T, K> {
-		DistinctBy<F, T, K> { up = self, key }
+		DistinctBy<F, T, K> { up = self, key, site = caller() }
 	}
 }
 
@@ -2304,6 +2318,17 @@ export impl type S: Source<type T> with Flow<T> {
 			self.attach_observer(|value| tracking.clear(|| observer(value)), true),
 			caller(),
 		)
+	}
+}
+
+/// Under the reactive trace (`trace`), remember that the subscriber `id` — a
+/// derivation's OWN registration, which no `Flow` member minted — was made at
+/// `site` (E345): a seal's refresh at the program's `.memo()`, a stage's relay at
+/// the program's `.distinct()` or `.switch(..)`, both `[track_caller]`.
+[internal("a stage author's placement: names a derivation's own registration by where the program made it")]
+export fun place_subscriber(id: i32, site: Location) {
+	if tracing.read() {
+		(trace_hooks.read().placed)(id, site);
 	}
 }
 
@@ -2375,6 +2400,10 @@ export trait Pipe<T> with Flow<T> {
 	/// `.memo_global()` says that lifetime (A130). It does NOT compare: every
 	/// change above it is a write, and a write always notifies — `.distinct()` is
 	/// the stage that compares.
+	///
+	/// `[track_caller]` (E345), with every seal below: under the reactive trace
+	/// (`trace`) the derivation names where it was sealed, and so does its cell.
+	[track_caller]
 	fun memo(own self): MemoCell<T> {
 		MemoCell<T> { cell = self.cell() }
 	}
@@ -2382,15 +2411,18 @@ export trait Pipe<T> with Flow<T> {
 	/// Seal into the WRITABLE cell (R20). A local `set` holds until the next change
 	/// upstream overwrites it — a legitimate pattern (a local override of a derived
 	/// value), and the only difference from `.memo()`.
+	[track_caller]
 	fun cell(own self): SignalCell<T> {
 		let instance = self.start();
 		let pull = instance.pull;
 		let cached = SignalCell::new(pull());
 		// A DERIVATION (A110 door 2): it publishes a value, so a turn settles it
 		// before any effect reads it.
-		let refreshed = (instance.attach)(subscriber_of(|| {
+		let refresh = subscriber_of(|| {
 			cached.set(pull());
-		}, true));
+		}, true);
+		place_subscriber(refresh.id, caller());
+		let refreshed = (instance.attach)(refresh);
 		also_releasing(refreshed, instance.release);
 		let _owned = register_with_owner(refreshed);
 		cached
@@ -2398,6 +2430,7 @@ export trait Pipe<T> with Flow<T> {
 
 	/// `.memo()` for a value that lives as long as the PROGRAM — the spelling for a
 	/// module-level derivation (A130), and for anything a `Memo` maker builds.
+	[track_caller]
 	fun memo_global(own self): MemoCell<T> {
 		MemoCell<T> { cell = self.cell_global() }
 	}
@@ -2408,6 +2441,7 @@ export trait Pipe<T> with Flow<T> {
 	/// above → the upstream — is a loop for the life of the program BY DESIGN
 	/// (`proposal/reactive-pipeline.md` §2.4); the standing no-cycle gate excludes
 	/// it by the refresh closure's name.
+	[track_caller]
 	fun cell_global(own self): SignalCell<T> {
 		let instance = self.start();
 		let pull = instance.pull;
@@ -2418,7 +2452,9 @@ export trait Pipe<T> with Flow<T> {
 		let cell_global_refresh = || {
 			cached.set(pull());
 		};
-		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+		let refresh = subscriber_of(cell_global_refresh, true);
+		place_subscriber(refresh.id, caller());
+		let _for_the_program = (instance.attach)(refresh);
 		cached
 	}
 
@@ -2791,16 +2827,22 @@ export impl SignalCell<type T: (2..)> {
 	/// position, and a `set` that changes nothing, included — because a cell never
 	/// compares (`T` needs no `PartialEq`). The parts are copies of the whole's
 	/// payloads, so a `set` on a part does not write back.
+	///
+	/// `[track_caller]` (E345): under the reactive trace (`trace`) the follow names
+	/// where the program split the cell.
+	[track_caller]
 	fun unzip(self): (U in T: SignalCell<U>) {
 		let parts = (part in self.get() => SignalCell::new(part));
 		as_derivation();
 		let whole = self;
-		let _owned = register_with_owner(whole.on_settle(subscriber_of(|| {
+		let follow = subscriber_of(|| {
 			let current = whole.get();
 			for key in current.keys() {
 				parts.get(key).set(current.get(key));
 			}
-		}, true)));
+		}, true);
+		place_subscriber(follow.id, caller());
+		let _owned = register_with_owner(whole.on_settle(follow));
 		parts
 	}
 }
@@ -3000,6 +3042,7 @@ export struct Selector<T> {
 /// The subscription is the AMBIENT OWNER's, like every derivation combinator's
 /// (A28), and it is a LAZY one (A43): the cells are seeded by `of` from `current`,
 /// so there is nothing for a first call to do.
+[track_caller]
 export fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T> {
 	let cells: Shared<NativeMap<SignalCell<bool>>> = Shared::new(NativeMap::new());
 	let current: Shared<T> = Shared::new(source.get());
@@ -3074,6 +3117,13 @@ fun relay_to(subscriber: Subscriber): Subscriber {
 	subscriber_of(|| wake(subscriber), true)
 }
 
+/// `subscriber`, placed at `site` under the reactive trace (E345): a stage's own
+/// relay names the program's `.distinct()` or `.switch(..)` that made the stage.
+fun placed_at(own subscriber: Subscriber, site: Location): Subscriber {
+	place_subscriber(subscriber.id, site);
+	subscriber
+}
+
 /// Detach the registration a stage holds in `handle`, if it holds one.
 fun detach_held(handle: Shared<Option<Subscription>>) {
 	match handle.read() {
@@ -3096,16 +3146,18 @@ fun detach_held(handle: Shared<Option<Subscription>>) {
 export struct Derive<S, T, U> {
 	up: S,
 	transform: (|T| U) context (owner_scope, tracking, ambient_nursery),
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl Derive<type S: Flow<type T>, T, type U> with Flow<U> {
 	fun start(own self): Instance<U> {
 		let transform = self.transform;
+		let site = self.site;
 		let upstream = self.up.start();
 		let pull = upstream.pull;
 		let upstream_attach = upstream.attach;
 		let runs = Owner::new();
-		let tracker = new_tracker();
+		let tracker = new_tracker(Some(site));
 		Instance<U> {
 			pull = || {
 				let value = pull();
@@ -3149,13 +3201,15 @@ export impl Derive<type S: Flow<type T>, T, type U> with Pipe<U> {}
 export struct Switch<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U> {
 	fun start(own self): Instance<U> {
 		let select = self.select;
+		let site = self.site;
 		let runs = Owner::new();
-		let tracker = new_tracker();
+		let tracker = new_tracker(Some(site));
 		let outer = self.up.start();
 		let outer_pull = outer.pull;
 		// The FIRST selection is made here, at start — the instance's state begins
@@ -3167,18 +3221,20 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U
 		Instance<U> {
 			pull = || (followed.read().pull)(),
 			attach = |subscriber: Subscriber| {
-				followed_handle.write() = Some((followed.read().attach)(relay_to(subscriber)));
+				followed_handle.write() = Some(
+					(followed.read().attach)(placed_at(relay_to(subscriber), site)),
+				);
 				// The re-selection: on the outer, and — through the selector's
 				// tracked reads (§7.2) — on whatever the last selection tracked.
 				// One record for both, so a turn re-selects once.
-				let reselect = subscriber_of(|| {
+				let reselect = placed_at(subscriber_of(|| {
 					detach_held(followed_handle);
 					(followed.read().release)();
 					let next = run_tracked(runs, tracker, || select(outer_pull())).start();
-					followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
+					followed_handle.write() = Some((next.attach)(placed_at(relay_to(subscriber), site)));
 					followed.write() = next;
 					wake(subscriber);
-				}, true);
+				}, true), site);
 				let outer_handle = (outer.attach)(reselect);
 				attach_tracker(tracker, reselect);
 				retiring(subscriber, || {
@@ -3207,6 +3263,7 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Pipe<U
 export struct SwitchSome<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U> with Flow<
@@ -3214,8 +3271,9 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 > {
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
+		let site = self.site;
 		let runs = Owner::new();
-		let tracker = new_tracker();
+		let tracker = new_tracker(Some(site));
 		let outer = self.up.start();
 		let outer_pull = outer.pull;
 		let followed: Shared<Option<Instance<U>>> = Shared::new(match outer_pull() {
@@ -3231,13 +3289,15 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 			attach = |subscriber: Subscriber| {
 				match followed.read() {
 					Some(let instance) => {
-						followed_handle.write() = Some((instance.attach)(relay_to(subscriber)));
+						followed_handle.write() = Some(
+							(instance.attach)(placed_at(relay_to(subscriber), site)),
+						);
 					},
 					None => {},
 				}
 				// One record re-selects on the outer and on the selector's tracked
 				// reads (§7.2), as `Switch`'s does.
-				let reselect = subscriber_of(|| {
+				let reselect = placed_at(subscriber_of(|| {
 					detach_held(followed_handle);
 					match followed.read() {
 						Some(let previous) => (previous.release)(),
@@ -3246,7 +3306,7 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 					followed.write() = match outer_pull() {
 						Some(let value) => {
 							let next = run_tracked(runs, tracker, || select(value)).start();
-							followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
+							followed_handle.write() = Some((next.attach)(placed_at(relay_to(subscriber), site)));
 							Some(next)
 						},
 						// Detached: what the last selection built is released now,
@@ -3259,7 +3319,7 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 						},
 					};
 					wake(subscriber);
-				}, true);
+				}, true), site);
 				let outer_handle = (outer.attach)(reselect);
 				attach_tracker(tracker, reselect);
 				retiring(subscriber, || {
@@ -3294,6 +3354,7 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 export struct AndThen<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, type U> with Flow<
@@ -3301,8 +3362,9 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 > {
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
+		let site = self.site;
 		let runs = Owner::new();
-		let tracker = new_tracker();
+		let tracker = new_tracker(Some(site));
 		let outer = self.up.start();
 		let outer_pull = outer.pull;
 		let followed: Shared<Option<Instance<Option<U>>>> = Shared::new(match outer_pull() {
@@ -3318,13 +3380,15 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 			attach = |subscriber: Subscriber| {
 				match followed.read() {
 					Some(let instance) => {
-						followed_handle.write() = Some((instance.attach)(relay_to(subscriber)));
+						followed_handle.write() = Some(
+							(instance.attach)(placed_at(relay_to(subscriber), site)),
+						);
 					},
 					None => {},
 				}
 				// One record re-selects on the outer and on the selector's tracked
 				// reads (§7.2), as `Switch`'s does.
-				let reselect = subscriber_of(|| {
+				let reselect = placed_at(subscriber_of(|| {
 					detach_held(followed_handle);
 					match followed.read() {
 						Some(let previous) => (previous.release)(),
@@ -3333,7 +3397,7 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 					followed.write() = match outer_pull() {
 						Some(let value) => {
 							let next = run_tracked(runs, tracker, || select(value)).start();
-							followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
+							followed_handle.write() = Some((next.attach)(placed_at(relay_to(subscriber), site)));
 							Some(next)
 						},
 						// Detached: what the last selection built is released now,
@@ -3346,7 +3410,7 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 						},
 					};
 					wake(subscriber);
-				}, true);
+				}, true), site);
 				let outer_handle = (outer.attach)(reselect);
 				attach_tracker(tracker, reselect);
 				retiring(subscriber, || {
@@ -3381,11 +3445,13 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 export struct ThenSome<F, S, T> {
 	up: F,
 	source: S,
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Flow<Option<T>> {
 	fun start(own self): Instance<Option<T>> {
 		let source = self.source;
+		let site = self.site;
 		let outer = self.up.start();
 		let outer_pull = outer.pull;
 		let following: Shared<bool> = Shared::new(outer_pull());
@@ -3394,20 +3460,22 @@ export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Flow<Op
 			pull = || if following.read() { Some(source.get()) } else { None },
 			attach = |subscriber: Subscriber| {
 				if following.read() {
-					followed_handle.write() = Some(source.on_settle(relay_to(subscriber)));
+					followed_handle.write() = Some(
+						source.on_settle(placed_at(relay_to(subscriber), site)),
+					);
 				}
-				let outer_handle = (outer.attach)(subscriber_of(|| {
+				let outer_handle = (outer.attach)(placed_at(subscriber_of(|| {
 					let on = outer_pull();
 					if on != following.read() {
 						following.write() = on;
 						if on {
-							followed_handle.write() = Some(source.on_settle(relay_to(subscriber)));
+							followed_handle.write() = Some(source.on_settle(placed_at(relay_to(subscriber), site)));
 						} else {
 							detach_held(followed_handle);
 						}
 						wake(subscriber);
 					}
-				}, true));
+				}, true), site));
 				retiring(subscriber, || {
 					detach_held(followed_handle);
 					detach(outer_handle);
@@ -3490,23 +3558,25 @@ export impl ZipSome<type T> with Pipe<Option<T>> {}
 [resource]
 export struct Distinct<S, T> {
 	up: S,
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl Distinct<type S: Flow<T>, type T: PartialEq> with Flow<T> {
 	fun start(own self): Instance<T> {
+		let site = self.site;
 		let upstream = self.up.start();
 		let pull = upstream.pull;
 		let last: Shared<T> = Shared::new(pull());
 		Instance<T> {
 			pull = || last.read(),
 			attach = |subscriber: Subscriber| {
-				let relayed = (upstream.attach)(subscriber_of(|| {
+				let relayed = (upstream.attach)(placed_at(subscriber_of(|| {
 					let now = pull();
 					if now != last.read() {
 						last.write() = now;
 						wake(subscriber);
 					}
-				}, true));
+				}, true), site));
 				also_retiring(relayed, subscriber);
 				relayed
 			},
@@ -3524,11 +3594,13 @@ export impl Distinct<type S: Flow<T>, type T: PartialEq> with Pipe<T> {}
 export struct DistinctBy<S, T, K> {
 	up: S,
 	key: |T| K,
+	[internal("where the program made the stage, for the reactive trace (E345)")] site: Location,
 }
 
 export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Flow<T> {
 	fun start(own self): Instance<T> {
 		let key = self.key;
+		let site = self.site;
 		let upstream = self.up.start();
 		let pull = upstream.pull;
 		let first = pull();
@@ -3537,7 +3609,7 @@ export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Flow<T> 
 		Instance<T> {
 			pull = || last.read(),
 			attach = |subscriber: Subscriber| {
-				let relayed = (upstream.attach)(subscriber_of(|| {
+				let relayed = (upstream.attach)(placed_at(subscriber_of(|| {
 					let now = pull();
 					let now_key = key(now);
 					if now_key != last_key.read() {
@@ -3545,7 +3617,7 @@ export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Flow<T> 
 						last_key.write() = now_key;
 						wake(subscriber);
 					}
-				}, true));
+				}, true), site));
 				also_retiring(relayed, subscriber);
 				relayed
 			},
@@ -3561,37 +3633,41 @@ export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Pipe<T> 
 export impl type F: Flow<type T: PartialEq> {
 	/// This flow, passing a change on only when the value differs from the last one
 	/// passed on — the `Distinct` stage, `T: PartialEq` asked here only (R7).
+	[track_caller]
 	fun distinct(own self): Distinct<F, T> {
-		Distinct<F, T> { up = self }
+		Distinct<F, T> { up = self, site = caller() }
 	}
 }
 
 export impl type F: Flow<Option<type T>> {
 	/// `switch` over an optional value (A142 R8): `None` detaches and reads `None`,
 	/// `Some(x)` follows the flow `select` builds for `x`, wrapped in `Some`.
+	[track_caller]
 	fun switch_some<U, I: Flow<U>>(
 		own self,
 		select: (sync |T| I) context (owner_scope, tracking, ambient_nursery),
 	): SwitchSome<F, T, I, U> {
-		SwitchSome<F, T, I, U> { up = self, select }
+		SwitchSome<F, T, I, U> { up = self, select, site = caller() }
 	}
 
 	/// The Kleisli form (A123): `select` answers a `Flow<Option<U>>`, and the outer
 	/// `None` (nothing selected) and the inner `None` (the followed flow holds
 	/// nothing yet) collapse into one — `Option::and_then`, one level up.
+	[track_caller]
 	fun and_then<U, I: Flow<Option<U>>>(
 		own self,
 		select: (sync |T| I) context (owner_scope, tracking, ambient_nursery),
 	): AndThen<F, T, I, U> {
-		AndThen<F, T, I, U> { up = self, select }
+		AndThen<F, T, I, U> { up = self, select, site = caller() }
 	}
 }
 
 export impl type F: Flow<bool> {
 	/// Follow `source`, as `Some`, while this flag is true, and read `None` (and
 	/// hold no registration on `source`) while it is false.
+	[track_caller]
 	fun then_some<T, S: Source<T>>(own self, source: S): ThenSome<F, S, T> {
-		ThenSome<F, S, T> { up = self, source }
+		ThenSome<F, S, T> { up = self, source, site = caller() }
 	}
 }
 
@@ -3606,8 +3682,9 @@ export impl type F: Flow<bool> {
 /// (reactive-44's `flatten` find, REPORT-reactive-44), so only one of the two can
 /// carry the name, and A142 §3.2 gives it to this one.
 export impl type F: Flow<Option<type I: Source<type U>>> {
+	[track_caller]
 	fun flatten(own self): SwitchSome<F, I, I, U> {
-		SwitchSome<F, I, I, U> { up = self, select = |inner| inner }
+		SwitchSome<F, I, I, U> { up = self, select = |inner| inner, site = caller() }
 	}
 }
 
