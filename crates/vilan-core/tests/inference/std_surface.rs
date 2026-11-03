@@ -677,19 +677,20 @@ fn i8_hash_map_get_or_insert_stores_the_key_it_was_given() {
     );
 }
 
-// --- B689 / M182: a `HashMap` read and written in place --------------------
+// --- B689 / M182 / M191: a `HashMap` read and written in place -------------
 //
-// proposal/hash-map-lend.md §4. `peek` lends the slot under a key as an
-// `&Option<V>`, `modify` as an `&mut Option<V>` whose final state the map
-// takes on (None removes, Some under an absent key inserts LAST, a present key
-// keeps its place), and `update` is M182's grouping idiom over `modify`. The
-// native leg of 1-4 is `native_differential`'s
+// proposal/hash-map-lend.md §4 and §10. `peek` lends the slot under a key as an
+// `&Option<V>`; `slot` answers the slot ITSELF, an `&mut Option<V>` the map
+// keeps (None is a tombstone every read skips, Some under an absent key lands
+// LAST, a present key keeps its place), and `Option::get_or_insert` fills it and
+// answers the payload in place — M182's grouping idiom with no handle type. The
+// native leg is `native_differential`'s
 // `b689_hash_map_lends_in_place_on_both_backends`.
 
 /// §4.1: `peek` on an absent key reads `&None`; on a present key it reads the
-/// stored value, and a write through `modify` is what the next `peek` sees.
+/// stored value, and a write through `slot` is what the next `peek` sees.
 #[test]
-fn b689_peek_reads_the_slot_and_sees_a_write_through_modify() {
+fn m191_peek_reads_the_slot_and_sees_a_write_through_slot() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -700,12 +701,7 @@ fn b689_peek_reads_the_slot_and_sees_a_write_through_modify() {
             print(scores.peek("ada", |slot| slot.is_none()));
             scores.insert("ada", [1, 2]);
             print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
-            scores.modify("ada", |slot: &mut Option<List<i32>>| {
-                match &mut slot {
-                    Some(let list) => list.push(3),
-                    None => {},
-                }
-            });
+            scores.slot("ada").get_or_insert([]).push(3);
             print(scores.peek("ada", |slot| slot.map_or(|list| list.len(), 0usize)));
             print(scores.get("ada").unwrap_or([]));
             print(scores.peek("alan", |slot| slot.is_some()));
@@ -715,11 +711,11 @@ fn b689_peek_reads_the_slot_and_sees_a_write_through_modify() {
     );
 }
 
-/// §4.2: `modify` leaving the slot `None` removes the key — `contains_key`,
-/// `len`, `keys()`, `values()` and `entries()` all agree it is gone — and its
-/// answer is the writer's.
+/// §10 rule 1: a slot left `None` is a TOMBSTONE — `contains_key`, `len`,
+/// `get`, `keys()`, `values()` and `entries()` all agree the key is gone the
+/// moment the view leaves it so, before any later write settles it.
 #[test]
-fn b689_modify_leaving_none_removes_the_key() {
+fn m191_a_slot_left_none_is_a_tombstone_every_read_skips() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -730,11 +726,7 @@ fn b689_modify_leaving_none_removes_the_key() {
             ages.insert("ada", 36);
             ages.insert("alan", 41);
             ages.insert("grace", 85);
-            let was = ages.modify("alan", |slot| {
-                let held = slot.unwrap_or(0);
-                slot = None;
-                held
-            });
+            let was = ages.slot("alan").take();
             print(was);
             print(ages.contains_key("alan"));
             print(ages.len());
@@ -742,17 +734,19 @@ fn b689_modify_leaving_none_removes_the_key() {
             print(ages.values());
             print(ages.entries().len());
             print(ages.get("alan").is_none());
+            print(ages.peek("alan", |slot| slot.is_none()));
         }
         "#,
-        "41\nfalse\n2\n[\"ada\", \"grace\"]\n[36, 85]\n2\ntrue\n",
+        "Some(41)\nfalse\n2\n[\"ada\", \"grace\"]\n[36, 85]\n2\ntrue\ntrue\n",
     );
 }
 
-/// §4.3: `modify` making the slot `Some` under an ABSENT key inserts it last;
-/// under a PRESENT key the key keeps its position whatever is written; a `None`
-/// left under an absent key inserts nothing.
+/// §10 rules 2-3: a slot made `Some` under an ABSENT key lands last; under a
+/// PRESENT key the key keeps its position whatever is written; a `None` left
+/// under an absent key inserts nothing; a key emptied through its slot and
+/// written again goes LAST (the next write settled the tombstone).
 #[test]
-fn b689_modify_inserts_an_absent_key_last_and_keeps_a_present_keys_place() {
+fn m191_a_slot_inserts_an_absent_key_last_and_keeps_a_present_keys_place() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -762,36 +756,30 @@ fn b689_modify_inserts_an_absent_key_last_and_keeps_a_present_keys_place() {
             mut ages: HashMap<str, i32> = HashMap::new();
             ages.insert("ada", 36);
             ages.insert("alan", 41);
-            ages.modify("grace", |slot| {
-                slot = Some(85);
-            });
-            ages.modify("ada", |slot| {
-                slot = Some(37);
-            });
-            ages.modify("linus", |slot| {});
+            ages.slot("grace") = Some(85);
+            ages.slot("ada") = Some(37);
+            print(ages.slot("linus").is_none());
             print(ages.keys());
             print(ages.values());
             print(ages.contains_key("linus"));
-            ages.modify("alan", |slot| {
-                slot = None;
-            });
-            ages.modify("alan", |slot| {
-                slot = Some(42);
-            });
+            print(ages.len());
+            let _gone = ages.slot("alan").take();
+            ages.slot("alan") = Some(42);
             for entry in ages.entries() {
                 print(i"{entry.0} {entry.1}");
             }
         }
         "#,
-        "[\"ada\", \"alan\", \"grace\"]\n[37, 41, 85]\nfalse\nada 37\ngrace 85\nalan 42\n",
+        "true\n[\"ada\", \"alan\", \"grace\"]\n[37, 41, 85]\nfalse\n3\nada 37\ngrace 85\nalan 42\n",
     );
 }
 
-/// §4.4: `update` on a miss inserts `missing` and then applies `change`; on a
-/// hit only `change` runs — and `missing`, being `lazy`, is not evaluated at all
-/// there (its maker counts its runs through a `Shared`).
+/// `Option::get_or_insert` makes its value only on a miss — `lazy`, so on a
+/// hit the maker is not evaluated at all (it counts its runs through a
+/// `Shared`) — and the push lands in place either way; on a scalar payload the
+/// answer is a place too (`+= 1` counts).
 #[test]
-fn m182_update_makes_missing_only_on_a_miss_and_changes_in_place() {
+fn m191_get_or_insert_makes_its_value_only_on_a_miss_and_changes_in_place() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -806,26 +794,38 @@ fn m182_update_makes_missing_only_on_a_miss_and_changes_in_place() {
         fun main() {
             let runs = Shared::new(0);
             mut groups: HashMap<str, List<i32>> = HashMap::new();
-            groups.update("a", fresh(runs), |list| list.push(1));
-            groups.update("a", fresh(runs), |list| list.push(2));
-            groups.update("b", fresh(runs), |list| list.push(3));
-            groups.update("a", fresh(runs), |list| list.push(4));
+            groups.slot("a").get_or_insert(fresh(runs)).push(1);
+            groups.slot("a").get_or_insert(fresh(runs)).push(2);
+            groups.slot("b").get_or_insert(fresh(runs)).push(3);
+            groups.slot("a").get_or_insert(fresh(runs)).push(4);
             print(groups.get("a").unwrap_or([]));
             print(groups.get("b").unwrap_or([]));
             print(groups.keys());
             print(runs.read());
+            mut counts: HashMap<str, i32> = HashMap::new();
+            for word in ["to", "be", "or", "not", "to", "be"] {
+                counts.slot(word).get_or_insert(0) += 1;
+            }
+            print(counts.entries());
+            mut cached: Option<List<i32>> = None;
+            cached.get_or_insert([7]).push(8);
+            cached.get_or_insert([9]).push(10);
+            print(cached);
         }
         "#,
-        "[0, 1, 2, 4]\n[0, 3]\n[\"a\", \"b\"]\n2\n",
+        "[0, 1, 2, 4]\n[0, 3]\n[\"a\", \"b\"]\n2\n[(\"to\", 2), (\"be\", 2), (\"or\", 1), (\"not\", 1)]\nSome([7, 8, 10])\n",
     );
 }
 
-/// M182's grouping idiom, the item's own repro rewritten on `update`: rows
-/// into each key's list in insertion order, every push landing in place.
+/// M182's grouping idiom on the M191 spelling, the item's own repro: rows into
+/// each key's list in insertion order, every push landing in place — O(1) per
+/// push, pinned as CODEGEN SHAPE: the loop pushes onto what
+/// `slot(..).get_or_insert(..)` answers, and on a hit neither of those two
+/// copies the list (on a miss `slot` copies the KEY the table keeps and
+/// `get_or_insert` the `[]` it stores).
 #[test]
-fn m182_update_groups_rows_under_their_keys() {
-    assert_compiles_and_runs(
-        r#"
+fn m182_the_entry_idiom_groups_rows_under_their_keys_in_place() {
+    let source = r#"
         import std::io::print;
         import std::hash_map::HashMap;
 
@@ -833,7 +833,7 @@ fn m182_update_groups_rows_under_their_keys() {
             mut groups: HashMap<i32, List<i32>> = HashMap::new();
             mut index = 0;
             for index < 10 {
-                groups.update(index % 3, [], |list| list.push(index));
+                groups.slot(index % 3).get_or_insert([]).push(index);
                 index += 1;
             }
             for entry in groups.entries() {
@@ -841,13 +841,67 @@ fn m182_update_groups_rows_under_their_keys() {
                 print(entry.1);
             }
         }
+        "#;
+    assert_compiles_and_runs(source, "0\n[0, 3, 6, 9]\n1\n[1, 4, 7]\n2\n[2, 5, 8]\n");
+    let js = compile(source).expect("the grouping compiles");
+    let push = js
+        .lines()
+        .find(|line| line.contains(".push(index)"))
+        .unwrap_or_else(|| panic!("the loop pushes in place:\n{js}"));
+    assert!(
+        push.contains("get_or_insert") && push.contains("slot(groups"),
+        "the push lands on the slot's payload:\n{push}"
+    );
+    assert!(
+        !push.contains("__clone") && !push.contains("insert(groups"),
+        "no copy out and no put-back:\n{push}"
+    );
+    for name in ["slot", "__nmap_slot"] {
+        let body = emitted_function(&js, name).replace("__clone(key", "");
+        assert!(
+            !body.contains("__clone"),
+            "`{name}` copies the value:\n{body}"
+        );
+    }
+    // `get_or_insert` copies the value it MADE, once, on the miss that stores
+    // it (a forced `lazy` is the caller's to read again); the hit path, which
+    // every push after the first takes, copies nothing.
+    let get_or_insert = emitted_function(&js, "get_or_insert");
+    for line in get_or_insert
+        .lines()
+        .filter(|line| line.contains("__clone"))
+    {
+        assert!(
+            line.contains("__replace(self, [ 0, "),
+            "`get_or_insert` copies off the miss:\n{get_or_insert}"
+        );
+    }
+}
+
+/// The view's second-class rule (spec memory.md §6.5, rule 4): a slot held in
+/// a local is a view of the map, so writing the map while it lives is refused
+/// — the existing view refusal, nothing new.
+#[test]
+fn m191_a_slot_held_across_a_write_of_its_map_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        fun main() {
+            mut map: HashMap<str, i32> = HashMap::new();
+            map.insert("a", 1);
+            let held = map.slot("a");
+            map.insert("b", 2);
+            print(held.take());
+        }
         "#,
-        "0\n[0, 3, 6, 9]\n1\n[1, 4, 7]\n2\n[2, 5, 8]\n",
+        "while a view into it is live",
     );
 }
 
-/// Value semantics through the two tables: `insert` KEEPS a copy of the key
-/// and the value it is given (`NativeMap::insert` takes `own value`, as
+/// Value semantics through the one table: `insert` KEEPS a copy of the key
+/// and the value it is given (`NativeMap::insert` takes `own key, own value`, as
 /// `List::push` does), so the caller's later writes to its own bindings do not
 /// reach the map — nor, through the same external, a `HashSet`'s member, which
 /// the JS backend aliased before. A value copied OUT by `get` is the caller's.
@@ -886,8 +940,9 @@ fn b689_insert_keeps_copies_of_what_it_is_given() {
 }
 
 /// §4.5, the CODEGEN SHAPE of B689's repro: the store's keyed step lends the
-/// map's slot — `at`'s two closures call `peek`/`modify`, which hand the slot
-/// to `__map_lend`/`__map_lend_mut`, and NONE of the four clones anything. A
+/// map's slot — `at`'s two closures call `peek`/`slot` (M191), which reach the
+/// slot through `__nmap_lend`/`__nmap_slot`, and NONE of the four clones the
+/// value. A
 /// read through `at(1).some().title().get()` copies only the leaf (the
 /// timings are the lane report's: a timing is not a gate).
 #[test]
@@ -923,8 +978,7 @@ fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
     let at = emitted_function(&js, "at");
     // The emitter suffixes a name another function already took (`peek2`),
     // so the two the step calls are read off its own body.
-    let callee = |method: &str| -> String {
-        let marker = "(held, key, f)";
+    let callee = |method: &str, marker: &str| -> String {
         at.match_indices(marker)
             .map(|(end, _)| {
                 let head = &at[..end];
@@ -936,12 +990,14 @@ fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
             .find(|name| name.starts_with(method))
             .unwrap_or_else(|| panic!("the keyed step lends through `{method}`:\n{at}"))
     };
-    let (peek, modify) = (callee("peek"), callee("modify"));
-    for name in ["at", &peek, &modify, "__map_lend", "__map_lend_mut"] {
+    let (peek, slot) = (
+        callee("peek", "(held, key, f)"),
+        callee("slot", "(held, key))"),
+    );
+    for name in ["at", &peek, &slot, "__nmap_lend", "__nmap_slot"] {
         let body = emitted_function(&js, name);
-        // The one copy on the path is of the KEY, and only when `modify` makes
-        // a key the map did not hold (the keys table keeps its own, as
-        // `insert` does); the value is never copied.
+        // The one copy on the path is of the KEY, which `slot` hands the table
+        // to keep on a miss (as `insert` does); the value is never copied.
         let without_the_new_key = body.replace("__clone(key)", "");
         assert!(
             !without_the_new_key.contains("__clone"),
@@ -949,12 +1005,12 @@ fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
         );
     }
     assert!(
-        emitted_function(&js, &peek).contains("__map_lend("),
+        emitted_function(&js, &peek).contains("__nmap_lend("),
         "`peek` is the in-place lend"
     );
     assert!(
-        emitted_function(&js, &modify).contains("__map_lend_mut("),
-        "`modify` is the in-place write"
+        emitted_function(&js, &slot).contains("__nmap_slot("),
+        "`slot` is the in-place write"
     );
 }
 

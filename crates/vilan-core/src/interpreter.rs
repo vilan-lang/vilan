@@ -1668,7 +1668,10 @@ impl<'a> Interpreter<'a> {
             }
             "__dbg_set" => {
                 let open = take(0);
-                let items = map_or_set_values(&take(1))?;
+                let items = nmap_held_entries(&take(1))?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect();
                 let show = take(2);
                 self.dbg_members(
                     open,
@@ -1682,14 +1685,11 @@ impl<'a> Interpreter<'a> {
             }
             "__dbg_map" => {
                 let open = take(0);
-                let keys = map_or_set_values(&take(1))?;
-                let values = map_or_set_values(&take(2))?;
-                let (show_key, show_value) = (take(3), take(4));
-                let items = keys
+                let items = nmap_held_entries(&take(1))?
                     .into_iter()
-                    .zip(values)
                     .map(|(key, value)| array(vec![key, value]))
                     .collect();
+                let (show_key, show_value) = (take(2), take(3));
                 self.dbg_members(
                     open,
                     items,
@@ -2550,42 +2550,118 @@ impl<'a> Interpreter<'a> {
                     None => Ok(option_none()),
                 }
             }
-            // B689: the slot as an `Option` view ALIASING the stored value —
-            // `Value`'s aggregates are `Rc`-shared, so `value.clone()` is the
-            // in-place view the emitted helper hands out, never a deep copy.
-            "__map_lend" => {
-                let map = expect_map(&take(0))?;
-                let key = Key::of(&take(1))?;
-                let read = take(2);
-                let view = match map.borrow().get(&key) {
-                    Some((_, value)) => option_some(value.clone()),
-                    None => option_none(),
-                };
-                self.call_value(&read, vec![view])
-            }
-            // The writable twin: the table is written back from the view once
-            // `write` returns — `Some` sets the slot (a present key keeps its
-            // position, an absent one goes last), `None` removes the key.
-            "__map_lend_mut" => {
-                let map = expect_map(&take(0))?;
-                let key_value = take(1);
-                let key = Key::of(&key_value)?;
-                let write = take(2);
-                let view = match map.borrow().get(&key) {
-                    Some((_, value)) => option_some(value.clone()),
-                    None => option_none(),
-                };
-                let answer = self.call_value(&write, vec![view.clone()])?;
-                let slot = array_items(&view)?;
-                match (slot.first(), slot.get(1)) {
-                    (Some(Value::Number(tag)), Some(value)) if *tag == 0.0 => {
-                        map.borrow_mut().insert(key, (key_value, value.clone()));
+            // M191 (hash-map-lend.md §10): `NativeMap<K, V>` is the pair `[ map,
+            // pending ]`, the `Map` from each hash to the entry `[ key, slot ]`,
+            // the slot the `Option` array itself (`Value`'s aggregates are
+            // `Rc`-shared, so handing it out IS the in-place view). Mirrors the
+            // `__nmap_*` helpers in `helper_source`, settle rule and all.
+            "__nmap_insert" => {
+                let (pair, map) = nmap_parts(&take(0))?;
+                nmap_settle(&pair, &map)?;
+                let hash = take(1);
+                let key = Key::of(&hash)?;
+                let (key_value, value) = (take(2), take(3));
+                let existing = map.borrow().get(&key).map(|(_, entry)| entry.clone());
+                match existing {
+                    Some(entry) => {
+                        let entry = expect_array(&entry)?;
+                        let mut entry = entry.borrow_mut();
+                        entry.clear();
+                        entry.push(key_value);
+                        entry.push(option_some(value));
                     }
-                    _ => {
-                        map.borrow_mut().shift_remove(&key);
+                    None => {
+                        let entry = array(vec![key_value, option_some(value)]);
+                        map.borrow_mut().insert(key, (hash, entry));
                     }
                 }
-                Ok(answer)
+                Ok(Value::Undefined)
+            }
+            "__nmap_get" | "__nmap_key" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let key = Key::of(&take(1))?;
+                let held = map
+                    .borrow()
+                    .get(&key)
+                    .and_then(|(_, entry)| nmap_held(entry));
+                Ok(match held {
+                    Some((key_value, value)) => option_some(deep_clone(if name == "__nmap_get" {
+                        &value
+                    } else {
+                        &key_value
+                    })),
+                    None => option_none(),
+                })
+            }
+            "__nmap_lend" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let key = Key::of(&take(1))?;
+                let read = take(2);
+                let slot = match map.borrow().get(&key) {
+                    Some((_, entry)) => nmap_slot_of(entry)?,
+                    None => option_none(),
+                };
+                self.call_value(&read, vec![slot])
+            }
+            "__nmap_slot" => {
+                let (pair, map) = nmap_parts(&take(0))?;
+                nmap_settle(&pair, &map)?;
+                let hash = take(1);
+                let key = Key::of(&hash)?;
+                let key_value = take(2);
+                let existing = map.borrow().get(&key).map(|(_, entry)| entry.clone());
+                let entry = match existing {
+                    Some(entry) => entry,
+                    None => {
+                        let entry = array(vec![key_value, option_none()]);
+                        map.borrow_mut().insert(key, (hash.clone(), entry.clone()));
+                        entry
+                    }
+                };
+                if let Some(pending) = pair.borrow_mut().get_mut(1) {
+                    *pending = hash;
+                }
+                nmap_slot_of(&entry)
+            }
+            "__nmap_has" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let key = Key::of(&take(1))?;
+                let held = map
+                    .borrow()
+                    .get(&key)
+                    .is_some_and(|(_, entry)| nmap_held(entry).is_some());
+                Ok(Value::Bool(held))
+            }
+            "__nmap_remove" => {
+                let (pair, map) = nmap_parts(&take(0))?;
+                nmap_settle(&pair, &map)?;
+                let key = Key::of(&take(1))?;
+                map.borrow_mut().shift_remove(&key);
+                Ok(Value::Undefined)
+            }
+            "__nmap_len" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let held = map
+                    .borrow()
+                    .values()
+                    .filter(|(_, entry)| nmap_held(entry).is_some())
+                    .count();
+                Ok(Value::Number(held as f64))
+            }
+            "__nmap_hashes" | "__nmap_keys" | "__nmap_values" => {
+                let (_, map) = nmap_parts(&take(0))?;
+                let walked = map
+                    .borrow()
+                    .values()
+                    .filter_map(|(hash, entry)| {
+                        nmap_held(entry).map(|(key_value, value)| match name {
+                            "__nmap_hashes" => hash.clone(),
+                            "__nmap_keys" => deep_clone(&key_value),
+                            _ => deep_clone(&value),
+                        })
+                    })
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(walked))))
             }
             "__map_keys" => {
                 let map = expect_map(&take(0))?;
@@ -2605,8 +2681,8 @@ impl<'a> Interpreter<'a> {
                     .collect();
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
-            // `[...set[0].values()]` — the `Set` struct is `[table]`; iterate the
-            // backing map's stored originals by reference (matching the spread).
+            // The `Set` struct is `[table]`; iterate the table's held KEYS — the
+            // stored originals, by reference (matching the emitted helper).
             "__set_iter" => {
                 let set = take(0);
                 let Value::Array(elements) = &set else {
@@ -2617,13 +2693,11 @@ impl<'a> Interpreter<'a> {
                     .first()
                     .cloned()
                     .unwrap_or(Value::Undefined);
-                let map = expect_map(&table)?;
-                let values = map
-                    .borrow()
-                    .values()
-                    .map(|(_, value)| value.clone())
+                let members = nmap_held_entries(&table)?
+                    .into_iter()
+                    .map(|(key, _)| key)
                     .collect();
-                Ok(Value::Array(Rc::new(RefCell::new(values))))
+                Ok(Value::Array(Rc::new(RefCell::new(members))))
             }
             // The externally-tagged enum discriminator (mirrors the
             // `__json_tag` codegen helper). A116: everything that is neither a
@@ -4177,19 +4251,75 @@ fn array_items<'a>(value: &Value<'a>) -> Result<Vec<Value<'a>>, Failure> {
 }
 
 /// `Array.from(table.values())` over a `Map` or a `Set`.
-fn map_or_set_values<'a>(value: &Value<'a>) -> Result<Vec<Value<'a>>, Failure> {
-    match value {
-        Value::Map(map) => Ok(map
-            .borrow()
-            .values()
-            .map(|(_, value)| value.clone())
-            .collect()),
-        Value::Set(set) => Ok(set.borrow().values().cloned().collect()),
-        other => Err(Failure::internal(format!(
-            "expected a Map or a Set, got {}",
-            type_name(other)
-        ))),
+/// A `NativeMap` table's halves (M191): the `[ map, pending ]` pair and its map.
+#[allow(clippy::type_complexity)]
+fn nmap_parts<'a>(
+    table: &Value<'a>,
+) -> Result<
+    (
+        Rc<RefCell<Vec<Value<'a>>>>,
+        Rc<RefCell<IndexMap<Key, (Value<'a>, Value<'a>)>>>,
+    ),
+    Failure,
+> {
+    let pair = expect_array(table)?;
+    let map = expect_map(&pair.borrow().first().cloned().unwrap_or(Value::Undefined))?;
+    Ok((pair, map))
+}
+
+/// An entry's `slot` — the `Option` array itself, shared (the in-place view).
+fn nmap_slot_of<'a>(entry: &Value<'a>) -> Result<Value<'a>, Failure> {
+    Ok(array_items(entry)?
+        .get(1)
+        .cloned()
+        .unwrap_or_else(option_none))
+}
+
+/// An entry's `(key, value)` when its slot is `Some` — `None` for a tombstone.
+fn nmap_held<'a>(entry: &Value<'a>) -> Option<(Value<'a>, Value<'a>)> {
+    let entry = array_items(entry).ok()?;
+    let slot = array_items(entry.get(1)?).ok()?;
+    match (slot.first(), slot.get(1)) {
+        (Some(Value::Number(tag)), Some(value)) if *tag == 0.0 => {
+            Some((entry.first()?.clone(), value.clone()))
+        }
+        _ => None,
     }
+}
+
+/// The table's held entries in insertion order, by reference.
+fn nmap_held_entries<'a>(table: &Value<'a>) -> Result<Vec<(Value<'a>, Value<'a>)>, Failure> {
+    let (_, map) = nmap_parts(table)?;
+    let held = map
+        .borrow()
+        .values()
+        .filter_map(|(_, entry)| nmap_held(entry))
+        .collect();
+    Ok(held)
+}
+
+/// The settle every write runs first: the pending slot, still `None`, loses
+/// its key.
+fn nmap_settle<'a>(
+    pair: &Rc<RefCell<Vec<Value<'a>>>>,
+    map: &Rc<RefCell<IndexMap<Key, (Value<'a>, Value<'a>)>>>,
+) -> Result<(), Failure> {
+    let pending = pair.borrow().get(1).cloned().unwrap_or(Value::Undefined);
+    if matches!(pending, Value::Undefined) {
+        return Ok(());
+    }
+    if let Some(slot) = pair.borrow_mut().get_mut(1) {
+        *slot = Value::Undefined;
+    }
+    let key = Key::of(&pending)?;
+    let tombstone = map
+        .borrow()
+        .get(&key)
+        .is_some_and(|(_, entry)| nmap_held(entry).is_none());
+    if tombstone {
+        map.borrow_mut().shift_remove(&key);
+    }
+    Ok(())
 }
 
 /// `__dbg_group(open, close, padded, entries, fill)`: `{ o, c, p, e, f }`.

@@ -22,6 +22,30 @@ function __list_get(list, index) {
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_len(table) {
+	const hash = table[1];
+	if (hash !== undefined) {
+		const entry = table[0].get(hash);
+		if (entry !== undefined && entry[1][0] === 1) return table[0].size - 1;
+	}
+	return table[0].size;
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
+}
 function __panic(message, location) {
 	const error = new Error(message);
 	error.name = "panicked at " + location;
@@ -50,9 +74,8 @@ function hash2(self) {
 	return __hash(self);
 }
 function new2() {
-	const keys = new Map();
-	const values = new Map();
-	return [ keys, values ];
+	const table = [ new Map(), undefined ];
+	return [ table ];
 }
 function fresh_id() {
 	const id = next_subscriber_id.v;
@@ -338,9 +361,7 @@ function new7(value, caller) {
 	return new5(value, caller);
 }
 function insert(self, key, value) {
-	const hash3 = hash(key);
-	self[0].set(hash3, __clone(key));
-	self[1].set(hash3, __clone(value));
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
 function notify2(self, $b) {
 	const traced = tracing.v;
@@ -389,7 +410,7 @@ function update2(self, mutate, $a, caller) {
 	notify2(self, $a);
 }
 function len(self) {
-	return self[1].size;
+	return __nmap_len(self[0]);
 }
 function update3(self, mutate, $a, caller) {
 	if (tracing.v) {

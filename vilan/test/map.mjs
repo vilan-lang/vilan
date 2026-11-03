@@ -1,3 +1,7 @@
+function __at(list, index, location) {
+	if (index >= 0 && index < list.length) return list[index];
+	throw __panic("index out of bounds: the length is " + list.length + " but the index is " + index, location);
+}
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
@@ -7,14 +11,59 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
 }
-function __map_keys(map) {
-	return [ ...map.keys() ].map(__clone);
+function __nmap_has(table, hash) {
+	if (hash !== table[1]) return table[0].has(hash);
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0;
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_keys(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[0]));
+	return out;
+}
+function __nmap_len(table) {
+	const hash = table[1];
+	if (hash !== undefined) {
+		const entry = table[0].get(hash);
+		if (entry !== undefined && entry[1][0] === 1) return table[0].size - 1;
+	}
+	return table[0].size;
+}
+function __nmap_remove(table, hash) {
+	__nmap_settle(table);
+	table[0].delete(hash);
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
+}
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[1][1]));
+	return out;
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function hash(self) {
 	return __hash(self);
@@ -26,23 +75,20 @@ function eq(self, b) {
 	return self === b;
 }
 function new2() {
-	const keys2 = new Map();
-	const values2 = new Map();
-	return [ keys2, values2 ];
+	const table = [ new Map(), undefined ];
+	return [ table ];
 }
 function insert(self, key2, value2) {
-	const hash3 = hash(key2);
-	self[0].set(hash3, __clone(key2));
-	self[1].set(hash3, __clone(value2));
+	__nmap_insert(self[0], hash(key2), __clone(key2), __clone(value2));
 }
 function len(self) {
-	return self[1].size;
+	return __nmap_len(self[0]);
 }
 function contains_key(self, key2) {
-	return self[1].has(hash(key2));
+	return __nmap_has(self[0], hash(key2));
 }
 function get(self, key2) {
-	return __map_get(self[1], hash(key2));
+	return __nmap_get(self[0], hash(key2));
 }
 function unwrap_or(self, fallback) {
 	const $a = self;
@@ -60,52 +106,36 @@ function is_some(self) {
 	return $c[0] === 0;
 }
 function remove(self, key2) {
-	const hash3 = hash(key2);
-	self[0].delete(hash3);
-	self[1].delete(hash3);
+	__nmap_remove(self[0], hash(key2));
 }
 function is_empty(self) {
 	return len(self) === 0;
 }
 function insert2(self, key2, value2) {
-	const hash3 = hash2(key2);
-	self[0].set(hash3, __clone(key2));
-	self[1].set(hash3, __clone(value2));
+	__nmap_insert(self[0], hash2(key2), __clone(key2), __clone(value2));
 }
 function get2(self, key2) {
-	return __map_get(self[1], hash2(key2));
+	return __nmap_get(self[0], hash2(key2));
 }
 function keys(self) {
-	return __map_values(self[0]);
+	return __nmap_keys(self[0]);
 }
 function values(self) {
-	return __map_values(self[1]);
+	return __nmap_values(self[0]);
 }
 function entries(self) {
+	const keys2 = __nmap_keys(self[0]);
+	const values2 = __nmap_values(self[0]);
 	let result = [  ];
-	for (const hash3 of __map_keys(self[1])) {
-		const $f = __map_get(self[0], hash3);
-		let $g = null;
-		if ($f[0] === 0) {
-			const key2 = $f[1];
-			const $h = __map_get(self[1], hash3);
-			let $i = null;
-			if ($h[0] === 0) {
-				const value2 = $h[1];
-				$i = result.push([ key2, value2 ]);
-			} else {
-				$i = undefined;
-			}
-			$g = $i;
-		} else {
-			$g = undefined;
-		}
-		$g;
+	let index = 0;
+	while (index < keys2.length) {
+		result.push([ __clone(__at(keys2, index, "std/src/hash_map.vl:125:17")), __clone(__at(values2, index, "std/src/hash_map.vl:125:30")) ]);
+		index = index + 1;
 	}
 	return result;
 }
 function contains_value(self, value2) {
-	for (const held of __map_values(self[1])) {
+	for (const held of __nmap_values(self[0])) {
 		if (eq(held, value2)) {
 			return true;
 		}

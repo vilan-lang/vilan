@@ -2675,13 +2675,15 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              \treturn __dbg_group(open, \"}\", true, entries, fill);\n\
              }\n\
-             function __dbg_map(open, keys, values, showKey, showValue) {\n\
-             \tconst stored = Array.from(values.values());\n\
-             \tconst items = Array.from(keys.values(), (key, index) => [ key, stored[index] ]);\n\
+             function __dbg_map(open, table, showKey, showValue) {\n\
+             \tconst items = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) items.push([ entry[0], entry[1][1] ]);\n\
              \treturn __dbg_members(open, items, (entry) => [ __dbg_flat(showKey(entry[0])) + \" => \", showValue(entry[1]) ]);\n\
              }\n\
              function __dbg_set(open, table, show, fill) {\n\
-             \treturn __dbg_members(open, Array.from(table.values()), (item) => [ \"\", show(item) ], fill);\n\
+             \tconst items = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) items.push(entry[0]);\n\
+             \treturn __dbg_members(open, items, (item) => [ \"\", show(item) ], fill);\n\
              }\n\
              function __dbg_str(text) {\n\
              \tlet out = \"\\\"\";\n\
@@ -2866,23 +2868,115 @@ fn helper_source(name: &str) -> &'static str {
         "__map_get" => {
             "function __map_get(map, key) {\n\treturn map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];\n}"
         }
-        // `Map.lend(key, read)` / `Map.lend_mut(key, write)` (B689,
-        // hash-map-lend.md §3.1) — the slot under `key` as an `Option` view
-        // that ALIASES the stored value (no `__clone`: the `&`/`&mut`
-        // discipline is what makes the alias safe, as `descend`'s closures
-        // already rely on). After a write the table reflects the view: `Some`
-        // is set back (a present key keeps its position, an absent one goes
-        // last — a JS `Map`'s own `set`), `None` deletes the key.
-        "__map_lend" => {
-            "function __map_lend(map, key, read) {\n\treturn read(map.has(key) ? [ 0, map.get(key) ] : [ 1 ]);\n}"
+        // `NativeMap<K, V>` (M191, hash-map-lend.md §10): the table is the pair
+        // `[ map, pending ]` — a JS `Map` from the hash to the entry `[ key,
+        // slot ]`, the slot the `Option` array itself, so a view of it IS the
+        // stored object (`__replace`, `take`, `replace` write it in place); and
+        // the hash of the slot last lent by `slot`, which every write settles
+        // first (a slot still `None` loses its key). A pair rather than an
+        // expando on the `Map` so `__clone` (and the const-eval interpreter,
+        // and a const value) carry the mark as they carry any array slot. A
+        // `None` slot is a tombstone: every read below skips it.
+        "__nmap_settle" => {
+            "function __nmap_settle(table) {\n\
+             \tconst hash = table[1];\n\
+             \tif (hash === undefined) return;\n\
+             \ttable[1] = undefined;\n\
+             \tconst entry = table[0].get(hash);\n\
+             \tif (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);\n\
+             }"
         }
-        "__map_lend_mut" => {
-            "function __map_lend_mut(map, key, write) {\n\
-             \tconst view = map.has(key) ? [ 0, map.get(key) ] : [ 1 ];\n\
-             \tconst answer = write(view);\n\
-             \tif (view[0] === 0) map.set(key, view[1]);\n\
-             \telse map.delete(key);\n\
-             \treturn answer;\n\
+        // An overwrite keeps the entry and replaces its slot with a FRESH one
+        // (a copy taken out of the old slot stays what it was), unless the slot
+        // already holds this very value — a set's `void`, a scalar written
+        // again — where there is nothing to replace.
+        "__nmap_insert" => {
+            "function __nmap_insert(table, hash, key, value) {\n\
+             \t__nmap_settle(table);\n\
+             \tconst entry = table[0].get(hash);\n\
+             \tif (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);\n\
+             \telse {\n\
+             \t\tentry[0] = key;\n\
+             \t\tif (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];\n\
+             \t}\n\
+             }"
+        }
+        "__nmap_get" => {
+            "function __nmap_get(table, hash) {\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];\n\
+             }"
+        }
+        "__nmap_key" => {
+            "function __nmap_key(table, hash) {\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[0]) ] : [ 1 ];\n\
+             }"
+        }
+        // The slot IN PLACE, no `__clone`: the `&` discipline is what makes the
+        // alias safe, as `descend`'s closures already rely on.
+        "__nmap_lend" => {
+            "function __nmap_lend(table, hash, read) {\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn read(entry !== undefined ? entry[1] : [ 1 ]);\n\
+             }"
+        }
+        "__nmap_slot" => {
+            "function __nmap_slot(table, hash, key) {\n\
+             \t__nmap_settle(table);\n\
+             \tlet entry = table[0].get(hash);\n\
+             \tif (entry === undefined) {\n\
+             \t\tentry = [ key, [ 1 ] ];\n\
+             \t\ttable[0].set(hash, entry);\n\
+             \t}\n\
+             \ttable[1] = hash;\n\
+             \treturn entry[1];\n\
+             }"
+        }
+        // Only the pending slot can be a tombstone (every write settles the last
+        // one), so any other hash is a plain `has`.
+        "__nmap_has" => {
+            "function __nmap_has(table, hash) {\n\
+             \tif (hash !== table[1]) return table[0].has(hash);\n\
+             \tconst entry = table[0].get(hash);\n\
+             \treturn entry !== undefined && entry[1][0] === 0;\n\
+             }"
+        }
+        "__nmap_remove" => {
+            "function __nmap_remove(table, hash) {\n\
+             \t__nmap_settle(table);\n\
+             \ttable[0].delete(hash);\n\
+             }"
+        }
+        "__nmap_len" => {
+            "function __nmap_len(table) {\n\
+             \tconst hash = table[1];\n\
+             \tif (hash !== undefined) {\n\
+             \t\tconst entry = table[0].get(hash);\n\
+             \t\tif (entry !== undefined && entry[1][0] === 1) return table[0].size - 1;\n\
+             \t}\n\
+             \treturn table[0].size;\n\
+             }"
+        }
+        "__nmap_hashes" => {
+            "function __nmap_hashes(table) {\n\
+             \tconst out = [];\n\
+             \tfor (const [ hash, entry ] of table[0]) if (entry[1][0] === 0) out.push(hash);\n\
+             \treturn out;\n\
+             }"
+        }
+        "__nmap_keys" => {
+            "function __nmap_keys(table) {\n\
+             \tconst out = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[0]));\n\
+             \treturn out;\n\
+             }"
+        }
+        "__nmap_values" => {
+            "function __nmap_values(table) {\n\
+             \tconst out = [];\n\
+             \tfor (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[1][1]));\n\
+             \treturn out;\n\
              }"
         }
         // `Map.keys()`/`Map.values(): List<_>` — a fresh array snapshot (cloned, so
@@ -2892,8 +2986,15 @@ fn helper_source(name: &str) -> &'static str {
             "function __map_values(map) {\n\treturn [ ...map.values() ].map(__clone);\n}"
         }
         // `for x in set`: `HashSet` is a struct `[table]` over a `NativeMap`, so the
-        // elements are the backing map's stored originals, in insertion order (I1).
-        "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
+        // elements are the table's stored KEYS, the originals, in insertion order
+        // (I1, M191), tombstones skipped.
+        "__set_iter" => {
+            "function __set_iter(set) {\n\
+             \tconst out = [];\n\
+             \tfor (const entry of set[0][0].values()) if (entry[1][0] === 0) out.push(entry[0]);\n\
+             \treturn out;\n\
+             }"
+        }
         // proposal/lazy.md §5 — the memo cell, and the ONE forcing helper both
         // lazy positions share (a `lazy` parameter and a `lazy let` module
         // binding). `{ state, value, thunk }` is the paper's shape; `name` is
@@ -5493,8 +5594,11 @@ impl<'src> Transformer<'src> {
             // scalar `Shared::write()` is one too: it lowers to the `(base,
             // key)` pair, and the analyzer cannot classify it (the pointee is
             // generic until this monomorphization).
-            Some(Expr::Call(..)) => {
-                self.program.scalar_view_calls.contains(&id) || self.call_is_scalar_shared_write(id)
+            Some(Expr::Call(call_id)) => {
+                self.program.scalar_view_calls.contains(&id)
+                    || self.call_is_scalar_shared_write(id)
+                    || self.call_is_scalar_option_view(id)
+                    || self.generic_view_call_is_scalar(*call_id)
             }
             // B514: a value `if`/`match`/block evaluates to whatever its tail
             // leaves emit, so it IS a pair when they are — `*if c { &a } else {
@@ -5845,6 +5949,86 @@ impl<'src> Transformer<'src> {
     /// Whether a call expression is a `Shared::write()` with a scalar pointee.
     fn call_is_scalar_shared_write(&self, call_expr_id: Id) -> bool {
         self.is_shared_write(call_expr_id) && self.shared_write_pointee_is_scalar(call_expr_id)
+    }
+
+    /// Whether `call_id` calls a `borrows` function whose return is a view of a
+    /// bare GENERIC built by `Option::some_view` (`get_or_insert`, M191) that
+    /// this call instantiates at a scalar. B506 keeps every other generic view
+    /// return on the DECLARED pointee's protocol (the instance hands the value
+    /// back); `some_view` is the one producer that pairs per instance, so its
+    /// callers read the pair it makes.
+    fn generic_view_call_is_scalar(&self, call_id: Id) -> bool {
+        let Some(function_call) = self.program.function_calls.get(&call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return false;
+        };
+        let Some(function) = self.program.functions.get(target) else {
+            return false;
+        };
+        let tail_is_a_some_view = match self.program.entity_map.get(&function.body.1) {
+            Some(Expr::Call(tail_call)) => self
+                .program
+                .function_calls
+                .get(tail_call)
+                .and_then(|tail| self.program.entity_map.get(&tail.subject_id))
+                .is_some_and(|subject| {
+                    matches!(subject, Expr::Local(callee)
+                        if matches!(self.program.intrinsics.get(callee), Some(Intrinsic::OptionSomeView)))
+                }),
+            _ => false,
+        };
+        tail_is_a_some_view
+            && function.returns_mut_view
+            && self.call_result_resolves_to_scalar(call_id)
+    }
+
+    /// Whether a call expression is `Option::some_view()` (M191) over a scalar
+    /// payload — a view the intrinsic lowers to the `(slot, 1)` pair.
+    fn call_is_scalar_option_view(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let Some(function_call) = self.program.function_calls.get(call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(function_id)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return false;
+        };
+        matches!(
+            self.program.intrinsics.get(function_id),
+            Some(Intrinsic::OptionSomeView)
+        ) && self.option_payload_is_scalar(call_expr_id)
+    }
+
+    /// Whether the RECEIVER of the call `call_expr_id` is an `Option` whose
+    /// payload resolves, at this monomorphization, to a scalar view pointee.
+    fn option_payload_is_scalar(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let Some(receiver_type_id) = self
+            .program
+            .function_calls
+            .get(call_id)
+            .and_then(|function_call| function_call.argument_ids.first())
+            .and_then(|receiver_id| self.expr_type_id(*receiver_id))
+        else {
+            return false;
+        };
+        let Some(Type::Enum(_, arguments)) = self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(receiver_type_id))
+        else {
+            return false;
+        };
+        arguments
+            .first()
+            .is_some_and(|payload| self.resolves_to_scalar_view_pointee(*payload))
     }
 
     /// A `&`/`&mut` parameter whose declared pointee is a generic that resolves,
@@ -11178,6 +11362,21 @@ impl<'src> Transformer<'src> {
                     vec![args.next().unwrap_or(js::Node::Void)],
                 )
             }
+            // M191: the `Some` payload as a view — the payload object itself when
+            // it is an aggregate (a view of an aggregate IS the object), the
+            // `(slot, 1)` pair when it is a scalar, decided per instance as a
+            // scalar `Shared::write()` is.
+            Intrinsic::OptionSomeView => {
+                let slot = args.next().unwrap_or(js::Node::Void);
+                if call_expr_id.is_some_and(|id| self.option_payload_is_scalar(id)) {
+                    js::Node::Array(vec![slot, js::Node::Number("1".to_string(), None)])
+                } else {
+                    js::Node::PropertyIndex(
+                        Box::new(slot),
+                        Box::new(js::Node::Number("1".to_string(), None)),
+                    )
+                }
+            }
             Intrinsic::OptionReplace => {
                 self.used_helpers.insert("__option_replace");
                 js::Node::Call(
@@ -11315,20 +11514,6 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
-            Intrinsic::MapLend => {
-                self.used_helpers.insert("__map_lend");
-                js::Node::Call(
-                    Box::new(js::Node::Local("__map_lend".to_string())),
-                    args.collect(),
-                )
-            }
-            Intrinsic::MapLendMut => {
-                self.used_helpers.insert("__map_lend_mut");
-                js::Node::Call(
-                    Box::new(js::Node::Local("__map_lend_mut".to_string())),
-                    args.collect(),
-                )
-            }
             Intrinsic::MapContainsKey => native_method(&mut args, "has"),
             Intrinsic::MapRemove => native_method(&mut args, "delete"),
             Intrinsic::MapLen => js::Node::Property(
@@ -11348,6 +11533,56 @@ impl<'src> Transformer<'src> {
                 self.used_helpers.insert("__clone");
                 js::Node::Call(
                     Box::new(js::Node::Local("__map_values".to_string())),
+                    args.collect(),
+                )
+            }
+            // `NativeMap::new()` -> the `[ map, pending ]` pair (M191).
+            Intrinsic::KeyedNew => js::Node::Array(vec![
+                js::Node::Call(Box::new(js::Node::Local("new Map".to_string())), Vec::new()),
+                js::Node::Void,
+            ]),
+            Intrinsic::KeyedInsert
+            | Intrinsic::KeyedGet
+            | Intrinsic::KeyedKey
+            | Intrinsic::KeyedLend
+            | Intrinsic::KeyedSlot
+            | Intrinsic::KeyedContainsKey
+            | Intrinsic::KeyedRemove
+            | Intrinsic::KeyedLen
+            | Intrinsic::KeyedHashes
+            | Intrinsic::KeyedKeys
+            | Intrinsic::KeyedValues => {
+                let helper = match intrinsic {
+                    Intrinsic::KeyedInsert => "__nmap_insert",
+                    Intrinsic::KeyedGet => "__nmap_get",
+                    Intrinsic::KeyedKey => "__nmap_key",
+                    Intrinsic::KeyedLend => "__nmap_lend",
+                    Intrinsic::KeyedSlot => "__nmap_slot",
+                    Intrinsic::KeyedContainsKey => "__nmap_has",
+                    Intrinsic::KeyedRemove => "__nmap_remove",
+                    Intrinsic::KeyedLen => "__nmap_len",
+                    Intrinsic::KeyedHashes => "__nmap_hashes",
+                    Intrinsic::KeyedKeys => "__nmap_keys",
+                    _ => "__nmap_values",
+                };
+                self.used_helpers.insert(helper);
+                if matches!(
+                    intrinsic,
+                    Intrinsic::KeyedInsert | Intrinsic::KeyedSlot | Intrinsic::KeyedRemove
+                ) {
+                    self.used_helpers.insert("__nmap_settle");
+                }
+                if matches!(
+                    intrinsic,
+                    Intrinsic::KeyedGet
+                        | Intrinsic::KeyedKey
+                        | Intrinsic::KeyedKeys
+                        | Intrinsic::KeyedValues
+                ) {
+                    self.used_helpers.insert("__clone");
+                }
+                js::Node::Call(
+                    Box::new(js::Node::Local(helper.to_string())),
                     args.collect(),
                 )
             }
@@ -16069,10 +16304,20 @@ const RESERVED_NAMES: &[&str] = &[
     "__option_take",
     "__option_replace",
     "__map_get",
-    "__map_lend",
-    "__map_lend_mut",
     "__map_keys",
     "__map_values",
+    "__nmap_settle",
+    "__nmap_insert",
+    "__nmap_get",
+    "__nmap_key",
+    "__nmap_lend",
+    "__nmap_slot",
+    "__nmap_has",
+    "__nmap_remove",
+    "__nmap_len",
+    "__nmap_hashes",
+    "__nmap_keys",
+    "__nmap_values",
     "__task",
     "__Task",
     "__nursery_new",

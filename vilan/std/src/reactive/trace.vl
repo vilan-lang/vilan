@@ -30,7 +30,7 @@
 // `trace(true)` installs, so a program that never imports it carries none of it.
 import pkg::debug::Location;
 import pkg::hash::{ Hash, Hashable };
-import pkg::js::native_map::NativeMap;
+import pkg::js::hash_table::HashTable;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ Subscriber, TraceHooks, Turn, queue_wakes, trace_hooks, tracing, waking };
 import pkg::shared::Shared;
@@ -55,7 +55,7 @@ export fun trace(on: bool) {
 			placed = |id: i32, site: Location| note_placed(id, site),
 		};
 	} else {
-		queued_wakes.write() = NativeMap::new();
+		queued_wakes.write() = HashTable::new();
 	}
 	tracing.write() = on;
 }
@@ -89,16 +89,16 @@ let write_site: Shared<Option<Location>> = Shared::new(None);
 let running_wake: Shared<Option<str>> = Shared::new(None);
 
 /// Where each cell made under the trace was made, by its identity.
-let made_at: Shared<NativeMap<str>> = Shared::new(NativeMap::new());
+let made_at: Shared<HashTable<str>> = Shared::new(HashTable::new());
 
 /// Where each subscriber made under the trace was made (an `effect`, a `sub`, an
 /// `on_change`), by its id.
-let placed_at: Shared<NativeMap<str>> = Shared::new(NativeMap::new());
+let placed_at: Shared<HashTable<str>> = Shared::new(HashTable::new());
 
 /// Each queued wake's cause and task, oldest first, by turn and subscriber. A list,
 /// because a subscriber taken out with a wave can be queued again before that wave
 /// runs it: the run takes the oldest, a scrub the newest.
-let queued_wakes: Shared<NativeMap<List<QueuedWake>>> = Shared::new(NativeMap::new());
+let queued_wakes: Shared<HashTable<List<QueuedWake>>> = Shared::new(HashTable::new());
 
 /// The last task token minted.
 let trace_tokens: Shared<i32> = Shared::new(0);

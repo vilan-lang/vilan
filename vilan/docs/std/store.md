@@ -300,7 +300,7 @@ A collection field takes its declared shape — no derive to write:
   nobody else. `at(key).set(None)` removes the key, and `.some()` reaches into
   a present value. `insert(key, value)` and `remove(key)` are the same two
   writes. The step lends the map's slot IN PLACE on both backends
-  (`HashMap::peek` / `modify`): a read of one field through
+  (`HashMap::peek` / `slot`): a read of one field through
   `at(key).some().title()` copies only that field, however large the value it
   sits in, and a write through `at(key)` lands where the value is — no copy out
   and back in.

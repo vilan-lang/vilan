@@ -10,7 +10,7 @@
 import pkg::hash::{ Hash, Hashable };
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
-import pkg::js::native_map::NativeMap;
+import pkg::js::hash_table::HashTable;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::delta::{ DeltaCursor, DeltaLog, DeltaSource, SetOp };
 import pkg::reactive::hash_map_cell::KeySlots;
@@ -199,7 +199,7 @@ export fun apply_set_ops<T: Hashable>(cell: HashSetCell<T>, ops: List<SetOp<T>>)
 	if reset {
 		cell.slots.wake_all();
 	} else {
-		mut named: NativeMap<bool> = NativeMap::new();
+		mut named: HashTable<bool> = HashTable::new();
 		for op in recorded {
 			match op {
 				SetOp::Add(let value) => wake_once(cell.slots, &mut named, value.hash()),
@@ -212,7 +212,7 @@ export fun apply_set_ops<T: Hashable>(cell: HashSetCell<T>, ops: List<SetOp<T>>)
 }
 
 /// Wake `hash`'s slot unless `named` says this batch already did.
-fun wake_once(slots: KeySlots, named: &mut NativeMap<bool>, hash: Hash) {
+fun wake_once(slots: KeySlots, named: &mut HashTable<bool>, hash: Hash) {
 	if !named.contains_key(hash) {
 		named.insert(hash, true);
 		slots.wake(hash);

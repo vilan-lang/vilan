@@ -6,13 +6,11 @@
 // the end. Keys are compared **by value** — a
 // scalar or a backed enum keys directly (the enum IS its backing value), and a
 // struct or unbacked/payload enum keys once it derives `Hashable` (I1). Each key
-// is turned into a canonical `Hash` via `key.hash()`, which keys the two
-// underlying native maps: `keys` holds the original key, so `keys()` returns
-// real `K`s and mutating the original afterward can't desync the map (value
-// semantics snapshot it on insert), and `values` holds the value, so a value is
-// a slot of its own that `peek` and `modify` reach IN PLACE (B689,
-// proposal/hash-map-lend.md §2). Every write touches both tables inside one
-// method, which is what keeps them in step.
+// is turned into a canonical `Hash` via `key.hash()`, which keys ONE native
+// table (M191, proposal/hash-map-lend.md §10): it holds the original key, so
+// `keys()` returns real `K`s and mutating the original afterward can't desync
+// the map (value semantics snapshot it on insert), beside an `Option<V>` slot
+// that `peek` reads and `slot` hands out IN PLACE.
 import pkg::compare::{ Eq, PartialEq };
 import pkg::debug::Debug;
 import pkg::default::Default;
@@ -23,101 +21,80 @@ import pkg::option::Option::{ self, None, Some };
 export *;
 
 struct HashMap<K: Hashable, V> {
-	keys: NativeMap<K>,
-	values: NativeMap<V>,
+	table: NativeMap<K, V>,
 }
 
 impl HashMap<type K: Hashable, type V> {
 	fun new(): HashMap<K, V> {
-		let keys: NativeMap<K> = NativeMap::new();
-		let values: NativeMap<V> = NativeMap::new();
-		HashMap { keys, values }
+		let table: NativeMap<K, V> = NativeMap::new();
+		HashMap { table }
 	}
 
 	fun insert(&mut self, key: K, value: V) {
-		let hash = key.hash();
-		self.keys.insert(hash, key);
-		self.values.insert(hash, value);
+		self.table.insert(key.hash(), key, value);
 	}
 
 	/// A copy of the value stored under `key`, or `None` if absent — ONE copy, of
-	/// the value alone (the table's own `get`; B689).
+	/// the value alone.
 	fun get(self, key: K): Option<V> {
-		self.values.get(key.hash())
+		self.table.get(key.hash())
 	}
 
 	/// Read the slot under `key` in place: `&Some(value)` while the key is held,
 	/// `&None` otherwise. Copies nothing; what `read` copies out is its own.
 	fun peek<U>(self, key: K, read: |&Option<V>| U): U {
-		self.values.lend(key.hash(), read)
+		self.table.lend(key.hash(), read)
 	}
 
-	/// Write the slot under `key` in place. Leave it `None` and the key is gone;
-	/// make it `Some` under an absent key and the key is inserted (last); a
-	/// present key keeps its place whatever is written.
-	fun modify<U>(&mut self, key: K, write: |&mut Option<V>| U): U {
-		let hash = key.hash();
-		let answer = self.values.lend_mut(hash, write);
-		if self.values.contains_key(hash) {
-			if !self.keys.contains_key(hash) {
-				self.keys.insert(hash, key);
-			}
-		} else {
-			self.keys.remove(hash);
-		}
-		answer
-	}
-
-	/// Change the value under `key` where it is — the one `missing` makes,
-	/// inserted first, when there is none (M182's grouping idiom:
-	/// `groups.update(key, [], |list| list.push(row))`, O(1) per push). `missing`
-	/// is evaluated only on a miss; `change` runs on the freshly made value too.
-	fun update(&mut self, key: K, lazy missing: V, change: |&mut V| void) {
-		self.modify(key, |slot: &mut Option<V>| {
-			match &mut slot {
-				Some(let value) => change(value),
-				None => {
-					mut made = missing;
-					change(&mut made);
-					slot = Some(made);
-				},
-			}
-		});
+	/// The slot under `key`, IN PLACE: `Some(value)` while the key is held,
+	/// `None` otherwise — a view of the map's own storage (M191), so what is
+	/// written through it is the map's:
+	///
+	/// - `groups.slot(key).get_or_insert([]).push(row)` — the entry idiom: the
+	///   list made on a miss, then pushed where it is (O(1) per push);
+	/// - `counts.slot(word).get_or_insert(0) += 1`;
+	/// - `map.slot(key) = Some(value)` inserts or overwrites, and
+	///   `map.slot(key).take()` removes and answers what was there.
+	///
+	/// A slot left `None` is a removal; one made `Some` under an absent key is
+	/// inserted LAST; a present key keeps its place. The view is second-class
+	/// (`borrows self`): use it in one expression, or a short-lived local the
+	/// map is not touched beside.
+	fun slot(&mut self, key: K): &mut Option<V> borrows self {
+		self.table.slot(key.hash(), key)
 	}
 
 	/// The value stored under `key` — or, when there is none, the one `make`
 	/// builds, INSERTED and then answered (tracker I8: the map's entry idiom, as
 	/// Rust's `entry(key).or_insert_with(make)`; the name says the write, as
-	/// `Shared<Option<T>>::get_or_insert` and `Memo::get_or_insert` do).
+	/// `Shared<Option<T>>::get_or_insert` and `Memo::get_or_insert` do). A copy:
+	/// to change the value where it is, `slot(key).get_or_insert(..)`.
 	///
 	/// `make` runs only on a miss, and exactly once there, so a maker that costs
 	/// something is paid for once per key. It runs at the call site, so a maker
 	/// that reads a context reads the caller's. The key is hashed once.
 	fun get_or_insert(&mut self, key: K, make: || V): V {
 		let hash = key.hash();
-		match self.values.get(hash) {
+		match self.table.get(hash) {
 			Some(let held) => held,
 			None => {
 				let made = make();
-				self.keys.insert(hash, key);
-				self.values.insert(hash, made);
+				self.table.insert(hash, key, made);
 				made
 			},
 		}
 	}
 
 	fun contains_key(self, key: K): bool {
-		self.values.contains_key(key.hash())
+		self.table.contains_key(key.hash())
 	}
 
 	fun remove(&mut self, key: K) {
-		let hash = key.hash();
-		self.keys.remove(hash);
-		self.values.remove(hash);
+		self.table.remove(key.hash());
 	}
 
 	fun len(self): usize {
-		self.values.len()
+		self.table.len()
 	}
 
 	fun is_empty(self): bool {
@@ -127,28 +104,26 @@ impl HashMap<type K: Hashable, type V> {
 	/// `List` snapshots of the keys / values, in insertion order — iterate with
 	/// `for key in map.keys()`.
 	fun keys(self): List<K> {
-		self.keys.values()
+		self.table.keys()
 	}
 
 	fun values(self): List<V> {
-		self.values.values()
+		self.table.values()
 	}
 
 	/// A `List` snapshot of `(key, value)` pairs, in insertion order — the paired
 	/// counterpart to `keys()`/`values()`, for walking both together without
 	/// zipping two separate snapshots by hand:
-	/// `for entry in map.entries() { entry.0; entry.1 }`. The two tables share one
-	/// insertion order, so a walk of the hashes reads each pair off both.
+	/// `for entry in map.entries() { entry.0; entry.1 }`. The two snapshots
+	/// share the table's one insertion order, so they pair up by position.
 	fun entries(self): List<(K, V)> {
+		let keys = self.table.keys();
+		let values = self.table.values();
 		mut result: List<(K, V)> = [];
-		for hash in self.values.keys() {
-			match self.keys.get(hash) {
-				Some(let key) => match self.values.get(hash) {
-					Some(let value) => result.push((key, value)),
-					None => {},
-				},
-				None => {},
-			}
+		mut index: usize = 0;
+		for index < keys.len() {
+			result.push((keys[index], values[index]));
+			index += 1;
 		}
 		result
 	}
@@ -161,7 +136,7 @@ impl HashMap<type K: Hashable, type V> {
 impl HashMap<type K: Hashable, type V: PartialEq> {
 	/// Whether any stored value equals `value`. For a KEY, use `contains_key`.
 	fun contains_value(self, value: V): bool {
-		for held in self.values.values() {
+		for held in self.table.values() {
 			if held.eq(value) {
 				ret true;
 			}
@@ -182,12 +157,12 @@ impl HashMap<type K: Hashable, type V: PartialEq> {
 /// the map itself keys by — so no key is hashed again.
 impl HashMap<type K: Hashable, type V: PartialEq> with PartialEq {
 	fun eq(self, other: HashMap<K, V>): bool {
-		if self.values.len() != other.values.len() {
+		if self.table.len() != other.table.len() {
 			ret false;
 		}
-		for hash in self.values.keys() {
-			match self.values.get(hash) {
-				Some(let mine) => match other.values.get(hash) {
+		for hash in self.table.hashes() {
+			match self.table.get(hash) {
+				Some(let mine) => match other.table.get(hash) {
 					Some(let theirs) => {
 						if !mine.eq(theirs) {
 							ret false;

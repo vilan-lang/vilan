@@ -11,11 +11,39 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
-function __map_get(map, key) {
-	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
+function __nmap_get(table, hash) {
+	const entry = table[0].get(hash);
+	return entry !== undefined && entry[1][0] === 0 ? [ 0, __clone(entry[1][1]) ] : [ 1 ];
 }
-function __map_values(map) {
-	return [ ...map.values() ].map(__clone);
+function __nmap_insert(table, hash, key, value) {
+	__nmap_settle(table);
+	const entry = table[0].get(hash);
+	if (entry === undefined) table[0].set(hash, [ key, [ 0, value ] ]);
+	else {
+		entry[0] = key;
+		if (entry[1][0] !== 0 || entry[1][1] !== value) entry[1] = [ 0, value ];
+	}
+}
+function __nmap_keys(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[0]));
+	return out;
+}
+function __nmap_remove(table, hash) {
+	__nmap_settle(table);
+	table[0].delete(hash);
+}
+function __nmap_settle(table) {
+	const hash = table[1];
+	if (hash === undefined) return;
+	table[1] = undefined;
+	const entry = table[0].get(hash);
+	if (entry !== undefined && entry[1][0] === 1) table[0].delete(hash);
+}
+function __nmap_values(table) {
+	const out = [];
+	for (const entry of table[0].values()) if (entry[1][0] === 0) out.push(__clone(entry[1][1]));
+	return out;
 }
 function __panic(message, location) {
 	const error = new Error(message);
@@ -135,27 +163,23 @@ function built(is_chosen2, is_muted2) {
 	return class_list(out);
 }
 function keys(self) {
-	return __map_values(self[0]);
+	return __nmap_keys(self[0]);
 }
 function get(self, key) {
-	return __map_get(self[1], hash(key));
+	return __nmap_get(self[0], hash(key));
 }
 function remove(self, key) {
-	const hash2 = hash(key);
-	self[0].delete(hash2);
-	self[1].delete(hash2);
+	__nmap_remove(self[0], hash(key));
 }
 function insert(self, key, value) {
-	const hash2 = hash(key);
-	self[0].set(hash2, __clone(key));
-	self[1].set(hash2, __clone(value));
+	__nmap_insert(self[0], hash(key), __clone(key), __clone(value));
 }
 function values(self) {
-	return __map_values(self[1]);
+	return __nmap_values(self[0]);
 }
-const base = [ [ new Map([ [ "::padding", "::padding" ], [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::padding", [ "s1ufvp8", "padding:var(--space-2)" ] ], [ "::color", [ "s1hbuywq", "color:var(--gray-900)" ] ], [ "::background-color", [ "sdoeicu", "background-color:#ffffff" ] ] ]) ] ];
-const chosen = [ [ new Map([ [ "::color", "::color" ], [ "::background-color", "::background-color" ] ]), new Map([ [ "::color", [ "s1ip1dgv", "color:var(--blue-900)" ] ], [ "::background-color", [ "s1do7ev5", "background-color:var(--blue-100)" ] ] ]) ] ];
-const muted = [ [ new Map([ [ "::color", "::color" ] ]), new Map([ [ "::color", [ "s1hbr49h", "color:var(--gray-400)" ] ] ]) ] ];
+const base = [ [ [ new Map([ [ "::padding", [ "::padding", [ 0, [ "s1ufvp8", "padding:var(--space-2)" ] ] ] ], [ "::color", [ "::color", [ 0, [ "s1hbuywq", "color:var(--gray-900)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "sdoeicu", "background-color:#ffffff" ] ] ] ] ]), undefined ] ] ];
+const chosen = [ [ [ new Map([ [ "::color", [ "::color", [ 0, [ "s1ip1dgv", "color:var(--blue-900)" ] ] ] ], [ "::background-color", [ "::background-color", [ 0, [ "s1do7ev5", "background-color:var(--blue-100)" ] ] ] ] ]), undefined ] ] ];
+const muted = [ [ [ new Map([ [ "::color", [ "::color", [ 0, [ "s1hbr49h", "color:var(--gray-400)" ] ] ] ] ]), undefined ] ] ];
 let cell = 0;
 while (cell < 4) {
 	const is_chosen = cell % 2 === 1;

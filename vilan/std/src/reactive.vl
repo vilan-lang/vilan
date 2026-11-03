@@ -3,7 +3,7 @@ import pkg::context::Context;
 import pkg::debug::{ Location, caller };
 import pkg::hash::Hashable;
 import pkg::io::panic;
-import pkg::js::native_map::NativeMap;
+import pkg::js::hash_table::HashTable;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, Weak };
@@ -298,7 +298,7 @@ export struct Turn {
 	// The ids in `pending`, as a keyed set — `enqueue`'s dedup (A44). Kept in exact
 	// step with `pending`: cleared when a wave is taken out, scrubbed when a
 	// `Subscription` removes itself.
-	queued: Shared<NativeMap<bool>>,
+	queued: Shared<HashTable<bool>>,
 	// The same dedup for `pending_derived`, and a SECOND map rather than one map
 	// over both queues. The two queues have two wave boundaries, so one shared map
 	// could no longer be cleared wholesale when a wave is taken out — it would have
@@ -306,7 +306,7 @@ export struct Turn {
 	// with a cost of its own (tracker M83, measured separately). Two maps keep the
 	// fresh-map-per-wave shape exactly as it was, so door 2 is charged for door 2
 	// only.
-	queued_derived: Shared<NativeMap<bool>>,
+	queued_derived: Shared<HashTable<bool>>,
 	draining: Shared<bool>,
 	// True once the extent's own settle ran; a LATE enqueue (an async
 	// continuation's write) then schedules its own segment-coalesced drain.
@@ -319,8 +319,8 @@ export impl Turn {
 		Turn {
 			pending = Shared::new([]),
 			pending_derived = Shared::new([]),
-			queued = Shared::new(NativeMap::new()),
-			queued_derived = Shared::new(NativeMap::new()),
+			queued = Shared::new(HashTable::new()),
+			queued_derived = Shared::new(HashTable::new()),
 			draining = Shared::new(false),
 			settled = Shared::new(false),
 			scheduled = Shared::new(false),
@@ -478,7 +478,7 @@ export fun drain(turn: Turn) {
 				for !turn.pending_derived.read().is_empty() && budget > 0 {
 					let derivations = turn.pending_derived.read();
 					turn.pending_derived.write() = [];
-					turn.queued_derived.write() = NativeMap::new();
+					turn.queued_derived.write() = HashTable::new();
 					for subscriber in derivations {
 						if tracing.read() {
 							(trace_hooks.read().run_queued)(turn, subscriber);
@@ -499,7 +499,7 @@ export fun drain(turn: Turn) {
 				// The wave is out of the queue, so its ids are free to re-enter it
 				// — a cascade re-enqueuing an observer this wave already ran is the
 				// propagation `drain`'s loop exists for.
-				turn.queued.write() = NativeMap::new();
+				turn.queued.write() = HashTable::new();
 				for subscriber in wave {
 					// A subscriber disposed since this wave was taken OUT of the
 					// queue does not fire (A110 door 1, `Subscriber.live`).
@@ -2982,7 +2982,7 @@ export struct Selector<T> {
 	// One cell per key, keyed by `key.hash()` (the canonical key
 	// `HashMap`/`HashSet` use). Every `of` for the same key hands back the same
 	// cell.
-	cells: Shared<NativeMap<SignalCell<bool>>>,
+	cells: Shared<HashTable<SignalCell<bool>>>,
 	// The source's current value, mirrored here so `of` can seed a fresh cell and
 	// the change observer can find the key that is LEAVING.
 	current: Shared<T>,
@@ -3001,7 +3001,7 @@ export struct Selector<T> {
 /// (A28), and it is a LAZY one (A43): the cells are seeded by `of` from `current`,
 /// so there is nothing for a first call to do.
 export fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T> {
-	let cells: Shared<NativeMap<SignalCell<bool>>> = Shared::new(NativeMap::new());
+	let cells: Shared<HashTable<SignalCell<bool>>> = Shared::new(HashTable::new());
 	let current: Shared<T> = Shared::new(source.get());
 	// A DERIVATION (A110 door 2): its two writes publish the per-key cells, and a
 	// row's own effect must see them settled.
@@ -3852,7 +3852,7 @@ export fun reconcile<T, K: PartialEq + Hashable>(
 	// where it was an `i32` terminated by `-1`. The walks below are the same
 	// walks; the sentinel became `None` and the build loop counts down to zero
 	// without ever reaching below it.
-	mut first: NativeMap<usize> = NativeMap::new();
+	mut first: HashTable<usize> = HashTable::new();
 	mut next_same: List<Option<usize>> = [];
 	for _ in old_keys {
 		next_same.push(None);

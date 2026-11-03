@@ -52,6 +52,25 @@ impl Option<type T> {
 	/// stayed readable after the move (B153).
 	external fun replace(&mut self, own value: T): Option<T>;
 
+	/// The payload, IN PLACE, after filling a `None` with `value` (evaluated only
+	/// then): `Some(v)` answers a view of `v`, `None` becomes `Some(value)` first.
+	/// With a map's `slot` it is the entry idiom (M191) —
+	/// `groups.slot(key).get_or_insert([]).push(row)` grows the list where it is,
+	/// `counts.slot(word).get_or_insert(0) += 1` counts — and on any `Option`
+	/// place it is a lazily made field: `self.cache.get_or_insert(build()).len()`.
+	/// `borrows self`: the view is second-class, used where it is made.
+	fun get_or_insert(&mut self, lazy value: T): &mut T borrows self {
+		if self.is_none() {
+			self = Some(value);
+		}
+		self.some_view()
+	}
+
+	/// The `Some` payload as a view — `get_or_insert`'s tail, which has just made
+	/// the option `Some` (a match-arm binding is no returnable projection).
+	[internal("get_or_insert's tail: the payload of an option known to be Some")]
+	external fun some_view(&mut self): &mut T borrows self;
+
 	fun is_some(self): bool {
 		self is Some(_)
 	}

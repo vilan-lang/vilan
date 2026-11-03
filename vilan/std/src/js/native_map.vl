@@ -1,53 +1,64 @@
-// `NativeMap<V>` — the raw JS `Map`, an internal building block for the value-keyed
-// `HashMap`/`HashSet` (proposal/hashable-keys.md, I1). It is always keyed by a
-// `Hash` (a string/primitive JS keys by value); the public `HashMap`/`HashSet`
-// compute that `Hash` from `key.hash()` and store the original key alongside the
-// value. Not part of the public surface.
+// `NativeMap<K, V>` — the ONE table under the value-keyed `HashMap<K, V>` and
+// `HashSet<T>` (M191, proposal/hash-map-lend.md §10; I1 before it). It is keyed
+// by a canonical `Hash` (a string/primitive JS keys by value), which the public
+// types compute from `key.hash()`, and it stores the ORIGINAL key beside an
+// `Option<V>` slot, so `keys()` answers real `K`s and a slot is a place of its
+// own that `lend` reads and `slot` hands out IN PLACE. Not part of the public
+// surface.
 //
-// The key type is fixed as `Hash` rather than generic — the raw layer only ever
-// takes canonical keys — which also keeps `NativeMap` single-parameter, so a
-// bounded element type used as its argument (`NativeMap<T>` for `T: Hashable`)
-// doesn't trip the two-parameter bound-propagation gap the tuple form would.
+// A slot holding `None` is a TOMBSTONE that no lookup, count or walk sees. Only
+// `slot` can leave one (a view written `None`, or a miss never filled); the
+// table settles it at its next write (`insert`, `remove`, `slot`): still `None`,
+// the key is gone (written again it goes last); `Some`, it stays where it was.
 //
-// This is the former `Map` intrinsic: `new` is `new Map()`, `insert` is `.set`,
-// `get` returns an `Option<V>` (a copy), and `keys`/`values` are cloned `List`
-// snapshots in insertion order. `lend`/`lend_mut` hand the slot under a key to a
-// closure IN PLACE, copying nothing (B689, proposal/hash-map-lend.md §3.1).
+// On JS the table is a `Map` from the hash to the entry `[key, slot]`, the slot
+// the `Option` array itself, so a view of it IS the stored object; natively it
+// is `vilan_rt::NativeMap`. Insertion-ordered on both.
 import pkg::hash::Hash;
 import pkg::option::Option;
 
 export *;
 
-external struct NativeMap<V>;
+external struct NativeMap<K, V>;
 
-impl NativeMap<type V> {
-	external fun new(): NativeMap<V>;
+impl NativeMap<type K, type V> {
+	external fun new(): NativeMap<K, V>;
 
-	/// `own value`: the table KEEPS what it is given (as `List::push` does), so a
-	/// place passed here is copied in rather than aliased by the host map.
-	external fun insert(&mut self, key: Hash, own value: V): void;
+	/// `value` under `hash`, with `key` kept beside it. A present key keeps its
+	/// place; both are replaced. `own`: the table KEEPS what it is given (as
+	/// `List::push` does), so a place passed here is copied in, never aliased.
+	external fun insert(&mut self, hash: Hash, own key: K, own value: V): void;
 
-	external fun get(self, key: Hash): Option<V>;
+	/// A copy of the value under `hash`, or `None`.
+	external fun get(self, hash: Hash): Option<V>;
 
-	/// `read` called once with the slot under `key` — `&Some(value)` in place while
-	/// the key is present, `&None` otherwise — answering what `read` answers. The
-	/// value is never cloned.
-	external fun lend<U>(self, key: Hash, read: |&Option<V>| U): U;
+	/// A copy of the KEY held under `hash`, or `None` — a set's member, a map
+	/// entry's key, found by its hash alone.
+	external fun key(self, hash: Hash): Option<K>;
 
-	/// `write` called once with a writable slot under `key`; when it returns the
-	/// table reflects the slot. A slot left `None` is removed (gone from
-	/// `contains_key`, `len` and every walk); a slot made `Some` under an absent
-	/// key is inserted LAST, as `insert` does; a present key keeps its place
-	/// whatever was written. The value is never cloned.
-	external fun lend_mut<U>(&mut self, key: Hash, write: |&mut Option<V>| U): U;
+	/// `read` called once with the slot under `hash` — `&Some(value)` in place
+	/// while the key is held, `&None` otherwise — answering what `read` answers.
+	/// The value is never cloned.
+	external fun lend<U>(self, hash: Hash, read: |&Option<V>| U): U;
 
-	external fun contains_key(self, key: Hash): bool;
+	/// The slot under `hash`, writable in place: a present key's own (its place
+	/// kept), or a fresh `None` appended LAST under `key` for an absent one. A
+	/// slot the view leaves `None` is a tombstone until the next write deletes
+	/// its key. `key` is copied in only on a miss.
+	external fun slot(&mut self, hash: Hash, own key: K): &mut Option<V> borrows self;
 
-	external fun remove(&mut self, key: Hash): void;
+	external fun contains_key(self, hash: Hash): bool;
+
+	external fun remove(&mut self, hash: Hash): void;
 
 	external fun len(self): usize;
 
-	external fun keys(self): List<Hash>;
+	/// The held keys' hashes, in insertion order.
+	external fun hashes(self): List<Hash>;
 
+	/// Copies of the held keys, in insertion order.
+	external fun keys(self): List<K>;
+
+	/// Copies of the held values, in insertion order.
 	external fun values(self): List<V>;
 }

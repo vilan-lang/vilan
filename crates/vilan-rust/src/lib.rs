@@ -3096,16 +3096,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .cloned()
                     .unwrap_or_else(|| "()".to_string())
             )),
-            // The raw JS `Map` (`native_map.vl`), whose key type is FIXED as
-            // `Hash` rather than generic, so its one written argument is the
-            // VALUE. The arity is why this cannot share `List`'s shape: a
-            // `NativeMap<V>` is a `vilan_rt::Map<Hash, V>`.
-            "NativeMap" => Ok(format!(
+            // The raw one-parameter JS `Map` (`hash_table.vl`), whose key type
+            // is FIXED as `Hash` rather than generic, so its one written
+            // argument is the VALUE: a `HashTable<V>` is a
+            // `vilan_rt::Map<Hash, V>`.
+            "HashTable" => Ok(format!(
                 "vilan_rt::Map<vilan_rt::Hash, {}>",
                 rendered
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "()".to_string())
+            )),
+            // M191: the keyed table under `HashMap`/`HashSet` (`native_map.vl`)
+            // — keyed by `Hash`, the original key beside an `Option<V>` slot.
+            "NativeMap" => Ok(format!(
+                "vilan_rt::NativeMap<{}, {}>",
+                rendered
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "()".to_string()),
+                rendered.get(1).cloned().unwrap_or_else(|| "()".to_string())
             )),
             // F20: the opaque canonical key (`hash.vl`'s `external struct
             // Hash`). `vilan_rt::Hash` documents why it has four arms.
@@ -3852,6 +3862,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // closure (it is hashable).
         if let Some((key, value)) = rendered
             .strip_prefix("vilan_rt::Map<")
+            .or_else(|| rendered.strip_prefix("vilan_rt::NativeMap<"))
             .and_then(|inner| inner.strip_suffix('>'))
             .and_then(split_at_the_top_level_comma)
         {
@@ -6442,6 +6453,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// BEHIND it, and `&mut loan.field` already reborrows through the
     /// reference by Rust's own auto-deref.
     fn names_a_mutable_loan(&self, id: Id) -> bool {
+        // M191: a call to a `borrows` function handing back a `&mut` view
+        // (`map.slot(key)`) IS a `&mut` loan; `&mut` of it would borrow the
+        // temporary reference, which a hoisted place outlives.
+        if let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&id) {
+            return self
+                .program
+                .function_calls
+                .get(&call_id)
+                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => self.program.functions.get(target),
+                    _ => None,
+                })
+                .is_some_and(|function| function.returns_mut_view);
+        }
         let binding = match self.program.entity_map.get(&id) {
             Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
             _ => return false,
@@ -6740,6 +6765,32 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let mut prelude = String::new();
         let saved = std::mem::take(&mut self.hoisted);
+        // M191: a compound write through a VIEW-returning call —
+        // `counts.slot(word).get_or_insert(0) += 1` — finds its place ONCE: the
+        // view is bound by a `match` around the write and both halves name it.
+        // Walked twice, Rust evaluates the re-read (the value) before the place,
+        // so a key the call consumes was moved by the re-read and then read
+        // again by the place, and the call ran twice. A `match` rather than a
+        // `let` because its subject's temporaries live to its end: a receiver
+        // in a cell (a captured `mut` map) lends the view out of a `borrow_mut`
+        // that must outlive the write.
+        let (target_root, reread_root) = (self.place_root(target), self.place_root(reread));
+        let mut view_binding = None;
+        if self.is_a_view_call(target_root) && self.is_a_view_call(reread_root) {
+            let rendered = self.expression(target_root, depth);
+            match rendered {
+                Ok(view) => {
+                    let name = format!("__hoist{}", self.hoisted.len());
+                    self.hoisted.insert(target_root, name.clone());
+                    self.hoisted.insert(reread_root, name.clone());
+                    view_binding = Some((name, view));
+                }
+                Err(error) => {
+                    self.hoisted = saved;
+                    return Err(error);
+                }
+            }
+        }
         let paired = self.pair_places(target, reread, &mut prelude, depth);
         let expecting = self.type_of(target);
         let rendered = paired.and_then(|_| {
@@ -6749,6 +6800,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         });
         self.hoisted = saved;
         let (target_text, value_text) = rendered?;
+        if let Some((name, view)) = view_binding {
+            let write = self.finish_assignment(target, prelude, &target_text, &value_text);
+            return Ok(Some(format!("match {view} {{ {name} => {{ {write}; }} }}")));
+        }
         if prelude.is_empty() {
             return Ok(None);
         }
@@ -6758,6 +6813,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &target_text,
             &value_text,
         )))
+    }
+
+    /// The ROOT of a place spine — under every field, tuple slot, subscript
+    /// and dereference — which for `map.slot(k).get_or_insert((w, 0)).1` is the
+    /// view-returning call the spine reads through (M191).
+    fn place_root(&self, mut id: Id) -> Id {
+        loop {
+            match self.program.entity_map.get(&id) {
+                Some(
+                    &Expr::Field(subject, _, _)
+                    | &Expr::TupleIndex(subject, _, _)
+                    | &Expr::Index(subject, _)
+                    | &Expr::Dereference(subject),
+                ) => id = subject,
+                _ => return id,
+            }
+        }
     }
 
     /// An assignment's statement, its hoisted subscripts first: the prelude,
@@ -8147,6 +8219,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     return Err(unsupported("a `const` value of an unresolved struct", span));
                 };
                 if declaration.external {
+                    if declaration.name == "NativeMap" {
+                        return self.const_native_map(items, &arguments, span);
+                    }
                     if declaration.name != "List" {
                         return Err(unsupported(
                             &format!("a `const` value of the host type `{}`", declaration.name),
@@ -8178,7 +8253,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .structs
                     .get(&struct_id)
                     .is_some_and(|declaration| {
-                        declaration.external && declaration.name == "NativeMap"
+                        declaration.external && declaration.name == "HashTable"
                     }) =>
             {
                 let element = arguments.first().copied();
@@ -8208,6 +8283,59 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             )),
         }
+    }
+
+    /// M191: a `NativeMap<K, V>` const is the JS pair `[ map, pending ]`, the
+    /// map each hash to its `[ key, slot ]` entry. Each held entry is inserted
+    /// under its hash; a tombstone (a `None` slot the const world left pending)
+    /// is the removal it would settle to.
+    fn const_native_map(
+        &mut self,
+        items: &[vilan_core::interpreter::ConstValue],
+        arguments: &[TypeId],
+        span: Span,
+    ) -> Result<String, Error> {
+        use vilan_core::interpreter::ConstValue;
+        let Some(ConstValue::Map(entries)) = items.first() else {
+            return Err(unsupported("a `const` table that is not a map", span));
+        };
+        let (key_type, value_type) = (arguments.first().copied(), arguments.get(1).copied());
+        let mut inserts = String::new();
+        for (hash, entry) in entries {
+            let hash = match hash {
+                ConstValue::Str(text) => {
+                    format!("vilan_rt::Hash::Text(vilan_rt::str_new({text:?}))")
+                }
+                ConstValue::Number(number) => {
+                    format!("vilan_rt::Hash::Number({number:?}f64)")
+                }
+                ConstValue::Bool(value) => format!("vilan_rt::Hash::Bool({value})"),
+                ConstValue::Null => "vilan_rt::Hash::Null".to_string(),
+                _ => return Err(unsupported("a `const` map keyed by a non-scalar", span)),
+            };
+            let ConstValue::Array(entry) = entry else {
+                return Err(unsupported(
+                    "a `const` table entry that is not a pair",
+                    span,
+                ));
+            };
+            let (Some(key), Some(ConstValue::Array(slot))) = (entry.first(), entry.get(1)) else {
+                return Err(unsupported(
+                    "a `const` table entry that is not a pair",
+                    span,
+                ));
+            };
+            let held = match (slot.first(), slot.get(1)) {
+                (Some(ConstValue::Number(tag)), Some(value)) if *tag == 0.0 => value,
+                _ => continue,
+            };
+            let key = self.const_value(key, key_type, span)?;
+            let value = self.const_value(held, value_type, span)?;
+            let _ = write!(inserts, "__table.insert({hash}, {key}, {value}); ");
+        }
+        Ok(format!(
+            "{{ let mut __table = vilan_rt::NativeMap::new(); {inserts}__table }}"
+        ))
     }
 
     /// F98: a `const` struct — its fields, in declaration order, are the
@@ -9729,11 +9857,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 _ => false,
             });
         // F95: a `HashSet` iterates its members in INSERTION order on both
-        // backends — std stores each value beside its canonical hash in the
-        // set's `table`, and the JS backend's `__set_iter` walks that table's
-        // values. Natively the table is the runtime's insertion-ordered map,
-        // and `values()` is the walk: a copy of each member (rule 1's element
-        // copy), taken before the body runs, as JS's array iterator takes it.
+        // backends — std stores each value as a KEY of the set's `table`
+        // (M191), and the JS backend's `__set_iter` walks that table's keys.
+        // Natively the table is the runtime's insertion-ordered map, and
+        // `keys()` is the walk: a copy of each member (rule 1's element copy),
+        // taken before the body runs, as JS's array iterator takes it.
         if self.for_each_iterates_a_set(id) {
             let set_text = self.expression(iterable_place, depth)?;
             let binder = match item {
@@ -9744,7 +9872,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.emit_block(statements, tail, &mut body, depth + 1)?;
             let pad = Self::indent(depth);
             return Ok(format!(
-                "for {binder} in ({set_text}).table.values().into_iter() {{\n{body}{pad}}}"
+                "for {binder} in ({set_text}).table.keys().into_iter() {{\n{body}{pad}}}"
             ));
         }
         if iterates_something_else {
@@ -13142,7 +13270,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // F49: a `&` argument over a BOXED binding is a VIEW of its cell for
         // the call (see [`Emitter::cell_view_place`]), taken after every
         // by-value argument has been evaluated — the same hoist.
-        let views_allowed = !self.no_cell_views && self.views_its_arguments(target, callee_bits);
+        // M191: a callee that hands back a VIEW (`map.slot(key)`) of a receiver
+        // living in a cell keeps the cell's borrow for as long as the view
+        // lives, so its arguments cannot be settled in a block ahead of the
+        // borrow (F30/F49/F129): the block would drop the borrow the view is
+        // made of. They are evaluated in place instead, receiver first.
+        let returns_a_view = self
+            .program
+            .functions
+            .get(&target)
+            .is_some_and(|function| function.returns_view || function.returns_mut_view);
+        let views_allowed =
+            !self.no_cell_views && !returns_a_view && self.views_its_arguments(target, callee_bits);
         // F123: a std lookup that runs no user code (`HashSet::contains`,
         // `HashMap::get`/`contains_key` over a key whose `hash` is std's)
         // reads a `Shared` view's field receiver through the cell, as F114's
@@ -13177,7 +13316,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // where it stands (F135: spec §6.7).
         let defers_a_copy: Vec<bool> = (0..argument_ids.len())
             .map(|index| {
-                self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
+                !returns_a_view
+                    && self.defers_its_cell_copy(&conventions, argument_ids, &takes_a_view, index)
             })
             .collect();
         let defers_copies = defers_a_copy.contains(&true);
@@ -13196,8 +13336,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     })
                     .is_some()
         });
-        let borrows_a_cell =
-            borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies;
+        let borrows_a_cell = if returns_a_view {
+            borrows_a_read_place
+        } else {
+            borrows_a_cell || borrows_a_read_place || views_a_cell || defers_copies
+        };
         let mut deferred_copies = String::new();
         let mut view_borrows = String::new();
         let mut views = 0;
@@ -13323,12 +13466,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             // The receiver of a loaned `self` arrives as a place in the IR and
             // as a reference natively, so the `&`/`&mut` the source never wrote
-            // is synthesized here — unless the source DID write one.
+            // is synthesized here — unless the source DID write one, or the
+            // argument is a `borrows` call whose value already IS one (M191:
+            // `map.slot(key).is_some()` over a captured `map`, whose hoisted
+            // block would otherwise borrow the reference it answers).
             let already_a_reference = self
                 .program
                 .entity_map
                 .get(argument)
-                .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
+                .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)))
+                || self.is_a_view_call(*argument);
             // F129: the deferred copy is taken after every hoisted argument,
             // and a `&` argument that computes a value (`&mark(cell)`) is
             // settled in order with the by-value ones, ahead of it.
@@ -16346,24 +16493,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // bound and CALLED inside the `FnOnce` the runtime takes — the
             // `sort_by` comparator's shape. The key is bound first because
             // Rust evaluates the receiver's borrow before the arguments.
-            Intrinsic::MapLend => {
+            // M191: `NativeMap<K, V>`, the keyed table under `HashMap`/`HashSet`.
+            Intrinsic::KeyedNew => "vilan_rt::NativeMap::new()".to_string(),
+            Intrinsic::KeyedInsert => {
+                format!("{}.insert({}, {}, {})", next(), next(), next(), next())
+            }
+            Intrinsic::KeyedGet => format!("{}.get(&{}).cloned()", next(), next()),
+            Intrinsic::KeyedKey => format!("{}.key(&{}).cloned()", next(), next()),
+            // The slot lent in place. The closure arrives as an `Rc<dyn Fn>`,
+            // which implements no `Fn` trait itself, so it is bound and CALLED
+            // inside the `FnOnce` the runtime takes — the `sort_by` comparator's
+            // shape. The key is bound first because Rust evaluates the
+            // receiver's borrow before the arguments.
+            Intrinsic::KeyedLend => {
                 let receiver = next();
-                let key = next();
+                let hash = next();
                 let read = next();
                 format!(
-                    "{{ let __key = {key}; let __read = {read}; \
-                     {receiver}.lend(&__key, move |slot| __read(slot)) }}"
+                    "{{ let __hash = {hash}; let __read = {read}; \
+                     {receiver}.lend(&__hash, move |slot| __read(slot)) }}"
                 )
             }
-            Intrinsic::MapLendMut => {
-                let receiver = next();
-                let key = next();
-                let write = next();
-                format!(
-                    "{{ let __key = {key}; let __write = {write}; \
-                     {receiver}.lend_mut(__key, move |slot| __write(slot)) }}"
-                )
+            // A view (`&mut Option<V>`) of the table's own slot.
+            Intrinsic::KeyedSlot => {
+                format!("{}.slot({}, {})", next(), next(), next())
             }
+            Intrinsic::KeyedContainsKey => format!("{}.contains_key(&{})", next(), next()),
+            Intrinsic::KeyedRemove => format!("{}.remove(&{})", next(), next()),
+            Intrinsic::KeyedLen => format!("{}.len()", next()),
+            Intrinsic::KeyedHashes => format!("{}.hashes()", next()),
+            Intrinsic::KeyedKeys => format!("{}.keys()", next()),
+            Intrinsic::KeyedValues => format!("{}.values()", next()),
+            // The payload of an option `get_or_insert` has just made `Some`.
+            Intrinsic::OptionSomeView => format!(
+                "match {} {{ Some(__payload) => __payload, None => unreachable!(\"some_view on None\") }}",
+                next()
+            ),
             Intrinsic::MapContainsKey => format!("{}.contains_key(&{})", next(), next()),
             Intrinsic::MapRemove => format!("{}.remove(&{})", next(), next()),
             Intrinsic::MapLen => format!("{}.len()", next()),

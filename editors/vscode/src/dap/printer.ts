@@ -222,6 +222,9 @@ export function walker(value: any, types: any[], root: number, read: string, ...
         }
         return group(open, '}', true, entries, fill, kind);
     };
+    // A `HashMap`/`HashSet` table (M191): `[ map, pending ]`, the held
+    // `[ key, slot ]` entries in insertion order, tombstones (`None` slots) skipped.
+    const held = (table: any): any[] => Array.from(table[0].values()).filter((entry: any) => entry[1][0] === 0);
     const document = (printed: any): Doc | undefined =>
         typeof printed === 'string' ||
         (printed !== null && typeof printed === 'object' && typeof printed.o === 'string' && Array.isArray(printed.e))
@@ -308,12 +311,11 @@ export function walker(value: any, types: any[], root: number, read: string, ...
             case 'cell':
                 return group(type.label + '(', ')', false, [['', show(current[type.field].v, type.value)]], false, 'c');
             case 'map': {
-                // Two tables of one insertion order (B689): the keys at
-                // `type.keys`, the values at `type.values`, side by side.
-                const stored = Array.from(current[type.values].values());
+                // One table (M191): `[ map, pending ]`, each hash to its
+                // `[ key, slot ]` entry; a `None` slot (`[1]`) is a tombstone.
                 return members(
                     type.label + ' {',
-                    Array.from(current[type.keys].values(), (key: any, index: number) => [key, stored[index]]),
+                    held(current[type.table]).map((entry: any) => [entry[0], entry[1][1]]),
                     (entry: any): [string, Doc] => [one(show(entry[0], type.key)) + ' => ', show(entry[1], type.value)],
                     false,
                     'm',
@@ -322,7 +324,7 @@ export function walker(value: any, types: any[], root: number, read: string, ...
             case 'set':
                 return members(
                     type.label + ' {',
-                    Array.from(current[type.field].values()),
+                    held(current[type.field]).map((entry: any) => entry[0]),
                     (item: any): [string, Doc] => ['', show(item, type.element)],
                     type.fill === true,
                     'z',
