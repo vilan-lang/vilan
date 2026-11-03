@@ -394,6 +394,14 @@ export impl Region {
 		row
 	}
 
+	/// Retires a row (M187): there is nothing to take out, so what is left is the
+	/// row's owner going — `disposal` runs, as the browser twin runs it, so the two
+	/// twins' owner bookkeeping agrees. KEEP IN STEP.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
+	fun retire_row(self, row: Row, end: Row, disposal: || void) {
+		disposal();
+	}
+
 	/// Puts a cut row back — see `cut_row`: nothing was ever taken out, and A98's
 	/// `end` bound has nothing to bound. KEEP IN STEP.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
@@ -417,6 +425,14 @@ export impl Region {
 	/// Drops the anchor — there is none to drop, and no live content to take out of
 	/// a document that does not exist yet (A88). KEEP IN STEP.
 	fun close(self) {}
+
+	/// `close`, with the rows' owners going first (M187): `disposal` runs, as the
+	/// browser twin runs it, and there is no run to mark as leaving and nothing to
+	/// take out. KEEP IN STEP.
+	fun close_with(self, disposal: || void) {
+		disposal();
+		self.close();
+	}
 }
 
 /// Something that can fill a child position (proposal/element-syntax.md §5) — the

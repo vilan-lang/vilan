@@ -42,6 +42,17 @@ let notifyMutation = () => {};
 /// The document root, set by `installStubDocument` — also `global.documentRoot`.
 let documentRoot = null;
 
+/// `node.nextSibling`, for every node kind: the child after `node` in its
+/// parent's list, or null. M187: `std::web::ui` walks a region's run by it
+/// (`__dom_cut_run`, `__dom_remove_run`, `__dom_run_nodes`), where it used
+/// to hand the run to a Range.
+function nextSiblingOf(node) {
+    if (!node.parent) return null;
+    const siblings = node.parent.children;
+    const at = siblings.indexOf(node);
+    return at >= 0 && at + 1 < siblings.length ? siblings[at + 1] : null;
+}
+
 /// An inline style declaration block, enough of one for the questions asked
 /// here: `setProperty` with an empty value REMOVES the declaration, which is
 /// what the CSSOM does and what `View::show` relies on to restore an element's
@@ -106,6 +117,7 @@ class StubElement {
     set hidden(on) { this._hidden = on; }
     get hidden() { return this._hidden; }
     get parentNode() { return this.parent; }
+    get nextSibling() { return nextSiblingOf(this); }
     // A121: the parent ELEMENT — the step `Element::tabbable`'s ancestor walk
     // takes. The stub has no `<body>`/`<html>` split, so the document root's
     // parent is null, which is the rule the walk terminates on.
@@ -339,6 +351,7 @@ class StubText {
     // A91: a `Region` reads its host off its anchor, because an anchor MOVES
     // when the row holding it is planted or re-ordered.
     get parentNode() { return this.parent; }
+    get nextSibling() { return nextSiblingOf(this); }
     remove() {
         if (this.parent) {
             this.parent.children = this.parent.children.filter(c => c !== this);
@@ -355,6 +368,8 @@ class StubText {
 /// shape reaches a position that is not the parent's end.
 class StubFragment {
     constructor() { this.tagName = "#fragment"; this.children = []; this.parent = null; this._text = ""; }
+    get parentNode() { return this.parent; }
+    get nextSibling() { return null; }
     appendChild(child) {
         if (child.tagName === "#fragment") {
             for (const node of child.take()) this.appendChild(node);
@@ -386,11 +401,13 @@ class StubFragment {
     render() { return this.children.map(c => c.render()).join(""); }
 }
 
-/// A DOM range, reduced to the one thing `std::web::ui` asks of it: cut every node
-/// between two sibling markers out of the document in one call (A91). A row's
-/// node set is not fixed — a row that is itself a `when` or an `each` grows
-/// after it was placed — so "move this row" is a span between markers rather
-/// than a list of remembered nodes.
+/// A DOM range, reduced to the one thing `std::web::ui` once asked of it: cut every
+/// node between two sibling markers out of the document in one call (A91). Since
+/// M187 std walks the run by `nextSibling` instead and makes no Range at all —
+/// a live Range per row made closing a long list quadratic — so this stays for
+/// a program's own `std::web::dom::create_range`, and every Range made is
+/// counted on `global.rangesMade`, which is what the pin that std makes none
+/// reads.
 class StubRange {
     setStartAfter(node) { this.start = node; }
     setEndBefore(node) { this.end = node; }
@@ -519,12 +536,13 @@ function installStubDocument(options = {}) {
     documentRoot = settings.root || settings.element(settings.rootTag);
     global.focusLog = [];
     global.activeElement = null;
+    global.rangesMade = 0;
     global.document = {
         createElement: (tag) => settings.element(tag),
         createElementNS: (namespace, tag) => settings.element(tag, namespace),
         createTextNode: (text) => settings.text(text),
         createDocumentFragment: () => new StubFragment(),
-        createRange: () => new StubRange(),
+        createRange: () => { global.rangesMade += 1; return new StubRange(); },
         getElementById: (id) => (settings.rootId === null || id === settings.rootId ? documentRoot : null),
         querySelector: () => null,
         querySelectorAll: () => [],
