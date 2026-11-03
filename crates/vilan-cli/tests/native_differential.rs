@@ -14014,6 +14014,74 @@ fn an_awaiting_inherent_next_drives_a_for_loop_on_both_backends() {
     );
 }
 
+/// F153: a `for x in subject` over a `[resource]` PLACE whose inherent `next`
+/// drives the loop BORROWS the subject natively (the analyzer loans it to the
+/// loop and drops it after), so cargo accepts the drop after the loop where
+/// it refused a use after the move (E0382) — and the teardown prints land
+/// where JS lands them: after a `jump break`, after a full walk, and at the
+/// end of a temporary subject's loop. A plain (non-resource) subject is the
+/// control. The emission pin: the place is borrowed, the temporary moves.
+#[test]
+fn f153_a_for_over_a_resource_place_loans_it_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_resource_for_in.vl";
+    std::fs::write(staged.join(file), include_str!("native/resource_for_in.vl"))
+        .expect("write the probe program");
+    let expected = "raw on\ntick 4\ntick 3\nraw off\nafter break\n\
+                    raw on\ntick 1\ntick 0\nraw off\nafter full\n\
+                    raw on\ntick 0\nraw off\nafter temporary\n\
+                    plain 1\nplain 0\nplain left 0\ndone\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_resource_for_in")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert_eq!(
+        emitted.matches("let iterator = &mut ticks_").count(),
+        2,
+        "both place subjects are borrowed:\n{emitted}"
+    );
+    assert_eq!(
+        emitted.matches("let mut iterator = ticks_").count(),
+        1,
+        "the temporary subject still moves:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("let mut iterator = (plain_"),
+        "the plain subject is unchanged (rule 1's copy):\n{emitted}"
+    );
+}
+
+/// F153 / A173 S2's terminal.md Q6: `for key in keys` over `process::keys()`
+/// — a `[resource]` whose awaiting inherent `next` drives the loop — builds
+/// natively and decodes the same piped bytes to the same keys as on JS.
+#[test]
+fn f153_a_for_over_the_key_stream_builds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_keys_for_in.vl";
+    std::fs::write(staged.join(file), include_str!("native/keys_for_in.vl"))
+        .expect("write the probe program");
+    std::fs::write(
+        staged.join("native_probe_keys_for_in.stdin"),
+        include_bytes!("native/keys_for_in.stdin"),
+    )
+    .expect("write the probe's stdin");
+    let expected = "Key::Char(\"a\")\nKey::Char(\"b\")\nKey::Enter\nKey::Up\nkeys before q: 4\n";
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
 /// native-54's F?1: `Option::take` / `Option::replace` over a receiver that
 /// lives in a CELL natively — a module-level binding (`module_maybe.take()`),
 /// a field of one, a captured binding, a `Shared` view's field

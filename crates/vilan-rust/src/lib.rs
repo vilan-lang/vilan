@@ -229,6 +229,31 @@ mod dbg;
 /// functions, whose subject names the declaration. A generic resource
 /// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
 /// answer is per declaration, not per instantiation.
+/// F153: the `let` bindings that are the subject of a `for .. in` driven by a
+/// `next` member (`Program::for_each_next`) and whose declared type is a
+/// `[resource]`. Read off the declared type, before any substitution: a
+/// binding only a generic instance makes a resource is not in it, and its
+/// loop keeps the move ([`Emitter::for_each_borrows_its_subject`]).
+fn for_each_resource_subjects(program: &Program<'_>) -> HashSet<Id> {
+    let mut subjects = HashSet::new();
+    for for_each_id in program.for_each_next.keys() {
+        let Some(Expr::ForEach(iterable, _, _)) = program.entity_map.get(for_each_id) else {
+            continue;
+        };
+        let Some(Expr::Local(binding)) = program.entity_map.get(iterable) else {
+            continue;
+        };
+        if program
+            .variables
+            .get(binding)
+            .is_some_and(|variable| program.resource_types.contains(&variable.type_id))
+        {
+            subjects.insert(*binding);
+        }
+    }
+    subjects
+}
+
 fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, DropImpl> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
@@ -615,6 +640,11 @@ struct Emitter<'a, 'src> {
     /// the ones rule 1's marking never reached, so the answer is computed here
     /// over the SAME bodies the emitter walks.
     last_uses: HashSet<Id>,
+    /// F153: the `let` bindings a `for x in <binding>` walks whose declared
+    /// type is a `[resource]` — the loop LOANS such a binding (the analyzer
+    /// drops it after the loop), so it is borrowed `&mut` and its `let` is
+    /// emitted `mut`. See [`Emitter::for_each_borrows_its_subject`].
+    for_each_resource_subjects: HashSet<Id>,
     /// F37: the FIELD reads (`record.live`) that are their field path's last
     /// use — [`Emitter::compute_liveness`]'s path-aware half.
     last_field_uses: HashSet<Id>,
@@ -791,6 +821,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_adapted_bits: Vec::new(),
             current_instance: None,
             last_uses: HashSet::new(),
+            for_each_resource_subjects: for_each_resource_subjects(program),
             last_field_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
@@ -7302,7 +7333,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Err(unsupported("a `lazy` binding", self.span_of(binding)));
         }
         let name = self.binding_name(binding);
-        let mutable = if variable.mutable { "mut " } else { "" };
+        let mutable = if variable.mutable || self.for_each_resource_subjects.contains(&binding) {
+            "mut "
+        } else {
+            ""
+        };
         // An annotation is WRITTEN ONLY where the initializer cannot type the
         // binding — an empty collection literal, and a `Shared` cell built
         // around one (F74: `let leases: Shared<List<KeyLease>> =
@@ -9824,6 +9859,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
             })
     }
 
+    /// F153: whether a `for .. in` over `iterable` borrows it rather than
+    /// moving it into the loop's iterator — an OWNED binding this frame holds
+    /// as a plain Rust place (a `let` in [`Emitter::for_each_resource_subjects`],
+    /// or a parameter received by value) whose type, under this instance, is a
+    /// `[resource]`. A loan, a view, a captured or boxed binding, a module
+    /// binding and every temporary keep the move.
+    fn for_each_borrows_its_subject(&self, iterable: Id) -> bool {
+        let binding = match self.program.entity_map.get(&iterable) {
+            Some(Expr::Local(binding)) => {
+                if !self.for_each_resource_subjects.contains(binding) {
+                    return false;
+                }
+                *binding
+            }
+            Some(Expr::Parameter(binding)) => *binding,
+            _ => return false,
+        };
+        !self.boxed.contains(&binding)
+            && !self.module_bindings.contains(&binding)
+            && self.moves_an_owned_resource(iterable)
+    }
+
     fn for_each_iterator(
         &mut self,
         id: Id,
@@ -9912,6 +9969,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let next_step = step(format!("{next}(&mut {place_text}{context_arguments})"));
             return Ok(format!(
                 "while let Some({binder}) = {next_step} {{\n{body}{pad}}}"
+            ));
+        }
+        // F153: a `[resource]` PLACE the loop walks is LOANED to it — the
+        // analyzer drops the binding after the loop (`std::mem::drop(ticks)`),
+        // so a move into the iterator was a use after move (rustc E0382). The
+        // place is borrowed for the loop and every step reborrows it; a
+        // TEMPORARY subject (`for k in keys()`) still moves into the iterator.
+        if self.for_each_borrows_its_subject(iterable) {
+            let place_text = self.mutable_place(iterable, depth)?;
+            let binder = match item {
+                Some(item) => self.binding_name(item),
+                None => "_".to_string(),
+            };
+            let mut body = String::new();
+            self.emit_block(statements, tail, &mut body, depth + 2)?;
+            let pad = Self::indent(depth);
+            let inner = Self::indent(depth + 1);
+            let next_step = step(format!("{next}(iterator{context_arguments})"));
+            return Ok(format!(
+                "{{\n{inner}let iterator = &mut {place_text};\n\
+                 {inner}while let Some({binder}) = {next_step} {{\n{body}{inner}}}\n{pad}}}"
             ));
         }
         // The iterable is CONSUMED by the loop (the iterator is advanced), so a

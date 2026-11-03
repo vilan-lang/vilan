@@ -1,0 +1,95 @@
+// F153: a `for x in subject` over a `[resource]` whose INHERENT `next(self):
+// Option<T>` drives the loop. The loop LOANS a PLACE subject - the analyzer
+// drops the binding after the loop - and natively the subject was MOVED into
+// the loop's iterator, so the drop after it named a moved binding (rustc
+// E0382). It is borrowed now (`let iterator = &mut ticks;`), and the
+// teardown prints say where the drop lands: after the loop, after a `jump
+// break` out of it, as on JS. A TEMPORARY subject (`for tick in ticks(1)`)
+// still moves into the loop and drops at its end; a plain (non-resource)
+// subject is the control.
+import std::drop::Drop;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::shared::Shared;
+
+[resource]
+struct Ticks {
+	left: Shared<i32>,
+}
+
+fun ticks(n: i32): Ticks {
+	print("raw on");
+	Ticks { left = Shared::new(n) }
+}
+
+impl Ticks {
+	fun next(self): Option<i32> {
+		if self.left.read() == 0 {
+			ret None;
+		}
+		self.left.write() = self.left.read() - 1;
+		Some(self.left.read())
+	}
+}
+
+impl Ticks with Drop {
+	fun drop(&mut self) {
+		print("raw off");
+	}
+}
+
+struct Plain {
+	left: Shared<i32>,
+}
+
+impl Plain {
+	fun next(self): Option<i32> {
+		if self.left.read() == 0 {
+			ret None;
+		}
+		self.left.write() = self.left.read() - 1;
+		Some(self.left.read())
+	}
+}
+
+fun broken() {
+	let ticks = ticks(5);
+	for tick in ticks {
+		if tick == 2 {
+			jump break;
+		}
+		print(i"tick {tick}");
+	}
+	print("after break");
+}
+
+fun full() {
+	let ticks = ticks(2);
+	for tick in ticks {
+		print(i"tick {tick}");
+	}
+	print("after full");
+}
+
+fun temporary() {
+	for tick in ticks(1) {
+		print(i"tick {tick}");
+	}
+	print("after temporary");
+}
+
+fun plain() {
+	let plain = Plain { left = Shared::new(2) };
+	for tick in plain {
+		print(i"plain {tick}");
+	}
+	print(i"plain left {plain.left.read()}");
+}
+
+fun main() {
+	broken();
+	full();
+	temporary();
+	plain();
+	print("done");
+}
