@@ -303,6 +303,7 @@ spec/names.md h1 spec-4--names-modules-and-packages
 spec/names.md h2 41-modules
 spec/names.md h2 42-the-three-namespaces
 spec/names.md h2 43-imports
+spec/names.md h3 431-what-an-import-means--the-elaboration
 spec/names.md h2 44-scopes-and-shadowing
 spec/names.md h2 45-type-position-vs-value-position
 spec/names.md h2 46-statics-and-members
