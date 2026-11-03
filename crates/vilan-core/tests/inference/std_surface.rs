@@ -9012,17 +9012,21 @@ fn m181_the_encoder_keeps_exactly_the_unreserved_set() {
 
 #[test]
 fn m181_the_encoder_is_total_over_a_lone_surrogate() {
-    // A JS string can hold half of a surrogate pair (`substring` counts UTF-16
-    // units there), on which `encodeURIComponent` itself throws: the helper
-    // answers U+FFFD's escape instead.
+    // A JS string can hold half of a surrogate pair — no vilan operation makes
+    // one since B695 (a cut inside a pair floors), but a host value can — and
+    // `encodeURIComponent` itself throws on one: the helper answers U+FFFD's
+    // escape instead.
     assert_compiles_and_runs(
-        &m181_program(
-            r#"
-            let face = "😀";
-            print(percent_encode(face.substring(0, 1)));
-            print(percent_encode(i"a{face.substring(1, 2)}b"));
-            "#,
-        ),
+        r#"
+        import std::io::print;
+        import std::url::percent_encode;
+        [extern("String.fromCharCode")]
+        external fun from_char_code(code: u32): str;
+        fun main() {
+            print(percent_encode(from_char_code(55357)));
+            print(percent_encode(i"a{from_char_code(56832)}b"));
+        }
+        "#,
         "%EF%BF%BD\na%EF%BF%BDb\n",
     );
 }
